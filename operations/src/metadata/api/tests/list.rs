@@ -336,10 +336,7 @@ async fn cross_shard_unknown() {
 
 #[test]
 fn anonymous_limit_clamped() {
-    assert_eq!(
-        effective_list_limit(None, true),
-        LIST_METADATA_LIMIT
-    );
+    assert_eq!(effective_list_limit(None, true), LIST_METADATA_LIMIT);
     assert_eq!(
         effective_list_limit(Some(MAX_METADATA_LIMIT), true),
         ANONYMOUS_METADATA_LIMIT
@@ -390,17 +387,22 @@ fn config_filters_cached() {
 fn peers_are_bounded() {
     let local = iroh::SecretKey::from_bytes(&[255u8; 32]).public();
     let mut config = RealmConfigDocument::new(TEST_REALM_ID, Vec::new(), 2);
-    config.ensure_node(local, aruna_core::structs::identity::realm::RealmNodeKind::Server);
+    config.ensure_node(
+        local,
+        aruna_core::structs::identity::realm::RealmNodeKind::Server,
+    );
     for seed in 1u8..=40 {
         config.ensure_node(
             iroh::SecretKey::from_bytes(&[seed; 32]).public(),
             aruna_core::structs::identity::realm::RealmNodeKind::Server,
         );
     }
-    config.nodes.push(aruna_core::structs::identity::realm::RealmNode {
-        node_id: "invalid-node".to_string(),
-        kind: aruna_core::structs::identity::realm::RealmNodeKind::Server,
-    });
+    config
+        .nodes
+        .push(aruna_core::structs::identity::realm::RealmNode {
+            node_id: "invalid-node".to_string(),
+            kind: aruna_core::structs::identity::realm::RealmNodeKind::Server,
+        });
     let mut reversed = config.clone();
     reversed.nodes.reverse();
     let first = select_forward_peers(

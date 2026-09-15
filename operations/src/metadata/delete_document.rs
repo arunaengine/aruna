@@ -12,11 +12,11 @@ use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     graph_revision_change, lifecycle_revision_change, updated_index_delete,
 };
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use byteview::ByteView;
@@ -120,7 +120,11 @@ pub enum DeleteDocumentError {
 }
 
 impl DeleteDocumentOperation {
-    pub fn new(actor: aruna_core::structs::identity::auth::Actor, group_id: Ulid, document_id: Ulid) -> Self {
+    pub fn new(
+        actor: aruna_core::structs::identity::auth::Actor,
+        group_id: Ulid,
+        document_id: Ulid,
+    ) -> Self {
         Self {
             actor,
             group_id,
@@ -1012,14 +1016,14 @@ mod pure_tests {
     use super::*;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::{
-        SYNC_REVISION_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
-        PRUNE_JOB_KEYSPACE, ID_MAPPING_KEYSPACE,
+        DOCUMENT_LIFECYCLE_KEYSPACE, ID_MAPPING_KEYSPACE, PRUNE_JOB_KEYSPACE,
+        SYNC_REVISION_KEYSPACE,
     };
     use aruna_core::storage_entries::sync_revision_key;
     use aruna_core::structs::execution::job::JobId;
-    use aruna_core::structs::{PersistentIdMapping, PersistentIdStatus, persistent_id_key};
-    use aruna_core::structs::placement::placement_record::PlacementStrategy;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+    use aruna_core::structs::placement::placement_record::PlacementStrategy;
+    use aruna_core::structs::{PersistentIdMapping, PersistentIdStatus, persistent_id_key};
 
     fn actor() -> aruna_core::structs::identity::auth::Actor {
         let realm_id = RealmId::from_bytes([7u8; 32]);
@@ -1125,10 +1129,7 @@ mod pure_tests {
         else {
             panic!("expected an updated-index delete, got {effects:?}");
         };
-        assert_eq!(
-            key_space,
-            aruna_core::keyspaces::UPDATED_INDEX_KEYSPACE
-        );
+        assert_eq!(key_space, aruna_core::keyspaces::UPDATED_INDEX_KEYSPACE);
         assert_eq!(
             key.as_ref(),
             aruna_core::storage_entries::updated_index_key(
@@ -1758,7 +1759,8 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::from_bytes([0x51; 16]);
-        let run = |actor: aruna_core::structs::identity::auth::Actor, record: &MetadataRegistryRecord| {
+        let run = |actor: aruna_core::structs::identity::auth::Actor,
+                   record: &MetadataRegistryRecord| {
             let mut operation =
                 DeleteDocumentOperation::new(actor, record.group_id, record.document_id)
                     .with_phase_source(fixed_phase_source());

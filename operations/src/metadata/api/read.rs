@@ -1,11 +1,10 @@
 use super::{
     AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
-    DriverContext, Event, GraphLifecycleRecord, GroupId, HashMap, ListGroupOperation,
-    DISTRIBUTED_QUERY_DEADLINE, DOCUMENT_LIFECYCLE_KEYSPACE,
-    GRAPH_LIFECYCLE_KEYSPACE, REFERENCES_LIMIT,
-    REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, MetadataApiError,
-    MetadataFanoutScope, MetadataFanoutStats, MetadataLifecycleRecord, MetadataQueryResults,
-    MetadataReadError, MetadataRegistryRecord, NodeId, Permission, RealmId, StorageEffect,
+    DISTRIBUTED_QUERY_DEADLINE, DOCUMENT_LIFECYCLE_KEYSPACE, DriverContext, Event,
+    GRAPH_LIFECYCLE_KEYSPACE, GraphLifecycleRecord, GroupId, HashMap, ListGroupOperation,
+    MetadataApiError, MetadataFanoutScope, MetadataFanoutStats, MetadataLifecycleRecord,
+    MetadataQueryResults, MetadataReadError, MetadataRegistryRecord, NodeId, Permission,
+    REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect,
     StorageEvent, StorageHandle, StorageReadError, TxnId, Ulid, check_policy_limit,
     document_lifecycle_key, drive, graph_lifecycle_key, load_document_record, load_group_records,
     load_pending_records, load_realm_config, map_internal_error, map_query_error,
@@ -411,8 +410,7 @@ pub(super) async fn load_claim_records(
         .map(|group| group.group_id)
         .collect(),
     })?;
-    let mut pending =
-        load_pending_records(context, group_id, REGISTRY_CANDIDATE_LIMIT).await?;
+    let mut pending = load_pending_records(context, group_id, REGISTRY_CANDIDATE_LIMIT).await?;
     let mut records = Vec::new();
     for group_id in group_ids {
         let remaining = REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());

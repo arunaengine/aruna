@@ -2,12 +2,11 @@ use super::field;
 
 use super::{
     ApiQueryMode, Arc, AuthToken, BoxFuture, BucketSearchExecution, BucketSearchHit,
-    BucketSearchRequest, DriverContext, HashSet, Instant, DISTRIBUTED_QUERY_DEADLINE,
-    QUERY_FANOUT_LIMIT, QUERY_MAX_NODES,
-    QUERY_MAX_BYTES, QUERY_MAX_ROWS, MetadataApiError, MetadataReadError, NodeId,
-    RealmId, SearchBucketsInput, Span, debug_span, deduplicate_fanout_nodes, discover_realm_nodes,
-    map_read_error, query_fingerprint, record_elapsed_ms, search_local_buckets,
-    select_fanout_nodes, short_display_id, stream, warn,
+    BucketSearchRequest, DISTRIBUTED_QUERY_DEADLINE, DriverContext, HashSet, Instant,
+    MetadataApiError, MetadataReadError, NodeId, QUERY_FANOUT_LIMIT, QUERY_MAX_BYTES,
+    QUERY_MAX_NODES, QUERY_MAX_ROWS, RealmId, SearchBucketsInput, Span, debug_span,
+    deduplicate_fanout_nodes, discover_realm_nodes, map_read_error, query_fingerprint,
+    record_elapsed_ms, search_local_buckets, select_fanout_nodes, short_display_id, stream, warn,
 };
 
 use super::distributed::record_bucket_result;
@@ -383,8 +382,8 @@ where
         subject: request_subject,
         deadline: scope_deadline,
     } = scope;
-    let deadline = scope_deadline
-        .unwrap_or_else(|| tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE);
+    let deadline =
+        scope_deadline.unwrap_or_else(|| tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE);
     ensure_query_mode(&mode);
     match mode.unwrap_or(ApiQueryMode::Distributed) {
         ApiQueryMode::Local => {

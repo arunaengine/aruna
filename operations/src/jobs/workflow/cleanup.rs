@@ -135,14 +135,14 @@ mod tests {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USER_ACCESS_KEYSPACE};
-    use aruna_core::structs::storage::blob::{
-        BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, UserAccess, VersionKey,
-    };
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState,
         WorkspaceMode,
     };
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::{
+        BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, UserAccess, VersionKey,
+    };
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
@@ -152,8 +152,8 @@ mod tests {
     use crate::driver::DriverContext;
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::{insert_job, record_attempt_intent};
-    use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::access::get::GetAccessOperation;
+    use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
 
     struct StubBackend {

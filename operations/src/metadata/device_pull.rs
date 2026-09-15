@@ -14,11 +14,11 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BlobVersion, BlobVersionState, BucketInfo, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{
     RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPullAck, SyncRefusal,
     SyncVersionPage,
 };
-use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::GroupId;
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -32,10 +32,10 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 
 /// Versions one idempotency scan reads at a time.
 const VERSION_SCAN_PAGE: usize = 256;
@@ -559,7 +559,12 @@ async fn ensure_read(
     authorize_pull(
         context,
         auth,
-        aruna_core::structs::storage::blob::bucket_permission_path(auth.realm_id, group_id, node_id, bucket),
+        aruna_core::structs::storage::blob::bucket_permission_path(
+            auth.realm_id,
+            group_id,
+            node_id,
+            bucket,
+        ),
         Permission::READ,
         "s3.ListObjectVersions",
     )
@@ -575,12 +580,12 @@ mod tests {
     use aruna_core::errors::{ConversionError, StorageError};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
-    use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
 

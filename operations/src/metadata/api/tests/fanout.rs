@@ -12,8 +12,14 @@ fn query_fans_out() {
     let document_id = Ulid::generate();
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
     config.seed_default_placement();
-    config.ensure_node(local_node_id, aruna_core::structs::identity::realm::RealmNodeKind::Server);
-    config.ensure_node(remote_node_id, aruna_core::structs::identity::realm::RealmNodeKind::Server);
+    config.ensure_node(
+        local_node_id,
+        aruna_core::structs::identity::realm::RealmNodeKind::Server,
+    );
+    config.ensure_node(
+        remote_node_id,
+        aruna_core::structs::identity::realm::RealmNodeKind::Server,
+    );
     let strategy = config
         .strategy(&config.default_strategy_id.expect("default strategy"))
         .expect("default strategy resolves");

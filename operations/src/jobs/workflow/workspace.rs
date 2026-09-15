@@ -16,13 +16,12 @@ use aruna_core::structs::execution::job::{
     workspace_credential_id,
 };
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
-use aruna_core::structs::storage::blob::{
-    BackendLocation, BucketInfo, HashIndex, CONTENT_TYPE_KEY, UserAccess,
-    bucket_permission_path, ensure_confined_path, group_permission_path, key_content_type,
-    object_permission_path,
-};
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BucketInfo, CONTENT_TYPE_KEY, HashIndex, UserAccess, bucket_permission_path,
+    ensure_confined_path, group_permission_path, key_content_type, object_permission_path,
+};
 use aruna_core::structs::storage::replication::{ReplicationFailure, VersionedObjectArn};
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -47,11 +46,11 @@ use crate::replication::version_replication::{
     SourceAuthorizationError,
 };
 use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
+use crate::s3::access::get::{GetAccessError, GetAccessOperation};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
-use crate::s3::access::get::{GetAccessError, GetAccessOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
@@ -94,9 +93,7 @@ pub async fn ensure_group_write(
         AuthorizationError::InvalidRealmId
         | AuthorizationError::InvalidGroupId
         | AuthorizationError::GroupNotFound
-        | AuthorizationError::DocNotFound => {
-            JobError::permanent("workspace write access denied")
-        }
+        | AuthorizationError::DocNotFound => JobError::permanent("workspace write access denied"),
         other => JobError::retryable(format!("workspace authorization failed: {other}")),
     })?;
     if allowed {
@@ -1564,9 +1561,11 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
+    use aruna_core::structs::execution::job::{
+        JobErrorKind, JobId, JobPayload, OutputCommitIntent,
+    };
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-    use aruna_core::structs::execution::job::{JobErrorKind, JobId, JobPayload, OutputCommitIntent};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
@@ -1960,7 +1959,10 @@ mod tests {
         let owner = record.created_by;
         let ungranted = UserId::local(Ulid::from_bytes([9; 16]), realm_id);
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-        config.ensure_node(node_id, aruna_core::structs::identity::realm::RealmNodeKind::User { owner });
+        config.ensure_node(
+            node_id,
+            aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
+        );
         let actor = Actor {
             node_id,
             user_id: owner,
@@ -2110,7 +2112,10 @@ mod tests {
             panic!("a foreign key must not yield a credential")
         };
 
-        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
         assert!(
             error
                 .message
@@ -2199,7 +2204,10 @@ mod tests {
             panic!("an over-limit mount set must not yield a credential")
         };
 
-        assert_eq!(over.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
+        assert_eq!(
+            over.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
         assert!(
             over.message
                 .starts_with("workspace credential restrictions invalid")
@@ -2339,7 +2347,10 @@ mod tests {
         assert_eq!(merged.len(), MAX_EXECUTION_OUTPUTS);
 
         let error = merge_outputs(inventoried, vec![output("overflow")]).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
     }
 
     fn wildcard_output(pattern: &str) -> OutputSelection {
@@ -2405,12 +2416,18 @@ mod tests {
     fn rejects_foreign_match() {
         let output = wildcard_output("/out/*.txt");
         let error = expand_selection(&output, vec!["/other/a.txt".to_string()]).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
 
         let mut output = output;
         output.path_prefix = None;
         let error = expand_selection(&output, vec!["/out/a.txt".to_string()]).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
     }
 
     #[test]
@@ -2422,7 +2439,10 @@ mod tests {
         }
         insert_output(&mut outputs, &mut keys, output("0")).unwrap();
         let error = insert_output(&mut outputs, &mut keys, output("overflow")).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
         assert_eq!(outputs.len(), MAX_EXECUTION_OUTPUTS);
     }
 }

@@ -569,7 +569,9 @@ async fn store_or_fail(
     };
     match Box::pin(store_outputs(context, &record, control, outputs)).await {
         Ok(digest) => Some(digest),
-        Err(error) if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent => {
+        Err(error)
+            if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent =>
+        {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output record store failed; failing");
             Box::pin(fail_and_crate(context, job_id, token, &record, error)).await;
             None
@@ -798,7 +800,9 @@ pub(super) async fn collect_or_park(
 ) -> Option<Vec<OutputObject>> {
     match Box::pin(collect_outputs(context, spec, bucket, control)).await {
         Ok(outputs) => Some(outputs),
-        Err(error) if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent => {
+        Err(error)
+            if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent =>
+        {
             warn!(job_id = %job_id, bucket = %bucket, error = ?error, "Output inventory failed permanently; failing");
             Box::pin(fail_or_park(context, job_id, token, error)).await;
             None
@@ -886,7 +890,9 @@ async fn export_or_park(
     .await
     {
         Ok(outputs) => Some(outputs),
-        Err(error) if error.kind == aruna_core::structs::execution::job::JobErrorKind::Retryable => {
+        Err(error)
+            if error.kind == aruna_core::structs::execution::job::JobErrorKind::Retryable =>
+        {
             warn!(job_id = %job_id, error = ?error, "Output capture failed; parking");
             Box::pin(park_attempt(context, job_id, token, error)).await;
             None

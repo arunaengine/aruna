@@ -4,10 +4,10 @@ use std::sync::Arc;
 use aruna_compute::ExecutorBackend;
 use aruna_compute::session::{EndReason, Session, SessionConfig};
 use aruna_core::compute::FenceContext;
-use aruna_core::structs::placement::compute_config::IDLE_AFTER_MS;
 use aruna_core::structs::execution::job::{
     ExecutionSpec, JobId, JobRecord, JobResultPayload, SessionReportDetail, SessionReportRow,
 };
+use aruna_core::structs::placement::compute_config::IDLE_AFTER_MS;
 use tracing::warn;
 
 use super::super::store::{put_job_entry, read_job_record};
@@ -36,16 +36,15 @@ pub(super) async fn start_session(
     let node_id = net.node_id();
     // The credential was minted while the task was prepared; this reads the
     // same one back, so the client sees when it really expires.
-    let credential_expires_ms =
-        match read_job_record(&context.storage_handle, job_id, None).await {
-            Ok(Some(record)) => Box::pin(mint_workspace_credential(
-                context, spec, &record, node_id, bucket,
-            ))
-            .await
-            .map(|credential| credential.expires_at_ms)
-            .unwrap_or_default(),
-            _ => 0,
-        };
+    let credential_expires_ms = match read_job_record(&context.storage_handle, job_id, None).await {
+        Ok(Some(record)) => Box::pin(mint_workspace_credential(
+            context, spec, &record, node_id, bucket,
+        ))
+        .await
+        .map(|credential| credential.expires_at_ms)
+        .unwrap_or_default(),
+        _ => 0,
+    };
     let realm_idle = realm_session_idle(context).await;
     let idle_after_ms = requested
         .idle_after_ms

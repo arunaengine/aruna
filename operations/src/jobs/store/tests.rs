@@ -1,15 +1,14 @@
 use super::*;
 use aruna_core::UserId;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportDetail, ImportReportRow,
-    ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
-    LEASE_INDEX_PREFIX, JobPayload, ReasonCode, RoCrateLimits, parse_schedule_key,
-    pid_dedup_key,
+    ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
+    LEASE_INDEX_PREFIX, ReasonCode, RoCrateLimits, parse_schedule_key, pid_dedup_key,
 };
-use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
-use aruna_core::structs::MintPersistentSpec;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_storage::FjallStorage;
 use tempfile::tempdir;
@@ -525,15 +524,10 @@ async fn stale_checkpoint_rejected() {
         Err(JobMutationError::TokenMismatch)
     ));
     assert_eq!(
-        read_state::<Vec<u8>>(
-            &storage,
-            STAGING_STATE_KEYSPACE,
-            key,
-            "staging checkpoint",
-        )
-        .await
-        .unwrap()
-        .unwrap(),
+        read_state::<Vec<u8>>(&storage, STAGING_STATE_KEYSPACE, key, "staging checkpoint",)
+            .await
+            .unwrap()
+            .unwrap(),
         b"newer".to_vec()
     );
 }

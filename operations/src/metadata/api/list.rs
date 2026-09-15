@@ -1,9 +1,9 @@
 use super::{
-    AuthContext, Deserialize, DriverContext, Event, GroupId, GroupPermissionRules, HashMap,
-    IterStart, LIST_METADATA_SIZE, ListGroupOperation, EVENT_LOG_KEYSPACE,
-    PENDING_PROJECTION_KEYSPACE, REGISTRY_CANDIDATE_LIMIT, MetadataApiError,
-    MetadataEventRecord, MetadataRegistryRecord, RealmId, Serialize, StorageEffect, StorageEvent,
-    drive, ensure_record_materialized, event_log_key, export_summary_jsonld, filter_live_records,
+    AuthContext, Deserialize, DriverContext, EVENT_LOG_KEYSPACE, Event, GroupId,
+    GroupPermissionRules, HashMap, IterStart, LIST_METADATA_SIZE, ListGroupOperation,
+    MetadataApiError, MetadataEventRecord, MetadataRegistryRecord, PENDING_PROJECTION_KEYSPACE,
+    REGISTRY_CANDIDATE_LIMIT, RealmId, Serialize, StorageEffect, StorageEvent, drive,
+    ensure_record_materialized, event_log_key, export_summary_jsonld, filter_live_records,
     iter_registry_effect, metadata_read_request, parse_registry_iter, pending_projection_target,
     stream,
 };
@@ -233,9 +233,7 @@ pub(super) fn effective_list_limit(requested: Option<usize>, anonymous: bool) ->
     } else {
         MAX_METADATA_LIMIT
     };
-    requested
-        .unwrap_or(LIST_METADATA_LIMIT)
-        .clamp(1, maximum)
+    requested.unwrap_or(LIST_METADATA_LIMIT).clamp(1, maximum)
 }
 
 pub(super) fn check_policy_limit(

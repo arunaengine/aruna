@@ -1,14 +1,13 @@
 use super::{
     ARUNA_DATA_PREFIX, ApiQueryMode, Arc, AuthContext, AuthToken, BLOB_HEAD_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BTreeMap, BTreeSet, BlobHeadKey, BlobVersion, BlobVersionState,
-    ConversionError, CurrentVersionPointer, Deserialize, DriverContext, Event, GetBucketError,
-    GetBucketOperation, GetConfigOperation, GetNodesOperation, HashMap, HashSet, IterStart, Key,
-    DISTRIBUTED_QUERY_DEADLINE, REFERENCES_LIMIT,
-    REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT,
-    MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation,
+    ConversionError, CurrentVersionPointer, DISTRIBUTED_QUERY_DEADLINE, Deserialize, DriverContext,
+    Event, GetBucketError, GetBucketOperation, GetConfigOperation, GetNodesOperation, HashMap,
+    HashSet, IterStart, Key, MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation,
     MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataReferenceEntry,
     MetadataReferencesRequest, MetadataRegistryRecord, MetadataSearchHit, NodeId, NodeSearchResult,
-    Permission, REALM_DISCOVERY_TIMEOUT, RealmConfigDocument, RealmId, RealmNodeDiscovery,
+    Permission, REALM_DISCOVERY_TIMEOUT, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT,
+    REGISTRY_CANDIDATE_LIMIT, RealmConfigDocument, RealmId, RealmNodeDiscovery,
     ResolvePathsOperation, SearchCursor, SearchCursorError, SearchWatermark, Serialize,
     StorageEffect, StorageEvent, Ulid, Value, VersionKey, W3idIdentifier, bucket_permission_path,
     can_read_record, deduplicate_fanout_nodes, drive, filter_live_records, forwarded_bearer,
@@ -32,9 +31,7 @@ pub(super) async fn resolve_preflight_targets(
             content_w3ids,
             remove_resolvable_locations,
         } => {
-            if content_w3ids.is_empty()
-                || content_w3ids.len() > MAX_TARGET_VERSIONS
-            {
+            if content_w3ids.is_empty() || content_w3ids.len() > MAX_TARGET_VERSIONS {
                 return Err(MetadataApiError::BadRequest);
             }
             let mut targets = BTreeMap::new();
@@ -405,8 +402,8 @@ pub(crate) async fn references_preflight_local(
                 key: alias.key.clone(),
                 version_id: alias.version_id,
             };
-            let removed = target.remove_resolvable_locations
-                || target.removed_locations.contains(&location);
+            let removed =
+                target.remove_resolvable_locations || target.removed_locations.contains(&location);
             remaining |= !removed;
             add_location_iris(
                 &mut target.queried_iris,
@@ -1001,12 +998,7 @@ pub(super) async fn run_preflight_fanout(
             plan.page_size,
         ),
         |(context, realm_id, auth, targets, endpoint, resume, page_size), node_id| async move {
-            let limit = resume_fetch_limit(
-                &resume,
-                node_id,
-                page_size,
-                MAX_PAGINATION_DEPTH,
-            );
+            let limit = resume_fetch_limit(&resume, node_id, page_size, MAX_PAGINATION_DEPTH);
             references_preflight_local(
                 &context,
                 realm_id,
@@ -1028,12 +1020,7 @@ pub(super) async fn run_preflight_fanout(
             plan.page_size,
         ),
         |(handle, auth_token, targets, resume, page_size), node_id| async move {
-            let limit = resume_fetch_limit(
-                &resume,
-                node_id,
-                page_size,
-                MAX_PAGINATION_DEPTH,
-            );
+            let limit = resume_fetch_limit(&resume, node_id, page_size, MAX_PAGINATION_DEPTH);
             handle
                 .request_remote_preflight(
                     node_id,
@@ -1148,10 +1135,7 @@ pub(super) fn assemble_preflight_execution(
                     .remove(&target.content_w3id)
                     .unwrap_or_default(),
                 hidden_references_exist: hidden.contains(&target.content_w3id),
-                would_remove_location: complete
-                    && removes_location
-                    && found
-                    && !remaining,
+                would_remove_location: complete && removes_location && found && !remaining,
                 location_impact_complete: complete,
                 content_w3id: target.content_w3id,
                 targeted_versions: target.targeted_versions,

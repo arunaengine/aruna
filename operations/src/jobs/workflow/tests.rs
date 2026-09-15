@@ -19,12 +19,12 @@ use aruna_core::compute::{
     AdoptableEvidence, AttemptPhase, AttemptStatus, CancelEvidence, LogLimits, LogTails, NOBODY,
     NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, UserSpec,
 };
-use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::execution::job::{
     JobErrorKind, JobResultPayload, JobState, MAX_MESSAGE_BYTES, OutputDestination,
     OutputSelection, SessionReportDetail, SessionReportRow, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;

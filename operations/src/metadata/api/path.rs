@@ -1,13 +1,13 @@
 use super::{
-    AuthContext, AuthFailure, AuthToken, DriverContext, GroupId, GroupPermissionRules, HashSet,
-    DISTRIBUTED_QUERY_DEADLINE, QUERY_FANOUT_LIMIT,
-    QUERY_MAX_NODES, REGISTRY_CANDIDATE_LIMIT, MetaResourceId,
-    MetadataApiError, MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner,
-    MetadataReadError, MetadataRegistryRecord, MetadataTransportMessage, NodeId, PathClaimRecord,
-    PlacementRef, ROLE_NODE, ReadDecision, RealmConfigDocument, RealmId, Ulid, holds_placement,
-    load_realm_config, meta_bucket_subject, metadata_read_request, neg_log2_q48, peer_rank,
-    reduce_holder_reads, registry_placement, registry_placement_for, registry_strategy,
-    resolve_holders_limit, resolve_shard_holders, select_top_peers, selector_hash, stream,
+    AuthContext, AuthFailure, AuthToken, DISTRIBUTED_QUERY_DEADLINE, DriverContext, GroupId,
+    GroupPermissionRules, HashSet, MetaResourceId, MetadataApiError, MetadataPathCandidate,
+    MetadataPathResolution, MetadataPathWinner, MetadataReadError, MetadataRegistryRecord,
+    MetadataTransportMessage, NodeId, PathClaimRecord, PlacementRef, QUERY_FANOUT_LIMIT,
+    QUERY_MAX_NODES, REGISTRY_CANDIDATE_LIMIT, ROLE_NODE, ReadDecision, RealmConfigDocument,
+    RealmId, Ulid, holds_placement, load_realm_config, meta_bucket_subject, metadata_read_request,
+    neg_log2_q48, peer_rank, reduce_holder_reads, registry_placement, registry_placement_for,
+    registry_strategy, resolve_holders_limit, resolve_shard_holders, select_top_peers,
+    selector_hash, stream,
 };
 
 use super::read::load_claim_records;
@@ -43,8 +43,7 @@ pub(super) fn select_path_holders(
             return Err(MetadataApiError::ServiceUnavailable);
         }
         let placement = PlacementRef { strategy_id, shard };
-        let holders =
-            resolve_holders_limit(config, &placement, QUERY_MAX_NODES);
+        let holders = resolve_holders_limit(config, &placement, QUERY_MAX_NODES);
         if holders.is_empty() {
             return Err(MetadataApiError::ServiceUnavailable);
         }

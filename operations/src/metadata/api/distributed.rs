@@ -1,13 +1,12 @@
 use super::{
     ApiQueryMode, Arc, AuthContext, BucketSearchHit, DriverContext, GroupId, HashMap, HashSet,
-    Instant, MAX_RESULT_BYTES, QUERY_MAX_ROWS,
-    MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation,
+    Instant, MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError, MetadataFanoutOperation,
     MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataQueryResults,
     MetadataReadError, MetadataSearchHit, NodeId, NodeSearchResult, ObjectKeyMatch,
-    ObjectQueryMode, RealmId, ReferenceNodeExecution, SearchNodePage, SearchPageCursor,
-    SearchWatermark, Span, fanout_bearer, field, map_read_error, merge_search_hits,
-    metadata_node_call, paginate, query_union_safe, record_elapsed_ms, resume_fetch_limit,
-    run_metadata_fanout,
+    ObjectQueryMode, QUERY_MAX_ROWS, RealmId, ReferenceNodeExecution, SearchNodePage,
+    SearchPageCursor, SearchWatermark, Span, fanout_bearer, field, map_read_error,
+    merge_search_hits, metadata_node_call, paginate, query_union_safe, record_elapsed_ms,
+    resume_fetch_limit, run_metadata_fanout,
 };
 
 pub(super) fn object_search_fingerprint(
@@ -327,12 +326,7 @@ pub(super) async fn run_search_distributed(
             page_size,
         ),
         |(handle, auth, graph_iris, query, conforms_to, group_id, resume, page_size), node_id| async move {
-            let limit = resume_fetch_limit(
-                &resume,
-                node_id,
-                page_size,
-                MAX_PAGINATION_DEPTH,
-            );
+            let limit = resume_fetch_limit(&resume, node_id, page_size, MAX_PAGINATION_DEPTH);
             let hits = match conforms_to {
                 Some(object_iri) => {
                     let mut hits = Vec::new();
@@ -377,12 +371,7 @@ pub(super) async fn run_search_distributed(
         ),
         |(handle, auth_token, graph_iris, query, conforms_to, group_id, resume, page_size),
          node_id| async move {
-            let limit = resume_fetch_limit(
-                &resume,
-                node_id,
-                page_size,
-                MAX_PAGINATION_DEPTH,
-            );
+            let limit = resume_fetch_limit(&resume, node_id, page_size, MAX_PAGINATION_DEPTH);
             let hits = match conforms_to {
                 Some(object_iri) => {
                     let mut hits = Vec::new();
@@ -438,12 +427,7 @@ pub(super) async fn run_search_distributed(
             hits,
         })
         .collect();
-    let page = paginate(
-        node_results,
-        watermark,
-        page_size,
-        MAX_PAGINATION_DEPTH,
-    );
+    let page = paginate(node_results, watermark, page_size, MAX_PAGINATION_DEPTH);
     span.record("hit_count", page.hits.len() as u64);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     Ok((page.hits, page.next, page.truncated, fanout_stats))
@@ -464,9 +448,7 @@ pub fn aggregate_query_results(
             let mut seen = HashSet::new();
             let mut merged = Vec::new();
             let mut merged_bytes = 32usize;
-            let row_limit = select_limit
-                .unwrap_or(QUERY_MAX_ROWS)
-                .min(QUERY_MAX_ROWS);
+            let row_limit = select_limit.unwrap_or(QUERY_MAX_ROWS).min(QUERY_MAX_ROWS);
             if row_limit == 0 {
                 return Ok(MetadataQueryResults::Solutions(Vec::new()));
             }

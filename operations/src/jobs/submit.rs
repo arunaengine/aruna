@@ -454,16 +454,14 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::store::read_job_record;
-    use aruna_core::keyspaces::{
-        JOB_KEYSPACE, JOB_INDEX_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
-    };
-    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::keyspaces::{JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
         ImportRoCrateSpec, ImportRoCrateTarget, JobState, RoCrateLimits, encode_dedup_value,
     };
-    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;
@@ -685,10 +683,7 @@ mod tests {
             .unwrap()
             .expect("job persisted");
         assert_eq!(record.state, JobState::Queued);
-        assert_eq!(
-            count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await,
-            1
-        );
+        assert_eq!(count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await, 1);
         assert_eq!(count_keyspace(&storage, JOB_INDEX_KEYSPACE).await, 1);
         assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 0);
     }

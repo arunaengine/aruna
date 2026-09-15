@@ -355,10 +355,7 @@ fn search_plan_limits() {
         object_search_request(realm_id, "query", usize::MAX),
     )
     .expect("large limit clamps");
-    assert_eq!(
-        plan.limit,
-        crate::s3::object::search::SEARCH_MAX_LIMIT
-    );
+    assert_eq!(plan.limit, crate::s3::object::search::SEARCH_MAX_LIMIT);
 }
 
 #[test]

@@ -1,19 +1,17 @@
 use super::{
-    ApiQueryMode, AuthContext, BlobHeadKey, BucketSearchHit, CursorEnvelopeError, Deserialize,
-    DriverContext, GroupId, HashMap, HashSet, DISTRIBUTED_QUERY_DEADLINE,
-    QUERY_MAX_NODES, MetadataApiError, MetadataFanoutOperation,
-    MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataReadError,
-    MetadataSearchHit, NodeId, ObjectInventoryHit, ObjectKeyMatch, RealmId, RealmNodeDiscovery,
-    SearchCursor, SearchCursorError, SearchNodePage, SearchObjectsInput, Serialize, SignedCursor,
-    SystemTime, deduplicate_fanout_nodes, discover_realm_nodes, fanout_bearer, load_realm_config,
+    ApiQueryMode, AuthContext, BlobHeadKey, BucketSearchHit, CursorEnvelopeError,
+    DISTRIBUTED_QUERY_DEADLINE, Deserialize, DriverContext, GroupId, HashMap, HashSet,
+    MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats,
+    MetadataNodeCall, MetadataReadError, MetadataSearchHit, NodeId, ObjectInventoryHit,
+    ObjectKeyMatch, QUERY_MAX_NODES, RealmId, RealmNodeDiscovery, SearchCursor, SearchCursorError,
+    SearchNodePage, SearchObjectsInput, Serialize, SignedCursor, SystemTime,
+    deduplicate_fanout_nodes, discover_realm_nodes, fanout_bearer, load_realm_config,
     map_read_error, metadata_node_call, object_search_fingerprint, query_fingerprint,
     record_object_result, run_metadata_fanout, search_local_objects, select_fanout_nodes,
 };
 
 use super::distributed::run_search_distributed;
-use crate::metadata::search_cursor::{
-    SEARCH_PAGE_SIZE, SEARCH_MAX_PAGE,
-};
+use crate::metadata::search_cursor::{SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE};
 
 const OBJECT_CURSOR_VERSION: u8 = 1;
 
@@ -154,9 +152,7 @@ impl SignedCursor<ObjectCursorPayload> {
             CURSOR_SIGNATURE_CONTEXT,
             authorized_signers,
             |cursor| {
-                if cursor.version != OBJECT_CURSOR_VERSION
-                    || cursor.fingerprint != fingerprint
-                {
+                if cursor.version != OBJECT_CURSOR_VERSION || cursor.fingerprint != fingerprint {
                     Err(CursorEnvelopeError::QueryMismatch)
                 } else {
                     Ok(())
@@ -185,8 +181,7 @@ impl SignedCursor<ObjectCursorPayload> {
             })?;
             if !nodes.insert(partition.node_id)
                 || partition.start_after.as_ref().is_some_and(|key| {
-                    key.len() > SEARCH_MAX_BYTES
-                        || BlobHeadKey::from_bytes(key).is_err()
+                    key.len() > SEARCH_MAX_BYTES || BlobHeadKey::from_bytes(key).is_err()
                 })
             {
                 return Err(MetadataApiError::InvalidCursor(
