@@ -21,7 +21,7 @@ pub const MAX_NODE_WEIGHT: u32 = 10_000;
 pub const MAX_NODE_LOCATION_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum NodePlacementInputError {
+pub enum NodeInputError {
     #[error("placement location must be at most {MAX_NODE_LOCATION_LEN} characters")]
     LocationTooLong,
 }
@@ -32,12 +32,12 @@ pub enum NodePlacementInputError {
 pub fn normalize_placement_input(
     location: Option<&str>,
     weight: Option<u32>,
-) -> Result<(String, u32), NodePlacementInputError> {
+) -> Result<(String, u32), NodeInputError> {
     let location = match location {
         Some(raw) => {
             let trimmed = raw.trim();
             if trimmed.len() > MAX_NODE_LOCATION_LEN {
-                return Err(NodePlacementInputError::LocationTooLong);
+                return Err(NodeInputError::LocationTooLong);
             }
             trimmed.to_string()
         }
@@ -623,7 +623,7 @@ mod tests {
         let long = "x".repeat(MAX_NODE_LOCATION_LEN + 1);
         assert_eq!(
             normalize_placement_input(Some(&long), None),
-            Err(NodePlacementInputError::LocationTooLong)
+            Err(NodeInputError::LocationTooLong)
         );
         let at_limit = "y".repeat(MAX_NODE_LOCATION_LEN);
         assert!(normalize_placement_input(Some(&at_limit), None).is_ok());

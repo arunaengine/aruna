@@ -9,7 +9,7 @@ use ulid::Ulid;
 use crate::structs::{
     BindingTuple, DocumentClass, HandleRangeDirectory, PlacementBinding, PlacementScope,
 };
-use crate::structured_id::{BucketId, BucketNotInRange, PlacementHandle, StructuredId};
+use crate::structured_id::{BucketId, BucketRangeError, PlacementHandle, StructuredId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum BindingError {
@@ -24,7 +24,7 @@ pub enum BindingError {
     Conflicted(PlacementHandle),
     /// `bucket >= bucket_count` of the resolved strategy (REQ-META-ID-FORMAT-001).
     #[error(transparent)]
-    BucketOutOfRange(BucketNotInRange),
+    BucketOutOfRange(BucketRangeError),
     /// The strategy named by the resolved binding is unknown to the caller.
     #[error("strategy {0} named by the binding is unknown")]
     UnknownStrategy(Ulid),

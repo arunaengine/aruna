@@ -634,4 +634,5 @@ fn encode_selector(selector: &PlacementSelector, out: &mut Vec<u8>) {
 }
 
 #[cfg(test)]
+#[path = "placement_policy_tests.rs"]
 mod tests;
