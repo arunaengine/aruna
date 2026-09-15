@@ -6,9 +6,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::{
     METADATA_RAW_BYTES_LIMIT, METADATA_RAW_EVENT_LIMIT, MetadataBatch, MetadataBatchSource,
-    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentLifecycleRecord,
-    MetadataEffect, MetadataError, MetadataEvent, MetadataProfileValidationStatus,
-    MetadataRawOriginBudget, deterministic_materialization_actor, raw_quotas,
+    MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
+    MetadataLifecycleRecord, ProfileValidationStatus, RawOriginBudget,
+    deterministic_materialization_actor, raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
@@ -44,16 +44,16 @@ use crate::sync::shard_placement::sort_node_ids;
 const RAW_EVENT_LIMIT: usize = METADATA_RAW_EVENT_LIMIT as usize;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct UpdateMetadataDocumentConfig {
+pub struct UpdateDocumentConfig {
     pub actor: aruna_core::structs::Actor,
     pub group_id: GroupId,
     pub document_id: Ulid,
     pub public: bool,
-    pub mutation: UpdateMetadataDocumentMutation,
+    pub mutation: UpdateDocumentMutation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UpdateMetadataDocumentMutation {
+pub enum UpdateDocumentMutation {
     ReplaceRoCrate {
         jsonld: String,
     },
@@ -75,31 +75,31 @@ pub enum UpdateMetadataDocumentMutation {
 /// Success means acceptance into the durable event/projection pipeline, not
 /// completed graph materialization or replica convergence.
 #[derive(Debug, PartialEq)]
-pub struct UpdateMetadataDocumentOperation {
-    config: UpdateMetadataDocumentConfig,
+pub struct UpdateDocumentOperation {
+    config: UpdateDocumentConfig,
     /// Minted before the batch is planned: it is the batch actor as well as the
     /// event id, so a plan can never be attributed to another event.
     event_id: Ulid,
     txn_id: Option<TxnId>,
     record: Option<MetadataRegistryRecord>,
-    update_event: Option<MetadataCreateEventRecord>,
+    update_event: Option<MetadataEventRecord>,
     planned_batch: Option<MetadataBatch>,
-    raw_budget: Option<MetadataRawOriginBudget>,
-    next_raw_budget: Option<MetadataRawOriginBudget>,
-    accepted_create: Option<MetadataCreateEventRecord>,
+    raw_budget: Option<RawOriginBudget>,
+    next_raw_budget: Option<RawOriginBudget>,
+    accepted_create: Option<MetadataEventRecord>,
     realm_config: Option<RealmConfigDocument>,
     /// Buckets this update publishes onto and the activation generation each
     /// resolved at, read as a fence inside the write transaction.
     fenced: Vec<(PlacementRef, u64)>,
-    route_profile_status: Option<MetadataProfileValidationStatus>,
+    route_profile_status: Option<ProfileValidationStatus>,
     /// Phase-time and identity sampling; production keeps the defaults.
     phase_source: crate::metadata::MetadataPhaseSource,
-    state: UpdateMetadataDocumentState,
-    output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
+    state: UpdateDocumentState,
+    output: Option<Result<MetadataRegistryRecord, UpdateDocumentError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum UpdateMetadataDocumentState {
+enum UpdateDocumentState {
     Init,
     ReadCurrent,
     ReadRealmConfig,
@@ -117,7 +117,7 @@ enum UpdateMetadataDocumentState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum UpdateMetadataDocumentError {
+pub enum UpdateDocumentError {
     #[error(transparent)]
     StorageError(#[from] aruna_core::errors::StorageError),
     #[error(transparent)]
@@ -144,23 +144,23 @@ pub enum UpdateMetadataDocumentError {
     },
 }
 
-impl UpdateMetadataDocumentOperation {
-    pub fn new(config: UpdateMetadataDocumentConfig) -> Self {
+impl UpdateDocumentOperation {
+    pub fn new(config: UpdateDocumentConfig) -> Self {
         let route_profile_status = match &config.mutation {
-            UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld }
+            UpdateDocumentMutation::ReplaceRoCrate { jsonld }
                 if !submission_profile_tag(jsonld) =>
             {
                 Some(not_profiled_status(config.document_id))
             }
-            UpdateMetadataDocumentMutation::ReplaceRoCrate { .. } => None,
-            UpdateMetadataDocumentMutation::UpsertDataEntity { .. }
-            | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. }
-            | UpdateMetadataDocumentMutation::ApplyBatch { .. } => {
+            UpdateDocumentMutation::ReplaceRoCrate { .. } => None,
+            UpdateDocumentMutation::UpsertDataEntity { .. }
+            | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ApplyBatch { .. } => {
                 Some(stale_status(config.document_id, "dataset_revision_changed"))
             }
         };
         let planned_batch = match &config.mutation {
-            UpdateMetadataDocumentMutation::ApplyBatch { batch, .. } => Some((**batch).clone()),
+            UpdateDocumentMutation::ApplyBatch { batch, .. } => Some((**batch).clone()),
             _ => None,
         };
         let phase_source = crate::metadata::MetadataPhaseSource::default();
@@ -181,7 +181,7 @@ impl UpdateMetadataDocumentOperation {
             fenced: Vec::new(),
             route_profile_status,
             phase_source,
-            state: UpdateMetadataDocumentState::Init,
+            state: UpdateDocumentState::Init,
             output: None,
         }
     }
@@ -206,35 +206,33 @@ impl UpdateMetadataDocumentOperation {
 
     fn batch_source(&self) -> MetadataBatchSource {
         match &self.config.mutation {
-            UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
+            UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
                 MetadataBatchSource::ReplaceRoCrate {
                     jsonld: jsonld.clone(),
                 }
             }
-            UpdateMetadataDocumentMutation::UpsertDataEntity { jsonld } => {
+            UpdateDocumentMutation::UpsertDataEntity { jsonld } => {
                 MetadataBatchSource::UpsertDataEntity {
                     jsonld: jsonld.clone(),
                 }
             }
-            UpdateMetadataDocumentMutation::UpsertContextualEntity { jsonld } => {
+            UpdateDocumentMutation::UpsertContextualEntity { jsonld } => {
                 MetadataBatchSource::UpsertContextualEntity {
                     jsonld: jsonld.clone(),
                 }
             }
-            UpdateMetadataDocumentMutation::ApplyBatch { authored, .. } => authored.clone(),
+            UpdateDocumentMutation::ApplyBatch { authored, .. } => authored.clone(),
         }
     }
 
-    fn update_event_payload(
-        &self,
-    ) -> Result<MetadataCreateEventPayload, UpdateMetadataDocumentError> {
+    fn update_event_payload(&self) -> Result<MetadataEventPayload, UpdateDocumentError> {
         let Some(batch) = self.planned_batch.clone() else {
             return Err(MetadataError::Backend(
                 "metadata batch is missing before update commit".to_string(),
             )
             .into());
         };
-        Ok(MetadataCreateEventPayload::ApplyBatch {
+        Ok(MetadataEventPayload::ApplyBatch {
             batch,
             authored: self.batch_source(),
         })
@@ -243,11 +241,11 @@ impl UpdateMetadataDocumentOperation {
     fn update_event_record(
         &self,
         record: &MetadataRegistryRecord,
-    ) -> Result<MetadataCreateEventRecord, UpdateMetadataDocumentError> {
+    ) -> Result<MetadataEventRecord, UpdateDocumentError> {
         let mut record = record.clone();
         record.last_event_id = self.event_id;
         let occurred_at_ms = record.updated_at_ms;
-        Ok(MetadataCreateEventRecord {
+        Ok(MetadataEventRecord {
             event_id: self.event_id,
             record,
             user_id: self.config.actor.user_id,
@@ -257,7 +255,7 @@ impl UpdateMetadataDocumentOperation {
         })
     }
 
-    fn audit_record(&self, event: &MetadataCreateEventRecord) -> MetadataAuditRecord {
+    fn audit_record(&self, event: &MetadataEventRecord) -> MetadataAuditRecord {
         MetadataAuditRecord {
             realm_id: event.record.realm_id,
             group_id: event.record.group_id,
@@ -279,10 +277,10 @@ impl UpdateMetadataDocumentOperation {
     ) -> Result<Option<Effect>, MetadataError> {
         match &self.config.mutation {
             // A device already planned its batch, so there is nothing to plan.
-            UpdateMetadataDocumentMutation::ApplyBatch { .. } => return Ok(None),
-            UpdateMetadataDocumentMutation::ReplaceRoCrate { .. } => {}
-            UpdateMetadataDocumentMutation::UpsertDataEntity { jsonld }
-            | UpdateMetadataDocumentMutation::UpsertContextualEntity { jsonld } => {
+            UpdateDocumentMutation::ApplyBatch { .. } => return Ok(None),
+            UpdateDocumentMutation::ReplaceRoCrate { .. } => {}
+            UpdateDocumentMutation::UpsertDataEntity { jsonld }
+            | UpdateDocumentMutation::UpsertContextualEntity { jsonld } => {
                 validate_entity_jsonld(jsonld)?;
             }
         }
@@ -294,7 +292,7 @@ impl UpdateMetadataDocumentOperation {
     }
 
     fn begin_transaction_effect(&mut self) -> Effects {
-        self.state = UpdateMetadataDocumentState::StartTransaction;
+        self.state = UpdateDocumentState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
         })]
@@ -326,9 +324,9 @@ impl UpdateMetadataDocumentOperation {
             .map_or(0, |(_, generation)| *generation)
     }
 
-    fn write_update_batch(&self, txn_id: TxnId) -> Result<Effect, UpdateMetadataDocumentError> {
+    fn write_batch_effect(&self, txn_id: TxnId) -> Result<Effect, UpdateDocumentError> {
         let Some(event) = self.update_event.as_ref() else {
-            return Err(UpdateMetadataDocumentError::MissingTransaction);
+            return Err(UpdateDocumentError::MissingTransaction);
         };
         let now = self.phase_source.now_ms();
         let audit = self.audit_record(event);
@@ -353,12 +351,12 @@ impl UpdateMetadataDocumentOperation {
                     .map_err(aruna_core::errors::ConversionError::from)?,
             );
         }
-        let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+        let lifecycle = MetadataLifecycleRecord::Upsert {
             event: Box::new(event.clone()),
         };
         writes.push(document_lifecycle_entry(&lifecycle)?);
         if outbox.is_none() {
-            let aruna_core::document::DocumentSyncOutboxEvent::Upsert { change, .. } =
+            let aruna_core::document::DocumentOutboxEvent::Upsert { change, .. } =
                 lifecycle_outbox.event
             else {
                 unreachable!("metadata lifecycle update outbox must be an upsert");
@@ -366,7 +364,7 @@ impl UpdateMetadataDocumentOperation {
             writes.push(sync_revision_entry(&lifecycle_outbox.target, &change)?);
         }
         let Some(raw_budget) = self.next_raw_budget.as_ref() else {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         };
         writes.push(raw_budget_entry(raw_budget)?);
         let Some(mut profile_status) = self.route_profile_status.clone() else {
@@ -387,16 +385,16 @@ impl UpdateMetadataDocumentOperation {
         }))
     }
 
-    fn fail(&mut self, error: UpdateMetadataDocumentError) -> Effects {
+    fn fail(&mut self, error: UpdateDocumentError) -> Effects {
         let cleanup = self.abort();
-        self.state = UpdateMetadataDocumentState::Error;
+        self.state = UpdateDocumentState::Error;
         self.output = Some(Err(error));
         cleanup
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(UpdateMetadataDocumentError::UnexpectedEvent {
+        self.fail(UpdateDocumentError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -405,33 +403,30 @@ impl UpdateMetadataDocumentOperation {
 
     fn origin_quota(
         &self,
-        event: &MetadataCreateEventRecord,
-    ) -> Result<MetadataRawOriginBudget, UpdateMetadataDocumentError> {
+        event: &MetadataEventRecord,
+    ) -> Result<RawOriginBudget, UpdateDocumentError> {
         if event.record.document_id != self.config.document_id
             || event.record.establishing_event_id != event.event_id
             || event.record.last_event_id != event.event_id
             || !matches!(
                 event.payload,
-                MetadataCreateEventPayload::Scaffold { .. }
-                    | MetadataCreateEventPayload::RoCrate { .. }
+                MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. }
             )
         {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         }
         let mut origins = event.record.holder_node_ids.clone();
         if origins.is_empty() {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         }
         let original = origins.clone();
         sort_node_ids(&mut origins);
         if origins != original {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         }
         let encoded_bytes = postcard::experimental::serialized_size(event)
-            .map_err(|_| UpdateMetadataDocumentError::RawLimit)
-            .and_then(|size| {
-                u64::try_from(size).map_err(|_| UpdateMetadataDocumentError::RawLimit)
-            })?;
+            .map_err(|_| UpdateDocumentError::RawLimit)
+            .and_then(|size| u64::try_from(size).map_err(|_| UpdateDocumentError::RawLimit))?;
         raw_quotas(
             event.record.document_id,
             &origins,
@@ -443,14 +438,10 @@ impl UpdateMetadataDocumentOperation {
                 .into_iter()
                 .find(|budget| budget.node_id == self.config.actor.node_id)
         })
-        .ok_or(UpdateMetadataDocumentError::RawLimit)
+        .ok_or(UpdateDocumentError::RawLimit)
     }
 
-    fn valid_budget(
-        &self,
-        budget: &MetadataRawOriginBudget,
-        quota: &MetadataRawOriginBudget,
-    ) -> bool {
+    fn valid_budget(&self, budget: &RawOriginBudget, quota: &RawOriginBudget) -> bool {
         budget.document_id == self.config.document_id
             && budget.node_id == self.config.actor.node_id
             && budget.event_limit == quota.event_limit
@@ -465,12 +456,12 @@ impl UpdateMetadataDocumentOperation {
         &self,
         values: &[(ByteView, ByteView)],
         next_start_after: Option<&ByteView>,
-    ) -> Result<(MetadataRawOriginBudget, usize, u64), UpdateMetadataDocumentError> {
+    ) -> Result<(RawOriginBudget, usize, u64), UpdateDocumentError> {
         if values.len() > RAW_EVENT_LIMIT || next_start_after.is_some() {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         }
         let Some(create) = self.accepted_create.as_ref() else {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         };
         let quota = self.origin_quota(create)?;
         let mut events = 0u32;
@@ -478,38 +469,36 @@ impl UpdateMetadataDocumentOperation {
         let mut total_bytes = 0u64;
         let mut saw_create = false;
         for (key, value) in values {
-            let event: MetadataCreateEventRecord =
-                postcard::from_bytes(value).map_err(|_| UpdateMetadataDocumentError::RawLimit)?;
+            let event: MetadataEventRecord =
+                postcard::from_bytes(value).map_err(|_| UpdateDocumentError::RawLimit)?;
             if key != &event_log_key(self.config.document_id, event.event_id)
                 || event.record.document_id != self.config.document_id
             {
-                return Err(UpdateMetadataDocumentError::RawLimit);
+                return Err(UpdateDocumentError::RawLimit);
             }
             let value_len =
-                u64::try_from(value.len()).map_err(|_| UpdateMetadataDocumentError::RawLimit)?;
+                u64::try_from(value.len()).map_err(|_| UpdateDocumentError::RawLimit)?;
             total_bytes = total_bytes
                 .checked_add(value_len)
-                .ok_or(UpdateMetadataDocumentError::RawLimit)?;
+                .ok_or(UpdateDocumentError::RawLimit)?;
             if total_bytes > METADATA_RAW_BYTES_LIMIT {
-                return Err(UpdateMetadataDocumentError::RawLimit);
+                return Err(UpdateDocumentError::RawLimit);
             }
             if &event == create {
                 saw_create = true;
             }
             if event.node_id == self.config.actor.node_id {
-                events = events
-                    .checked_add(1)
-                    .ok_or(UpdateMetadataDocumentError::RawLimit)?;
+                events = events.checked_add(1).ok_or(UpdateDocumentError::RawLimit)?;
                 encoded_bytes = encoded_bytes
                     .checked_add(value_len)
-                    .ok_or(UpdateMetadataDocumentError::RawLimit)?;
+                    .ok_or(UpdateDocumentError::RawLimit)?;
             }
         }
         if !saw_create || events > quota.event_limit || encoded_bytes > quota.byte_limit {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         }
         Ok((
-            MetadataRawOriginBudget {
+            RawOriginBudget {
                 document_id: quota.document_id,
                 node_id: quota.node_id,
                 event_limit: quota.event_limit,
@@ -526,41 +515,40 @@ impl UpdateMetadataDocumentOperation {
         &self,
         history_events: usize,
         history_bytes: u64,
-    ) -> Result<MetadataRawOriginBudget, UpdateMetadataDocumentError> {
+    ) -> Result<RawOriginBudget, UpdateDocumentError> {
         let Some(event) = self.update_event.as_ref() else {
-            return Err(UpdateMetadataDocumentError::MissingTransaction);
+            return Err(UpdateDocumentError::MissingTransaction);
         };
         if history_events >= RAW_EVENT_LIMIT {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         }
         let Some(budget) = self.raw_budget.as_ref() else {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         };
         let Some(create) = self.accepted_create.as_ref() else {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         };
         let quota = self.origin_quota(create)?;
         if !self.valid_budget(budget, &quota) || budget.events >= budget.event_limit {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         }
         let event_bytes = postcard::experimental::serialized_size(event)
             .map_err(aruna_core::errors::ConversionError::from)?;
-        let event_bytes =
-            u64::try_from(event_bytes).map_err(|_| UpdateMetadataDocumentError::RawLimit)?;
+        let event_bytes = u64::try_from(event_bytes).map_err(|_| UpdateDocumentError::RawLimit)?;
         if history_bytes
             .checked_add(event_bytes)
             .is_none_or(|bytes| bytes > METADATA_RAW_BYTES_LIMIT)
         {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         }
         let encoded_bytes = budget
             .encoded_bytes
             .checked_add(event_bytes)
-            .ok_or(UpdateMetadataDocumentError::RawLimit)?;
+            .ok_or(UpdateDocumentError::RawLimit)?;
         if encoded_bytes > budget.byte_limit {
-            return Err(UpdateMetadataDocumentError::RawLimit);
+            return Err(UpdateDocumentError::RawLimit);
         }
-        Ok(MetadataRawOriginBudget {
+        Ok(RawOriginBudget {
             document_id: budget.document_id,
             node_id: budget.node_id,
             event_limit: budget.event_limit,
@@ -568,28 +556,28 @@ impl UpdateMetadataDocumentOperation {
             events: budget
                 .events
                 .checked_add(1)
-                .ok_or(UpdateMetadataDocumentError::RawLimit)?,
+                .ok_or(UpdateDocumentError::RawLimit)?,
             encoded_bytes,
         })
     }
-    fn phase_read_current(&mut self, event: Event) -> Effects {
+    fn read_current(&mut self, event: Event) -> Effects {
         match parse_registry_read(event) {
             Ok(Some(record)) => {
                 self.record = Some(record.clone());
-                self.state = UpdateMetadataDocumentState::ReadRealmConfig;
+                self.state = UpdateDocumentState::ReadRealmConfig;
                 smallvec![Effect::Storage(StorageEffect::Read {
                     key_space: REALM_CONFIG_KEYSPACE.to_string(),
                     key: ByteView::from(*record.realm_id.as_bytes()),
                     txn_id: None,
                 })]
             }
-            Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
+            Ok(None) => self.fail(UpdateDocumentError::DocumentNotFound),
             Err(StorageReadError::Storage(error)) => self.fail(error.into()),
             Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
         }
     }
 
-    fn phase_read_realm_config(&mut self, event: Event) -> Effects {
+    fn read_realm_config(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                 if let Some(bytes) = value {
@@ -599,11 +587,11 @@ impl UpdateMetadataDocumentOperation {
                     }
                 }
                 let Some(record) = self.record.clone() else {
-                    return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                    return self.fail(UpdateDocumentError::DocumentNotFound);
                 };
                 match self.plan_batch_effect(&record) {
                     Ok(Some(effect)) => {
-                        self.state = UpdateMetadataDocumentState::PlanBatch;
+                        self.state = UpdateDocumentState::PlanBatch;
                         smallvec![effect]
                     }
                     Ok(None) => self.begin_transaction_effect(),
@@ -615,7 +603,7 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn phase_plan_batch(&mut self, event: Event) -> Effects {
+    fn plan_batch(&mut self, event: Event) -> Effects {
         match event {
             Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => {
                 self.planned_batch = Some(batch);
@@ -626,11 +614,11 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn phase_start_transaction(&mut self, event: Event) -> Effects {
+    fn start_transaction(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                 self.txn_id = Some(txn_id);
-                self.state = UpdateMetadataDocumentState::ReadFence;
+                self.state = UpdateDocumentState::ReadFence;
                 smallvec![read_registry_effect(
                     self.config.group_id,
                     self.config.document_id,
@@ -642,7 +630,7 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn phase_read_fence(&mut self, event: Event) -> Effects {
+    fn read_fence(&mut self, event: Event) -> Effects {
         match parse_registry_read(event) {
             Ok(Some(record)) => {
                 let record = self.updated_record(record);
@@ -653,9 +641,9 @@ impl UpdateMetadataDocumentOperation {
                 self.record = Some(update_event.record.clone());
                 self.update_event = Some(update_event);
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    return self.fail(UpdateDocumentError::MissingTransaction);
                 };
-                self.state = UpdateMetadataDocumentState::ReadRawFence;
+                self.state = UpdateDocumentState::ReadRawFence;
                 self.fenced = self.fenced_buckets(&record);
                 let mut reads = vec![
                     (
@@ -677,13 +665,13 @@ impl UpdateMetadataDocumentOperation {
                     txn_id: Some(txn_id),
                 })]
             }
-            Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
+            Ok(None) => self.fail(UpdateDocumentError::DocumentNotFound),
             Err(StorageReadError::Storage(error)) => self.fail(error.into()),
             Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
         }
     }
 
-    fn phase_read_raw_fence(&mut self, event: Event) -> Effects {
+    fn read_raw_fence(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchReadResult { values }) => {
                 let [(_, raw_budget), (_, accepted_create), fences @ ..] = values.as_slice() else {
@@ -706,14 +694,14 @@ impl UpdateMetadataDocumentOperation {
                             crate::placement::fence::admits(value.as_ref(), *generation)
                         });
                 if !admitted {
-                    return self.fail(UpdateMetadataDocumentError::PlacementFenced);
+                    return self.fail(UpdateDocumentError::PlacementFenced);
                 }
                 let Some(value) = accepted_create.clone() else {
-                    return self.fail(UpdateMetadataDocumentError::RawLimit);
+                    return self.fail(UpdateDocumentError::RawLimit);
                 };
-                let create: MetadataCreateEventRecord = match postcard::from_bytes(&value) {
+                let create: MetadataEventRecord = match postcard::from_bytes(&value) {
                     Ok(create) => create,
-                    Err(_) => return self.fail(UpdateMetadataDocumentError::RawLimit),
+                    Err(_) => return self.fail(UpdateDocumentError::RawLimit),
                 };
                 let quota = match self.origin_quota(&create) {
                     Ok(quota) => quota,
@@ -722,14 +710,14 @@ impl UpdateMetadataDocumentOperation {
                 self.accepted_create = Some(create);
                 let budget = match raw_budget.clone() {
                     Some(value) => {
-                        let budget: MetadataRawOriginBudget = match postcard::from_bytes(&value) {
+                        let budget: RawOriginBudget = match postcard::from_bytes(&value) {
                             Ok(budget) => budget,
                             Err(_) => {
-                                return self.fail(UpdateMetadataDocumentError::RawLimit);
+                                return self.fail(UpdateDocumentError::RawLimit);
                             }
                         };
                         if !self.valid_budget(&budget, &quota) {
-                            return self.fail(UpdateMetadataDocumentError::RawLimit);
+                            return self.fail(UpdateDocumentError::RawLimit);
                         }
                         Some(budget)
                     }
@@ -737,9 +725,9 @@ impl UpdateMetadataDocumentOperation {
                 };
                 self.raw_budget = budget;
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    return self.fail(UpdateDocumentError::MissingTransaction);
                 };
-                self.state = UpdateMetadataDocumentState::ReadRawEvents;
+                self.state = UpdateDocumentState::ReadRawEvents;
                 smallvec![Effect::Storage(StorageEffect::Iter {
                     key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
                     prefix: Some(event_log_prefix(self.config.document_id)),
@@ -753,7 +741,7 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn phase_read_raw_events(&mut self, event: Event) -> Effects {
+    fn read_raw_events(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::IterResult {
                 values,
@@ -769,7 +757,7 @@ impl UpdateMetadataDocumentOperation {
                     .as_ref()
                     .is_some_and(|budget| &reconstructed != budget)
                 {
-                    return self.fail(UpdateMetadataDocumentError::RawLimit);
+                    return self.fail(UpdateDocumentError::RawLimit);
                 }
                 self.raw_budget = Some(reconstructed);
                 self.next_raw_budget = match self.check_raw_budget(history_events, history_bytes) {
@@ -777,10 +765,10 @@ impl UpdateMetadataDocumentOperation {
                     Err(error) => return self.fail(error),
                 };
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    return self.fail(UpdateDocumentError::MissingTransaction);
                 };
-                self.state = UpdateMetadataDocumentState::WriteUpdateBatch;
-                match self.write_update_batch(txn_id) {
+                self.state = UpdateDocumentState::WriteUpdateBatch;
+                match self.write_batch_effect(txn_id) {
                     Ok(effect) => smallvec![effect],
                     Err(error) => self.fail(error),
                 }
@@ -790,13 +778,13 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn phase_write_update_batch(&mut self, event: Event) -> Effects {
+    fn write_update_batch(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    return self.fail(UpdateDocumentError::MissingTransaction);
                 };
-                self.state = UpdateMetadataDocumentState::CommitTransaction;
+                self.state = UpdateDocumentState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
@@ -804,11 +792,11 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn phase_commit_transaction(&mut self, event: Event) -> Effects {
+    fn commit_transaction(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                self.state = UpdateMetadataDocumentState::ScheduleMaterializationDrain;
+                self.state = UpdateDocumentState::ScheduleMaterializationDrain;
                 smallvec![schedule_materialization()]
             }
             Event::Storage(StorageEvent::Error { error }) => {
@@ -819,15 +807,15 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn phase_schedule_materialization_drain(&mut self, event: Event) -> Effects {
+    fn finish_materialization_drain(&mut self, event: Event) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                self.state = UpdateMetadataDocumentState::ScheduleOutboxDrain;
+                self.state = UpdateDocumentState::ScheduleOutboxDrain;
                 smallvec![schedule_drain_effect()]
             }
             Event::Task(TaskEvent::Error { message, .. }) => {
                 warn!(message = %message, "Failed to schedule metadata materialization drain after committed update");
-                self.state = UpdateMetadataDocumentState::ScheduleOutboxDrain;
+                self.state = UpdateDocumentState::ScheduleOutboxDrain;
                 smallvec![schedule_drain_effect()]
             }
             other => self.unexpected_event(
@@ -837,22 +825,22 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
-    fn phase_schedule_outbox_drain(&mut self, event: Event) -> Effects {
+    fn schedule_outbox_drain(&mut self, event: Event) -> Effects {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. }) => {
                 let Some(record) = self.record.clone() else {
-                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    return self.fail(UpdateDocumentError::MissingTransaction);
                 };
-                self.state = UpdateMetadataDocumentState::Finish;
+                self.state = UpdateDocumentState::Finish;
                 self.output = Some(Ok(record));
                 smallvec![]
             }
             Event::Task(TaskEvent::Error { message, .. }) => {
                 warn!(message = %message, "Failed to schedule metadata document outbox drain after committed update");
                 let Some(record) = self.record.clone() else {
-                    return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    return self.fail(UpdateDocumentError::MissingTransaction);
                 };
-                self.state = UpdateMetadataDocumentState::Finish;
+                self.state = UpdateDocumentState::Finish;
                 self.output = Some(Ok(record));
                 smallvec![]
             }
@@ -865,11 +853,11 @@ impl UpdateMetadataDocumentOperation {
 }
 
 pub async fn update_metadata_document(
-    mut operation: UpdateMetadataDocumentOperation,
+    mut operation: UpdateDocumentOperation,
     context: &DriverContext,
-) -> Result<MetadataRegistryRecord, UpdateMetadataDocumentError> {
+) -> Result<MetadataRegistryRecord, UpdateDocumentError> {
     operation.route_profile_status = Some(match &operation.config.mutation {
-        UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
+        UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
             validate_submission(
                 context,
                 operation.config.document_id,
@@ -878,9 +866,9 @@ pub async fn update_metadata_document(
             )
             .await?
         }
-        UpdateMetadataDocumentMutation::UpsertDataEntity { .. }
-        | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. }
-        | UpdateMetadataDocumentMutation::ApplyBatch { .. } => {
+        UpdateDocumentMutation::UpsertDataEntity { .. }
+        | UpdateDocumentMutation::UpsertContextualEntity { .. }
+        | UpdateDocumentMutation::ApplyBatch { .. } => {
             stale_status(operation.config.document_id, "dataset_revision_changed")
         }
     });
@@ -952,15 +940,15 @@ fn validate_entity_jsonld(jsonld: &str) -> Result<(), MetadataError> {
     Ok(())
 }
 
-impl Operation for UpdateMetadataDocumentOperation {
+impl Operation for UpdateDocumentOperation {
     type Output = MetadataRegistryRecord;
-    type Error = UpdateMetadataDocumentError;
+    type Error = UpdateDocumentError;
 
     fn start(&mut self) -> Effects {
         if self.event_id.is_nil() {
             self.event_id = self.phase_source.next_id();
         }
-        self.state = UpdateMetadataDocumentState::ReadCurrent;
+        self.state = UpdateDocumentState::ReadCurrent;
         smallvec![read_registry_effect(
             self.config.group_id,
             self.config.document_id,
@@ -970,37 +958,34 @@ impl Operation for UpdateMetadataDocumentOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            UpdateMetadataDocumentState::ReadCurrent => self.phase_read_current(event),
-            UpdateMetadataDocumentState::ReadRealmConfig => self.phase_read_realm_config(event),
-            UpdateMetadataDocumentState::PlanBatch => self.phase_plan_batch(event),
-            UpdateMetadataDocumentState::StartTransaction => self.phase_start_transaction(event),
-            UpdateMetadataDocumentState::ReadFence => self.phase_read_fence(event),
-            UpdateMetadataDocumentState::ReadRawFence => self.phase_read_raw_fence(event),
-            UpdateMetadataDocumentState::ReadRawEvents => self.phase_read_raw_events(event),
-            UpdateMetadataDocumentState::WriteUpdateBatch => self.phase_write_update_batch(event),
-            UpdateMetadataDocumentState::CommitTransaction => self.phase_commit_transaction(event),
-            UpdateMetadataDocumentState::ScheduleMaterializationDrain => {
-                self.phase_schedule_materialization_drain(event)
+            UpdateDocumentState::ReadCurrent => self.read_current(event),
+            UpdateDocumentState::ReadRealmConfig => self.read_realm_config(event),
+            UpdateDocumentState::PlanBatch => self.plan_batch(event),
+            UpdateDocumentState::StartTransaction => self.start_transaction(event),
+            UpdateDocumentState::ReadFence => self.read_fence(event),
+            UpdateDocumentState::ReadRawFence => self.read_raw_fence(event),
+            UpdateDocumentState::ReadRawEvents => self.read_raw_events(event),
+            UpdateDocumentState::WriteUpdateBatch => self.write_update_batch(event),
+            UpdateDocumentState::CommitTransaction => self.commit_transaction(event),
+            UpdateDocumentState::ScheduleMaterializationDrain => {
+                self.finish_materialization_drain(event)
             }
-            UpdateMetadataDocumentState::ScheduleOutboxDrain => {
-                self.phase_schedule_outbox_drain(event)
-            }
-            UpdateMetadataDocumentState::Finish
-            | UpdateMetadataDocumentState::Error
-            | UpdateMetadataDocumentState::Init => smallvec![],
+            UpdateDocumentState::ScheduleOutboxDrain => self.schedule_outbox_drain(event),
+            UpdateDocumentState::Finish
+            | UpdateDocumentState::Error
+            | UpdateDocumentState::Init => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            UpdateMetadataDocumentState::Finish | UpdateMetadataDocumentState::Error
+            UpdateDocumentState::Finish | UpdateDocumentState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(UpdateMetadataDocumentError::NotFinished))
+        self.output.unwrap_or(Err(UpdateDocumentError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -1015,8 +1000,7 @@ impl Operation for UpdateMetadataDocumentOperation {
 mod pure_tests {
     use super::*;
     use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
-        DocumentSyncOutboxRecord,
+        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
     };
     use aruna_core::keyspaces::{
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_AUDIT_KEYSPACE,
@@ -1093,9 +1077,9 @@ mod pure_tests {
     fn config(
         actor: Actor,
         record: &MetadataRegistryRecord,
-        mutation: UpdateMetadataDocumentMutation,
-    ) -> UpdateMetadataDocumentConfig {
-        UpdateMetadataDocumentConfig {
+        mutation: UpdateDocumentMutation,
+    ) -> UpdateDocumentConfig {
+        UpdateDocumentConfig {
             actor,
             group_id: record.group_id,
             document_id: record.document_id,
@@ -1118,14 +1102,14 @@ mod pure_tests {
         })
     }
 
-    fn create_event(record: &MetadataRegistryRecord) -> MetadataCreateEventRecord {
+    fn create_event(record: &MetadataRegistryRecord) -> MetadataEventRecord {
         let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        MetadataCreateEventRecord {
+        MetadataEventRecord {
             event_id: record.establishing_event_id,
             record: record.clone(),
             user_id: aruna_core::UserId::local(Ulid::from_parts(2, 2), record.realm_id),
             node_id,
-            payload: MetadataCreateEventPayload::Scaffold {
+            payload: MetadataEventPayload::Scaffold {
                 name: "name".to_string(),
                 description: "description".to_string(),
                 date_published: "date".to_string(),
@@ -1135,11 +1119,7 @@ mod pure_tests {
         }
     }
 
-    fn budget(
-        record: &MetadataRegistryRecord,
-        events: u32,
-        encoded_bytes: u64,
-    ) -> MetadataRawOriginBudget {
+    fn budget(record: &MetadataRegistryRecord, events: u32, encoded_bytes: u64) -> RawOriginBudget {
         let create = create_event(record);
         let create_bytes = postcard::experimental::serialized_size(&create).unwrap() as u64;
         let mut budget = raw_quotas(
@@ -1160,7 +1140,7 @@ mod pure_tests {
     fn raw_read_for(
         record: &MetadataRegistryRecord,
         node_id: aruna_core::NodeId,
-        budget: Option<MetadataRawOriginBudget>,
+        budget: Option<RawOriginBudget>,
     ) -> Event {
         let create = create_event(record);
         Event::Storage(StorageEvent::BatchReadResult {
@@ -1177,7 +1157,7 @@ mod pure_tests {
         })
     }
 
-    fn raw_read(record: &MetadataRegistryRecord, budget: Option<MetadataRawOriginBudget>) -> Event {
+    fn raw_read(record: &MetadataRegistryRecord, budget: Option<RawOriginBudget>) -> Event {
         raw_read_for(record, actor().node_id, budget)
     }
 
@@ -1239,20 +1219,20 @@ mod pure_tests {
         };
     }
 
-    fn is_replace(payload: &MetadataCreateEventPayload) -> bool {
+    fn is_replace(payload: &MetadataEventPayload) -> bool {
         matches!(
             payload,
-            MetadataCreateEventPayload::ApplyBatch {
+            MetadataEventPayload::ApplyBatch {
                 authored: MetadataBatchSource::ReplaceRoCrate { .. },
                 ..
             }
         )
     }
 
-    fn is_data_upsert(payload: &MetadataCreateEventPayload) -> bool {
+    fn is_data_upsert(payload: &MetadataEventPayload) -> bool {
         matches!(
             payload,
-            MetadataCreateEventPayload::ApplyBatch {
+            MetadataEventPayload::ApplyBatch {
                 authored: MetadataBatchSource::UpsertDataEntity { .. },
                 ..
             }
@@ -1268,8 +1248,8 @@ mod pure_tests {
     fn assert_update_batch(
         effects: &[Effect],
         txn_id: TxnId,
-        expected_payload: impl FnOnce(&MetadataCreateEventPayload) -> bool,
-    ) -> MetadataCreateEventRecord {
+        expected_payload: impl FnOnce(&MetadataEventPayload) -> bool,
+    ) -> MetadataEventRecord {
         let [
             Effect::Storage(StorageEffect::BatchWrite {
                 writes,
@@ -1304,8 +1284,7 @@ mod pure_tests {
             .iter()
             .find(|(keyspace, _, _)| keyspace == METADATA_EVENT_LOG_KEYSPACE)
             .map(|(_, _, value)| {
-                postcard::from_bytes::<MetadataCreateEventRecord>(value)
-                    .expect("update event decodes")
+                postcard::from_bytes::<MetadataEventRecord>(value).expect("update event decodes")
             })
             .expect("event log write exists");
         assert!(expected_payload(&event.payload));
@@ -1313,16 +1292,12 @@ mod pure_tests {
             .iter()
             .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .map(|(_, _, value)| {
-                postcard::from_bytes::<DocumentSyncOutboxRecord>(value)
-                    .expect("outbox record decodes")
+                postcard::from_bytes::<DocumentOutboxRecord>(value).expect("outbox record decodes")
             })
             .expect("outbox write exists");
         assert_eq!(outbox.outbox_id, event.event_id);
-        assert!(matches!(
-            outbox.event,
-            DocumentSyncOutboxEvent::Upsert { .. }
-        ));
-        let (revision_key, revision): (_, DocumentSyncChange) = writes
+        assert!(matches!(outbox.event, DocumentOutboxEvent::Upsert { .. }));
+        let (revision_key, revision): (_, DocumentChange) = writes
             .iter()
             .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_REVISION_KEYSPACE)
             .map(|(_, key, value)| {
@@ -1336,18 +1311,18 @@ mod pure_tests {
         assert_eq!(revision.current.event_id, event.event_id);
         assert_eq!(revision.current.actor, event.node_id);
         assert_eq!(revision.current.generation, event.record.updated_at_ms);
-        assert_eq!(revision.kind, DocumentSyncChangeKind::Upsert);
+        assert_eq!(revision.kind, DocumentChangeKind::Upsert);
         let lifecycle = writes
             .iter()
             .find(|(keyspace, _, _)| keyspace == METADATA_DOCUMENT_LIFECYCLE_KEYSPACE)
             .map(|(_, _, value)| {
-                postcard::from_bytes::<MetadataDocumentLifecycleRecord>(value)
+                postcard::from_bytes::<MetadataLifecycleRecord>(value)
                     .expect("lifecycle source decodes")
             })
             .expect("lifecycle source write exists");
         assert_eq!(
             lifecycle,
-            MetadataDocumentLifecycleRecord::Upsert {
+            MetadataLifecycleRecord::Upsert {
                 event: Box::new(event.clone())
             }
         );
@@ -1365,10 +1340,10 @@ mod pure_tests {
             shard: 11,
         };
         let txn_id = Ulid::from_parts(4, 4);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor.clone(),
             &record,
-            UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: replace_jsonld(record.document_id, "Placement Preserved"),
             },
         ));
@@ -1407,10 +1382,10 @@ mod pure_tests {
             shard: 12,
         };
         let txn_id = Ulid::from_parts(5, 5);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1472,7 +1447,7 @@ mod pure_tests {
 
     fn fenced_raw_read(
         record: &MetadataRegistryRecord,
-        budget: Option<MetadataRawOriginBudget>,
+        budget: Option<RawOriginBudget>,
         closed: &[Option<u64>],
     ) -> Event {
         let Event::Storage(StorageEvent::BatchReadResult { mut values }) =
@@ -1489,7 +1464,7 @@ mod pure_tests {
         Event::Storage(StorageEvent::BatchReadResult { values })
     }
 
-    fn outbox_rows(effects: &[Effect]) -> Vec<aruna_core::document::DocumentSyncOutboxRecord> {
+    fn outbox_rows(effects: &[Effect]) -> Vec<aruna_core::document::DocumentOutboxRecord> {
         effects
             .iter()
             .filter_map(|effect| match effect {
@@ -1506,7 +1481,7 @@ mod pure_tests {
 
     /// Steps an update to the fence read and answers it with `closed`.
     fn step_to_fence(
-        operation: &mut UpdateMetadataDocumentOperation,
+        operation: &mut UpdateDocumentOperation,
         record: &MetadataRegistryRecord,
         config: Event,
         txn_id: Ulid,
@@ -1538,10 +1513,10 @@ mod pure_tests {
         let mut record = record(&actor);
         let realm_config = activated_config(&mut record);
         let txn_id = Ulid::from_parts(6, 6);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1566,10 +1541,10 @@ mod pure_tests {
         let mut record = record(&actor);
         let realm_config = activated_config(&mut record);
         let txn_id = Ulid::from_parts(7, 7);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1589,7 +1564,7 @@ mod pure_tests {
         );
         assert_eq!(
             operation.finalize().unwrap_err(),
-            UpdateMetadataDocumentError::PlacementFenced
+            UpdateDocumentError::PlacementFenced
         );
     }
 
@@ -1598,10 +1573,10 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::from_parts(8, 8);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1630,10 +1605,7 @@ mod pure_tests {
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
                 if *abort_txn == txn_id
         ));
-        assert_eq!(
-            operation.finalize(),
-            Err(UpdateMetadataDocumentError::RawLimit)
-        );
+        assert_eq!(operation.finalize(), Err(UpdateDocumentError::RawLimit));
     }
 
     #[test]
@@ -1641,10 +1613,10 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::from_parts(9, 9);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1677,10 +1649,10 @@ mod pure_tests {
         let record = record(&actor);
         let create = create_event(&record);
         let txn_id = Ulid::from_parts(10, 10);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor.clone(),
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1720,7 +1692,7 @@ mod pure_tests {
                 _ => None,
             })
             .expect("rebuilt budget write exists");
-        let budget: MetadataRawOriginBudget = postcard::from_bytes(budget_value).unwrap();
+        let budget: RawOriginBudget = postcard::from_bytes(budget_value).unwrap();
         assert_eq!(budget.events, 2);
         assert_eq!(
             budget.encoded_bytes,
@@ -1739,10 +1711,10 @@ mod pure_tests {
         outsider.node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
         current.holder_node_ids = vec![outsider.node_id];
         let txn_id = Ulid::from_parts(11, 11);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             outsider.clone(),
             &current,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1759,10 +1731,7 @@ mod pure_tests {
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
                 if *abort_txn == txn_id
         ));
-        assert_eq!(
-            operation.finalize(),
-            Err(UpdateMetadataDocumentError::RawLimit)
-        );
+        assert_eq!(operation.finalize(), Err(UpdateDocumentError::RawLimit));
     }
 
     #[test]
@@ -1770,10 +1739,10 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::from_parts(12, 12);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1795,10 +1764,7 @@ mod pure_tests {
             ),
             "expected raw-limit abort, got {effects:?}"
         );
-        assert_eq!(
-            operation.finalize(),
-            Err(UpdateMetadataDocumentError::RawLimit)
-        );
+        assert_eq!(operation.finalize(), Err(UpdateDocumentError::RawLimit));
     }
 
     #[test]
@@ -1806,10 +1772,10 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::from_parts(13, 13);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1830,7 +1796,7 @@ mod pure_tests {
         ));
         assert_eq!(
             operation.finalize(),
-            Err(UpdateMetadataDocumentError::DocumentNotFound)
+            Err(UpdateDocumentError::DocumentNotFound)
         );
     }
 
@@ -1839,10 +1805,10 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::from_parts(14, 14);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: replace_jsonld(record.document_id, "Atomic Replace"),
             },
         ));
@@ -1880,10 +1846,10 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::from_parts(15, 15);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1914,10 +1880,10 @@ mod pure_tests {
         let mut record = record(&actor);
         record.holder_node_ids.clear();
         let txn_id = Ulid::from_parts(16, 16);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
             },
         ));
@@ -1935,33 +1901,30 @@ mod pure_tests {
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
                 if *abort_txn == txn_id
         ));
-        assert_eq!(
-            operation.finalize(),
-            Err(UpdateMetadataDocumentError::RawLimit)
-        );
+        assert_eq!(operation.finalize(), Err(UpdateDocumentError::RawLimit));
     }
 
     #[test]
-    fn phase_denial_aborts_without_mutation() {
+    fn denial_aborts() {
         // The realm-config phase is where an invalid entity payload is denied
         // before the transaction opens: no forbidden mutation effect may escape.
         let actor = actor();
         let record = record(&actor);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::UpsertDataEntity {
+            UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"name":"missing identity"}"#.to_string(),
             },
         ));
 
         operation.start();
         operation.step(registry_read(&record));
-        let effects = operation.phase_read_realm_config(realm_config_read(&record));
+        let effects = operation.read_realm_config(realm_config_read(&record));
         assert_no_mutation(effects.as_slice());
         assert_eq!(
             operation.finalize(),
-            Err(UpdateMetadataDocumentError::MetadataError(
+            Err(UpdateDocumentError::MetadataError(
                 MetadataError::InvalidInput("entity payload must define string `@id`".to_string())
             ))
         );
@@ -1972,10 +1935,10 @@ mod pure_tests {
         let actor = actor();
         let record = record(&actor);
         let txn_id = Ulid::from_parts(17, 17);
-        let mut operation = UpdateMetadataDocumentOperation::new(config(
+        let mut operation = UpdateDocumentOperation::new(config(
             actor,
             &record,
-            UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: replace_jsonld(record.document_id, "Commit Failure"),
             },
         ));
@@ -2012,7 +1975,7 @@ mod pure_tests {
         assert!(operation.is_complete());
         assert_eq!(
             operation.finalize(),
-            Err(UpdateMetadataDocumentError::StorageError(
+            Err(UpdateDocumentError::StorageError(
                 aruna_core::errors::StorageError::WriteError("boom".to_string())
             ))
         );
@@ -2032,8 +1995,8 @@ mod pure_tests {
         crate::metadata::MetadataPhaseSource::fixed(fixed_phase_ms, fixed_phase_id)
     }
 
-    fn fixed_mutation(record: &MetadataRegistryRecord) -> UpdateMetadataDocumentMutation {
-        UpdateMetadataDocumentMutation::UpsertDataEntity {
+    fn fixed_mutation(record: &MetadataRegistryRecord) -> UpdateDocumentMutation {
+        UpdateDocumentMutation::UpsertDataEntity {
             jsonld: replace_jsonld(record.document_id, "fixed"),
         }
     }
@@ -2041,7 +2004,7 @@ mod pure_tests {
     /// The update trace takes its event identity and phase time from the
     /// injected source, so identical inputs produce identical records.
     #[test]
-    fn fixed_phase_source_pins_event_id_and_updated_time() {
+    fn update_source_pinned() {
         let mut record = record(&actor());
         record.document_id = Ulid::from_bytes([0x31; 16]);
         record.graph_iri = MetadataRegistryRecord::graph_iri_for(record.document_id);
@@ -2053,35 +2016,35 @@ mod pure_tests {
         );
         let first_config = config(actor(), &record, fixed_mutation(&record));
 
-        let operation = UpdateMetadataDocumentOperation::new(first_config)
-            .with_phase_source(fixed_phase_source());
+        let operation =
+            UpdateDocumentOperation::new(first_config).with_phase_source(fixed_phase_source());
 
         assert_eq!(operation.event_id, fixed_phase_id());
         let updated = operation.updated_record(record.clone());
         assert_eq!(updated.updated_at_ms, FIXED_PHASE_MS);
 
         let replay =
-            UpdateMetadataDocumentOperation::new(config(actor(), &record, fixed_mutation(&record)))
+            UpdateDocumentOperation::new(config(actor(), &record, fixed_mutation(&record)))
                 .with_phase_source(fixed_phase_source());
         assert_eq!(replay.updated_record(record), updated);
     }
 
     /// A wrong event is an explicit failure, not a silent state change.
     #[test]
-    fn wrong_event_in_a_fixed_state_fails() {
+    fn rejects_wrong_event() {
         let record = record(&actor());
         let mut operation =
-            UpdateMetadataDocumentOperation::new(config(actor(), &record, fixed_mutation(&record)))
+            UpdateDocumentOperation::new(config(actor(), &record, fixed_mutation(&record)))
                 .with_phase_source(fixed_phase_source());
-        operation.state = UpdateMetadataDocumentState::WriteUpdateBatch;
+        operation.state = UpdateDocumentState::WriteUpdateBatch;
 
         let effects = operation.step(Event::Storage(StorageEvent::SyncAllFinished));
 
         assert!(effects.is_empty());
         assert!(matches!(
             operation.output,
-            Some(Err(UpdateMetadataDocumentError::UnexpectedEvent { .. }))
+            Some(Err(UpdateDocumentError::UnexpectedEvent { .. }))
         ));
-        assert_eq!(operation.state, UpdateMetadataDocumentState::Error);
+        assert_eq!(operation.state, UpdateDocumentState::Error);
     }
 }

@@ -892,7 +892,7 @@ mod tests {
     async fn seed_realm(context: &DriverContext, policies: Vec<RequestPolicy>) {
         let mut config = RealmConfigDocument::new(REALM, Vec::new(), 1);
         config.request_policies = policies;
-        let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id: REALM };
+        let target = aruna_core::document::DocumentTarget::RealmConfig { realm_id: REALM };
         write(
             context,
             vec![(
@@ -1116,7 +1116,7 @@ mod tests {
         .await;
         rebuild_index(&context).await.unwrap();
 
-        let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id: REALM };
+        let target = aruna_core::document::DocumentTarget::RealmConfig { realm_id: REALM };
         let event = context
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::Delete {
