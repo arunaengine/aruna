@@ -77,11 +77,11 @@ impl DocumentSyncService {
                 .collect();
             match state {
                 Some(state) => {
-                    if state.event_type_id != DocumentSyncEvent::TYPE_ID {
+                    if state.event_type_id != DocumentEvent::TYPE_ID {
                         return Err(NetError::Bootstrap(format!(
                             "Document sync topic {topic_id} has event type {}, expected {}",
                             state.event_type_id,
-                            DocumentSyncEvent::TYPE_ID
+                            DocumentEvent::TYPE_ID
                         )));
                     }
                     let history_cutoff = if verified_topics.contains(&topic_id) {
@@ -177,13 +177,13 @@ impl DocumentSyncService {
     pub async fn reconcile_sync_topics(
         &self,
         topic_ids: Vec<::irokle::TopicId>,
-    ) -> Result<DocumentSyncReconcileResult> {
+    ) -> Result<DocumentReconcileResult> {
         self.reconcile_document_topics(topic_ids).await
     }
 
     pub(in crate::document_sync) async fn reconcile_documents(
         &self,
-    ) -> Result<DocumentSyncReconcileResult> {
+    ) -> Result<DocumentReconcileResult> {
         let topics = self.document_topic_ids()?;
         self.reconcile_document_topics(topics).await
     }
@@ -195,7 +195,7 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         Ok(topics
             .into_iter()
-            .filter(|topic| topic.event_type_id == DocumentSyncEvent::TYPE_ID)
+            .filter(|topic| topic.event_type_id == DocumentEvent::TYPE_ID)
             .map(|topic| topic.topic_id)
             .collect())
     }
@@ -320,23 +320,21 @@ impl DocumentSyncService {
             match op.signed.body.payload {
                 // An undecodable payload is permanent: it becomes raw evidence
                 // and the cursor advances instead of replaying forever.
-                TopicPayload::Event(envelope) => {
-                    match envelope.decode_event::<DocumentSyncEvent>() {
-                        Ok(event) => events.push((event, actor_id, actor_seq)),
-                        Err(error) => rejections.push(SyncRejection::raw(
-                            SyncQuarantineIdentity {
-                                topic: topic_id,
-                                actor: actor_id,
-                                actor_seq,
-                            },
-                            envelope.payload.to_vec(),
-                            format!(
-                                "undecodable sync payload of type `{}`: {error}",
-                                envelope.type_id
-                            ),
-                        )),
-                    }
-                }
+                TopicPayload::Event(envelope) => match envelope.decode_event::<DocumentEvent>() {
+                    Ok(event) => events.push((event, actor_id, actor_seq)),
+                    Err(error) => rejections.push(SyncRejection::raw(
+                        SyncQuarantineIdentity {
+                            topic: topic_id,
+                            actor: actor_id,
+                            actor_seq,
+                        },
+                        envelope.payload.to_vec(),
+                        format!(
+                            "undecodable sync payload of type `{}`: {error}",
+                            envelope.type_id
+                        ),
+                    )),
+                },
                 TopicPayload::Genesis(_) | TopicPayload::Control(_) => {}
             }
             working_cursor.observe(actor_id, actor_seq);
@@ -394,7 +392,7 @@ impl DocumentSyncService {
         &self,
         topic_id: ::irokle::TopicId,
         cursor: &::irokle::ActorClock,
-    ) -> Result<Vec<(DocumentSyncEvent, ::irokle::ActorId, u64)>> {
+    ) -> Result<Vec<(DocumentEvent, ::irokle::ActorId, u64)>> {
         Ok(self
             .document_event_batch(topic_id, cursor, DOCUMENT_SYNC_FRAME_LEN_LIMIT)?
             .events)
@@ -405,12 +403,12 @@ impl DocumentSyncService {
     pub(in crate::document_sync) fn prepare_create(
         &self,
         identity: SyncQuarantineIdentity,
-        event: DocumentSyncEvent,
-    ) -> std::result::Result<PendingMetadataCreateApply, Box<SyncRejection>> {
+        event: DocumentEvent,
+    ) -> std::result::Result<PendingCreateApply, Box<SyncRejection>> {
         let (document_id, target_event_id, bytes) = match &event {
-            DocumentSyncEvent::Upsert {
+            DocumentEvent::Upsert {
                 target:
-                    DocumentSyncTarget::MetadataCreateEvent {
+                    DocumentTarget::MetadataCreateEvent {
                         document_id,
                         event_id: target_event_id,
                     },
@@ -421,7 +419,7 @@ impl DocumentSyncService {
                 "metadata create apply helper is only called for metadata create upserts"
             ),
         };
-        let record = match postcard::from_bytes::<MetadataCreateEventRecord>(&bytes) {
+        let record = match postcard::from_bytes::<MetadataEventRecord>(&bytes) {
             Ok(record) => record,
             Err(error) => {
                 return Err(Box::new(SyncRejection::new(
@@ -438,10 +436,10 @@ impl DocumentSyncService {
             );
             return Err(Box::new(SyncRejection::new(identity, event, reason)));
         }
-        Ok(PendingMetadataCreateApply {
+        Ok(PendingCreateApply {
             identity,
             event,
-            target: DocumentSyncTarget::MetadataCreateEvent {
+            target: DocumentTarget::MetadataCreateEvent {
                 document_id,
                 event_id: target_event_id,
             },
@@ -453,12 +451,12 @@ impl DocumentSyncService {
 }
 
 pub(in crate::document_sync) fn satisfied_dependencies(
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     event: &AdminDocumentEvent,
 ) -> Vec<DocumentSyncDependency> {
     let mut dependencies = Vec::new();
     match target {
-        DocumentSyncTarget::RealmConfig { realm_id } => {
+        DocumentTarget::RealmConfig { realm_id } => {
             dependencies.push(DocumentSyncDependency::RealmConfig(*realm_id));
             if let AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy } =
                 &event.op
@@ -469,10 +467,10 @@ pub(in crate::document_sync) fn satisfied_dependencies(
                 });
             }
         }
-        DocumentSyncTarget::RealmAuthorization { realm_id } => {
+        DocumentTarget::RealmAuthorization { realm_id } => {
             dependencies.push(DocumentSyncDependency::RealmAuthorization(*realm_id));
         }
-        DocumentSyncTarget::GroupAuthorization { group_id } => {
+        DocumentTarget::GroupAuthorization { group_id } => {
             dependencies.push(DocumentSyncDependency::GroupAuthorization(*group_id));
         }
         _ => {}
@@ -509,12 +507,12 @@ pub(in crate::document_sync) fn register_deferred_topic(
     deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>>,
     dependency: DocumentSyncDependency,
     topic_id: ::irokle::TopicId,
-) -> DeferredTopicRegistrationOutcome {
+) -> DeferredRegistrationOutcome {
     if deferred_topics
         .get(&dependency)
         .is_some_and(|topics| topics.contains(&topic_id))
     {
-        return DeferredTopicRegistrationOutcome::AlreadyRegistered;
+        return DeferredRegistrationOutcome::AlreadyRegistered;
     }
     let total_topics = deferred_topics.values().map(BTreeSet::len).sum::<usize>();
     let dependency_topics = deferred_topics
@@ -524,13 +522,13 @@ pub(in crate::document_sync) fn register_deferred_topic(
     if total_topics >= MAX_DEFERRED_TOPICS
         || dependency_topics >= MAX_DEFERRED_TOPICS_PER_DEPENDENCY
     {
-        return DeferredTopicRegistrationOutcome::CapacityExceeded;
+        return DeferredRegistrationOutcome::CapacityExceeded;
     }
     deferred_topics
         .entry(dependency)
         .or_default()
         .insert(topic_id);
-    DeferredTopicRegistrationOutcome::Inserted
+    DeferredRegistrationOutcome::Inserted
 }
 
 pub(in crate::document_sync) fn remove_deferred_topic(

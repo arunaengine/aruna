@@ -1,4 +1,4 @@
-use aruna_core::document::{DocumentSyncEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentEvent, DocumentTarget};
 use aruna_core::structs::SyncQuarantineIdentity;
 use tracing::warn;
 
@@ -11,7 +11,7 @@ use super::validate::{
 };
 
 pub(super) enum SharedOutcome {
-    Applied(DocumentSyncTarget),
+    Applied(DocumentTarget),
     Skipped,
     Rejected(SyncRejection),
 }
@@ -21,12 +21,12 @@ pub(super) async fn apply_watch_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<SharedOutcome> {
     match event {
-        DocumentSyncEvent::Upsert {
+        DocumentEvent::Upsert {
             event_id,
-            target: target @ DocumentSyncTarget::WatchSubscription { owner, watch_id },
+            target: target @ DocumentTarget::WatchSubscription { owner, watch_id },
             bytes,
             change,
         } => {
@@ -41,7 +41,7 @@ pub(super) async fn apply_watch_event(
                 );
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Upsert {
+                    DocumentEvent::Upsert {
                         event_id,
                         target,
                         bytes,
@@ -54,7 +54,7 @@ pub(super) async fn apply_watch_event(
                 warn!(%topic_id, %owner, %watch_id, %reason, "Rejecting invalid watch subscription");
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Upsert {
+                    DocumentEvent::Upsert {
                         event_id,
                         target,
                         bytes,
@@ -72,9 +72,9 @@ pub(super) async fn apply_watch_event(
                 Ok(SharedOutcome::Skipped)
             }
         }
-        DocumentSyncEvent::Delete {
+        DocumentEvent::Delete {
             event_id,
-            target: target @ DocumentSyncTarget::WatchSubscription { owner, watch_id },
+            target: target @ DocumentTarget::WatchSubscription { owner, watch_id },
             change,
         } => {
             let expected_actor =
@@ -88,7 +88,7 @@ pub(super) async fn apply_watch_event(
                 );
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Delete {
+                    DocumentEvent::Delete {
                         event_id,
                         target,
                         change,
@@ -100,7 +100,7 @@ pub(super) async fn apply_watch_event(
                 warn!(%topic_id, %owner, %watch_id, %reason, "Rejecting invalid watch subscription delete");
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Delete {
+                    DocumentEvent::Delete {
                         event_id,
                         target,
                         change,
@@ -128,15 +128,15 @@ pub(super) async fn apply_shared_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<SharedOutcome> {
-    if matches!(event.target(), DocumentSyncTarget::NodeUsage { .. }) {
+    if matches!(event.target(), DocumentTarget::NodeUsage { .. }) {
         return apply_usage_event(service, topic_id, actor_id, identity, event).await;
     }
-    if matches!(event.target(), DocumentSyncTarget::WatchInterest { .. }) {
+    if matches!(event.target(), DocumentTarget::WatchInterest { .. }) {
         return apply_interest_event(service, topic_id, actor_id, identity, event).await;
     }
-    if matches!(event.target(), DocumentSyncTarget::NodeInfo { .. }) {
+    if matches!(event.target(), DocumentTarget::NodeInfo { .. }) {
         return apply_node_event(service, topic_id, actor_id, identity, event).await;
     }
     Err(NetError::Bootstrap(
@@ -149,13 +149,13 @@ async fn apply_usage_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<SharedOutcome> {
     match event {
-        DocumentSyncEvent::Upsert {
+        DocumentEvent::Upsert {
             event_id,
             target:
-                target @ DocumentSyncTarget::NodeUsage {
+                target @ DocumentTarget::NodeUsage {
                     node_id: snapshot_node,
                     ..
                 },
@@ -172,7 +172,7 @@ async fn apply_usage_event(
                 );
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Upsert {
+                    DocumentEvent::Upsert {
                         event_id,
                         target,
                         bytes,
@@ -190,7 +190,7 @@ async fn apply_usage_event(
                 );
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Upsert {
+                    DocumentEvent::Upsert {
                         event_id,
                         target,
                         bytes,
@@ -211,13 +211,13 @@ async fn apply_interest_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<SharedOutcome> {
     match event {
-        DocumentSyncEvent::Upsert {
+        DocumentEvent::Upsert {
             event_id,
             target:
-                target @ DocumentSyncTarget::WatchInterest {
+                target @ DocumentTarget::WatchInterest {
                     realm_id,
                     node_id: interest_node,
                 },
@@ -235,7 +235,7 @@ async fn apply_interest_event(
                 );
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Upsert {
+                    DocumentEvent::Upsert {
                         event_id,
                         target,
                         bytes,
@@ -254,7 +254,7 @@ async fn apply_interest_event(
                 );
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Upsert {
+                    DocumentEvent::Upsert {
                         event_id,
                         target,
                         bytes,
@@ -275,13 +275,13 @@ async fn apply_node_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<SharedOutcome> {
     match event {
-        DocumentSyncEvent::Upsert {
+        DocumentEvent::Upsert {
             event_id,
             target:
-                target @ DocumentSyncTarget::NodeInfo {
+                target @ DocumentTarget::NodeInfo {
                     node_id: info_node, ..
                 },
             bytes,
@@ -297,7 +297,7 @@ async fn apply_node_event(
                 );
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Upsert {
+                    DocumentEvent::Upsert {
                         event_id,
                         target,
                         bytes,
@@ -315,7 +315,7 @@ async fn apply_node_event(
                 );
                 return Ok(SharedOutcome::Rejected(SyncRejection::new(
                     identity,
-                    DocumentSyncEvent::Upsert {
+                    DocumentEvent::Upsert {
                         event_id,
                         target,
                         bytes,
@@ -346,7 +346,7 @@ async fn apply_node_event(
 fn reject_shared_event(
     topic_id: ::irokle::TopicId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<SharedOutcome> {
     // Shared realm snapshots sync only as owner-validated upserts.
     warn!(

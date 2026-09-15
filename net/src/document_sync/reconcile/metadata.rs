@@ -1,13 +1,13 @@
-use aruna_core::document::{DocumentSyncEvent, DocumentSyncTarget};
-use aruna_core::metadata::{MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord};
+use aruna_core::document::{DocumentEvent, DocumentTarget};
+use aruna_core::metadata::{GraphLifecycleRecord, MetadataLifecycleRecord};
 use aruna_core::structs::{
     MetadataRegistryRecord, PersistentIdMapping, PlacementPolicyDocument, SyncQuarantineIdentity,
 };
 use tracing::warn;
 
 use crate::document_sync::{
-    DocumentSyncDependency, DocumentSyncService, MetadataPlacementOutcome,
-    PendingMetadataCreateApply, SyncRejection, node_to_peer,
+    DocumentSyncDependency, DocumentSyncService, MetadataPlacementOutcome, PendingCreateApply,
+    SyncRejection, node_to_peer,
 };
 use crate::error::{NetError, Result};
 
@@ -15,11 +15,11 @@ use super::validate::{validate_pid_mapping, validate_policy_document};
 
 pub(super) enum MetadataOutcome {
     Applied {
-        target: DocumentSyncTarget,
-        tombstone: Option<MetadataGraphLifecycleRecord>,
+        target: DocumentTarget,
+        tombstone: Option<GraphLifecycleRecord>,
     },
     Deferred(DocumentSyncDependency),
-    Pending(Box<PendingMetadataCreateApply>),
+    Pending(Box<PendingCreateApply>),
     Rejected(SyncRejection),
     Skipped,
 }
@@ -28,15 +28,12 @@ pub(super) async fn apply_metadata_event(
     service: &DocumentSyncService,
     topic_id: ::irokle::TopicId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
-    if matches!(event.target(), DocumentSyncTarget::MetadataRegistry { .. }) {
+    if matches!(event.target(), DocumentTarget::MetadataRegistry { .. }) {
         return apply_registry_event(service, topic_id, identity, event).await;
     }
-    if matches!(
-        event.target(),
-        DocumentSyncTarget::MetadataCreateEvent { .. }
-    ) {
+    if matches!(event.target(), DocumentTarget::MetadataCreateEvent { .. }) {
         return Ok(match service.prepare_create(identity, event) {
             Ok(pending) => MetadataOutcome::Pending(Box::new(pending)),
             Err(rejection) => {
@@ -47,13 +44,13 @@ pub(super) async fn apply_metadata_event(
     }
     if matches!(
         event.target(),
-        DocumentSyncTarget::MetadataDocumentLifecycle { .. }
+        DocumentTarget::MetadataDocumentLifecycle { .. }
     ) {
         return apply_lifecycle_event(service, topic_id, identity, event).await;
     }
     if matches!(
         event.target(),
-        DocumentSyncTarget::MetadataGraphLifecycle { .. }
+        DocumentTarget::MetadataGraphLifecycle { .. }
     ) {
         return apply_graph_event(service, topic_id, identity, event).await;
     }
@@ -67,15 +64,12 @@ pub(super) async fn apply_policy_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
-    if matches!(
-        event.target(),
-        DocumentSyncTarget::PersistentIdMapping { .. }
-    ) {
+    if matches!(event.target(), DocumentTarget::PersistentIdMapping { .. }) {
         return apply_mapping_event(service, topic_id, actor_id, identity, event).await;
     }
-    if matches!(event.target(), DocumentSyncTarget::PlacementPolicy { .. }) {
+    if matches!(event.target(), DocumentTarget::PlacementPolicy { .. }) {
         return apply_placement_event(service, topic_id, actor_id, identity, event).await;
     }
     Err(NetError::Bootstrap(
@@ -87,12 +81,12 @@ async fn apply_registry_event(
     service: &DocumentSyncService,
     topic_id: ::irokle::TopicId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
-    let DocumentSyncEvent::Upsert {
+    let DocumentEvent::Upsert {
         event_id,
         target:
-            DocumentSyncTarget::MetadataRegistry {
+            DocumentTarget::MetadataRegistry {
                 group_id,
                 document_id,
             },
@@ -104,14 +98,14 @@ async fn apply_registry_event(
             "metadata registry handler received a non-upsert event".to_string(),
         ));
     };
-    let target = DocumentSyncTarget::MetadataRegistry {
+    let target = DocumentTarget::MetadataRegistry {
         group_id,
         document_id,
     };
     let reject = |reason: String| {
         SyncRejection::new(
             identity,
-            DocumentSyncEvent::Upsert {
+            DocumentEvent::Upsert {
                 event_id,
                 target: target.clone(),
                 bytes: bytes.clone(),
@@ -164,7 +158,7 @@ async fn apply_registry_event(
             );
             Ok(MetadataOutcome::Rejected(SyncRejection::new(
                 identity,
-                DocumentSyncEvent::Upsert {
+                DocumentEvent::Upsert {
                     event_id,
                     target,
                     bytes: event_bytes,
@@ -180,11 +174,11 @@ async fn apply_lifecycle_event(
     service: &DocumentSyncService,
     topic_id: ::irokle::TopicId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
-    let DocumentSyncEvent::Upsert {
+    let DocumentEvent::Upsert {
         event_id,
-        target: DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+        target: DocumentTarget::MetadataDocumentLifecycle { document_id },
         bytes,
         change,
     } = event
@@ -193,11 +187,11 @@ async fn apply_lifecycle_event(
             "metadata lifecycle handler received a non-upsert event".to_string(),
         ));
     };
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    let target = DocumentTarget::MetadataDocumentLifecycle { document_id };
     let reject = |reason: String| {
         SyncRejection::new(
             identity,
-            DocumentSyncEvent::Upsert {
+            DocumentEvent::Upsert {
                 event_id,
                 target: target.clone(),
                 bytes: bytes.clone(),
@@ -206,7 +200,7 @@ async fn apply_lifecycle_event(
             reason,
         )
     };
-    let lifecycle = match postcard::from_bytes::<MetadataDocumentLifecycleRecord>(&bytes) {
+    let lifecycle = match postcard::from_bytes::<MetadataLifecycleRecord>(&bytes) {
         Ok(lifecycle) => lifecycle,
         Err(error) => {
             warn!(%topic_id, %document_id, %error, "Rejecting undecodable metadata document lifecycle record");
@@ -223,30 +217,28 @@ async fn apply_lifecycle_event(
         ))));
     }
     match lifecycle {
-        MetadataDocumentLifecycleRecord::Upsert { event: record } => {
+        MetadataLifecycleRecord::Upsert { event: record } => {
             let record = *record;
             let inner_bytes = postcard::to_allocvec(&record)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            Ok(MetadataOutcome::Pending(Box::new(
-                PendingMetadataCreateApply {
-                    identity,
-                    event: DocumentSyncEvent::Upsert {
-                        event_id,
-                        target: target.clone(),
-                        bytes,
-                        change,
-                    },
-                    target,
-                    lifecycle_revision: Some(change),
-                    record,
-                    bytes: inner_bytes,
+            Ok(MetadataOutcome::Pending(Box::new(PendingCreateApply {
+                identity,
+                event: DocumentEvent::Upsert {
+                    event_id,
+                    target: target.clone(),
+                    bytes,
+                    change,
                 },
-            )))
+                target,
+                lifecycle_revision: Some(change),
+                record,
+                bytes: inner_bytes,
+            })))
         }
-        MetadataDocumentLifecycleRecord::Delete { event } => {
+        MetadataLifecycleRecord::Delete { event } => {
             let tombstone = event.tombstone.clone();
             let accepted = service
-                .apply_document_lifecycle(MetadataDocumentLifecycleRecord::Delete { event }, change)
+                .apply_document_lifecycle(MetadataLifecycleRecord::Delete { event }, change)
                 .await?;
             if accepted {
                 Ok(MetadataOutcome::Applied {
@@ -264,11 +256,11 @@ async fn apply_graph_event(
     service: &DocumentSyncService,
     topic_id: ::irokle::TopicId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
-    let DocumentSyncEvent::Upsert {
+    let DocumentEvent::Upsert {
         event_id,
-        target: DocumentSyncTarget::MetadataGraphLifecycle { graph_iri },
+        target: DocumentTarget::MetadataGraphLifecycle { graph_iri },
         bytes,
         change,
     } = event
@@ -277,13 +269,13 @@ async fn apply_graph_event(
             "metadata graph handler received a non-upsert event".to_string(),
         ));
     };
-    let target = DocumentSyncTarget::MetadataGraphLifecycle {
+    let target = DocumentTarget::MetadataGraphLifecycle {
         graph_iri: graph_iri.clone(),
     };
     let reject = |reason: String| {
         SyncRejection::new(
             identity,
-            DocumentSyncEvent::Upsert {
+            DocumentEvent::Upsert {
                 event_id,
                 target: target.clone(),
                 bytes: bytes.clone(),
@@ -292,7 +284,7 @@ async fn apply_graph_event(
             reason,
         )
     };
-    let record = match postcard::from_bytes::<MetadataGraphLifecycleRecord>(&bytes) {
+    let record = match postcard::from_bytes::<GraphLifecycleRecord>(&bytes) {
         Ok(record) => record,
         Err(error) => {
             warn!(%topic_id, %graph_iri, %error, "Rejecting undecodable metadata graph lifecycle record");
@@ -322,22 +314,22 @@ async fn apply_mapping_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
-    let DocumentSyncEvent::Upsert {
+    let DocumentEvent::Upsert {
         event_id,
-        target: DocumentSyncTarget::PersistentIdMapping { document_id },
+        target: DocumentTarget::PersistentIdMapping { document_id },
         bytes,
         change,
     } = event
     else {
         return reject_mapping_event(topic_id, identity, event);
     };
-    let target = DocumentSyncTarget::PersistentIdMapping { document_id };
+    let target = DocumentTarget::PersistentIdMapping { document_id };
     let reject = |reason: String| {
         SyncRejection::new(
             identity,
-            DocumentSyncEvent::Upsert {
+            DocumentEvent::Upsert {
                 event_id,
                 target: target.clone(),
                 bytes: bytes.clone(),
@@ -408,22 +400,22 @@ async fn apply_placement_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
-    let DocumentSyncEvent::Upsert {
+    let DocumentEvent::Upsert {
         event_id,
-        target: DocumentSyncTarget::PlacementPolicy { policy_id },
+        target: DocumentTarget::PlacementPolicy { policy_id },
         bytes,
         change,
     } = event
     else {
         return reject_policy_event(topic_id, identity, event);
     };
-    let target = DocumentSyncTarget::PlacementPolicy { policy_id };
+    let target = DocumentTarget::PlacementPolicy { policy_id };
     let reject = |reason: String| {
         SyncRejection::new(
             identity,
-            DocumentSyncEvent::Upsert {
+            DocumentEvent::Upsert {
                 event_id,
                 target: target.clone(),
                 bytes: bytes.clone(),
@@ -493,7 +485,7 @@ async fn apply_placement_event(
 fn reject_mapping_event(
     topic_id: ::irokle::TopicId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
     // The mapping row is a permanent tombstone and only accepts upserts.
     warn!(
@@ -511,7 +503,7 @@ fn reject_mapping_event(
 fn reject_policy_event(
     topic_id: ::irokle::TopicId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
     // A policy document is immutable and only accepts its initial upsert.
     warn!(

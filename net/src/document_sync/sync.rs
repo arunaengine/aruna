@@ -46,11 +46,11 @@ impl DocumentSyncService {
                     NetError::Bootstrap(format!("document sync topic {topic_id} is missing"))
                 })?;
 
-            if state.event_type_id != DocumentSyncEvent::TYPE_ID {
+            if state.event_type_id != DocumentEvent::TYPE_ID {
                 return Err(NetError::Bootstrap(format!(
                     "Document sync topic {topic_id} has event type {}, expected {}",
                     state.event_type_id,
-                    DocumentSyncEvent::TYPE_ID
+                    DocumentEvent::TYPE_ID
                 )));
             }
 
@@ -645,7 +645,7 @@ impl DocumentSyncService {
         if summary_is_empty(&summary) {
             return Ok(());
         }
-        if summary.event_type_id.as_deref() != Some(DocumentSyncEvent::TYPE_ID) {
+        if summary.event_type_id.as_deref() != Some(DocumentEvent::TYPE_ID) {
             return Err(NetError::Bootstrap(format!(
                 "peer {peer} advertised document sync topic {topic_id} with unexpected event type {:?}",
                 summary.event_type_id
