@@ -18,12 +18,12 @@ async fn missing_requires_genesis() {
     .expect("document sync service opens");
 
     let local_node = service.local_node_id().expect("local node id");
-    let target = DocumentSyncTarget::NodeInfo {
+    let target = DocumentTarget::NodeInfo {
         realm_id,
         node_id: local_node,
     };
     let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-    let change = DocumentSyncChange {
+    let change = DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -31,7 +31,7 @@ async fn missing_requires_genesis() {
             actor: local_node,
             updated_at_ms: 1,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement: aruna_core::structs::PlacementRef::NIL,
     };
 
@@ -48,7 +48,7 @@ async fn missing_requires_genesis() {
         )
         .await;
     assert!(
-        matches!(blocked, DocumentSyncNetEvent::Error { .. }),
+        matches!(blocked, DocumentNetEvent::Error { .. }),
         "non-origin publish must fail retryably: {blocked:?}"
     );
     assert!(
@@ -69,7 +69,7 @@ async fn missing_requires_genesis() {
         )
         .await;
     assert!(
-        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published, DocumentNetEvent::DocumentsPublished { .. }),
         "origin publish must succeed: {published:?}"
     );
     assert!(
@@ -97,18 +97,18 @@ async fn blocked_allows_ready() {
     .expect("document sync service opens");
 
     let local_node = service.local_node_id().expect("local node id");
-    let blocked_target = DocumentSyncTarget::NodeUsage {
+    let blocked_target = DocumentTarget::NodeUsage {
         realm_id,
         node_id: local_node,
         group_id: None,
     };
-    let ready_target = DocumentSyncTarget::WatchInterest {
+    let ready_target = DocumentTarget::WatchInterest {
         realm_id,
         node_id: local_node,
     };
     let blocked_topic = blocked_target.sync_topic_id(realm_id, &placement);
     let ready_topic = ready_target.sync_topic_id(realm_id, &placement);
-    let change = DocumentSyncChange {
+    let change = DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -116,7 +116,7 @@ async fn blocked_allows_ready() {
             actor: local_node,
             updated_at_ms: 1,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     };
 
@@ -143,7 +143,7 @@ async fn blocked_allows_ready() {
         .await;
 
     match published {
-        DocumentSyncNetEvent::DocumentsPartiallyPublished {
+        DocumentNetEvent::DocumentsPartiallyPublished {
             published_indices,
             retry_indices,
             error,
@@ -199,7 +199,7 @@ async fn lost_eviction_replays() {
     let node_a = service_a.local_node_id().expect("node a id");
     let node_b = service_b.local_node_id().expect("node b id");
     let user_id = UserId::local(Ulid::from_parts(79, 1), realm_id);
-    let target = DocumentSyncTarget::User { user_id };
+    let target = DocumentTarget::User { user_id };
     let admin_target = AdminDocumentTarget::User { user_id };
     let placement = PlacementRef {
         strategy_id: Ulid::from_parts(79, 7),
@@ -239,7 +239,7 @@ async fn lost_eviction_replays() {
                     Vec::new(),
                 )
                 .await,
-            DocumentSyncNetEvent::DocumentsPublished { .. }
+            DocumentNetEvent::DocumentsPublished { .. }
         ));
     }
 

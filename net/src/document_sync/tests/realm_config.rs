@@ -10,7 +10,7 @@ async fn node_state_only() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let reducer_node = node(10);
 
     apply_admin_operation(
@@ -46,7 +46,7 @@ async fn node_state_only() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&state_value).expect("reducer state decodes");
     assert_eq!(
         reducer_state.materialized_config_nodes()[&reducer_node],
@@ -64,7 +64,7 @@ async fn settings_materialize_config() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let existing_provider = test_oidc_provider("existing", "existing-settings");
     let seed_node = node(20);
     let mut seed_config = RealmConfigDocument::new(realm_id, vec![existing_provider.clone()], 3);
@@ -117,7 +117,7 @@ async fn settings_materialize_config() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&state_value).expect("reducer state decodes");
     assert_eq!(
         reducer_state.materialized_metadata_replication(),
@@ -139,7 +139,7 @@ async fn description_materializes_config() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let mut seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     seed_config.description = "Old Realm".to_string();
     batch_write_to(
@@ -180,7 +180,7 @@ async fn description_materializes_config() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&state_value).expect("reducer state decodes");
     assert_eq!(
         reducer_state.materialized_realm_description().as_deref(),
@@ -198,7 +198,7 @@ async fn placement_materializes_config() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     batch_write_to(
         &storage,
@@ -290,7 +290,7 @@ async fn placement_materializes_config() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&state_value).expect("reducer state decodes");
     assert_eq!(
         reducer_state.materialized_default_strategy(),
@@ -305,7 +305,7 @@ fn conflict_clears_default() {
     let actor_a = test_actor(35, user_id, realm_id);
     let actor_b = test_actor(36, user_id, realm_id);
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let mut state = AdminDocumentReducerState::new(target.clone());
+    let mut state = AdminDocumentState::new(target.clone());
     let prior_default = Ulid::from_parts(1_521, 1);
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.default_strategy_id = Some(prior_default);
@@ -369,7 +369,7 @@ async fn dangling_strategy_materializes() {
     let user_id = UserId::local(Ulid::from_parts(1_510, 1), realm_id);
     let strategy_actor = test_actor(30, user_id, realm_id);
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     batch_write_to(
         &storage,
@@ -478,7 +478,7 @@ async fn dangling_strategy_materializes() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&state_value).expect("reducer state decodes");
     assert!(reducer_state.materialized_strategies().is_empty());
     assert_eq!(
@@ -497,7 +497,7 @@ async fn settings_create_config() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let metadata_replication = MetadataReplicationConfig::new(5);
     let discovery = test_discovery(23, "https://missing-settings.example:443");
 
@@ -530,7 +530,7 @@ async fn settings_create_config() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&state_value).expect("reducer state decodes");
     assert_eq!(
         reducer_state.materialized_metadata_replication(),
@@ -554,7 +554,7 @@ async fn realm_policies_replicate() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
 
     apply_admin_operation(
         &storage,
@@ -613,7 +613,7 @@ async fn replicated_revocation_applies() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
 
     apply_admin_operation(
         &storage,
@@ -687,7 +687,7 @@ async fn accepts_onboarded_origin() {
         realm_id,
     );
     let token_owner = UserId::local(Ulid::from_parts(1_651, 1), realm_id);
-    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let config_target = DocumentTarget::RealmConfig { realm_id };
     let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.ensure_node(attacker.node_id, RealmNodeKind::Server);
@@ -856,7 +856,7 @@ struct RelayFixture {
     storage: StorageHandle,
     realm_id: RealmId,
     topic: ::irokle::TopicId,
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     event: AdminDocumentEvent,
     placement: PlacementRef,
     origin: Actor,
@@ -883,7 +883,7 @@ async fn relay_fixture(dir: &TempDir) -> RelayFixture {
             owner: origin.user_id,
         },
     );
-    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let config_target = DocumentTarget::RealmConfig { realm_id };
     batch_write_to(
         &storage,
         vec![target_write_entry(
@@ -895,7 +895,7 @@ async fn relay_fixture(dir: &TempDir) -> RelayFixture {
     .expect("config writes");
 
     let group_id = Ulid::from_parts(1_701, 1);
-    let target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let target = DocumentTarget::GroupAuthorization { group_id };
     let placement = PlacementRef {
         strategy_id: Ulid::from_parts(1_705, 1),
         shard: 1,
@@ -1058,7 +1058,7 @@ async fn caps_flooding_origin() {
         UserId::local(Ulid::from_parts(1_671, 1), realm_id),
         realm_id,
     );
-    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let config_target = DocumentTarget::RealmConfig { realm_id };
     let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.ensure_node(flooder.node_id, RealmNodeKind::Server);
@@ -1074,7 +1074,7 @@ async fn caps_flooding_origin() {
     .expect("config writes");
 
     let expires_at = unix_timestamp_secs() + 600;
-    let mut state = AdminDocumentReducerState::new(admin_target.clone());
+    let mut state = AdminDocumentState::new(admin_target.clone());
     let mut index = state.revocation_index(expires_at);
     for seed in 0..MAX_LIVE_REVOCATIONS_PER_ORIGIN {
         state
@@ -1191,7 +1191,7 @@ fn accepts_historical_origin() {
             },
         },
     );
-    let mut state = AdminDocumentReducerState::new(target.clone());
+    let mut state = AdminDocumentState::new(target.clone());
     state.apply(&ensure).expect("onboarding applies");
     state
         .apply(&conflict)
@@ -1235,7 +1235,7 @@ async fn replicated_revocation_compacts() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
 
     apply_admin_operation(
         &storage,
@@ -1337,7 +1337,7 @@ async fn redundant_persists_clock() {
     let (_dir, storage) = test_storage();
     let realm_id = RealmId::from_bytes([64; 32]);
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let assert_stable = |before: &[u8], after: &[u8]| {
         let mut before = RealmConfigDocument::from_bytes(before).expect("decode prior config");
         let after = RealmConfigDocument::from_bytes(after).expect("decode current config");
@@ -1448,7 +1448,7 @@ async fn group_policies_replicate() {
     let owner = UserId::local(Ulid::from_parts(1_621, 1), realm_id);
     let actor = test_actor(10, owner, realm_id);
     let target = AdminDocumentTarget::Group { group_id };
-    let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
 
     apply_admin_operation(
         &storage,
@@ -1530,17 +1530,17 @@ async fn join_authority_replication() {
     };
     let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
     let target = AdminDocumentTarget::Group { group_id };
-    let document = DocumentSyncTarget::GroupAuthorization { group_id };
-    let mut reducer = AdminDocumentReducerState::new(target.clone());
+    let document = DocumentTarget::GroupAuthorization { group_id };
+    let mut reducer = AdminDocumentState::new(target.clone());
     batch_write_to(
         &storage,
         vec![
             target_write_entry(
-                DocumentSyncTarget::RealmConfig { realm_id },
+                DocumentTarget::RealmConfig { realm_id },
                 config.to_bytes(&owner).unwrap().into(),
             ),
             target_write_entry(
-                DocumentSyncTarget::RealmAuthorization { realm_id },
+                DocumentTarget::RealmAuthorization { realm_id },
                 realm_auth.to_bytes(&owner).unwrap().into(),
             ),
             target_write_entry(document.clone(), auth.to_bytes(&owner).unwrap().into()),
@@ -1674,11 +1674,11 @@ async fn policies_authority_gate() {
         &storage,
         vec![
             target_write_entry(
-                DocumentSyncTarget::RealmConfig { realm_id },
+                DocumentTarget::RealmConfig { realm_id },
                 config.to_bytes(&actor).expect("config serializes").into(),
             ),
             target_write_entry(
-                DocumentSyncTarget::RealmAuthorization { realm_id },
+                DocumentTarget::RealmAuthorization { realm_id },
                 realm_auth
                     .to_bytes(&actor)
                     .expect("realm auth serializes")
@@ -1728,7 +1728,7 @@ async fn policies_authority_gate() {
         batch_write_to(
             &storage,
             vec![target_write_entry(
-                DocumentSyncTarget::GroupAuthorization { group_id },
+                DocumentTarget::GroupAuthorization { group_id },
                 auth_doc
                     .to_bytes(&actor)
                     .expect("auth doc serializes")
@@ -1759,7 +1759,7 @@ async fn quota_survives_materialization() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let quota = QuotaConfig {
         default_group_quota_bytes: Some(9_000),
         grace_factor_percent: 130,
@@ -1770,7 +1770,7 @@ async fn quota_survives_materialization() {
             grace_factor_percent: Some(140),
         }],
         max_groups_per_user: Some(7),
-        user_group_cap_overrides: vec![UserGroupCapOverride {
+        user_group_cap_overrides: vec![UserCapOverride {
             user_id: UserId::local(Ulid::from_parts(1_386, 1), realm_id),
             max_groups: Some(2),
         }],
@@ -1830,7 +1830,7 @@ async fn settings_bootstrap_config() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let reducer_node = node(28);
     let provider = test_oidc_provider("default", "bootstrap-after-reducer");
     let metadata_replication = MetadataReplicationConfig::new(8);
@@ -1917,7 +1917,7 @@ async fn drops_evicted_node() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let device = node(31);
 
     for (seq, op) in [
@@ -1986,7 +1986,7 @@ async fn replicates_compute_config() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let compute = aruna_core::structs::RealmComputeConfig {
         witness_base_delay_ms: 4_200,
         catch_up_after_ms: 61_000,
@@ -2061,7 +2061,7 @@ async fn settings_conflict_withholds() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     batch_write_to(
         &storage,
@@ -2123,7 +2123,7 @@ async fn settings_conflict_withholds() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&state_value).expect("reducer state decodes");
     assert_eq!(reducer_state.materialized_metadata_replication(), None);
     assert!(
@@ -2152,7 +2152,7 @@ async fn retries_config_conflict() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     batch_write_to(
         &storage,
@@ -2221,7 +2221,7 @@ async fn keeps_stale_config() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     batch_write_to(
         &storage,
@@ -2292,7 +2292,7 @@ async fn node_ensure_merges() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let first_node = node(11);
     let second_node = node(12);
 
@@ -2349,7 +2349,7 @@ async fn oidc_updates_merge() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let existing = test_oidc_provider("existing", "existing");
     let removed = test_oidc_provider("removed", "removed");
     let first = test_oidc_provider("default", "one");
@@ -2447,7 +2447,7 @@ async fn oidc_conflict_withholds() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let untouched = test_oidc_provider("untouched", "untouched");
     let first = test_oidc_provider("default", "one");
     let second = test_oidc_provider("default", "two");
@@ -2522,7 +2522,7 @@ async fn orphan_oidc_stores() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let provider = test_oidc_provider("default", "missing");
 
     apply_admin_operation(
@@ -2557,7 +2557,7 @@ async fn orphan_oidc_stores() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&state_value).expect("reducer state decodes");
     assert_eq!(
         reducer_state.materialized_oidc_providers(),
@@ -2580,7 +2580,7 @@ async fn kind_conflict_withholds() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     let conflicted_node = node(15);
 
     let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);

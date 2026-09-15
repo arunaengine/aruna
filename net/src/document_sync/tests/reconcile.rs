@@ -21,7 +21,7 @@ async fn applied_cursor_lineage() {
     )
     .expect("document sync service opens");
 
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let local_actor = test_actor(81, UserId::nil(realm_id), realm_id);
     let event = test_admin_event(
@@ -46,7 +46,7 @@ async fn applied_cursor_lineage() {
                 Vec::new(),
             )
             .await,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     let node = service.node();
@@ -128,7 +128,7 @@ async fn whole_admin_skipped() {
     .expect("document sync service opens");
 
     let user_id = UserId::local(Ulid::from_parts(1_400, 1), realm_id);
-    let target = DocumentSyncTarget::User { user_id };
+    let target = DocumentTarget::User { user_id };
     let placement = PlacementRef {
         strategy_id: Ulid::from_parts(54, 7),
         shard: 1,
@@ -138,7 +138,7 @@ async fn whole_admin_skipped() {
         .ensure_sync_topics(&[topic_id], Vec::new())
         .expect("admin shard topic genesis");
 
-    let change = |kind| DocumentSyncChange {
+    let change = |kind| DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -159,7 +159,7 @@ async fn whole_admin_skipped() {
     batch_write_to(
         &storage,
         vec![target_write_entry(
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             config.to_bytes(&actor).expect("config serializes").into(),
         )],
     )
@@ -184,13 +184,13 @@ async fn whole_admin_skipped() {
                     event_id: Ulid::generate(),
                     target: target.clone(),
                     bytes: b"whole-document-admin-upsert".to_vec(),
-                    change: change(DocumentSyncChangeKind::Upsert),
+                    change: change(DocumentChangeKind::Upsert),
                     allow_genesis: true,
                 },
                 DocumentSyncPublish::Delete {
                     event_id: Ulid::generate(),
                     target: target.clone(),
-                    change: change(DocumentSyncChangeKind::Delete),
+                    change: change(DocumentChangeKind::Delete),
                     allow_genesis: true,
                 },
                 DocumentSyncPublish::AdminOperation {
@@ -206,7 +206,7 @@ async fn whole_admin_skipped() {
         .await;
     assert!(matches!(
         published,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     // Reset the cursor so reconcile reprocesses every op as a fresh peer would.
@@ -268,7 +268,7 @@ async fn publisher_impersonation_rejected() {
     batch_write_to(
         &storage,
         vec![target_write_entry(
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             config.to_bytes(&actor).expect("config serializes").into(),
         )],
     )
@@ -277,7 +277,7 @@ async fn publisher_impersonation_rejected() {
 
     let cases = [
         (
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             test_admin_event(
                 Ulid::from_parts(1_602, 1),
                 AdminDocumentTarget::RealmConfig { realm_id },
@@ -289,7 +289,7 @@ async fn publisher_impersonation_rejected() {
             ),
         ),
         (
-            DocumentSyncTarget::RealmAuthorization { realm_id },
+            DocumentTarget::RealmAuthorization { realm_id },
             test_admin_event(
                 Ulid::from_parts(1_603, 1),
                 AdminDocumentTarget::Realm { realm_id },
@@ -301,7 +301,7 @@ async fn publisher_impersonation_rejected() {
             ),
         ),
         (
-            DocumentSyncTarget::User { user_id },
+            DocumentTarget::User { user_id },
             test_admin_event(
                 Ulid::from_parts(1_605, 1),
                 AdminDocumentTarget::User { user_id },
@@ -313,7 +313,7 @@ async fn publisher_impersonation_rejected() {
             ),
         ),
         (
-            DocumentSyncTarget::GroupAuthorization { group_id },
+            DocumentTarget::GroupAuthorization { group_id },
             test_admin_event(
                 Ulid::from_parts(1_606, 1),
                 AdminDocumentTarget::Group { group_id },
@@ -359,7 +359,7 @@ async fn management_preserves_genesis() {
     let (_dir, storage) = test_storage();
     let realm_id = RealmId::from_bytes([65; 32]);
     let nil_actor = test_actor(65, UserId::nil(realm_id), realm_id);
-    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let config_target = DocumentTarget::RealmConfig { realm_id };
     let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let publisher = ::irokle::actor_id_for(config_topic, node_to_peer(&nil_actor.node_id));
     let ensure = test_admin_event(
@@ -421,7 +421,7 @@ async fn management_preserves_genesis() {
     );
 
     let (_auth_dir, auth_storage) = test_storage();
-    let auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let auth_target = DocumentTarget::RealmAuthorization { realm_id };
     let auth_topic = auth_target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let auth_publisher = ::irokle::actor_id_for(auth_topic, node_to_peer(&nil_actor.node_id));
     let genesis_role = test_admin_event(
@@ -461,7 +461,7 @@ async fn management_preserves_genesis() {
     batch_write_to(
         &auth_storage,
         vec![target_write_entry(
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             server_config
                 .to_bytes(&server_actor)
                 .expect("config serializes")
@@ -472,7 +472,7 @@ async fn management_preserves_genesis() {
     .expect("config writes");
     for (target, event) in [
         (
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             test_admin_event(
                 Ulid::from_parts(1_614, 1),
                 AdminDocumentTarget::RealmConfig { realm_id },
@@ -484,7 +484,7 @@ async fn management_preserves_genesis() {
             ),
         ),
         (
-            DocumentSyncTarget::RealmAuthorization { realm_id },
+            DocumentTarget::RealmAuthorization { realm_id },
             test_admin_event(
                 Ulid::from_parts(1_615, 1),
                 AdminDocumentTarget::Realm { realm_id },
@@ -526,7 +526,7 @@ async fn inbound_rejects_pool() {
     let realm_id = RealmId::from_bytes([73; 32]);
     let coordinator = test_actor(73, UserId::local(Ulid::generate(), realm_id), realm_id);
     let attacker = test_actor(74, UserId::local(Ulid::generate(), realm_id), realm_id);
-    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let config_target = DocumentTarget::RealmConfig { realm_id };
     let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
     let topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
 
@@ -628,7 +628,7 @@ async fn inbound_checks_grants() {
     let (_dir, storage) = test_storage();
     let realm_id = RealmId::from_bytes([75; 32]);
     let coordinator = test_actor(75, UserId::local(Ulid::generate(), realm_id), realm_id);
-    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let config_target = DocumentTarget::RealmConfig { realm_id };
     let admin_target = AdminDocumentTarget::RealmConfig { realm_id };
     let topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let publisher = ::irokle::actor_id_for(topic, node_to_peer(&coordinator.node_id));
@@ -763,13 +763,13 @@ async fn malformed_targets_rejected() {
     batch_write_to(
         &storage,
         vec![target_write_entry(
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             config.to_bytes(&actor).expect("config serializes").into(),
         )],
     )
     .await
     .expect("config writes");
-    let target = DocumentSyncTarget::User { user_id };
+    let target = DocumentTarget::User { user_id };
     let placement = admin_test_placement();
     let topic_id = target.sync_topic_id(realm_id, &placement);
     let publisher = ::irokle::actor_id_for(topic_id, node_to_peer(&actor.node_id));
@@ -861,7 +861,7 @@ async fn rejection_advances_cursor() {
         local_actor.node_id
     );
 
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
@@ -1003,7 +1003,7 @@ async fn rejection_advances_cursor() {
         .await;
     assert!(matches!(
         published,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     reset_test_cursor(&service, topic_id).await;
@@ -1042,7 +1042,7 @@ async fn rejection_advances_cursor() {
         assert!(!record.reason.is_empty());
         assert!(matches!(
             record.decoded_event().expect("event decodes"),
-            DocumentSyncEvent::AdminOperation { .. }
+            DocumentEvent::AdminOperation { .. }
         ));
     }
     assert_eq!(quarantine_usage(&storage).await.records, 4);
@@ -1070,7 +1070,7 @@ async fn unknown_report_quarantined() {
     .expect("document sync service opens");
 
     let local_actor = test_actor(74, UserId::nil(realm_id), realm_id);
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
@@ -1132,7 +1132,7 @@ async fn unknown_report_quarantined() {
                 Vec::new(),
             )
             .await,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
     reset_test_cursor(&service, topic_id).await;
 
@@ -1201,7 +1201,7 @@ async fn plan_report_coalesce() {
     .expect("document sync service opens");
 
     let local_actor = test_actor(75, UserId::nil(realm_id), realm_id);
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     config.ensure_node(local_actor.node_id, RealmNodeKind::Management);
@@ -1277,7 +1277,7 @@ async fn plan_report_coalesce() {
                 Vec::new(),
             )
             .await,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
     reset_test_cursor(&service, topic_id).await;
 

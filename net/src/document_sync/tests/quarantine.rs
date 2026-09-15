@@ -22,7 +22,7 @@ async fn quarantine_keeps_placement() {
         strategy_id: Ulid::from_parts(7_200, 1),
         shard: 5,
     };
-    let target = DocumentSyncTarget::PersistentIdMapping {
+    let target = DocumentTarget::PersistentIdMapping {
         document_id: Ulid::from_parts(7_201, 1),
     };
     let topic_id = target.sync_topic_id(realm_id, &placement);
@@ -35,7 +35,7 @@ async fn quarantine_keeps_placement() {
             vec![DocumentSyncPublish::Delete {
                 event_id,
                 target: target.clone(),
-                change: DocumentSyncChange {
+                change: DocumentChange {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: 1,
@@ -43,7 +43,7 @@ async fn quarantine_keeps_placement() {
                         actor: local_node,
                         updated_at_ms: 1,
                     },
-                    kind: DocumentSyncChangeKind::Delete,
+                    kind: DocumentChangeKind::Delete,
                     placement,
                 },
                 allow_genesis: true,
@@ -53,7 +53,7 @@ async fn quarantine_keeps_placement() {
         .await;
     assert!(matches!(
         published,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     reset_test_cursor(&service, topic_id).await;
@@ -104,7 +104,7 @@ async fn quarantine_retains_families() {
     let forged_node = node(71);
     let owner = UserId::local(Ulid::from_bytes([3; 16]), realm_id);
 
-    let change = |actor, generation, kind| DocumentSyncChange {
+    let change = |actor, generation, kind| DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation,
@@ -136,13 +136,13 @@ async fn quarantine_retains_families() {
         WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
         1,
     );
-    let watch_target = |watch: &WatchSubscription| DocumentSyncTarget::WatchSubscription {
+    let watch_target = |watch: &WatchSubscription| DocumentTarget::WatchSubscription {
         owner,
         watch_id: watch.watch_id,
     };
     let watch_topic = watch_target(&valid_watch).sync_topic_id(realm_id, &PlacementRef::NIL);
 
-    let info_target = DocumentSyncTarget::NodeInfo {
+    let info_target = DocumentTarget::NodeInfo {
         realm_id,
         node_id: local_node,
     };
@@ -160,34 +160,34 @@ async fn quarantine_retains_families() {
                     event_id: invalid_watch_event,
                     target: watch_target(&invalid_watch),
                     bytes: invalid_watch.to_bytes().expect("subscription serializes"),
-                    change: change(local_node, 1, DocumentSyncChangeKind::Upsert),
+                    change: change(local_node, 1, DocumentChangeKind::Upsert),
                     allow_genesis: true,
                 },
                 DocumentSyncPublish::Delete {
                     event_id: forged_delete_event,
                     target: watch_target(&deleted_watch),
-                    change: change(forged_node, 2, DocumentSyncChangeKind::Delete),
+                    change: change(forged_node, 2, DocumentChangeKind::Delete),
                     allow_genesis: true,
                 },
                 DocumentSyncPublish::Upsert {
                     event_id: valid_watch_event,
                     target: watch_target(&valid_watch),
                     bytes: valid_watch.to_bytes().expect("subscription serializes"),
-                    change: change(local_node, 1, DocumentSyncChangeKind::Upsert),
+                    change: change(local_node, 1, DocumentChangeKind::Upsert),
                     allow_genesis: true,
                 },
                 DocumentSyncPublish::Upsert {
                     event_id: invalid_info_event,
                     target: info_target.clone(),
                     bytes: node_info_bytes(forged_node, 5),
-                    change: change(local_node, 1, DocumentSyncChangeKind::Upsert),
+                    change: change(local_node, 1, DocumentChangeKind::Upsert),
                     allow_genesis: true,
                 },
                 DocumentSyncPublish::Upsert {
                     event_id: valid_info_event,
                     target: info_target.clone(),
                     bytes: node_info_bytes(local_node, 6),
-                    change: change(local_node, 2, DocumentSyncChangeKind::Upsert),
+                    change: change(local_node, 2, DocumentChangeKind::Upsert),
                     allow_genesis: true,
                 },
             ],
@@ -196,7 +196,7 @@ async fn quarantine_retains_families() {
         .await;
     assert!(matches!(
         published,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     reset_test_cursor(&service, watch_topic).await;
@@ -236,7 +236,7 @@ async fn quarantine_retains_families() {
     assert_eq!(invalid_watch_record.origin(), Some(local_node));
     assert_eq!(invalid_watch_record.identity.topic, watch_topic);
     match invalid_watch_record.decoded_event().expect("event decodes") {
-        DocumentSyncEvent::Upsert {
+        DocumentEvent::Upsert {
             event_id, bytes, ..
         } => {
             assert_eq!(event_id, invalid_watch_event);
@@ -353,7 +353,7 @@ async fn quarantine_rejects_placement() {
     batch_write_to(
         &storage,
         vec![target_write_entry(
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             config
                 .to_bytes(&actor)
                 .expect("realm config serializes")
@@ -405,11 +405,11 @@ async fn quarantine_rejects_placement() {
     let mut good_create = metadata_create_event(group_id, good_document, 100, good_event_id, 75);
     good_create.record = good_record.clone();
 
-    let registry_target = |document_id| DocumentSyncTarget::MetadataRegistry {
+    let registry_target = |document_id| DocumentTarget::MetadataRegistry {
         group_id,
         document_id,
     };
-    let create_target = |document_id, event_id| DocumentSyncTarget::MetadataCreateEvent {
+    let create_target = |document_id, event_id| DocumentTarget::MetadataCreateEvent {
         document_id,
         event_id,
     };
@@ -418,7 +418,7 @@ async fn quarantine_rejects_placement() {
     service
         .ensure_sync_topics(&[bad_topic, good_topic], Vec::new())
         .expect("metadata shard topic genesis");
-    let change = |event_id, placement| DocumentSyncChange {
+    let change = |event_id, placement| DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -426,7 +426,7 @@ async fn quarantine_rejects_placement() {
             actor: local_node,
             updated_at_ms: 100,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     };
     let bad_registry_event = Ulid::from_parts(2_157, 1);
@@ -467,7 +467,7 @@ async fn quarantine_rejects_placement() {
         )
         .await;
     assert!(
-        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published, DocumentNetEvent::DocumentsPublished { .. }),
         "metadata publish failed: {published:?}"
     );
 
@@ -524,11 +524,11 @@ async fn quarantine_batch_accounting() {
 
     let topic_id = topic(79);
     let shared_event_id = Ulid::from_parts(3_300, 1);
-    let event = || DocumentSyncEvent::Upsert {
+    let event = || DocumentEvent::Upsert {
         event_id: shared_event_id,
-        target: DocumentSyncTarget::RealmConfig { realm_id },
+        target: DocumentTarget::RealmConfig { realm_id },
         bytes: vec![3; 8],
-        change: DocumentSyncChange {
+        change: DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
@@ -536,7 +536,7 @@ async fn quarantine_batch_accounting() {
                 actor: node(79),
                 updated_at_ms: 1,
             },
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement: PlacementRef::NIL,
         },
     };

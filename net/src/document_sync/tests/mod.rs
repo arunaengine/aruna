@@ -5,7 +5,7 @@ use aruna_core::admin_documents::{
 };
 use aruna_core::alpn::Alpn;
 use aruna_core::auth::{MAX_BEARER_TOKEN_LIFETIME_SECS, REVOCATION_GRACE_SECS};
-use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
+use aruna_core::document::{DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
     ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE,
     METADATA_CREATE_ACCEPTANCE_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     METADATA_INDEX_KEYSPACE, USER_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE,
     USER_SUBJECT_INDEX_KEYSPACE,
 };
-use aruna_core::metadata::MetadataCreateEventPayload;
+use aruna_core::metadata::MetadataEventPayload;
 use aruna_core::reducer::REALM_CONFIG_DEFAULT_STRATEGY_PATH;
 use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
@@ -26,7 +26,7 @@ use aruna_core::structs::{
     PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig, RealmAuthorizationDocument,
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role,
     SYNC_QUARANTINE_MAX_RECORDS, StaticRealmEndpoint, StrategyBinding, SyncQuarantineFamily,
-    SyncQuarantineRecord, UserGroupCapOverride, band_start,
+    SyncQuarantineRecord, UserCapOverride, band_start,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::{MetaResourceId, StructuredId, UserId};
@@ -47,7 +47,7 @@ mod role_assignments;
 mod shard;
 mod validation;
 
-use crate::tests::fixtures::document_sync::*;
+use crate::tests::document_sync_support::*;
 
 // Two services fork one admin topic. The tie-break resets the losing side, whose
 // evicted event decodes back to an outbox publish with its original event id.
@@ -85,7 +85,7 @@ async fn eviction_preserves_event() {
     let node_b = service_b.local_node_id().expect("node b id");
 
     let user_id = UserId::local(Ulid::from_parts(7, 1), realm_id);
-    let target = DocumentSyncTarget::User { user_id };
+    let target = DocumentTarget::User { user_id };
     let admin_target = AdminDocumentTarget::User { user_id };
     let placement = PlacementRef {
         strategy_id: Ulid::from_parts(71, 7),
@@ -145,7 +145,7 @@ async fn eviction_preserves_event() {
         )
         .await;
     assert!(
-        matches!(published_a, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published_a, DocumentNetEvent::DocumentsPublished { .. }),
         "service a publish: {published_a:?}"
     );
     let published_b = service_b
@@ -161,7 +161,7 @@ async fn eviction_preserves_event() {
         )
         .await;
     assert!(
-        matches!(published_b, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published_b, DocumentNetEvent::DocumentsPublished { .. }),
         "service b publish: {published_b:?}"
     );
 
@@ -305,7 +305,7 @@ async fn eviction_preserves_event() {
     );
     assert_eq!(document.placement, placement);
     match &document.event {
-        DocumentSyncOutboxEvent::AdminOperation { event, .. } => {
+        DocumentOutboxEvent::AdminOperation { event, .. } => {
             assert_eq!(
                 event.event_id, loser_event_id,
                 "embedded admin event id must survive for applier dedup"
@@ -324,7 +324,7 @@ async fn eviction_preserves_event() {
             name: "foreign".into(),
         },
     );
-    let foreign_payload = DocumentSyncEvent::AdminOperation {
+    let foreign_payload = DocumentEvent::AdminOperation {
         target: target.clone(),
         origin_signature: sign_as_origin(&foreign_admin, &placement),
         event: Box::new(foreign_admin),
@@ -387,9 +387,9 @@ async fn deferred_admin_retries() {
     let bootstrap_actor = test_actor(68, UserId::nil(realm_id), realm_id);
     let admin_actor = test_actor(68, admin_user_id, realm_id);
     let role_id = Ulid::from_parts(1_626, 1);
-    let auth_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let auth_target = DocumentTarget::RealmAuthorization { realm_id };
     let auth_topic = auth_target.sync_topic_id(realm_id, &PlacementRef::NIL);
-    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let config_target = DocumentTarget::RealmConfig { realm_id };
     let config_topic = config_target.sync_topic_id(realm_id, &PlacementRef::NIL);
     assert_ne!(auth_topic, config_topic);
 
@@ -462,7 +462,7 @@ async fn deferred_admin_retries() {
             .collect();
         assert!(matches!(
             service.publish_documents(documents, Vec::new()).await,
-            DocumentSyncNetEvent::DocumentsPublished { .. }
+            DocumentNetEvent::DocumentsPublished { .. }
         ));
         reset_test_cursor(&service, target.sync_topic_id(realm_id, &PlacementRef::NIL)).await;
     }
@@ -540,7 +540,7 @@ async fn deferred_admin_retries() {
     assert!(applied_cursor.dominates(&auth_clock));
 
     let group_id = Ulid::from_parts(1_631, 1);
-    let group_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let group_target = DocumentTarget::GroupAuthorization { group_id };
     let group_placement = admin_test_placement();
     // Shard topics are join-only at publish; create the genesis eagerly.
     service
@@ -598,7 +598,7 @@ async fn deferred_admin_retries() {
                 Vec::new(),
             )
             .await,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
     reset_test_cursor(
         &service,
@@ -671,7 +671,7 @@ async fn quarantine_malformed_payloads() {
     batch_write_to(
         &storage,
         vec![target_write_entry(
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             config
                 .to_bytes(&actor)
                 .expect("realm config serializes")
@@ -690,7 +690,7 @@ async fn quarantine_malformed_payloads() {
             .unwrap()
             .as_ulid()
     };
-    let topic_id = DocumentSyncTarget::MetadataRegistry {
+    let topic_id = DocumentTarget::MetadataRegistry {
         group_id,
         document_id: document(3_210),
     }
@@ -705,7 +705,7 @@ async fn quarantine_malformed_payloads() {
         .publish_raw_event(topic_id, raw_payload.clone())
         .expect("raw op publishes");
 
-    let change = |event_id| DocumentSyncChange {
+    let change = |event_id| DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -713,10 +713,10 @@ async fn quarantine_malformed_payloads() {
             actor: local_node,
             updated_at_ms: 100,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     };
-    let poison = |event_id: u64, target: DocumentSyncTarget| {
+    let poison = |event_id: u64, target: DocumentTarget| {
         let event_id = Ulid::from_parts(event_id, 1);
         DocumentSyncPublish::Upsert {
             event_id,
@@ -740,7 +740,7 @@ async fn quarantine_malformed_payloads() {
     let valid_document = document(3_212);
     let mut valid = registry_record(group_id, valid_document, "datasets/valid", 100, valid_event);
     valid.placement = placement;
-    let valid_target = DocumentSyncTarget::MetadataRegistry {
+    let valid_target = DocumentTarget::MetadataRegistry {
         group_id,
         document_id: valid_document,
     };
@@ -750,39 +750,39 @@ async fn quarantine_malformed_payloads() {
             vec![
                 poison(
                     3_220,
-                    DocumentSyncTarget::MetadataRegistry {
+                    DocumentTarget::MetadataRegistry {
                         group_id,
                         document_id: document(3_213),
                     },
                 ),
                 poison(
                     3_221,
-                    DocumentSyncTarget::MetadataCreateEvent {
+                    DocumentTarget::MetadataCreateEvent {
                         document_id: document(3_214),
                         event_id: Ulid::from_parts(3_221, 1),
                     },
                 ),
                 poison(
                     3_222,
-                    DocumentSyncTarget::MetadataDocumentLifecycle {
+                    DocumentTarget::MetadataDocumentLifecycle {
                         document_id: document(3_215),
                     },
                 ),
                 poison(
                     3_223,
-                    DocumentSyncTarget::MetadataGraphLifecycle {
+                    DocumentTarget::MetadataGraphLifecycle {
                         graph_iri: MetadataRegistryRecord::graph_iri_for(document(3_216)),
                     },
                 ),
                 poison(
                     3_224,
-                    DocumentSyncTarget::PersistentIdMapping {
+                    DocumentTarget::PersistentIdMapping {
                         document_id: document(3_217),
                     },
                 ),
                 DocumentSyncPublish::Upsert {
                     event_id: mismatched_event,
-                    target: DocumentSyncTarget::MetadataRegistry {
+                    target: DocumentTarget::MetadataRegistry {
                         group_id,
                         document_id: document(3_218),
                     },
@@ -802,7 +802,7 @@ async fn quarantine_malformed_payloads() {
         )
         .await;
     assert!(
-        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published, DocumentNetEvent::DocumentsPublished { .. }),
         "poison publish failed: {published:?}"
     );
 
