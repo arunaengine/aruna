@@ -1,8 +1,6 @@
 use crate::NodeId;
 use crate::UserId;
-use crate::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
-};
+use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
 use crate::structs::{JobId, MetadataRegistryRecord, PlacementRef};
 use serde::{Deserialize, Serialize};
@@ -297,8 +295,8 @@ pub fn persistent_id_key(document_id: Ulid) -> Vec<u8> {
     document_id.to_bytes().to_vec()
 }
 
-pub fn persistent_id_target(document_id: Ulid) -> DocumentSyncTarget {
-    DocumentSyncTarget::PersistentIdMapping { document_id }
+pub fn persistent_id_target(document_id: Ulid) -> DocumentTarget {
+    DocumentTarget::PersistentIdMapping { document_id }
 }
 
 /// Sync change a mapping row publishes and records. Derived purely from the row,
@@ -307,8 +305,8 @@ pub fn persistent_id_target(document_id: Ulid) -> DocumentSyncTarget {
 pub fn persistent_id_change(
     mapping: &PersistentIdMapping,
     placement: PlacementRef,
-) -> DocumentSyncChange {
-    DocumentSyncChange {
+) -> DocumentChange {
+    DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: mapping.revision.occurred_at_ms,
@@ -316,14 +314,14 @@ pub fn persistent_id_change(
             actor: mapping.revision.actor,
             updated_at_ms: mapping.revision.occurred_at_ms,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     }
 }
 
 /// Internal job payload for an idempotent PID registration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MintPersistentIdSpec {
+pub struct MintPersistentSpec {
     pub document_id: Ulid,
     pub minted_by: UserId,
 }
@@ -456,7 +454,7 @@ mod tests {
         assert_eq!(change.current.generation, 42);
         assert_eq!(change.current.event_id, Ulid::from_bytes([7; 16]));
         assert_eq!(change.current.actor, node(7));
-        assert_eq!(change.kind, DocumentSyncChangeKind::Upsert);
+        assert_eq!(change.kind, DocumentChangeKind::Upsert);
         assert_eq!(change.placement, placement);
     }
 

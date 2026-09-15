@@ -1,92 +1,95 @@
-//! Persisted and wire records: one module per record family, re-exported from
-//! this root so callers name the record, not its file.
+//! Persisted and wire records, grouped into domain modules. Small families
+//! stay flat; callers name a record through its domain, e.g.
+//! `structs::storage::blob::BlobVersion`.
+
+pub mod execution;
+pub mod identity;
+pub mod placement;
+pub mod storage;
+
 mod assistant_chat;
 mod assistant_provider;
-mod auth;
-mod backends;
-mod binding_directory;
-mod blob;
 pub mod checksum;
-mod cleanup;
-mod compute_config;
-mod delete_audit;
-mod group;
-mod group_backend;
-mod handle_allocation;
-mod harvest;
 mod info;
-mod job;
-mod metadata_registry;
-mod multipart;
-mod node_info;
-mod node_subject;
-mod notification;
-mod notification_watch;
-mod offered_directory;
 mod path_claim;
 mod persistent_id;
-mod placement;
-mod placement_policy;
-mod placement_transition;
-mod policy_attachment;
-mod policy_document;
-mod realm;
-mod replication;
-mod routing;
-mod s3_session;
-mod source_access;
-mod source_connector;
-mod staging;
-mod storage_purge;
 mod sync_quarantine;
 mod sync_relationship;
 mod synced_folder;
-mod usage;
-mod user;
-mod user_session;
-mod user_vault;
 
-pub use assistant_chat::*;
-pub use assistant_provider::*;
-pub use auth::*;
-pub use backends::*;
-pub use binding_directory::*;
-pub use blob::*;
-pub use cleanup::*;
-pub use compute_config::*;
-pub use delete_audit::*;
-pub use group::*;
-pub use group_backend::*;
-pub use handle_allocation::*;
-pub use harvest::*;
-pub use info::*;
-pub use job::*;
-pub use metadata_registry::*;
-pub use multipart::*;
-pub use node_info::*;
-pub use node_subject::*;
-pub use notification::*;
-pub use notification_watch::*;
-pub use offered_directory::*;
-pub use path_claim::*;
-pub use persistent_id::*;
-pub use placement::*;
-pub use placement_policy::*;
-pub use placement_transition::*;
-pub use policy_attachment::*;
-pub use policy_document::*;
-pub use realm::*;
-pub use replication::*;
-pub use routing::*;
-pub use s3_session::*;
-pub use source_access::*;
-pub use source_connector::*;
-pub use staging::*;
-pub use storage_purge::*;
-pub use sync_quarantine::*;
-pub use sync_relationship::*;
-pub use synced_folder::*;
-pub use usage::*;
-pub use user::*;
-pub use user_session::*;
-pub use user_vault::*;
+pub use assistant_chat::{
+    AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHAT_TURNS,
+    MAX_ASSISTANT_CHATS, MAX_ASSISTANT_TURN_BYTES,
+};
+pub use assistant_provider::{
+    AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
+    AssistantProviderStatus, AssistantSecretError,
+};
+pub use info::{
+    BackendState, BlobState, ConnectionAddressState, ConnectionAddressStatus,
+    ConnectionMonitorState, NetState, NetworkDiagnosticsState, OpenConnection, PeerConnectionState,
+    PeerConnectionStatus, ProtocolConnectionState, RequestSummaryState, Status,
+};
+pub use path_claim::{PathClaimRecord, PathResolution, resolve_path_claim};
+pub use persistent_id::{
+    MintPersistentSpec, PersistentIdFailure, PersistentIdKind, PersistentIdMapping,
+    PersistentIdProvider, PersistentIdRevision, PersistentIdStatus, persistent_id_change,
+    persistent_id_key, persistent_id_target,
+};
+pub use sync_quarantine::{
+    SYNC_QUARANTINE_MAX_BYTES, SYNC_QUARANTINE_MAX_RECORDS, SYNC_QUARANTINE_USAGE_KEY,
+    SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence, SyncQuarantineFamily,
+    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineRecord, SyncQuarantineUsage,
+    SyncQuarantineWrite, build_quarantine_entries, check_quarantine_capacity, quarantine_row_entry,
+    quarantine_usage_entry, sync_quarantine_key,
+};
+pub use sync_relationship::{
+    ReferenceHandling, SyncCounters, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
+    sync_relationship_key, sync_relationship_prefix, sync_state_key,
+};
+pub use synced_folder::{
+    ActionKind, ActionOutcome, ActionScope, EntrySide, EntryState, FolderMode, FolderState,
+    MAX_SYNC_PAGE, Observed, PendingMark, RemoteBinding, RemoteHead, ReplaceReason,
+    SYNC_SOURCE_VERSION_TAG, SYNC_TRASH_DIR, SyncAction, SyncActionRecord, SyncBase,
+    SyncListCursor, SyncPageLimit, SyncPolicy, SyncPullAck, SyncRefusal, SyncVersionPage,
+    SyncedBytes, SyncedFolder, WriteGuard, decide,
+};
+
+// Temporary flat re-exports of records that moved into the domain modules.
+// TODO(polisher): migrate callers to the domain paths, then delete this block.
+pub use execution::harvest::*;
+pub use execution::job::*;
+pub use execution::notification::*;
+pub use execution::notification_watch::*;
+pub use execution::offered_directory::*;
+pub use execution::source_access::*;
+pub use execution::source_connector::*;
+pub use execution::staging::*;
+pub use identity::auth::*;
+pub use identity::group::*;
+pub use identity::realm::*;
+pub use identity::s3_session::*;
+pub use identity::user::*;
+pub use identity::user_session::*;
+pub use identity::user_vault::*;
+pub use placement::binding_directory::*;
+pub use placement::compute_config::*;
+pub use placement::handle_allocation::*;
+pub use placement::node_subject::*;
+pub use placement::placement_policy::*;
+pub use placement::placement_record::*;
+pub use placement::placement_transition::*;
+pub use placement::policy_attachment::*;
+pub use placement::policy_document::*;
+pub use storage::backends::*;
+pub use storage::blob::*;
+pub use storage::cleanup::*;
+pub use storage::delete_audit::*;
+pub use storage::group_backend::*;
+pub use storage::metadata_registry::*;
+pub use storage::multipart::*;
+pub use storage::node_info::*;
+pub use storage::replication::*;
+pub use storage::routing::*;
+pub use storage::storage_purge::*;
+pub use storage::usage::*;
