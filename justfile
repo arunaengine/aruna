@@ -21,14 +21,14 @@ test-fast-workspace:
 check:
 	cargo check --workspace --locked
 	cargo check --workspace --all-targets --all-features --locked
-	cargo check -p aruna-compute --no-default-features --locked
-	cargo check -p aruna-compute --no-default-features --features docker --locked
-	cargo check -p aruna-compute --no-default-features --features apptainer --locked
-	cargo check -p aruna-compute --no-default-features --features kubernetes --locked
-	cargo check -p aruna --no-default-features --locked
-	cargo check -p aruna --no-default-features --features docker --locked
-	cargo check -p aruna --no-default-features --features apptainer --locked
-	cargo check -p aruna --no-default-features --features kubernetes --locked
+	cargo check -p aruna-compute --all-targets --no-default-features --locked
+	cargo check -p aruna-compute --all-targets --no-default-features --features docker --locked
+	cargo check -p aruna-compute --all-targets --no-default-features --features apptainer --locked
+	cargo check -p aruna-compute --all-targets --no-default-features --features kubernetes --locked
+	cargo check -p aruna --all-targets --no-default-features --locked
+	cargo check -p aruna --all-targets --no-default-features --features docker --locked
+	cargo check -p aruna --all-targets --no-default-features --features apptainer --locked
+	cargo check -p aruna --all-targets --no-default-features --features kubernetes --locked
 
 # Single-node stack with Keycloak; prints service URLs and ADMIN_TOKEN.
 local:
