@@ -91,10 +91,9 @@ pub async fn install_task_queues(
     install_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true).await
 }
 
-/// Test convenience: installs the inbound handler, then restores and starts the
-/// durable queues under the caller's shutdown owner. Integration tests own that
-/// owner; production uses [`install_task_queues`] and
-/// [`TaskQueues::restore_timers_and_start`] so it owns the lifecycle.
+/// Test convenience: installs the inbound handler, then restores and starts
+/// durable queues under the caller's shutdown owner. Production uses
+/// [`install_task_queues`] and [`TaskQueues::restore_timers_and_start`].
 #[doc(hidden)]
 pub async fn install_and_start_task_queues(
     context: Arc<DriverContext>,
@@ -145,39 +144,114 @@ impl TaskQueues {
     /// Restores persisted timers with their stored due time and starts the
     /// recurring re-arm loop, once the node is already serving.
     pub async fn restore_timers_and_start(self, shutdown: &Shutdown) {
+        let stop = shutdown.token();
+        self.restore_timers_and_start_until(shutdown, &stop, || false)
+            .await;
+    }
+
+    /// [`Self::restore_timers_and_start`] with an explicit startup stop and a
+    /// required-service failure probe, checked before every restore unit so an
+    /// accepted stop finishes the current unit and admits no later one.
+    pub async fn restore_timers_and_start_until(
+        self,
+        shutdown: &Shutdown,
+        stop: &CancellationToken,
+        should_stop: impl Fn() -> bool,
+    ) {
         let Self {
             context,
             task_handle,
             handler,
             refresh_holders,
         } = self;
+        let stopped = || stop.is_cancelled() || should_stop();
+        if stopped() {
+            return;
+        }
         spawn_queue_rearm(&context, &task_handle, shutdown);
+        if stopped() {
+            return;
+        }
         restore_task_timers(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         restore_outbox_timers(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         restore_publish_timer(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         // Before the first refresh: a queued edit is the one local change no
         // holder would hand back.
         crate::device::edit::replay_queued_edits(&context).await;
+        if stopped() {
+            return;
+        }
         restore_sync_timers(&context, &task_handle).await;
+        if stopped() {
+            return;
+        }
         restore_usage_timer(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         crate::notifications::watch::interest::restore_publish_timer(
             &context.storage_handle,
             &task_handle,
         )
         .await;
+        if stopped() {
+            return;
+        }
         crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         restore_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
+        if stopped() {
+            return;
+        }
         restore_projection_timer(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         sweep_dead_letters(&context.storage_handle).await;
+        if stopped() {
+            return;
+        }
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
+        if stopped() {
+            return;
+        }
         crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
             .await;
+        if stopped() {
+            return;
+        }
         crate::notifications::prune::restore_prune_timer(&context.storage_handle, &task_handle)
             .await;
+        if stopped() {
+            return;
+        }
         restore_blob_timer(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         crate::s3::refresh_metadata::restore_timer(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         restore_prune_timer(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
+        if stopped() {
+            return;
+        }
         if context.blob_handle.is_some() {
             restore_hidden_sweep(&context.storage_handle, &task_handle).await;
             restore_reclaim_sweep(&context.storage_handle, &task_handle).await;
@@ -979,4 +1053,109 @@ pub async fn drain_notification_outbox(context: Arc<DriverContext>) {
     OperationsTaskHandler::new(context, JobsRuntime::new())
         .drain_notification_outbox()
         .await;
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use aruna_storage::FjallStorage;
+    use tempfile::tempdir;
+
+    async fn restore_queues() -> (tempfile::TempDir, TaskHandle, TaskQueues, Shutdown) {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+        });
+        let queues = install_task_queues(
+            context,
+            task_handle.clone(),
+            JobsRuntime::new_paused(),
+            RoCrateLimits::default(),
+        )
+        .await;
+        (temp_dir, task_handle, queues, Shutdown::new())
+    }
+
+    // A stop accepted before restoration admits no restore unit.
+    #[tokio::test]
+    async fn cancelled_restore_restores_no_timer() {
+        let (temp, task_handle, queues, shutdown) = restore_queues().await;
+        persist_task_effect(
+            &queues.context.storage_handle,
+            &TaskEffect::ResetTimer {
+                key: TaskKey::RefreshBlobHolders,
+                after: Duration::from_secs(7200),
+            },
+        )
+        .await
+        .expect("timer persists");
+        let stop = CancellationToken::new();
+        stop.cancel();
+
+        queues
+            .restore_timers_and_start_until(&shutdown, &stop, || false)
+            .await;
+
+        let TaskEvent::TimerScheduled { after, .. } = task_handle
+            .schedule_idle_timer(TaskKey::RefreshBlobHolders, Duration::from_secs(3600))
+            .await
+        else {
+            panic!("expected timer schedule event");
+        };
+        assert_eq!(
+            after,
+            Duration::from_secs(3600),
+            "a cancelled restore must not restore the persisted timer"
+        );
+        drop(temp);
+    }
+
+    // A stop observed after the first unit finishes the current unit and skips
+    // the next one instead of racing and dropping it mid-flight.
+    #[tokio::test]
+    async fn stop_between_units_skips_the_next_restore() {
+        let (temp, task_handle, queues, shutdown) = restore_queues().await;
+        persist_task_effect(
+            &queues.context.storage_handle,
+            &TaskEffect::ResetTimer {
+                key: TaskKey::RefreshBlobHolders,
+                after: Duration::from_secs(7200),
+            },
+        )
+        .await
+        .expect("timer persists");
+        let checks = std::cell::Cell::new(0u32);
+        // The re-arm loop is not part of this unit sequence; stop it up front
+        // so only `restore_timers_and_start_until` can restore the timer.
+        shutdown.trigger();
+
+        queues
+            .restore_timers_and_start_until(&shutdown, &CancellationToken::new(), || {
+                checks.set(checks.get() + 1);
+                checks.get() > 1
+            })
+            .await;
+
+        assert!(checks.get() >= 2, "each unit boundary must be checked");
+        let TaskEvent::TimerScheduled { after, .. } = task_handle
+            .schedule_idle_timer(TaskKey::RefreshBlobHolders, Duration::from_secs(3600))
+            .await
+        else {
+            panic!("expected timer schedule event");
+        };
+        assert_eq!(
+            after,
+            Duration::from_secs(3600),
+            "the later restore unit must not run after the stop"
+        );
+        drop(temp);
+    }
 }
