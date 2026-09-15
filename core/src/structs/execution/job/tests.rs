@@ -17,11 +17,11 @@ fn user(realm: u8, byte: u8) -> UserId {
 #[test]
 fn digest_ignores_minter() {
     let document_id = Ulid::from_bytes([1; 16]);
-    let first = JobPayload::MintPersistentId(MintPersistentIdSpec {
+    let first = JobPayload::MintPersistentId(MintPersistentSpec {
         document_id,
         minted_by: user(1, 2),
     });
-    let second = JobPayload::MintPersistentId(MintPersistentIdSpec {
+    let second = JobPayload::MintPersistentId(MintPersistentSpec {
         document_id,
         minted_by: user(3, 4),
     });
