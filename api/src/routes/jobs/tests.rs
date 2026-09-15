@@ -1,4 +1,8 @@
 use super::*;
+use crate::jobs::{
+    MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs, output_buckets,
+    validate_output_prefixes, workspace_request,
+};
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
@@ -9,8 +13,15 @@ use aruna_core::structs::{
     JobProgress, JobResultPayload, NodeCapabilities, PathRestriction, Permission, RealmId,
     ReasonCode, RoCrateLimits,
 };
+use aruna_core::structs::{
+    CollisionPolicy, ComputeResources, ExecutionSpec, OutputDestination, WorkspaceMode,
+};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::DriverContext;
+use aruna_operations::jobs::command::{
+    ExecutionInput, ExecutionOutput, ExecutionTarget, InputMode,
+    WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
+};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
@@ -1015,7 +1026,7 @@ fn local_request() -> SubmitExecutionRequest {
         collision_policy: Default::default(),
         idempotency_key: None,
         workspace: None,
-        target: Some(ExecutionTarget::Local),
+        target: Some(super::ExecutionTarget::Local),
     }
 }
 
@@ -1096,7 +1107,7 @@ async fn device_checks_group() {
     let (_dir, state) = build_state().await;
     enroll_device(&state, user(2)).await;
 
-    for target in [None, Some(ExecutionTarget::Local)] {
+    for target in [None, Some(super::ExecutionTarget::Local)] {
         let result = submit_job(
             State(state.clone()),
             Extension(auth_for(user(2))),
@@ -1133,14 +1144,14 @@ async fn local_refuses_stranger() {
 #[test]
 fn local_names_holder() {
     // Only a local run may name the holder: the planner stores it otherwise.
-    let input = ExecutionInputRequest {
+    let input = ExecutionInput {
         bucket: "src".to_string(),
         key: "data.csv".to_string(),
         version_id: Some(Ulid::from_bytes([4u8; 16]).to_string()),
         source_node_id: Some(node_id().to_string()),
         dest_key: "data.csv".to_string(),
         container_path: None,
-        mode: InputModeRequest::Snapshot,
+        mode: InputMode::Snapshot,
     };
 
     assert!(matches!(
@@ -1202,14 +1213,14 @@ async fn rejects_huge_ram() {
 #[test]
 fn maps_native_input() {
     // Missing container_path defaults to /inputs/<dest_key>.
-    let input = ExecutionInputRequest {
+    let input = ExecutionInput {
         bucket: "src".to_string(),
         key: "data.csv".to_string(),
         version_id: None,
         source_node_id: None,
         dest_key: "in/data.csv".to_string(),
         container_path: None,
-        mode: InputModeRequest::Snapshot,
+        mode: InputMode::Snapshot,
     };
     let mapped = native_input(input.clone(), ExecutionTarget::Realm).unwrap();
     assert_eq!(
@@ -1217,7 +1228,7 @@ fn maps_native_input() {
         Some("/inputs/in/data.csv")
     );
 
-    let explicit = ExecutionInputRequest {
+    let explicit = ExecutionInput {
         container_path: Some("/data/input.csv".to_string()),
         ..input.clone()
     };
@@ -1229,15 +1240,15 @@ fn maps_native_input() {
         Some("/data/input.csv")
     );
 
-    let traversal = ExecutionInputRequest {
+    let traversal = ExecutionInput {
         container_path: Some("/in/../etc".to_string()),
         ..input
     };
     assert!(native_input(traversal, ExecutionTarget::Realm).is_err());
 }
 
-fn output_request(path: &str, key: &str, bucket: Option<&str>) -> ExecutionOutputRequest {
-    ExecutionOutputRequest {
+fn output_request(path: &str, key: &str, bucket: Option<&str>) -> ExecutionOutput {
+    ExecutionOutput {
         container_path: path.to_string(),
         dest_key: key.to_string(),
         bucket: bucket.map(str::to_string),
@@ -1383,8 +1394,8 @@ fn workspace_defaults_none() {
         (WorkspaceMode::None, None)
     );
     assert_eq!(
-        workspace_request(Some(WorkspaceRequest {
-            mode: WorkspaceModeRequest::None,
+        workspace_request(Some(WorkspaceSpec {
+            mode: CommandWorkspaceMode::None,
             bucket: None,
         }))
         .unwrap(),
@@ -1393,15 +1404,15 @@ fn workspace_defaults_none() {
     let record = job_for(job_id(1), user(2), 1);
     assert_eq!(job_status_response(&record).workspace_mode, "none");
     assert!(
-        workspace_request(Some(WorkspaceRequest {
-            mode: WorkspaceModeRequest::Existing,
+        workspace_request(Some(WorkspaceSpec {
+            mode: CommandWorkspaceMode::Existing,
             bucket: None,
         }))
         .is_err()
     );
     assert!(
-        workspace_request(Some(WorkspaceRequest {
-            mode: WorkspaceModeRequest::None,
+        workspace_request(Some(WorkspaceSpec {
+            mode: CommandWorkspaceMode::None,
             bucket: Some("shared".to_string()),
         }))
         .is_err()
@@ -1423,178 +1434,6 @@ async fn invalid_cursor_rejected() {
     assert!(matches!(result, Err(ServerError::BadRequest)));
 }
 
-/// The shape the portal posts for a session: no image, no command, an
-/// existing workspace bucket.
-fn session_body() -> SubmitExecutionRequest {
-    let mut tags = BTreeMap::new();
-    tags.insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
-    SubmitExecutionRequest {
-        group_id: Ulid::from_bytes([5u8; 16]).to_string(),
-        name: None,
-        description: None,
-        image: String::new(),
-        runtime: Some("python-notebook".to_string()),
-        session_idle_after_ms: Some(600_000),
-        session_mount: None,
-        entrypoint: None,
-        command: Vec::new(),
-        env: BTreeMap::new(),
-        tags,
-        workdir: None,
-        cpu_cores: None,
-        ram_bytes: None,
-        max_walltime_ms: None,
-        executor_constraint: None,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        output_prefixes: Vec::new(),
-        collision_policy: CollisionPolicyRequest::default(),
-        idempotency_key: None,
-        workspace: Some(WorkspaceRequest {
-            mode: WorkspaceModeRequest::Existing,
-            bucket: Some("lab-data".to_string()),
-        }),
-        target: None,
-    }
-}
-
-#[test]
-fn session_takes_catalog() {
-    let mut request = session_body();
-    session_request(&mut request, None).expect("a session submit is accepted");
-    let runtime = session_runtime("python-notebook").expect("the catalog holds it");
-    assert_eq!(request.cpu_cores, Some(2));
-    assert_eq!(request.ram_bytes, Some(4_000_000_000));
-    assert_eq!(request.image, runtime.image);
-    assert_eq!(request.command, vec![runtime.command[0].to_string()]);
-    assert_eq!(request.workdir.as_deref(), Some(SESSION_WORKDIR));
-    assert_eq!(
-        request.tags.get(SESSION_RUNTIME_TAG).map(String::as_str),
-        Some("python-notebook")
-    );
-    assert_eq!(
-        request.tags.get(SESSION_IDLE_TAG).map(String::as_str),
-        Some("600000")
-    );
-}
-
-#[test]
-fn session_keeps_resources() {
-    let mut request = session_body();
-    request.cpu_cores = Some(8);
-    request.ram_bytes = Some(16_000_000_000);
-    session_request(&mut request, None).expect("explicit resources are accepted");
-    assert_eq!(request.cpu_cores, Some(8));
-    assert_eq!(request.ram_bytes, Some(16_000_000_000));
-}
-
-#[test]
-fn session_refuses_image() {
-    for mutate in [
-        |request: &mut SubmitExecutionRequest| request.image = "alpine:3".to_string(),
-        |request: &mut SubmitExecutionRequest| request.entrypoint = Some(vec!["sh".to_string()]),
-        |request: &mut SubmitExecutionRequest| request.command = vec!["sh".to_string()],
-    ] {
-        let mut request = session_body();
-        mutate(&mut request);
-        assert!(session_request(&mut request, None).is_err());
-    }
-}
-
-#[test]
-fn session_needs_bucket() {
-    let mut request = session_body();
-    request.workspace = None;
-    assert!(session_request(&mut request, None).is_err());
-
-    let mut request = session_body();
-    request.workspace = Some(WorkspaceRequest {
-        mode: WorkspaceModeRequest::None,
-        bucket: None,
-    });
-    assert!(session_request(&mut request, None).is_err());
-}
-
-#[test]
-fn session_needs_runtime() {
-    let mut request = session_body();
-    request.runtime = None;
-    assert!(session_request(&mut request, None).is_err());
-
-    let mut request = session_body();
-    request.runtime = Some("nope".to_string());
-    assert!(session_request(&mut request, None).is_err());
-}
-
-#[test]
-fn runtime_needs_tag() {
-    // A catalog runtime outside a session would leave the image unpinned.
-    let mut request = session_body();
-    request.tags.clear();
-    assert!(session_request(&mut request, None).is_err());
-}
-
-#[test]
-fn session_mount_defaults() {
-    // An omitted block keeps the data/ folder below the working directory.
-    let mut request = session_body();
-    session_request(&mut request, None).expect("a session submit is accepted");
-    assert_eq!(
-        request
-            .tags
-            .get(SESSION_MOUNT_PREFIX_TAG)
-            .map(String::as_str),
-        Some("data/")
-    );
-    assert_eq!(
-        request.tags.get(SESSION_MOUNT_PATH_TAG).map(String::as_str),
-        Some("/work/data")
-    );
-}
-
-#[test]
-fn session_mount_chosen() {
-    // The caller picks the bucket folder and the kernel folder. The prefix
-    // ends in one slash, the path is normalised, and an empty prefix is the
-    // whole bucket.
-    let mut request = session_body();
-    request.workdir = Some("/home/user/".to_string());
-    request.session_mount = Some(SessionMountRequest {
-        prefix: Some(" raw/2024 ".to_string()),
-        path: Some("/home/user/project//raw/".to_string()),
-    });
-    session_request(&mut request, None).expect("a chosen mount is accepted");
-    assert_eq!(
-        request
-            .tags
-            .get(SESSION_MOUNT_PREFIX_TAG)
-            .map(String::as_str),
-        Some("raw/2024/")
-    );
-    assert_eq!(
-        request.tags.get(SESSION_MOUNT_PATH_TAG).map(String::as_str),
-        Some("/home/user/project/raw")
-    );
-
-    let mut request = session_body();
-    request.session_mount = Some(SessionMountRequest {
-        prefix: Some(String::new()),
-        path: None,
-    });
-    session_request(&mut request, None).expect("the whole bucket is accepted");
-    assert_eq!(
-        request
-            .tags
-            .get(SESSION_MOUNT_PREFIX_TAG)
-            .map(String::as_str),
-        Some("")
-    );
-    assert_eq!(
-        request.tags.get(SESSION_MOUNT_PATH_TAG).map(String::as_str),
-        Some("/work/data")
-    );
-}
-
 #[test]
 fn mount_path_checked() {
     // The whole bucket is checked on the bucket path; a folder on its own
@@ -1605,64 +1444,4 @@ fn mount_path_checked() {
         mount_permission_path(bucket.clone(), "raw/2024/"),
         format!("{bucket}/raw/2024")
     );
-}
-
-#[test]
-fn session_mount_refused() {
-    // A prefix must stay inside the bucket, and the folder must stay below
-    // the working directory and clear of the helper's socket directory.
-    for (prefix, path) in [
-        (Some("/raw"), None),
-        (Some("raw/../other"), None),
-        (Some("raw//2024"), None),
-        (Some("./raw"), None),
-        (None, Some("/work")),
-        (None, Some("/data")),
-        (None, Some("work/data")),
-        (None, Some("/work/.aruna/data")),
-        (None, Some("/work/../data")),
-    ] {
-        let mut request = session_body();
-        request.session_mount = Some(SessionMountRequest {
-            prefix: prefix.map(str::to_string),
-            path: path.map(str::to_string),
-        });
-        assert!(
-            session_request(&mut request, None).is_err(),
-            "{prefix:?} {path:?}"
-        );
-    }
-
-    // Outside a session the block has nothing to mount.
-    let mut request = local_request();
-    request.session_mount = Some(SessionMountRequest {
-        prefix: None,
-        path: None,
-    });
-    assert!(session_request(&mut request, None).is_err());
-}
-
-#[test]
-fn session_refuses_reserved() {
-    // The runtime, idle, expiry and mount tags are the node's to set.
-    for tag in [
-        SESSION_RUNTIME_TAG,
-        SESSION_IDLE_TAG,
-        SESSION_EXPIRY_TAG,
-        SESSION_MOUNT_PREFIX_TAG,
-        SESSION_MOUNT_PATH_TAG,
-    ] {
-        let mut request = session_body();
-        request.tags.insert(tag.to_string(), "x".to_string());
-        assert!(session_request(&mut request, None).is_err());
-    }
-}
-
-#[test]
-fn plain_run_untouched() {
-    // A run without the session tag keeps its own image and tags.
-    let mut request = local_request();
-    session_request(&mut request, None).expect("a plain run is untouched");
-    assert_eq!(request.image, "alpine:3");
-    assert!(!request.tags.contains_key(SESSION_RUNTIME_TAG));
 }
