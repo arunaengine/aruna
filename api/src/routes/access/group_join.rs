@@ -10,9 +10,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::join_request::{
     GroupJoinError, GroupJoinInput, GroupJoinOperation, JoinAction,
 };
-use aruna_operations::groups::list_requests::{
-    ListJoinRequestsError, ListJoinRequestsInput, ListJoinRequestsOperation,
-};
+use aruna_operations::groups::list_requests::{ListJoinError, ListJoinInput, ListJoinOperation};
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -214,7 +212,7 @@ async fn list(
         })
         .transpose()?;
     let page = drive(
-        ListJoinRequestsOperation::new(ListJoinRequestsInput {
+        ListJoinOperation::new(ListJoinInput {
             auth,
             group_id,
             pending_only: query.status.is_some(),
@@ -225,7 +223,7 @@ async fn list(
     )
     .await
     .map_err(|error| match error {
-        ListJoinRequestsError::Unauthorized => ServerError::Forbidden,
+        ListJoinError::Unauthorized => ServerError::Forbidden,
         other => ServerError::InternalError(other.to_string()),
     })?;
     let names = drive(

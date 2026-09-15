@@ -1,6 +1,4 @@
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, permission_granted, require_realm_auth,
-};
+use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
 use crate::server_state::ServerState;
@@ -14,12 +12,8 @@ use aruna_core::types::RoleId;
 use aruna_operations::device::realm_documents::install_group_docs;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::is_user_origin;
-use aruna_operations::groups::add_member::{
-    AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
-};
-use aruna_operations::groups::add_role::{
-    AddGroupRoleConfig, AddGroupRoleError, AddGroupRoleOperation,
-};
+use aruna_operations::groups::add_member::{AddUserError, AddUserInput, AddUserOperation};
+use aruna_operations::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation};
 use aruna_operations::groups::create_group::{
     CreateGroupConfig, CreateGroupError, CreateGroupOperation,
 };
@@ -27,21 +21,21 @@ use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create}
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::groups::remove_member::{
-    RemoveUserFromGroupError, RemoveUserFromGroupInput, RemoveUserFromGroupOperation,
+    RemoveFromError, RemoveFromInput, RemoveFromOperation,
 };
 use aruna_operations::groups::remove_role::{
-    RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
+    RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation,
 };
 use aruna_operations::groups::update_group::{
     UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
 };
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::stats::count_group_purpose;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::list_objects::{
-    ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Operation,
+    ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use axum::extract::{Path, Query, State};
@@ -110,7 +104,8 @@ pub struct RoleResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AddGroupMemberRequest {
+#[schema(as = AddGroupMemberRequest)]
+pub struct AddMemberRequest {
     pub user_id: String,
     /// Role ids to assign; defaults to the role named "user" when omitted.
     #[serde(default)]
@@ -123,14 +118,16 @@ pub struct GroupRolesResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
-pub struct RemoveGroupMemberQuery {
+#[schema(as = RemoveGroupMemberQuery)]
+pub struct RemoveMemberQuery {
     /// Revoke only this role; all roles when omitted.
     #[serde(default)]
     pub role_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateGroupRoleRequest {
+#[schema(as = CreateGroupRoleRequest)]
+pub struct CreateRoleRequest {
     pub name: String,
     /// Permission path -> "read" | "write" | "deny". Every path must stay
     /// inside the group.
@@ -144,7 +141,8 @@ pub struct CreateGroupRoleRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GroupMemberRoleResponse {
+#[schema(as = GroupMemberRoleResponse)]
+pub struct GroupRoleResponse {
     pub role_id: String,
     pub name: String,
 }
@@ -154,7 +152,7 @@ pub struct GroupMemberResponse {
     pub user_id: String,
     /// Display name from the user directory; None when the user is unresolvable.
     pub name: Option<String>,
-    pub roles: Vec<GroupMemberRoleResponse>,
+    pub roles: Vec<GroupRoleResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -433,7 +431,7 @@ realm's per-user group quota, from which WRITE on the realm group-admin path exe
 pub async fn create_group(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateGroupRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
     let auth = require_unrestricted(auth)?;
@@ -488,7 +486,7 @@ pub async fn create_group(
     let owner_cap = if is_realm_admin {
         None
     } else {
-        let realm_config = drive(GetRealmConfigOperation::new(realm_id), &state.get_ctx())
+        let realm_config = drive(GetConfigOperation::new(realm_id), &state.get_ctx())
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
         realm_config.quota.max_groups_for(&auth.user_id)
@@ -876,40 +874,36 @@ fn map_rename_error(error: UpdateGroupError) -> ServerError {
     }
 }
 
-fn map_member_error(error: AddUserToGroupError) -> ServerError {
+fn map_member_error(error: AddUserError) -> ServerError {
     match error {
-        AddUserToGroupError::Unauthorized => ServerError::Forbidden,
-        AddUserToGroupError::InvalidUserId => ServerError::BadRequest,
-        AddUserToGroupError::RoleNotFound | AddUserToGroupError::AuthDocNotFound => {
-            ServerError::NotFound
-        }
+        AddUserError::Unauthorized => ServerError::Forbidden,
+        AddUserError::InvalidUserId => ServerError::BadRequest,
+        AddUserError::RoleNotFound | AddUserError::AuthDocNotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
-fn map_role_error(error: AddGroupRoleError) -> ServerError {
+fn map_role_error(error: AddRoleError) -> ServerError {
     match error {
-        AddGroupRoleError::Unauthorized => ServerError::Forbidden,
-        AddGroupRoleError::InvalidPublicRole
-        | AddGroupRoleError::InvalidAssignedUser
-        | AddGroupRoleError::UnconfinedRolePath
-        | AddGroupRoleError::ReservedRoleName => ServerError::BadRequest,
-        AddGroupRoleError::GroupNotFound => ServerError::NotFound,
-        AddGroupRoleError::CheckPermissionsError(
+        AddRoleError::Unauthorized => ServerError::Forbidden,
+        AddRoleError::InvalidPublicRole
+        | AddRoleError::InvalidAssignedUser
+        | AddRoleError::UnconfinedRolePath
+        | AddRoleError::ReservedRoleName => ServerError::BadRequest,
+        AddRoleError::GroupNotFound => ServerError::NotFound,
+        AddRoleError::CheckPermissionsError(
             AuthorizationError::GroupNotFound | AuthorizationError::AuthDocNotFound,
         ) => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
-fn map_removal_error(error: RemoveUserFromGroupError) -> ServerError {
+fn map_removal_error(error: RemoveFromError) -> ServerError {
     match error {
-        RemoveUserFromGroupError::Unauthorized => ServerError::Forbidden,
-        RemoveUserFromGroupError::InvalidUserId => ServerError::BadRequest,
-        RemoveUserFromGroupError::RoleNotFound | RemoveUserFromGroupError::AuthDocNotFound => {
-            ServerError::NotFound
-        }
-        RemoveUserFromGroupError::LastAdmin => {
+        RemoveFromError::Unauthorized => ServerError::Forbidden,
+        RemoveFromError::InvalidUserId => ServerError::BadRequest,
+        RemoveFromError::RoleNotFound | RemoveFromError::AuthDocNotFound => ServerError::NotFound,
+        RemoveFromError::LastAdmin => {
             ServerError::Conflict("the last admin of a group cannot be removed".to_string())
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1029,7 +1023,7 @@ pub(crate) async fn run_group_usage(
     // Best effort: omit the quota block rather than failing the request if the
     // realm config is unavailable.
     if let Ok(config) = drive(
-        GetRealmConfigOperation::new(state.get_realm_id()),
+        GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
@@ -1113,7 +1107,7 @@ pub(crate) async fn run_group_members(
         return Err(ServerError::Forbidden);
     }
 
-    let mut roles_by_user: HashMap<UserId, Vec<GroupMemberRoleResponse>> = HashMap::new();
+    let mut roles_by_user: HashMap<UserId, Vec<GroupRoleResponse>> = HashMap::new();
     for (role_id, role) in &auth_doc.roles {
         for user in &role.assigned_users {
             if user.is_nil() {
@@ -1122,7 +1116,7 @@ pub(crate) async fn run_group_members(
             roles_by_user
                 .entry(*user)
                 .or_default()
-                .push(GroupMemberRoleResponse {
+                .push(GroupRoleResponse {
                     role_id: role_id.to_string(),
                     name: role.name.clone(),
                 });
@@ -1189,7 +1183,7 @@ administrative path for the user being added, so authority can be granted per me
 - Adding a user who already holds the roles is accepted and changes nothing.
 - The change commits here and reaches the rest of the realm through document sync."#,
     request_body(
-        content = AddGroupMemberRequest,
+        content = AddMemberRequest,
         description = "User to add, and optionally the exact roles to assign instead of the default `user` role.",
         example = json!({
             "user_id": "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
@@ -1230,7 +1224,7 @@ pub async fn add_group_member(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
-    Json(request): Json<AddGroupMemberRequest>,
+    Json(request): Json<AddMemberRequest>,
 ) -> ServerResult<(StatusCode, Json<GroupRolesResponse>)> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
@@ -1273,7 +1267,7 @@ pub async fn add_group_member(
     }
 
     let auth_doc = drive(
-        AddUserToGroupOperation::new(AddUserToGroupInput {
+        AddUserOperation::new(AddUserInput {
             actor: actor_for(&state, &auth),
             group_id,
             user_id,
@@ -1328,7 +1322,7 @@ pub async fn remove_group_member(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, user_id)): Path<(String, String)>,
-    Query(query): Query<RemoveGroupMemberQuery>,
+    Query(query): Query<RemoveMemberQuery>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
@@ -1357,7 +1351,7 @@ pub async fn remove_group_member(
     }
 
     drive(
-        RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
+        RemoveFromOperation::new(RemoveFromInput {
             actor: actor_for(&state, &auth),
             group_id,
             user_id,
@@ -1408,7 +1402,7 @@ pub async fn leave_group(
     refuse_group_edit(&state).await?;
 
     drive(
-        RemoveUserFromGroupOperation::new(RemoveUserFromGroupInput {
+        RemoveFromOperation::new(RemoveFromInput {
             actor: actor_for(&state, &auth),
             group_id,
             user_id: auth.user_id,
@@ -1445,7 +1439,7 @@ administrative path.
 - A public role applies to every principal including anonymous callers, so it may only carry `READ`
   grants."#,
     request_body(
-        content = CreateGroupRoleRequest,
+        content = CreateRoleRequest,
         description = "Role name, the permission paths it grants inside the group, and the users it is assigned to.",
         example = json!({
             "name": "readers",
@@ -1488,7 +1482,7 @@ pub async fn create_group_role(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
-    Json(request): Json<CreateGroupRoleRequest>,
+    Json(request): Json<CreateRoleRequest>,
 ) -> ServerResult<(StatusCode, Json<RoleResponse>)> {
     let auth = require_unrestricted(auth)?;
     let group_id = parse_group_id(&group_id)?;
@@ -1543,7 +1537,7 @@ pub async fn create_group_role(
 
     let role_id = Ulid::generate();
     let (_, auth_doc) = drive(
-        AddGroupRoleOperation::new(AddGroupRoleConfig {
+        AddRoleOperation::new(AddRoleConfig {
             auth_context: auth.clone(),
             actor: actor_for(&state, &auth),
             realm_id,
@@ -1618,7 +1612,7 @@ pub async fn delete_group_role(
     .await?;
 
     drive(
-        RemoveGroupRoleOperation::new(RemoveGroupRoleConfig {
+        RemoveGroupOperation::new(RemoveGroupConfig {
             auth_context: auth.clone(),
             actor: actor_for(&state, &auth),
             realm_id: state.get_realm_id(),
@@ -1629,11 +1623,9 @@ pub async fn delete_group_role(
     )
     .await
     .map_err(|error| match error {
-        RemoveGroupRoleError::Unauthorized => ServerError::Forbidden,
-        RemoveGroupRoleError::RoleNotFound | RemoveGroupRoleError::AuthDocNotFound => {
-            ServerError::NotFound
-        }
-        RemoveGroupRoleError::AdminRoleUndeletable => {
+        RemoveGroupError::Unauthorized => ServerError::Forbidden,
+        RemoveGroupError::RoleNotFound | RemoveGroupError::AuthDocNotFound => ServerError::NotFound,
+        RemoveGroupError::AdminRoleUndeletable => {
             ServerError::Conflict("the admin role cannot be deleted".to_string())
         }
         other => ServerError::InternalError(other.to_string()),
@@ -1880,7 +1872,7 @@ async fn list_bucket_objects(
 
     let continuation_token = decode_object_token(continuation_token)?;
     let result = drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: bucket.to_string(),
             group_id,
             continuation_token,
@@ -1927,13 +1919,13 @@ pub(crate) async fn get_bucket_group(
     bucket: &str,
 ) -> ServerResult<Option<Ulid>> {
     match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(info) => Ok(Some(info.group_id)),
-        Err(GetBucketInfoError::NotFound) => Ok(None),
+        Err(GetBucketError::NotFound) => Ok(None),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }
@@ -1953,20 +1945,18 @@ fn encode_bucket_token(bucket: String) -> String {
     STANDARD.encode(bucket.as_bytes())
 }
 
-fn decode_object_token(
-    token: Option<&str>,
-) -> ServerResult<Option<ListObjectsV2ContinuationToken>> {
+fn decode_object_token(token: Option<&str>) -> ServerResult<Option<ListContinuationToken>> {
     token
         .map(|token| {
             let bytes = STANDARD
                 .decode(token)
                 .map_err(|_| ServerError::BadRequest)?;
-            ListObjectsV2ContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
+            ListContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
         })
         .transpose()
 }
 
-fn encode_object_token(token: ListObjectsV2ContinuationToken) -> ServerResult<String> {
+fn encode_object_token(token: ListContinuationToken) -> ServerResult<String> {
     token
         .to_bytes()
         .map(|bytes| STANDARD.encode(bytes))
@@ -1974,4 +1964,5 @@ fn encode_object_token(token: ListObjectsV2ContinuationToken) -> ServerResult<St
 }
 
 #[cfg(test)]
+#[path = "groups_tests.rs"]
 mod tests;

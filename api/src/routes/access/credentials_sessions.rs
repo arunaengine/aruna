@@ -2,16 +2,15 @@ use super::{
     authorize_credential_issuance, build_credential_restrictions, format_node_id,
     format_system_time, serialize_restrictions,
 };
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
+use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, PathRestriction, S3_SESSION_ACCESS_PREFIX, S3Session};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::s3::session::{
-    CreateS3SessionConfig, CreateS3SessionOperation, GetS3SessionOperation,
-    ListS3SessionsOperation, RefreshS3SessionConfig, RefreshS3SessionOperation,
-    RevokeS3SessionConfig, RevokeS3SessionOperation, S3SessionCredentials, S3SessionError,
+    CreateS3Config, CreateS3Operation, GetS3Operation, ListSessionsOperation, RefreshS3Config,
+    RefreshS3Operation, RevokeS3Config, RevokeS3Operation, S3SessionCredentials, S3SessionError,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -32,52 +31,59 @@ pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
-pub struct CreateS3SessionRequest {
+#[schema(as = CreateS3SessionRequest)]
+pub struct S3SessionRequest {
     pub group_id: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
-pub struct S3SessionGroupResponse {
+#[schema(as = S3SessionGroupResponse)]
+pub struct SessionGroupResponse {
     pub id: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
-pub struct S3SessionIssuerResponse {
+#[schema(as = S3SessionIssuerResponse)]
+pub struct SessionIssuerResponse {
     pub node_id: String,
     pub s3_endpoint: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
-pub struct S3SessionRestrictionResponse {
+#[schema(as = S3SessionRestrictionResponse)]
+pub struct SessionRestrictionResponse {
     pub pattern: String,
     pub permission: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
-pub struct S3SessionResponse {
+#[schema(as = S3SessionResponse)]
+pub struct SessionTokenResponse {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: String,
     pub expires_at: String,
-    pub group: S3SessionGroupResponse,
-    pub restrictions: Vec<S3SessionRestrictionResponse>,
-    pub issuer_node: S3SessionIssuerResponse,
+    pub group: SessionGroupResponse,
+    pub restrictions: Vec<SessionRestrictionResponse>,
+    pub issuer_node: SessionIssuerResponse,
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
-pub struct S3SessionSummaryResponse {
+#[schema(as = S3SessionSummaryResponse)]
+pub struct SessionSummaryResponse {
     pub access_key_id: String,
     pub created_at: Option<String>,
     pub expires_at: String,
     pub last_used_at: Option<String>,
-    pub group: S3SessionGroupResponse,
-    pub restrictions: Vec<S3SessionRestrictionResponse>,
-    pub issuer_node: S3SessionIssuerResponse,
+    pub group: SessionGroupResponse,
+    pub restrictions: Vec<SessionRestrictionResponse>,
+    pub issuer_node: SessionIssuerResponse,
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
-pub struct ListS3SessionsResponse {
-    pub sessions: Vec<S3SessionSummaryResponse>,
+#[schema(as = ListS3SessionsResponse)]
+pub struct S3SessionsResponse {
+    pub sessions: Vec<SessionSummaryResponse>,
 }
 
 #[utoipa::path(
@@ -99,7 +105,7 @@ write scope on that group's data path. A read-only member receives a read-only s
 - Expiry is the earlier of one hour from issuance and the bearer token's own expiry.
 - At most four sessions are kept per user and group; a further exchange evicts the oldest one."#,
     request_body(
-        content = CreateS3SessionRequest,
+        content = S3SessionRequest,
         description = "The explicitly selected group; group_id is required.",
         example = json!({
             "group_id": "01JGRP00123456789ABCDEFGHJ"
@@ -109,7 +115,7 @@ write scope on that group's data path. A read-only member receives a read-only s
         (
             status = 201,
             description = "A new node-local S3 session; the secret and token are redacted in this example and returned in full to the caller",
-            body = S3SessionResponse,
+            body = SessionTokenResponse,
             example = json!({
                 "access_key_id": "ARUNASESSION0123456789AB",
                 "secret_access_key": "<redacted>",
@@ -139,9 +145,9 @@ write scope on that group's data path. A read-only member receives a read-only s
 pub async fn create_s3_session(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
-    Json(request): Json<CreateS3SessionRequest>,
-) -> ServerResult<(StatusCode, Json<S3SessionResponse>)> {
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    Json(request): Json<S3SessionRequest>,
+) -> ServerResult<(StatusCode, Json<SessionTokenResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let group_id = request
@@ -152,8 +158,8 @@ pub async fn create_s3_session(
     let now = SystemTime::now();
     let expiry = session_expiry(now, bearer.expires_at_secs())?;
     let credentials = drive(
-        CreateS3SessionOperation::new(
-            CreateS3SessionConfig {
+        CreateS3Operation::new(
+            CreateS3Config {
                 user_identity: auth.user_id,
                 group_id,
                 now,
@@ -191,7 +197,7 @@ listing is scoped to the caller and carries no permission of its own.
         (
             status = 200,
             description = "The caller's active sessions on this node",
-            body = ListS3SessionsResponse,
+            body = S3SessionsResponse,
             example = json!({
                 "sessions": [{
                     "access_key_id": "ARUNASESSION0123456789AB",
@@ -222,7 +228,7 @@ listing is scoped to the caller and carries no permission of its own.
 pub async fn list_s3_sessions(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-) -> ServerResult<(StatusCode, Json<ListS3SessionsResponse>)> {
+) -> ServerResult<(StatusCode, Json<S3SessionsResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let now = SystemTime::now();
     let issued_by = *state.get_node_id().as_bytes();
@@ -231,14 +237,14 @@ pub async fn list_s3_sessions(
         .await
         .s3
         .map(|interface| interface.base_url);
-    let sessions = drive(ListS3SessionsOperation::new(auth.user_id), &state.get_ctx())
+    let sessions = drive(ListSessionsOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?
         .into_iter()
         .filter(|session| session.issued_by == issued_by && !session.is_expired(now))
         .map(|session| session_summary(session, s3_endpoint.clone()))
         .collect();
-    Ok((StatusCode::OK, Json(ListS3SessionsResponse { sessions })))
+    Ok((StatusCode::OK, Json(S3SessionsResponse { sessions })))
 }
 
 #[utoipa::path(
@@ -264,7 +270,7 @@ session's group with READ or WRITE on some path under its data root.
         (
             status = 200,
             description = "The same access key id with a rotated secret and session token, redacted in this example",
-            body = S3SessionResponse,
+            body = SessionTokenResponse,
             example = json!({
                 "access_key_id": "ARUNASESSION0123456789AB",
                 "secret_access_key": "<redacted>",
@@ -295,18 +301,15 @@ session's group with READ or WRITE on some path under its data root.
 pub async fn refresh_s3_session(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(access_key_id): Path<String>,
-) -> ServerResult<(StatusCode, Json<S3SessionResponse>)> {
+) -> ServerResult<(StatusCode, Json<SessionTokenResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
-    let session = drive(
-        GetS3SessionOperation::new(access_key_id.clone()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
-    .ok_or(ServerError::NotFound)?;
+    let session = drive(GetS3Operation::new(access_key_id.clone()), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .ok_or(ServerError::NotFound)?;
     if session.user_identity != auth.user_id || session.issued_by != *state.get_node_id().as_bytes()
     {
         return Err(ServerError::NotFound);
@@ -315,8 +318,8 @@ pub async fn refresh_s3_session(
     let now = SystemTime::now();
     let expiry = session_expiry(now, bearer.expires_at_secs())?;
     let credentials = drive(
-        RefreshS3SessionOperation::new(
-            RefreshS3SessionConfig {
+        RefreshS3Operation::new(
+            RefreshS3Config {
                 access_key: access_key_id,
                 user_identity: auth.user_id,
                 group_id: session.group_id,
@@ -368,7 +371,7 @@ pub async fn revoke_s3_session(
 ) -> ServerResult<StatusCode> {
     let auth = require_realm_auth(&state, auth)?;
     drive(
-        RevokeS3SessionOperation::new(RevokeS3SessionConfig {
+        RevokeS3Operation::new(RevokeS3Config {
             access_key: access_key_id,
             user_identity: auth.user_id,
             issued_by: *state.get_node_id().as_bytes(),
@@ -433,18 +436,18 @@ fn session_expiry(now: SystemTime, bearer_expiry: u64) -> ServerResult<SystemTim
 async fn session_response(
     state: &ServerState,
     credentials: S3SessionCredentials,
-) -> S3SessionResponse {
+) -> SessionTokenResponse {
     let s3_endpoint = state
         .interface_state()
         .await
         .s3
         .map(|interface| interface.base_url);
-    S3SessionResponse {
+    SessionTokenResponse {
         access_key_id: credentials.access_key_id,
         secret_access_key: credentials.secret_access_key.expose().to_string(),
         session_token: credentials.session_token.expose().to_string(),
         expires_at: format_system_time(credentials.session.expiry),
-        group: S3SessionGroupResponse {
+        group: SessionGroupResponse {
             id: credentials.session.group_id.to_string(),
         },
         restrictions: credentials
@@ -452,12 +455,12 @@ async fn session_response(
             .path_restrictions
             .unwrap_or_default()
             .into_iter()
-            .map(|restriction| S3SessionRestrictionResponse {
+            .map(|restriction| SessionRestrictionResponse {
                 pattern: restriction.pattern,
                 permission: restriction.permission.to_string(),
             })
             .collect(),
-        issuer_node: S3SessionIssuerResponse {
+        issuer_node: SessionIssuerResponse {
             node_id: format_node_id(credentials.session.issued_by),
             s3_endpoint,
         },
@@ -473,27 +476,27 @@ fn session_issued(access_key: &str) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_millis(key_id.timestamp_ms()))
 }
 
-fn session_summary(session: S3Session, s3_endpoint: Option<String>) -> S3SessionSummaryResponse {
+fn session_summary(session: S3Session, s3_endpoint: Option<String>) -> SessionSummaryResponse {
     let created_at = session_issued(&session.access_key).map(format_system_time);
     let restrictions = session
         .path_restrictions
         .unwrap_or_default()
         .into_iter()
-        .map(|restriction| S3SessionRestrictionResponse {
+        .map(|restriction| SessionRestrictionResponse {
             pattern: restriction.pattern,
             permission: restriction.permission.to_string(),
         })
         .collect();
-    S3SessionSummaryResponse {
+    SessionSummaryResponse {
         access_key_id: session.access_key,
         created_at,
         expires_at: format_system_time(session.expiry),
         last_used_at: session.last_used_at.map(format_system_time),
-        group: S3SessionGroupResponse {
+        group: SessionGroupResponse {
             id: session.group_id.to_string(),
         },
         restrictions,
-        issuer_node: S3SessionIssuerResponse {
+        issuer_node: SessionIssuerResponse {
             node_id: format_node_id(session.issued_by),
             s3_endpoint,
         },
@@ -535,4 +538,5 @@ fn map_revoke_error(error: S3SessionError) -> ServerError {
 }
 
 #[cfg(test)]
+#[path = "credentials_sessions_tests.rs"]
 mod tests;

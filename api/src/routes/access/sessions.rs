@@ -1,4 +1,4 @@
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_auth};
+use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::structs::{Actor, AuthContext, SessionKind, UserSession};
@@ -162,7 +162,7 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
 pub async fn create_session(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateSessionRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateSessionResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
@@ -307,7 +307,7 @@ mod tests {
     use super::*;
     use crate::auth::handle_token;
     use crate::error::TokenError;
-    use crate::tests::fixtures::routes::{test_context, test_state, test_storage};
+    use crate::tests::routes::{test_context, test_state, test_storage};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::{NodeCapabilities, RealmId, SessionRef};
@@ -363,9 +363,7 @@ mod tests {
         let error = create_session(
             State(state),
             Extension(Some(auth)),
-            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-                "parent",
-            ))),
+            Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "unknown".to_string(),
                 label: None,
@@ -387,9 +385,7 @@ mod tests {
         let error = create_session(
             State(state.clone()),
             Extension(Some(auth)),
-            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-                "parent",
-            ))),
+            Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "portal".to_string(),
                 label: None,
@@ -437,9 +433,7 @@ mod tests {
         let (_, Json(created)) = create_session(
             State(state.clone()),
             Extension(Some(auth.clone())),
-            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-                "parent",
-            ))),
+            Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "assistant".to_string(),
                 label: None,
@@ -468,9 +462,7 @@ mod tests {
         let (_, Json(created)) = create_session(
             State(state.clone()),
             Extension(Some(auth.clone())),
-            Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-                "parent",
-            ))),
+            Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "api".to_string(),
                 label: None,

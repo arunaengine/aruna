@@ -6,12 +6,11 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::s3::create_access::{
-    CreateUserAccessConfig, CreateUserAccessError, CreateUserAccessOperation,
-    DEFAULT_CREDENTIAL_TTL,
+    CreateUserConfig, CreateUserError, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
 };
-use aruna_operations::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
-use aruna_operations::s3::list_access::{ListUserAccessInput, ListUserAccessOperation};
-use aruna_operations::s3::revoke_access::{RevokeUserAccessError, RevokeUserAccessOperation};
+use aruna_operations::s3::get_access::{GetAccessError, GetAccessOperation};
+use aruna_operations::s3::list_access::{ListUserInput, ListUserOperation};
+use aruna_operations::s3::revoke_access::{RevokeUserError, RevokeUserOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -24,6 +23,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+#[path = "credentials_sessions.rs"]
 mod sessions;
 
 #[derive(OpenApi)]
@@ -40,27 +40,31 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateS3PathRestriction {
+#[schema(as = CreateS3PathRestriction)]
+pub struct CreatePathRestriction {
     pub pattern: String,
     pub permission: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateS3CredentialsRequest {
+#[schema(as = CreateS3CredentialsRequest)]
+pub struct CreateS3Request {
     pub group_id: String,
     #[schema(default = 31536000)]
     pub expires_in_seconds: Option<u64>,
-    pub path_restrictions: Option<Vec<CreateS3PathRestriction>>,
+    pub path_restrictions: Option<Vec<CreatePathRestriction>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateS3CredentialsResponse {
+#[schema(as = CreateS3CredentialsResponse)]
+pub struct CreateS3Response {
     pub access_key_id: String,
     pub access_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct S3PathRestrictionResponse {
+#[schema(as = S3PathRestrictionResponse)]
+pub struct S3RestrictionResponse {
     pub pattern: String,
     pub permission: String,
 }
@@ -74,19 +78,21 @@ pub enum CredentialStatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct S3CredentialSummaryResponse {
+#[schema(as = S3CredentialSummaryResponse)]
+pub struct S3CredentialResponse {
     pub access_key_id: String,
     pub group_id: String,
     pub expires_at: String,
     pub revoked_at: Option<String>,
     pub issued_by: String,
-    pub path_restrictions: Vec<S3PathRestrictionResponse>,
+    pub path_restrictions: Vec<S3RestrictionResponse>,
     pub status: CredentialStatusResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListS3CredentialsResponse {
-    pub credentials: Vec<S3CredentialSummaryResponse>,
+#[schema(as = ListS3CredentialsResponse)]
+pub struct ListS3Response {
+    pub credentials: Vec<S3CredentialResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,7 +229,7 @@ fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRes
         (
             status = 200,
             description = "The caller's credentials held by this node, with every secret access key omitted",
-            body = ListS3CredentialsResponse,
+            body = ListS3Response,
             example = json!({
                 "credentials": [
                     {
@@ -251,11 +257,11 @@ fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRes
 pub async fn list_s3_credentials(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-) -> ServerResult<(StatusCode, Json<ListS3CredentialsResponse>)> {
+) -> ServerResult<(StatusCode, Json<ListS3Response>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
 
     let credentials = drive(
-        ListUserAccessOperation::new(ListUserAccessInput {
+        ListUserOperation::new(ListUserInput {
             user_identity: auth.user_id,
         }),
         &state.get_ctx(),
@@ -265,7 +271,7 @@ pub async fn list_s3_credentials(
 
     Ok((
         StatusCode::OK,
-        Json(ListS3CredentialsResponse {
+        Json(ListS3Response {
             credentials: credentials.into_iter().map(map_redacted_access).collect(),
         }),
     ))
@@ -296,7 +302,7 @@ to the group data root and can never widen them.
   insensitively; at most 50 restrictions are accepted.
 - A user holds at most 16 active credentials."#,
     request_body(
-        content = CreateS3CredentialsRequest,
+        content = CreateS3Request,
         description = "Group the credential is bound to, an optional lifetime in seconds, and optional path restrictions",
         example = json!({
             "group_id": "01JGRP00123456789ABCDEFGHJ",
@@ -313,7 +319,7 @@ to the group data root and can never widen them.
         (
             status = 201,
             description = "Credential created; `access_secret` is the plaintext secret access key and is shown only here",
-            body = CreateS3CredentialsResponse,
+            body = CreateS3Response,
             example = json!({
                 "access_key_id": "01JAKEY0123456789ABCDEFGHJ",
                 "access_secret": "<one-time-secret-shown-only-in-this-response>"
@@ -329,8 +335,8 @@ to the group data root and can never widen them.
 pub async fn create_s3_credentials(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Json(request): Json<CreateS3CredentialsRequest>,
-) -> ServerResult<(StatusCode, Json<CreateS3CredentialsResponse>)> {
+    Json(request): Json<CreateS3Request>,
+) -> ServerResult<(StatusCode, Json<CreateS3Response>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
     let node_id = state.get_node_id();
@@ -362,8 +368,8 @@ pub async fn create_s3_credentials(
     }
     let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
     let result = drive(
-        CreateUserAccessOperation::new(
-            CreateUserAccessConfig {
+        CreateUserOperation::new(
+            CreateUserConfig {
                 user_identity,
                 group_id,
                 expiry,
@@ -379,12 +385,12 @@ pub async fn create_s3_credentials(
     match result {
         Ok((access_key_id, access_secret, _)) => Ok((
             StatusCode::CREATED,
-            Json(CreateS3CredentialsResponse {
+            Json(CreateS3Response {
                 access_key_id,
                 access_secret: access_secret.expose().to_string(),
             }),
         )),
-        Err(CreateUserAccessError::LimitReached) => Err(ServerError::Conflict(
+        Err(CreateUserError::LimitReached) => Err(ServerError::Conflict(
             "active credential limit reached".to_string(),
         )),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
@@ -423,13 +429,13 @@ pub async fn revoke_s3_credentials(
     let auth = require_unrestricted_auth(&state, auth)?;
 
     let credential = match drive(
-        GetUserAccessOperation::new(access_key_id.clone()),
+        GetAccessOperation::new(access_key_id.clone()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(credential) => credential,
-        Err(GetUserAccessError::NotFound) => return Err(ServerError::NotFound),
+        Err(GetAccessError::NotFound) => return Err(ServerError::NotFound),
         Err(err) => return Err(ServerError::InternalError(err.to_string())),
     };
 
@@ -448,24 +454,19 @@ pub async fn revoke_s3_credentials(
         .await?;
     }
 
-    match drive(
-        RevokeUserAccessOperation::new(access_key_id),
-        &state.get_ctx(),
-    )
-    .await
-    {
+    match drive(RevokeUserOperation::new(access_key_id), &state.get_ctx()).await {
         Ok(_) => Ok(StatusCode::NO_CONTENT),
-        Err(RevokeUserAccessError::NotFound) => Err(ServerError::NotFound),
+        Err(RevokeUserError::NotFound) => Err(ServerError::NotFound),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }
 
-fn map_redacted_access(access: UserAccess) -> S3CredentialSummaryResponse {
+fn map_redacted_access(access: UserAccess) -> S3CredentialResponse {
     let now = SystemTime::now();
     let status = credential_status(&access, now);
     let expires_at = format_system_time(access.expiry);
     let revoked_at = access.revoked_at.map(format_system_time);
-    S3CredentialSummaryResponse {
+    S3CredentialResponse {
         access_key_id: access.access_key,
         group_id: access.group_id.to_string(),
         expires_at,
@@ -475,7 +476,7 @@ fn map_redacted_access(access: UserAccess) -> S3CredentialSummaryResponse {
             .path_restrictions
             .unwrap_or_default()
             .into_iter()
-            .map(|restriction| S3PathRestrictionResponse {
+            .map(|restriction| S3RestrictionResponse {
                 pattern: restriction.pattern,
                 permission: restriction.permission.to_string(),
             })
@@ -521,7 +522,7 @@ async fn build_credential_restrictions(
     auth: &AuthContext,
     state: &ServerState,
     group_id: Ulid,
-    requested_restrictions: Option<Vec<CreateS3PathRestriction>>,
+    requested_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
     let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
     let auth_restrictions = normalize_auth_restrictions(auth, &group_root)?;
@@ -567,7 +568,7 @@ fn normalize_auth_restrictions(
 }
 
 fn normalize_requested_restrictions(
-    requested_restrictions: Option<Vec<CreateS3PathRestriction>>,
+    requested_restrictions: Option<Vec<CreatePathRestriction>>,
     group_root: &str,
 ) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
     let Some(requested_restrictions) = requested_restrictions else {
@@ -699,11 +700,9 @@ async fn authorize_credential_issuance(
                 Err(error) => return Err(error),
             }
         }
-        // A member whose roles reach only part of the group data may still
-        // take a credential: it inherits those roles and every S3 request is
-        // authorized against them. The derived roots are the authorization
-        // surface; probing their bare directory path would ask a `/**` grant
-        // to match the directory itself.
+        // A member whose roles reach only part of the group data may still take
+        // a credential: authorization uses the derived roots, while probing the
+        // bare directory would ask a `/**` grant to match the directory itself.
         let roots = aruna_operations::auth::permission_rules::reachable_roots(
             &state.get_ctx(),
             &effective_auth,
@@ -774,4 +773,5 @@ fn parse_permission(permission: &str) -> ServerResult<Permission> {
 }
 
 #[cfg(test)]
+#[path = "credentials_tests.rs"]
 mod tests;
