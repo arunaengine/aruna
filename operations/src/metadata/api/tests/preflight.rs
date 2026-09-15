@@ -1,5 +1,10 @@
 use super::*;
 
+use super::super::preflight::{
+    assemble_preflight_execution, plan_preflight_request, resolve_preflight_targets,
+    verify_preflight_cursor,
+};
+
 #[tokio::test]
 async fn preflight_fanout_reports() {
     let directory = tempdir().unwrap();
@@ -141,4 +146,173 @@ fn preflight_cursor_pagination() {
 
     assert_eq!(returned, vec!["document-0", "document-1", "document-2"]);
     assert!(watermark.is_none());
+}
+
+fn content_w3id(hash: [u8; 32]) -> String {
+    format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash))
+}
+
+fn preflight_request(
+    realm_id: RealmId,
+    content_w3ids: Vec<String>,
+    limit: Option<usize>,
+) -> MetadataReferencePreflightRequest {
+    MetadataReferencePreflightRequest {
+        auth: AuthContext {
+            user_id: UserId::nil(realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        bearer_token: None,
+        target: MetadataReferencePreflightTarget::ContentW3ids {
+            content_w3ids,
+            remove_all_resolvable_locations: false,
+        },
+        s3_endpoint: None,
+        limit,
+        cursor: None,
+        mode: None,
+        target_nodes: None,
+        allow_partial: false,
+    }
+}
+
+#[test]
+fn preflight_plan_scopes_and_clamps_limit() {
+    let realm_id = RealmId::from_bytes([76u8; 32]);
+    let target = || vec![content_w3id([1u8; 32])];
+    assert!(matches!(
+        plan_preflight_request(
+            realm_id,
+            preflight_request(RealmId::from_bytes([77u8; 32]), target(), None)
+        ),
+        Err(MetadataApiError::Forbidden)
+    ));
+
+    let (plan, target_value) =
+        plan_preflight_request(realm_id, preflight_request(realm_id, target(), None))
+            .expect("default plan");
+    assert_eq!(plan.page_size, METADATA_REFERENCES_DEFAULT_LIMIT);
+    assert!(matches!(
+        target_value,
+        MetadataReferencePreflightTarget::ContentW3ids { .. }
+    ));
+    let (plan, _) =
+        plan_preflight_request(realm_id, preflight_request(realm_id, target(), Some(0)))
+            .expect("zero limit clamps");
+    assert_eq!(plan.page_size, 1);
+    let (plan, _) = plan_preflight_request(
+        realm_id,
+        preflight_request(realm_id, target(), Some(usize::MAX)),
+    )
+    .expect("large limit clamps");
+    assert_eq!(plan.page_size, METADATA_REFERENCES_MAX_LIMIT);
+}
+
+#[tokio::test]
+async fn preflight_stages_reject_invalid_reference_cursor_and_partial_result() {
+    let test = metadata_test();
+    let realm_id = RealmId::from_bytes([78u8; 32]);
+    let local_node_id = iroh::SecretKey::from_bytes(&[79u8; 32]).public();
+
+    let (plan, target) = plan_preflight_request(
+        realm_id,
+        preflight_request(realm_id, vec!["not-a-w3id".to_string()], None),
+    )
+    .expect("plan");
+    assert!(matches!(
+        resolve_preflight_targets(
+            &test.context,
+            realm_id,
+            local_node_id,
+            &plan.auth,
+            target,
+            None
+        )
+        .await,
+        Err(MetadataApiError::BadRequest)
+    ));
+
+    let (mut plan, target) = plan_preflight_request(
+        realm_id,
+        preflight_request(realm_id, vec![content_w3id([2u8; 32])], None),
+    )
+    .expect("plan");
+    let resolved = resolve_preflight_targets(
+        &test.context,
+        realm_id,
+        local_node_id,
+        &plan.auth,
+        target,
+        None,
+    )
+    .await
+    .expect("content w3ids resolve without storage");
+    plan.cursor = Some("not-a-cursor".to_string());
+    plan.mode = Some(MetadataApiQueryMode::Local);
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    assert!(matches!(
+        verify_preflight_cursor(
+            &test.context,
+            realm_id,
+            local_node_id,
+            &plan,
+            &resolved,
+            deadline
+        )
+        .await,
+        Err(MetadataApiError::InvalidCursor(_))
+    ));
+
+    let (partial_plan, target) = plan_preflight_request(
+        realm_id,
+        preflight_request(realm_id, vec![content_w3id([3u8; 32])], None),
+    )
+    .expect("plan");
+    let partial_resolved = resolve_preflight_targets(
+        &test.context,
+        realm_id,
+        local_node_id,
+        &partial_plan.auth,
+        target,
+        None,
+    )
+    .await
+    .expect("content w3ids resolve");
+    let cursor = verify_preflight_cursor(
+        &test.context,
+        realm_id,
+        local_node_id,
+        &partial_plan,
+        &partial_resolved,
+        deadline,
+    )
+    .await
+    .expect("first page has no cursor");
+    let part = MetadataReferencePreflightNodeExecution {
+        visible_references: Vec::new(),
+        targets: Vec::new(),
+        freshness: MetadataPreflightNodeFreshness {
+            node_id: local_node_id,
+            index_state: MetadataPreflightIndexState::Current,
+            oldest_status_updated_at_ms: None,
+        },
+        path_style_endpoint_available: true,
+        saturated: false,
+    };
+    let denied = assemble_preflight_execution(
+        &test.context,
+        partial_resolved,
+        &partial_plan,
+        cursor,
+        vec![(local_node_id, part)],
+        MetadataFanoutStats {
+            nodes_queried: 2,
+            nodes_failed: 1,
+            failed_partitions: vec![local_node_id],
+            discovery_failed: false,
+        },
+    );
+    assert!(matches!(denied, Err(MetadataApiError::ServiceUnavailable)));
 }
