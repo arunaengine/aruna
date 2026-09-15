@@ -10,7 +10,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PutBucketRoutingState {
+enum PutRoutingState {
     Init,
     LoadInputs,
     StartTransaction,
@@ -22,7 +22,7 @@ enum PutBucketRoutingState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum PutBucketRoutingError {
+pub enum PutRoutingError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -48,29 +48,29 @@ pub enum PutBucketRoutingError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct PutBucketRoutingOperation {
+pub struct PutRoutingOperation {
     bucket: String,
     group_id: GroupId,
     rules: Vec<StorageRoutingRule>,
-    state: PutBucketRoutingState,
+    state: PutRoutingState,
     txn_id: Option<ulid::Ulid>,
-    output: Option<Result<Vec<StorageRoutingRule>, PutBucketRoutingError>>,
+    output: Option<Result<Vec<StorageRoutingRule>, PutRoutingError>>,
 }
 
-impl PutBucketRoutingOperation {
+impl PutRoutingOperation {
     pub fn new(bucket: String, group_id: GroupId, rules: Vec<StorageRoutingRule>) -> Self {
         Self {
             bucket,
             group_id,
             rules,
-            state: PutBucketRoutingState::Init,
+            state: PutRoutingState::Init,
             txn_id: None,
             output: None,
         }
     }
 
-    fn fail(&mut self, err: PutBucketRoutingError) -> Effects {
-        self.state = PutBucketRoutingState::Error;
+    fn fail(&mut self, err: PutRoutingError) -> Effects {
+        self.state = PutRoutingState::Error;
         self.output = Some(Err(err));
         self.abort()
     }
@@ -81,26 +81,26 @@ impl PutBucketRoutingOperation {
 
     fn state_name(&self) -> &'static str {
         match self.state {
-            PutBucketRoutingState::Init => "Init",
-            PutBucketRoutingState::LoadInputs => "LoadInputs",
-            PutBucketRoutingState::StartTransaction => "StartTransaction",
-            PutBucketRoutingState::ReadBucket => "ReadBucket",
-            PutBucketRoutingState::WriteBucket => "WriteBucket",
-            PutBucketRoutingState::CommitTransaction => "CommitTransaction",
-            PutBucketRoutingState::Finish => "Finish",
-            PutBucketRoutingState::Error => "Error",
+            PutRoutingState::Init => "Init",
+            PutRoutingState::LoadInputs => "LoadInputs",
+            PutRoutingState::StartTransaction => "StartTransaction",
+            PutRoutingState::ReadBucket => "ReadBucket",
+            PutRoutingState::WriteBucket => "WriteBucket",
+            PutRoutingState::CommitTransaction => "CommitTransaction",
+            PutRoutingState::Finish => "Finish",
+            PutRoutingState::Error => "Error",
         }
     }
 }
 
-impl Operation for PutBucketRoutingOperation {
+impl Operation for PutRoutingOperation {
     type Output = Vec<StorageRoutingRule>;
-    type Error = PutBucketRoutingError;
+    type Error = PutRoutingError;
 
     fn start(&mut self) -> Effects {
         // A `Group` target is checked against the ids the bucket's own group
         // registered, so a rule can never name another tenant's backend.
-        self.state = PutBucketRoutingState::LoadInputs;
+        self.state = PutRoutingState::LoadInputs;
         smallvec![load_group_inputs(self.group_id)]
     }
 
@@ -109,11 +109,11 @@ impl Operation for PutBucketRoutingOperation {
             return self.fail(error.clone().into());
         }
         match self.state {
-            PutBucketRoutingState::Init => self.start(),
-            PutBucketRoutingState::LoadInputs => {
+            PutRoutingState::Init => self.start(),
+            PutRoutingState::LoadInputs => {
                 let Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) = event
                 else {
-                    return self.fail(PutBucketRoutingError::InvalidStateEvent {
+                    return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
                         received: event,
@@ -122,43 +122,43 @@ impl Operation for PutBucketRoutingOperation {
                 let owned = match result {
                     Ok(inputs) => inputs.backend_ids,
                     Err(error) => {
-                        return self.fail(PutBucketRoutingError::InputsUnavailable(error));
+                        return self.fail(PutRoutingError::InputsUnavailable(error));
                     }
                 };
                 if let Err(error) = validate_tenant_rules(&self.rules, &owned) {
                     return self.fail(error.into());
                 }
-                self.state = PutBucketRoutingState::StartTransaction;
+                self.state = PutRoutingState::StartTransaction;
                 smallvec![Effect::Storage(StorageEffect::StartTransaction {
                     read: false,
                 })]
             }
-            PutBucketRoutingState::StartTransaction => {
+            PutRoutingState::StartTransaction => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self.fail(PutBucketRoutingError::InvalidStateEvent {
+                    return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionStarted)",
                         received: event,
                     });
                 };
                 self.txn_id = Some(txn_id);
-                self.state = PutBucketRoutingState::ReadBucket;
+                self.state = PutRoutingState::ReadBucket;
                 smallvec![Effect::Storage(StorageEffect::Read {
                     key_space: S3_BUCKET_KEYSPACE.to_string(),
                     key: self.write_key(),
                     txn_id: Some(txn_id),
                 })]
             }
-            PutBucketRoutingState::ReadBucket => {
+            PutRoutingState::ReadBucket => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(PutBucketRoutingError::InvalidStateEvent {
+                    return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
                 let Some(value) = value else {
-                    return self.fail(PutBucketRoutingError::NoSuchBucket);
+                    return self.fail(PutRoutingError::NoSuchBucket);
                 };
                 let mut info = match BucketInfo::from_bytes(value.as_ref()) {
                     Ok(info) => info,
@@ -167,14 +167,14 @@ impl Operation for PutBucketRoutingOperation {
                 // The owned backend ids were loaded for the authorized group, so
                 // the record has to still belong to it.
                 if info.group_id != self.group_id {
-                    return self.fail(PutBucketRoutingError::GroupMismatch);
+                    return self.fail(PutRoutingError::GroupMismatch);
                 }
                 info.storage_routing = self.rules.clone();
                 let value = match info.to_bytes() {
                     Ok(value) => value,
                     Err(err) => return self.fail(err.into()),
                 };
-                self.state = PutBucketRoutingState::WriteBucket;
+                self.state = PutRoutingState::WriteBucket;
                 smallvec![Effect::Storage(StorageEffect::Write {
                     key_space: S3_BUCKET_KEYSPACE.to_string(),
                     key: self.write_key(),
@@ -182,48 +182,44 @@ impl Operation for PutBucketRoutingOperation {
                     txn_id: self.txn_id,
                 })]
             }
-            PutBucketRoutingState::WriteBucket => {
+            PutRoutingState::WriteBucket => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-                    return self.fail(PutBucketRoutingError::InvalidStateEvent {
+                    return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::WriteResult)",
                         received: event,
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
-                    return self.fail(PutBucketRoutingError::NoTransactionFound);
+                    return self.fail(PutRoutingError::NoTransactionFound);
                 };
-                self.state = PutBucketRoutingState::CommitTransaction;
+                self.state = PutRoutingState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            PutBucketRoutingState::CommitTransaction => {
+            PutRoutingState::CommitTransaction => {
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return self.fail(PutBucketRoutingError::InvalidStateEvent {
+                    return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                         received: event,
                     });
                 };
                 self.txn_id = None;
-                self.state = PutBucketRoutingState::Finish;
+                self.state = PutRoutingState::Finish;
                 self.output = Some(Ok(self.rules.clone()));
                 smallvec![]
             }
-            PutBucketRoutingState::Finish => smallvec![],
-            PutBucketRoutingState::Error => self.abort(),
+            PutRoutingState::Finish => smallvec![],
+            PutRoutingState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            PutBucketRoutingState::Finish | PutBucketRoutingState::Error
-        )
+        matches!(self.state, PutRoutingState::Finish | PutRoutingState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(PutBucketRoutingError::NotFinished))
+        self.output.unwrap_or(Err(PutRoutingError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -236,7 +232,7 @@ impl Operation for PutBucketRoutingOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum GetBucketRoutingState {
+enum GetRoutingState {
     Init,
     ReadBucket,
     Finish,
@@ -244,7 +240,7 @@ enum GetBucketRoutingState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetBucketRoutingError {
+pub enum GetRoutingError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -262,43 +258,43 @@ pub enum GetBucketRoutingError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetBucketRoutingOperation {
+pub struct GetRoutingOperation {
     bucket: String,
-    state: GetBucketRoutingState,
-    output: Option<Result<Vec<StorageRoutingRule>, GetBucketRoutingError>>,
+    state: GetRoutingState,
+    output: Option<Result<Vec<StorageRoutingRule>, GetRoutingError>>,
 }
 
-impl GetBucketRoutingOperation {
+impl GetRoutingOperation {
     pub fn new(bucket: String) -> Self {
         Self {
             bucket,
-            state: GetBucketRoutingState::Init,
+            state: GetRoutingState::Init,
             output: None,
         }
     }
 
     fn state_name(&self) -> &'static str {
         match self.state {
-            GetBucketRoutingState::Init => "Init",
-            GetBucketRoutingState::ReadBucket => "ReadBucket",
-            GetBucketRoutingState::Finish => "Finish",
-            GetBucketRoutingState::Error => "Error",
+            GetRoutingState::Init => "Init",
+            GetRoutingState::ReadBucket => "ReadBucket",
+            GetRoutingState::Finish => "Finish",
+            GetRoutingState::Error => "Error",
         }
     }
 
-    fn fail(&mut self, err: GetBucketRoutingError) -> Effects {
-        self.state = GetBucketRoutingState::Error;
+    fn fail(&mut self, err: GetRoutingError) -> Effects {
+        self.state = GetRoutingState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 }
 
-impl Operation for GetBucketRoutingOperation {
+impl Operation for GetRoutingOperation {
     type Output = Vec<StorageRoutingRule>;
-    type Error = GetBucketRoutingError;
+    type Error = GetRoutingError;
 
     fn start(&mut self) -> Effects {
-        self.state = GetBucketRoutingState::ReadBucket;
+        self.state = GetRoutingState::ReadBucket;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: self.bucket.as_bytes().to_vec().into(),
@@ -311,41 +307,37 @@ impl Operation for GetBucketRoutingOperation {
             return self.fail(error.clone().into());
         }
         match self.state {
-            GetBucketRoutingState::Init => self.start(),
-            GetBucketRoutingState::ReadBucket => {
+            GetRoutingState::Init => self.start(),
+            GetRoutingState::ReadBucket => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(GetBucketRoutingError::InvalidStateEvent {
+                    return self.fail(GetRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
                 let Some(value) = value else {
-                    return self.fail(GetBucketRoutingError::NoSuchBucket);
+                    return self.fail(GetRoutingError::NoSuchBucket);
                 };
                 match BucketInfo::from_bytes(value.as_ref()) {
                     Ok(info) => {
-                        self.state = GetBucketRoutingState::Finish;
+                        self.state = GetRoutingState::Finish;
                         self.output = Some(Ok(info.storage_routing));
                         smallvec![]
                     }
                     Err(err) => self.fail(err.into()),
                 }
             }
-            GetBucketRoutingState::Finish | GetBucketRoutingState::Error => smallvec![],
+            GetRoutingState::Finish | GetRoutingState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            GetBucketRoutingState::Finish | GetBucketRoutingState::Error
-        )
+        matches!(self.state, GetRoutingState::Finish | GetRoutingState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(GetBucketRoutingError::NotFinished))
+        self.output.unwrap_or(Err(GetRoutingError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -355,10 +347,7 @@ impl Operation for GetBucketRoutingOperation {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{
-        GetBucketRoutingError, GetBucketRoutingOperation, PutBucketRoutingError,
-        PutBucketRoutingOperation,
-    };
+    use super::{GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
@@ -383,7 +372,7 @@ mod pure_tests {
     }
 
     /// Replays the loader sub-operation with the ids the group owns.
-    fn loaded(operation: &mut PutBucketRoutingOperation, owned: BTreeSet<Ulid>) -> Effects {
+    fn loaded(operation: &mut PutRoutingOperation, owned: BTreeSet<Ulid>) -> Effects {
         operation.start();
         operation.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
             result: Ok(GroupRoutingInputs {
@@ -408,7 +397,7 @@ mod pure_tests {
     #[test]
     fn writes_bucket_rules() {
         let rules = vec![rule(RoutingTarget::Class("cold".to_string()))];
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), rules.clone());
+        let mut operation = PutRoutingOperation::new("b".to_string(), group(), rules.clone());
         loaded(&mut operation, BTreeSet::new());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
@@ -432,7 +421,7 @@ mod pure_tests {
         let rules = vec![rule(RoutingTarget::Backend(BackendRef::Node(
             "cold".to_string(),
         )))];
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), rules);
+        let mut operation = PutRoutingOperation::new("b".to_string(), group(), rules);
 
         let effects = loaded(&mut operation, BTreeSet::new());
 
@@ -440,7 +429,7 @@ mod pure_tests {
         assert!(operation.is_complete());
         assert!(matches!(
             operation.finalize(),
-            Err(PutBucketRoutingError::InvalidRules(
+            Err(PutRoutingError::InvalidRules(
                 RoutingError::OperatorBackendTarget
             ))
         ));
@@ -451,7 +440,7 @@ mod pure_tests {
         // A rule naming a backend this group does not own must not be stored.
         let foreign = Ulid::from_bytes([9u8; 16]);
         let rules = vec![rule(RoutingTarget::Backend(BackendRef::Group(foreign)))];
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), rules);
+        let mut operation = PutRoutingOperation::new("b".to_string(), group(), rules);
 
         let effects = loaded(
             &mut operation,
@@ -461,9 +450,9 @@ mod pure_tests {
         assert!(effects.is_empty(), "expected no write, got {effects:?}");
         assert_eq!(
             operation.finalize(),
-            Err(PutBucketRoutingError::InvalidRules(
-                RoutingError::ForeignBackend(foreign)
-            ))
+            Err(PutRoutingError::InvalidRules(RoutingError::ForeignBackend(
+                foreign
+            )))
         );
     }
 
@@ -471,7 +460,7 @@ mod pure_tests {
     fn accepts_owned_backend() {
         let owned = Ulid::from_bytes([4u8; 16]);
         let rules = vec![rule(RoutingTarget::Backend(BackendRef::Group(owned)))];
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), rules);
+        let mut operation = PutRoutingOperation::new("b".to_string(), group(), rules);
 
         let effects = loaded(&mut operation, BTreeSet::from([owned]));
 
@@ -485,7 +474,7 @@ mod pure_tests {
     fn rejects_foreign_bucket() {
         // The loaded ids belong to the authorized group, so a record that moved
         // to another group must not take its rules.
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), Vec::new());
+        let mut operation = PutRoutingOperation::new("b".to_string(), group(), Vec::new());
         loaded(&mut operation, BTreeSet::new());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
@@ -498,15 +487,12 @@ mod pure_tests {
             value: Some(moved.to_bytes().unwrap().into()),
         }));
 
-        assert_eq!(
-            operation.finalize(),
-            Err(PutBucketRoutingError::GroupMismatch)
-        );
+        assert_eq!(operation.finalize(), Err(PutRoutingError::GroupMismatch));
     }
 
     #[test]
     fn missing_bucket_aborts() {
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), Vec::new());
+        let mut operation = PutRoutingOperation::new("b".to_string(), group(), Vec::new());
         loaded(&mut operation, BTreeSet::new());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
@@ -523,13 +509,13 @@ mod pure_tests {
         ));
         assert!(matches!(
             operation.finalize(),
-            Err(PutBucketRoutingError::NoSuchBucket)
+            Err(PutRoutingError::NoSuchBucket)
         ));
     }
 
     #[test]
     fn rejects_unexpected_event() {
-        let mut operation = PutBucketRoutingOperation::new("b".to_string(), group(), Vec::new());
+        let mut operation = PutRoutingOperation::new("b".to_string(), group(), Vec::new());
         loaded(&mut operation, BTreeSet::new());
 
         operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -538,7 +524,7 @@ mod pure_tests {
 
         assert!(matches!(
             operation.finalize(),
-            Err(PutBucketRoutingError::InvalidStateEvent { .. })
+            Err(PutRoutingError::InvalidStateEvent { .. })
         ));
     }
 
@@ -547,7 +533,7 @@ mod pure_tests {
         let rules = vec![rule(RoutingTarget::Class("cold".to_string()))];
         let mut info = bucket();
         info.storage_routing = rules.clone();
-        let mut operation = GetBucketRoutingOperation::new("b".to_string());
+        let mut operation = GetRoutingOperation::new("b".to_string());
         operation.start();
 
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -560,7 +546,7 @@ mod pure_tests {
 
     #[test]
     fn missing_bucket_errors() {
-        let mut operation = GetBucketRoutingOperation::new("b".to_string());
+        let mut operation = GetRoutingOperation::new("b".to_string());
         operation.start();
 
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -570,7 +556,7 @@ mod pure_tests {
 
         assert!(matches!(
             operation.finalize(),
-            Err(GetBucketRoutingError::NoSuchBucket)
+            Err(GetRoutingError::NoSuchBucket)
         ));
     }
 }

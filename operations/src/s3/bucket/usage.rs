@@ -8,20 +8,17 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::s3::list_uploads::{
-    ListMultipartUploadsError, ListMultipartUploadsInput, ListMultipartUploadsOperation,
-};
-use crate::s3::list_versions::{
-    ListObjectVersionsError, ListObjectVersionsInput, ListObjectVersionsItem,
-    ListObjectVersionsOperation,
+use crate::s3::multipart::uploads::{ListUploadsError, ListUploadsInput, ListUploadsOperation};
+use crate::s3::object::versions::{
+    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
 
 #[derive(Debug, Error, PartialEq)]
 pub enum BucketUsageError {
     #[error(transparent)]
-    Versions(#[from] ListObjectVersionsError),
+    Versions(#[from] ListVersionsError),
     #[error(transparent)]
-    Uploads(#[from] ListMultipartUploadsError),
+    Uploads(#[from] ListUploadsError),
     #[error("bucket usage received an event in state {state:?}: {event:?}")]
     UnexpectedEvent {
         state: BucketUsageState,
@@ -62,8 +59,8 @@ pub struct BucketUsageOutput {
 pub struct BucketUsageOperation {
     input: BucketUsageInput,
     state: BucketUsageState,
-    versions: Option<ListObjectVersionsOperation>,
-    uploads: Option<ListMultipartUploadsOperation>,
+    versions: Option<ListVersionsOperation>,
+    uploads: Option<ListUploadsOperation>,
     totals: BucketUsageOutput,
     truncated: bool,
     output: Option<Result<BucketUsageOutput, BucketUsageError>>,
@@ -89,7 +86,7 @@ impl BucketUsageOperation {
     }
 
     fn scan_uploads(&mut self) -> Effects {
-        let mut uploads = ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+        let mut uploads = ListUploadsOperation::new(ListUploadsInput {
             bucket: self.input.bucket.clone(),
             prefix: None,
             delimiter: None,
@@ -128,7 +125,7 @@ impl BucketUsageOperation {
         self.truncated |= result.is_truncated;
         for item in result.items {
             match item {
-                ListObjectVersionsItem::Version {
+                ListVersionsItem::Version {
                     is_latest,
                     location,
                     source_metadata,
@@ -142,7 +139,7 @@ impl BucketUsageOperation {
                         .unwrap_or_default();
                     self.totals.logical_bytes = self.totals.logical_bytes.saturating_add(bytes);
                 }
-                ListObjectVersionsItem::DeleteMarker { .. } => self.totals.delete_markers += 1,
+                ListVersionsItem::DeleteMarker { .. } => self.totals.delete_markers += 1,
             }
         }
         self.scan_uploads()
@@ -163,7 +160,7 @@ impl BucketUsageOperation {
             Ok(result) => result,
             // The scan keeps its row budget, so a reader cannot walk every
             // multipart row on the node; an exhausted budget is a lower bound.
-            Err(ListMultipartUploadsError::ScanBudgetExceeded) => {
+            Err(ListUploadsError::ScanBudgetExceeded) => {
                 self.truncated = true;
                 return self.finish();
             }
@@ -180,7 +177,7 @@ impl Operation for BucketUsageOperation {
     type Error = BucketUsageError;
 
     fn start(&mut self) -> Effects {
-        let mut versions = ListObjectVersionsOperation::new(ListObjectVersionsInput {
+        let mut versions = ListVersionsOperation::new(ListVersionsInput {
             bucket: self.input.bucket.clone(),
             prefix: None,
             delimiter: None,
@@ -237,7 +234,7 @@ mod pure_tests {
             bucket: "data".to_string(),
             limit: 10,
         });
-        let mut uploads = ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+        let mut uploads = ListUploadsOperation::new(ListUploadsInput {
             bucket: "data".to_string(),
             prefix: None,
             delimiter: None,
@@ -279,9 +276,9 @@ mod pure_tests {
         assert!(operation.abort().is_empty());
         assert_eq!(
             operation.finalize(),
-            Err(BucketUsageError::Versions(
-                ListObjectVersionsError::StorageError(StorageError::CommitFailed)
-            ))
+            Err(BucketUsageError::Versions(ListVersionsError::StorageError(
+                StorageError::CommitFailed
+            )))
         );
     }
 }
