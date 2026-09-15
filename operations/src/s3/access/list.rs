@@ -1,4 +1,4 @@
-use super::access_index::{decode_index, owner_key};
+use super::index::{decode_index, owner_key};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -11,12 +11,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ListUserAccessInput {
+pub struct ListUserInput {
     pub user_identity: UserId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListUserAccessState {
+pub enum ListUserState {
     Init,
     StartTransaction,
     ReadOwnerIndex,
@@ -27,14 +27,14 @@ pub enum ListUserAccessState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ListUserAccessError {
+pub enum ListUserError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: ListUserAccessState,
+        state: ListUserState,
         expected: &'static str,
         received: Event,
     },
@@ -45,36 +45,36 @@ pub enum ListUserAccessError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListUserAccessOperation {
-    input: ListUserAccessInput,
+pub struct ListUserOperation {
+    input: ListUserInput,
     access_keys: Vec<String>,
     credentials: Vec<UserAccess>,
     txn_id: Option<ulid::Ulid>,
-    state: ListUserAccessState,
-    output: Option<Result<Vec<UserAccess>, ListUserAccessError>>,
+    state: ListUserState,
+    output: Option<Result<Vec<UserAccess>, ListUserError>>,
 }
 
-impl ListUserAccessOperation {
-    pub fn new(input: ListUserAccessInput) -> Self {
+impl ListUserOperation {
+    pub fn new(input: ListUserInput) -> Self {
         Self {
             input,
             access_keys: Vec::new(),
             credentials: Vec::new(),
             txn_id: None,
-            state: ListUserAccessState::Init,
+            state: ListUserState::Init,
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: ListUserAccessError) -> Effects {
+    fn emit_error(&mut self, error: ListUserError) -> Effects {
         let effects = self.abort();
-        self.state = ListUserAccessState::Error;
+        self.state = ListUserState::Error;
         self.output = Some(Err(error));
         effects
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = ListUserAccessState::StartTransaction;
+        self.state = ListUserState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: true
         })]
@@ -82,14 +82,14 @@ impl ListUserAccessOperation {
 
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(ListUserAccessError::InvalidStateEvent {
+            return self.emit_error(ListUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
                 received: event,
             });
         };
         self.txn_id = Some(txn_id);
-        self.state = ListUserAccessState::ReadOwnerIndex;
+        self.state = ListUserState::ReadOwnerIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: USER_ACCESS_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.input.user_identity),
@@ -99,7 +99,7 @@ impl ListUserAccessOperation {
 
     fn handle_index(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(ListUserAccessError::InvalidStateEvent {
+            return self.emit_error(ListUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
                 received: event,
@@ -110,17 +110,17 @@ impl ListUserAccessOperation {
             Err(error) => return self.emit_error(error.into()),
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListUserAccessError::StorageError(
+            return self.emit_error(ListUserError::StorageError(
                 StorageError::TransactionNotFound,
             ));
         };
         if index.is_empty() {
             self.output = Some(Ok(Vec::new()));
-            self.state = ListUserAccessState::CommitTransaction;
+            self.state = ListUserState::CommitTransaction;
             return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
         }
         self.access_keys = index.into_iter().collect();
-        self.state = ListUserAccessState::ReadCredentials;
+        self.state = ListUserState::ReadCredentials;
         let reads = self
             .access_keys
             .iter()
@@ -139,18 +139,18 @@ impl ListUserAccessOperation {
 
     fn handle_credentials(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(ListUserAccessError::InvalidStateEvent {
+            return self.emit_error(ListUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
             });
         };
         if values.len() != self.access_keys.len() {
-            return self.emit_error(ListUserAccessError::IndexInconsistent);
+            return self.emit_error(ListUserError::IndexInconsistent);
         }
         for (key, value) in values {
             let Some(value) = value else {
-                return self.emit_error(ListUserAccessError::IndexInconsistent);
+                return self.emit_error(ListUserError::IndexInconsistent);
             };
             let access = match UserAccess::from_bytes(value.as_ref()) {
                 Ok(access) => access,
@@ -160,38 +160,38 @@ impl ListUserAccessOperation {
                 || !self.access_keys.contains(&access.access_key)
                 || access.user_identity != self.input.user_identity
             {
-                return self.emit_error(ListUserAccessError::IndexInconsistent);
+                return self.emit_error(ListUserError::IndexInconsistent);
             }
             self.credentials.push(access);
         }
-        self.state = ListUserAccessState::Finish;
+        self.state = ListUserState::Finish;
         self.output = Some(Ok(std::mem::take(&mut self.credentials)));
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListUserAccessError::StorageError(
+            return self.emit_error(ListUserError::StorageError(
                 StorageError::TransactionNotFound,
             ));
         };
-        self.state = ListUserAccessState::CommitTransaction;
+        self.state = ListUserState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(ListUserAccessError::InvalidStateEvent {
+            return self.emit_error(ListUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received: event,
             });
         };
         self.txn_id = None;
-        self.state = ListUserAccessState::Finish;
+        self.state = ListUserState::Finish;
         smallvec![]
     }
 }
 
-impl Operation for ListUserAccessOperation {
+impl Operation for ListUserOperation {
     type Output = Vec<UserAccess>;
-    type Error = ListUserAccessError;
+    type Error = ListUserError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -202,28 +202,25 @@ impl Operation for ListUserAccessOperation {
             return self.emit_error(error.into());
         }
         match self.state {
-            ListUserAccessState::Init => self.handle_init(),
-            ListUserAccessState::StartTransaction => self.handle_transaction_started(event),
-            ListUserAccessState::ReadOwnerIndex => self.handle_index(event),
-            ListUserAccessState::ReadCredentials => self.handle_credentials(event),
-            ListUserAccessState::CommitTransaction => self.handle_transaction_committed(event),
-            ListUserAccessState::Finish | ListUserAccessState::Error => smallvec![],
+            ListUserState::Init => self.handle_init(),
+            ListUserState::StartTransaction => self.handle_transaction_started(event),
+            ListUserState::ReadOwnerIndex => self.handle_index(event),
+            ListUserState::ReadCredentials => self.handle_credentials(event),
+            ListUserState::CommitTransaction => self.handle_transaction_committed(event),
+            ListUserState::Finish | ListUserState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListUserAccessState::Finish | ListUserAccessState::Error
-        )
+        matches!(self.state, ListUserState::Finish | ListUserState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ListUserAccessState::Error {
+        if self.state == ListUserState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(ListUserAccessError::ListUserAccessFailed);
+            return Err(ListUserError::ListUserAccessFailed);
         }
         self.output.unwrap_or_else(|| Ok(Vec::new()))
     }
@@ -240,7 +237,7 @@ impl Operation for ListUserAccessOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::s3::access_index::{MAX_ACTIVE_CREDENTIALS, encode_index, owner_key};
+    use crate::s3::access::index::{MAX_ACTIVE_CREDENTIALS, encode_index, owner_key};
     use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::structs::RealmId;
     use std::time::{Duration, SystemTime};
@@ -252,7 +249,7 @@ mod pure_tests {
         let keys = (0..MAX_ACTIVE_CREDENTIALS)
             .map(|index| format!("key{index}"))
             .collect::<std::collections::BTreeSet<_>>();
-        let mut operation = ListUserAccessOperation::new(ListUserAccessInput { user_identity });
+        let mut operation = ListUserOperation::new(ListUserInput { user_identity });
         assert!(matches!(
             operation.start().as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction {

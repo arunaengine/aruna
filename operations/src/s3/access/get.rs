@@ -9,7 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GetUserAccessState {
+pub enum GetAccessState {
     Init,
     GetUserAccess,
     Finish,
@@ -17,19 +17,19 @@ pub enum GetUserAccessState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetUserAccessError {
+pub enum GetAccessError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
     InvalidState {
-        current: GetUserAccessState,
-        expected: GetUserAccessState,
+        current: GetAccessState,
+        expected: GetAccessState,
     },
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: GetUserAccessState,
+        state: GetAccessState,
         expected: &'static str,
         received: Event,
     },
@@ -42,24 +42,24 @@ pub enum GetUserAccessError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetUserAccessOperation {
+pub struct GetAccessOperation {
     access_key_id: String,
-    state: GetUserAccessState,
-    output: Option<Result<UserAccess, GetUserAccessError>>,
+    state: GetAccessState,
+    output: Option<Result<UserAccess, GetAccessError>>,
 }
 
-impl GetUserAccessOperation {
+impl GetAccessOperation {
     pub fn new(access_key_id: String) -> Self {
         Self {
             access_key_id,
-            state: GetUserAccessState::Init,
+            state: GetAccessState::Init,
             output: None,
         }
     }
 
     fn handle_init(&mut self) -> Effects {
-        if let GetUserAccessState::Init = self.state {
-            self.state = GetUserAccessState::GetUserAccess;
+        if let GetAccessState::Init = self.state {
+            self.state = GetAccessState::GetUserAccess;
             smallvec![Effect::Storage(StorageEffect::Read {
                 key_space: USER_ACCESS_KEYSPACE.to_string(),
                 key: self.access_key_id.as_bytes().into(),
@@ -72,16 +72,16 @@ impl GetUserAccessOperation {
 
     fn access_received(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::ReadResult { value, .. }) = event {
-            self.state = GetUserAccessState::Finish;
+            self.state = GetAccessState::Finish;
             self.output = Some(match value {
                 Some(value) => {
-                    UserAccess::from_bytes(&value).map_err(GetUserAccessError::ConversionError)
+                    UserAccess::from_bytes(&value).map_err(GetAccessError::ConversionError)
                 }
-                None => Err(GetUserAccessError::NotFound),
+                None => Err(GetAccessError::NotFound),
             });
             smallvec![]
         } else {
-            self.emit_error(GetUserAccessError::InvalidStateEvent {
+            self.emit_error(GetAccessError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
                 received: event,
@@ -89,16 +89,16 @@ impl GetUserAccessOperation {
         }
     }
 
-    pub fn emit_error(&mut self, error: GetUserAccessError) -> Effects {
-        self.state = GetUserAccessState::Error;
+    pub fn emit_error(&mut self, error: GetAccessError) -> Effects {
+        self.state = GetAccessState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 }
 
-impl Operation for GetUserAccessOperation {
+impl Operation for GetAccessOperation {
     type Output = UserAccess;
-    type Error = GetUserAccessError;
+    type Error = GetAccessError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -109,25 +109,22 @@ impl Operation for GetUserAccessOperation {
             return self.emit_error(error.clone().into());
         }
         match self.state {
-            GetUserAccessState::Init => self.handle_init(),
-            GetUserAccessState::GetUserAccess => self.access_received(event),
-            GetUserAccessState::Finish => smallvec![],
-            GetUserAccessState::Error => self.abort(),
+            GetAccessState::Init => self.handle_init(),
+            GetAccessState::GetUserAccess => self.access_received(event),
+            GetAccessState::Finish => smallvec![],
+            GetAccessState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            GetUserAccessState::Finish | GetUserAccessState::Error
-        )
+        matches!(self.state, GetAccessState::Finish | GetAccessState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.output {
             Some(Ok(value)) => Ok(value),
             Some(Err(error)) => Err(error),
-            None => Err(GetUserAccessError::NotFinished),
+            None => Err(GetAccessError::NotFinished),
         }
     }
 
@@ -140,8 +137,8 @@ impl Operation for GetUserAccessOperation {
 mod test {
     use crate::driver::DriverContext;
     use crate::driver::drive;
-    use crate::s3::get_access::GetUserAccessOperation;
-    use crate::s3::get_access::UserAccess;
+    use crate::s3::access::get::GetAccessOperation;
+    use crate::s3::access::get::UserAccess;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
     use aruna_storage::storage;
@@ -185,7 +182,7 @@ mod test {
             compute_handle: None,
         };
 
-        let operation = GetUserAccessOperation::new(access_key_id.to_string());
+        let operation = GetAccessOperation::new(access_key_id.to_string());
         let result = drive(operation, &driver_ctx).await.unwrap();
 
         assert_eq!(result, user_access);
