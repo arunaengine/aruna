@@ -6,8 +6,8 @@
 mod topology;
 
 use aruna_core::StructuredId;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,

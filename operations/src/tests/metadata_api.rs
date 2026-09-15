@@ -1,6 +1,6 @@
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::GroupId;
 use aruna_core::{MetaResourceId, StructuredId};

@@ -7,7 +7,7 @@ use aruna_core::storage_entries::{stale_subject_deletes, subject_index_writes};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{Effects, TxnId};
-use aruna_core::{USER_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
+use aruna_core::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::{BTreeSet, HashSet, VecDeque};
@@ -436,7 +436,7 @@ mod pure_tests {
     use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
-    use aruna_core::{USER_KEYSPACE, SUBJECT_INDEX_KEYSPACE, UserId};
+    use aruna_core::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE, UserId};
     use byteview::ByteView;
     use std::collections::HashSet;
     use ulid::Ulid;

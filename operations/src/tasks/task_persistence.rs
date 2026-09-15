@@ -94,8 +94,7 @@ pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHand
                     continue;
                 }
             };
-            let after =
-                Duration::from_millis(record.due_unix_millis.saturating_sub(now_millis()));
+            let after = Duration::from_millis(record.due_unix_millis.saturating_sub(now_millis()));
             let event = task_handle
                 .send_effect(Effect::Task(TaskEffect::ResetTimer {
                     key: record.key,

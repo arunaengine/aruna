@@ -10,11 +10,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::storage_entries::registry_delete_entries;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
     ImportRoCrateTarget, JobState, RoCrateLimits, WorkspaceMode, user_dedup_key,
 };
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::placement_record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::drive;
@@ -418,14 +418,14 @@ async fn swap_keeps_owner() -> TestResult<()> {
             entry.draining = true;
         }
     }
-    config
-        .placement_overrides
-        .push(aruna_core::structs::placement::placement_record::PlacementOverride {
+    config.placement_overrides.push(
+        aruna_core::structs::placement::placement_record::PlacementOverride {
             subject: b"any-shard-subject".to_vec(),
             pinned: Vec::new(),
             excluded: vec![owner_id],
             strategy_id: None,
-        });
+        },
+    );
     realm.apply_config(config).await?;
     assert_eq!(
         derived_owner(&realm, submitted.job_id)?,

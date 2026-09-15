@@ -8,9 +8,8 @@ use std::time::Duration;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
+    DEAD_LETTER_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE, REFRESH_JOB_KEYSPACE,
     REPLICATION_JOB_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    DEAD_LETTER_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
-    REFRESH_JOB_KEYSPACE,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
@@ -68,24 +67,12 @@ impl QueueLagReporter {
         // Preserve the tracing gauge's position immediately after its two
         // durable scans rather than including the remaining metric probes.
         let storage_in_flight = storage.in_flight();
-        let blob_replication = probe_with_timeout(probe_queue_depth(
-            storage,
-            REPLICATION_JOB_KEYSPACE,
-            false,
-        ))
-        .await;
-        let reference_metadata_refresh = probe_with_timeout(probe_queue_depth(
-            storage,
-            REFRESH_JOB_KEYSPACE,
-            false,
-        ))
-        .await;
-        let materialization_dead_letters = probe_with_timeout(probe_queue_depth(
-            storage,
-            DEAD_LETTER_KEYSPACE,
-            false,
-        ))
-        .await;
+        let blob_replication =
+            probe_with_timeout(probe_queue_depth(storage, REPLICATION_JOB_KEYSPACE, false)).await;
+        let reference_metadata_refresh =
+            probe_with_timeout(probe_queue_depth(storage, REFRESH_JOB_KEYSPACE, false)).await;
+        let materialization_dead_letters =
+            probe_with_timeout(probe_queue_depth(storage, DEAD_LETTER_KEYSPACE, false)).await;
         let sample = QueueLagSample {
             document_sync_outbox,
             metadata_materialization,
@@ -189,13 +176,8 @@ pub async fn probe_outbox_lag(
     let mut start_after: Option<ByteView> = None;
     for page in 0..SCAN_PAGE_LIMIT {
         let limit = first_page_limit(page, assume_active);
-        let (keys, next) = iter_page(
-            storage,
-            SYNC_OUTBOX_KEYSPACE,
-            start_after.take(),
-            limit,
-        )
-        .await?;
+        let (keys, next) =
+            iter_page(storage, SYNC_OUTBOX_KEYSPACE, start_after.take(), limit).await?;
         depth += keys.len();
         for key in &keys {
             // Outbox keys end in the record's ULID, whose timestamp is the

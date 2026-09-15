@@ -8,15 +8,15 @@ use aruna_core::StructuredId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{PENDING_PROJECTION_KEYSPACE, ID_MAPPING_KEYSPACE};
+use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, PENDING_PROJECTION_KEYSPACE};
 use aruna_core::storage_entries::pending_projection_key;
 use aruna_core::structs::execution::job::{JobId, pid_dedup_key};
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{
     MintPersistentSpec, PersistentIdMapping, PersistentIdRevision, PersistentIdStatus,
     persistent_id_key,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::service::{read_job_routed, submit_mint_pid};

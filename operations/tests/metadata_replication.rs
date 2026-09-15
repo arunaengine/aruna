@@ -13,8 +13,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    REALM_CONFIG_KEYSPACE,
+    EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataBatchSource, MetadataDeleteRecord, MetadataEffect, MetadataEvent,
@@ -24,9 +23,9 @@ use aruna_core::storage_entries::{
     create_event_entry, event_log_key, lifecycle_revision_change, metadata_registry_key,
 };
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};

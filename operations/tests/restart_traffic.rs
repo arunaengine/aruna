@@ -1429,7 +1429,8 @@ async fn read_registry(
     node: &TestNode,
     group_id: Ulid,
     document_id: Ulid,
-) -> Result<Option<aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord>, BoxError> {
+) -> Result<Option<aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord>, BoxError>
+{
     match node
         .context
         .storage_handle

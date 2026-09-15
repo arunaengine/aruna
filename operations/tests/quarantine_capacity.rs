@@ -9,12 +9,12 @@ use aruna_core::document::{
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
-use aruna_core::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
 use aruna_core::structs::{
-    QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity,
-    SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
+    QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineRecord,
+    SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
 use aruna_core::types::Value;
 use aruna_net::document_sync::DocumentSyncService;

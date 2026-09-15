@@ -10,8 +10,8 @@ use aruna_core::structs::execution::job::{
     LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use ulid::Ulid;
 
 use aruna_core::document::DocumentTarget;

@@ -430,10 +430,7 @@ async fn close_routes_defer() {
 
     handler.close_rotation(key.clone(), rotation).await;
 
-    assert_eq!(
-        scheduled_after(&task_handle).await,
-        DEFER_RETRY_AFTER
-    );
+    assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
     assert!(
         !handler
             .retry_backoff
@@ -754,10 +751,7 @@ async fn blocked_keeps_backoff() {
 
     handler.drain_sync_outbox().await;
 
-    assert_eq!(
-        scheduled_after(&task_handle).await,
-        DEFER_RETRY_AFTER
-    );
+    assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
     assert_eq!(
         handler
             .retry_backoff
@@ -938,7 +932,10 @@ async fn rotation_streak() {
     let net = make_net_handle(realm_id, &storage, [51u8; 32]).await;
     tokio::time::pause();
     let target = DocumentTarget::RealmAuthorization { realm_id };
-    let topic = target.sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
+    let topic = target.sync_topic_id(
+        realm_id,
+        &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+    );
     net.ensure_sync_topics(&[topic], Vec::new())
         .expect("shared topic genesis");
     let task_handle = TaskHandle::new();
@@ -996,10 +993,7 @@ async fn rotation_streak() {
             .continuations,
         0
     );
-    assert_eq!(
-        scheduled_after(&task_handle).await,
-        DEFER_RETRY_AFTER
-    );
+    assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
     for _ in 0..4 {
         handler.drain_sync_outbox().await;
     }
@@ -1151,8 +1145,10 @@ async fn config_setup() -> ConfigHarness {
         group_id: Ulid::from_parts(7, 1),
         document_id: Ulid::from_parts(8, 1),
     };
-    let shared_topic =
-        shared_target.sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
+    let shared_topic = shared_target.sync_topic_id(
+        realm_id,
+        &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+    );
     net.ensure_sync_topics(&[shared_topic], Vec::new())
         .expect("shared topic genesis");
     let mut shard_change = change();
@@ -1518,7 +1514,10 @@ impl BoundaryHarness {
         let shared = DocumentTarget::RealmAuthorization {
             realm_id: self.realm_id,
         };
-        let topic = shared.sync_topic_id(self.realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
+        let topic = shared.sync_topic_id(
+            self.realm_id,
+            &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        );
         self.net
             .ensure_sync_topics(&[topic], Vec::new())
             .expect("appended topic genesis");

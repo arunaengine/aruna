@@ -412,8 +412,7 @@ async fn drain_reconcile_wakes() {
 async fn drain_reconcile_summary() {
     use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
     use aruna_core::structs::storage::usage::{
-        SUMMARY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_shard_key,
-        usage_global_key,
+        NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, UsageCounters, global_shard_key, usage_global_key,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 

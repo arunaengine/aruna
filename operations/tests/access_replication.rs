@@ -63,7 +63,10 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
     // Positive control: pull the whole shared realm topic from the issuer, so
     // absence afterwards proves non-replication rather than sync lag.
     let topic = aruna_core::document::DocumentTarget::RealmAuthorization { realm_id }
-        .sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
+        .sync_topic_id(
+            realm_id,
+            &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        );
     nodes[1]
         .net
         .sync_document_topics(vec![topic], vec![nodes[0].net.node_id()])

@@ -11,10 +11,10 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{PRUNE_JOB_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::GraphPruneRecord;
-use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -146,7 +146,10 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
     let net = make_net_handle(realm_id, &storage, [46u8; 32]).await;
     tokio::time::pause();
     let target = DocumentTarget::RealmAuthorization { realm_id };
-    let topic = target.sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
+    let topic = target.sync_topic_id(
+        realm_id,
+        &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+    );
     net.ensure_sync_topics(&[topic], Vec::new())
         .expect("shared topic genesis");
     for index in 1..=2u128 {

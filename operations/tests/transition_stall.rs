@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
-use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::placement::placement_transition::TransitionLimits;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::drive;

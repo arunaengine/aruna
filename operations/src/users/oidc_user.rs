@@ -13,13 +13,13 @@ use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, TxnId};
-use aruna_core::{USER_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
+use aruna_core::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::BTreeSet;
@@ -623,9 +623,11 @@ mod tests {
                     .expect("user write is included");
                 let stored_user = User::from_bytes(user_write.2.as_ref()).unwrap();
                 assert_eq!(stored_user, expected_user);
-                assert!(writes.iter().any(
-                    |(keyspace, _, _)| keyspace == aruna_core::SYNC_REVISION_KEYSPACE
-                ));
+                assert!(
+                    writes
+                        .iter()
+                        .any(|(keyspace, _, _)| keyspace == aruna_core::SYNC_REVISION_KEYSPACE)
+                );
                 let reducer_state_write = writes
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == aruna_core::DOCUMENT_STATE_KEYSPACE)
@@ -649,9 +651,7 @@ mod tests {
 
                 let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
-                    .filter(|(keyspace, _, _)| {
-                        keyspace == aruna_core::SYNC_OUTBOX_KEYSPACE
-                    })
+                    .filter(|(keyspace, _, _)| keyspace == aruna_core::SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
                     .collect();
                 assert_eq!(outbox_records.len(), 2);
@@ -863,7 +863,9 @@ mod tests {
                 existing_user
                     .to_bytes(&Actor {
                         node_id: iroh::SecretKey::from_bytes(&[6u8; 32]).public(),
-                        user_id: UserId::nil(aruna_core::structs::identity::realm::RealmId([5u8; 32])),
+                        user_id: UserId::nil(aruna_core::structs::identity::realm::RealmId(
+                            [5u8; 32],
+                        )),
                         realm_id: aruna_core::structs::identity::realm::RealmId([5u8; 32]),
                     })
                     .unwrap()

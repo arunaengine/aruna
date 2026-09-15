@@ -6,12 +6,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-    PATHS_INDEX_KEYSPACE, OBJECT_METADATA_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     CurrentVersionPointer, HashIndex, VersionKey,
@@ -21,7 +21,6 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectPart, MultipartObjectSummary, MultipartPartKey, MultipartUpload,
     MultipartUploadStatus,
 };
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
@@ -32,9 +31,9 @@ use aruna_operations::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
 use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+use aruna_operations::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_operations::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
 use aruna_storage::storage;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{create_dir_all, exists, read_dir};
@@ -364,7 +363,8 @@ async fn completion_persists_parts() {
         .await
         .expect("missing blob location entry");
     assert_eq!(
-        aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref()).unwrap(),
+        aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref())
+            .unwrap(),
         complete.location.clone()
     );
 
@@ -929,7 +929,8 @@ async fn completion_deduplicates_multipart() {
         .await
         .expect("missing blob location entry");
     assert_eq!(
-        aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref()).unwrap(),
+        aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref())
+            .unwrap(),
         first_complete.location
     );
 }

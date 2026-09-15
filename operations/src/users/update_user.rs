@@ -16,9 +16,9 @@ use aruna_core::storage_entries::{
     sync_revision_entry, sync_revision_key,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId};
@@ -586,9 +586,7 @@ impl Operation for UpdateUserOperation {
         match self.state.clone() {
             UpdateUserState::Auth => self.handle_auth_result(event),
             UpdateUserState::StartTransaction => self.handle_start_transaction(event),
-            UpdateUserState::ReadStateRevision { txn_id } => {
-                self.accept_admin_state(event, txn_id)
-            }
+            UpdateUserState::ReadStateRevision { txn_id } => self.accept_admin_state(event, txn_id),
             UpdateUserState::WriteStateRevision {
                 txn_id,
                 user,
@@ -758,14 +756,14 @@ mod pure_tests {
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
-    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_core::{
-        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
-        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
+        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+        SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
     };
     use byteview::ByteView;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1239,18 +1237,22 @@ mod pure_tests {
         realm_id: RealmId,
         actor: &Actor,
     ) -> aruna_core::structs::identity::realm::RealmConfigDocument {
-        let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        config.ensure_node(actor.node_id, aruna_core::structs::identity::realm::RealmNodeKind::Server);
-        config
-            .strategies
-            .push(aruna_core::structs::placement::placement_record::PlacementStrategy {
+        let mut config =
+            aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(
+            actor.node_id,
+            aruna_core::structs::identity::realm::RealmNodeKind::Server,
+        );
+        config.strategies.push(
+            aruna_core::structs::placement::placement_record::PlacementStrategy {
                 strategy_id: Ulid::from_bytes([5; 16]),
                 name: "default".to_string(),
                 replica_count: Some(1),
                 distinct_locations: false,
                 affinity: Vec::new(),
                 shard_count: 16,
-            });
+            },
+        );
         config.default_strategy_id = Some(config.strategies[0].strategy_id);
         config.snapshot_candidate_map();
         config

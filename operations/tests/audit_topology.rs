@@ -10,8 +10,8 @@ use aruna_core::StructuredId;
 use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::audit::{
-    AUDIT_DEADLINE_SECS, AuditAggregate, ListAuditOperation, ListAuditRequest, LocalPageOperation,
-    AUDIT_PAGE_LIMIT, list_audit,
+    AUDIT_DEADLINE_SECS, AUDIT_PAGE_LIMIT, AuditAggregate, ListAuditOperation, ListAuditRequest,
+    LocalPageOperation, list_audit,
 };
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
@@ -241,7 +241,9 @@ fn request(
     }
 }
 
-fn unique_documents(records: &[aruna_core::structs::storage::metadata_registry::MetadataAuditRecord]) -> usize {
+fn unique_documents(
+    records: &[aruna_core::structs::storage::metadata_registry::MetadataAuditRecord],
+) -> usize {
     let mut ids: Vec<Ulid> = records.iter().map(|record| record.document_id).collect();
     ids.sort();
     ids.dedup();

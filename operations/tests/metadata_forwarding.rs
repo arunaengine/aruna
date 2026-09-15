@@ -22,11 +22,11 @@ use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYS
 use aruna_core::metadata::MetadataError;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::check_permissions::{

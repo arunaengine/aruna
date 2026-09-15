@@ -8,9 +8,9 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    SYNC_OUTBOX_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
-    PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    DOCUMENT_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventPayload, MetadataEventRecord};
 use aruna_core::storage_entries::{
@@ -18,9 +18,9 @@ use aruna_core::storage_entries::{
     metadata_document_key, metadata_registry_key, pending_projection_key, registry_write_entries,
 };
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
@@ -890,10 +890,7 @@ async fn assert_projection_absent(
         .await?
         .is_none()
     );
-    assert_eq!(
-        iter_keyspace_count(test, SYNC_OUTBOX_KEYSPACE).await?,
-        0
-    );
+    assert_eq!(iter_keyspace_count(test, SYNC_OUTBOX_KEYSPACE).await?, 0);
     assert_eq!(
         iter_keyspace_count(test, MATERIALIZATION_JOB_KEYSPACE).await?,
         0
