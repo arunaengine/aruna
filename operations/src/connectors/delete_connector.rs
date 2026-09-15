@@ -321,12 +321,12 @@ mod tests {
     use aruna_core::effects::IterStart;
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
-    use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::source_connector::{
         SourceConnector, SourceConnectorKind, SourceConnectorSecret,
     };
     use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+    use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;

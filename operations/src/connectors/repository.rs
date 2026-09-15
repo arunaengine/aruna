@@ -3,8 +3,8 @@ use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE,
 };
-use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
+use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
 use ulid::Ulid;

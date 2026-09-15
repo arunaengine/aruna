@@ -6,8 +6,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    SYNC_LOG_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE,
-    SYNCED_FOLDER_KEYSPACE,
+    SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::structs::{SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Key, TxnId, Value};

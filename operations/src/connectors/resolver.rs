@@ -9,7 +9,9 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, ResolvedSourceConnector};
+use aruna_core::structs::execution::source_access::{
+    ResolvedSourceAccess, ResolvedSourceConnector,
+};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::types::{Effects, GroupId, TxnId};
@@ -358,7 +360,9 @@ pub fn resolve_inline_access(
     build_source_access(kind, public_config, Some(secret_config), "", None, true)
 }
 
-pub(crate) fn secret_fingerprint(secret: &aruna_core::structs::execution::source_connector::SourceConnectorSecret) -> [u8; 16] {
+pub(crate) fn secret_fingerprint(
+    secret: &aruna_core::structs::execution::source_connector::SourceConnectorSecret,
+) -> [u8; 16] {
     let mut entries = secret.secret_config.iter().collect::<Vec<_>>();
     entries.sort_unstable_by_key(|(key, _)| *key);
 
@@ -441,10 +445,7 @@ fn build_native_access(
         NATIVE_RELATIONSHIP_ID.to_string(),
         relationship_id.to_string(),
     );
-    config.insert(
-        ORIGIN_NODE_ID.to_string(),
-        origin_node_id.to_string(),
-    );
+    config.insert(ORIGIN_NODE_ID.to_string(), origin_node_id.to_string());
     Ok(ResolvedSourceAccess::OpenDal {
         kind: SourceConnectorKind::ArunaNative,
         config,

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SYNC_STATE_KEYSPACE, SYNC_BASE_KEYSPACE};
+use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_STATE_KEYSPACE};
 use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
@@ -402,8 +402,8 @@ mod tests {
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
     use aruna_core::UserId;
-    use aruna_core::structs::{FolderMode, RemoteBinding};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::{FolderMode, RemoteBinding};
 
     fn replica(state: ReplicaState) -> ReplicaRecord {
         let mut replica = ReplicaRecord::new(

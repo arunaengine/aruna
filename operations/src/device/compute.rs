@@ -328,19 +328,18 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        SYNC_OUTBOX_KEYSPACE, FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-        S3_BUCKET_KEYSPACE,
-    };
-    use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::storage::blob::{
-        BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, VersionKey,
+        FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::structs::execution::job::{
         InputSelection, OutputDestination, OutputSelection, WorkspaceMode,
     };
-    use aruna_core::structs::storage::node_info::NodeUrls;
+    use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, VersionKey,
+    };
+    use aruna_core::structs::storage::node_info::NodeUrls;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;

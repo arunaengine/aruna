@@ -239,9 +239,7 @@ mod pure_tests {
     use super::{SetDisabledError, SetDisabledOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{
-        BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
-    };
+    use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::types::{Effects, TxnId};
@@ -328,10 +326,7 @@ mod pure_tests {
                 .iter()
                 .map(|(key_space, ..)| key_space.as_str())
                 .collect::<Vec<_>>(),
-            [
-                STORAGE_BACKEND_KEYSPACE,
-                BACKEND_INDEX_KEYSPACE
-            ]
+            [STORAGE_BACKEND_KEYSPACE, BACKEND_INDEX_KEYSPACE]
         );
         assert!(
             writes

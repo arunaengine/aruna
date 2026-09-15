@@ -1893,7 +1893,9 @@ mod test {
             smallvec::smallvec![
                 Effect::Task(TaskEffect::CancelTimer {
                     key: TaskKey::RealmPresence {
-                        realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([0u8; 32]),
+                        realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes(
+                            [0u8; 32]
+                        ),
                         node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
                     },
                 }),

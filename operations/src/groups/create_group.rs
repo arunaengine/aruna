@@ -18,8 +18,8 @@ use aruna_core::structs::identity::auth::{Actor, Role};
 use aruna_core::structs::identity::group::{
     Group, GroupAuthorizationDocument, owner_group_key, owner_group_prefix,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
@@ -681,7 +681,7 @@ mod test {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE,
+        AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
@@ -793,20 +793,28 @@ mod test {
 
     /// A realm whose buckets are activated at generation one, so a create
     /// resolves a generation and takes the group bucket's fence.
-    fn activated_config(actor: &Actor) -> aruna_core::structs::identity::realm::RealmConfigDocument {
-        let mut config =
-            aruna_core::structs::identity::realm::RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
-        config.ensure_node(actor.node_id, aruna_core::structs::identity::realm::RealmNodeKind::Server);
-        config
-            .strategies
-            .push(aruna_core::structs::placement::placement_record::PlacementStrategy {
+    fn activated_config(
+        actor: &Actor,
+    ) -> aruna_core::structs::identity::realm::RealmConfigDocument {
+        let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(
+            actor.realm_id,
+            Vec::new(),
+            3,
+        );
+        config.ensure_node(
+            actor.node_id,
+            aruna_core::structs::identity::realm::RealmNodeKind::Server,
+        );
+        config.strategies.push(
+            aruna_core::structs::placement::placement_record::PlacementStrategy {
                 strategy_id: Ulid::from_bytes([5; 16]),
                 name: "default".to_string(),
                 replica_count: Some(1),
                 distinct_locations: false,
                 affinity: Vec::new(),
                 shard_count: 16,
-            });
+            },
+        );
         config.default_strategy_id = Some(config.strategies[0].strategy_id);
         config.snapshot_candidate_map();
         config
@@ -1046,10 +1054,7 @@ mod test {
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,
         }));
-        assert_eq!(
-            operation.state,
-            super::CreateGroupState::ScheduleSyncDrain
-        );
+        assert_eq!(operation.state, super::CreateGroupState::ScheduleSyncDrain);
         assert_eq!(
             effects.first(),
             Some(&Effect::Task(TaskEffect::ResetTimer {

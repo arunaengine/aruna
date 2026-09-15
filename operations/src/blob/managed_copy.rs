@@ -7,11 +7,11 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
     BackendLocation, CopyOrigin, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState, VersionKey,
 };
-use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -378,13 +378,13 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
     use aruna_core::structs::storage::blob::CopyOrigin;
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
         ManagedCopyState, VersionKey,
     };
-    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
@@ -832,13 +832,13 @@ mod driver_tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
     use aruna_core::structs::storage::blob::{
         Backend, BackendConfig, BackendRef, BlobVersion, ManagedCopyKey, ManagedCopyQuarantine,
         ManagedCopyRecord, ManagedCopyState, VersionKey,
     };
-    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
-    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::GroupId;
     use aruna_net::{NetConfig, NetHandle};

@@ -226,8 +226,7 @@ mod pure_tests {
     use aruna_core::errors::BlobError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
-        BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
-        BACKEND_SECRET_KEYSPACE,
+        BACKEND_INDEX_KEYSPACE, BACKEND_SECRET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;

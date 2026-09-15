@@ -1,10 +1,10 @@
 use super::*;
 use aruna_core::events::StorageEvent;
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
     AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_TURN_BYTES,
 };
-use aruna_core::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
 const CHAT: &str = "c-1";
@@ -436,10 +436,7 @@ fn trims_old_turns() {
     let effects = operation.step(heads_iter(&[full.clone()]));
     assert_eq!(
         deleted_keys(&effects),
-        vec![(
-            CHAT_TURN_KEYSPACE.to_string(),
-            turn_key(user(), CHAT, 10)
-        )]
+        vec![(CHAT_TURN_KEYSPACE.to_string(), turn_key(user(), CHAT, 10))]
     );
     assert!(is_batch_write(&operation.step(batch_deleted())));
     operation.step(batch_written());

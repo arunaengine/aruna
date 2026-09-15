@@ -14,15 +14,13 @@ use aruna_core::auth::revocation_live;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    MANAGEMENT_URL_KEYSPACE, REALM_MARKER_KEYSPACE, GROUP_KEYSPACE,
-};
+use aruna_core::keyspaces::{GROUP_KEYSPACE, MANAGEMENT_URL_KEYSPACE, REALM_MARKER_KEYSPACE};
 use aruna_core::metadata::AuthToken;
+use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::SyncRefusal;
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, Value};
 use rand::seq::SliceRandom;

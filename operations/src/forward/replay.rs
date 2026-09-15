@@ -14,10 +14,10 @@ use aruna_core::keyspaces::CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::create_acceptance_key;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::sync::Arc;
 use ulid::Ulid;
 

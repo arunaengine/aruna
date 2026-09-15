@@ -8,8 +8,8 @@ use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keys::realm_presence_key;
-use aruna_core::structs::{ConnectionAddressStatus, NetState, PeerConnectionStatus};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::{ConnectionAddressStatus, NetState, PeerConnectionStatus};
 use aruna_net::streams::BiStream;
 use aruna_net::{
     DiscoveryMethod, InboundEventHandler, NetConfig, NetError, NetHandle, RelayMethod,

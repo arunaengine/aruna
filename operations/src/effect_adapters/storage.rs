@@ -48,11 +48,8 @@ pub(super) async fn dispatch_storage(effect: StorageEffect, context: &DriverCont
             (Event::Storage(StorageEvent::TransactionCommitted { .. }), _)
                 if refresh_after_commit =>
             {
-                match tokio::time::timeout(
-                    PEER_REFRESH_TIMEOUT,
-                    net_handle.reload_realm_peers(),
-                )
-                .await
+                match tokio::time::timeout(PEER_REFRESH_TIMEOUT, net_handle.reload_realm_peers())
+                    .await
                 {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => {

@@ -15,10 +15,9 @@ use aruna_core::document::{
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    APPLIED_OPS_KEYSPACE, SYNC_REVISION_KEYSPACE,
-    DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    APPLIED_OPS_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
     GRAPH_LIFECYCLE_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, QUARANTINE_USAGE_KEYSPACE,
+    QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataDeleteRecord, MetadataEventPayload, MetadataEventRecord,
@@ -30,15 +29,15 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::auth::{Actor, Permission, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::identity::realm::{
     OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
     RealmId, RealmNodeKind, StaticRealmEndpoint,
 };
-use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
-use aruna_core::structs::placement::placement_record::PlacementRef;
-use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
 use aruna_core::structs::identity::user::User;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
 use aruna_core::types::Value;
 use aruna_core::{NodeId, UserId};
 use aruna_storage::FjallPersistPolicy;
@@ -52,10 +51,8 @@ use std::process::Command;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-pub(crate) const CHILD_PATH_ENV: &str =
-    "ARUNA_NET_DOCUMENT_SYNC_RESTART_CHILD_PATH";
-pub(crate) const SYNC_CHILD_TEST: &str =
-    "document_sync::tests::restart::buffered_publish_child";
+pub(crate) const CHILD_PATH_ENV: &str = "ARUNA_NET_DOCUMENT_SYNC_RESTART_CHILD_PATH";
+pub(crate) const SYNC_CHILD_TEST: &str = "document_sync::tests::restart::buffered_publish_child";
 
 pub(crate) fn topic(seed: u8) -> ::irokle::TopicId {
     DocumentTarget::RealmConfig {
@@ -219,12 +216,8 @@ pub(crate) async fn read_test_cursor(
     storage: &StorageHandle,
     topic_id: ::irokle::TopicId,
 ) -> Option<::irokle::ActorClock> {
-    let bytes = read_storage_value(
-        storage,
-        APPLIED_OPS_KEYSPACE,
-        topic_cursor_key(topic_id),
-    )
-    .await?;
+    let bytes =
+        read_storage_value(storage, APPLIED_OPS_KEYSPACE, topic_cursor_key(topic_id)).await?;
     Some(
         postcard::from_bytes::<AppliedCursor>(&bytes)
             .expect("cursor decodes")
@@ -664,13 +657,9 @@ pub(crate) async fn read_lifecycle_revision(
     document_id: Ulid,
 ) -> DocumentChange {
     let target = DocumentTarget::MetadataDocumentLifecycle { document_id };
-    let value = read_storage_value(
-        storage,
-        SYNC_REVISION_KEYSPACE,
-        sync_revision_key(&target),
-    )
-    .await
-    .expect("lifecycle revision exists");
+    let value = read_storage_value(storage, SYNC_REVISION_KEYSPACE, sync_revision_key(&target))
+        .await
+        .expect("lifecycle revision exists");
     postcard::from_bytes(&value).expect("lifecycle revision decodes")
 }
 
@@ -759,7 +748,9 @@ pub(crate) async fn write_realm_view(
         .expect("realm view is stored");
 }
 
-pub(crate) fn policy_fixture(policy_id: Ulid) -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
+pub(crate) fn policy_fixture(
+    policy_id: Ulid,
+) -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
     use aruna_core::structs::placement::placement_policy::{
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };

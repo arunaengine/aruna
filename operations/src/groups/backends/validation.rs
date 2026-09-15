@@ -1,6 +1,6 @@
 use crate::endpoint_screening;
-use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
 use aruna_core::structs::storage::blob::ensure_confined_path;
+use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;

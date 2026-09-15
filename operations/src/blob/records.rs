@@ -4,11 +4,11 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer, HashIndex,
     VersionKey,
 };
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -241,8 +241,8 @@ mod pure_tests {
         iter_index_effect,
     };
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::structs::storage::blob::{CurrentVersionPointer, HashIndex};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::{CurrentVersionPointer, HashIndex};
     use ulid::Ulid;
 
     fn alias_context() -> HeadAliasContext {
@@ -280,7 +280,8 @@ mod pure_tests {
         };
 
         let prefix = prefix.expect("expected prefix");
-        let expected = aruna_core::structs::storage::blob::HashIndex::hash_prefix(&[7u8; 32]).unwrap();
+        let expected =
+            aruna_core::structs::storage::blob::HashIndex::hash_prefix(&[7u8; 32]).unwrap();
         assert_eq!(prefix.as_ref(), expected.as_slice());
     }
 

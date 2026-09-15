@@ -3,9 +3,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BACKEND_INDEX_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE,
-    UPLOAD_KEYSPACE,
+    BACKEND_INDEX_KEYSPACE, BACKEND_SECRET_KEYSPACE, BLOB_CLEANUP_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, BlobLocationKey};
@@ -505,10 +504,7 @@ mod tests {
 
         assert_eq!(remove_drained_backends(&ctx).await.unwrap(), 1);
 
-        for key_space in [
-            STORAGE_BACKEND_KEYSPACE,
-            BACKEND_SECRET_KEYSPACE,
-        ] {
+        for key_space in [STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE] {
             assert!(
                 read(&ctx, key_space, backend_key(backend_id))
                     .await
@@ -535,13 +531,9 @@ mod tests {
 
         assert_eq!(remove_drained_backends(&ctx).await.unwrap(), 0);
         assert!(
-            read(
-                &ctx,
-                STORAGE_BACKEND_KEYSPACE,
-                backend_key(backend_id)
-            )
-            .await
-            .is_some()
+            read(&ctx, STORAGE_BACKEND_KEYSPACE, backend_key(backend_id))
+                .await
+                .is_some()
         );
     }
 

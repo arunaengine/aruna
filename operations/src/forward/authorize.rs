@@ -10,11 +10,11 @@ use crate::placement::process_placements::load_realm_config;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::telemetry::time_stage;
 use aruna_core::types::GroupId;
 use std::sync::Arc;
@@ -89,9 +89,7 @@ pub(crate) async fn authorize_forwarded_caller(
         MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } => {
             Some(auth_token.clone())
         }
-        MetadataTransportMessage::ForwardCreatePolicy { auth_token, .. } => {
-            auth_token.clone()
-        }
+        MetadataTransportMessage::ForwardCreatePolicy { auth_token, .. } => auth_token.clone(),
         MetadataTransportMessage::ForwardGroupCreate { auth_token, .. } => auth_token.clone(),
         MetadataTransportMessage::ForwardApplyBatch { auth_token, .. } => Some(auth_token.clone()),
         _ => None,

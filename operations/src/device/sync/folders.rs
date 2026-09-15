@@ -5,15 +5,14 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    SYNC_LOG_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE,
-    SYNCED_FOLDER_KEYSPACE,
+    SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
     EntryState, FolderMode, FolderState, RemoteBinding, SyncActionRecord, SyncBase, SyncPageLimit,
     SyncRefusal, SyncedFolder,
 };
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
@@ -294,11 +293,7 @@ pub async fn unbind_folder(
         )
         .await?;
     }
-    for key_space in [
-        SYNC_BASE_KEYSPACE,
-        SYNC_UPLOAD_KEYSPACE,
-        SYNC_LOG_KEYSPACE,
-    ] {
+    for key_space in [SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNC_LOG_KEYSPACE] {
         clear_rows(context, key_space, folder_id).await?;
     }
     let removed = match withdraw_offer(

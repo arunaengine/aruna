@@ -9,11 +9,11 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::offered_directory::fingerprint_complete;
 use aruna_core::structs::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
     SyncedFolder, WriteGuard, decide,
 };
-use aruna_core::structs::execution::offered_directory::fingerprint_complete;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -776,8 +776,8 @@ mod pure_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::structs::execution::offered_directory::FileStat;
-    use aruna_core::structs::{FolderMode, FolderState, RemoteBinding};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::{FolderMode, FolderState, RemoteBinding};
     use byteview::ByteView;
 
     fn folder() -> SyncedFolder {

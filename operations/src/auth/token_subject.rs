@@ -5,7 +5,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
-use aruna_core::{USER_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
+use aruna_core::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;

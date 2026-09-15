@@ -244,8 +244,8 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::storage::blob::HashIndex;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::HashIndex;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;

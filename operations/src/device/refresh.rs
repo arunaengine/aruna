@@ -11,9 +11,9 @@ use aruna_core::events::Event;
 use aruna_core::metadata::{
     AuthToken, MetadataClockRelation, MetadataEffect, MetadataEvent, compare_metadata_clocks,
 };
+use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::SyncRefusal;
 use aruna_core::time::unix_timestamp_millis;
 use rand::seq::SliceRandom;
 use tracing::{debug, warn};

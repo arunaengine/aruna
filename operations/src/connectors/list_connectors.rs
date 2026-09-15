@@ -132,8 +132,7 @@ impl Operation for ListSourceOperation {
             return Err(ListSourceError::ListConnectorsFailed);
         }
 
-        self.output
-            .ok_or(ListSourceError::ListConnectorsFailed)?
+        self.output.ok_or(ListSourceError::ListConnectorsFailed)?
     }
 
     fn abort(&mut self) -> Effects {

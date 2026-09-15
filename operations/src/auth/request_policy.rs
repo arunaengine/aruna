@@ -212,9 +212,7 @@ async fn group_scope(
             }
             compile_scope(&auth_doc.policies, "group")
         }
-        Err(GetGroupError::GroupNotFound | GetGroupError::DocNotFound) => {
-            Err(group_unavailable())
-        }
+        Err(GetGroupError::GroupNotFound | GetGroupError::DocNotFound) => Err(group_unavailable()),
         Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),
     }
 }
@@ -251,9 +249,7 @@ async fn group_txn_scope(
             }
             compile_scope(&auth_doc.policies, "group")
         }
-        Err(GetGroupError::GroupNotFound | GetGroupError::DocNotFound) => {
-            Err(group_unavailable())
-        }
+        Err(GetGroupError::GroupNotFound | GetGroupError::DocNotFound) => Err(group_unavailable()),
         Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),
     }
 }
@@ -610,8 +606,10 @@ mod tests {
             user_id: aruna_core::UserId::nil(realm_id),
             realm_id,
         };
-        let config =
-            aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        let config = aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(
+            realm_id,
+            Vec::new(),
+        );
         let event = context
             .storage_handle
             .send_storage_effect(aruna_core::effects::StorageEffect::Write {

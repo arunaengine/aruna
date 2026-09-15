@@ -7,10 +7,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTa
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    OUTBOX_INDEX_KEYSPACE,
-};
+use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
@@ -34,8 +31,7 @@ use crate::sync::document_outbox::{
 };
 
 const PRIVILEGED_REVOCATION_RESERVE: usize = 128;
-const REVOCATION_CAP: usize =
-    REVOCATIONS_PER_ORIGIN - PRIVILEGED_REVOCATION_RESERVE;
+const REVOCATION_CAP: usize = REVOCATIONS_PER_ORIGIN - PRIVILEGED_REVOCATION_RESERVE;
 const OWNER_CAP: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,19 +319,13 @@ impl RevokeTokenOperation {
 
         for (index_key, (outbox_key, value)) in index_keys.into_iter().zip(values) {
             let Some(value) = value else {
-                pending_deletes.push((
-                    OUTBOX_INDEX_KEYSPACE.to_string(),
-                    index_key,
-                ));
+                pending_deletes.push((OUTBOX_INDEX_KEYSPACE.to_string(), index_key));
                 continue;
             };
             let Ok(record) = postcard::from_bytes::<DocumentOutboxRecord>(&value) else {
                 pending_deletes.extend([
                     (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
-                    (
-                        OUTBOX_INDEX_KEYSPACE.to_string(),
-                        index_key,
-                    ),
+                    (OUTBOX_INDEX_KEYSPACE.to_string(), index_key),
                 ]);
                 continue;
             };
@@ -343,20 +333,14 @@ impl RevokeTokenOperation {
             else {
                 pending_deletes.extend([
                     (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
-                    (
-                        OUTBOX_INDEX_KEYSPACE.to_string(),
-                        index_key,
-                    ),
+                    (OUTBOX_INDEX_KEYSPACE.to_string(), index_key),
                 ]);
                 continue;
             };
             if !revocation_retained(expires_at, self.config.now) {
                 pending_deletes.extend([
                     (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
-                    (
-                        OUTBOX_INDEX_KEYSPACE.to_string(),
-                        index_key,
-                    ),
+                    (OUTBOX_INDEX_KEYSPACE.to_string(), index_key),
                 ]);
             } else {
                 pending_live
@@ -868,7 +852,7 @@ impl Operation for RevokeTokenOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        DOCUMENT_STATE_KEYSPACE, AdminDocumentState, AdminDocumentTarget, Event,
+        AdminDocumentState, AdminDocumentTarget, DOCUMENT_STATE_KEYSPACE, Event,
         REVOCATIONS_PER_ORIGIN, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
         RevokeTokenOperation, StorageEffect, StorageEvent, reducer_state_key,
     };
@@ -881,9 +865,7 @@ mod tests {
     use aruna_core::auth::MAX_TOKEN_LIFETIME;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
-    use aruna_core::keyspaces::{
-        SYNC_OUTBOX_KEYSPACE, OUTBOX_INDEX_KEYSPACE,
-    };
+    use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::storage_entries::reducer_state_entry;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;

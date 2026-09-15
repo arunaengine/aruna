@@ -224,17 +224,15 @@ pub(crate) async fn apply_token_revoke(
     .await
     {
         Ok(_) => MetadataTransportMessage::ForwardedTokenRevoked,
-        Err(RevokeTokenError::CapacityReached) => {
-            MetadataTransportMessage::TokenRevocationCapacity
-        }
+        Err(RevokeTokenError::CapacityReached) => MetadataTransportMessage::TokenRevocationCapacity,
         Err(error) => reject(format!("token revocation failed: {error}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TOKEN_REVOKE_DEADLINE;
     use super::REVOKE_PEER_LIMIT;
+    use super::TOKEN_REVOKE_DEADLINE;
     use super::rank_revoke_peers;
     use super::run_revoke;
     use crate::metadata::api::MetadataApiError;
@@ -327,9 +325,7 @@ mod tests {
             Instant::now() + TOKEN_REVOKE_DEADLINE,
             |peer, _| {
                 calls.push(peer);
-                std::future::ready(Ok(
-                    MetadataTransportMessage::TokenRevocationCapacity,
-                ))
+                std::future::ready(Ok(MetadataTransportMessage::TokenRevocationCapacity))
             },
         )
         .await;
@@ -374,9 +370,7 @@ mod tests {
             Instant::now() + TOKEN_REVOKE_DEADLINE,
             |peer, _| {
                 calls.push(peer);
-                std::future::ready(Ok(
-                    MetadataTransportMessage::TokenRevocationCapacity,
-                ))
+                std::future::ready(Ok(MetadataTransportMessage::TokenRevocationCapacity))
             },
         )
         .await;

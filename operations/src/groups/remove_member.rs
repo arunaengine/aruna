@@ -6,17 +6,17 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
+use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::execution::notification::ResourceEvent;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, KeySpace, RoleId, TxnId};
@@ -672,9 +672,7 @@ impl Operation for RemoveFromOperation {
         match self.state.clone() {
             RemoveFromState::Auth => self.handle_authorization(event),
             RemoveFromState::StartTransaction => self.handle_start_transaction(event),
-            RemoveFromState::ReadAdminState { txn_id } => {
-                self.handle_auth_read(event, txn_id)
-            }
+            RemoveFromState::ReadAdminState { txn_id } => self.handle_auth_read(event, txn_id),
             RemoveFromState::WriteAdminState {
                 txn_id,
                 auth_doc,
@@ -833,6 +831,7 @@ fn should_seed_role(state: &AdminDocumentState, role_id: RoleId) -> bool {
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
+    use aruna_core::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
@@ -841,16 +840,15 @@ pub mod test {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::reducer_state_key;
-    use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::execution::notification::{
         NotificationOutboxRecord, NotificationRecord,
     };
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::auth::{Permission, Role};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{RoleId, TxnId};
-    use aruna_core::SYNC_OUTBOX_KEYSPACE;
-    use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;

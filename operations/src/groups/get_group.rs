@@ -86,9 +86,7 @@ impl GetGroupOperation {
             self.state = GetGroupState::Finish;
             self.output = Some(Ok((
                 self.group.clone().ok_or(GetGroupError::GroupNotFound)?,
-                self.auth_doc
-                    .clone()
-                    .ok_or(GetGroupError::DocNotFound)?,
+                self.auth_doc.clone().ok_or(GetGroupError::DocNotFound)?,
             )));
             return Ok(smallvec![]);
         }
@@ -349,7 +347,10 @@ mod test {
         };
 
         let actor = Actor {
-            user_id: UserId::local(Ulid::generate(), aruna_core::structs::identity::realm::RealmId([0u8; 32])),
+            user_id: UserId::local(
+                Ulid::generate(),
+                aruna_core::structs::identity::realm::RealmId([0u8; 32]),
+            ),
             realm_id: aruna_core::structs::identity::realm::RealmId([0u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
         };

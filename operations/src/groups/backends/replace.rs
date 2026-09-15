@@ -3,9 +3,7 @@ use super::validation::{check_identity, validate_backend_input};
 use super::{backend_key, parse_read, record_writes};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{
-    STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE,
-};
+use aruna_core::keyspaces::{BACKEND_SECRET_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::types::{Effects, TxnId};

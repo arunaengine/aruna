@@ -6,12 +6,12 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::routing::{
     BackendCatalog, GroupRoutingInputs, NodeRouting, RoutingSnapshot, StorageRoutingRule,
 };
-use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
-use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_keys};
 use aruna_core::types::GroupId;
 use thiserror::Error;
@@ -248,13 +248,13 @@ mod tests {
     use super::*;
     use crate::tests::staging::setup_driver_context;
     use aruna_core::UserId;
-    use aruna_core::keyspaces::{STORAGE_ROUTING_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+    use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
+    use aruna_core::structs::placement::placement_policy::PlacementSubject;
     use aruna_core::structs::storage::blob::{BackendRef, ResolvedBackend};
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::routing::{
         GroupStorageRouting, RoutingTarget, StorageRoutingRule, resolve_backend,
     };
-    use aruna_core::structs::placement::placement_policy::PlacementSubject;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key};
     use std::collections::HashMap;
     use std::time::SystemTime;

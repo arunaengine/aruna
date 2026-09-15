@@ -10,8 +10,8 @@ use aruna_core::permission_path::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission, Role};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use globset::GlobMatcher;
 use smallvec::smallvec;
@@ -686,8 +686,8 @@ mod pure_tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use ulid::Ulid;
 
     use super::{CollectedRole, PermissionRules, PermissionRulesConfig, PermissionRulesOperation};

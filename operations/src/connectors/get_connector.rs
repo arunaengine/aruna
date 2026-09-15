@@ -150,8 +150,7 @@ impl Operation for GetSourceOperation {
             return Err(GetSourceError::GetConnectorFailed);
         }
 
-        self.output
-            .ok_or(GetSourceError::GetConnectorFailed)?
+        self.output.ok_or(GetSourceError::GetConnectorFailed)?
     }
 
     fn abort(&mut self) -> Effects {

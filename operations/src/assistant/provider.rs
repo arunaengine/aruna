@@ -731,8 +731,8 @@ impl Operation for UpdateProviderOperation {
 mod pure_tests {
     use super::*;
     use aruna_core::credential_encryption::EncryptedS3Secret;
-    use aruna_core::structs::{AssistantProviderKind, AssistantProviderStatus};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::{AssistantProviderKind, AssistantProviderStatus};
 
     #[test]
     fn rejects_stale_update() {
