@@ -1124,12 +1124,12 @@ mod tests {
     // Production construction must not return a scheduler-less handle as if it
     // were running; outside a runtime the failure is concrete.
     #[test]
-    fn try_new_requires_a_runtime() {
+    fn requires_runtime() {
         assert_eq!(TaskHandle::try_new().unwrap_err(), TaskSchedulerUnavailable);
     }
 
     #[tokio::test]
-    async fn try_new_starts_with_a_runtime() {
+    async fn starts_in_runtime() {
         assert!(TaskHandle::try_new().is_ok());
     }
 
@@ -1137,7 +1137,7 @@ mod tests {
     // instead of handing back an inactive scheduler.
     #[test]
     #[should_panic(expected = "task scheduler requires an active Tokio runtime")]
-    fn new_without_a_runtime_panics() {
+    fn new_without_runtime() {
         let _ = TaskHandle::new();
     }
 
@@ -1573,7 +1573,7 @@ mod tests {
     // Dropping the drain future does not detach the run: the scheduler keeps it
     // owned, so the forced stop is still observed and a resumed drain is clean.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn interrupted_shutdown_keeps_run_owned() {
+    async fn shutdown_keeps_run() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -1630,7 +1630,7 @@ mod tests {
     // Concurrent drains wait on the same completion: both must be released by
     // the single handler finish instead of only the first waiter.
     #[tokio::test]
-    async fn concurrent_drains_share_one_completion() {
+    async fn drains_share_completion() {
         let handle = TaskHandle::new();
         let started = Arc::new(Notify::new());
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1673,7 +1673,7 @@ mod tests {
     // A drain waiter that the scheduler drops without a completion is not a
     // successful drain.
     #[tokio::test]
-    async fn lost_drain_ack_is_unavailable() {
+    async fn lost_drain_unavailable() {
         let (command_tx, mut command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
         let handle = TaskHandle {
             command_tx,
@@ -1703,7 +1703,7 @@ mod tests {
     // A lost forced-abort acknowledgement must not collapse to zero aborted
     // work and a clean report.
     #[tokio::test]
-    async fn lost_abort_ack_is_unavailable() {
+    async fn lost_abort_unavailable() {
         let (command_tx, mut command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
         let handle = TaskHandle {
             command_tx,
@@ -1822,7 +1822,7 @@ mod tests {
     // second abort can see an empty entry while the handler is still running,
     // and a third abort only reports zero after the completion arrived.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn per_key_abort_retains_entry_until_completion() {
+    async fn per_key_retention() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -1888,7 +1888,7 @@ mod tests {
     // After a per-key abort, the same key can be rescheduled; the new run only
     // starts once the aborted run reported completion.
     #[tokio::test]
-    async fn same_key_reschedule_waits_for_aborted_run() {
+    async fn reschedule_after_abort() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
@@ -1919,7 +1919,7 @@ mod tests {
     // Repeating shutdown after handlers were already drained is a clean no-op
     // instead of a second teardown.
     #[tokio::test]
-    async fn repeated_shutdown_is_clean() {
+    async fn repeat_shutdown_clean() {
         let handle = TaskHandle::new();
         let first = handle.shutdown(Duration::from_millis(10)).await;
         let second = handle.shutdown(Duration::from_millis(10)).await;
@@ -1934,7 +1934,7 @@ mod tests {
     // A retained clone owns the command channel just like the original, so
     // dropping one handle must not stop the scheduler.
     #[tokio::test]
-    async fn dropped_clone_keeps_the_scheduler_running() {
+    async fn clone_keeps_scheduler() {
         let handle = TaskHandle::new();
         let clone = handle.clone();
         let key = test_key();
@@ -1999,7 +1999,7 @@ mod decision_tests {
     }
 
     #[test]
-    fn due_timers_dispatch_at_their_deadline_only() {
+    fn dispatch_at_deadline() {
         let mut state = state();
         let start = Instant::now();
         let key = key();
@@ -2020,7 +2020,7 @@ mod decision_tests {
     }
 
     #[test]
-    fn shorten_replaces_only_earlier_deadlines() {
+    fn shorten_earlier_deadlines() {
         let mut state = state();
         let start = Instant::now();
         let key = key();
@@ -2041,7 +2041,7 @@ mod decision_tests {
     }
 
     #[test]
-    fn idle_timer_respects_running_key() {
+    fn idle_timer_suppressed() {
         let mut state = state();
         let start = Instant::now();
         let key = key();
@@ -2059,7 +2059,7 @@ mod decision_tests {
     }
 
     #[test]
-    fn cancel_removes_both_indexes() {
+    fn cancel_removes_indexes() {
         let mut state = state();
         let start = Instant::now();
         let key = key();
