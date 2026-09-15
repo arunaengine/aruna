@@ -1,5 +1,5 @@
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentSyncTarget, PendingShardPlacement};
+use aruna_core::document::{DocumentTarget, PendingShardPlacement};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -24,7 +24,7 @@ pub struct ReplicateDocumentsConfig {
     pub realm_id: RealmId,
     pub local_node_id: NodeId,
     pub excluded_peers: Vec<NodeId>,
-    pub documents: Vec<DocumentSyncTarget>,
+    pub documents: Vec<DocumentTarget>,
     /// Whether announces this run may mint a missing topic genesis. True for a
     /// document's origin; for shared node-usage only the realm-bootstrap node, so
     /// joiners ride the TopicNotReady retry instead of forking.
@@ -35,7 +35,7 @@ pub struct ReplicateDocumentsConfig {
 pub struct ReplicateDocumentsOperation {
     config: ReplicateDocumentsConfig,
     state: ReplicateDocumentsState,
-    pending_documents: Vec<DocumentSyncTarget>,
+    pending_documents: Vec<DocumentTarget>,
     realm_config: Option<RealmConfigDocument>,
     placement_action: Option<PlacementAction>,
     retry_needed: bool,
@@ -82,7 +82,7 @@ pub enum ReplicateDocumentsError {
 pub fn replicate_documents_effect(
     realm_id: RealmId,
     local_node_id: NodeId,
-    documents: Vec<DocumentSyncTarget>,
+    documents: Vec<DocumentTarget>,
 ) -> Effect {
     Effect::SubOperation(boxed_suboperation(
         ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
@@ -213,9 +213,9 @@ impl ReplicateDocumentsOperation {
         if selected_peers.is_empty()
             && !matches!(
                 document,
-                DocumentSyncTarget::NodeUsage { .. }
-                    | DocumentSyncTarget::WatchInterest { .. }
-                    | DocumentSyncTarget::NodeInfo { .. }
+                DocumentTarget::NodeUsage { .. }
+                    | DocumentTarget::WatchInterest { .. }
+                    | DocumentTarget::NodeInfo { .. }
             )
         {
             return match self.emit_placement_update() {
@@ -293,7 +293,7 @@ impl Operation for ReplicateDocumentsOperation {
     fn start(&mut self) -> Effects {
         self.state = ReplicateDocumentsState::LoadRealmConfig;
         smallvec![read_effect(
-            &DocumentSyncTarget::RealmConfig {
+            &DocumentTarget::RealmConfig {
                 realm_id: self.config.realm_id,
             },
             None,
@@ -391,26 +391,26 @@ mod pure_tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn group_target(seed: u8) -> DocumentSyncTarget {
-        DocumentSyncTarget::Group {
+    fn group_target(seed: u8) -> DocumentTarget {
+        DocumentTarget::Group {
             group_id: Ulid::from_bytes([seed; 16]),
         }
     }
 
-    fn node_usage_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
-        DocumentSyncTarget::NodeUsage {
+    fn node_usage_target(realm_id: RealmId, node_id: NodeId) -> DocumentTarget {
+        DocumentTarget::NodeUsage {
             realm_id,
             node_id,
             group_id: None,
         }
     }
 
-    fn watch_interest_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
-        DocumentSyncTarget::WatchInterest { realm_id, node_id }
+    fn watch_interest_target(realm_id: RealmId, node_id: NodeId) -> DocumentTarget {
+        DocumentTarget::WatchInterest { realm_id, node_id }
     }
 
-    fn node_info_target(realm_id: RealmId, node_id: NodeId) -> DocumentSyncTarget {
-        DocumentSyncTarget::NodeInfo { realm_id, node_id }
+    fn node_info_target(realm_id: RealmId, node_id: NodeId) -> DocumentTarget {
+        DocumentTarget::NodeInfo { realm_id, node_id }
     }
 
     fn config_with(nodes: &[NodeId], replica: Option<u32>) -> RealmConfigDocument {

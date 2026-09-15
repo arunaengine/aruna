@@ -395,8 +395,7 @@ mod tests {
     use super::*;
     use aruna_core::NodeId;
     use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncRevision,
-        DocumentSyncTarget,
+        DocumentChange, DocumentChangeKind, DocumentEvent, DocumentSyncRevision, DocumentTarget,
     };
     use aruna_core::structs::{
         PlacementRef, RealmId, SyncQuarantineCapacity, SyncQuarantineEvidence,
@@ -418,15 +417,15 @@ mod tests {
         (context, dir)
     }
 
-    fn event(index: u8) -> DocumentSyncEvent {
+    fn event(index: u8) -> DocumentEvent {
         let node = NodeId::from_bytes(&[1u8; 32]).unwrap();
-        DocumentSyncEvent::Upsert {
+        DocumentEvent::Upsert {
             event_id: Ulid::from_bytes([index; 16]),
-            target: DocumentSyncTarget::RealmConfig {
+            target: DocumentTarget::RealmConfig {
                 realm_id: RealmId([9; 32]),
             },
             bytes: vec![index; 8],
-            change: DocumentSyncChange {
+            change: DocumentChange {
                 base: None,
                 current: DocumentSyncRevision {
                     generation: 1,
@@ -434,7 +433,7 @@ mod tests {
                     actor: node,
                     updated_at_ms: 1,
                 },
-                kind: DocumentSyncChangeKind::Upsert,
+                kind: DocumentChangeKind::Upsert,
                 placement: PlacementRef::NIL,
             },
         }

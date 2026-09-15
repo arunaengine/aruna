@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use aruna_core::document::{
-    DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncPublish, DocumentSyncTarget,
+    DocumentOutboxEvent, DocumentOutboxRecord, DocumentSyncPublish, DocumentTarget,
 };
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
@@ -17,7 +17,7 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
-use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
+use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -45,7 +45,7 @@ use crate::blob::cleanup::{
 use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
 };
-use crate::blob::holders::RefreshBlobHoldersOperation;
+use crate::blob::holders::RefreshHoldersOperation;
 use crate::blob::reclaim::{
     RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
 };
@@ -68,9 +68,8 @@ use crate::jobs::store::release_job;
 use crate::jobs::{JOB_DRAIN_RETRY_AFTER, JOB_PRUNE_POLL_AFTER, JOB_PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
     METADATA_MATERIALIZATION_NEXT_BATCH_AFTER, METADATA_MATERIALIZATION_POLL_AFTER,
-    METADATA_MATERIALIZATION_RETRY_AFTER, MetadataMaterializationDrainResult,
-    materialization_jobs_exist, process_materialization_batch, requeue_dead_letters,
-    restore_materialization_timer,
+    METADATA_MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, materialization_jobs_exist,
+    process_materialization_batch, requeue_dead_letters, restore_materialization_timer,
 };
 use crate::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, drain_projection_queue, project_create_events,
@@ -99,7 +98,7 @@ use crate::notifications::watch::interest::{
 use crate::placement::policy::observe_placement;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
+    AnnouncePresenceConfig, AnnouncePresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer,
@@ -120,11 +119,13 @@ use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
 
+#[path = "incoming_outbox.rs"]
 mod outbox;
+#[path = "incoming_restore.rs"]
 mod restore;
 
 pub use outbox::drive_sync_drain;
-pub use restore::{drain_notification_outbox, install_and_start_task_queues, install_task_queues};
+pub use restore::{drain_notification_outbox, install_task_queues, start_task_queues};
 
 /// Process-wide tally of document sync outbox records ever classified
 /// undeliverable. The drain already error-logs each one; this exposes the count
@@ -177,7 +178,7 @@ impl Default for OutboxLimits {
 /// One drained outbox record with its resolved publish topic.
 type DrainRecord = (
     Vec<u8>,
-    aruna_core::document::DocumentSyncOutboxRecord,
+    aruna_core::document::DocumentOutboxRecord,
     irokle::TopicId,
 );
 
@@ -241,7 +242,7 @@ struct DrainSubBatch {
     /// Admin origin of each entry, so a blocked publish also blocks the rest of
     /// that origin's sequence.
     origins: Vec<Option<aruna_core::NodeId>>,
-    targets: Vec<DocumentSyncTarget>,
+    targets: Vec<DocumentTarget>,
     record_keys: Vec<Vec<u8>>,
 }
 
@@ -271,7 +272,7 @@ struct DrainDeferState {
 
 type StuckRecord = (
     u64,
-    DocumentSyncTarget,
+    DocumentTarget,
     irokle::TopicId,
     aruna_core::structs::PlacementRef,
 );
@@ -298,7 +299,7 @@ struct DrainInvocation {
 
 enum DrainPage {
     Records {
-        records: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+        records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
         has_more: bool,
         boundary_reached: bool,
     },
@@ -378,7 +379,7 @@ impl OperationsTaskHandler {
             return;
         }
         let operation =
-            RefreshBlobHoldersOperation::new(*net_handle.realm_id(), self.rocrate_limits.clone());
+            RefreshHoldersOperation::new(*net_handle.realm_id(), self.rocrate_limits.clone());
         if let Err(error) = drive(operation, self.context.as_ref()).await {
             warn!(task_id = ?TaskKey::RefreshBlobHolders, error = %error, "Failed to refresh blob holders");
             self.reschedule_timer(
@@ -408,7 +409,7 @@ impl OperationsTaskHandler {
             }
             // A device can never become a holder, so an unrelayable row of its
             // own would only be error-logged on every drain: drop it instead.
-            if device && !matches!(record.event, DocumentSyncOutboxEvent::AdminOperation { .. }) {
+            if device && !matches!(record.event, DocumentOutboxEvent::AdminOperation { .. }) {
                 warn!(
                     event = "pipeline.drain.dropped",
                     target = ?record.target,
@@ -453,9 +454,9 @@ impl OperationsTaskHandler {
     async fn relay_admin_record(
         &self,
         config: &aruna_core::structs::RealmConfigDocument,
-        record: &DocumentSyncOutboxRecord,
+        record: &DocumentOutboxRecord,
     ) -> bool {
-        let DocumentSyncOutboxEvent::AdminOperation {
+        let DocumentOutboxEvent::AdminOperation {
             event,
             origin_signature,
         } = &record.event
@@ -719,7 +720,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 ) {
                     return;
                 }
-                let op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                let op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                     realm_id,
                     node_id,
                     schedule_refresh: true,
@@ -859,4 +860,5 @@ impl InboundTaskHandler for OperationsTaskHandler {
 }
 
 #[cfg(test)]
+#[path = "incoming_tests.rs"]
 mod tests;
