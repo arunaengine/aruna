@@ -1,8 +1,8 @@
 use aruna_core::UserId;
+use aruna_core::structs::execution::notification::NotificationRecord;
 pub use aruna_core::structs::execution::notification_watch::{
     INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP,
 };
-use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };

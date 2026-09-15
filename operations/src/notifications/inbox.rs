@@ -8,8 +8,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::storage_entries::inbox_write_entries;
 use aruna_core::structs::execution::notification::{
-    TRANSIENT_USER_CAP, NotificationClass, NotificationRecord,
-    notification_inbox_key, notification_inbox_prefix,
+    NotificationClass, NotificationRecord, TRANSIENT_USER_CAP, notification_inbox_key,
+    notification_inbox_prefix,
 };
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use aruna_storage::StorageHandle;
@@ -263,9 +263,7 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
 mod tests {
     use super::*;
     use crate::tests::notifications::{record, temp_storage, user};
-    use aruna_core::keyspaces::{
-        NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
-    };
+    use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
     use aruna_core::storage_entries::inbox_update_entry;
     use aruna_core::structs::execution::notification::NotificationClass;
 
@@ -328,10 +326,7 @@ mod tests {
             NotificationRecord::from_bytes(&stored).expect("decodes"),
             record
         );
-        assert_eq!(
-            count_keyspace(&storage, PRUNE_INDEX_KEYSPACE).await,
-            1
-        );
+        assert_eq!(count_keyspace(&storage, PRUNE_INDEX_KEYSPACE).await, 1);
     }
 
     #[tokio::test]

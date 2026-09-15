@@ -1,12 +1,12 @@
 use aruna_core::UserId;
-use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, ResourceEvent,
 };
-use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchSubscription, watch_notification_id, watch_path_matches,
 };
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 
 pub fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc
@@ -173,11 +173,11 @@ pub fn route_watch_event(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::identity::auth::Role;
     use aruna_core::structs::execution::notification_watch::{
         WatchEventDetail, WatchEventKind, WatchEventMask,
     };
+    use aruna_core::structs::identity::auth::Role;
+    use aruna_core::structs::identity::realm::RealmId;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
 
@@ -434,8 +434,8 @@ mod pure_tests {
     }
 
     fn upload_event(actor: UserId, path: &str) -> WatchEvent {
-        let resource =
-            aruna_core::structs::execution::notification_watch::parse_watch_path(path).expect("canonical data watch path");
+        let resource = aruna_core::structs::execution::notification_watch::parse_watch_path(path)
+            .expect("canonical data watch path");
         WatchEvent {
             event_id: Ulid::from_bytes([7u8; 16]),
             realm_id: REALM,
@@ -454,8 +454,8 @@ mod pure_tests {
     }
 
     fn sync_event(actor: UserId, path: &str) -> WatchEvent {
-        let resource =
-            aruna_core::structs::execution::notification_watch::parse_watch_path(path).expect("canonical data watch path");
+        let resource = aruna_core::structs::execution::notification_watch::parse_watch_path(path)
+            .expect("canonical data watch path");
         WatchEvent {
             event_id: Ulid::from_bytes([9u8; 16]),
             realm_id: REALM,
@@ -474,7 +474,12 @@ mod pure_tests {
     }
 
     fn data_path(node_id: aruna_core::NodeId, bucket: &str, key: &str) -> String {
-        aruna_core::structs::execution::notification_watch::watch_resource_path(Ulid::from_bytes([6u8; 16]), node_id, bucket, key)
+        aruna_core::structs::execution::notification_watch::watch_resource_path(
+            Ulid::from_bytes([6u8; 16]),
+            node_id,
+            bucket,
+            key,
+        )
     }
 
     fn metadata_event(actor: UserId, group_id: Ulid, document_id: Ulid) -> WatchEvent {

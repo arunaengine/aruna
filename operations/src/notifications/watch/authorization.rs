@@ -4,15 +4,15 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::execution::notification::NotificationKind;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
     WatchSubscription, parse_watch_path, watch_path_matches, watch_resource_path,
 };
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -705,13 +705,13 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::structs::execution::notification_watch::{
+        WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
+    };
     use aruna_core::structs::identity::auth::{Actor, PathRestriction};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
-    };
-    use aruna_core::structs::execution::notification_watch::{
-        WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
 

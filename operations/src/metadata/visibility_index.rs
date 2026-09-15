@@ -9,12 +9,10 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    VISIBILITY_INDEX_KEYSPACE, VISIBILITY_STATE_KEYSPACE,
-};
+use aruna_core::keyspaces::{VISIBILITY_INDEX_KEYSPACE, VISIBILITY_STATE_KEYSPACE};
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
@@ -225,7 +223,10 @@ fn record_visible(record: &MetadataRegistryRecord, evaluators: &Evaluators) -> b
 }
 
 type Evaluators = std::collections::HashMap<
-    (aruna_core::structs::identity::realm::RealmId, aruna_core::types::GroupId),
+    (
+        aruna_core::structs::identity::realm::RealmId,
+        aruna_core::types::GroupId,
+    ),
     PolicyEvaluator,
 >;
 
@@ -791,11 +792,11 @@ mod tests {
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
-    use aruna_core::structs::placement::placement_record::PlacementRef;
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::{NodeId, UserId};
     use aruna_storage::storage;
     use std::collections::{HashMap, HashSet};

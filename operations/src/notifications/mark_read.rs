@@ -226,9 +226,7 @@ impl Operation for MarkReadOperation {
 
     fn start(&mut self) -> Effects {
         if self.too_many_ids {
-            return self.fail(MarkReadError::TooManyIds {
-                max: MARK_MAX_IDS,
-            });
+            return self.fail(MarkReadError::TooManyIds { max: MARK_MAX_IDS });
         }
         if self.input.ids.is_empty() && self.input.up_to_ms.is_none() {
             return self.finish();
@@ -491,9 +489,7 @@ mod tests {
         assert!(operation.start().is_empty());
         assert_eq!(
             operation.finalize(),
-            Err(MarkReadError::TooManyIds {
-                max: MARK_MAX_IDS
-            })
+            Err(MarkReadError::TooManyIds { max: MARK_MAX_IDS })
         );
     }
 

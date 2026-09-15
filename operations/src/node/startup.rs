@@ -12,8 +12,8 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::MetadataEventRecord;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -29,10 +29,7 @@ use crate::placement::{draining_former_holders, resolve_shard_holders};
 /// these; see [`DocumentTarget::sync_topic_id`]).
 pub const RESTORE_TOPIC_COUNT: usize = 5;
 
-fn shared_targets(
-    realm_id: RealmId,
-    node_id: NodeId,
-) -> [DocumentTarget; RESTORE_TOPIC_COUNT] {
+fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentTarget; RESTORE_TOPIC_COUNT] {
     [
         DocumentTarget::RealmAuthorization { realm_id },
         DocumentTarget::RealmConfig { realm_id },
@@ -1638,8 +1635,8 @@ mod tests {
     use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
     use aruna_core::events::{DhtEntry, DhtEvent, NetEvent};
     use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::placement::placement_record::{PlacementOverride, PlacementStrategy};
     use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
+    use aruna_core::structs::placement::placement_record::{PlacementOverride, PlacementStrategy};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -1735,10 +1732,7 @@ mod tests {
         // The device plans no realm-wide topic and reaches nobody with the ones
         // that are its own.
         let planned = plan_shard_groups(&config, device, realm_id, 0);
-        assert_eq!(
-            planned.summary.shared_topics,
-            RESTORE_TOPIC_COUNT - 2
-        );
+        assert_eq!(planned.summary.shared_topics, RESTORE_TOPIC_COUNT - 2);
         assert!(
             planned
                 .into_units()

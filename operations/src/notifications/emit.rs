@@ -173,7 +173,9 @@ mod tests {
     use crate::tests::notifications::{context_with_storage, record, user};
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
-    use aruna_core::structs::execution::notification::{NotificationClass, notification_outbox_key};
+    use aruna_core::structs::execution::notification::{
+        NotificationClass, notification_outbox_key,
+    };
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_storage::storage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};

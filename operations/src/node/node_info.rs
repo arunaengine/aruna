@@ -14,22 +14,22 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    COMPUTE_DEPARTURE_KEYSPACE, SYNC_REVISION_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
+    COMPUTE_DEPARTURE_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
+    SYNC_REVISION_KEYSPACE,
 };
 use aruna_core::storage_entries::sync_revision_key;
-use aruna_core::structs::storage::node_info::{
-    AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, CLASS_LABEL_PREFIX,
-    node_info_key,
-};
-use aruna_core::structs::storage::routing::BackendCatalog;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LogicalJobState, SubmissionId,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::placement_record::PlacementRef;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::node_info::{
+    AdvertisementEpoch, CLASS_LABEL_PREFIX, NodeInfoDocument, NodeUrls, NodeUtilization,
+    node_info_key,
+};
+use aruna_core::structs::storage::routing::BackendCatalog;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, TxnId, Value};
@@ -832,12 +832,7 @@ fn class_labels(catalog: &BackendCatalog) -> BTreeMap<String, String> {
     catalog
         .classes()
         .into_iter()
-        .map(|class| {
-            (
-                format!("{CLASS_LABEL_PREFIX}{class}"),
-                "true".to_string(),
-            )
-        })
+        .map(|class| (format!("{CLASS_LABEL_PREFIX}{class}"), "true".to_string()))
         .collect()
 }
 
@@ -1082,12 +1077,12 @@ mod tests {
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::storage_entries::metadata_registry_key;
-    use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::placement::placement_record::{
         NodePlacementEntry, PlacementRef, PlacementStrategy,
     };
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
@@ -1667,7 +1662,8 @@ mod tests {
                 state,
                 canonical_execution_id: None,
                 executions: Vec::new(),
-                outputs: aruna_core::structs::execution::job::OutputSet::new(Vec::new()).expect("empty outputs"),
+                outputs: aruna_core::structs::execution::job::OutputSet::new(Vec::new())
+                    .expect("empty outputs"),
                 cancel_requested: false,
             }),
         };
@@ -1944,7 +1940,10 @@ mod tests {
             labels: BTreeMap::new(),
         });
         write_realm_config(&ctx, &config).await;
-        let subject = aruna_core::structs::placement::node_subject::storage_subject(&config.placement_map[0], 1);
+        let subject = aruna_core::structs::placement::node_subject::storage_subject(
+            &config.placement_map[0],
+            1,
+        );
         let record = NodeSubjectRecord::seed(subject).expect("subject is valid");
         write_row(
             &ctx,

@@ -198,20 +198,15 @@ impl SignedCursor<SearchCursorPayload> {
     }
 
     pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
-        Self::decode_verified(
-            raw,
-            SIGNATURE_CONTEXT,
-            authorized_signers,
-            |cursor| {
-                if cursor.version != SEARCH_CURSOR_VERSION
-                    || cursor.payload.resume.len() > MAX_RESUME_NODES
-                {
-                    Err(CursorEnvelopeError::Invalid)
-                } else {
-                    Ok(())
-                }
-            },
-        )
+        Self::decode_verified(raw, SIGNATURE_CONTEXT, authorized_signers, |cursor| {
+            if cursor.version != SEARCH_CURSOR_VERSION
+                || cursor.payload.resume.len() > MAX_RESUME_NODES
+            {
+                Err(CursorEnvelopeError::Invalid)
+            } else {
+                Ok(())
+            }
+        })
         .map_err(SearchCursorError::from)
     }
 
@@ -888,12 +883,7 @@ mod pure_tests {
             hits,
             saturated: false,
         };
-        let page = paginate(
-            vec![node],
-            Some(watermark),
-            2,
-            MAX_PAGINATION_DEPTH,
-        );
+        let page = paginate(vec![node], Some(watermark), 2, MAX_PAGINATION_DEPTH);
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].subject_iri, "./c");
         assert!(page.next.is_none());
@@ -911,12 +901,7 @@ mod pure_tests {
             hits: vec![hit("01A", "./shared", 0.5), hit("01C", "./r", 0.7)],
             saturated: false,
         };
-        let page = paginate(
-            vec![left, right],
-            None,
-            1,
-            MAX_PAGINATION_DEPTH,
-        );
+        let page = paginate(vec![left, right], None, 1, MAX_PAGINATION_DEPTH);
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].subject_iri, "./shared");
         assert_eq!(page.hits[0].score, 0.9);
@@ -940,12 +925,7 @@ mod pure_tests {
             hits: vec![hit("01A", "./a", 0.9)],
             saturated: true,
         };
-        let page = paginate(
-            vec![node],
-            Some(watermark.clone()),
-            2,
-            MAX_PAGINATION_DEPTH,
-        );
+        let page = paginate(vec![node], Some(watermark.clone()), 2, MAX_PAGINATION_DEPTH);
         assert!(page.hits.is_empty());
         let next = page.next.expect("saturation keeps paging");
         assert_eq!(next.watermark, watermark);
@@ -1019,12 +999,7 @@ mod pure_tests {
             ],
             saturated: false,
         };
-        let page = paginate(
-            vec![node],
-            Some(watermark),
-            5,
-            MAX_PAGINATION_DEPTH,
-        );
+        let page = paginate(vec![node], Some(watermark), 5, MAX_PAGINATION_DEPTH);
         let subjects: Vec<_> = page.hits.iter().map(|h| h.subject_iri.as_str()).collect();
         assert_eq!(subjects, vec!["./c"]);
     }

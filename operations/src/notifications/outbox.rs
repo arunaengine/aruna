@@ -180,7 +180,9 @@ async fn restore_timer_with(
 mod tests {
     use super::*;
     use crate::tests::notifications::{record, temp_storage, user};
-    use aruna_core::structs::execution::notification::{NotificationClass, notification_outbox_key};
+    use aruna_core::structs::execution::notification::{
+        NotificationClass, notification_outbox_key,
+    };
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
     use std::sync::Arc;

@@ -2,16 +2,14 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
-};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::execution::notification::NotificationRecord;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, watch_retry_key,
     watch_retry_prefix, watch_subscription_key,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Key, KeySpace, TxnId};
 use tracing::warn;
 
@@ -19,8 +17,7 @@ use crate::driver::DriverContext;
 use crate::notifications::inbox::{InboxWriteOutcome, UpsertFailure, upsert_transactionally};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::protocol::{
-    EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP,
-    EXPANSION_RECORD_CAP, EXPANSION_WORK_CAP,
+    EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, EXPANSION_WORK_CAP,
     RETRY_BATCH_CAP, RETRY_BYTES_CAP,
 };
 use crate::notifications::routing::route_watch_event;
@@ -107,20 +104,11 @@ async fn expand_events_once(
         for subscription in &subscriptions {
             let routed = route_watch_event(event, std::slice::from_ref(subscription));
             if !routed.is_empty() {
-                add_limit(
-                    candidates.len(),
-                    1,
-                    EXPANSION_CANDIDATE_CAP,
-                    "candidate",
-                )
-                .map_err(UpsertFailure::Fatal)?;
-                record_count = add_limit(
-                    record_count,
-                    routed.len(),
-                    EXPANSION_RECORD_CAP,
-                    "record",
-                )
-                .map_err(UpsertFailure::Fatal)?;
+                add_limit(candidates.len(), 1, EXPANSION_CANDIDATE_CAP, "candidate")
+                    .map_err(UpsertFailure::Fatal)?;
+                record_count =
+                    add_limit(record_count, routed.len(), EXPANSION_RECORD_CAP, "record")
+                        .map_err(UpsertFailure::Fatal)?;
                 candidates.push((subscription, event, routed));
             }
         }
@@ -522,13 +510,8 @@ async fn stage_watch_expansion(
 ) -> Result<(InboxWriteOutcome, bool), UpsertFailure> {
     let mut record_budget = 0;
     for (_, _, routed) in &candidates {
-        record_budget = add_limit(
-            record_budget,
-            routed.len(),
-            EXPANSION_RECORD_CAP,
-            "record",
-        )
-        .map_err(UpsertFailure::Fatal)?;
+        record_budget = add_limit(record_budget, routed.len(), EXPANSION_RECORD_CAP, "record")
+            .map_err(UpsertFailure::Fatal)?;
     }
     let mut subscriptions = Vec::with_capacity(candidates.len());
     for (subscription, _, _) in &candidates {
@@ -730,14 +713,14 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
+    use aruna_core::structs::execution::notification_watch::{
+        WatchAuthorizationBinding, WatchEventDetail, WatchEventKind, WatchEventMask,
+        watch_resource_path,
+    };
     use aruna_core::structs::identity::auth::{Actor, Permission};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
-    };
-    use aruna_core::structs::execution::notification_watch::{
-        WatchAuthorizationBinding, WatchEventDetail, WatchEventKind, WatchEventMask,
-        watch_resource_path,
     };
     use aruna_core::structs::storage::blob::object_permission_path;
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -823,15 +806,7 @@ mod tests {
 
     #[test]
     fn expansion_caps_records() {
-        assert!(
-            add_limit(
-                EXPANSION_RECORD_CAP,
-                1,
-                EXPANSION_RECORD_CAP,
-                "record"
-            )
-            .is_err()
-        );
+        assert!(add_limit(EXPANSION_RECORD_CAP, 1, EXPANSION_RECORD_CAP, "record").is_err());
     }
 
     #[test]

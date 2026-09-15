@@ -5,9 +5,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
 use aruna_core::structs::execution::notification::{
-    DIRECT_TTL_MS, TRANSIENT_USER_CAP, TRANSIENT_TTL_MS,
-    NotificationClass, NotificationRecord, notification_inbox_key, notification_prune_key,
-    parse_prune_key,
+    DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
+    notification_inbox_key, notification_prune_key, parse_prune_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
@@ -93,13 +92,8 @@ async fn prune_expired_rows(
     let mut start_after: Option<Key> = None;
 
     'scan: loop {
-        let (values, next_start_after) = iter_page(
-            storage,
-            PRUNE_INDEX_KEYSPACE,
-            start_after.take(),
-            page_size,
-        )
-        .await?;
+        let (values, next_start_after) =
+            iter_page(storage, PRUNE_INDEX_KEYSPACE, start_after.take(), page_size).await?;
         if values.is_empty() {
             break;
         }
@@ -264,11 +258,7 @@ async fn first_prune_delay(storage: &StorageHandle) -> Result<Duration, String> 
         Err(error) => {
             let raw = key.to_vec();
             warn!(error = %error, key = ?raw, "Deleting malformed notification prune index row during restore");
-            batch_delete(
-                storage,
-                vec![(PRUNE_INDEX_KEYSPACE.to_string(), key)],
-            )
-            .await?;
+            batch_delete(storage, vec![(PRUNE_INDEX_KEYSPACE.to_string(), key)]).await?;
             Ok(Duration::ZERO)
         }
     }

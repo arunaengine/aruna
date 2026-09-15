@@ -3,14 +3,13 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE,
-    GRAPH_LIFECYCLE_KEYSPACE, RAW_REVISION_KEYSPACE,
+    DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    RAW_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, RAW_BYTES_LIMIT, EVENT_LIMIT, MaterializationState,
-    MetadataError, MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
-    MetadataMergedRevision, MetadataRawRevision, apply_raw_upsert, raw_context_digest,
-    raw_upsert_entity, resolve_raw_revision,
+    EVENT_LIMIT, GraphLifecycleRecord, MaterializationState, MetadataError, MetadataEventPayload,
+    MetadataEventRecord, MetadataLifecycleRecord, MetadataMergedRevision, MetadataRawRevision,
+    RAW_BYTES_LIMIT, apply_raw_upsert, raw_context_digest, raw_upsert_entity, resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
     document_lifecycle_key, event_log_key, event_log_prefix, graph_lifecycle_key,
@@ -707,9 +706,9 @@ fn validate_raw_entry(
 mod tests {
     use super::*;
     use aruna_core::storage_entries::create_event_entry;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 

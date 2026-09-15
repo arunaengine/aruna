@@ -149,12 +149,9 @@ async fn sweep_bounded(
                 _ => stale.push(key),
             }
             if stale.len() >= SWEEP_DELETE_BATCH {
-                deleted += delete_index_keys(
-                    context,
-                    UPDATED_INDEX_KEYSPACE,
-                    std::mem::take(&mut stale),
-                )
-                .await?;
+                deleted +=
+                    delete_index_keys(context, UPDATED_INDEX_KEYSPACE, std::mem::take(&mut stale))
+                        .await?;
             }
             if scanned >= scan_limit {
                 break 'scan;
@@ -213,11 +210,11 @@ mod tests {
     use aruna_core::NodeId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
-    use aruna_core::structs::placement::placement_record::PlacementRef;
-    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use tempfile::tempdir;
 

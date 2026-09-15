@@ -22,15 +22,14 @@ use crate::notifications::list::{
 };
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
-use crate::notifications::unread::{UNREAD_COUNT_CAP, SCAN_MAX_ROWS};
+use crate::notifications::unread::{SCAN_MAX_ROWS, UNREAD_COUNT_CAP};
 use crate::notifications::watch::authorization::{
     WatchAuthorization, authorize_notification, list_authorized_subscriptions,
 };
 use crate::notifications::watch::interest::schedule_interest_publish;
 use crate::notifications::watch::subscriptions::{
-    WATCH_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED,
-    WATCH_SUBSCRIPTION_UNAVAILABLE, WatchSubscriptionError, create_holder_watch,
-    delete_holder_watch,
+    WATCH_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
+    WatchSubscriptionError, create_holder_watch, delete_holder_watch,
 };
 use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 

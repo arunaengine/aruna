@@ -1,9 +1,9 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::placement::placement_record::{DEFAULT_SHARD_COUNT, PlacementStrategy};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::execution::notification_watch::WatchSubscription;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::placement_record::{DEFAULT_SHARD_COUNT, PlacementStrategy};
 use ulid::Ulid;
 
 use crate::placement::{build_view, resolve_holders};

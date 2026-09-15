@@ -223,10 +223,8 @@ pub(crate) fn classify_root_summary(
         return Ok(DocumentPurpose::Profile);
     }
 
-    let mut conforms_to_keys = HashSet::from([
-        "conformsTo".to_string(),
-        DCTERMS_CONFORMS_IRI.to_string(),
-    ]);
+    let mut conforms_to_keys =
+        HashSet::from(["conformsTo".to_string(), DCTERMS_CONFORMS_IRI.to_string()]);
     collect_conforms_terms(document.get("@context"), &mut conforms_to_keys);
     if root.as_object().is_some_and(|root| {
         root.iter().any(|(key, value)| {
@@ -329,8 +327,8 @@ mod tests {
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::Group;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::types::GroupId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use byteview::ByteView;

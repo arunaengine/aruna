@@ -5,8 +5,8 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_AUDIT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    METADATA_AUDIT_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::metadata::{
@@ -20,7 +20,9 @@ pub use aruna_core::storage_entries::{
     materialization_status_key, metadata_document_key, metadata_registry_key,
     metadata_registry_prefix, registry_write_entries, shard_manifest_entry,
 };
-use aruna_core::structs::storage::metadata_registry::{MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::structs::storage::metadata_registry::{
+    MetadataAuditRecord, MetadataRegistryRecord,
+};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -368,14 +370,14 @@ mod pure_tests {
     use crate::sync::document_outbox::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::{
-        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
-        UPDATED_INDEX_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+        SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
+        UPDATED_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataEventPayload;
     use aruna_core::storage_entries::{shard_manifest_key, sync_revision_key, updated_index_key};
-    use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
 
     fn node(seed: u8) -> NodeId {
         NodeId::from_bytes(&[seed; 32]).expect("node id")
@@ -543,10 +545,7 @@ mod pure_tests {
             (METADATA_HOLDERS_KEYSPACE.to_string(), registry_key),
             (UPDATED_INDEX_KEYSPACE.to_string(), updated_key),
             (METADATA_AUDIT_KEYSPACE.to_string(), audit_key),
-            (
-                SYNC_OUTBOX_KEYSPACE.to_string(),
-                outbox_key(&delete),
-            ),
+            (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key(&delete)),
         ];
 
         assert_eq!(writes.len(), 6);

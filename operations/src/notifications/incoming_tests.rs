@@ -10,21 +10,20 @@ use crate::notifications::watch::subscriptions::{
 use crate::sync::incoming::initialize_incoming_fixture;
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-    WATCH_INTEREST_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
-};
-use aruna_core::structs::identity::realm::{
-    RealmAuthorizationDocument, RealmNodeKind, TokenRevocation,
 };
 use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
     interest_dirty_key, watch_resource_path,
+};
+use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmNodeKind, TokenRevocation,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -1070,8 +1069,7 @@ async fn oversized_message_refused() {
         })
         .expect("encodes")
         .len();
-    let count =
-        crate::notifications::protocol::MAX_NOTIFICATION_SIZE / per_record.max(1) + 1_000;
+    let count = crate::notifications::protocol::MAX_NOTIFICATION_SIZE / per_record.max(1) + 1_000;
     let records = vec![sample; count];
 
     let error = deliver_remote(&a.net, b.net.node_id(), records)
@@ -1490,10 +1488,7 @@ fn metadata_path_accepted() {
 fn watch_batch_caps() {
     let realm_id = RealmId::from_bytes([80u8; 32]);
     let actor = UserId::new(Ulid::generate(), realm_id);
-    let events = vec![
-        upload_event(realm_id, actor, "bucket/object");
-        EVENT_BATCH_SIZE + 1
-    ];
+    let events = vec![upload_event(realm_id, actor, "bucket/object"); EVENT_BATCH_SIZE + 1];
 
     assert!(
         validate_watch_events(&events, realm_id, 1_700_000_000_000)

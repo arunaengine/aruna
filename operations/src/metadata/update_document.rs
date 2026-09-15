@@ -1,23 +1,23 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, RAW_BUDGET_KEYSPACE,
-    REALM_CONFIG_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    RAW_BYTES_LIMIT, EVENT_LIMIT, MetadataBatch, MetadataBatchSource,
-    MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
-    MetadataLifecycleRecord, ProfileValidationStatus, RawOriginBudget,
-    deterministic_materialization_actor, raw_quotas,
+    EVENT_LIMIT, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
+    MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord, ProfileValidationStatus,
+    RAW_BYTES_LIMIT, RawOriginBudget, deterministic_materialization_actor, raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     create_acceptance_key, document_lifecycle_entry, event_log_key, event_log_prefix,
     profile_validation_entry, raw_budget_entry, raw_budget_key, sync_revision_entry,
 };
-use aruna_core::structs::storage::metadata_registry::{MetadataAuditRecord, MetadataRegistryRecord};
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::{
+    MetadataAuditRecord, MetadataRegistryRecord,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use byteview::ByteView;
@@ -1003,19 +1003,18 @@ mod pure_tests {
         DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
     };
     use aruna_core::keyspaces::{
-        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, METADATA_AUDIT_KEYSPACE,
-        DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
-        EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
-        DOCUMENT_JOB_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
-        MATERIALIZATION_STATUS_KEYSPACE, RAW_BUDGET_KEYSPACE,
+        DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+        EVENT_LOG_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+        METADATA_AUDIT_KEYSPACE, METADATA_INDEX_KEYSPACE, RAW_BUDGET_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
     };
     use aruna_core::storage_entries::{
         create_acceptance_key, event_log_key, metadata_registry_key, raw_budget_key,
         sync_revision_key,
     };
     use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
 
     fn actor() -> Actor {
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -1423,18 +1422,21 @@ mod pure_tests {
     /// resolves a generation and takes the bucket's fence.
     fn activated_config(record: &mut MetadataRegistryRecord) -> Event {
         let mut config = RealmConfigDocument::new(record.realm_id, Vec::new(), 3);
-        config.ensure_node(actor().node_id, aruna_core::structs::identity::realm::RealmNodeKind::Server);
+        config.ensure_node(
+            actor().node_id,
+            aruna_core::structs::identity::realm::RealmNodeKind::Server,
+        );
         let strategy_id = Ulid::from_bytes([5u8; 16]);
-        config
-            .strategies
-            .push(aruna_core::structs::placement::placement_record::PlacementStrategy {
+        config.strategies.push(
+            aruna_core::structs::placement::placement_record::PlacementStrategy {
                 strategy_id,
                 name: "default".to_string(),
                 replica_count: Some(1),
                 distinct_locations: false,
                 affinity: Vec::new(),
                 shard_count: 16,
-            });
+            },
+        );
         config.default_strategy_id = Some(strategy_id);
         config.snapshot_candidate_map();
         record.placement = PlacementRef {
@@ -1474,9 +1476,7 @@ mod pure_tests {
                 _ => None,
             })
             .flatten()
-            .filter(|(key_space, _, _)| {
-                key_space == aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE
-            })
+            .filter(|(key_space, _, _)| key_space == aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE)
             .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).expect("outbox row decodes"))
             .collect()
     }
