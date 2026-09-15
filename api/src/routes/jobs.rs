@@ -3,35 +3,25 @@ use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aruna_core::compute::SessionMount;
-use aruna_core::compute::normalize_container_path;
-use aruna_core::compute::runtimes::{
-    DEFAULT_SESSION_MOUNT_DIR, DEFAULT_SESSION_MOUNT_PREFIX, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG,
-    SESSION_MOUNT_PATH_TAG, SESSION_MOUNT_PREFIX_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES,
-    SESSION_TAG, SESSION_TAG_NOTEBOOK, session_runtime,
-};
-use aruna_core::id::NodeId;
-use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::{
-    AuthContext, CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec,
-    ExportReportRow, ImportReportRow, InputMode, InputSelection, InputSource,
-    JOB_SYSTEM_ENTRY_PREFIX, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, NodeCapabilities,
-    OutputDestination, OutputSelection, Permission, WorkspaceMode, WorkspaceOutput,
-    bucket_permission_path, group_permission_path,
+    AuthContext, CompositionError, ExportReportRow, ImportReportRow, JOB_SYSTEM_ENTRY_PREFIX,
+    JobId, JobRecord, JobState,
 };
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::device::compute::{
-    LocalExecutionConfig, LocalExecutionError, submit_local_execution,
+use aruna_operations::device::compute::LocalExecutionError;
+use aruna_operations::jobs::command::{
+    CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
+    ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
+    SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
+use aruna_operations::jobs::lifecycle::{FamilyReport, family_report};
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
     cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
-    read_owned_job, read_report_routed,
+    read_report_routed,
 };
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::jobs::{JOB_REPORT_MAX_ROWS, JobRouteError};
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
 use aruna_operations::s3::get_object::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -46,7 +36,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -54,17 +43,13 @@ use utoipa_axum::routes;
 use crate::auth::{ValidatedArunaBearerTokenCarrier, require_unrestricted_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::admit_execution;
 use crate::rate_limit::LocalKey;
-use crate::routes::device::require_owner;
 use crate::server_state::ServerState;
-use aruna_operations::driver::drive;
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
 const DEFAULT_REPORT_LIMIT: usize = 200;
-const MAX_OUTPUT_PREFIXES: usize = 32;
-/// Working directory a session runs in when the caller names none.
-const SESSION_WORKDIR: &str = "/work";
 
 #[derive(OpenApi)]
 #[openapi(
@@ -300,6 +285,118 @@ pub struct SubmitExecutionRequest {
     /// this machine and is served by a user device only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ExecutionTarget>,
+}
+
+/// REST maps its schema-bearing request body into the transport-independent
+/// application command the admission entry point consumes.
+impl From<SubmitExecutionRequest> for SubmitExecutionCommand {
+    fn from(request: SubmitExecutionRequest) -> Self {
+        Self {
+            group_id: request.group_id,
+            name: request.name,
+            description: request.description,
+            image: request.image,
+            runtime: request.runtime,
+            session_idle_after_ms: request.session_idle_after_ms,
+            session_mount: request.session_mount.map(Into::into),
+            entrypoint: request.entrypoint,
+            command: request.command,
+            env: request.env,
+            tags: request.tags,
+            workdir: request.workdir,
+            cpu_cores: request.cpu_cores,
+            ram_bytes: request.ram_bytes,
+            max_walltime_ms: request.max_walltime_ms,
+            executor_constraint: request.executor_constraint,
+            inputs: request.inputs.into_iter().map(Into::into).collect(),
+            outputs: request.outputs.into_iter().map(Into::into).collect(),
+            output_prefixes: request.output_prefixes,
+            collision_policy: request.collision_policy.into(),
+            idempotency_key: request.idempotency_key,
+            workspace: request.workspace.map(Into::into),
+            target: request.target.map(Into::into),
+        }
+    }
+}
+
+impl From<ExecutionInputRequest> for ExecutionInput {
+    fn from(input: ExecutionInputRequest) -> Self {
+        Self {
+            bucket: input.bucket,
+            key: input.key,
+            version_id: input.version_id,
+            source_node_id: input.source_node_id,
+            dest_key: input.dest_key,
+            container_path: input.container_path,
+            mode: input.mode.into(),
+        }
+    }
+}
+
+impl From<ExecutionOutputRequest> for ExecutionOutput {
+    fn from(output: ExecutionOutputRequest) -> Self {
+        Self {
+            container_path: output.container_path,
+            dest_key: output.dest_key,
+            bucket: output.bucket,
+        }
+    }
+}
+
+impl From<InputModeRequest> for CommandInputMode {
+    fn from(mode: InputModeRequest) -> Self {
+        match mode {
+            InputModeRequest::Snapshot => Self::Snapshot,
+            InputModeRequest::FloatingReference => Self::FloatingReference,
+            InputModeRequest::ExactReference => Self::ExactReference,
+        }
+    }
+}
+
+impl From<CollisionPolicyRequest> for CommandCollisionPolicy {
+    fn from(policy: CollisionPolicyRequest) -> Self {
+        match policy {
+            CollisionPolicyRequest::Reject => Self::Reject,
+            CollisionPolicyRequest::Replace => Self::Replace,
+            CollisionPolicyRequest::KeepExisting => Self::KeepExisting,
+        }
+    }
+}
+
+impl From<WorkspaceModeRequest> for CommandWorkspaceMode {
+    fn from(mode: WorkspaceModeRequest) -> Self {
+        match mode {
+            WorkspaceModeRequest::None => Self::None,
+            WorkspaceModeRequest::Existing => Self::Existing,
+        }
+    }
+}
+
+impl From<WorkspaceRequest> for WorkspaceSpec {
+    fn from(workspace: WorkspaceRequest) -> Self {
+        Self {
+            mode: workspace.mode.into(),
+            bucket: workspace.bucket,
+        }
+    }
+}
+
+impl From<SessionMountRequest> for SessionMountSpec {
+    fn from(mount: SessionMountRequest) -> Self {
+        Self {
+            prefix: mount.prefix,
+            path: mount.path,
+        }
+    }
+}
+
+impl From<ExecutionTarget> for CommandExecutionTarget {
+    fn from(target: ExecutionTarget) -> Self {
+        match target {
+            ExecutionTarget::Realm => Self::Realm,
+            ExecutionTarget::Local => Self::Local,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -849,391 +946,6 @@ pub(crate) fn map_submit_error(
     }
 }
 
-/// Resolves the session directives of a submission. A session names a catalog
-/// runtime instead of an image, and the node records the resolved runtime and
-/// the requested idle wait as engine tags the executing node reads back.
-fn session_request(
-    request: &mut SubmitExecutionRequest,
-    bearer_expires_at_ms: Option<u64>,
-) -> ServerResult<()> {
-    let Some(value) = request.tags.get(SESSION_TAG) else {
-        if request.runtime.is_some()
-            || request.session_idle_after_ms.is_some()
-            || request.session_mount.is_some()
-        {
-            return Err(ServerError::BadRequestMessage(format!(
-                "runtime, session_idle_after_ms and session_mount need the tag {SESSION_TAG}"
-            )));
-        }
-        return Ok(());
-    };
-    if value != SESSION_TAG_NOTEBOOK {
-        return Err(ServerError::BadRequestMessage(format!(
-            "tag {SESSION_TAG} accepts only the value {SESSION_TAG_NOTEBOOK}"
-        )));
-    }
-    if [
-        SESSION_RUNTIME_TAG,
-        SESSION_IDLE_TAG,
-        SESSION_EXPIRY_TAG,
-        SESSION_MOUNT_PREFIX_TAG,
-        SESSION_MOUNT_PATH_TAG,
-    ]
-    .iter()
-    .any(|tag| request.tags.contains_key(*tag))
-    {
-        return Err(ServerError::BadRequestMessage(
-            "the session runtime, idle, expiry and mount tags are set by the node".to_string(),
-        ));
-    }
-    let existing = request
-        .workspace
-        .as_ref()
-        .is_some_and(|workspace| matches!(workspace.mode, WorkspaceModeRequest::Existing));
-    if !existing {
-        return Err(ServerError::BadRequestMessage(
-            "a session runs inside an existing workspace bucket".to_string(),
-        ));
-    }
-    if !request.image.trim().is_empty()
-        || request.entrypoint.is_some()
-        || !request.command.is_empty()
-    {
-        return Err(ServerError::BadRequestMessage(
-            "a session takes image, entrypoint and command from its runtime".to_string(),
-        ));
-    }
-    let id = request.runtime.as_deref().unwrap_or_default();
-    let runtime = session_runtime(id).ok_or_else(|| {
-        let known: Vec<&str> = SESSION_RUNTIMES.iter().map(|entry| entry.id).collect();
-        ServerError::BadRequestMessage(format!(
-            "unknown session runtime; known ids are {}",
-            known.join(", ")
-        ))
-    })?;
-    if let Some(idle) = request.session_idle_after_ms {
-        if idle == 0 {
-            return Err(ServerError::BadRequestMessage(
-                "session_idle_after_ms must be greater than zero".to_string(),
-            ));
-        }
-        request
-            .tags
-            .insert(SESSION_IDLE_TAG.to_string(), idle.to_string());
-    }
-    if request.workdir.is_none() {
-        request.workdir = Some(SESSION_WORKDIR.to_string());
-    }
-    let mount = mount_request(
-        request.session_mount.as_ref(),
-        request.workdir.as_deref().unwrap_or(SESSION_WORKDIR),
-    )?;
-    request
-        .tags
-        .insert(SESSION_MOUNT_PREFIX_TAG.to_string(), mount.prefix);
-    request
-        .tags
-        .insert(SESSION_MOUNT_PATH_TAG.to_string(), mount.path);
-    request.cpu_cores.get_or_insert(2);
-    request.ram_bytes.get_or_insert(4_000_000_000);
-    request.image = runtime.image.to_string();
-    request.command = runtime
-        .command
-        .iter()
-        .map(|part| (*part).to_string())
-        .collect();
-    for (key, value) in runtime.env {
-        request
-            .env
-            .entry((*key).to_string())
-            .or_insert_with(|| (*value).to_string());
-    }
-    request
-        .tags
-        .insert(SESSION_RUNTIME_TAG.to_string(), runtime.id.to_string());
-    if let Some(expires_at_ms) = bearer_expires_at_ms {
-        request
-            .tags
-            .insert(SESSION_EXPIRY_TAG.to_string(), expires_at_ms.to_string());
-    }
-    Ok(())
-}
-
-/// The bucket slice a session mounts and the folder it appears at. An omitted
-/// block mounts `data/` at `<workdir>/data`. The folder must lie below the
-/// working directory and clear of the helper's `.aruna` directory.
-fn mount_request(mount: Option<&SessionMountRequest>, workdir: &str) -> ServerResult<SessionMount> {
-    let workdir = normalize_container_path(workdir).map_err(ServerError::BadRequestMessage)?;
-    let prefix = match mount
-        .and_then(|mount| mount.prefix.as_deref())
-        .map(str::trim)
-    {
-        None => DEFAULT_SESSION_MOUNT_PREFIX.to_string(),
-        Some("") => String::new(),
-        Some(prefix) => {
-            let folder = prefix.trim_end_matches('/');
-            if folder.starts_with('/')
-                || folder
-                    .split('/')
-                    .any(|part| part.is_empty() || part == "." || part == "..")
-            {
-                return Err(ServerError::BadRequestMessage(
-                    "session_mount.prefix must be a relative, traversal-free bucket folder"
-                        .to_string(),
-                ));
-            }
-            format!("{folder}/")
-        }
-    };
-    let path = match mount.and_then(|mount| mount.path.as_deref()).map(str::trim) {
-        None | Some("") => workdir.join(DEFAULT_SESSION_MOUNT_DIR),
-        Some(path) => normalize_container_path(path).map_err(ServerError::BadRequestMessage)?,
-    };
-    let below = path
-        .strip_prefix(&workdir)
-        .ok()
-        .filter(|rest| !rest.as_os_str().is_empty() && !rest.starts_with(".aruna"));
-    if below.is_none() {
-        return Err(ServerError::BadRequestMessage(
-            "session_mount.path must be a folder below the working directory, outside .aruna"
-                .to_string(),
-        ));
-    }
-    Ok(SessionMount {
-        prefix,
-        path: path.display().to_string(),
-    })
-}
-
-/// The permission path of the mounted bucket folder: the bucket path itself for
-/// the whole bucket, else the folder below it, shaped like an object path.
-fn mount_permission_path(bucket_path: String, prefix: &str) -> String {
-    match prefix.trim_end_matches('/') {
-        "" => bucket_path,
-        folder => format!("{bucket_path}/{folder}"),
-    }
-}
-
-/// An omitted workspace block runs without a bucket of the run's own.
-fn workspace_request(
-    workspace: Option<WorkspaceRequest>,
-) -> ServerResult<(WorkspaceMode, Option<String>)> {
-    let Some(workspace) = workspace else {
-        return Ok((WorkspaceMode::None, None));
-    };
-    match (workspace.mode, workspace.bucket) {
-        (WorkspaceModeRequest::None, None) => Ok((WorkspaceMode::None, None)),
-        (WorkspaceModeRequest::Existing, Some(bucket)) if !bucket.trim().is_empty() => {
-            Ok((WorkspaceMode::Existing, Some(bucket)))
-        }
-        _ => Err(ServerError::BadRequest),
-    }
-}
-
-/// A bucket the run writes into: it must exist, belong to the execution group,
-/// and grant the caller WRITE. Both the workspace and every explicit output
-/// destination pass this gate.
-async fn validate_owned_bucket(
-    state: &ServerState,
-    auth: &AuthContext,
-    group_id: Ulid,
-    bucket: &str,
-    extras: PolicyRequestExtras,
-) -> ServerResult<()> {
-    let info = match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(GetBucketInfoError::NotFound) => return Err(ServerError::BadRequest),
-        Err(error) => return Err(ServerError::InternalError(error.to_string())),
-    };
-    if info.group_id != group_id {
-        return Err(ServerError::BadRequest);
-    }
-    crate::auth::ensure_permission_with(
-        state,
-        auth,
-        bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
-        Permission::WRITE,
-        extras,
-    )
-    .await
-}
-
-/// Canonical absolute container path or 400.
-fn container_path(path: &str) -> ServerResult<String> {
-    let normalized = normalize_container_path(path).map_err(|_| ServerError::BadRequest)?;
-    normalized
-        .to_str()
-        .map(str::to_string)
-        .ok_or(ServerError::BadRequest)
-}
-
-/// Native inputs land in the container at the given path, defaulting to
-/// `/inputs/<dest_key>` so `load_inputs` always stages them.
-fn native_input(
-    input: ExecutionInputRequest,
-    target: ExecutionTarget,
-) -> ServerResult<InputSelection> {
-    if input.dest_key.is_empty() {
-        return Err(ServerError::BadRequest);
-    }
-    // A realm submission resolves its inputs through the planner, which stores
-    // the holder itself; naming one there would claim an unverified value.
-    let source_node_id = match (&input.source_node_id, target) {
-        (Some(node_id), ExecutionTarget::Local) => {
-            Some(NodeId::from_str(node_id).map_err(|_| ServerError::BadRequest)?)
-        }
-        (Some(_), ExecutionTarget::Realm) => {
-            return Err(ServerError::BadRequestMessage(
-                "source_node_id is only accepted by a local run".to_string(),
-            ));
-        }
-        (None, _) => None,
-    };
-    let path = match &input.container_path {
-        Some(path) => container_path(path)?,
-        None => container_path(&format!("/inputs/{}", input.dest_key))?,
-    };
-    Ok(InputSelection {
-        source: InputSource::S3 {
-            bucket: input.bucket,
-            key: input.key,
-            version_id: input.version_id,
-        },
-        source_node_id,
-        dest_key: input.dest_key,
-        mode: match input.mode {
-            InputModeRequest::Snapshot => InputMode::Snapshot,
-            InputModeRequest::FloatingReference => InputMode::FloatingReference,
-            InputModeRequest::ExactReference => InputMode::ExactReference,
-        },
-        container_path: Some(path),
-        name: None,
-        description: None,
-    })
-}
-
-fn collision_policy(policy: CollisionPolicyRequest) -> CollisionPolicy {
-    match policy {
-        CollisionPolicyRequest::Reject => CollisionPolicy::Reject,
-        CollisionPolicyRequest::Replace => CollisionPolicy::Replace,
-        CollisionPolicyRequest::KeepExisting => CollisionPolicy::KeepExisting,
-    }
-}
-
-/// A declared output either names its own destination bucket or resolves its
-/// key against the workspace bucket the run works inside.
-enum MappedOutput {
-    Explicit(OutputSelection),
-    Workspace(WorkspaceOutput),
-}
-
-fn native_output(
-    output: ExecutionOutputRequest,
-    mode: WorkspaceMode,
-) -> ServerResult<MappedOutput> {
-    if output.dest_key.is_empty() {
-        return Err(ServerError::BadRequest);
-    }
-    let container_path = container_path(&output.container_path)?;
-    let bucket = output
-        .bucket
-        .map(|bucket| bucket.trim().to_string())
-        .filter(|bucket| !bucket.is_empty());
-    match (bucket, mode) {
-        (Some(bucket), _) => Ok(MappedOutput::Explicit(OutputSelection {
-            container_path,
-            path_prefix: None,
-            destination_node_id: None,
-            destination: OutputDestination::S3 {
-                bucket,
-                key: output.dest_key,
-            },
-            name: None,
-            description: None,
-        })),
-        (None, WorkspaceMode::Existing) => Ok(MappedOutput::Workspace(WorkspaceOutput {
-            container_path,
-            dest_key: output.dest_key,
-        })),
-        (None, WorkspaceMode::None) => Err(ServerError::BadRequestMessage(format!(
-            "output `{container_path}` needs a bucket when `workspace.mode` is `none`"
-        ))),
-    }
-}
-
-/// Splits the declared outputs into bucket-qualified destinations and workspace
-/// intents. Container paths are unique across both, destinations within each.
-fn native_outputs(
-    outputs: Vec<ExecutionOutputRequest>,
-    mode: WorkspaceMode,
-) -> ServerResult<(Vec<OutputSelection>, Vec<WorkspaceOutput>)> {
-    let mut explicit: Vec<OutputSelection> = Vec::new();
-    let mut workspace: Vec<WorkspaceOutput> = Vec::new();
-    let mut paths: Vec<String> = Vec::with_capacity(outputs.len());
-    for output in outputs {
-        let mapped = native_output(output, mode)?;
-        let path = match &mapped {
-            MappedOutput::Explicit(output) => &output.container_path,
-            MappedOutput::Workspace(output) => &output.container_path,
-        };
-        if paths.iter().any(|existing| existing == path) {
-            return Err(ServerError::BadRequest);
-        }
-        paths.push(path.clone());
-        match mapped {
-            MappedOutput::Explicit(output) => {
-                if explicit
-                    .iter()
-                    .any(|existing| existing.destination == output.destination)
-                {
-                    return Err(ServerError::BadRequest);
-                }
-                explicit.push(output);
-            }
-            MappedOutput::Workspace(output) => {
-                if workspace
-                    .iter()
-                    .any(|existing| existing.dest_key == output.dest_key)
-                {
-                    return Err(ServerError::BadRequest);
-                }
-                workspace.push(output);
-            }
-        }
-    }
-    Ok((explicit, workspace))
-}
-
-/// Every bucket the run writes into, the workspace bucket first.
-fn output_buckets(workspace: Option<&str>, outputs: &[OutputSelection]) -> Vec<String> {
-    let mut buckets: Vec<String> = workspace.map(str::to_string).into_iter().collect();
-    for output in outputs {
-        let OutputDestination::S3 { bucket, .. } = &output.destination;
-        if !buckets.contains(bucket) {
-            buckets.push(bucket.clone());
-        }
-    }
-    buckets
-}
-
-fn validate_output_prefixes(prefixes: Vec<String>) -> ServerResult<Vec<String>> {
-    if prefixes.len() > MAX_OUTPUT_PREFIXES || prefixes.iter().any(String::is_empty) {
-        return Err(ServerError::BadRequest);
-    }
-    let mut deduplicated = Vec::with_capacity(prefixes.len());
-    for prefix in prefixes {
-        if !deduplicated.contains(&prefix) {
-            deduplicated.push(prefix);
-        }
-    }
-    Ok(deduplicated)
-}
-
 #[utoipa::path(
     get,
     path = "/compute/jobs",
@@ -1518,7 +1230,7 @@ pub async fn submit_job(
         state.as_ref(),
         auth,
         bearer,
-        request,
+        request.into(),
         PolicyRequestExtras::rest(),
     )
     .await?;
@@ -1528,215 +1240,19 @@ pub async fn submit_job(
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(response)))
-}
-
-/// A blank label carries no more than an absent one, so it is stored as absent.
-fn trimmed(value: Option<String>) -> Option<String> {
-    value
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-}
-
-/// The transport-independent admission decision shared by REST and MCP. The
-/// response carries the application outcome; each transport maps it to its own
-/// status/response contract.
-pub(crate) async fn admit_execution(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-    bearer: Option<ValidatedArunaBearerTokenCarrier>,
-    mut request: SubmitExecutionRequest,
-    extras: PolicyRequestExtras,
-) -> ServerResult<SubmitJobResponse> {
-    session_request(
-        &mut request,
-        bearer
-            .as_ref()
-            .map(|bearer| bearer.expires_at_secs().saturating_mul(1_000)),
-    )?;
-    let target = request.target.unwrap_or_default();
-    let auth = match target {
-        ExecutionTarget::Realm => require_unrestricted_auth(state, auth)?,
-        ExecutionTarget::Local => local_auth(state, auth).await?,
-    };
-    let group_id = Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
-    let (workspace_mode, workspace_bucket) = workspace_request(request.workspace)?;
-    if request.image.trim().is_empty() {
-        return Err(ServerError::BadRequest);
-    }
-    // RAM above i64::MAX would wrap negative in the Docker HostConfig cast.
-    if request.cpu_cores == Some(0)
-        || request
-            .ram_bytes
-            .is_some_and(|bytes| bytes == 0 || i64::try_from(bytes).is_err())
-    {
-        return Err(ServerError::BadRequest);
-    }
-    let output_prefixes = validate_output_prefixes(request.output_prefixes)?;
-    crate::auth::ensure_permission_with(
-        state,
-        &auth,
-        group_permission_path(state.get_realm_id(), group_id, state.get_node_id()),
-        Permission::WRITE,
-        extras.clone(),
-    )
-    .await?;
-
-    if request.inputs.len() > MAX_PLAN_INPUTS || request.outputs.len() > MAX_EXECUTION_OUTPUTS {
-        return Err(ServerError::BadRequest);
-    }
-    // Destination-key overlaps are the composition's collision policy to resolve.
-    let mut inputs: Vec<InputSelection> = Vec::with_capacity(request.inputs.len());
-    for input in request.inputs {
-        let input = native_input(input, target)?;
-        if inputs
-            .iter()
-            .any(|existing| existing.container_path == input.container_path)
-        {
-            return Err(ServerError::BadRequest);
-        }
-        inputs.push(input);
-    }
-    let (file_outputs, workspace_outputs) = native_outputs(request.outputs, workspace_mode)?;
-    for bucket in output_buckets(workspace_bucket.as_deref(), &file_outputs) {
-        validate_owned_bucket(state, &auth, group_id, &bucket, extras.clone()).await?;
-    }
-    // The mounted folder is written freely from the kernel, so the caller needs
-    // WRITE on that folder itself, not only on the bucket.
-    if let (Some(prefix), Some(bucket)) = (
-        request.tags.get(SESSION_MOUNT_PREFIX_TAG),
-        workspace_bucket.as_deref(),
-    ) {
-        crate::auth::ensure_permission_with(
-            state,
-            &auth,
-            mount_permission_path(
-                bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket),
-                prefix,
-            ),
-            Permission::WRITE,
-            extras.clone(),
-        )
-        .await?;
-    }
-
-    let spec = ExecutionSpec {
-        group_id,
-        name: trimmed(request.name),
-        description: trimmed(request.description),
-        tags: request.tags,
-        image: request.image,
-        entrypoint: request.entrypoint,
-        command: request.command,
-        workdir: request.workdir,
-        env: request.env,
-        resources: ComputeResources {
-            cpu_cores: request.cpu_cores,
-            ram_bytes: request.ram_bytes,
-            disk_bytes: None,
-            max_walltime_ms: request.max_walltime_ms,
-            preemptible: false,
-        },
-        executor_constraint: request.executor_constraint,
-        inputs,
-        file_outputs,
-        workspace_outputs,
-        output_prefixes,
-        collision_policy: collision_policy(request.collision_policy),
-    };
-    let accepted = match target {
-        ExecutionTarget::Local => {
-            local_submit(state, &auth, spec, request.idempotency_key, workspace_mode).await?
-        }
-        ExecutionTarget::Realm => {
-            let result = submit_external_job(
-                &state.get_ctx(),
-                spec,
-                auth.user_id,
-                request.idempotency_key,
-                workspace_mode,
-                workspace_bucket,
-                state.rocrate_limits().artifact_retention_ms,
-                forwarded_job_auth(bearer)?,
-            )
-            .await
-            .map_err(map_submit_error)?;
-            AcceptedJob {
-                job_id: result.job_id,
-                created: result.created,
-                submission_id: Some(hex32(&result.submission_id.0)),
-                state: result.state.name().to_string(),
-            }
-        }
-    };
-
-    let urls = job_urls(state, accepted.job_id).await?;
-    // The accepting holder's canonical binding is the alias it answered with;
-    // a later merge may move it, which the status surface then reports.
-    Ok(SubmitJobResponse {
-        job_id: accepted.job_id.to_string(),
-        created: accepted.created,
-        submission_id: accepted.submission_id,
-        canonical_job_id: accepted.job_id.to_string(),
-        state: accepted.state,
-        origin_node_url: urls.owner_node_url,
-        status_url: urls.status_url,
-    })
-}
-
-/// What both submission paths answer with. A local run has no submission
-/// family, so it names none.
-struct AcceptedJob {
-    job_id: JobId,
-    created: bool,
-    submission_id: Option<String>,
-    state: String,
-}
-
-/// The owner of this device, for a run that must stay on this machine. A node
-/// that serves no device plane refuses the target itself, not the caller.
-async fn local_auth(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
-    if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
-        return Err(ServerError::BadRequestMessage(
-            "target `local` is served by a user device only".to_string(),
-        ));
-    }
-    require_owner(state, auth).await
-}
-
-async fn local_submit(
-    state: &ServerState,
-    auth: &AuthContext,
-    spec: ExecutionSpec,
-    idempotency_key: Option<String>,
-    workspace_mode: WorkspaceMode,
-) -> ServerResult<AcceptedJob> {
-    let context = state.get_ctx();
-    let result = submit_local_execution(
-        &context,
-        LocalExecutionConfig {
-            spec,
-            owner: auth.user_id,
-            node_id: state.get_node_id(),
-            idempotency_key,
-            workspace_mode,
-            retention_ms: state.rocrate_limits().artifact_retention_ms,
-        },
-    )
-    .await
-    .map_err(map_local_error)?;
-    // A replay answers with the state the device already reduced for that job.
-    let state = read_owned_job(&context, auth.user_id, result.job_id)
-        .await
-        .ok()
-        .flatten()
-        .map_or(JobState::Queued, |record| record.state);
-    Ok(AcceptedJob {
-        job_id: result.job_id,
-        created: result.created,
-        submission_id: None,
-        state: state.name().to_string(),
-    })
+    let urls = job_urls(state.as_ref(), response.job_id).await?;
+    Ok((
+        status,
+        Json(SubmitJobResponse {
+            job_id: response.job_id.to_string(),
+            created: response.created,
+            submission_id: response.submission_id,
+            canonical_job_id: response.canonical_job_id.to_string(),
+            state: response.state,
+            origin_node_url: urls.owner_node_url,
+            status_url: urls.status_url,
+        }),
+    ))
 }
 
 pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
