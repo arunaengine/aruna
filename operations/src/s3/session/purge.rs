@@ -23,7 +23,7 @@ struct ExpiryCandidate {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PurgeS3SessionsResult {
+pub struct PurgeSessionsResult {
     pub scanned: usize,
     pub purged: usize,
     pub removed: usize,
@@ -44,19 +44,19 @@ enum PurgeSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct PurgeS3SessionsOperation {
+pub struct PurgeSessionsOperation {
     now: SystemTime,
     candidates: Vec<ExpiryCandidate>,
     removals: BTreeMap<Vec<u8>, BTreeSet<String>>,
     writes: Vec<(String, Key, aruna_core::types::Value)>,
     deletes: Vec<(String, Key)>,
-    result: PurgeS3SessionsResult,
+    result: PurgeSessionsResult,
     txn_id: Option<Ulid>,
     state: PurgeSessionState,
-    output: Result<PurgeS3SessionsResult, S3SessionError>,
+    output: Result<PurgeSessionsResult, S3SessionError>,
 }
 
-impl PurgeS3SessionsOperation {
+impl PurgeSessionsOperation {
     pub fn new(now: SystemTime) -> Self {
         Self {
             now,
@@ -64,7 +64,7 @@ impl PurgeS3SessionsOperation {
             removals: BTreeMap::new(),
             writes: Vec::new(),
             deletes: Vec::new(),
-            result: PurgeS3SessionsResult::default(),
+            result: PurgeSessionsResult::default(),
             txn_id: None,
             state: PurgeSessionState::Init,
             output: Err(S3SessionError::NotFinished),
@@ -346,8 +346,8 @@ impl PurgeS3SessionsOperation {
     }
 }
 
-impl Operation for PurgeS3SessionsOperation {
-    type Output = PurgeS3SessionsResult;
+impl Operation for PurgeSessionsOperation {
+    type Output = PurgeSessionsResult;
     type Error = S3SessionError;
 
     fn start(&mut self) -> Effects {

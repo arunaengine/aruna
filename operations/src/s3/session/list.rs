@@ -23,7 +23,7 @@ enum ListSessionsState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListS3SessionsOperation {
+pub struct ListSessionsOperation {
     user_identity: UserId,
     access_keys: Vec<String>,
     sessions: Vec<S3Session>,
@@ -32,7 +32,7 @@ pub struct ListS3SessionsOperation {
     output: Result<Vec<S3Session>, S3SessionError>,
 }
 
-impl ListS3SessionsOperation {
+impl ListSessionsOperation {
     pub fn new(user_identity: UserId) -> Self {
         Self {
             user_identity,
@@ -175,7 +175,7 @@ impl ListS3SessionsOperation {
     }
 }
 
-impl Operation for ListS3SessionsOperation {
+impl Operation for ListSessionsOperation {
     type Output = Vec<S3Session>;
     type Error = S3SessionError;
 

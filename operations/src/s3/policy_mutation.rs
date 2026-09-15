@@ -24,7 +24,7 @@ use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy_successor::{
-    MintPolicySuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
+    MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -84,7 +84,7 @@ pub struct PolicyMutationOperation {
     state: MutationState,
     resolver: Option<PolicySetResolver>,
     resolved: BTreeMap<Ulid, PolicyResolution>,
-    mint: Option<MintPolicySuccessorOperation>,
+    mint: Option<MintSuccessorOperation>,
     output: Option<Result<SuccessorOutcome, PolicyMutationError>>,
 }
 
@@ -185,7 +185,7 @@ impl PolicyMutationOperation {
             intent: None,
             captured_default: None,
         };
-        let mut mint = MintPolicySuccessorOperation::new(plan);
+        let mut mint = MintSuccessorOperation::new(plan);
         let effects = mint.start();
         self.mint = Some(mint);
         self.state = MutationState::Mint;
@@ -302,9 +302,7 @@ impl Operation for PolicyMutationOperation {
             PolicyMutationError::Unauthorized
             | PolicyMutationError::ForeignPolicy { .. }
             | PolicyMutationError::PolicyUnavailable { .. } => true,
-            PolicyMutationError::Successor(error) => {
-                MintPolicySuccessorOperation::expected_error(error)
-            }
+            PolicyMutationError::Successor(error) => MintSuccessorOperation::expected_error(error),
             _ => false,
         }
     }
@@ -331,7 +329,7 @@ mod pure_tests {
     use crate::blob::records::HeadAliasContext;
     use crate::placement::policy::cache::PolicyCacheEntry;
     use crate::s3::policy_successor::SuccessorError;
-    use crate::tests::fixtures::policy::signed_document;
+    use crate::tests::policy::signed_document;
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
@@ -452,7 +450,7 @@ mod pure_tests {
         operation.step(authorized(false));
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        let effects = operation.step(crate::tests::fixtures::policy::group_authority(
+        let effects = operation.step(crate::tests::policy::group_authority(
             realm_id(),
             group_id(),
         ));
@@ -472,10 +470,7 @@ mod pure_tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        let effects = operation.step(crate::tests::fixtures::policy::group_authority(
-            realm_id(),
-            foreign,
-        ));
+        let effects = operation.step(crate::tests::policy::group_authority(realm_id(), foreign));
 
         assert!(effects.is_empty(), "a foreign rule opens no transaction");
         assert_eq!(
@@ -517,7 +512,7 @@ mod pure_tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        let effects = operation.step(crate::tests::fixtures::policy::authority(realm_id()));
+        let effects = operation.step(crate::tests::policy::authority(realm_id()));
 
         assert!(matches!(
             effects.as_slice(),
@@ -535,7 +530,7 @@ mod pure_tests {
         operation.start();
         operation.step(authorized(true));
         operation.step(cached(&policy));
-        operation.step(crate::tests::fixtures::policy::authority(realm_id()));
+        operation.step(crate::tests::policy::authority(realm_id()));
         let txn_id = Ulid::from_bytes([5u8; 16]);
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(Event::Storage(StorageEvent::ReadResult {

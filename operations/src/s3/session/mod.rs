@@ -6,13 +6,13 @@ mod refresh;
 mod revoke;
 mod touch;
 
-pub use create::{CreateS3SessionConfig, CreateS3SessionOperation};
-pub use get::GetS3SessionOperation;
-pub use list::ListS3SessionsOperation;
-pub use purge::{PurgeS3SessionsOperation, PurgeS3SessionsResult};
-pub use refresh::{RefreshS3SessionConfig, RefreshS3SessionOperation};
-pub use revoke::{RevokeS3SessionConfig, RevokeS3SessionOperation};
-pub use touch::{TouchS3SessionConfig, TouchS3SessionOperation};
+pub use create::{CreateS3Config, CreateS3Operation};
+pub use get::GetS3Operation;
+pub use list::ListSessionsOperation;
+pub use purge::{PurgeSessionsOperation, PurgeSessionsResult};
+pub use refresh::{RefreshS3Config, RefreshS3Operation};
+pub use revoke::{RevokeS3Config, RevokeS3Operation};
+pub use touch::{TouchS3Config, TouchS3Operation};
 
 use crate::driver::{DriverContext, drive};
 use aruna_core::UserId;
@@ -243,7 +243,7 @@ pub fn spawn_session_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
             }
             loop {
                 match drive(
-                    PurgeS3SessionsOperation::new(SystemTime::now()),
+                    PurgeSessionsOperation::new(SystemTime::now()),
                     context.as_ref(),
                 )
                 .await
@@ -265,8 +265,8 @@ pub fn spawn_session_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::create_access::{CreateUserAccessConfig, CreateUserAccessOperation};
-    use crate::s3::list_access::{ListUserAccessInput, ListUserAccessOperation};
+    use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
+    use crate::s3::access::list::{ListUserInput, ListUserOperation};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_OWNER_KEYSPACE};
@@ -297,8 +297,8 @@ mod tests {
         now: SystemTime,
         expiry: SystemTime,
         issued_by: [u8; 32],
-    ) -> CreateS3SessionConfig {
-        CreateS3SessionConfig {
+    ) -> CreateS3Config {
+        CreateS3Config {
             user_identity,
             group_id,
             now,
@@ -353,7 +353,7 @@ mod tests {
         let issuer = [4u8; 32];
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let issued = drive(
-            CreateS3SessionOperation::new(
+            CreateS3Operation::new(
                 session_config(user, group, start, start + S3_SESSION_MAX_TTL, issuer),
                 encryption_key.clone(),
             ),
@@ -362,7 +362,7 @@ mod tests {
         .await
         .unwrap();
         drive(
-            TouchS3SessionOperation::new(TouchS3SessionConfig {
+            TouchS3Operation::new(TouchS3Config {
                 access_key: issued.access_key_id.clone(),
                 token_hash: S3Session::hash_token(issued.session_token.expose()),
                 now: start + Duration::from_secs(60),
@@ -375,8 +375,8 @@ mod tests {
 
         let early = start + Duration::from_secs(55 * 60 - 1);
         let error = drive(
-            RefreshS3SessionOperation::new(
-                RefreshS3SessionConfig {
+            RefreshS3Operation::new(
+                RefreshS3Config {
                     access_key: issued.access_key_id.clone(),
                     user_identity: user,
                     group_id: group,
@@ -395,8 +395,8 @@ mod tests {
 
         let boundary = start + Duration::from_secs(55 * 60);
         let refreshed = drive(
-            RefreshS3SessionOperation::new(
-                RefreshS3SessionConfig {
+            RefreshS3Operation::new(
+                RefreshS3Config {
                     access_key: issued.access_key_id.clone(),
                     user_identity: user,
                     group_id: group,
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(refreshed.session.last_used_at, None);
 
         let error = drive(
-            TouchS3SessionOperation::new(TouchS3SessionConfig {
+            TouchS3Operation::new(TouchS3Config {
                 access_key: refreshed.access_key_id,
                 token_hash: S3Session::hash_token(issued.session_token.expose()),
                 now: boundary + Duration::from_secs(1),
@@ -444,7 +444,7 @@ mod tests {
         let issuer = [4u8; 32];
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let issued = drive(
-            CreateS3SessionOperation::new(
+            CreateS3Operation::new(
                 session_config(user, group, now, now + Duration::from_secs(100), issuer),
                 CredentialEncryptionKey::derive(&[7u8; 32]),
             ),
@@ -454,14 +454,14 @@ mod tests {
         .unwrap();
 
         let result = drive(
-            PurgeS3SessionsOperation::new(now + Duration::from_secs(100)),
+            PurgeSessionsOperation::new(now + Duration::from_secs(100)),
             &context,
         )
         .await
         .unwrap();
         assert_eq!(result.purged, 1);
         assert_eq!(
-            drive(GetS3SessionOperation::new(issued.access_key_id), &context)
+            drive(GetS3Operation::new(issued.access_key_id), &context)
                 .await
                 .unwrap(),
             None
@@ -503,8 +503,8 @@ mod tests {
         let far_future = SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000);
         for _ in 0..16 {
             drive(
-                CreateUserAccessOperation::new(
-                    CreateUserAccessConfig {
+                CreateUserOperation::new(
+                    CreateUserConfig {
                         user_identity: user,
                         group_id: group,
                         expiry: far_future,
@@ -520,7 +520,7 @@ mod tests {
         }
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let session = drive(
-            CreateS3SessionOperation::new(
+            CreateS3Operation::new(
                 session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
                 CredentialEncryptionKey::derive(&[7u8; 32]),
             ),
@@ -529,7 +529,7 @@ mod tests {
         .await
         .unwrap();
         let listed = drive(
-            ListUserAccessOperation::new(ListUserAccessInput {
+            ListUserOperation::new(ListUserInput {
                 user_identity: user,
             }),
             &context,
@@ -547,7 +547,7 @@ mod tests {
         for _ in 1..MAX_GROUP_SESSIONS {
             issued.push(
                 drive(
-                    CreateS3SessionOperation::new(
+                    CreateS3Operation::new(
                         session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
                         CredentialEncryptionKey::derive(&[7u8; 32]),
                     ),
@@ -559,7 +559,7 @@ mod tests {
             );
         }
         let extra = drive(
-            CreateS3SessionOperation::new(
+            CreateS3Operation::new(
                 session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
                 CredentialEncryptionKey::derive(&[7u8; 32]),
             ),
@@ -577,7 +577,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(evicted.len(), 1);
         assert_eq!(
-            drive(GetS3SessionOperation::new(evicted[0].clone()), &context)
+            drive(GetS3Operation::new(evicted[0].clone()), &context)
                 .await
                 .unwrap(),
             None
@@ -597,7 +597,7 @@ mod tests {
             let ttl = Duration::from_secs(3_600 - step * 600);
             issued.push(
                 drive(
-                    CreateS3SessionOperation::with_key(
+                    CreateS3Operation::with_key(
                         session_config(user, group, now, now + ttl, [4u8; 32]),
                         Ulid::from_parts(1_000 + step, u128::from(step)).to_string(),
                         encryption_key.clone(),
@@ -611,7 +611,7 @@ mod tests {
         }
 
         let extra = drive(
-            CreateS3SessionOperation::with_key(
+            CreateS3Operation::with_key(
                 session_config(user, group, now, now + Duration::from_secs(600), [4u8; 32]),
                 Ulid::from_parts(2_000, 9).to_string(),
                 encryption_key,
@@ -627,7 +627,7 @@ mod tests {
         assert!(!index.contains(&issued[0]));
         assert!(issued[1..].iter().all(|key| index.contains(key)));
         assert_eq!(
-            drive(GetS3SessionOperation::new(issued[0].clone()), &context)
+            drive(GetS3Operation::new(issued[0].clone()), &context)
                 .await
                 .unwrap(),
             None

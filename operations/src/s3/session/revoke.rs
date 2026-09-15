@@ -12,7 +12,7 @@ use smallvec::smallvec;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
-pub struct RevokeS3SessionConfig {
+pub struct RevokeS3Config {
     pub access_key: String,
     pub user_identity: UserId,
     pub issued_by: [u8; 32],
@@ -32,8 +32,8 @@ enum RevokeSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RevokeS3SessionOperation {
-    config: RevokeS3SessionConfig,
+pub struct RevokeS3Operation {
+    config: RevokeS3Config,
     owner_key: Option<Key>,
     deletes: Vec<(String, Key)>,
     txn_id: Option<Ulid>,
@@ -41,8 +41,8 @@ pub struct RevokeS3SessionOperation {
     output: Result<(), S3SessionError>,
 }
 
-impl RevokeS3SessionOperation {
-    pub fn new(config: RevokeS3SessionConfig) -> Self {
+impl RevokeS3Operation {
+    pub fn new(config: RevokeS3Config) -> Self {
         Self {
             config,
             owner_key: None,
@@ -207,7 +207,7 @@ impl RevokeS3SessionOperation {
     }
 }
 
-impl Operation for RevokeS3SessionOperation {
+impl Operation for RevokeS3Operation {
     type Output = ();
     type Error = S3SessionError;
 
