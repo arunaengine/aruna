@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -20,7 +20,7 @@ use aruna_operations::placement::{
     PlacementResolutionContext, resolve_shard_holders, target_placement_ref,
 };
 use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -111,7 +111,7 @@ async fn unheld_group_replicates() -> Result<(), Box<dyn std::error::Error>> {
 /// Holders of the bucket the group's authorization document hashes into, under
 /// the strategy the realm actually binds the group class to.
 fn group_holders(config: &RealmConfigDocument, group_id: Ulid) -> Vec<NodeId> {
-    let target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let target = DocumentTarget::GroupAuthorization { group_id };
     let placement = target_placement_ref(
         config,
         &target,
@@ -200,7 +200,7 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         jobs_runtime.clone(),
         &shutdown,
     );
-    install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+    start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,

@@ -11,11 +11,11 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::{Actor, PathRestriction, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::create_access::{CreateUserAccessConfig, CreateUserAccessOperation};
-use aruna_operations::s3::get_access::GetUserAccessOperation;
-use aruna_operations::s3::revoke_access::RevokeUserAccessOperation;
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::s3::create_access::{CreateUserConfig, CreateUserOperation};
+use aruna_operations::s3::get_access::GetAccessOperation;
+use aruna_operations::s3::revoke_access::RevokeUserOperation;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -38,7 +38,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
         pattern: "datasets/**".to_string(),
         permission: aruna_core::structs::Permission::READ,
     }];
-    let config = CreateUserAccessConfig {
+    let config = CreateUserConfig {
         user_identity: UserId::local(Ulid::generate(), realm_id),
         group_id: Ulid::generate(),
         expiry: SystemTime::now() + Duration::from_secs(3600),
@@ -47,13 +47,13 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
     };
     let encryption_key = aruna_core::credential_encryption::CredentialEncryptionKey::random();
     let (access_key, _, _) = drive(
-        CreateUserAccessOperation::new(config, encryption_key),
+        CreateUserOperation::new(config, encryption_key),
         nodes[0].context.as_ref(),
     )
     .await?;
 
     let local = drive(
-        GetUserAccessOperation::new(access_key.clone()),
+        GetAccessOperation::new(access_key.clone()),
         nodes[0].context.as_ref(),
     )
     .await?;
@@ -61,7 +61,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
 
     // Positive control: pull the whole shared realm topic from the issuer, so
     // absence afterwards proves non-replication rather than sync lag.
-    let topic = aruna_core::document::DocumentSyncTarget::RealmAuthorization { realm_id }
+    let topic = aruna_core::document::DocumentTarget::RealmAuthorization { realm_id }
         .sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
     nodes[1]
         .net
@@ -69,29 +69,29 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     let remote = drive(
-        GetUserAccessOperation::new(access_key.clone()),
+        GetAccessOperation::new(access_key.clone()),
         nodes[1].context.as_ref(),
     )
     .await;
     assert!(matches!(
         remote,
-        Err(aruna_operations::s3::get_access::GetUserAccessError::NotFound)
+        Err(aruna_operations::s3::get_access::GetAccessError::NotFound)
     ));
 
     drive(
-        RevokeUserAccessOperation::new(access_key.clone()),
+        RevokeUserOperation::new(access_key.clone()),
         nodes[0].context.as_ref(),
     )
     .await?;
 
     let revoked = drive(
-        GetUserAccessOperation::new(access_key),
+        GetAccessOperation::new(access_key),
         nodes[0].context.as_ref(),
     )
     .await;
     assert!(matches!(
         revoked,
-        Err(aruna_operations::s3::get_access::GetUserAccessError::NotFound)
+        Err(aruna_operations::s3::get_access::GetAccessError::NotFound)
     ));
 
     shutdown_nodes(nodes).await;
@@ -146,9 +146,9 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         compute_handle: None,
     });
 
-    initialize_net_incoming_for_tests(context.clone());
+    initialize_incoming_fixture(context.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),

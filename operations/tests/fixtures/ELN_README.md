@@ -10,6 +10,6 @@ at commit `74a64fd7d9a1786ebf713e0b6eb12bddfb241d69`.
 | `pasta.eln` | `examples/PASTA/PASTA.eln` | `4b5cf6fe7818efac0163acdb1499421a2a32dc4cf85bfb33bf364c04c0f3ed2f` |
 | `kadi4mat.eln` | `examples/kadi4mat/records-example.eln` | `aed5c374f100b750d5b9181fc5438dc6533a79e7f5154f3b93b649464f547bf9` |
 
-The upstream repository's MIT license is included as `LICENSE`. Licenses
+The upstream repository's MIT license is included as `ELN_LICENSE`. Licenses
 declared by the datasets inside the archives continue to apply to their
 embedded content.

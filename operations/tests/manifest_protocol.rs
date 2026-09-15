@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aruna_core::StructuredId;
-use aruna_core::document::{DocumentSyncTarget, ShardManifest};
+use aruna_core::document::{DocumentTarget, ShardManifest};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -16,18 +16,17 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
+use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::shard::assemble_shard_manifest;
 use aruna_operations::shard::client::fetch_shard_manifest;
 use aruna_operations::shard::verify::{is_shard_verified, verify_held_shards};
 use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -144,13 +143,13 @@ async fn new_holder_verifies() -> Result<(), Box<dyn std::error::Error>> {
         mint_local_document(&config, &actor, group_id, "datasets/verify-canary")?.as_ulid();
 
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: actor.clone(),
             group_id,
             document_id,
             document_path: "datasets/verify-canary".to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Verify Canary".to_string(),
                 description: "verification test".to_string(),
                 date_published: "2026-07-07".to_string(),
@@ -160,7 +159,7 @@ async fn new_holder_verifies() -> Result<(), Box<dyn std::error::Error>> {
         nodes[0].context.as_ref(),
     )
     .await?;
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+    let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: created.record.document_id,
     };
     let placement = created.record.placement;
@@ -354,7 +353,7 @@ async fn wait_manifest_entry(
     node: &TestNode,
     realm_id: RealmId,
     placement: PlacementRef,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
 ) -> Result<ShardManifest, Box<dyn std::error::Error>> {
     wait_for_convergence("timed out waiting for manifest entry", || async {
         let manifest = assemble_shard_manifest(node.context.as_ref(), realm_id, placement).await?;
@@ -388,7 +387,7 @@ async fn build_realm_nodes(
     }
     for node in &nodes {
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id: *realm_id,
                 node_id: node.net.node_id(),
                 schedule_refresh: true,
@@ -441,7 +440,7 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         jobs_runtime.clone(),
         &shutdown,
     );
-    install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+    start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
     Ok(TestNode {
         _temp_dir: temp_dir,
         net,
@@ -503,12 +502,7 @@ async fn wait_node_convergence(
     wait_for_convergence("realm nodes did not converge", || async {
         let mut pending = 0;
         for node in nodes {
-            match drive(
-                GetRealmNodesOperation::new(*realm_id),
-                node.context.as_ref(),
-            )
-            .await
-            {
+            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
                 Ok(realm_nodes) if realm_nodes == expected => {}
                 _ => pending += 1,
             }

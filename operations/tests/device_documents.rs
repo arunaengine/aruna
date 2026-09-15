@@ -6,7 +6,7 @@ mod topology;
 
 use std::collections::{HashMap, HashSet};
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, NodeUrls, RealmNodeKind, User,
@@ -23,7 +23,7 @@ use aruna_operations::node::node_info::{read_info_documents, seed_info_document}
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::users::read_document::ReadUserDocumentOperation;
+use aruna_operations::users::read_document::ReadUserOperation;
 use ulid::Ulid;
 
 use topology::{
@@ -107,7 +107,7 @@ async fn device_fetches_owner() -> TestResult<()> {
     let device = join_device(&realm).await?;
     assert!(
         drive(
-            ReadUserDocumentOperation::new(realm.user_id),
+            ReadUserOperation::new(realm.user_id),
             device.context.as_ref()
         )
         .await
@@ -120,7 +120,7 @@ async fn device_fetches_owner() -> TestResult<()> {
         "a realm node must serve the device the realm documents"
     );
     let fetched = drive(
-        ReadUserDocumentOperation::new(realm.user_id),
+        ReadUserOperation::new(realm.user_id),
         device.context.as_ref(),
     )
     .await?;
@@ -209,7 +209,7 @@ async fn device_fetches_nodes() -> TestResult<()> {
                 realm_id: realm.realm_id,
                 local_node_id: node.node_id(),
                 excluded_peers: Vec::new(),
-                documents: vec![DocumentSyncTarget::NodeInfo {
+                documents: vec![DocumentTarget::NodeInfo {
                     realm_id: realm.realm_id,
                     node_id: node.node_id(),
                 }],

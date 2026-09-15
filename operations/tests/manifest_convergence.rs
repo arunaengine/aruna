@@ -2,7 +2,7 @@
 #![recursion_limit = "256"]
 use std::sync::Arc;
 
-use aruna_core::document::{DocumentSyncTarget, ShardManifest, ShardManifestEntry};
+use aruna_core::document::{DocumentTarget, ShardManifest, ShardManifestEntry};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -16,22 +16,21 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::delete_document::DeleteMetadataDocumentOperation;
+use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::persistent_id::read_mapping;
 use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,
 };
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
+use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::shard::assemble_shard_manifest;
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -103,11 +102,11 @@ async fn interleaved_writes_converge() -> Result<(), Box<dyn std::error::Error>>
 
     // Receivers must stamp the origin actor into identical tombstone manifests.
     let deleted_id = document_ids[0];
-    let deleted_target = DocumentSyncTarget::MetadataDocumentLifecycle {
+    let deleted_target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: deleted_id,
     };
     drive(
-        DeleteMetadataDocumentOperation::new(
+        DeleteDocumentOperation::new(
             Actor {
                 node_id: leader,
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -169,7 +168,7 @@ fn shared_path_bucket(
     realm_id: RealmId,
     group_id: Ulid,
 ) -> PlacementRef {
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+    let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: doc_id(1),
     };
     let path = MetadataRegistryRecord::normalize_document_path(CONVERGE_PATH);
@@ -209,7 +208,7 @@ async fn create_document(
     index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: node.net.node_id(),
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -219,7 +218,7 @@ async fn create_document(
             document_id,
             document_path: format!("{CONVERGE_PATH}/{index}"),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: format!("Converge {index}"),
                 description: "convergence test".to_string(),
                 date_published: "2026-07-07".to_string(),
@@ -294,7 +293,7 @@ async fn build_realm_nodes(
     }
     for node in &nodes {
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id: *realm_id,
                 node_id: node.net.node_id(),
                 schedule_refresh: true,
@@ -339,9 +338,9 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
-    initialize_net_incoming_for_tests(context.clone());
+    initialize_incoming_fixture(context.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -411,12 +410,7 @@ async fn wait_node_convergence(
     wait_for_convergence("realm nodes did not converge", || async {
         let mut pending = 0;
         for node in nodes {
-            match drive(
-                GetRealmNodesOperation::new(*realm_id),
-                node.context.as_ref(),
-            )
-            .await
-            {
+            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
                 Ok(realm_nodes) if realm_nodes == expected => {}
                 _ => pending += 1,
             }

@@ -34,7 +34,7 @@ use aruna_operations::metadata::forward::route_metadata_delete;
 use aruna_operations::metadata::get_document::load_document_record;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
+use aruna_operations::metadata::{AuthToken, MetadataHandle};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use axum::Router;
@@ -502,7 +502,7 @@ async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), Box
         fixture.actor.clone(),
         Some(&record),
         document_id,
-        Some(MetadataAuthToken::internal(AuthContext {
+        Some(AuthToken::internal(AuthContext {
             user_id: fixture.actor.user_id,
             realm_id: fixture.actor.realm_id,
             path_restrictions: None,

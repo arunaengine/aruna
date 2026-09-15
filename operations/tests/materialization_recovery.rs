@@ -8,11 +8,10 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::METADATA_MATERIALIZATION_JOB_KEYSPACE;
 use aruna_core::metadata::{
-    MetadataApplyRoCrateRequest, MetadataBatch, MetadataCreateCrateRequest,
-    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataEvent,
-    MetadataGraphPolicy, MetadataMaterializationState, MetadataMaterializationStatusRecord,
-    MetadataRequestDurability, MetadataUpsertEntityRequest, deterministic_materialization_actor,
-    resolve_raw_revision,
+    ApplyRoCrateRequest, MaterializationState, MaterializationStatusRecord, MetadataBatch,
+    MetadataCrateRequest, MetadataEffect, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
+    MetadataGraphPolicy, MetadataRequestDurability, UpsertEntityRequest,
+    deterministic_materialization_actor, resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
     create_event_entry, document_job_entry, materialization_job_entry,
@@ -74,7 +73,7 @@ async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
         Ulid::from_parts(40, 1),
         "divergence",
-        MetadataCreateEventPayload::RoCrate {
+        MetadataEventPayload::RoCrate {
             jsonld: base_jsonld.clone(),
         },
     );
@@ -190,7 +189,7 @@ async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
         Ulid::from_parts(41, 1),
         "divergence",
-        MetadataCreateEventPayload::UpsertContextualEntity {
+        MetadataEventPayload::UpsertContextualEntity {
             jsonld: serde_json::json!({
                 "@id": "#lab",
                 "@type": "Organization",
@@ -204,7 +203,7 @@ async fn raw_projection_diverges() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
         Ulid::from_parts(41, 2),
         "divergence",
-        MetadataCreateEventPayload::UpsertContextualEntity {
+        MetadataEventPayload::UpsertContextualEntity {
             jsonld: serde_json::json!({
                 "@id": "#lab",
                 "@type": "Organization",
@@ -285,7 +284,7 @@ async fn retries_interrupted_apply() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .expect("materialization status exists");
     assert_eq!(status.event_id, event_id);
-    assert_eq!(status.state, MetadataMaterializationState::Materialized);
+    assert_eq!(status.state, MaterializationState::Materialized);
     assert_eq!(status.last_error, None);
     Ok(())
 }
@@ -297,13 +296,13 @@ async fn cleans_leftover_job() -> Result<(), Box<dyn std::error::Error>> {
     let event_id = Ulid::from_parts(20, 1);
     let event = create_event(&test, document_id, event_id, "final-leftover");
     let job = new_materialization_job(&event, 1);
-    let final_status = MetadataMaterializationStatusRecord {
+    let final_status = MaterializationStatusRecord {
         document_id,
         event_id,
         graph_iri: event.record.graph_iri.clone(),
         context_digest: None,
         dataset_digest: None,
-        state: MetadataMaterializationState::Materialized,
+        state: MaterializationState::Materialized,
         attempts: 1,
         failures: 0,
         last_error: None,
@@ -356,7 +355,7 @@ async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
         upsert_event_id,
         "entity-replay",
-        MetadataCreateEventPayload::UpsertDataEntity {
+        MetadataEventPayload::UpsertDataEntity {
             jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file","description":"preserved"}"#.to_string(),
         },
     );
@@ -368,7 +367,7 @@ async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
         Ulid::from_parts(30, 3),
         "entity-replay",
-        MetadataCreateEventPayload::UpsertDataEntity {
+        MetadataEventPayload::UpsertDataEntity {
             jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"renamed"}"#.to_string(),
         },
     );
@@ -391,7 +390,7 @@ async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
         contextual_event_id,
         "entity-replay",
-        MetadataCreateEventPayload::UpsertContextualEntity {
+        MetadataEventPayload::UpsertContextualEntity {
             jsonld: r##"{"@id":"#lab","@type":"Organization","name":"lab"}"##.to_string(),
         },
     );
@@ -401,7 +400,7 @@ async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn assert_upsert_replayed(
     metadata_handle: &MetadataHandle,
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let first_batch = materialize_entity_upsert(metadata_handle, event).await?;
     assert_eq!(
@@ -422,7 +421,7 @@ async fn assert_upsert_replayed(
 
 async fn materialize_entity_upsert(
     metadata_handle: &MetadataHandle,
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
 ) -> Result<MetadataBatch, Box<dyn std::error::Error>> {
     match metadata_handle
         .send_effect(materialization_effect(event))
@@ -438,13 +437,13 @@ fn create_event(
     document_id: Ulid,
     event_id: Ulid,
     name: &str,
-) -> MetadataCreateEventRecord {
+) -> MetadataEventRecord {
     create_payload_event(
         test,
         document_id,
         event_id,
         name,
-        MetadataCreateEventPayload::Scaffold {
+        MetadataEventPayload::Scaffold {
             name: name.to_string(),
             description: "Materialization recovery".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -458,8 +457,8 @@ fn create_payload_event(
     document_id: Ulid,
     event_id: Ulid,
     name: &str,
-    payload: MetadataCreateEventPayload,
-) -> MetadataCreateEventRecord {
+    payload: MetadataEventPayload,
+) -> MetadataEventRecord {
     let group_id = Ulid::from_parts(1, 1);
     let document_path = format!("datasets/{name}");
     let record = MetadataRegistryRecord {
@@ -482,7 +481,7 @@ fn create_payload_event(
         establishing_event_id: event_id,
         last_event_id: event_id,
     };
-    MetadataCreateEventRecord {
+    MetadataEventRecord {
         event_id,
         record,
         user_id: test.actor.user_id,
@@ -492,7 +491,7 @@ fn create_payload_event(
     }
 }
 
-fn materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
+fn materialization_effect(event: &MetadataEventRecord) -> Effect {
     let policy = MetadataGraphPolicy {
         public: event.record.public,
         permission_paths: vec![event.record.permission_path.clone()],
@@ -500,13 +499,13 @@ fn materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
     .normalized();
     let deterministic_actor = Some(deterministic_materialization_actor(event.event_id));
     match &event.payload {
-        MetadataCreateEventPayload::Scaffold {
+        MetadataEventPayload::Scaffold {
             name,
             description,
             date_published,
             license,
         } => Effect::Metadata(MetadataEffect::CreateCrate {
-            request: MetadataCreateCrateRequest {
+            request: MetadataCrateRequest {
                 graph_iri: event.record.graph_iri.clone(),
                 name: name.clone(),
                 description: description.clone(),
@@ -517,10 +516,10 @@ fn materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
                 deterministic_actor,
             },
         }),
-        MetadataCreateEventPayload::RoCrate { jsonld }
-        | MetadataCreateEventPayload::ReplaceRoCrate { jsonld } => {
+        MetadataEventPayload::RoCrate { jsonld }
+        | MetadataEventPayload::ReplaceRoCrate { jsonld } => {
             Effect::Metadata(MetadataEffect::ApplyRoCrate {
-                request: MetadataApplyRoCrateRequest {
+                request: ApplyRoCrateRequest {
                     graph_iri: event.record.graph_iri.clone(),
                     jsonld: jsonld.clone(),
                     policy,
@@ -529,9 +528,9 @@ fn materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
                 },
             })
         }
-        MetadataCreateEventPayload::UpsertDataEntity { jsonld } => {
+        MetadataEventPayload::UpsertDataEntity { jsonld } => {
             Effect::Metadata(MetadataEffect::UpsertDataEntity {
-                request: MetadataUpsertEntityRequest {
+                request: UpsertEntityRequest {
                     graph_iri: event.record.graph_iri.clone(),
                     jsonld: jsonld.clone(),
                     durability: MetadataRequestDurability::WalAlreadyDurable,
@@ -539,9 +538,9 @@ fn materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
                 },
             })
         }
-        MetadataCreateEventPayload::UpsertContextualEntity { jsonld } => {
+        MetadataEventPayload::UpsertContextualEntity { jsonld } => {
             Effect::Metadata(MetadataEffect::UpsertContextualEntity {
-                request: MetadataUpsertEntityRequest {
+                request: UpsertEntityRequest {
                     graph_iri: event.record.graph_iri.clone(),
                     jsonld: jsonld.clone(),
                     durability: MetadataRequestDurability::WalAlreadyDurable,
@@ -549,7 +548,7 @@ fn materialization_effect(event: &MetadataCreateEventRecord) -> Effect {
                 },
             })
         }
-        MetadataCreateEventPayload::ApplyBatch { batch, .. } => {
+        MetadataEventPayload::ApplyBatch { batch, .. } => {
             Effect::Metadata(MetadataEffect::MergeBatch {
                 graph_iri: event.record.graph_iri.clone(),
                 batch: batch.clone(),
@@ -578,7 +577,7 @@ async fn write_entries(
 async fn read_status(
     storage: &StorageHandle,
     document_id: Ulid,
-) -> Result<Option<MetadataMaterializationStatusRecord>, Box<dyn std::error::Error>> {
+) -> Result<Option<MaterializationStatusRecord>, Box<dyn std::error::Error>> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: aruna_core::keyspaces::METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),

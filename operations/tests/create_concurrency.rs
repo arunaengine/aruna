@@ -11,8 +11,7 @@ use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    create_metadata_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,
 };
 use aruna_storage::FjallStorage;
 use ulid::Ulid;
@@ -21,8 +20,8 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const CONCURRENT_CREATES: usize = 8;
 
-fn scaffold(index: usize) -> CreateMetadataDocumentPayload {
-    CreateMetadataDocumentPayload::Scaffold {
+fn scaffold(index: usize) -> CreateDocumentPayload {
+    CreateDocumentPayload::Scaffold {
         name: format!("Concurrent Dataset {index}"),
         description: "Concurrent create regression".to_string(),
         date_published: "2026-07-24".to_string(),
@@ -88,20 +87,19 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
     for index in 0..CONCURRENT_CREATES {
         let context = context.clone();
         handles.push(tokio::spawn(async move {
-            let operation =
-                CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
-                    actor: Actor {
-                        node_id,
-                        user_id: UserId::local(Ulid::generate(), realm_id),
-                        realm_id,
-                    },
-                    group_id,
-                    // Unminted sentinel: the driver mints a structured id.
-                    document_id: Ulid::nil(),
-                    document_path: format!("datasets/concurrent-{index}"),
-                    public: true,
-                    payload: scaffold(index),
-                });
+            let operation = CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: UserId::local(Ulid::generate(), realm_id),
+                    realm_id,
+                },
+                group_id,
+                // Unminted sentinel: the driver mints a structured id.
+                document_id: Ulid::nil(),
+                document_path: format!("datasets/concurrent-{index}"),
+                public: true,
+                payload: scaffold(index),
+            });
             create_metadata_document(operation, context).await
         }));
     }
