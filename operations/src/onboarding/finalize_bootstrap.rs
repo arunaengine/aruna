@@ -6,7 +6,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
-    DEFAULT_METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind,
+    METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind,
 };
 use aruna_core::structs::placement::placement_record::{
     NodePlacementEntry, normalize_placement_input,
@@ -27,7 +27,7 @@ use crate::onboarding::consume_secret::{
     ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
 };
 use crate::onboarding::issue_ticket::{
-    IssueSyncError, IssueSyncInput, IssueSyncOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
+    IssueSyncError, IssueSyncInput, IssueSyncOperation, TICKET_TTL_SECS,
 };
 use crate::onboarding::reserve_secret::{
     ReserveSecretError, ReserveSecretInput, ReserveSecretOperation,
@@ -39,8 +39,8 @@ use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 use crate::realm::mutate_placement::{MutatePlacementError, RealmPlacementMutation};
 use crate::realm::read_authorization::ReadAuthorizationOperation;
 
-const ONBOARDING_RESERVATION_TTL_SECS: u64 = 300;
-const REALM_NODE_UPDATE_RETRIES: usize = 5;
+const RESERVATION_TTL_SECS: u64 = 300;
+const NODE_UPDATE_RETRIES: usize = 5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BootstrapFinalizeInput {
@@ -89,7 +89,7 @@ pub enum BootstrapFinalizeError {
     #[error("placement labels must not set the derived label `{0}`")]
     ReservedNodeLabel(String),
     #[error("placement location must be at most 64 characters")]
-    NodeLocationTooLong,
+    LongNodeLocation,
     #[error("ticketed user {0} has no placement")]
     UserPlacementUnavailable(UserId),
 }
@@ -106,7 +106,7 @@ pub async fn bootstrap_onboarding_finalize(
             secret_hash: input.secret_hash.clone(),
             node_id: input.node_id.to_string(),
             now: input.now,
-            reservation_expires_at: input.now.saturating_add(ONBOARDING_RESERVATION_TTL_SECS),
+            reservation_expires_at: input.now.saturating_add(RESERVATION_TTL_SECS),
             finalizing: true,
         }),
         context.as_ref(),
@@ -127,7 +127,7 @@ pub async fn bootstrap_onboarding_finalize(
             node_id: input.node_id,
             issuer_node_id: input.local_node_id,
             now: input.now,
-            ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
+            ttl_secs: TICKET_TTL_SECS,
         }),
         context.as_ref(),
     )
@@ -215,7 +215,7 @@ async fn ensure_realm_node(
     context: &DriverContext,
 ) -> Result<(), EnsureConfigError> {
     let mut last_conflict = None;
-    for _ in 0..REALM_NODE_UPDATE_RETRIES {
+    for _ in 0..NODE_UPDATE_RETRIES {
         match ensure_node_once(input, mode, context).await {
             Ok(()) => {
                 if let Err(error) = mark_interest_dirty(context, input.realm_id).await {
@@ -249,7 +249,7 @@ async fn ensure_node_once(
             },
             target_node_id: input.node_id,
             target_node_kind: onboarding_node_kind(mode),
-            default_metadata_replication_factor: DEFAULT_METADATA_REPLICATION_FACTOR,
+            metadata_replication_factor: METADATA_REPLICATION_FACTOR,
             realm_description: String::new(),
             create_if_missing: false,
             reject_kind_mismatch: true,
@@ -278,7 +278,7 @@ fn build_joiner_entry(
     }
     let (location, weight) =
         normalize_placement_input(input.node_location.as_deref(), input.node_weight)
-            .map_err(|_| BootstrapFinalizeError::NodeLocationTooLong)?;
+            .map_err(|_| BootstrapFinalizeError::LongNodeLocation)?;
 
     Ok(NodePlacementEntry {
         node_id: input.node_id,
@@ -402,7 +402,7 @@ mod tests {
     use ulid::Ulid;
 
     const LOCAL_NODE_SECRET: [u8; 32] = [4u8; 32];
-    const ONBOARDING_SECRET_EXPIRES_AT: u64 = 1_000;
+    const SECRET_EXPIRES_AT: u64 = 1_000;
 
     #[test]
     fn kind_follows_mode() {
@@ -477,7 +477,7 @@ mod tests {
                     secret_hash: "abc".to_string(),
                     mode: OnboardingMode::Server,
                     purpose: OnboardingPurpose::NodeEnrollment,
-                    expires_at: ONBOARDING_SECRET_EXPIRES_AT,
+                    expires_at: SECRET_EXPIRES_AT,
                     claimed_node_id: None,
                 },
             }),
@@ -730,7 +730,7 @@ mod tests {
             finalize_input(
                 &fixture,
                 fixture.joiner_node_id,
-                ONBOARDING_SECRET_EXPIRES_AT + 1,
+                SECRET_EXPIRES_AT + 1,
             ),
             retry_context,
         )
@@ -795,7 +795,7 @@ mod tests {
                     secret_hash: "device".to_string(),
                     mode: OnboardingMode::User { owner },
                     purpose: OnboardingPurpose::NodeEnrollment,
-                    expires_at: ONBOARDING_SECRET_EXPIRES_AT,
+                    expires_at: SECRET_EXPIRES_AT,
                     claimed_node_id: None,
                 },
             }),
@@ -1000,7 +1000,7 @@ mod tests {
 
         let other_node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
         let rejected = bootstrap_onboarding_finalize(
-            finalize_input(&fixture, other_node_id, ONBOARDING_SECRET_EXPIRES_AT + 1),
+            finalize_input(&fixture, other_node_id, SECRET_EXPIRES_AT + 1),
             fixture.context.clone(),
         )
         .await;
@@ -1031,7 +1031,7 @@ mod tests {
             finalize_input(
                 &fixture,
                 fixture.joiner_node_id,
-                ONBOARDING_SECRET_EXPIRES_AT + 1,
+                SECRET_EXPIRES_AT + 1,
             ),
             retry_context,
         )
@@ -1076,7 +1076,7 @@ mod tests {
             finalize_input(
                 &fixture,
                 fixture.joiner_node_id,
-                ONBOARDING_SECRET_EXPIRES_AT + 1,
+                SECRET_EXPIRES_AT + 1,
             ),
             context,
         )
@@ -1130,7 +1130,7 @@ mod tests {
             finalize_input(
                 &fixture,
                 fixture.joiner_node_id,
-                ONBOARDING_SECRET_EXPIRES_AT + 1,
+                SECRET_EXPIRES_AT + 1,
             ),
             retry_context,
         )
@@ -1190,7 +1190,7 @@ mod tests {
         input.node_location = Some("x".repeat(65));
 
         let result = bootstrap_onboarding_finalize(input, fixture.context.clone()).await;
-        assert_eq!(result, Err(BootstrapFinalizeError::NodeLocationTooLong));
+        assert_eq!(result, Err(BootstrapFinalizeError::LongNodeLocation));
         assert_eq!(
             read_secret_state(&fixture.storage_handle, fixture.enrollment_id).await,
             OnboardingSecretState::Available

@@ -168,7 +168,7 @@ async fn read_config(
 ) -> Result<RealmConfigDocument, MutatePlacementError> {
     drive(GetConfigOperation::new(actor.realm_id), context)
         .await
-        .map_err(|_| MutatePlacementError::RealmConfigNotFound)
+        .map_err(|_| MutatePlacementError::ConfigMissing)
 }
 
 /// Drives one placement mutation with the shared conflict re-drive.

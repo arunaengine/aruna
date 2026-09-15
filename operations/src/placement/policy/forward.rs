@@ -45,7 +45,7 @@ pub async fn create_policy_routed(
     let response = forward_to_holders(
         context,
         &holders,
-        MetadataTransportMessage::ForwardCreatePlacementPolicy {
+        MetadataTransportMessage::ForwardCreatePolicy {
             auth_token,
             policy: Box::new(policy),
             created_at_ms,
@@ -55,7 +55,7 @@ pub async fn create_policy_routed(
     )
     .await?;
     match response {
-        MetadataTransportMessage::ForwardedPlacementPolicyCreated { document } => Ok(*document),
+        MetadataTransportMessage::PlacementPolicyCreated { document } => Ok(*document),
         other => Err(MetadataWriteError::Undeliverable(format!(
             "holder answered a policy publication with {}",
             crate::metadata::transport_message_kind(&other)
@@ -79,7 +79,7 @@ pub(crate) async fn apply_forwarded_policy(
         Ok(auth) => auth,
         Err(error) => return forward_auth_error(error),
     };
-    let MetadataTransportMessage::ForwardCreatePlacementPolicy {
+    let MetadataTransportMessage::ForwardCreatePolicy {
         policy,
         created_at_ms,
         ..
@@ -108,7 +108,7 @@ pub(crate) async fn apply_forwarded_policy(
         created_at_ms,
     };
     match drive(CreatePolicyOperation::new(config), context.as_ref()).await {
-        Ok(document) => MetadataTransportMessage::ForwardedPlacementPolicyCreated {
+        Ok(document) => MetadataTransportMessage::PlacementPolicyCreated {
             document: Box::new(document),
         },
         Err(CreatePolicyError::Unauthorized) => MetadataTransportMessage::ForwardedWriteDenied {

@@ -5,7 +5,7 @@
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::PLACEMENT_WRITE_FENCE_KEYSPACE;
+use aruna_core::keyspaces::WRITE_FENCE_KEYSPACE;
 use aruna_core::storage_entries::placement_fence_key;
 use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -31,7 +31,7 @@ pub fn write_generation(config: &RealmConfigDocument, placement: &PlacementRef) 
 /// The bucket's fence read, addressed for a batch read inside a transaction.
 pub fn fence_read(realm_id: &RealmId, placement: &PlacementRef) -> (String, Key) {
     (
-        PLACEMENT_WRITE_FENCE_KEYSPACE.to_string(),
+        WRITE_FENCE_KEYSPACE.to_string(),
         placement_fence_key(realm_id, placement),
     )
 }
@@ -301,7 +301,7 @@ mod tests {
         };
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: PLACEMENT_WRITE_FENCE_KEYSPACE.to_string(),
+                key_space: WRITE_FENCE_KEYSPACE.to_string(),
                 key: placement_fence_key(&realm_id, &placement),
                 txn_id: Some(txn_id),
             })
@@ -317,7 +317,7 @@ mod tests {
 
         let write = storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                key_space: aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
                 key: ByteView::from(b"paused-row".to_vec()),
                 value: ByteView::from(vec![1u8]),
                 txn_id: Some(txn_id),
@@ -351,7 +351,7 @@ mod tests {
         let stored = || async {
             match storage
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: PLACEMENT_WRITE_FENCE_KEYSPACE.to_string(),
+                    key_space: WRITE_FENCE_KEYSPACE.to_string(),
                     key: placement_fence_key(&realm_id, &placement),
                     txn_id: None,
                 })

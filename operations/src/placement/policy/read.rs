@@ -4,7 +4,7 @@
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{
-    Effect, HolderList, MAX_POLICY_FETCH_HOLDERS, NetEffect, PolicyFetchEffect, StorageEffect,
+    Effect, HolderList, MAX_FETCH_HOLDERS, NetEffect, PolicyFetchEffect, StorageEffect,
 };
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicyFetchEvent, StorageEvent};
@@ -299,7 +299,7 @@ impl ReadPolicyOperation {
             read_holder_sets(&realm.config, &placement)?
                 .into_iter()
                 .filter(|holder| *holder != self.config.local_node_id)
-                .take(MAX_POLICY_FETCH_HOLDERS)
+                .take(MAX_FETCH_HOLDERS)
                 .collect()
         };
         self.emit_fetch(holders)

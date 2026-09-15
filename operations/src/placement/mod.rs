@@ -1423,7 +1423,7 @@ mod pure_tests {
             shard_overrides: Vec::new(),
         };
         for operation in [
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: PlacementStrategy {
                     strategy_id,
                     name: "moved".to_string(),
@@ -1433,14 +1433,14 @@ mod pure_tests {
                     shard_count: 2,
                 },
             },
-            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+            AdminDocumentOperation::CandidateMapPublished {
                 map: map(1, [1, 2]),
             },
-            AdminDocumentOperation::RealmConfigActivationsInitialized {
+            AdminDocumentOperation::ConfigActivationsInitialized {
                 strategy_id,
                 candidate_map_epoch: 1,
             },
-            AdminDocumentOperation::RealmConfigCandidateMapPublished {
+            AdminDocumentOperation::CandidateMapPublished {
                 map: map(2, [3, 4]),
             },
         ] {
@@ -1467,7 +1467,7 @@ mod pure_tests {
         state
             .apply_operation(
                 &actor(1),
-                AdminDocumentOperation::RealmConfigTransitionStarted { plan: plan.clone() },
+                AdminDocumentOperation::ConfigTransitionStarted { plan: plan.clone() },
             )
             .expect("applies");
 
@@ -1479,7 +1479,7 @@ mod pure_tests {
                 state
                     .apply_operation(
                         &actor(seed),
-                        AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+                        AdminDocumentOperation::TransitionBarrierReported {
                             transition_id: plan.transition_id,
                             bucket: bucket.bucket,
                             reported_by: *holder,
@@ -1498,7 +1498,7 @@ mod pure_tests {
                 state
                     .apply_operation(
                         &actor(seed),
-                        AdminDocumentOperation::RealmConfigTransitionDrainReported {
+                        AdminDocumentOperation::TransitionDrainReported {
                             transition_id: plan.transition_id,
                             bucket: bucket.bucket,
                             reported_by: *holder,
@@ -1540,7 +1540,7 @@ mod pure_tests {
                 state
                     .apply_operation(
                         &actor(seed),
-                        AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+                        AdminDocumentOperation::TransitionProofSubmitted {
                             transition_id: plan.transition_id,
                             strategy_id,
                             proof,

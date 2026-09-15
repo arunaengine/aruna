@@ -7,10 +7,10 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::execution::notification_watch::{
-    WATCH_INTEREST_DIRTY_PREFIX, WatchEventKind, WatchEventMask, WatchInterestDigest,
+    WATCH_DIRTY_PREFIX, WatchEventKind, WatchEventMask, WatchInterestDigest,
     WatchInterestEntry, WatchInterestTable, dirty_interest_realm, interest_dirty_key,
     interest_node_id, interest_node_key, interest_node_prefix, interest_pending_key,
     interest_realm_id, interest_realm_prefix,
@@ -25,8 +25,8 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::notifications::protocol::{
-    NOTIFICATION_WATCH_DIRTY_REALM_CAP, NOTIFICATION_WATCH_INTEREST_BYTES_CAP,
-    NOTIFICATION_WATCH_INTEREST_ENTRY_CAP,
+    DIRTY_REALM_CAP, INTEREST_BYTES_CAP,
+    INTEREST_ENTRY_CAP,
 };
 use crate::notifications::watch::authorization::filter_authorized_subscriptions;
 use crate::notifications::watch::expand::drain_watch_events;
@@ -40,7 +40,7 @@ use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocume
 /// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
 /// fires this long after the first dirty write, collapsing a run of watch CRUD
 /// into one publish with bounded latency.
-pub const WATCH_INTEREST_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
+pub const WATCH_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Ensures this node has a document to announce when joining the shared
 /// realm-scoped watch-interest topic. Existing digests may contain live watches
@@ -53,7 +53,7 @@ pub async fn ensure_interest_digest(
     let key = Key::from(interest_node_key(realm_id, node_id));
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             key: key.clone(),
             txn_id: None,
         })
@@ -67,7 +67,7 @@ pub async fn ensure_interest_digest(
             };
             match storage
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                    key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                     key,
                     value: Value::from(digest.to_bytes().map_err(|error| error.to_string())?),
                     txn_id: None,
@@ -92,7 +92,7 @@ pub async fn ensure_interest_digest(
 pub fn schedule_publish_effect() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
         key: TaskKey::PublishWatchInterest,
-        after: WATCH_INTEREST_PUBLISH_DEBOUNCE,
+        after: WATCH_PUBLISH_DEBOUNCE,
     })
 }
 
@@ -102,7 +102,7 @@ pub fn schedule_publish_effect() -> Effect {
 pub fn dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, Value) {
     let generation = ByteView::from(Ulid::generate().to_bytes().to_vec());
     (
-        NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+        WATCH_INTEREST_KEYSPACE.to_string(),
         ByteView::from(interest_dirty_key(realm_id)),
         generation,
     )
@@ -193,11 +193,11 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
             .send_storage_effect(StorageEffect::BatchRead {
                 reads: vec![
                     (
-                        NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                        WATCH_INTEREST_KEYSPACE.to_string(),
                         digest_key.clone(),
                     ),
                     (
-                        NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                        WATCH_INTEREST_KEYSPACE.to_string(),
                         pending_key.clone(),
                     ),
                 ],
@@ -218,12 +218,12 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         }
         if changed {
             writes.push((
-                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                WATCH_INTEREST_KEYSPACE.to_string(),
                 digest_key,
                 digest_value,
             ));
             writes.push((
-                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                WATCH_INTEREST_KEYSPACE.to_string(),
                 pending_key,
                 Value::from(Vec::new()),
             ));
@@ -260,7 +260,7 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         .map_err(|error| format!("watch interest replication failed: {error}"))?;
         match storage
             .send_storage_effect(StorageEffect::Delete {
-                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                 key: Key::from(interest_pending_key(realm_id)),
                 txn_id: None,
             })
@@ -295,10 +295,10 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
 async fn read_dirty_markers(storage: &StorageHandle) -> Result<(Vec<(Key, Value)>, bool), String> {
     let (values, scan_more) = match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-            prefix: Some(Key::from(WATCH_INTEREST_DIRTY_PREFIX.to_vec())),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
+            prefix: Some(Key::from(WATCH_DIRTY_PREFIX.to_vec())),
             start: None,
-            limit: NOTIFICATION_WATCH_DIRTY_REALM_CAP.saturating_add(1),
+            limit: DIRTY_REALM_CAP.saturating_add(1),
             txn_id: None,
         })
         .await
@@ -314,11 +314,11 @@ async fn read_dirty_markers(storage: &StorageHandle) -> Result<(Vec<(Key, Value)
             ));
         }
     };
-    let more = scan_more || values.len() > NOTIFICATION_WATCH_DIRTY_REALM_CAP;
+    let more = scan_more || values.len() > DIRTY_REALM_CAP;
     Ok((
         values
             .into_iter()
-            .take(NOTIFICATION_WATCH_DIRTY_REALM_CAP)
+            .take(DIRTY_REALM_CAP)
             .collect(),
         more,
     ))
@@ -358,11 +358,11 @@ async fn build_realm_digest(
 }
 
 fn digest_over(digest: &WatchInterestDigest) -> Result<bool, String> {
-    if digest.entries.len() > NOTIFICATION_WATCH_INTEREST_ENTRY_CAP {
+    if digest.entries.len() > INTEREST_ENTRY_CAP {
         return Ok(true);
     }
     Ok(digest.to_bytes().map_err(|error| error.to_string())?.len()
-        > NOTIFICATION_WATCH_INTEREST_BYTES_CAP)
+        > INTEREST_BYTES_CAP)
 }
 
 fn catchall_digest(node_id: NodeId) -> WatchInterestDigest {
@@ -423,7 +423,7 @@ async fn clear_consumed_markers(
         .iter()
         .map(|(key, _)| {
             (
-                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                WATCH_INTEREST_KEYSPACE.to_string(),
                 key.clone(),
             )
         })
@@ -448,7 +448,7 @@ async fn clear_consumed_markers(
     for ((key, observed_generation), (_, current_value)) in observed.iter().zip(current) {
         if current_value.as_ref() == Some(observed_generation) {
             deletes.push((
-                NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                WATCH_INTEREST_KEYSPACE.to_string(),
                 key.clone(),
             ));
         }
@@ -497,8 +497,8 @@ async fn clear_consumed_markers(
 pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let has_markers = match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-            prefix: Some(Key::from(WATCH_INTEREST_DIRTY_PREFIX.to_vec())),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
+            prefix: Some(Key::from(WATCH_DIRTY_PREFIX.to_vec())),
             start: None,
             limit: 1,
             txn_id: None,
@@ -531,7 +531,7 @@ pub async fn rebuild_interest_table(storage: &StorageHandle) -> WatchInterestTab
     let mut eligible_by_realm: HashMap<RealmId, Option<HashSet<NodeId>>> = HashMap::new();
     let entries = match scan_all(
         storage,
-        NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+        WATCH_INTEREST_KEYSPACE,
         Some(Key::from(interest_node_prefix())),
     )
     .await
@@ -641,7 +641,7 @@ async fn build_node_map(
     let eligible = sync_eligible_nodes(storage, realm_id).await?;
     let entries = scan_all(
         storage,
-        NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+        WATCH_INTEREST_KEYSPACE,
         Some(Key::from(interest_realm_prefix(realm_id))),
     )
     .await?;
@@ -756,7 +756,7 @@ mod tests {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                 key: Key::from(interest_node_key(realm_id, digest.node_id)),
                 value: Value::from(digest.to_bytes().unwrap()),
                 txn_id: None,
@@ -891,7 +891,7 @@ mod tests {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                 key: Key::from(interest_dirty_key(realm_id)),
                 txn_id: None,
             })
@@ -906,8 +906,8 @@ mod tests {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                prefix: Some(Key::from(WATCH_INTEREST_DIRTY_PREFIX.to_vec())),
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
+                prefix: Some(Key::from(WATCH_DIRTY_PREFIX.to_vec())),
                 start: None,
                 limit: 1024,
                 txn_id: None,
@@ -923,7 +923,7 @@ mod tests {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                 key: Key::from(interest_pending_key(realm_id)),
                 txn_id: None,
             })
@@ -942,7 +942,7 @@ mod tests {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                 key: Key::from(interest_node_key(realm_id, node_id)),
                 txn_id: None,
             })
@@ -968,7 +968,7 @@ mod tests {
     fn digest_caps_work() {
         let digest = WatchInterestDigest {
             node_id: node(1),
-            entries: (0..=NOTIFICATION_WATCH_INTEREST_ENTRY_CAP)
+            entries: (0..=INTEREST_ENTRY_CAP)
                 .map(|index| WatchInterestEntry {
                     path_prefix: format!("p/{index}"),
                     event_mask: mask(),
@@ -982,11 +982,11 @@ mod tests {
     async fn dirty_page_caps() {
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
-        for index in 0..=NOTIFICATION_WATCH_DIRTY_REALM_CAP {
+        for index in 0..=DIRTY_REALM_CAP {
             assert!(matches!(
                 ctx.storage_handle
                     .send_storage_effect(StorageEffect::Write {
-                        key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                        key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                         key: format!("dirty/bad/{index}").into_bytes().into(),
                         value: vec![index as u8].into(),
                         txn_id: None,

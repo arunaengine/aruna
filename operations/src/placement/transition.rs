@@ -20,7 +20,7 @@ pub enum TransitionPlanError {
     #[error("candidate map epoch {0} is missing or conflicted")]
     MapUnavailable(u64),
     #[error("bucket {0} is outside the strategy's shard count")]
-    BucketOutOfRange(u32),
+    OutOfRange(u32),
     #[error("bucket {0} has no activation to move")]
     ActivationUnavailable(u32),
     #[error("bucket {0} resolves no holder in the target map")]
@@ -135,7 +135,7 @@ pub fn preview_transition(
     let mut previews = Vec::with_capacity(scope.len());
     for bucket in scope {
         if bucket >= strategy.shard_count {
-            return Err(TransitionPlanError::BucketOutOfRange(bucket));
+            return Err(TransitionPlanError::OutOfRange(bucket));
         }
         let placement = PlacementRef {
             strategy_id,

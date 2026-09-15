@@ -14,7 +14,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 const REALM_PRESENCE_TTL: Duration = Duration::from_secs(60);
-pub(crate) const REALM_PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
+pub(crate) const PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnouncePresenceConfig {
@@ -117,7 +117,7 @@ impl Operation for AnnouncePresenceOperation {
                         self.state = AnnouncePresenceState::ScheduleRefresh;
                         smallvec![Effect::Task(TaskEffect::ResetTimer {
                             key: self.task_key(),
-                            after: REALM_PRESENCE_REFRESH_AFTER,
+                            after: PRESENCE_REFRESH_AFTER,
                         })]
                     } else {
                         self.finish_success()
@@ -176,7 +176,7 @@ mod pure_tests {
         let [Effect::Net(NetEffect::Dht(DhtEffect::Put { ttl, .. }))] = effects.as_slice() else {
             panic!("expected one DHT put effect");
         };
-        assert!(*ttl > REALM_PRESENCE_REFRESH_AFTER);
+        assert!(*ttl > PRESENCE_REFRESH_AFTER);
         assert!(*ttl > aruna_net::dht::constants::DRIVER_TICK_INTERVAL);
     }
 

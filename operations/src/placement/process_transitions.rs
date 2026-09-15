@@ -779,7 +779,7 @@ mod tests {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
                 discovery_method: DiscoveryMethod::None,
                 relay_method: RelayMethod::None,
-                document_sync_storage_path: Some(root.join("document-sync")),
+                sync_storage_path: Some(root.join("document-sync")),
                 ..NetConfig::default()
             },
             storage_handle.clone(),
@@ -1301,7 +1301,7 @@ mod tests {
                     origin_seq: 1,
                     observed: AdminDocumentClock::default(),
                     actor: actor(realm_id, origin),
-                    op: AdminDocumentOperation::RealmConfigCandidateMapPublished { map },
+                    op: AdminDocumentOperation::CandidateMapPublished { map },
                 })
                 .expect("the publication applies");
         };

@@ -6,7 +6,7 @@ use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::PLACEMENT_POLICY_CACHE_KEYSPACE;
+use aruna_core::keyspaces::POLICY_CACHE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, VerifiedPolicy};
@@ -206,7 +206,7 @@ impl ResolvePolicyOperation {
         });
         self.state = ResolveState::Scan;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+            key_space: POLICY_CACHE_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: MAX_CACHE_ENTRIES + 1,
@@ -220,7 +220,7 @@ impl ResolvePolicyOperation {
         };
         self.state = ResolveState::Store;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+            key_space: POLICY_CACHE_KEYSPACE.to_string(),
             key: pending.key,
             value: ByteView::from(pending.bytes),
             txn_id: None,
@@ -265,7 +265,7 @@ impl Operation for ResolvePolicyOperation {
     fn start(&mut self) -> Effects {
         self.state = ResolveState::ReadCache;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+            key_space: POLICY_CACHE_KEYSPACE.to_string(),
             key: cache_key(&self.config.policy_ref),
             txn_id: None,
         })]
@@ -346,7 +346,7 @@ impl Operation for ResolvePolicyOperation {
                     smallvec![Effect::Storage(StorageEffect::BatchDelete {
                         deletes: victims
                             .into_iter()
-                            .map(|key| (PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(), key))
+                            .map(|key| (POLICY_CACHE_KEYSPACE.to_string(), key))
                             .collect(),
                         txn_id: None,
                     })]
@@ -528,7 +528,7 @@ mod pure_tests {
         let Some(Effect::Storage(StorageEffect::Iter { key_space, .. })) = effects.first() else {
             panic!("expected a cache scan, got {effects:?}");
         };
-        assert_eq!(key_space, PLACEMENT_POLICY_CACHE_KEYSPACE);
+        assert_eq!(key_space, POLICY_CACHE_KEYSPACE);
 
         let effects = operation.step(iter_result(Vec::new()));
         let Some(Effect::Storage(StorageEffect::Write { key, value, .. })) = effects.first() else {

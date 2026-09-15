@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE,
+    MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE, POLICY_CACHE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -185,7 +185,7 @@ impl PolicyDiagnosticsOperation {
         }
         self.state = DiagnosticsState::ScanCache;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: PLACEMENT_POLICY_CACHE_KEYSPACE.to_string(),
+            key_space: POLICY_CACHE_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: MAX_CACHE_ENTRIES + 1,

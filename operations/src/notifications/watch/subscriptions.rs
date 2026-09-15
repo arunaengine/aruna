@@ -7,12 +7,12 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
+use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::execution::notification_watch::{
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, WatchAuthorizationBinding,
+    MAX_PREFIX_LEN, WATCH_USER_CAP, WatchAuthorizationBinding,
     WatchEventMask, WatchSubscription, parse_watch_key, watch_subscription_prefix,
 };
 use aruna_core::structs::placement::placement_record::PlacementRef;
@@ -23,7 +23,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::notifications::protocol::NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP;
+use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
 use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
 use crate::notifications::watch::interest::dirty_marker_write;
 use crate::sync::document_outbox::{
@@ -32,12 +32,12 @@ use crate::sync::document_outbox::{
 
 /// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
 /// always covers a subscription set with a wide safety margin.
-const WATCH_SUBSCRIPTION_LIST_LIMIT: usize = 256;
-const WATCH_SUBSCRIPTION_PAGE_LIMIT: usize = 256;
+const WATCH_LIST_LIMIT: usize = 256;
+const SUBSCRIPTION_PAGE_LIMIT: usize = 256;
 
 /// Stable reject reason for a cap-exceeded create; matched verbatim by the
 /// holder proxy to surface a 409 to the API layer.
-pub const WATCH_SUBSCRIPTION_CAP_REACHED: &str = "notification watch subscription cap reached";
+pub const WATCH_CAP_REACHED: &str = "notification watch subscription cap reached";
 
 /// Stable reject reason for an unauthorized create; matched verbatim by the
 /// holder proxy to surface a 403 to the API layer.
@@ -176,7 +176,7 @@ fn validate_subscription_fields(
     if path_prefix.starts_with('/') {
         return Err(WatchSubscriptionError::LeadingSlash);
     }
-    if path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN {
+    if path_prefix.len() > MAX_PREFIX_LEN {
         return Err(WatchSubscriptionError::PrefixTooLong);
     }
     if event_mask.is_empty() {
@@ -237,10 +237,10 @@ async fn create_once(
 
     let existing = match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
             prefix: Some(watch_subscription_prefix(subscription.owner)),
             start: None,
-            limit: NOTIFICATION_WATCH_PER_USER_CAP.saturating_add(1),
+            limit: WATCH_USER_CAP.saturating_add(1),
             txn_id: Some(txn_id),
         })
         .await
@@ -256,7 +256,7 @@ async fn create_once(
             )));
         }
     };
-    if existing.len() >= NOTIFICATION_WATCH_PER_USER_CAP {
+    if existing.len() >= WATCH_USER_CAP {
         abort_txn(storage, txn_id).await;
         return Err(CreateFailure::Cap);
     }
@@ -403,7 +403,7 @@ async fn delete_once(
     let (_, subscription_key) = watch_delete_entry(owner, watch_id);
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
             key: subscription_key,
             txn_id: Some(txn_id),
         })
@@ -612,10 +612,10 @@ pub async fn list_watch_subscriptions(
 ) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
     let values = match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
             prefix: Some(watch_subscription_prefix(owner)),
             start: None,
-            limit: WATCH_SUBSCRIPTION_LIST_LIMIT,
+            limit: WATCH_LIST_LIMIT,
             txn_id: None,
         })
         .await
@@ -652,16 +652,16 @@ pub async fn list_realm_subscriptions(
     realm_id: RealmId,
 ) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
     let prefix = UserId::storage_prefix(realm_id);
-    let mut subscriptions = Vec::with_capacity(NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP);
+    let mut subscriptions = Vec::with_capacity(SUBSCRIPTION_SCAN_CAP);
     let mut start = None;
     loop {
-        let remaining = NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP - subscriptions.len();
+        let remaining = SUBSCRIPTION_SCAN_CAP - subscriptions.len();
         let limit = remaining
             .saturating_add(1)
-            .min(WATCH_SUBSCRIPTION_PAGE_LIMIT);
+            .min(SUBSCRIPTION_PAGE_LIMIT);
         let (values, next) = match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+                key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start.map(IterStart::After),
                 limit,
@@ -711,7 +711,7 @@ pub async fn list_watch_page(
     start: Option<Vec<u8>>,
     limit: usize,
 ) -> Result<(Vec<WatchSubscription>, Option<Vec<u8>>), WatchSubscriptionError> {
-    if limit == 0 || limit > NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP {
+    if limit == 0 || limit > SUBSCRIPTION_SCAN_CAP {
         return Err(WatchSubscriptionError::Storage(
             "notification watch subscription page cap exceeded".to_string(),
         ));
@@ -719,7 +719,7 @@ pub async fn list_watch_page(
     let prefix = UserId::storage_prefix(realm_id);
     let values = match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
             prefix: Some(prefix),
             start: start.map(|key| IterStart::After(key.into())),
             limit: limit.saturating_add(1),
@@ -895,7 +895,7 @@ mod tests {
             create_local_watch(
                 &storage,
                 owner,
-                "x".repeat(NOTIFICATION_WATCH_MAX_PREFIX_LEN + 1),
+                "x".repeat(MAX_PREFIX_LEN + 1),
                 mask(),
                 1
             )
@@ -925,7 +925,7 @@ mod tests {
     async fn create_enforces_cap() {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 1);
-        for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
+        for index in 0..WATCH_USER_CAP {
             create_local_watch(&storage, owner, format!("p/{index}"), mask(), index as u64)
                 .await
                 .expect("create under cap succeeds");
@@ -939,7 +939,7 @@ mod tests {
                 .await
                 .expect("list succeeds")
                 .len(),
-            NOTIFICATION_WATCH_PER_USER_CAP
+            WATCH_USER_CAP
         );
     }
 
@@ -955,7 +955,7 @@ mod tests {
         install_auth(&storage, realm_id, owner, group_id, node_id).await;
 
         let dead_prefix = watch_resource_path(Ulid::nil(), node_id, "bucket", "");
-        for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
+        for index in 0..WATCH_USER_CAP {
             create_local_watch(
                 &storage,
                 owner,
@@ -987,7 +987,7 @@ mod tests {
                 .await
                 .expect("durable rows remain listable")
                 .len(),
-            NOTIFICATION_WATCH_PER_USER_CAP
+            WATCH_USER_CAP
         );
     }
 
@@ -1036,7 +1036,7 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let alice = user(1, 1);
         let bob = user(1, 2);
-        for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
+        for index in 0..WATCH_USER_CAP {
             create_local_watch(&storage, alice, format!("a/{index}"), mask(), index as u64)
                 .await
                 .expect("alice fills her cap");
@@ -1058,7 +1058,7 @@ mod tests {
     async fn concurrent_cap() {
         let (_dir, storage) = temp_storage();
         let owner = user(1, 7);
-        for index in 0..NOTIFICATION_WATCH_PER_USER_CAP - 1 {
+        for index in 0..WATCH_USER_CAP - 1 {
             create_local_watch(&storage, owner, format!("p/{index}"), mask(), index as u64)
                 .await
                 .expect("prefill succeeds");
@@ -1073,7 +1073,7 @@ mod tests {
                 .await
                 .expect("list succeeds")
                 .len(),
-            NOTIFICATION_WATCH_PER_USER_CAP
+            WATCH_USER_CAP
         );
     }
 
@@ -1141,10 +1141,10 @@ mod tests {
         let realm = RealmId([9u8; 32]);
         // Owner and watch ids are offset by one: stored rows with nil identity
         // are rejected at decode time.
-        let writes = (0..=NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP)
+        let writes = (0..=SUBSCRIPTION_SCAN_CAP)
             .map(|index| {
                 let owner = UserId::new(
-                    Ulid::from_bytes([(index / NOTIFICATION_WATCH_PER_USER_CAP + 1) as u8; 16]),
+                    Ulid::from_bytes([(index / WATCH_USER_CAP + 1) as u8; 16]),
                     realm,
                 );
                 let mut subscription =
@@ -1163,14 +1163,14 @@ mod tests {
             Event::Storage(StorageEvent::BatchWriteResult { .. })
         ));
 
-        let (page, next) = list_watch_page(&storage, realm, None, WATCH_SUBSCRIPTION_PAGE_LIMIT)
+        let (page, next) = list_watch_page(&storage, realm, None, SUBSCRIPTION_PAGE_LIMIT)
             .await
             .expect("first page succeeds");
-        assert_eq!(page.len(), WATCH_SUBSCRIPTION_PAGE_LIMIT);
-        let (tail, _) = list_watch_page(&storage, realm, next, WATCH_SUBSCRIPTION_PAGE_LIMIT)
+        assert_eq!(page.len(), SUBSCRIPTION_PAGE_LIMIT);
+        let (tail, _) = list_watch_page(&storage, realm, next, SUBSCRIPTION_PAGE_LIMIT)
             .await
             .expect("continuation succeeds");
-        assert_eq!(tail.len(), WATCH_SUBSCRIPTION_PAGE_LIMIT);
+        assert_eq!(tail.len(), SUBSCRIPTION_PAGE_LIMIT);
 
         assert!(matches!(
             list_realm_subscriptions(&storage, realm).await,
@@ -1183,7 +1183,7 @@ mod tests {
     fn cap_reason_matches() {
         assert_eq!(
             WatchSubscriptionError::CapExceeded.to_string(),
-            WATCH_SUBSCRIPTION_CAP_REACHED
+            WATCH_CAP_REACHED
         );
     }
 }

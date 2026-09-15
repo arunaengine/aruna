@@ -21,7 +21,7 @@ use crate::sync::shard_placement::{
     decode_placement, new_placement, placement_prefix, sort_node_ids, write_placement_effect,
 };
 
-const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
+const PLACEMENT_PAGE_SIZE: usize = 256;
 
 /// Reconciles every shard topic the local node holds: rank-0 creates the genesis,
 /// other holders pull it from a co-holder. Missing topics are adopted before
@@ -234,7 +234,7 @@ pub(crate) async fn resolve_creatable_topics(
     unreachable_peers.extend(probe.unreachable.iter().copied());
     let mut to_adopt: Vec<::irokle::TopicId> = Vec::new();
     for topic in missing {
-        if probe.known_by_co_holder.contains(&topic) {
+        if probe.known_co_holder.contains(&topic) {
             to_adopt.push(topic);
         } else if may_mint && probe.unreachable.is_empty() && !probe.unconfirmed.contains(&topic) {
             to_ensure.push(topic);
@@ -486,7 +486,7 @@ async fn reconcile_placements(
                 key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
                 prefix: Some(placement_prefix(realm_id)),
                 start: start_after.take().map(IterStart::After),
-                limit: PENDING_PLACEMENT_PAGE_SIZE,
+                limit: PLACEMENT_PAGE_SIZE,
                 txn_id: None,
             })
             .await
@@ -627,9 +627,9 @@ async fn reconcile_placements(
     if retry_needed && let Some(task_handle) = context.task_handle.as_ref() {
         // Pending pulls retry quickly; withheld genesis waits before probing its co-holder again.
         let after = if held.pull_pending {
-            crate::sync::shard_placement::SHARD_TOPIC_PULL_RETRY_AFTER
+            crate::sync::shard_placement::PULL_RETRY_AFTER
         } else {
-            crate::sync::shard_placement::SYNC_PLACEMENT_RETRY_AFTER
+            crate::sync::shard_placement::PLACEMENT_RETRY_AFTER
         };
         let effect =
             crate::sync::shard_placement::schedule_retry_after(realm_id, local_node_id, after);
@@ -759,7 +759,7 @@ async fn prune_released_transitions(
                     document.storage_key(),
                 ),
                 (
-                    aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE.to_string(),
                     aruna_core::storage_entries::reducer_state_key(&target),
                 ),
             ],

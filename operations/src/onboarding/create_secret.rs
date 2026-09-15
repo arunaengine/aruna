@@ -212,7 +212,7 @@ impl Operation for CreateSecretOperation {
                 };
                 let cap = config
                     .as_ref()
-                    .and_then(|config| config.quota.max_devices_per_user);
+                    .and_then(|config| config.quota.devices_per_user);
                 let (Some(cap), Some(owner)) = (cap, self.input.record.mode.owner()) else {
                     return self.emit_write_record(txn_id);
                 };
@@ -403,7 +403,7 @@ mod tests {
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
         config.quota = QuotaConfig {
-            max_devices_per_user: cap,
+            devices_per_user: cap,
             ..QuotaConfig::default()
         };
         for (index, owner) in enrolled.iter().enumerate() {

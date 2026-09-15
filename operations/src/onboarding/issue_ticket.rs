@@ -13,8 +13,8 @@ use ed25519_dalek::SigningKey;
 use smallvec::smallvec;
 use thiserror::Error;
 
-pub const ONBOARDING_SYNC_TICKET_TTL_SECS: u64 = 300;
-const USER_SYNC_TICKET_PAGE_SIZE: usize = 512;
+pub const TICKET_TTL_SECS: u64 = 300;
+const TICKET_PAGE_SIZE: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IssueSyncInput {
@@ -101,7 +101,7 @@ impl IssueSyncOperation {
             key_space: USER_KEYSPACE.to_string(),
             prefix: Some(UserId::storage_prefix(self.input.realm_id)),
             start: self.next_start_after.take().map(IterStart::After),
-            limit: USER_SYNC_TICKET_PAGE_SIZE,
+            limit: TICKET_PAGE_SIZE,
             txn_id: None,
         })]
     }
@@ -190,7 +190,7 @@ impl Operation for IssueSyncOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{IssueSyncInput, IssueSyncOperation, ONBOARDING_SYNC_TICKET_TTL_SECS};
+    use super::{IssueSyncInput, IssueSyncOperation, TICKET_TTL_SECS};
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
@@ -217,7 +217,7 @@ mod tests {
             node_id: joiner_node_id,
             issuer_node_id,
             now: 100,
-            ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
+            ttl_secs: TICKET_TTL_SECS,
         });
 
         assert_eq!(operation.start().len(), 1);
@@ -310,7 +310,7 @@ mod tests {
                 node_id,
                 issuer_node_id,
                 now: 100,
-                ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
+                ttl_secs: TICKET_TTL_SECS,
             }),
             &context,
         )

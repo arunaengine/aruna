@@ -337,7 +337,7 @@ impl Operation for ReserveSecretOperation {
                 };
                 let Some(cap) = config
                     .as_ref()
-                    .and_then(|config| config.quota.max_devices_per_user)
+                    .and_then(|config| config.quota.devices_per_user)
                 else {
                     return self.emit_reserve_write(txn_id, record);
                 };
@@ -521,7 +521,7 @@ mod tests {
     async fn write_config(context: &DriverContext, cap: Option<u32>, devices: &[UserId]) {
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
         config.quota = QuotaConfig {
-            max_devices_per_user: cap,
+            devices_per_user: cap,
             ..QuotaConfig::default()
         };
         for (index, owner) in devices.iter().enumerate() {

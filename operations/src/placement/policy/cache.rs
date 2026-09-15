@@ -30,16 +30,16 @@ pub const MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Encoded bytes of one entry. A verified policy stays well below this through
 /// its own name, selector, and label bounds; a larger row is unusable.
-pub const MAX_CACHE_ENTRY_BYTES: usize = 256 * 1024;
+pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
 
 pub const CACHE_KEY_LEN: usize = 16 + 32;
 
 /// A single entry must always fit, or eviction could never make room for it.
-const _: () = assert!(MAX_CACHE_ENTRY_BYTES < MAX_CACHE_BYTES);
+const _: () = assert!(MAX_ENTRY_BYTES < MAX_CACHE_BYTES);
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PolicyCacheError {
-    #[error("cache entry exceeds {MAX_CACHE_ENTRY_BYTES} bytes")]
+    #[error("cache entry exceeds {MAX_ENTRY_BYTES} bytes")]
     EntryBytes,
     #[error(transparent)]
     Conversion(#[from] ConversionError),
@@ -134,14 +134,14 @@ impl PolicyCacheEntry {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, PolicyCacheError> {
         let bytes = postcard::to_allocvec(self).map_err(ConversionError::from)?;
-        if bytes.len() > MAX_CACHE_ENTRY_BYTES {
+        if bytes.len() > MAX_ENTRY_BYTES {
             return Err(PolicyCacheError::EntryBytes);
         }
         Ok(bytes)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PolicyCacheError> {
-        if bytes.len() > MAX_CACHE_ENTRY_BYTES {
+        if bytes.len() > MAX_ENTRY_BYTES {
             return Err(PolicyCacheError::EntryBytes);
         }
         Ok(postcard::from_bytes(bytes).map_err(ConversionError::from)?)
@@ -426,7 +426,7 @@ mod pure_tests {
     #[test]
     fn entry_bytes_bounded() {
         assert_eq!(
-            PolicyCacheEntry::from_bytes(&vec![0u8; MAX_CACHE_ENTRY_BYTES + 1]),
+            PolicyCacheEntry::from_bytes(&vec![0u8; MAX_ENTRY_BYTES + 1]),
             Err(PolicyCacheError::EntryBytes)
         );
     }
