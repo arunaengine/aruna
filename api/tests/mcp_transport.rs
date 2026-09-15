@@ -26,11 +26,9 @@ use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperati
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::{HeaderValue, header};
@@ -141,7 +139,7 @@ async fn setup_fixture() -> Fixture {
     .await
     .unwrap();
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: actor.clone(),
         }),
         &context,
@@ -477,7 +475,7 @@ async fn mcp_transport_contract() {
     );
 
     let mut realm = drive(
-        GetRealmConfigOperation::new(fixture.state.get_realm_id()),
+        GetConfigOperation::new(fixture.state.get_realm_id()),
         &fixture.state.get_ctx(),
     )
     .await
@@ -930,7 +928,7 @@ async fn metadata_transports_match() {
     });
 
     let mut realm = drive(
-        GetRealmConfigOperation::new(fixture.state.get_realm_id()),
+        GetConfigOperation::new(fixture.state.get_realm_id()),
         &fixture.state.get_ctx(),
     )
     .await
