@@ -3,9 +3,9 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
 use aruna_core::structs::execution::notification::{
-    NOTIFICATION_DIRECT_TTL_MS, NOTIFICATION_TRANSIENT_PER_USER_CAP, NOTIFICATION_TRANSIENT_TTL_MS,
+    DIRECT_TTL_MS, TRANSIENT_USER_CAP, TRANSIENT_TTL_MS,
     NotificationClass, NotificationRecord, notification_inbox_key, notification_prune_key,
     parse_prune_key,
 };
@@ -18,9 +18,9 @@ use tracing::warn;
 
 use crate::driver::DriverContext;
 
-pub const NOTIFICATION_PRUNE_SCAN_PAGE_SIZE: usize = 512;
-pub const NOTIFICATION_PRUNE_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
-pub const NOTIFICATION_PRUNE_RETRY_AFTER: Duration = Duration::from_secs(30);
+pub const PRUNE_PAGE_SIZE: usize = 512;
+pub const NOTIFICATION_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
+pub const NOTIFICATION_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct NotificationPruneOutcome {
@@ -54,7 +54,7 @@ pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHand
 pub async fn process_prune_batch(
     context: &DriverContext,
 ) -> Result<NotificationPruneOutcome, String> {
-    process_prune_page(context, NOTIFICATION_PRUNE_SCAN_PAGE_SIZE).await
+    process_prune_page(context, PRUNE_PAGE_SIZE).await
 }
 
 pub(crate) async fn process_prune_page(
@@ -95,7 +95,7 @@ async fn prune_expired_rows(
     'scan: loop {
         let (values, next_start_after) = iter_page(
             storage,
-            NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
+            PRUNE_INDEX_KEYSPACE,
             start_after.take(),
             page_size,
         )
@@ -109,7 +109,7 @@ async fn prune_expired_rows(
                 Err(error) => {
                     let raw = key.to_vec();
                     warn!(error = %error, key = ?raw, "Deleting malformed notification prune index row");
-                    deletes.push((NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(), key));
+                    deletes.push((PRUNE_INDEX_KEYSPACE.to_string(), key));
                     continue;
                 }
             };
@@ -121,12 +121,12 @@ async fn prune_expired_rows(
             // Saturated expiry is future, so phase A stops before unmatched candidates.
             let direct_key = notification_inbox_key(
                 recipient,
-                expires_at_ms.saturating_sub(NOTIFICATION_DIRECT_TTL_MS),
+                expires_at_ms.saturating_sub(DIRECT_TTL_MS),
                 notification_id,
             );
             let transient_key = notification_inbox_key(
                 recipient,
-                expires_at_ms.saturating_sub(NOTIFICATION_TRANSIENT_TTL_MS),
+                expires_at_ms.saturating_sub(TRANSIENT_TTL_MS),
                 notification_id,
             );
             let read = batch_read(
@@ -142,7 +142,7 @@ async fn prune_expired_rows(
             .await?;
             let direct_exists = read.first().is_some_and(|(_, value)| value.is_some());
             let transient_exists = read.get(1).is_some_and(|(_, value)| value.is_some());
-            deletes.push((NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(), key));
+            deletes.push((PRUNE_INDEX_KEYSPACE.to_string(), key));
             if direct_exists {
                 deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), direct_key));
                 expired = expired.saturating_add(1);
@@ -222,7 +222,7 @@ async fn sweep_primary_keyspace(
             if record.expires_at_ms() <= now_ms {
                 deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
                 deletes.push((
-                    NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
+                    PRUNE_INDEX_KEYSPACE.to_string(),
                     notification_prune_key(&record),
                 ));
                 expired = expired.saturating_add(1);
@@ -230,10 +230,10 @@ async fn sweep_primary_keyspace(
             }
             if record.class == NotificationClass::Transient {
                 transient_seen = transient_seen.saturating_add(1);
-                if transient_seen > NOTIFICATION_TRANSIENT_PER_USER_CAP {
+                if transient_seen > TRANSIENT_USER_CAP {
                     deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
                     deletes.push((
-                        NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
+                        PRUNE_INDEX_KEYSPACE.to_string(),
                         notification_prune_key(&record),
                     ));
                     capped = capped.saturating_add(1);
@@ -251,22 +251,22 @@ async fn sweep_primary_keyspace(
 }
 
 async fn first_prune_delay(storage: &StorageHandle) -> Result<Duration, String> {
-    let (values, _) = iter_page(storage, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE, None, 1).await?;
+    let (values, _) = iter_page(storage, PRUNE_INDEX_KEYSPACE, None, 1).await?;
     let Some((key, _)) = values.into_iter().next() else {
-        return Ok(NOTIFICATION_PRUNE_POLL_AFTER);
+        return Ok(NOTIFICATION_POLL_AFTER);
     };
     match parse_prune_key(key.as_ref()) {
         Ok((expires_at_ms, _, _)) => {
             let due_after =
                 Duration::from_millis(expires_at_ms.saturating_sub(unix_timestamp_millis()));
-            Ok(due_after.min(NOTIFICATION_PRUNE_POLL_AFTER))
+            Ok(due_after.min(NOTIFICATION_POLL_AFTER))
         }
         Err(error) => {
             let raw = key.to_vec();
             warn!(error = %error, key = ?raw, "Deleting malformed notification prune index row during restore");
             batch_delete(
                 storage,
-                vec![(NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(), key)],
+                vec![(PRUNE_INDEX_KEYSPACE.to_string(), key)],
             )
             .await?;
             Ok(Duration::ZERO)
@@ -450,7 +450,7 @@ mod tests {
     async fn index_exists(storage: &StorageHandle, record: &NotificationRecord) -> bool {
         key_exists(
             storage,
-            NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
+            PRUNE_INDEX_KEYSPACE,
             notification_prune_key(record),
         )
         .await
@@ -742,8 +742,8 @@ mod tests {
         restore_prune_timer(&storage, &task_handle).await;
 
         let after = probe_shorten_after(&task_handle, Duration::from_secs(2 * 60 * 60)).await;
-        assert!(after <= NOTIFICATION_PRUNE_POLL_AFTER);
-        assert!(NOTIFICATION_PRUNE_POLL_AFTER.saturating_sub(after) <= Duration::from_secs(5));
+        assert!(after <= NOTIFICATION_POLL_AFTER);
+        assert!(NOTIFICATION_POLL_AFTER.saturating_sub(after) <= Duration::from_secs(5));
     }
 
     #[tokio::test]
@@ -756,8 +756,8 @@ mod tests {
         let task_handle = TaskHandle::new();
         restore_prune_timer(&storage, &task_handle).await;
         let after = probe_shorten_after(&task_handle, Duration::from_secs(2 * 60 * 60)).await;
-        assert!(after <= NOTIFICATION_PRUNE_POLL_AFTER);
-        assert!(NOTIFICATION_PRUNE_POLL_AFTER.saturating_sub(after) <= Duration::from_secs(5));
+        assert!(after <= NOTIFICATION_POLL_AFTER);
+        assert!(NOTIFICATION_POLL_AFTER.saturating_sub(after) <= Duration::from_secs(5));
 
         let task_handle = TaskHandle::new();
         let Event::Task(TaskEvent::TimerScheduled { .. }) = task_handle

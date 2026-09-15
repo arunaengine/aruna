@@ -24,11 +24,11 @@ use crate::notifications::client::{
 };
 use crate::notifications::dispatch::{list_on_holder, mark_on_holder, unread_on_holder};
 use crate::notifications::inbox::upsert_with_report;
-use crate::notifications::mark_read::MARK_READ_MAX_IDS;
-use crate::notifications::outbox::NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE;
+use crate::notifications::mark_read::MARK_MAX_IDS;
+use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::{
-    NOTIFICATION_WATCH_EVENT_BATCH_SIZE, NotificationTransportMessage, notification_message_kind,
+    EVENT_BATCH_SIZE, NotificationTransportMessage, notification_message_kind,
 };
 use crate::notifications::watch::authorization::{
     WatchAuthorization, authorize_forwarded_watch, list_authorized_subscriptions,
@@ -40,7 +40,7 @@ use crate::notifications::watch::subscriptions::{
     delete_holder_watch,
 };
 
-const NOTIFICATION_MAX_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
+const MAX_FUTURE_SKEW: u64 = 5 * 60 * 1000;
 const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tracing::instrument(
@@ -147,9 +147,9 @@ async fn build_response(
             ids,
             up_to_ms,
         } => {
-            if ids.len() > MARK_READ_MAX_IDS {
+            if ids.len() > MARK_MAX_IDS {
                 return NotificationTransportMessage::Reject(format!(
-                    "mark read id count {} exceeds cap {MARK_READ_MAX_IDS}",
+                    "mark read id count {} exceeds cap {MARK_MAX_IDS}",
                     ids.len()
                 ));
             }
@@ -287,11 +287,11 @@ async fn build_response(
 }
 
 fn validate_inbound_batch(records: &[NotificationRecord], now_ms: u64) -> Result<(), String> {
-    if records.len() > NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE {
+    if records.len() > OUTBOX_BATCH_SIZE {
         return Err(format!(
             "notification batch count {} exceeds cap {}",
             records.len(),
-            NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE
+            OUTBOX_BATCH_SIZE
         ));
     }
     for record in records {
@@ -305,11 +305,11 @@ fn validate_watch_events(
     realm_id: RealmId,
     now_ms: u64,
 ) -> Result<(), String> {
-    if events.len() > NOTIFICATION_WATCH_EVENT_BATCH_SIZE {
+    if events.len() > EVENT_BATCH_SIZE {
         return Err(format!(
             "watch event batch count {} exceeds cap {}",
             events.len(),
-            NOTIFICATION_WATCH_EVENT_BATCH_SIZE
+            EVENT_BATCH_SIZE
         ));
     }
     for event in events {
@@ -325,7 +325,7 @@ fn validate_watch_event(event: &WatchEvent, realm_id: RealmId, now_ms: u64) -> R
     if event.event_id.is_nil() {
         return Err("watch event has empty event_id".to_string());
     }
-    if event.occurred_at_ms > now_ms.saturating_add(NOTIFICATION_MAX_FUTURE_SKEW_MS) {
+    if event.occurred_at_ms > now_ms.saturating_add(MAX_FUTURE_SKEW) {
         return Err(format!(
             "watch event occurred_at_ms {} is too far in the future",
             event.occurred_at_ms
@@ -436,7 +436,7 @@ fn validate_inbound_record(record: &NotificationRecord, now_ms: u64) -> Result<(
     if record.read_at_ms.is_some() {
         return Err("delivered notification records must be unread".to_string());
     }
-    if record.created_at_ms > now_ms.saturating_add(NOTIFICATION_MAX_FUTURE_SKEW_MS) {
+    if record.created_at_ms > now_ms.saturating_add(MAX_FUTURE_SKEW) {
         return Err(format!(
             "notification created_at_ms {} is too far in the future",
             record.created_at_ms
@@ -678,11 +678,11 @@ fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, Stri
             let Some(first) = events.first() else {
                 return Err("empty batch".to_string());
             };
-            if events.len() > NOTIFICATION_WATCH_EVENT_BATCH_SIZE {
+            if events.len() > EVENT_BATCH_SIZE {
                 return Err(format!(
                     "watch event batch count {} exceeds cap {}",
                     events.len(),
-                    NOTIFICATION_WATCH_EVENT_BATCH_SIZE
+                    EVENT_BATCH_SIZE
                 ));
             }
             let realm_id = first.realm_id;

@@ -12,7 +12,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-pub const LIST_NOTIFICATIONS_MAX_LIMIT: usize = 200;
+pub const LIST_MAX_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListNotificationsInput {
@@ -62,7 +62,7 @@ pub enum ListNotificationsError {
 
 impl ListNotificationsOperation {
     pub fn new(mut input: ListNotificationsInput) -> Self {
-        input.limit = input.limit.clamp(1, LIST_NOTIFICATIONS_MAX_LIMIT);
+        input.limit = input.limit.clamp(1, LIST_MAX_LIMIT);
         Self {
             input,
             state: ListNotificationsState::Init,

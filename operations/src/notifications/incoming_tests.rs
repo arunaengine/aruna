@@ -11,7 +11,7 @@ use crate::sync::incoming::initialize_incoming_fixture;
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE,
+    WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
@@ -474,7 +474,7 @@ async fn future_batch_rejected() {
     let valid = record(recipient, 1);
     let mut future = record(recipient, 2);
     future.created_at_ms = unix_timestamp_millis()
-        .saturating_add(NOTIFICATION_MAX_FUTURE_SKEW_MS)
+        .saturating_add(MAX_FUTURE_SKEW)
         .saturating_add(60_000);
 
     let error = deliver_remote(&a.net, b.net.node_id(), vec![valid, future])
@@ -537,7 +537,7 @@ async fn watch_batch_rejected() {
 #[tokio::test]
 async fn direct_cap_rejected() {
     let (a, b, recipient) = delivery_pair(74).await;
-    let records: Vec<_> = (0..=NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE)
+    let records: Vec<_> = (0..=OUTBOX_BATCH_SIZE)
         .map(|index| record(recipient, (index % 255 + 1) as u8))
         .collect();
 
@@ -575,7 +575,7 @@ fn join_payload_validates() {
 fn transient_batch_cap() {
     let realm_id = RealmId::from_bytes([75u8; 32]);
     let recipient = UserId::new(Ulid::generate(), realm_id);
-    let mut records: Vec<_> = (0..=NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE)
+    let mut records: Vec<_> = (0..=OUTBOX_BATCH_SIZE)
         .map(|index| {
             let mut record = record(recipient, (index % 255 + 1) as u8);
             record.class = NotificationClass::Transient;
@@ -586,7 +586,7 @@ fn transient_batch_cap() {
     let error = validate_inbound_batch(&records, unix_timestamp_millis())
         .expect_err("transient-only batch must use the total cap");
     assert!(error.contains("notification batch count"));
-    records.truncate(NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE);
+    records.truncate(OUTBOX_BATCH_SIZE);
     assert!(validate_inbound_batch(&records, unix_timestamp_millis()).is_ok());
 }
 
@@ -956,7 +956,7 @@ async fn unread_mark_roundtrip() {
 #[tokio::test]
 async fn mark_limit_rejected() {
     let (a, b, recipient) = delivery_pair(75).await;
-    let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::generate()).collect();
+    let ids = (0..=MARK_MAX_IDS).map(|_| Ulid::generate()).collect();
 
     let error = mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
         .await
@@ -1071,7 +1071,7 @@ async fn oversized_message_refused() {
         .expect("encodes")
         .len();
     let count =
-        crate::notifications::protocol::NOTIFICATION_MAX_MESSAGE_SIZE / per_record.max(1) + 1_000;
+        crate::notifications::protocol::MAX_NOTIFICATION_SIZE / per_record.max(1) + 1_000;
     let records = vec![sample; count];
 
     let error = deliver_remote(&a.net, b.net.node_id(), records)
@@ -1492,7 +1492,7 @@ fn watch_batch_caps() {
     let actor = UserId::new(Ulid::generate(), realm_id);
     let events = vec![
         upload_event(realm_id, actor, "bucket/object");
-        NOTIFICATION_WATCH_EVENT_BATCH_SIZE + 1
+        EVENT_BATCH_SIZE + 1
     ];
 
     assert!(
@@ -1649,7 +1649,7 @@ async fn stale_subscription_skipped() {
         .context
         .storage_handle
         .send_storage_effect(StorageEffect::Delete {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             key: dirty_key.clone().into(),
             txn_id: None,
         })
@@ -1686,7 +1686,7 @@ async fn stale_subscription_skipped() {
         .context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             key: dirty_key.into(),
             txn_id: None,
         })

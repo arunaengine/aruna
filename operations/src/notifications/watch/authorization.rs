@@ -291,7 +291,7 @@ async fn evaluate_permission_path(
             error @ (AuthorizationError::InvalidRealmId
             | AuthorizationError::InvalidGroupId
             | AuthorizationError::GroupNotFound
-            | AuthorizationError::AuthDocNotFound),
+            | AuthorizationError::DocNotFound),
         ) => return Ok(WatchAuthorization::Unavailable(error.to_string())),
         Err(error) => return Err(error.to_string()),
     };

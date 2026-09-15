@@ -6,7 +6,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    S3_BUCKET_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
+    S3_BUCKET_KEYSPACE, NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
@@ -14,9 +14,9 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::usage::{
-    NODE_USAGE_DIRTY_GLOBAL_KEY, NODE_USAGE_DIRTY_PREFIX, NODE_USAGE_GLOBAL_PREFIX,
-    NODE_USAGE_GROUP_PREFIX, NODE_USAGE_SUMMARY_GLOBAL_KEY, NODE_USAGE_SUMMARY_GROUP_PREFIX,
-    NodeUsageSnapshot, USAGE_GLOBAL_KEY, USAGE_GLOBAL_SHARD_COUNT, UsageCounterError,
+    DIRTY_GLOBAL_KEY, DIRTY_PREFIX, USAGE_GLOBAL_PREFIX,
+    USAGE_GROUP_PREFIX, SUMMARY_GLOBAL_KEY, SUMMARY_GROUP_PREFIX,
+    NodeUsageSnapshot, USAGE_GLOBAL_KEY, GLOBAL_SHARD_COUNT, UsageCounterError,
     UsageCounters, UsageDelta, dirty_group_id, dirty_group_key, global_group_key,
     global_shard_index, global_shard_key, global_shard_keys, shard_for_hash, usage_backend_key,
     usage_global_key, usage_group_id, usage_group_key, usage_group_prefix, usage_hash_key,
@@ -179,13 +179,13 @@ impl UsageCounterUpdate {
     fn dirty_marker_writes(&self) -> Vec<(String, Key, Value)> {
         let generation = ByteView::from(ulid::Ulid::generate().to_bytes().to_vec());
         let mut writes = vec![(
-            USAGE_NODE_STATS_KEYSPACE.to_string(),
-            ByteView::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
+            NODE_STATS_KEYSPACE.to_string(),
+            ByteView::from(DIRTY_GLOBAL_KEY.to_vec()),
             generation.clone(),
         )];
         if let Some(group_id) = self.dirty_group {
             writes.push((
-                USAGE_NODE_STATS_KEYSPACE.to_string(),
+                NODE_STATS_KEYSPACE.to_string(),
                 ByteView::from(dirty_group_key(group_id)),
                 generation,
             ));
@@ -354,7 +354,7 @@ impl QuotaGate {
 
     fn scan_effect(&self, start_after: Option<Key>, txn_id: TxnId) -> Effects {
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
             prefix: Some(self.remote_prefix.clone().into()),
             start: start_after.map(IterStart::After),
             limit: Self::SCAN_LIMIT,
@@ -664,7 +664,7 @@ impl RebuildStatsOperation {
             blob_sizes: HashMap::new(),
             current_versions: HashMap::new(),
             global: UsageCounters::default(),
-            global_shards: vec![UsageCounters::default(); USAGE_GLOBAL_SHARD_COUNT],
+            global_shards: vec![UsageCounters::default(); GLOBAL_SHARD_COUNT],
             backend_shards: HashMap::new(),
             groups: HashMap::new(),
             existing_counter_keys: Vec::new(),
@@ -893,8 +893,8 @@ impl RebuildStatsOperation {
         };
         self.txn_id = Some(txn_id);
 
-        let mut writes = Vec::with_capacity(USAGE_GLOBAL_SHARD_COUNT + self.groups.len());
-        let mut write_keys = HashSet::with_capacity(USAGE_GLOBAL_SHARD_COUNT + self.groups.len());
+        let mut writes = Vec::with_capacity(GLOBAL_SHARD_COUNT + self.groups.len());
+        let mut write_keys = HashSet::with_capacity(GLOBAL_SHARD_COUNT + self.groups.len());
         for (shard, counters) in self.global_shards.iter().enumerate() {
             let key = global_shard_key(shard);
             let bytes = match counters.to_bytes() {
@@ -1051,13 +1051,13 @@ impl Operation for RebuildStatsOperation {
 /// Debounce window for the coalesced node-usage snapshot publisher. `ShortenTimer`
 /// fires this long after a burst's first dirty write, so bursts collapse into one
 /// publish run with bounded latency.
-pub const USAGE_SNAPSHOT_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
+pub const SNAPSHOT_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Schedules (or shortens toward) the debounced snapshot publish task.
 pub fn schedule_snapshot_publish() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
         key: TaskKey::PublishUsageSnapshots,
-        after: USAGE_SNAPSHOT_PUBLISH_DEBOUNCE,
+        after: SNAPSHOT_PUBLISH_DEBOUNCE,
     })
 }
 
@@ -1160,7 +1160,7 @@ async fn sum_remote_snapshots(
     local_node_id: NodeId,
     active_node_ids: Option<&HashSet<NodeId>>,
 ) -> Result<UsageCounters, String> {
-    let entries = scan_all(storage, USAGE_NODE_STATS_KEYSPACE, Some(Key::from(prefix))).await?;
+    let entries = scan_all(storage, NODE_STATS_KEYSPACE, Some(Key::from(prefix))).await?;
     let mut total = UsageCounters::default();
     for (key, value) in entries {
         let key_node_id = usage_node_id(key.as_ref());
@@ -1207,15 +1207,15 @@ async fn publish_retaining_markers(
 
     let observed_markers = scan_all(
         storage,
-        USAGE_NODE_STATS_KEYSPACE,
-        Some(Key::from(NODE_USAGE_DIRTY_PREFIX.to_vec())),
+        NODE_STATS_KEYSPACE,
+        Some(Key::from(DIRTY_PREFIX.to_vec())),
     )
     .await?;
 
     let mut groups: BTreeSet<GroupId> = BTreeSet::new();
     let mut global = false;
     for (key, _) in &observed_markers {
-        if key.as_ref() == NODE_USAGE_DIRTY_GLOBAL_KEY {
+        if key.as_ref() == DIRTY_GLOBAL_KEY {
             global = true;
         } else if let Some(group_id) = dirty_group_id(key.as_ref()) {
             groups.insert(group_id);
@@ -1240,8 +1240,8 @@ async fn publish_retaining_markers(
         // Republish snapshots missing a live counter as zero so peers stop summing stale data.
         for (key, _) in scan_all(
             storage,
-            USAGE_NODE_STATS_KEYSPACE,
-            Some(Key::from(NODE_USAGE_GROUP_PREFIX.to_vec())),
+            NODE_STATS_KEYSPACE,
+            Some(Key::from(USAGE_GROUP_PREFIX.to_vec())),
         )
         .await?
         {
@@ -1262,7 +1262,7 @@ async fn publish_retaining_markers(
         let counters = read_local_global(storage).await?;
         let snapshot = NodeUsageSnapshot { node_id, counters };
         writes.push((
-            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            NODE_STATS_KEYSPACE.to_string(),
             Key::from(usage_global_key(node_id)),
             Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
         ));
@@ -1272,7 +1272,7 @@ async fn publish_retaining_markers(
         let counters = read_local_group(storage, *group_id).await?;
         let snapshot = NodeUsageSnapshot { node_id, counters };
         writes.push((
-            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            NODE_STATS_KEYSPACE.to_string(),
             Key::from(usage_snapshot_key(*group_id, node_id)),
             Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
         ));
@@ -1377,10 +1377,10 @@ async fn write_retry_markers(
     let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
     let mut writes: Vec<(String, Key, Value)> =
         Vec::with_capacity(published.groups.len() + usize::from(published.global));
-    if published.global && !observed_keys.contains(NODE_USAGE_DIRTY_GLOBAL_KEY) {
+    if published.global && !observed_keys.contains(DIRTY_GLOBAL_KEY) {
         writes.push((
-            USAGE_NODE_STATS_KEYSPACE.to_string(),
-            Key::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
+            NODE_STATS_KEYSPACE.to_string(),
+            Key::from(DIRTY_GLOBAL_KEY.to_vec()),
             generation.clone(),
         ));
     }
@@ -1390,7 +1390,7 @@ async fn write_retry_markers(
             continue;
         }
         writes.push((
-            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            NODE_STATS_KEYSPACE.to_string(),
             Key::from(marker_key),
             generation.clone(),
         ));
@@ -1454,7 +1454,7 @@ async fn clear_consumed_markers(
 
     let reads = observed
         .iter()
-        .map(|(key, _)| (USAGE_NODE_STATS_KEYSPACE.to_string(), key.clone()))
+        .map(|(key, _)| (NODE_STATS_KEYSPACE.to_string(), key.clone()))
         .collect();
     let current = match storage
         .send_storage_effect(StorageEffect::BatchRead {
@@ -1475,7 +1475,7 @@ async fn clear_consumed_markers(
     let mut deletes: Vec<(String, Key)> = Vec::with_capacity(observed.len());
     for ((key, observed_generation), (_, current_value)) in observed.iter().zip(current) {
         if current_value.as_ref() == Some(observed_generation) {
-            deletes.push((USAGE_NODE_STATS_KEYSPACE.to_string(), key.clone()));
+            deletes.push((NODE_STATS_KEYSPACE.to_string(), key.clone()));
         }
     }
 
@@ -1552,17 +1552,17 @@ async fn active_usage_nodes(ctx: &DriverContext) -> Result<Option<HashSet<NodeId
 
 async fn clear_usage_cache(ctx: &DriverContext) -> Result<(), String> {
     let mut deletes = vec![(
-        USAGE_NODE_STATS_KEYSPACE.to_string(),
-        Key::from(NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec()),
+        NODE_STATS_KEYSPACE.to_string(),
+        Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
     )];
     for (key, _) in scan_all(
         &ctx.storage_handle,
-        USAGE_NODE_STATS_KEYSPACE,
-        Some(Key::from(NODE_USAGE_SUMMARY_GROUP_PREFIX.to_vec())),
+        NODE_STATS_KEYSPACE,
+        Some(Key::from(SUMMARY_GROUP_PREFIX.to_vec())),
     )
     .await?
     {
-        deletes.push((USAGE_NODE_STATS_KEYSPACE.to_string(), key));
+        deletes.push((NODE_STATS_KEYSPACE.to_string(), key));
     }
     match ctx
         .storage_handle
@@ -1593,8 +1593,8 @@ pub async fn recompute_usage_summary(
     if include_global {
         let total = realm_global_usage(storage, local_node_id, active_node_ids.as_ref()).await?;
         writes.push((
-            USAGE_NODE_STATS_KEYSPACE.to_string(),
-            Key::from(NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec()),
+            NODE_STATS_KEYSPACE.to_string(),
+            Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
             Value::from(total.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
@@ -1602,7 +1602,7 @@ pub async fn recompute_usage_summary(
         let total =
             realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await?;
         writes.push((
-            USAGE_NODE_STATS_KEYSPACE.to_string(),
+            NODE_STATS_KEYSPACE.to_string(),
             Key::from(usage_summary_key(group_id)),
             Value::from(total.to_bytes().map_err(|e| e.to_string())?),
         ));
@@ -1675,7 +1675,7 @@ async fn realm_global_usage(
     let mut total = read_local_global(storage).await?;
     let remote = sum_remote_snapshots(
         storage,
-        NODE_USAGE_GLOBAL_PREFIX.to_vec(),
+        USAGE_GLOBAL_PREFIX.to_vec(),
         local_node_id,
         active_node_ids,
     )
@@ -1711,12 +1711,12 @@ pub async fn load_realm_usage(
 ) -> Result<UsageCounters, String> {
     let storage = &ctx.storage_handle;
     let cache_key = match scope {
-        RealmUsageScope::Global => Key::from(NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec()),
+        RealmUsageScope::Global => Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
         RealmUsageScope::Group(group_id) => Key::from(usage_summary_key(group_id)),
     };
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
             key: cache_key,
             txn_id: None,
         })
@@ -1744,8 +1744,8 @@ pub async fn load_realm_usage(
 pub async fn restore_usage_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let has_markers = match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
-            prefix: Some(Key::from(NODE_USAGE_DIRTY_PREFIX.to_vec())),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
+            prefix: Some(Key::from(DIRTY_PREFIX.to_vec())),
             start: None,
             limit: 1,
             txn_id: None,
@@ -2414,7 +2414,7 @@ mod tests {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key_space: NODE_STATS_KEYSPACE.to_string(),
                 key: key.into(),
                 txn_id: None,
             })
@@ -2429,7 +2429,7 @@ mod tests {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+                key_space: NODE_STATS_KEYSPACE.to_string(),
                 key: key.into(),
                 value: value.into(),
                 txn_id: None,
@@ -2466,7 +2466,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_some()
         );
@@ -2492,7 +2492,7 @@ mod tests {
         };
         write_counters(&ctx, global_group_key(group_id), counters).await;
         write_counters(&ctx, usage_group_key(group_id), counters).await;
-        write_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec(), Vec::new()).await;
+        write_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec(), Vec::new()).await;
         write_node_stat(&ctx, dirty_group_key(group_id), Vec::new()).await;
 
         let published = publish_usage_snapshots(&ctx, node_id, realm_id, false)
@@ -2503,7 +2503,7 @@ mod tests {
 
         // Markers were consumed.
         assert!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_none()
         );
@@ -2652,7 +2652,7 @@ mod tests {
             },
         };
         write_node_stat(&ctx, snapshot_key.clone(), snapshot.to_bytes().unwrap()).await;
-        write_node_stat(&ctx, NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec(), Vec::new()).await;
+        write_node_stat(&ctx, SUMMARY_GLOBAL_KEY.to_vec(), Vec::new()).await;
 
         drive(RebuildStatsOperation::new(), &ctx).await.unwrap();
 
@@ -2661,7 +2661,7 @@ mod tests {
             Some(snapshot.to_bytes().unwrap())
         );
         assert!(
-            read_node_stat(&ctx, NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, SUMMARY_GLOBAL_KEY.to_vec())
                 .await
                 .is_some()
         );
@@ -2675,12 +2675,12 @@ mod tests {
 
         write_node_stat(
             &ctx,
-            NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec(),
+            DIRTY_GLOBAL_KEY.to_vec(),
             generation_one.clone(),
         )
         .await;
         let observed = vec![(
-            Key::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
+            Key::from(DIRTY_GLOBAL_KEY.to_vec()),
             Value::from(generation_one),
         )];
 
@@ -2689,7 +2689,7 @@ mod tests {
         let generation_two = Ulid::generate().to_bytes().to_vec();
         write_node_stat(
             &ctx,
-            NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec(),
+            DIRTY_GLOBAL_KEY.to_vec(),
             generation_two.clone(),
         )
         .await;
@@ -2701,20 +2701,20 @@ mod tests {
         // The re-dirtied marker survives, keeping the retry signal for the racing
         // write's counter change.
         assert_eq!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()).await,
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec()).await,
             Some(generation_two.clone())
         );
 
         // Observing the current generation lets the marker be consumed.
         let observed = vec![(
-            Key::from(NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()),
+            Key::from(DIRTY_GLOBAL_KEY.to_vec()),
             Value::from(generation_two),
         )];
         clear_consumed_markers(&ctx.storage_handle, observed)
             .await
             .unwrap();
         assert!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_none()
         );
@@ -2737,7 +2737,7 @@ mod tests {
         write_counters(&ctx, usage_group_key(group_id), counters).await;
         write_node_stat(
             &ctx,
-            NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec(),
+            DIRTY_GLOBAL_KEY.to_vec(),
             generation.clone(),
         )
         .await;
@@ -2767,7 +2767,7 @@ mod tests {
 
         // Markers survive so the debounced publisher retries the run.
         assert!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_some()
         );
@@ -2793,7 +2793,7 @@ mod tests {
         write_counters(&ctx, global_group_key(group_id), counters).await;
         write_counters(&ctx, usage_group_key(group_id), counters).await;
         assert!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_none()
         );
@@ -2835,7 +2835,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_some()
         );
@@ -2864,7 +2864,7 @@ mod tests {
         write_counters(&ctx, usage_group_key(group_id), counters).await;
         write_node_stat(
             &ctx,
-            NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec(),
+            DIRTY_GLOBAL_KEY.to_vec(),
             generation.clone(),
         )
         .await;
@@ -2885,7 +2885,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec()).await,
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec()).await,
             Some(generation.clone())
         );
         assert_eq!(
@@ -2913,7 +2913,7 @@ mod tests {
         write_node_stat(&ctx, usage_global_key(remote), b"corrupt".to_vec()).await;
 
         assert!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_none()
         );
@@ -2942,7 +2942,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            read_node_stat(&ctx, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_some()
         );
@@ -3074,7 +3074,7 @@ mod tests {
 
         // The summed cache was materialized for both touched scopes.
         assert_eq!(
-            read_node_stat(&ctx, NODE_USAGE_SUMMARY_GLOBAL_KEY.to_vec())
+            read_node_stat(&ctx, SUMMARY_GLOBAL_KEY.to_vec())
                 .await
                 .map(|bytes| UsageCounters::from_bytes(&bytes).unwrap().logical_bytes),
             Some(15)

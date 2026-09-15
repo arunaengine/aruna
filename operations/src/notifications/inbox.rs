@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::storage_entries::inbox_write_entries;
 use aruna_core::structs::execution::notification::{
-    NOTIFICATION_TRANSIENT_PER_USER_CAP, NotificationClass, NotificationRecord,
+    TRANSIENT_USER_CAP, NotificationClass, NotificationRecord,
     notification_inbox_key, notification_inbox_prefix,
 };
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
@@ -165,9 +165,9 @@ pub(crate) async fn upsert_transactionally(
 
     for (recipient, added) in transient_counts {
         let existing = count_transient(storage, recipient, txn_id).await?;
-        if existing.saturating_add(added) > NOTIFICATION_TRANSIENT_PER_USER_CAP {
+        if existing.saturating_add(added) > TRANSIENT_USER_CAP {
             return Err(UpsertFailure::Fatal(format!(
-                "notification transient count for recipient {recipient} exceeds cap {NOTIFICATION_TRANSIENT_PER_USER_CAP}"
+                "notification transient count for recipient {recipient} exceeds cap {TRANSIENT_USER_CAP}"
             )));
         }
     }
@@ -210,7 +210,7 @@ async fn count_transient(
                 key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start_after.take().map(IterStart::After),
-                limit: NOTIFICATION_TRANSIENT_PER_USER_CAP.saturating_add(1),
+                limit: TRANSIENT_USER_CAP.saturating_add(1),
                 txn_id: Some(txn_id),
             })
             .await;
@@ -232,7 +232,7 @@ async fn count_transient(
                 .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
             if record.class == NotificationClass::Transient {
                 count = count.saturating_add(1);
-                if count >= NOTIFICATION_TRANSIENT_PER_USER_CAP {
+                if count >= TRANSIENT_USER_CAP {
                     return Ok(count);
                 }
             }
@@ -264,7 +264,7 @@ mod tests {
     use super::*;
     use crate::tests::notifications::{record, temp_storage, user};
     use aruna_core::keyspaces::{
-        NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
+        NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
     };
     use aruna_core::storage_entries::inbox_update_entry;
     use aruna_core::structs::execution::notification::NotificationClass;
@@ -329,7 +329,7 @@ mod tests {
             record
         );
         assert_eq!(
-            count_keyspace(&storage, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE).await,
+            count_keyspace(&storage, PRUNE_INDEX_KEYSPACE).await,
             1
         );
     }
@@ -428,24 +428,24 @@ mod tests {
     #[tokio::test]
     async fn transient_cap_exact() {
         let (_dir, storage) = temp_storage();
-        let records: Vec<_> = (0..NOTIFICATION_TRANSIENT_PER_USER_CAP)
+        let records: Vec<_> = (0..TRANSIENT_USER_CAP)
             .map(|_| transient_record())
             .collect();
 
         assert_eq!(
             upsert_inbox_records(&storage, &records).await,
-            Ok(NOTIFICATION_TRANSIENT_PER_USER_CAP)
+            Ok(TRANSIENT_USER_CAP)
         );
         assert_eq!(
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
-            NOTIFICATION_TRANSIENT_PER_USER_CAP
+            TRANSIENT_USER_CAP
         );
     }
 
     #[tokio::test]
     async fn transient_cap_rejects() {
         let (_dir, storage) = temp_storage();
-        let records: Vec<_> = (0..NOTIFICATION_TRANSIENT_PER_USER_CAP)
+        let records: Vec<_> = (0..TRANSIENT_USER_CAP)
             .map(|_| transient_record())
             .collect();
         upsert_inbox_records(&storage, &records)
@@ -458,14 +458,14 @@ mod tests {
         assert!(error.contains("exceeds cap"));
         assert_eq!(
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
-            NOTIFICATION_TRANSIENT_PER_USER_CAP
+            TRANSIENT_USER_CAP
         );
     }
 
     #[tokio::test]
     async fn concurrent_cap_holds() {
         let (_dir, storage) = temp_storage();
-        let records: Vec<_> = (0..NOTIFICATION_TRANSIENT_PER_USER_CAP - 1)
+        let records: Vec<_> = (0..TRANSIENT_USER_CAP - 1)
             .map(|_| transient_record())
             .collect();
         upsert_inbox_records(&storage, &records)
@@ -481,7 +481,7 @@ mod tests {
         assert!(first.is_ok() ^ second.is_ok());
         assert_eq!(
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
-            NOTIFICATION_TRANSIENT_PER_USER_CAP
+            TRANSIENT_USER_CAP
         );
     }
 }

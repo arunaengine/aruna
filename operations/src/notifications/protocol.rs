@@ -1,6 +1,6 @@
 use aruna_core::UserId;
 pub use aruna_core::structs::execution::notification_watch::{
-    NOTIFICATION_WATCH_INTEREST_BYTES_CAP, NOTIFICATION_WATCH_INTEREST_ENTRY_CAP,
+    INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP,
 };
 use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::notification_watch::{
@@ -11,15 +11,15 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ulid::Ulid;
 
-pub const NOTIFICATION_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
-pub const NOTIFICATION_WATCH_EVENT_BATCH_SIZE: usize = 128;
-pub const NOTIFICATION_WATCH_SUBSCRIPTION_SCAN_CAP: usize = 1024;
-pub const NOTIFICATION_WATCH_DIRTY_REALM_CAP: usize = 4;
-pub const NOTIFICATION_WATCH_RETRY_BATCH_CAP: usize = 4;
-pub const NOTIFICATION_WATCH_RETRY_BYTES_CAP: usize = 1024 * 1024;
-pub const NOTIFICATION_WATCH_EXPANSION_WORK_CAP: usize = 4096;
-pub const NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP: usize = 1024;
-pub const NOTIFICATION_WATCH_EXPANSION_RECORD_CAP: usize = 1024;
+pub const MAX_NOTIFICATION_SIZE: usize = 4 * 1024 * 1024;
+pub const EVENT_BATCH_SIZE: usize = 128;
+pub const SUBSCRIPTION_SCAN_CAP: usize = 1024;
+pub const DIRTY_REALM_CAP: usize = 4;
+pub const RETRY_BATCH_CAP: usize = 4;
+pub const RETRY_BYTES_CAP: usize = 1024 * 1024;
+pub const EXPANSION_WORK_CAP: usize = 4096;
+pub const EXPANSION_CANDIDATE_CAP: usize = 1024;
+pub const EXPANSION_RECORD_CAP: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NotificationTransportMessage {
@@ -109,7 +109,7 @@ pub async fn write_notification_message(
     message: &NotificationTransportMessage,
 ) -> Result<(), String> {
     let bytes = postcard::to_allocvec(message).map_err(|err| err.to_string())?;
-    if bytes.len() > NOTIFICATION_MAX_MESSAGE_SIZE {
+    if bytes.len() > MAX_NOTIFICATION_SIZE {
         return Err("notification message exceeds maximum size".to_string());
     }
 
@@ -137,7 +137,7 @@ pub async fn read_notification_message(
         .await
         .map_err(|err| err.to_string())?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > NOTIFICATION_MAX_MESSAGE_SIZE {
+    if len > MAX_NOTIFICATION_SIZE {
         return Err("notification frame exceeds maximum size".to_string());
     }
 

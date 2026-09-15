@@ -14,8 +14,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-pub const MARK_READ_SCAN_PAGE_SIZE: usize = 512;
-pub const MARK_READ_MAX_IDS: usize = 512;
+pub const MARK_PAGE_SIZE: usize = 512;
+pub const MARK_MAX_IDS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkReadInput {
@@ -70,7 +70,7 @@ pub enum MarkReadError {
 
 impl MarkReadOperation {
     pub fn new(mut input: MarkReadInput) -> Self {
-        let too_many_ids = input.ids.len() > MARK_READ_MAX_IDS;
+        let too_many_ids = input.ids.len() > MARK_MAX_IDS;
         if !too_many_ids {
             input.ids.sort_unstable();
             input.ids.dedup();
@@ -113,7 +113,7 @@ impl MarkReadOperation {
             key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
             prefix: Some(notification_inbox_prefix(self.input.recipient)),
             start,
-            limit: MARK_READ_SCAN_PAGE_SIZE,
+            limit: MARK_PAGE_SIZE,
             txn_id: None,
         })
     }
@@ -227,7 +227,7 @@ impl Operation for MarkReadOperation {
     fn start(&mut self) -> Effects {
         if self.too_many_ids {
             return self.fail(MarkReadError::TooManyIds {
-                max: MARK_READ_MAX_IDS,
+                max: MARK_MAX_IDS,
             });
         }
         if self.input.ids.is_empty() && self.input.up_to_ms.is_none() {
@@ -278,7 +278,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::tests::notifications::{context_with_storage, seed, user};
-    use aruna_core::keyspaces::NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE;
+    use aruna_core::keyspaces::PRUNE_INDEX_KEYSPACE;
     use aruna_core::structs::execution::notification::{NotificationClass, notification_inbox_key};
     use aruna_storage::storage::StorageHandle;
 
@@ -308,7 +308,7 @@ mod tests {
     async fn read_prune_index(storage: &StorageHandle) -> Vec<(Vec<u8>, Vec<u8>)> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
+                key_space: PRUNE_INDEX_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 4096,
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn rejects_id_limit() {
         let recipient = user(1, 1);
-        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::generate()).collect();
+        let ids = (0..=MARK_MAX_IDS).map(|_| Ulid::generate()).collect();
         let mut operation = MarkReadOperation::new(MarkReadInput {
             recipient,
             ids,
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(
             operation.finalize(),
             Err(MarkReadError::TooManyIds {
-                max: MARK_READ_MAX_IDS
+                max: MARK_MAX_IDS
             })
         );
     }

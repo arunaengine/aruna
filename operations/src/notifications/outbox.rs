@@ -13,9 +13,9 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-pub const NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE: usize = 512;
-pub const NOTIFICATION_DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
-pub const NOTIFICATION_OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
+pub const OUTBOX_BATCH_SIZE: usize = 512;
+pub const DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
+pub const OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
 
 pub fn new_outbox_record(record: NotificationRecord) -> NotificationOutboxRecord {
     NotificationOutboxRecord {
@@ -372,7 +372,7 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let batch = read_outbox_batch(&storage, None, NOTIFICATION_OUTBOX_DRAIN_BATCH_SIZE, None)
+        let batch = read_outbox_batch(&storage, None, OUTBOX_BATCH_SIZE, None)
             .await
             .expect("outbox read succeeds");
         assert_eq!(batch.records.len(), 1);

@@ -10,7 +10,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 pub const UNREAD_COUNT_CAP: usize = 100;
-pub const UNREAD_SCAN_MAX_ROWS: usize = 2_000;
+pub const SCAN_MAX_ROWS: usize = 2_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnreadCountInput {
@@ -132,7 +132,7 @@ impl UnreadCountOperation {
             }
         }
 
-        if self.examined >= UNREAD_SCAN_MAX_ROWS && next_start_after.is_some() {
+        if self.examined >= SCAN_MAX_ROWS && next_start_after.is_some() {
             return self.finish(true);
         }
         match next_start_after {
@@ -316,7 +316,7 @@ mod tests {
     async fn scan_work_bounded() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
-        let total = UNREAD_SCAN_MAX_ROWS + 100;
+        let total = SCAN_MAX_ROWS + 100;
         let records: Vec<_> = (0..total)
             .map(|ts| record(recipient, ts as u64, ts + 5 < total))
             .collect();
@@ -353,6 +353,6 @@ mod tests {
                 capped: true
             }
         );
-        assert!(iters <= UNREAD_SCAN_MAX_ROWS / UNREAD_COUNT_CAP);
+        assert!(iters <= SCAN_MAX_ROWS / UNREAD_COUNT_CAP);
     }
 }

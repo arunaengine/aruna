@@ -18,17 +18,17 @@ use crate::notifications::client::{
     unread_count_remote,
 };
 use crate::notifications::list::{
-    LIST_NOTIFICATIONS_MAX_LIMIT, ListNotificationsInput, ListNotificationsOperation,
+    LIST_MAX_LIMIT, ListNotificationsInput, ListNotificationsOperation,
 };
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
-use crate::notifications::unread::{UNREAD_COUNT_CAP, UNREAD_SCAN_MAX_ROWS};
+use crate::notifications::unread::{UNREAD_COUNT_CAP, SCAN_MAX_ROWS};
 use crate::notifications::watch::authorization::{
     WatchAuthorization, authorize_notification, list_authorized_subscriptions,
 };
 use crate::notifications::watch::interest::schedule_interest_publish;
 use crate::notifications::watch::subscriptions::{
-    WATCH_SUBSCRIPTION_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED,
+    WATCH_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED,
     WATCH_SUBSCRIPTION_UNAVAILABLE, WatchSubscriptionError, create_holder_watch,
     delete_holder_watch,
 };
@@ -184,7 +184,7 @@ pub(crate) async fn list_on_holder(
     mut cursor: Option<Vec<u8>>,
     limit: usize,
 ) -> Result<(Vec<NotificationRecord>, Option<Vec<u8>>), String> {
-    let limit = limit.clamp(1, LIST_NOTIFICATIONS_MAX_LIMIT);
+    let limit = limit.clamp(1, LIST_MAX_LIMIT);
     let mut records = Vec::with_capacity(limit);
 
     loop {
@@ -225,7 +225,7 @@ pub(crate) async fn unread_on_holder(
             ListNotificationsOperation::new(ListNotificationsInput {
                 recipient,
                 cursor,
-                limit: UNREAD_COUNT_CAP.min(UNREAD_SCAN_MAX_ROWS - examined),
+                limit: UNREAD_COUNT_CAP.min(SCAN_MAX_ROWS - examined),
             }),
             context,
         )
@@ -244,7 +244,7 @@ pub(crate) async fn unread_on_holder(
             }
         }
 
-        if examined >= UNREAD_SCAN_MAX_ROWS && output.next_cursor.is_some() {
+        if examined >= SCAN_MAX_ROWS && output.next_cursor.is_some() {
             return Ok((count as u32, true));
         }
         match output.next_cursor {
@@ -310,7 +310,7 @@ pub(crate) async fn mark_on_holder(
     mut ids: Vec<Ulid>,
     up_to_ms: Option<u64>,
 ) -> Result<u32, String> {
-    if ids.len() > crate::notifications::mark_read::MARK_READ_MAX_IDS {
+    if ids.len() > crate::notifications::mark_read::MARK_MAX_IDS {
         return Err("mark read id count exceeds cap".to_string());
     }
     if ids.is_empty() && up_to_ms.is_none() {
@@ -323,7 +323,7 @@ pub(crate) async fn mark_on_holder(
     let now_ms = unix_timestamp_millis();
     loop {
         let (records, next_cursor) =
-            list_on_holder(context, recipient, cursor, LIST_NOTIFICATIONS_MAX_LIMIT).await?;
+            list_on_holder(context, recipient, cursor, LIST_MAX_LIMIT).await?;
         let visible_ids: Vec<_> = records
             .into_iter()
             .filter(|record| {
@@ -333,7 +333,7 @@ pub(crate) async fn mark_on_holder(
             })
             .map(|record| record.notification_id)
             .collect();
-        for chunk in visible_ids.chunks(crate::notifications::mark_read::MARK_READ_MAX_IDS) {
+        for chunk in visible_ids.chunks(crate::notifications::mark_read::MARK_MAX_IDS) {
             marked += drive(
                 MarkReadOperation::new(MarkReadInput {
                     recipient,
@@ -399,7 +399,7 @@ pub async fn create_for_user(
         )
         .await
         .map_err(|reason| {
-            if reason == WATCH_SUBSCRIPTION_CAP_REACHED {
+            if reason == WATCH_CAP_REACHED {
                 WatchDispatchError::CapExceeded
             } else if let Some(reason) = reason
                 .strip_prefix(WATCH_SUBSCRIPTION_UNAUTHORIZED)
