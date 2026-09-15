@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use aruna_core::UserId;
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncPublish, DocumentSyncRevision,
-    DocumentSyncTarget, shard_topic_id,
+    DocumentChange, DocumentChangeKind, DocumentSyncPublish, DocumentSyncRevision, DocumentTarget,
+    shard_topic_id,
 };
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
@@ -17,9 +17,8 @@ use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataBatchSource, MetadataCreateEventPayload, MetadataCreateEventRecord,
-    MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataEffect, MetadataEvent,
-    MetadataGraphLifecycleRecord,
+    GraphLifecycleRecord, MetadataBatchSource, MetadataDeleteRecord, MetadataEffect, MetadataEvent,
+    MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
 };
 use aruna_core::storage_entries::{
     create_event_entry, event_log_key, lifecycle_revision_change, metadata_registry_key,
@@ -29,37 +28,36 @@ use aruna_core::structs::{
     RealmNodeKind,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent, MetaResourceId, NodeId, StructuredId};
+use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::delete_document::DeleteMetadataDocumentOperation;
-use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
+use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::{project_create_events, replay_event_log};
 use aruna_operations::metadata::update_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
     strategy_for_target, subject_bytes,
 };
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{
-    MutateRealmPlacementConfig, MutateRealmPlacementOperation, RealmPlacementMutation,
+    MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::sync::document_outbox::read_outbox_records;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::sync::shard_placement::sort_node_ids;
-use aruna_operations::tasks::incoming::{OutboxDrainer, install_and_start_task_queues};
+use aruna_operations::tasks::incoming::{OutboxDrainer, start_task_queues};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -121,15 +119,11 @@ async fn creation_reaches_holders() -> Result<(), Box<dyn std::error::Error>> {
         "datasets/bootstrap",
     );
 
-    let visible_nodes = drive(
-        GetRealmNodesOperation::new(realm_id),
-        nodes[0].context.as_ref(),
-    )
-    .await?;
+    let visible_nodes = drive(GetNodesOperation::new(realm_id), nodes[0].context.as_ref()).await?;
     assert_eq!(visible_nodes.len(), 3);
 
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -139,7 +133,7 @@ async fn creation_reaches_holders() -> Result<(), Box<dyn std::error::Error>> {
             document_id,
             document_path: "datasets/bootstrap".to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Bootstrap Dataset".to_string(),
                 description: "Replicated metadata".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -180,7 +174,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
     );
 
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -190,7 +184,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
             document_id,
             document_path: document_path.to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Replan Holder Refresh".to_string(),
                 description: "Replacement holder index convergence".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -210,11 +204,8 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
             .is_some()
     );
 
-    let initial_config = drive(
-        GetRealmConfigOperation::new(realm_id),
-        nodes[0].context.as_ref(),
-    )
-    .await?;
+    let initial_config =
+        drive(GetConfigOperation::new(realm_id), nodes[0].context.as_ref()).await?;
     // The bucket was chosen by the origin at create; holders derive from it.
     let placement = created.placement;
     let mut initial_holders = resolve_shard_holders(&initial_config, &placement);
@@ -230,7 +221,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
     .await?;
 
     drive(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -239,7 +230,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
             group_id,
             document_id,
             public: true,
-            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
+            mutation: UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#.to_string(),
             },
         }),
@@ -253,7 +244,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
 
     let obsolete = initial_holders[0];
     let updated_config = drive(
-        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+        MutatePlacementOperation::new(MutatePlacementConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::nil(realm_id),
@@ -294,10 +285,10 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
     // The registry row rides the everywhere-bound registry class, so it can land on the
     // replacement before the document's own bucket topic delivers the event.
     let refreshed_event = wait_event_value(replacement_node, document_id, latest_update_id).await?;
-    let refreshed_event: MetadataCreateEventRecord = postcard::from_bytes(&refreshed_event)?;
+    let refreshed_event: MetadataEventRecord = postcard::from_bytes(&refreshed_event)?;
     assert!(matches!(
         refreshed_event.payload,
-        MetadataCreateEventPayload::ApplyBatch {
+        MetadataEventPayload::ApplyBatch {
             authored: MetadataBatchSource::UpsertDataEntity { .. },
             ..
         }
@@ -428,7 +419,7 @@ async fn seed_and_update(
     document_path: &str,
 ) -> Result<(PlacementRef, Vec<aruna_core::NodeId>, Ulid), Box<dyn std::error::Error>> {
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -438,7 +429,7 @@ async fn seed_and_update(
             document_id,
             document_path: document_path.to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Draining Flush".to_string(),
                 description: "Draining flush regression".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -455,11 +446,7 @@ async fn seed_and_update(
     process_materialization_batch(nodes[0].context.as_ref()).await?;
     drain_until_empty(&nodes[0]).await?;
 
-    let config = drive(
-        GetRealmConfigOperation::new(realm_id),
-        nodes[0].context.as_ref(),
-    )
-    .await?;
+    let config = drive(GetConfigOperation::new(realm_id), nodes[0].context.as_ref()).await?;
     let placement = created.placement;
     let mut initial_holders = resolve_shard_holders(&config, &placement);
     sort_node_ids(&mut initial_holders);
@@ -481,7 +468,7 @@ async fn seed_and_update(
     );
 
     let updated = drive(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -490,7 +477,7 @@ async fn seed_and_update(
             group_id,
             document_id,
             public: true,
-            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
+            mutation: UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#.to_string(),
             },
         }),
@@ -510,7 +497,7 @@ async fn drain_origin(
 ) -> Result<aruna_core::NodeId, Box<dyn std::error::Error>> {
     let obsolete = nodes[0].net.node_id();
     let updated_config = drive(
-        MutateRealmPlacementOperation::new(MutateRealmPlacementConfig {
+        MutatePlacementOperation::new(MutatePlacementConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::nil(realm_id),
@@ -558,10 +545,10 @@ async fn assert_update_reaches(
         wait_persisted_update(replacement_node, group_id, document_id, update_event_id).await?;
     assert_eq!(registry.last_event_id, update_event_id);
     let event = wait_event_value(replacement_node, document_id, update_event_id).await?;
-    let event: MetadataCreateEventRecord = postcard::from_bytes(&event)?;
+    let event: MetadataEventRecord = postcard::from_bytes(&event)?;
     assert!(matches!(
         event.payload,
-        MetadataCreateEventPayload::ApplyBatch {
+        MetadataEventPayload::ApplyBatch {
             authored: MetadataBatchSource::UpsertDataEntity { .. },
             ..
         }
@@ -590,7 +577,7 @@ async fn remote_origin_converges() -> Result<(), Box<dyn std::error::Error>> {
         group_id: Some(group_id),
         metadata_path: Some(document_path),
     };
-    let sample = DocumentSyncTarget::MetadataDocumentLifecycle {
+    let sample = DocumentTarget::MetadataDocumentLifecycle {
         document_id: doc_id(1),
     };
     let (strategy, _) =
@@ -603,7 +590,7 @@ async fn remote_origin_converges() -> Result<(), Box<dyn std::error::Error>> {
     let document_id = mint_local(&config, origin, realm_id, group_id, document_path);
 
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: origin,
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -613,7 +600,7 @@ async fn remote_origin_converges() -> Result<(), Box<dyn std::error::Error>> {
             document_id,
             document_path: document_path.to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Off Hash Origin".to_string(),
                 description: "Created on a node outside the hashed bucket".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -652,7 +639,7 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -662,7 +649,7 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
             document_id,
             document_path: "datasets/propagation".to_string(),
             public: false,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Initial Dataset".to_string(),
                 description: "Initial description".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -715,7 +702,7 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let updated = drive(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -724,7 +711,7 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
             group_id,
             document_id,
             public: true,
-            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: updated_jsonld,
             },
         }),
@@ -744,7 +731,7 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     drive(
-        DeleteMetadataDocumentOperation::new(
+        DeleteDocumentOperation::new(
             Actor {
                 node_id: nodes[0].net.node_id(),
                 user_id: UserId::local(Ulid::generate(), realm_id),
@@ -775,7 +762,7 @@ async fn batch_projection_materializes() -> Result<(), Box<dyn std::error::Error
         let placement_seed = Ulid::generate();
         let now = unix_timestamp_millis().saturating_add(index.into());
         let document_path = format!("datasets/batch-{index}");
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: placement_seed,
         };
         let (strategy, _) = strategy_for_target(
@@ -821,12 +808,12 @@ async fn batch_projection_materializes() -> Result<(), Box<dyn std::error::Error
             establishing_event_id: event_id,
             last_event_id: event_id,
         };
-        events.push(MetadataCreateEventRecord {
+        events.push(MetadataEventRecord {
             event_id,
             record,
             user_id: UserId::local(Ulid::generate(), realm_id),
             node_id: node.net.node_id(),
-            payload: MetadataCreateEventPayload::Scaffold {
+            payload: MetadataEventPayload::Scaffold {
                 name: format!("Batch Dataset {index}"),
                 description: "Projected from one metadata batch".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -877,7 +864,7 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
     let document_path = "datasets/reordered-delete";
     let event_id = Ulid::generate();
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
-    let lifecycle_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    let lifecycle_target = DocumentTarget::MetadataDocumentLifecycle { document_id };
     let placement = aruna_operations::placement::target_placement_ref(
         &realm_config,
         &lifecycle_target,
@@ -903,12 +890,12 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
         establishing_event_id: event_id,
         last_event_id: event_id,
     };
-    let create_event = MetadataCreateEventRecord {
+    let create_event = MetadataEventRecord {
         event_id,
         record: record.clone(),
         user_id: UserId::local(Ulid::generate(), realm_id),
         node_id: nodes[0].net.node_id(),
-        payload: MetadataCreateEventPayload::Scaffold {
+        payload: MetadataEventPayload::Scaffold {
             name: "Reordered Delete".to_string(),
             description: "Stale create follows tombstone".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -916,11 +903,10 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
         },
         occurred_at_ms: 1,
     };
-    let tombstone =
-        MetadataGraphLifecycleRecord::deleted(graph_iri, realm_id, group_id, document_id, 2);
+    let tombstone = GraphLifecycleRecord::deleted(graph_iri, realm_id, group_id, document_id, 2);
     let delete_event_id = Ulid::generate();
-    let lifecycle = MetadataDocumentLifecycleRecord::Delete {
-        event: MetadataDocumentDeleteRecord {
+    let lifecycle = MetadataLifecycleRecord::Delete {
+        event: MetadataDeleteRecord {
             event_id: delete_event_id,
             tombstone,
             deleted_after_event_id: event_id,
@@ -928,7 +914,7 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
     };
     // All records of this document ride the bucket stamped on the record, so one shard topic.
     assert_ne!(placement, PlacementRef::NIL);
-    let shard_topic_of = |target: &DocumentSyncTarget| target.sync_topic_id(realm_id, &placement);
+    let shard_topic_of = |target: &DocumentTarget| target.sync_topic_id(realm_id, &placement);
     assert!(
         nodes[0]
             .net
@@ -957,7 +943,7 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     assert_eq!(delete_result.metadata_create_events.len(), 0);
 
-    let stale_target = DocumentSyncTarget::MetadataCreateEvent {
+    let stale_target = DocumentTarget::MetadataCreateEvent {
         document_id,
         event_id,
     };
@@ -986,7 +972,7 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
             .is_none()
     );
     let fetched = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         nodes[1].context.as_ref(),
     )
     .await;
@@ -1039,7 +1025,7 @@ async fn build_pinned_realm(
             loop {
                 sleep(Duration::from_secs(5)).await;
                 let _ = drive(
-                    AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                    AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                         realm_id,
                         node_id,
                         schedule_refresh: false,
@@ -1073,7 +1059,7 @@ async fn finish_realm_setup(
 
     for node in nodes {
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id: *realm_id,
                 node_id: node.net.node_id(),
                 schedule_refresh: true,
@@ -1140,7 +1126,7 @@ async fn spawn_node_configured(
     // A node without the auto task loop leaves its outbox drain (and every other
     // timer) for the test to drive by hand.
     if start_tasks {
-        install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+        start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
     }
 
     Ok(TestNode {
@@ -1216,7 +1202,7 @@ async fn install_realm_config(
 async fn publish_to_peer(
     node: &TestNode,
     event_id: Ulid,
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     bytes: Vec<u8>,
     peer: aruna_core::NodeId,
     placement: aruna_core::structs::PlacementRef,
@@ -1224,7 +1210,7 @@ async fn publish_to_peer(
     match node
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentSyncEffect::PublishDocuments {
+            DocumentEffect::PublishDocuments {
                 documents: vec![DocumentSyncPublish::Upsert {
                     event_id,
                     target: target.clone(),
@@ -1237,9 +1223,7 @@ async fn publish_to_peer(
         )))
         .await
     {
-        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished {
-            targets,
-        })) => {
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished { targets })) => {
             assert_eq!(targets, vec![target]);
             Ok(())
         }
@@ -1249,27 +1233,27 @@ async fn publish_to_peer(
 
 fn publish_change(
     node_id: aruna_core::NodeId,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     bytes: &[u8],
     placement: aruna_core::structs::PlacementRef,
-) -> Result<DocumentSyncChange, Box<dyn std::error::Error>> {
+) -> Result<DocumentChange, Box<dyn std::error::Error>> {
     match target {
-        DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
-            let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)?;
+        DocumentTarget::MetadataDocumentLifecycle { document_id } => {
+            let lifecycle: MetadataLifecycleRecord = postcard::from_bytes(bytes)?;
             if lifecycle.document_id() != *document_id {
                 return Err("metadata document lifecycle target mismatch".into());
             }
             Ok(lifecycle_revision_change(&lifecycle, node_id, placement))
         }
-        DocumentSyncTarget::MetadataCreateEvent {
+        DocumentTarget::MetadataCreateEvent {
             document_id,
             event_id,
         } => {
-            let record: MetadataCreateEventRecord = postcard::from_bytes(bytes)?;
+            let record: MetadataEventRecord = postcard::from_bytes(bytes)?;
             if record.record.document_id != *document_id || record.event_id != *event_id {
                 return Err("metadata create-event target mismatch".into());
             }
-            Ok(DocumentSyncChange {
+            Ok(DocumentChange {
                 base: None,
                 current: DocumentSyncRevision {
                     generation: record.record.updated_at_ms,
@@ -1277,7 +1261,7 @@ fn publish_change(
                     actor: record.node_id,
                     updated_at_ms: record.occurred_at_ms,
                 },
-                kind: DocumentSyncChangeKind::Upsert,
+                kind: DocumentChangeKind::Upsert,
                 placement,
             })
         }
@@ -1434,12 +1418,7 @@ async fn wait_node_convergence(
     wait_for_convergence("realm nodes did not converge", || async {
         let mut pending = 0;
         for node in nodes {
-            match drive(
-                GetRealmNodesOperation::new(*realm_id),
-                node.context.as_ref(),
-            )
-            .await
-            {
+            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
                 Ok(realm_nodes) if realm_nodes == expected => {}
                 _ => pending += 1,
             }
@@ -1482,7 +1461,7 @@ async fn wait_metadata_state(
         let mut pending = 0;
         for node in nodes {
             match drive(
-                GetMetadataDocumentOperation::new(group_id, document_id),
+                GetDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
             )
             .await
@@ -1516,7 +1495,7 @@ async fn wait_metadata_absence(
         let mut pending = 0;
         for node in nodes {
             let document_absent = drive(
-                GetMetadataDocumentOperation::new(group_id, document_id),
+                GetDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
             )
             .await
@@ -1544,7 +1523,7 @@ async fn wait_metadata_absence(
 async fn wait_batch_projection(
     node: &TestNode,
     group_id: Ulid,
-    events: &[MetadataCreateEventRecord],
+    events: &[MetadataEventRecord],
 ) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_convergence(
         "batched metadata projection did not materialize",
@@ -1553,11 +1532,11 @@ async fn wait_batch_projection(
             for event in events {
                 let document_id = event.record.document_id;
                 let expected_name = match &event.payload {
-                    MetadataCreateEventPayload::Scaffold { name, .. } => name.as_str(),
+                    MetadataEventPayload::Scaffold { name, .. } => name.as_str(),
                     _ => "",
                 };
                 match drive(
-                    GetMetadataDocumentOperation::new(group_id, document_id),
+                    GetDocumentOperation::new(group_id, document_id),
                     node.context.as_ref(),
                 )
                 .await

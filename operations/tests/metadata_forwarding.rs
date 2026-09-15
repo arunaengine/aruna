@@ -12,8 +12,7 @@ use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -45,25 +44,23 @@ use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create}
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_forward_document, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
+    mint_local_document,
 };
 use aruna_operations::metadata::forward::{route_metadata_create, route_metadata_update};
 use aruna_operations::metadata::get_document::load_document_record;
-use aruna_operations::metadata::update_document::{
-    UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
-};
-use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
+use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
+use aruna_operations::metadata::{AuthToken, MetadataHandle};
 use aruna_operations::placement::resolve_shard_holders;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::set_policies::{
-    SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation,
+    SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
 use aruna_operations::sync::document_outbox::{
     new_outbox_record, outbox_key, read_outbox_record, write_outbox_effect,
 };
 use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::incoming::{OutboxDrainer, install_and_start_task_queues};
+use aruna_operations::tasks::incoming::{OutboxDrainer, start_task_queues};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -306,7 +303,7 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
         let mut pending = 0;
         for node in nodes.iter().filter(|node| node.sync_eligible) {
             let config = drive(
-                GetRealmConfigOperation::new(realm.realm_id),
+                GetConfigOperation::new(realm.realm_id),
                 node.context.as_ref(),
             )
             .await?;
@@ -319,7 +316,7 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let user_config = drive(
-        GetRealmConfigOperation::new(realm.realm_id),
+        GetConfigOperation::new(realm.realm_id),
         user_node.context.as_ref(),
     )
     .await?;
@@ -440,7 +437,7 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
         Some(&record),
         document_id,
         None,
-        UpdateMetadataDocumentMutation::UpsertDataEntity {
+        UpdateDocumentMutation::UpsertDataEntity {
             jsonld: "{}".to_string(),
         },
         Some(realm.bearer_token()),
@@ -451,7 +448,7 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
     assert!(
         matches!(
             &error,
-            MetadataWriteError::Update(UpdateMetadataDocumentError::MetadataError(
+            MetadataWriteError::Update(UpdateDocumentError::MetadataError(
                 MetadataError::InvalidInput(_)
             ))
         ),
@@ -604,8 +601,8 @@ async fn create_replay_rejects() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn forged_delete_change(placement: PlacementRef, actor: NodeId) -> DocumentSyncChange {
-    DocumentSyncChange {
+fn forged_delete_change(placement: PlacementRef, actor: NodeId) -> DocumentChange {
+    DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -613,7 +610,7 @@ fn forged_delete_change(placement: PlacementRef, actor: NodeId) -> DocumentSyncC
             actor,
             updated_at_ms: 1,
         },
-        kind: DocumentSyncChangeKind::Delete,
+        kind: DocumentChangeKind::Delete,
         placement,
     }
 }
@@ -660,13 +657,13 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
         mint_local_document(&config, &actor, group_id, "datasets/nonholder")?.as_ulid();
 
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: actor.clone(),
             group_id,
             document_id,
             document_path: "datasets/nonholder".to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Non Holder".to_string(),
                 description: "Resolvable from outside its bucket".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -706,9 +703,9 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
     // Plant a delete for the document's bucket into the non-holder's outbox.
     let forged = new_outbox_record(
         outsider.net.node_id(),
-        DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+        DocumentTarget::MetadataDocumentLifecycle { document_id },
         Vec::new(),
-        DocumentSyncOutboxEvent::Delete {
+        DocumentOutboxEvent::Delete {
             change: forged_delete_change(created.placement, outsider.net.node_id()),
         },
         created.placement,
@@ -769,13 +766,13 @@ impl Realm {
         }
     }
 
-    fn bearer_token(&self) -> MetadataAuthToken {
+    fn bearer_token(&self) -> AuthToken {
         self.token_for(self.user_id)
     }
 
     /// A valid realm token for any subject, which is what a stolen or borrowed
     /// credential looks like to an ingress.
-    fn token_for(&self, user_id: UserId) -> MetadataAuthToken {
+    fn token_for(&self, user_id: UserId) -> AuthToken {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let claims = TokenClaims {
             sub: user_id.to_string(),
@@ -799,13 +796,13 @@ impl Realm {
             &EncodingKey::from_ed_pem(key_pem.as_bytes()).expect("realm key is an ed25519 key"),
         )
         .expect("token signs");
-        MetadataAuthToken::bearer(token).expect("token is within the length bound")
+        AuthToken::bearer(token).expect("token is within the length bound")
     }
 
     fn bearer_string(&self) -> String {
         match self.bearer_token() {
-            MetadataAuthToken::Bearer(token) => token.as_str().to_string(),
-            MetadataAuthToken::Internal(_) => unreachable!(),
+            AuthToken::Bearer(token) => token.as_str().to_string(),
+            AuthToken::Internal(_) => unreachable!(),
         }
     }
 }
@@ -855,7 +852,7 @@ async fn set_write_policy(
         let mut attempts = 0;
         loop {
             let outcome = drive(
-                SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
+                SetPoliciesOperation::new(SetPoliciesConfig {
                     actor: Actor {
                         node_id: node.net.node_id(),
                         user_id: realm.user_id,
@@ -875,7 +872,7 @@ async fn set_write_policy(
             .await;
             match outcome {
                 Ok(_) => break,
-                Err(SetRealmPoliciesError::StorageError(StorageError::TransactionConflict))
+                Err(SetPoliciesError::StorageError(StorageError::TransactionConflict))
                     if attempts < POLICY_WRITE_ATTEMPTS =>
                 {
                     attempts += 1;
@@ -1012,7 +1009,7 @@ async fn drive_create_at(
     document_path: &str,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     let created = route_metadata_create(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: node.net.node_id(),
                 user_id: realm.user_id,
@@ -1022,7 +1019,7 @@ async fn drive_create_at(
             document_id,
             document_path: document_path.to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Forwarded".to_string(),
                 description: "Placed by a holder".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -1107,7 +1104,7 @@ async fn spawn_node(
         jobs_runtime.clone(),
         &shutdown,
     );
-    install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+    start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,
