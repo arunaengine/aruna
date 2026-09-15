@@ -308,11 +308,7 @@ impl AdminDocumentState {
         display_name: &str,
         owner: &UserId,
     ) {
-        self.apply_group_field(
-            event,
-            DISPLAY_NAME_PATH,
-            Some(display_name.to_string()),
-        );
+        self.apply_group_field(event, DISPLAY_NAME_PATH, Some(display_name.to_string()));
         self.apply_group_field(event, REALM_ID_PATH, Some(realm_id.to_string()));
         self.apply_group_field(event, GROUP_OWNER_PATH, Some(owner.to_string()));
     }

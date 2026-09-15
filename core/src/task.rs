@@ -7,8 +7,14 @@ use crate::structs::identity::realm::RealmId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskKey {
-    RealmPresence { realm_id: RealmId, node_id: NodeId },
-    SyncPlacements { realm_id: RealmId, node_id: NodeId },
+    RealmPresence {
+        realm_id: RealmId,
+        node_id: NodeId,
+    },
+    SyncPlacements {
+        realm_id: RealmId,
+        node_id: NodeId,
+    },
     #[serde(rename = "DrainDocumentSyncOutbox")]
     DrainSyncOutbox,
     PublishUsageSnapshots,

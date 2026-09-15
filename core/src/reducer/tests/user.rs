@@ -49,10 +49,7 @@ fn admin_document_trip() {
         METADATA_REPLICATION_PATH,
         "realm_config.settings.metadata_replication"
     );
-    assert_eq!(
-        CONFIG_DISCOVERY_PATH,
-        "realm_config.settings.discovery"
-    );
+    assert_eq!(CONFIG_DISCOVERY_PATH, "realm_config.settings.discovery");
     assert_eq!(CONFIG_DESCRIPTION_PATH, "realm_config.description");
     assert_eq!(
         user_attribute_path("department"),

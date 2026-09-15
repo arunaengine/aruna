@@ -2,12 +2,12 @@ use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
 use crate::scheduling::*;
 use crate::structs::execution::job::{EffectiveResources, SubmissionId};
+use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::compute_config::{LocationLink, RealmComputeConfig};
 use crate::structs::placement::placement_policy::{
     PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, PolicyResolution,
     VerifiedPolicy,
 };
-use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::storage::replication::VersionedObjectArn;
 use std::collections::BTreeMap;
 use ulid::Ulid;

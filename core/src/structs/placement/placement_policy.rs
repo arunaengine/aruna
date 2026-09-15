@@ -1,7 +1,5 @@
 use crate::NodeId;
-use crate::structs::placement::placement_record::{
-    DEFAULT_LOCATION, LabelMatch, MAX_LOCATION_LEN,
-};
+use crate::structs::placement::placement_record::{DEFAULT_LOCATION, LabelMatch, MAX_LOCATION_LEN};
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -458,10 +456,7 @@ impl PlacementSubject {
         let mut keys = BTreeSet::new();
         for (key, value) in &self.labels {
             let key = key.trim();
-            if key.is_empty()
-                || key.len() > MAX_LABEL_LEN
-                || value.trim().len() > MAX_VALUE_LEN
-            {
+            if key.is_empty() || key.len() > MAX_LABEL_LEN || value.trim().len() > MAX_VALUE_LEN {
                 return Err(PlacementPolicyError::InvalidLabel);
             }
             if !keys.insert(key) {

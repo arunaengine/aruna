@@ -358,9 +358,7 @@ impl PoolContext {
         }
 
         let counter = ConnectionCounter::new();
-        let mut idle_timer = Box::pin(tokio::time::sleep(Duration::from_secs(
-            IDLE_TIMER_SECS,
-        )));
+        let mut idle_timer = Box::pin(tokio::time::sleep(Duration::from_secs(IDLE_TIMER_SECS)));
         let mut idle_timer_active = false;
 
         let mut close_fut = state.as_ref().ok().map(|connection| {

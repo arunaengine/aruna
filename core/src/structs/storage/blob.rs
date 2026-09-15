@@ -5,13 +5,13 @@ use crate::credential_encryption::{
 use crate::errors::{BlobError, ConversionError};
 use crate::id::NodeId;
 use crate::structs::checksum::HASH_BLAKE3;
-use crate::structs::storage::group_backend::GroupBackendKind;
-use crate::structs::identity::auth::PathRestriction;
-use crate::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
-use crate::structs::identity::realm::RealmId;
 use crate::structs::execution::source_access::SourceMetadata;
-use crate::structs::storage::routing::StorageRoutingRule;
 use crate::structs::execution::staging::VersionSourceBinding;
+use crate::structs::identity::auth::PathRestriction;
+use crate::structs::identity::realm::RealmId;
+use crate::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use crate::structs::storage::group_backend::GroupBackendKind;
+use crate::structs::storage::routing::StorageRoutingRule;
 use crate::types::GroupId;
 use byteview::ByteView;
 use core::fmt;
@@ -1278,15 +1278,15 @@ mod tests {
     use crate::NodeId;
     use crate::UserId;
     use crate::errors::ConversionError;
-    use crate::structs::placement::placement_policy::{
-        MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef,
-    };
+    use crate::structs::execution::source_access::SourceMetadata;
+    use crate::structs::execution::source_connector::SourceConnectorKind;
     use crate::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
     use crate::structs::identity::realm::RealmId;
-    use crate::structs::execution::source_connector::SourceConnectorKind;
-    use crate::structs::execution::source_access::SourceMetadata;
+    use crate::structs::placement::placement_policy::{
+        MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef,
+    };
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;

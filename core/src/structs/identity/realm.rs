@@ -3,22 +3,22 @@ use crate::UserId;
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};
 use crate::errors::ConversionError;
 use crate::reducer::{AdminDocumentState, RevocationIndex};
+use crate::structs::execution::job::{JobId, SubmissionId};
 use crate::structs::identity::auth::Actor;
+use crate::structs::identity::auth::{Permission, Role};
+use crate::structs::placement::binding_directory::{BindingDirectory, BindingError};
+use crate::structs::placement::handle_allocation::HandleRangeDirectory;
 use crate::structs::placement::placement_record::{
     BandPool, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
     DocumentClass, HandleRange, METADATA_HANDLE, NodePlacementEntry, PlacementBinding,
     PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, SHARD_SUBJECT_LEN,
     StrategyBinding, band_start, shard_for_subject,
 };
-use crate::structs::placement::binding_directory::{BindingDirectory, BindingError};
 use crate::structs::placement::placement_transition::{
     CandidateMapNode, CandidatePlacementMap, FrozenStrategySelector, PlacementActivation,
     PlacementTransition,
 };
-use crate::structs::placement::handle_allocation::HandleRangeDirectory;
-use crate::structs::execution::job::{JobId, SubmissionId};
 use crate::structs::storage::node_info::{KIND_LABEL_KEY, NODE_LABEL_KEY};
-use crate::structs::identity::auth::{Permission, Role};
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId};
 use core::fmt;
@@ -501,11 +501,7 @@ impl RealmConfigDocument {
     }
 
     pub fn default_for_realm(realm_id: RealmId, oidc_providers: Vec<OidcProviderConfig>) -> Self {
-        Self::new(
-            realm_id,
-            oidc_providers,
-            METADATA_REPLICATION_FACTOR,
-        )
+        Self::new(realm_id, oidc_providers, METADATA_REPLICATION_FACTOR)
     }
 
     /// Installs `default` metadata replication and `everywhere` control-document strategies.
@@ -1100,19 +1096,19 @@ mod test {
     use crate::auth::REVOCATION_GRACE_SECS;
     use crate::reducer::AdminDocumentState;
     use crate::request_policy::{PolicyKind, RequestPolicy};
+    use crate::structs::execution::job::SubmissionId;
     use crate::structs::identity::auth::Actor;
-    use crate::structs::placement::placement_record::{
-        BindingScope, DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy,
-        StrategyBinding, shard_for_subject,
-    };
-    use crate::structs::placement::placement_transition::CandidatePlacementMap;
     use crate::structs::identity::realm::{
         DynamicDiscoveryMethod, MetadataPathOverride, MetadataReplicationOverride,
         OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
         RealmId, RealmNodeKind, TokenRevocation, default_discovery_config,
     };
+    use crate::structs::placement::placement_record::{
+        BindingScope, DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy,
+        StrategyBinding, shard_for_subject,
+    };
+    use crate::structs::placement::placement_transition::CandidatePlacementMap;
     use crate::structs::storage::node_info::{KIND_LABEL_KEY, NODE_LABEL_KEY};
-    use crate::structs::execution::job::SubmissionId;
     use ulid::Ulid;
 
     use super::JobFamilyError;
@@ -1235,10 +1231,7 @@ mod test {
 
         assert!(!config.family_strategy_id.is_nil());
         assert!(config.strategy(&config.family_strategy_id).is_some());
-        assert_ne!(
-            Some(config.family_strategy_id),
-            config.default_strategy_id
-        );
+        assert_ne!(Some(config.family_strategy_id), config.default_strategy_id);
     }
 
     #[test]
@@ -1556,15 +1549,15 @@ mod test {
         let mut reordered = config.clone();
         let extra = reordered.freeze_map(9);
         reordered.candidate_maps.push(extra.clone());
-        reordered
-            .placement_activations
-            .push(crate::structs::placement::placement_transition::PlacementActivation {
+        reordered.placement_activations.push(
+            crate::structs::placement::placement_transition::PlacementActivation {
                 strategy_id: reordered.default_strategy_id.unwrap(),
                 shard: 63,
                 activation_epoch: 2,
                 candidate_map_epoch: 9,
                 transition_id: None,
-            });
+            },
+        );
         let mut swapped = reordered.clone();
         swapped.candidate_maps.swap(0, 1);
         assert_eq!(reordered.digest().unwrap(), swapped.digest().unwrap());
@@ -1819,12 +1812,12 @@ mod test {
     fn owner_survives_rebalance() {
         // The derived owner is a pure function of band + binding; arbitrary
         // placement-map, strategy, and override changes never move it.
+        use crate::structs::execution::job::JobId;
+        use crate::structs::identity::realm::JobOwnerError;
         use crate::structs::placement::placement_record::{
             DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
             NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementScope,
         };
-        use crate::structs::execution::job::JobId;
-        use crate::structs::identity::realm::JobOwnerError;
         use crate::structured_id::{BucketId, PlacementHandle};
 
         fn node_id(seed: u8) -> NodeId {
@@ -1967,7 +1960,9 @@ mod test {
         let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
         config.seed_default_placement();
         let bound = config
-            .class_strategy(crate::structs::placement::placement_record::DocumentClass::PlacementPolicy)
+            .class_strategy(
+                crate::structs::placement::placement_record::DocumentClass::PlacementPolicy,
+            )
             .expect("binding resolves")
             .expect("a strategy is bound");
         assert_eq!(Some(bound.strategy_id), config.default_strategy_id);

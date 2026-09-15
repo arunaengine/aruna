@@ -3,8 +3,8 @@ use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
 use crate::structs::execution::job::JobId;
-use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::placement::placement_record::PlacementRef;
+use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

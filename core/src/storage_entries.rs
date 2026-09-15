@@ -10,20 +10,15 @@ use crate::document::{
 };
 use crate::errors::ConversionError;
 use crate::keyspaces::{
-    DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
-    SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE,
-    CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
-    DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE,
-    GRAPH_LIFECYCLE_KEYSPACE, PRUNE_JOB_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, IRI_INDEX_KEYSPACE,
-    DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE,
-    MATERIALIZATION_JOB_KEYSPACE, MATERIALIZATION_PRUNE_KEYSPACE,
-    MATERIALIZATION_STATUS_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
-    VALIDATION_STATUS_KEYSPACE, RAW_BUDGET_KEYSPACE,
-    UPDATED_INDEX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-    PRUNE_INDEX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
-    WATCH_SUBSCRIPTIONS_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
-    SUBJECT_INDEX_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, DEAD_LETTER_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE,
+    DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, IRI_INDEX_KEYSPACE,
+    MATERIALIZATION_JOB_KEYSPACE, MATERIALIZATION_PRUNE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+    NOTIFICATION_OUTBOX_KEYSPACE, PENDING_PROJECTION_KEYSPACE, PRUNE_INDEX_KEYSPACE,
+    PRUNE_JOB_KEYSPACE, RAW_BUDGET_KEYSPACE, SHARD_MANIFEST_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
+    SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE, UPDATED_INDEX_KEYSPACE,
+    VALIDATION_STATUS_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use crate::metadata::{
     DeadLetterRecord, GraphLifecycleRecord, GraphPruneRecord, IriIndexRecord,
@@ -31,15 +26,15 @@ use crate::metadata::{
     MetadataMaterializationRecord, ProfileValidationStatus, RawOriginBudget,
 };
 use crate::reducer::{AdminConflict, AdminDocumentState};
-use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::execution::notification::{
     NotificationOutboxRecord, NotificationRecord, notification_inbox_key, notification_outbox_key,
     notification_prune_key,
 };
-use crate::structs::placement::placement_record::{PLACEMENT_EPOCH_PAD, PlacementRef};
+use crate::structs::execution::notification_watch::{WatchSubscription, watch_subscription_key};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::User;
-use crate::structs::execution::notification_watch::{WatchSubscription, watch_subscription_key};
+use crate::structs::placement::placement_record::{PLACEMENT_EPOCH_PAD, PlacementRef};
+use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::types::{GroupId, Key, KeySpace, Value};
 
 pub fn subject_index_key(subject_id: &str) -> Key {
@@ -865,19 +860,18 @@ mod tests {
         DocumentTarget,
     };
     use crate::keyspaces::{
-        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
-        SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE,
-        DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-        IRI_INDEX_KEYSPACE, UPDATED_INDEX_KEYSPACE,
-        SHARD_MANIFEST_KEYSPACE,
+        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+        IRI_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        SHARD_MANIFEST_KEYSPACE, SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE,
+        UPDATED_INDEX_KEYSPACE,
     };
     use crate::metadata::{GraphLifecycleRecord, IriIndexRecord};
     use crate::reducer::{
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
-    use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use crate::structs::placement::placement_record::PlacementRef;
     use crate::structs::identity::realm::RealmId;
+    use crate::structs::placement::placement_record::PlacementRef;
+    use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
     use crate::{NodeId, UserId};
 
     fn node(seed: u8) -> NodeId {

@@ -3,8 +3,8 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::UserId;
-use crate::structs::placement::placement_record::PlacementRef;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::placement::placement_record::PlacementRef;
 use crate::types::GroupId;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

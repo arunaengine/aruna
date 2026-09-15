@@ -5,8 +5,7 @@ pub const DISPLAY_NAME_PATH: &str = "group.display_name";
 pub const REALM_ID_PATH: &str = "group.realm_id";
 pub const GROUP_OWNER_PATH: &str = "group.owner";
 pub const GROUP_POLICIES_PATH: &str = "group.policies";
-pub const METADATA_REPLICATION_PATH: &str =
-    "realm_config.settings.metadata_replication";
+pub const METADATA_REPLICATION_PATH: &str = "realm_config.settings.metadata_replication";
 pub const CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 pub const CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
 pub const CONFIG_QUOTA_PATH: &str = "realm_config.quota";
@@ -301,9 +300,7 @@ pub(super) fn quota_value(quota: &QuotaConfig) -> String {
 pub(super) fn supported_quota(quota: &QuotaConfig) -> QuotaConfig {
     let mut quota = quota.clone();
     quota.group_overrides.sort_by_key(|over| over.group_id);
-    quota
-        .group_cap_overrides
-        .sort_by_key(|over| over.user_id);
+    quota.group_cap_overrides.sort_by_key(|over| over.user_id);
     quota
 }
 

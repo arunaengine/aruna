@@ -6,10 +6,10 @@ use std::collections::{BTreeSet, HashMap};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::structs::placement::handle_allocation::HandleRangeDirectory;
 use crate::structs::placement::placement_record::{
     BindingTuple, DocumentClass, PlacementBinding, PlacementScope,
 };
-use crate::structs::placement::handle_allocation::HandleRangeDirectory;
 use crate::structured_id::{BucketId, BucketRangeError, PlacementHandle, StructuredId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

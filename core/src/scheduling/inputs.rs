@@ -3,14 +3,14 @@
 
 use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
-use crate::structs::placement::compute_config::ComputeConfigError;
 use crate::structs::execution::job::{EffectiveResources, SubmissionId};
-use crate::structs::placement::placement_record::LabelMatch;
+use crate::structs::identity::realm::RealmNodeKind;
+use crate::structs::placement::compute_config::ComputeConfigError;
 use crate::structs::placement::placement_policy::{
     MAX_SELECTOR_LABELS, PlacementPolicyError, PlacementPolicyRef, PlacementSubject,
     PolicyResolution,
 };
-use crate::structs::identity::realm::RealmNodeKind;
+use crate::structs::placement::placement_record::LabelMatch;
 use crate::structs::storage::replication::VersionedObjectArn;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;

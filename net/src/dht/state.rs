@@ -10,7 +10,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use smallvec::SmallVec;
 
 use super::constants::{
-    LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, MAX_CLOCK_SKEW, ENTRIES_PER_KEY, MAX_TTL_SECS,
+    ENTRIES_PER_KEY, LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, MAX_CLOCK_SKEW, MAX_TTL_SECS,
     MAX_VALUE_SIZE, RPC_TIMEOUT_TICKS,
 };
 use super::kbucket::{InsertResult, K, PeerInfo, RoutingTable};
@@ -2244,8 +2244,7 @@ fn stored_value_matches(value: &StoredValue, stored: &StoredEntry) -> bool {
 fn stored_value_bounded(key: &DhtKeyId, entry: &StoredValue, now_secs: u64) -> bool {
     entry.value.len() <= MAX_VALUE_SIZE
         && entry.revision > 0
-        && entry.expires_at.saturating_sub(now_secs)
-            <= MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW)
+        && entry.expires_at.saturating_sub(now_secs) <= MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW)
         && retention_deadline(entry.expires_at, now_secs) > now_secs
         && verify_stored_value(key, entry)
 }

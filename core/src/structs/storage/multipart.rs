@@ -1,9 +1,9 @@
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};
+use crate::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
 use crate::structs::storage::blob::checked_refs;
 use crate::structs::storage::blob::{BackendLocation, BackendRef};
-use crate::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -78,7 +78,10 @@ pub struct MultipartUpload {
 impl MultipartUpload {
     /// Whether a part may still land here. The create-time gate stored the refs
     /// and the subject; a part is only a cheap re-check of the same values.
-    pub fn admits_part(&self, subject: Option<&crate::structs::placement::node_subject::NodeSubjectRecord>) -> bool {
+    pub fn admits_part(
+        &self,
+        subject: Option<&crate::structs::placement::node_subject::NodeSubjectRecord>,
+    ) -> bool {
         if self.placement_policies.is_empty() {
             return true;
         }

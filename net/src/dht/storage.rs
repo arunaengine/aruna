@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::constants::{
-    DHT_ACTIVE_PREFIX, DHT_FLOOR_PREFIX, MAX_CLOCK_SKEW, ENTRIES_PER_KEY,
-    MAX_STORED_SIZE, MAX_TTL_SECS, MAX_VALUE_SIZE,
+    DHT_ACTIVE_PREFIX, DHT_FLOOR_PREFIX, ENTRIES_PER_KEY, MAX_CLOCK_SKEW, MAX_STORED_SIZE,
+    MAX_TTL_SECS, MAX_VALUE_SIZE,
 };
 use super::rpc::verify_record;
 

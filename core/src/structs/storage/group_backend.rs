@@ -120,8 +120,8 @@ impl GroupStorageSecret {
 mod tests {
     use super::{GroupBackendKind, GroupStorage, GroupStorageSecret};
     use crate::UserId;
-    use crate::structs::storage::cleanup::CleanupStrategy;
     use crate::structs::identity::realm::RealmId;
+    use crate::structs::storage::cleanup::CleanupStrategy;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;

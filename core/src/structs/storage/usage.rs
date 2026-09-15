@@ -113,9 +113,7 @@ pub fn global_group_key(group_id: GroupId) -> Vec<u8> {
 }
 
 pub fn global_shard_keys() -> Vec<Vec<u8>> {
-    (0..GLOBAL_SHARD_COUNT)
-        .map(global_shard_key)
-        .collect()
+    (0..GLOBAL_SHARD_COUNT).map(global_shard_key).collect()
 }
 
 /// Shard of the physical `stored_*` counters. Keyed by content hash so a

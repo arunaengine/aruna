@@ -8,8 +8,7 @@ mod generator;
 mod layout;
 
 pub use generator::{
-    ClockHealthError, MAX_ID_SKEW, IdEnvironment, StructuredIdGenerator,
-    SystemEnvironment,
+    ClockHealthError, IdEnvironment, MAX_ID_SKEW, StructuredIdGenerator, SystemEnvironment,
 };
 
 use serde::{Deserialize, Serialize};
@@ -388,10 +387,7 @@ mod tests {
             PlacementHandle::new(0x100000),
             Err(FieldError::HandleRangeError(0x100000))
         );
-        assert_eq!(
-            BucketId::new(0x1000),
-            Err(FieldError::OutOfRange(0x1000))
-        );
+        assert_eq!(BucketId::new(0x1000), Err(FieldError::OutOfRange(0x1000)));
     }
 
     #[test]

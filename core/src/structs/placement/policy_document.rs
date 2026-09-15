@@ -7,13 +7,13 @@ use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
 use crate::permission_path::compile_permission_matcher;
-use crate::structs::identity::group::GroupAuthorizationDocument;
 use crate::structs::identity::auth::{Permission, Role};
+use crate::structs::identity::group::GroupAuthorizationDocument;
+use crate::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument, RealmId};
 use crate::structs::placement::placement_policy::{
     PlacementPolicy, PlacementPolicyError, PlacementPolicyRef, VerifiedPolicy,
 };
 use crate::structs::placement::placement_record::PlacementRef;
-use crate::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument, RealmId};
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -366,10 +366,10 @@ pub fn placement_policy_change(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::placement::placement_record::LabelMatch;
-    use crate::structs::placement::placement_policy::PlacementSelector;
-    use crate::structs::identity::realm::RealmNodeKind;
     use crate::structs::identity::auth::Role;
+    use crate::structs::identity::realm::RealmNodeKind;
+    use crate::structs::placement::placement_policy::PlacementSelector;
+    use crate::structs::placement::placement_record::LabelMatch;
     use std::collections::{HashMap, HashSet};
 
     fn secret(seed: u8) -> iroh::SecretKey {
@@ -410,7 +410,10 @@ mod tests {
         VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
-    fn group_roles(user: UserId, pattern: &str) -> crate::structs::identity::group::GroupAuthorizationDocument {
+    fn group_roles(
+        user: UserId,
+        pattern: &str,
+    ) -> crate::structs::identity::group::GroupAuthorizationDocument {
         let role = Role {
             role_id: Ulid::from_bytes([2; 16]),
             name: "group_admin".to_string(),

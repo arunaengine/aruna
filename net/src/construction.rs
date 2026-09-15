@@ -354,12 +354,9 @@ impl NetworkServices {
             }
         }
 
-        let document_sync_path = config
-            .sync_storage_path
-            .clone()
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::generate()))
-            });
+        let document_sync_path = config.sync_storage_path.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::generate()))
+        });
         // Configured bootstrap peers join the persisted realm peers so a fresh
         // joiner admits its seed's pushes before the first realm config applies.
         let mut document_sync_peers = realm_peer_nodes;
@@ -461,8 +458,7 @@ impl BackgroundRuntime {
         let dht_inbound_tx = dht_resources.inbound_stream_tx.clone();
         tasks.push(spawn_dht_forwarder(dht_rx, dht_inbound_tx));
 
-        let inbound_stream_handlers =
-            Arc::new(tokio::sync::Semaphore::new(MAX_STREAM_HANDLERS));
+        let inbound_stream_handlers = Arc::new(tokio::sync::Semaphore::new(MAX_STREAM_HANDLERS));
         tasks.push(spawn_stream_dispatch(
             stream_rx,
             services.dht.clone(),

@@ -1,9 +1,9 @@
 use super::*;
 use crate::NodeId;
 use crate::compute::{ExecutorAvailability, NetworkAccess, ResourceEnvelope, StagingMode};
-use crate::structs::placement::placement_record::LabelMatch;
-use crate::structs::placement::placement_policy::PlacementSelector;
 use crate::structs::identity::realm::RealmNodeKind;
+use crate::structs::placement::placement_policy::PlacementSelector;
+use crate::structs::placement::placement_record::LabelMatch;
 
 use crate::tests::scheduling::*;
 
@@ -376,7 +376,9 @@ fn excludes_user_nodes() {
     let plan_request = request(Vec::new());
     let mut user = candidate(node(3), "docker");
     user.node_kind = RealmNodeKind::User {
-        owner: crate::UserId::nil(crate::structs::identity::realm::RealmId::from_bytes([1u8; 32])),
+        owner: crate::UserId::nil(crate::structs::identity::realm::RealmId::from_bytes(
+            [1u8; 32],
+        )),
     };
     let mut inactive = candidate(node(4), "docker");
     inactive.active = false;

@@ -2,8 +2,8 @@
 //! generation and blocks serving until local inventory is revalidated for that generation.
 
 use crate::errors::ConversionError;
-use crate::structs::placement::placement_record::NodePlacementEntry;
 use crate::structs::placement::placement_policy::{PlacementPolicyError, PlacementSubject};
+use crate::structs::placement::placement_record::NodePlacementEntry;
 use serde::{Deserialize, Serialize};
 
 /// Single-row key of the local subject record.

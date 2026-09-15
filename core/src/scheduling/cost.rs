@@ -6,9 +6,9 @@ use crate::compute::ExecutorCapability;
 use crate::compute::ResourceEnvelope;
 use crate::scheduling::eligibility::allows;
 use crate::scheduling::inputs::{PlanRequest, ResolvedInput, TargetCandidate, TargetScore};
-use crate::structs::placement::placement_record::DEFAULT_LOCATION;
-use crate::structs::placement::placement_policy::PlacementSubject;
 use crate::structs::placement::compute_config::RealmComputeConfig;
+use crate::structs::placement::placement_policy::PlacementSubject;
+use crate::structs::placement::placement_record::DEFAULT_LOCATION;
 use std::collections::BTreeMap;
 
 /// Rank value of an unknown or stale ranking hint: as bad as a fully loaded
@@ -49,12 +49,7 @@ impl<'a> LinkIndex<'a> {
             links: config
                 .links
                 .iter()
-                .map(|link| {
-                    (
-                        (link.from.trim(), link.to.trim()),
-                        link.bandwidth_per_sec,
-                    )
-                })
+                .map(|link| ((link.from.trim(), link.to.trim()), link.bandwidth_per_sec))
                 .collect(),
             pessimistic: config.pessimistic_per_sec.max(1),
             stale_after_ms: config.availability_stale_ms,

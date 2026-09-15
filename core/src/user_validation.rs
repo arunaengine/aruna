@@ -50,9 +50,8 @@ pub fn validate_attribute_count(count: usize) -> Result<(), UserAttributeError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTRIBUTE_KEY_BYTES, ATTRIBUTE_VALUE_BYTES, MAX_USER_ATTRIBUTES,
-        UserAttributeError, validate_attribute_count, validate_attribute_key,
-        validate_attribute_value,
+        ATTRIBUTE_KEY_BYTES, ATTRIBUTE_VALUE_BYTES, MAX_USER_ATTRIBUTES, UserAttributeError,
+        validate_attribute_count, validate_attribute_key, validate_attribute_value,
     };
 
     #[test]
@@ -102,10 +101,7 @@ mod tests {
         );
 
         assert_eq!(
-            validate_attribute_value(
-                "department",
-                &"a".repeat(ATTRIBUTE_VALUE_BYTES + 1)
-            ),
+            validate_attribute_value("department", &"a".repeat(ATTRIBUTE_VALUE_BYTES + 1)),
             Err(UserAttributeError::InvalidValue("department".to_string()))
         );
     }

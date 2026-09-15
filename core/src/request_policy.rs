@@ -481,9 +481,7 @@ fn trace_entry(
 /// Compile-checks one expression without evaluating it.
 pub fn validate_expression(expression: &str) -> Result<(), String> {
     if expression.len() > MAX_EXPRESSION_BYTES {
-        return Err(format!(
-            "expression exceeds {MAX_EXPRESSION_BYTES} bytes"
-        ));
+        return Err(format!("expression exceeds {MAX_EXPRESSION_BYTES} bytes"));
     }
     Program::compile(expression)
         .map(|_| ())
@@ -527,9 +525,7 @@ pub fn analyze_policy_source(when: Option<&str>, expression: &str) -> PolicyAnal
     for (label, source) in [("guard", when), ("expression", Some(expression))] {
         let Some(source) = source else { continue };
         if source.len() > MAX_EXPRESSION_BYTES {
-            errors.push(format!(
-                "{label} exceeds {MAX_EXPRESSION_BYTES} bytes"
-            ));
+            errors.push(format!("{label} exceeds {MAX_EXPRESSION_BYTES} bytes"));
             continue;
         }
         match Program::compile(source) {

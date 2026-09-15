@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::id::NodeId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
 };
-use aruna_core::structs::identity::realm::RealmId;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::TransportAddrUsage;
 use iroh::{Endpoint, TransportAddr};
@@ -158,9 +158,7 @@ impl PeerManagerState {
                 node_id: peer.node_id,
                 consecutive_failures: peer.consecutive_failures,
                 last_error: peer.last_error.clone(),
-                retry_in_secs: Some(
-                    peer.next_attempt.saturating_duration_since(now).as_secs(),
-                ),
+                retry_in_secs: Some(peer.next_attempt.saturating_duration_since(now).as_secs()),
             })
             .collect()
     }

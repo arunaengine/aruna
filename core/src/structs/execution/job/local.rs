@@ -826,11 +826,7 @@ pub fn job_prune_key(retention_expiry_ms: u64, job_id: JobId) -> Key {
 /// Extract `(timestamp_ms, job_id)` from a `due/`, `lease/`, or `prune/` schedule
 /// index key.
 pub fn parse_schedule_key(key: &[u8]) -> Result<(u64, JobId), ConversionError> {
-    for prefix in [
-        DUE_INDEX_PREFIX,
-        LEASE_INDEX_PREFIX,
-        PRUNE_INDEX_PREFIX,
-    ] {
+    for prefix in [DUE_INDEX_PREFIX, LEASE_INDEX_PREFIX, PRUNE_INDEX_PREFIX] {
         if let Some(rest) = key.strip_prefix(prefix) {
             if rest.len() != 24 {
                 return Err(ConversionError::InvalidLength(format!(

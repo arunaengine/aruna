@@ -442,12 +442,7 @@ fn realm_config_detection() {
     };
     let reordered = QuotaConfig {
         group_overrides: expected.group_overrides.iter().cloned().rev().collect(),
-        group_cap_overrides: expected
-            .group_cap_overrides
-            .iter()
-            .cloned()
-            .rev()
-            .collect(),
+        group_cap_overrides: expected.group_cap_overrides.iter().cloned().rev().collect(),
         devices_per_user: Some(6),
         ..expected.clone()
     };
@@ -565,11 +560,7 @@ fn realm_settings_discovery() {
         Some(metadata_replication)
     );
     assert_eq!(state.materialized_realm_discovery(), None);
-    assert!(
-        !state
-            .conflicts
-            .contains_key(METADATA_REPLICATION_PATH)
-    );
+    assert!(!state.conflicts.contains_key(METADATA_REPLICATION_PATH));
     let conflict = state
         .conflicts
         .get(CONFIG_DISCOVERY_PATH)

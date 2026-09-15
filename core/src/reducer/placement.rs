@@ -10,9 +10,7 @@ pub fn overlay_placement(
     if reducer_state
         .user_subject_ids
         .contains_key(CONFIG_STRATEGY_PATH)
-        || reducer_state
-            .conflicts
-            .contains_key(CONFIG_STRATEGY_PATH)
+        || reducer_state.conflicts.contains_key(CONFIG_STRATEGY_PATH)
     {
         config.default_strategy_id = reducer_state.materialized_default_strategy();
     }
@@ -701,10 +699,12 @@ impl AdminDocumentState {
                         plan.old_holders.contains(&reported_by)
                             && !plan.target_holders.contains(&reported_by)
                     }) {
-                        transition.drained.push(crate::structs::placement::placement_transition::BucketDrain {
-                            bucket,
-                            reported_by,
-                        });
+                        transition.drained.push(
+                            crate::structs::placement::placement_transition::BucketDrain {
+                                bucket,
+                                reported_by,
+                            },
+                        );
                     }
                 }
             }

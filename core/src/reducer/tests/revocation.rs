@@ -182,11 +182,7 @@ fn compaction_canonicalizes() {
     assert!(state.equivalent_value_dots.is_empty());
     assert!(!state.applied_event_ids.contains(&equal.event_id));
     assert!(!state.applied_event_ids.contains(&shorter.event_id));
-    assert!(
-        state
-            .conflicts
-            .contains_key(super::CONFIG_DESCRIPTION_PATH)
-    );
+    assert!(state.conflicts.contains_key(super::CONFIG_DESCRIPTION_PATH));
     assert!(
         state
             .applied_event_ids

@@ -3,7 +3,7 @@ use crate::NodeId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{DocumentEvent, DocumentTarget};
 use crate::errors::ConversionError;
-use crate::keyspaces::{SYNC_QUARANTINE_KEYSPACE, QUARANTINE_USAGE_KEYSPACE};
+use crate::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use crate::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use irokle::{ActorId, TopicId};
@@ -365,8 +365,8 @@ mod tests {
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
     use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use crate::structs::identity::auth::Actor;
-    use crate::structs::placement::placement_record::PlacementRef;
     use crate::structs::identity::realm::RealmId;
+    use crate::structs::placement::placement_record::PlacementRef;
 
     fn node() -> NodeId {
         NodeId::from_bytes(&[1u8; 32]).unwrap()

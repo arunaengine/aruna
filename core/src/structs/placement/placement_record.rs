@@ -1,6 +1,6 @@
 use crate::NodeId;
-use crate::structs::placement::handle_allocation::HandleRangeDirectory;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::placement::handle_allocation::HandleRangeDirectory;
 use crate::structured_id::PlacementHandle;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
