@@ -728,7 +728,10 @@ impl SessionRegistry {
         backend: Arc<dyn ExecutorBackend>,
         fence: FenceContext,
     ) -> Arc<Session> {
-        if let Some(existing) = self.get(&config.job_id) {
+        // An ended session of the same job is a previous attempt; replace it.
+        if let Some(existing) = self.get(&config.job_id)
+            && !existing.done.is_cancelled()
+        {
             return existing;
         }
         let (session, requests) = build_session(config);
@@ -737,8 +740,15 @@ impl SessionRegistry {
         }
         tokio::spawn(pump(session.clone(), backend, fence, requests));
         tokio::spawn(idle_watch(session.clone()));
-        tokio::spawn(forget(self.clone(), session.clone()));
         session
+    }
+
+    /// Drops a session once its job is finished, so an ended session still
+    /// answers state, replay and end calls while the job tears down.
+    pub fn close(&self, job_id: &str) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.remove(job_id);
+        }
     }
 
     /// Registers a session without a channel. Only tests use it; production
@@ -796,15 +806,6 @@ fn build_session(config: SessionConfig) -> (Arc<Session>, mpsc::Receiver<HelperR
         done: CancellationToken::new(),
     });
     (session, receiver)
-}
-
-/// Drops the session from the registry once it has ended, so a later job of the
-/// same id starts clean.
-async fn forget(registry: Arc<SessionRegistry>, session: Arc<Session>) {
-    session.finished().await;
-    if let Ok(mut sessions) = registry.sessions.lock() {
-        sessions.remove(session.job_id());
-    }
 }
 
 /// Ends the session once it has gone without a submit for its idle wait.
