@@ -2,6 +2,7 @@
 //! channel to its helper, the event log a client resumes from, and its idle
 //! timer.
 
+#[path = "session_events.rs"]
 pub mod events;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -1025,4 +1026,5 @@ fn deadline_ms(deadline: Instant) -> u64 {
 }
 
 #[cfg(test)]
+#[path = "session_tests.rs"]
 mod tests;

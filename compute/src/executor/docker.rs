@@ -49,8 +49,11 @@ const NON_REGULAR_MODES: u32 =
 /// only stops an archive that never ends.
 const MAX_LISTING_SCAN_BYTES: u64 = 1024 * MAX_TRANSFER_BYTES;
 
+#[path = "docker_archive.rs"]
 mod archive;
+#[path = "docker_control.rs"]
 mod control;
+#[path = "docker_session.rs"]
 mod session;
 
 use archive::{
