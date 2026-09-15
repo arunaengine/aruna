@@ -1,5 +1,5 @@
 use super::LocationSummaryError;
-use crate::replication::queue::BlobReplicationJobRecord;
+use crate::replication::queue::BlobJobRecord;
 use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
@@ -36,7 +36,7 @@ pub struct QueuedReplicas {
 /// copies a caller must see as `pending`: no location record for them exists
 /// anywhere yet, so nothing else would report them.
 #[derive(Debug, PartialEq)]
-pub struct QueuedReplicaNodesOperation {
+pub struct QueuedNodesOperation {
     bucket: String,
     key: String,
     version_id: Ulid,
@@ -47,7 +47,7 @@ pub struct QueuedReplicaNodesOperation {
     output: Option<Result<QueuedReplicas, LocationSummaryError>>,
 }
 
-impl QueuedReplicaNodesOperation {
+impl QueuedNodesOperation {
     pub fn new(bucket: String, key: String, version_id: Ulid, delete_marker: bool) -> Self {
         Self {
             bucket,
@@ -97,7 +97,7 @@ impl QueuedReplicaNodesOperation {
     }
 }
 
-impl Operation for QueuedReplicaNodesOperation {
+impl Operation for QueuedNodesOperation {
     type Output = QueuedReplicas;
     type Error = LocationSummaryError;
 
@@ -122,7 +122,7 @@ impl Operation for QueuedReplicaNodesOperation {
                     return smallvec![];
                 };
                 for (_, value) in values {
-                    let Ok(record) = BlobReplicationJobRecord::from_bytes(value.as_ref()) else {
+                    let Ok(record) = BlobJobRecord::from_bytes(value.as_ref()) else {
                         self.found.skipped = self.found.skipped.saturating_add(1);
                         continue;
                     };
@@ -158,16 +158,16 @@ impl Operation for QueuedReplicaNodesOperation {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::QueuedReplicaNodesOperation;
-    use crate::replication::queue::BlobReplicationJobRecord;
+    use super::QueuedNodesOperation;
+    use crate::replication::queue::BlobJobRecord;
     use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
-    use crate::tests::fixtures::locations::{auth, node_id};
+    use crate::tests::locations::{auth, node_id};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
     use ulid::Ulid;
 
-    fn job(target: ReplicateScopeTarget, target_node: NodeId) -> BlobReplicationJobRecord {
+    fn job(target: ReplicateScopeTarget, target_node: NodeId) -> BlobJobRecord {
         marker_job(target, target_node, true)
     }
 
@@ -175,8 +175,8 @@ mod pure_tests {
         target: ReplicateScopeTarget,
         target_node: NodeId,
         markers: bool,
-    ) -> BlobReplicationJobRecord {
-        BlobReplicationJobRecord::new(
+    ) -> BlobJobRecord {
+        BlobJobRecord::new(
             ReplicateScopeInput {
                 bucket: "raw".to_string(),
                 target,
@@ -194,7 +194,7 @@ mod pure_tests {
     fn skips_declined_markers() {
         // A scoped job that skips delete markers will skip this version, so
         // reporting its target pending would promise a copy never coming.
-        let mut operation = QueuedReplicaNodesOperation::new(
+        let mut operation = QueuedNodesOperation::new(
             "raw".to_string(),
             "run1.tar".to_string(),
             Ulid::from_bytes([3u8; 16]),
@@ -220,12 +220,8 @@ mod pure_tests {
     fn names_queued_nodes() {
         let version_id = Ulid::from_bytes([3u8; 16]);
         let wanted = node_id(6);
-        let mut operation = QueuedReplicaNodesOperation::new(
-            "raw".to_string(),
-            "run1.tar".to_string(),
-            version_id,
-            false,
-        );
+        let mut operation =
+            QueuedNodesOperation::new("raw".to_string(), "run1.tar".to_string(), version_id, false);
         operation.start();
 
         operation.step(Event::Storage(StorageEvent::IterResult {
@@ -263,7 +259,7 @@ mod pure_tests {
     fn counts_skipped_records() {
         // A record that will not decode may name a node; the scan is then not
         // an exhaustive answer and must say so.
-        let mut operation = QueuedReplicaNodesOperation::new(
+        let mut operation = QueuedNodesOperation::new(
             "raw".to_string(),
             "run1.tar".to_string(),
             Ulid::from_bytes([3u8; 16]),
@@ -286,7 +282,7 @@ mod pure_tests {
         // A capped scan must not look like an exhausted one: a queued copy past
         // the cap is otherwise indistinguishable from absent.
         let wanted = node_id(6);
-        let mut operation = QueuedReplicaNodesOperation::new(
+        let mut operation = QueuedNodesOperation::new(
             "raw".to_string(),
             "run1.tar".to_string(),
             Ulid::from_bytes([3u8; 16]),
