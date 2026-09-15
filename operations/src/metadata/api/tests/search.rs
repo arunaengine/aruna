@@ -1,5 +1,9 @@
 use super::*;
 
+use super::super::search::{
+    ObjectSearchPartitions, ObjectSearchPlan, assemble_object_execution, plan_object_search,
+};
+
 #[tokio::test]
 async fn bucket_fanout_partial() {
     let directory = tempdir().unwrap();
@@ -307,4 +311,152 @@ async fn capped_fanout_incomplete() {
     .await;
 
     assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
+}
+
+fn object_search_request(realm_id: RealmId, query: &str, limit: usize) -> ObjectSearchRequest {
+    ObjectSearchRequest {
+        auth: AuthContext {
+            user_id: UserId::nil(realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        bearer_token: None,
+        query: query.to_string(),
+        key_match: ObjectKeyMatch::Substring,
+        bucket: None,
+        limit,
+        cursor: None,
+        mode: ObjectSearchQueryMode::Local,
+        target_nodes: None,
+    }
+}
+
+#[test]
+fn object_search_plan_scopes_and_clamps_limit() {
+    let realm_id = RealmId::from_bytes([70u8; 32]);
+    assert!(matches!(
+        plan_object_search(realm_id, object_search_request(realm_id, "", 10)),
+        Err(MetadataApiError::BadRequest)
+    ));
+    assert!(matches!(
+        plan_object_search(
+            realm_id,
+            object_search_request(RealmId::from_bytes([71u8; 32]), "query", 10)
+        ),
+        Err(MetadataApiError::Forbidden)
+    ));
+
+    let plan = plan_object_search(realm_id, object_search_request(realm_id, "query", 0))
+        .expect("zero limit clamps");
+    assert_eq!(plan.limit, 1);
+    let plan = plan_object_search(
+        realm_id,
+        object_search_request(realm_id, "query", usize::MAX),
+    )
+    .expect("large limit clamps");
+    assert_eq!(
+        plan.limit,
+        crate::s3::search_objects::OBJECT_SEARCH_MAX_LIMIT
+    );
+}
+
+#[test]
+fn object_search_assembly_keeps_partition_order_and_empty_pages() {
+    let realm_id = RealmId::from_bytes([72u8; 32]);
+    let test = metadata_test();
+    let first = iroh::SecretKey::from_bytes(&[73u8; 32]).public();
+    let second = iroh::SecretKey::from_bytes(&[74u8; 32]).public();
+    let plan = ObjectSearchPlan {
+        auth: AuthContext {
+            user_id: UserId::nil(realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        bearer_token: None,
+        query: "query".to_string(),
+        key_match: ObjectKeyMatch::Substring,
+        bucket: None,
+        limit: 10,
+        cursor: None,
+        mode: ObjectSearchQueryMode::DistributedBestEffort,
+        target_nodes: None,
+        fingerprint: [7u8; 32],
+    };
+    let partitions = ObjectSearchPartitions {
+        as_of: SystemTime::UNIX_EPOCH,
+        partitions: vec![
+            ObjectSearchPartitionState {
+                node_id: first,
+                start_after: None,
+                exhausted: false,
+                observed_at: None,
+            },
+            ObjectSearchPartitionState {
+                node_id: second,
+                start_after: None,
+                exhausted: false,
+                observed_at: None,
+            },
+        ],
+        failed_partitions: Vec::new(),
+        discovery_failed: false,
+        omitted_partitions: 0,
+    };
+    let page = |node_id, key: Option<&str>| ObjectSearchNodePage {
+        hits: key
+            .map(|key| {
+                vec![crate::s3::search_objects::ObjectSearchNodeHit {
+                    hit: ObjectInventoryHit {
+                        node_id,
+                        group_id: Ulid::nil(),
+                        bucket: "bucket".to_string(),
+                        key: key.to_string(),
+                        content_w3id: None,
+                        checksum: None,
+                        size: None,
+                        updated_at: None,
+                    },
+                    cursor_key: key.as_bytes().to_vec(),
+                }]
+            })
+            .unwrap_or_default(),
+        next_start_after: None,
+        observed_at: SystemTime::UNIX_EPOCH,
+    };
+    let execution = assemble_object_execution(
+        &test.context,
+        &plan,
+        partitions,
+        vec![
+            (first, page(first, Some("a"))),
+            (second, page(second, None)),
+        ],
+        MetadataFanoutStats {
+            nodes_queried: 2,
+            nodes_failed: 0,
+            failed_partitions: Vec::new(),
+            discovery_failed: false,
+        },
+    )
+    .expect("exhausted partitions assemble without a net handle");
+
+    assert_eq!(
+        execution
+            .hits
+            .iter()
+            .map(|hit| hit.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a"]
+    );
+    assert_eq!(execution.partitions.len(), 2);
+    assert!(
+        execution
+            .partitions
+            .iter()
+            .all(|partition| !partition.truncated)
+    );
+    assert!(execution.complete);
+    assert!(execution.next_cursor.is_none());
 }
