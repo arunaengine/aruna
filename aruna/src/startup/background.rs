@@ -51,11 +51,9 @@ pub(crate) enum StartupPhase {
     RecoverChild,
 }
 
-/// The order the node starts its durable background work. Readiness is
-/// announced only once both listeners are bound and the local safety gate is
-/// satisfied; stale-job recovery runs before the job runtime admits work; and
-/// durable queues start before their restored timers. A change here is a
-/// startup behavior change, not a side effect of refactoring.
+/// The order the node starts its durable background work. Readiness requires
+/// both listeners bound and the safety gate; stale-job recovery precedes job
+/// admission, and queues precede their restored timers. A change is behavior.
 pub(crate) const STARTUP_PHASES: &[StartupPhase] = &[
     StartupPhase::Ready,
     StartupPhase::CorePublication,
@@ -76,16 +74,16 @@ pub(crate) enum BackgroundOutcome {
     /// Readiness was announced and the phase sequence completed. An optional
     /// listener exit is reported without abandoning later phases.
     Started,
-    /// A stop was accepted; no background work was admitted.
+    /// A stop was accepted before the phase sequence completed; no later
+    /// phase was admitted.
     Cancelled,
     /// A listener whose loss stops the node exited; the sequence stopped.
     RequiredListenerFailed(Service),
 }
 
-/// Runs the background start, applying the steady-state supervision policy to
-/// any finished ingress listener between phases. An optional exit is reported
-/// and the required phases continue; a required exit stops the sequence and is
-/// returned for the caller's failure path.
+/// Runs the background start, applying steady-state supervision to any
+/// finished ingress listener between phases: an optional exit is reported and
+/// required phases continue; a required exit stops the sequence and returns.
 pub(crate) async fn start(
     background: Background,
     stop: &tokio_util::sync::CancellationToken,
@@ -112,7 +110,7 @@ pub(crate) async fn start(
     } = core_announcement;
     let mut core_documents = Some(documents);
     let mut task_queues = Some(task_queues);
-    let mut ready_announced = false;
+    let mut completed_all_phases = true;
 
     for phase in STARTUP_PHASES {
         // The supervision policy applies here exactly as it does in steady
@@ -132,13 +130,13 @@ pub(crate) async fn start(
         }
         // A stop accepted while an earlier phase ran must not admit more work.
         if stop.is_cancelled() {
+            completed_all_phases = false;
             break;
         }
         on_phase(*phase);
         match phase {
             StartupPhase::Ready => {
                 readiness.set_ready();
-                ready_announced = true;
             }
             StartupPhase::CorePublication => {
                 let documents = core_documents
@@ -161,7 +159,9 @@ pub(crate) async fn start(
             }
             StartupPhase::RecoverStaleJobs => {
                 if let Err(error) = jobs_runtime
-                    .recover_stale_jobs(&driver_ctx.storage_handle)
+                    .recover_stale_jobs_until(&driver_ctx.storage_handle, stop, || {
+                        matches!(observed_exit(), Some((_, ServiceExit::StopsNode)))
+                    })
                     .await
                 {
                     warn!(error = %error, "Failed to recover stale jobs at startup");
@@ -170,7 +170,11 @@ pub(crate) async fn start(
             StartupPhase::StartJobRuntime => jobs_runtime.start(),
             StartupPhase::StartTaskQueues => {
                 let task_queues = task_queues.take().expect("task queues start exactly once");
-                task_queues.restore_timers_and_start(&shutdown).await;
+                task_queues
+                    .restore_timers_and_start_until(&shutdown, stop, || {
+                        matches!(observed_exit(), Some((_, ServiceExit::StopsNode)))
+                    })
+                    .await;
             }
             StartupPhase::RestoreDrainTimer => {
                 restore_drain_timer(&driver_ctx.storage_handle, &task_handle).await;
@@ -198,7 +202,7 @@ pub(crate) async fn start(
             }
         }
     }
-    if ready_announced {
+    if completed_all_phases {
         BackgroundOutcome::Started
     } else {
         BackgroundOutcome::Cancelled
