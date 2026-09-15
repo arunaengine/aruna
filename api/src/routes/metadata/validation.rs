@@ -1,17 +1,16 @@
 //! Metadata profile validation routes: thin request-to-operation conversion
 //! over the shared `crate::metadata` adapter.
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
+use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::{
-    ProfileValidationCapabilitiesResponse, ProfileValidationPreviewRequest,
-    ProfileValidationPreviewResponse, ProfileValidationStatusResponse, ensure_metadata_scope,
-    forwarded_auth_token, map_api_error, map_metadata_error, parse_document_id,
-    serialize_jsonld_object,
+    ProfileCapabilitiesResponse, ProfilePreviewRequest, ProfilePreviewResponse,
+    ProfileValidationResponse, ensure_metadata_scope, forwarded_auth_token, map_api_error,
+    map_metadata_error, parse_document_id, serialize_jsonld_object,
 };
 use crate::server_state::ServerState;
 use aruna_core::structs::{AuthContext, Permission};
-use aruna_operations::metadata::api::GetVisibleMetadataDocumentRequest;
+use aruna_operations::metadata::api::GetVisibleRequest;
 use aruna_operations::metadata::forward::route_profile_status as run_profile_validation_status;
 use aruna_operations::metadata::profile_validation::{
     SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name, preview_submission as run_preview_submission,
@@ -54,7 +53,7 @@ use std::sync::Arc;
     responses((
         status = 200,
         description = "Evaluator identity, exact supported constraints, fail-closed policy, and accepted Profile IRI forms",
-        body = ProfileValidationCapabilitiesResponse,
+        body = ProfileCapabilitiesResponse,
         example = json!({
             "evaluator": "craqle-shacl-core/0.2",
             "supported_constraints": [
@@ -76,11 +75,10 @@ use std::sync::Arc;
         })
     ))
 )]
-pub async fn profile_validation_capabilities()
--> (StatusCode, Json<ProfileValidationCapabilitiesResponse>) {
+pub async fn profile_validation_capabilities() -> (StatusCode, Json<ProfileCapabilitiesResponse>) {
     (
         StatusCode::OK,
-        Json(ProfileValidationCapabilitiesResponse {
+        Json(ProfileCapabilitiesResponse {
             evaluator: evaluator_name().to_string(),
             supported_constraints: SUPPORTED_PROFILE_CONSTRAINTS
                 .iter()
@@ -125,7 +123,7 @@ metadata path, because the group's own Profiles resolve for it.
   when limits, remote-only objects or unavailable authorization prevent a complete check;
   an empty list then does not establish public readability. `group_id` identifies the owning
   group for each caller-readable permission path."#,
-    request_body(content = ProfileValidationPreviewRequest,
+    request_body(content = ProfilePreviewRequest,
         example = json!({
             "group_id": "01JGROUP00000000000000000",
             "public": true,
@@ -152,7 +150,7 @@ metadata path, because the group's own Profiles resolve for it.
             }
         })),
     responses(
-        (status = 200, description = "Verdict for the draft, including structural violations and Profile findings", body = ProfileValidationPreviewResponse,
+        (status = 200, description = "Verdict for the draft, including structural violations and Profile findings", body = ProfilePreviewResponse,
             example = json!({
                 "accepted": false,
                 "state": "invalid",
@@ -195,8 +193,8 @@ metadata path, because the group's own Profiles resolve for it.
 pub async fn preview_profile_validation(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Json(request): Json<ProfileValidationPreviewRequest>,
-) -> ServerResult<(StatusCode, Json<ProfileValidationPreviewResponse>)> {
+    Json(request): Json<ProfilePreviewRequest>,
+) -> ServerResult<(StatusCode, Json<ProfilePreviewResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = request
         .group_id
@@ -213,7 +211,7 @@ pub async fn preview_profile_validation(
     let preview = run_preview_submission(&context, group_id, &jsonld)
         .await
         .map_err(map_metadata_error)?;
-    let mut response = ProfileValidationPreviewResponse::from(preview);
+    let mut response = ProfilePreviewResponse::from(preview);
     if request.public {
         response.set_restricted(
             run_restricted_files(
@@ -246,7 +244,7 @@ apply.
   changes."#,
     params(("document_id" = String, Path, description = "Metadata document id")),
     responses(
-        (status = 200, description = "Current, invalid, unprofiled, or stale revision-bound validation status", body = ProfileValidationStatusResponse,
+        (status = 200, description = "Current, invalid, unprofiled, or stale revision-bound validation status", body = ProfileValidationResponse,
             example = json!({
                 "document_id": "01JMETADATA0123456789ABCDE",
                 "dataset_revision": "01JREVISION000000000000000",
@@ -282,14 +280,14 @@ apply.
 pub async fn get_validation_status(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
-) -> ServerResult<(StatusCode, Json<ProfileValidationStatusResponse>)> {
+) -> ServerResult<(StatusCode, Json<ProfileValidationResponse>)> {
     let document_id = parse_document_id(&document_id)?;
     let status = run_profile_validation_status(
         &state.get_ctx(),
         state.get_realm_id(),
-        GetVisibleMetadataDocumentRequest { document_id, auth },
+        GetVisibleRequest { document_id, auth },
         forwarded_auth_token(bearer_token)?,
         false,
     )
@@ -313,7 +311,7 @@ pub async fn get_validation_status(
 - Fences the Dataset revision and durably replaces the stored status."#,
     params(("document_id" = String, Path, description = "Metadata document id")),
     responses(
-        (status = 200, description = "Fresh valid, invalid, or unprofiled status", body = ProfileValidationStatusResponse,
+        (status = 200, description = "Fresh valid, invalid, or unprofiled status", body = ProfileValidationResponse,
             example = json!({
                 "document_id": "01JMETADATA0123456789ABCDE",
                 "dataset_revision": "01JREVISION000000000000000",
@@ -338,15 +336,15 @@ pub async fn get_validation_status(
 pub async fn revalidate_profile(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
-) -> ServerResult<(StatusCode, Json<ProfileValidationStatusResponse>)> {
+) -> ServerResult<(StatusCode, Json<ProfileValidationResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let status = run_profile_validation_status(
         &state.get_ctx(),
         state.get_realm_id(),
-        GetVisibleMetadataDocumentRequest {
+        GetVisibleRequest {
             document_id,
             auth: Some(auth),
         },

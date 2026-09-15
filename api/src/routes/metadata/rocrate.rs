@@ -2,28 +2,27 @@
 //! `crate::metadata` adapter.
 
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission_with, require_realm_auth,
-    require_unrestricted_auth,
+    ValidatedBearer, ensure_permission_with, require_realm_auth, require_unrestricted_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
-    JsonLdObject, MetadataDocumentSummary, MetadataRoCrateExportParams, MetadataRoCrateResponse,
-    MetadataRoCrateView, ReplaceMetadataRoCrateRequest, SubmitRoCrateExportRequest,
-    SubmitRoCrateExportResponse, forwarded_auth_token, load_document_record, local_write_record,
-    map_api_error, map_export_response, map_export_view, map_write_error, parse_document_id,
+    JsonLdObject, MetadataDocumentSummary, MetadataRoCrateResponse, MetadataRoCrateView,
+    ReplaceRoCrateRequest, RoCrateExportParams, SubmitExportRequest, SubmitExportResponse,
+    forwarded_auth_token, load_document_record, local_write_record, map_api_error,
+    map_export_response, map_export_view, map_write_error, parse_document_id,
     serialize_jsonld_object,
 };
-use crate::routes::jobs::{job_urls, map_submit_error};
+use crate::routes::execution::jobs::{job_urls, map_submit_error};
 use crate::server_state::ServerState;
 use aruna_core::structs::{Actor, AuthContext, ExportRoCrateSpec, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::jobs::service::submit_export_job;
-use aruna_operations::metadata::api::ExportMetadataRoCrateRequest;
+use aruna_operations::metadata::api::ExportMetadataRequest;
 use aruna_operations::metadata::forward::{
     export_rocrate_routed as run_export_rocrate,
     route_metadata_update as run_update_metadata_document,
 };
-use aruna_operations::metadata::update_document::UpdateMetadataDocumentMutation;
+use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -182,9 +181,9 @@ truncated."#,
 pub async fn export_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
-    Query(params): Query<MetadataRoCrateExportParams>,
+    Query(params): Query<RoCrateExportParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataRoCrateResponse>)> {
     let document_id = parse_document_id(&document_id)?;
     let view = params.view.clone().unwrap_or(MetadataRoCrateView::Full);
@@ -192,7 +191,7 @@ pub async fn export_metadata_rocrate(
     let export = run_export_rocrate(
         &ctx,
         state.get_realm_id(),
-        ExportMetadataRoCrateRequest {
+        ExportMetadataRequest {
             document_id,
             auth,
             view: map_export_view(&view),
@@ -229,7 +228,7 @@ registry view. A path-restricted delegated token is refused even when it would p
   returns the same job with `created` false, while reusing it for a different document conflicts."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
-        content = SubmitRoCrateExportRequest,
+        content = SubmitExportRequest,
         description = "Optional idempotency key, scoped to the calling user. Rejects unknown fields; an empty object submits a new job unconditionally.",
         example = json!({
             "idempotency_key": "export-run-42-2026-04-09"
@@ -239,7 +238,7 @@ registry view. A path-restricted delegated token is refused even when it would p
         (
             status = 202,
             description = "Export job durably accepted and queued on this node; `created` is false when an existing job was replayed",
-            body = SubmitRoCrateExportResponse,
+            body = SubmitExportResponse,
             examples(
                 (
                     "Accepted" = (
@@ -268,8 +267,8 @@ pub async fn submit_rocrate_export(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(document_id): Path<String>,
-    Json(request): Json<SubmitRoCrateExportRequest>,
-) -> ServerResult<(StatusCode, Json<SubmitRoCrateExportResponse>)> {
+    Json(request): Json<SubmitExportRequest>,
+) -> ServerResult<(StatusCode, Json<SubmitExportResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let record = load_document_record(&state, document_id).await?;
@@ -296,7 +295,7 @@ pub async fn submit_rocrate_export(
     let urls = job_urls(&state, result.job_id).await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(SubmitRoCrateExportResponse {
+        Json(SubmitExportResponse {
             job_id: result.job_id.to_string(),
             created: result.created,
             owner_node_url: urls.owner_node_url,
@@ -326,7 +325,7 @@ caller's own token.
   searchable or present on every replica yet."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
-        content = ReplaceMetadataRoCrateRequest,
+        content = ReplaceRoCrateRequest,
         description = "The full replacement RO-Crate with a 1.2 or 1.3 context and specification IRI; the submitted version is preserved. Use the entity routes for small incremental changes. Omitting public keeps the current visibility.",
         examples(
             (
@@ -392,9 +391,9 @@ caller's own token.
 pub async fn replace_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
-    Json(request): Json<ReplaceMetadataRoCrateRequest>,
+    Json(request): Json<ReplaceRoCrateRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
@@ -411,7 +410,7 @@ pub async fn replace_metadata_rocrate(
         record.as_ref(),
         document_id,
         request.public,
-        UpdateMetadataDocumentMutation::ReplaceRoCrate {
+        UpdateDocumentMutation::ReplaceRoCrate {
             jsonld: serialize_jsonld_object(&request.rocrate)?,
         },
         forwarded_auth_token(bearer_token)?,
@@ -499,7 +498,7 @@ caller's own token.
 pub async fn add_data_entity(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
@@ -518,7 +517,7 @@ pub async fn add_data_entity(
         record.as_ref(),
         document_id,
         None,
-        UpdateMetadataDocumentMutation::UpsertDataEntity {
+        UpdateDocumentMutation::UpsertDataEntity {
             jsonld: serialize_jsonld_entity(&entity)?,
         },
         forwarded_auth_token(bearer_token)?,
@@ -603,7 +602,7 @@ caller's own token.
 pub async fn add_contextual_entity(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
@@ -622,7 +621,7 @@ pub async fn add_contextual_entity(
         record.as_ref(),
         document_id,
         None,
-        UpdateMetadataDocumentMutation::UpsertContextualEntity {
+        UpdateDocumentMutation::UpsertContextualEntity {
             jsonld: serialize_jsonld_entity(&entity)?,
         },
         forwarded_auth_token(bearer_token)?,
