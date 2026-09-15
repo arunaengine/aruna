@@ -1,11 +1,11 @@
 use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
 use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
-use crate::s3::copy_object::{CopySourceConditions, evaluate_source_conditions};
-use crate::s3::get_object::{
+use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
+use crate::s3::object::copy::{CopySourceConditions, evaluate_source_conditions};
+use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, ObjectRangeRequest,
 };
 use crate::s3::purge_fence::ensure_write_allowed;
-use crate::s3::upload_part::{UploadPartError, UploadPartInput, UploadPartOperation};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_MULTIPART_UPLOAD_KEYSPACE;
@@ -21,7 +21,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UploadPartCopyInput {
+pub struct PartCopyInput {
     pub source_bucket: String,
     pub source_key: String,
     pub source_version_id: Option<Ulid>,
@@ -38,14 +38,14 @@ pub struct UploadPartCopyInput {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct UploadPartCopyResultData {
+pub struct PartCopyResult {
     pub part_location: BackendLocation,
     pub source_version_id: Option<Ulid>,
     pub source_last_modified: Option<SystemTime>,
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum UploadPartCopyError {
+pub enum PartCopyError {
     #[error(transparent)]
     Get(#[from] GetObjectError),
     #[error(transparent)]
@@ -60,11 +60,11 @@ pub enum UploadPartCopyError {
 
 pub async fn upload_part_copy(
     context: &DriverContext,
-    input: UploadPartCopyInput,
-) -> Result<UploadPartCopyResultData, UploadPartCopyError> {
+    input: PartCopyInput,
+) -> Result<PartCopyResult, PartCopyError> {
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
-        .map_err(|error| UploadPartCopyError::UploadPart(UploadPartError::PurgeFence(error)))?;
+        .map_err(|error| PartCopyError::UploadPart(UploadPartError::PurgeFence(error)))?;
     let destination_upload = validate_destination_upload(context, &input).await?;
 
     let source = drive(
@@ -114,7 +114,7 @@ pub async fn upload_part_copy(
     )
     .is_err()
     {
-        return Err(UploadPartCopyError::PreconditionFailed);
+        return Err(PartCopyError::PreconditionFailed);
     }
 
     // No byte of a governed source lands here before this node is admitted for
@@ -159,7 +159,7 @@ pub async fn upload_part_copy(
     )
     .await?;
 
-    Ok(UploadPartCopyResultData {
+    Ok(PartCopyResult {
         part_location: part.location,
         source_version_id,
         source_last_modified,
@@ -173,7 +173,7 @@ async fn gate_part(
     realm_id: RealmId,
     refs: &[PlacementPolicyRef],
     group_id: GroupId,
-) -> Result<(), UploadPartCopyError> {
+) -> Result<(), PartCopyError> {
     let destination = gate_context(context, realm_id, now_ms()).await?;
     let Some(gate) =
         write_gate(destination.as_ref(), refs, Some(group_id)).map_err(UploadPartError::from)?
@@ -193,7 +193,7 @@ async fn store_source_policies(
     context: &DriverContext,
     upload_id: Ulid,
     policies: &[PlacementPolicyRef],
-) -> Result<(), UploadPartCopyError> {
+) -> Result<(), PartCopyError> {
     if policies.is_empty() {
         return Ok(());
     }
@@ -226,7 +226,7 @@ async fn merge_upload_policies(
     upload_id: Ulid,
     policies: &[PlacementPolicyRef],
     txn_id: aruna_core::types::TxnId,
-) -> Result<(), UploadPartCopyError> {
+) -> Result<(), PartCopyError> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -271,8 +271,8 @@ async fn merge_upload_policies(
 /// already stores, which the gate unions with the source's.
 async fn validate_destination_upload(
     context: &DriverContext,
-    input: &UploadPartCopyInput,
-) -> Result<MultipartUpload, UploadPartCopyError> {
+    input: &PartCopyInput,
+) -> Result<MultipartUpload, PartCopyError> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -284,31 +284,27 @@ async fn validate_destination_upload(
     let value = match event {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => {
-            return Err(UploadPartCopyError::UploadPart(
-                UploadPartError::StorageError(error),
-            ));
+            return Err(PartCopyError::UploadPart(UploadPartError::StorageError(
+                error,
+            )));
         }
         _ => {
-            return Err(UploadPartCopyError::UploadPart(
+            return Err(PartCopyError::UploadPart(
                 UploadPartError::InvalidOperationState,
             ));
         }
     };
     let Some(value) = value else {
-        return Err(UploadPartCopyError::UploadPart(
-            UploadPartError::NoSuchUpload,
-        ));
+        return Err(PartCopyError::UploadPart(UploadPartError::NoSuchUpload));
     };
     let record = MultipartUpload::from_bytes(value.as_ref()).map_err(UploadPartError::from)?;
     if record.bucket != input.dest_bucket || record.key != input.dest_key {
-        return Err(UploadPartCopyError::UploadPart(
+        return Err(PartCopyError::UploadPart(
             UploadPartError::UploadTargetMismatch,
         ));
     }
     if record.status != MultipartUploadStatus::Open {
-        return Err(UploadPartCopyError::UploadPart(
-            UploadPartError::UploadNotOpen,
-        ));
+        return Err(PartCopyError::UploadPart(UploadPartError::UploadNotOpen));
     }
     Ok(record)
 }
@@ -317,8 +313,8 @@ async fn validate_destination_upload(
 mod test {
     use super::*;
     use crate::driver::gate_context;
-    use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-    use crate::tests::fixtures::policy::{seed_gate, subject};
+    use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
     use aruna_core::effects::StorageEffect;
@@ -326,8 +322,8 @@ mod test {
     use aruna_core::keyspaces::{S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        Backend, BackendConfig, BackendRef, MultipartUpload, MultipartUploadPart,
-        MultipartUploadPartKey, MultipartUploadStatus, RealmId, RoutingSnapshot,
+        Backend, BackendConfig, BackendRef, MultipartPart, MultipartPartKey, MultipartUpload,
+        MultipartUploadStatus, RealmId, RoutingSnapshot,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -494,7 +490,7 @@ mod test {
 
         let result = upload_part_copy(
             &context,
-            UploadPartCopyInput {
+            PartCopyInput {
                 source_bucket: "bucket".to_string(),
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
@@ -524,7 +520,7 @@ mod test {
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
-                key: MultipartUploadPartKey::new(upload_id, 1)
+                key: MultipartPartKey::new(upload_id, 1)
                     .to_bytes()
                     .unwrap()
                     .into(),
@@ -534,8 +530,7 @@ mod test {
         else {
             panic!("missing part record");
         };
-        let part =
-            MultipartUploadPart::from_bytes(value.expect("missing part record").as_ref()).unwrap();
+        let part = MultipartPart::from_bytes(value.expect("missing part record").as_ref()).unwrap();
         assert_eq!(part.part_number, 1);
         assert_eq!(part.location.blob_size, 4);
         assert_eq!(part.location.created_by, user_id);
@@ -590,7 +585,7 @@ mod test {
 
         upload_part_copy(
             &context,
-            UploadPartCopyInput {
+            PartCopyInput {
                 source_bucket: "bucket".to_string(),
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
@@ -683,7 +678,7 @@ mod test {
 
         let error = upload_part_copy(
             &context,
-            UploadPartCopyInput {
+            PartCopyInput {
                 source_bucket: "bucket".to_string(),
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
@@ -704,17 +699,15 @@ mod test {
 
         assert_eq!(
             error,
-            UploadPartCopyError::UploadPart(UploadPartError::PolicyGateError(
-                PolicyGateError::Denied {
-                    policy_ids: vec![policy.policy_id]
-                }
-            ))
+            PartCopyError::UploadPart(UploadPartError::PolicyGateError(PolicyGateError::Denied {
+                policy_ids: vec![policy.policy_id]
+            }))
         );
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
-                key: MultipartUploadPartKey::new(upload_id, 1)
+                key: MultipartPartKey::new(upload_id, 1)
                     .to_bytes()
                     .unwrap()
                     .into(),
@@ -762,7 +755,7 @@ mod test {
 
         let error = upload_part_copy(
             &context,
-            UploadPartCopyInput {
+            PartCopyInput {
                 source_bucket: "missing-source".to_string(),
                 source_key: "missing.txt".to_string(),
                 source_version_id: None,
@@ -788,7 +781,7 @@ mod test {
 
         assert_eq!(
             error,
-            UploadPartCopyError::UploadPart(UploadPartError::NoSuchUpload)
+            PartCopyError::UploadPart(UploadPartError::NoSuchUpload)
         );
     }
 
@@ -815,7 +808,7 @@ mod test {
 
         let error = upload_part_copy(
             &context,
-            UploadPartCopyInput {
+            PartCopyInput {
                 source_bucket: "bucket".to_string(),
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
@@ -842,9 +835,6 @@ mod test {
         .await
         .unwrap_err();
 
-        assert_eq!(
-            error,
-            UploadPartCopyError::Get(GetObjectError::InvalidRange)
-        );
+        assert_eq!(error, PartCopyError::Get(GetObjectError::InvalidRange));
     }
 }

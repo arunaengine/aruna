@@ -10,8 +10,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BucketInfo, MultipartUpload, MultipartUploadChecksumHint, MultipartUploadStatus,
-    PlacementPolicyRef, ResolvedBackend, RoutingError, RoutingSnapshot, resolve_backend,
+    BucketInfo, MultipartChecksumHint, MultipartUpload, MultipartUploadStatus, PlacementPolicyRef,
+    ResolvedBackend, RoutingError, RoutingSnapshot, resolve_backend,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -21,7 +21,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CreateMultipartUploadState {
+pub enum CreateMultipartState {
     Init,
     ReadGateBucket,
     PolicyGate,
@@ -35,7 +35,7 @@ pub enum CreateMultipartUploadState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum CreateMultipartUploadError {
+pub enum CreateMultipartError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -44,7 +44,7 @@ pub enum CreateMultipartUploadError {
     TransactionMissing,
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: CreateMultipartUploadState,
+        state: CreateMultipartState,
         expected: &'static str,
         received: Event,
     },
@@ -63,26 +63,26 @@ pub enum CreateMultipartUploadError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateMultipartUploadInput {
+pub struct CreateMultipartInput {
     pub bucket: String,
     pub key: String,
     pub group_id: GroupId,
     pub created_by: UserId,
-    pub checksum_hint: Option<MultipartUploadChecksumHint>,
+    pub checksum_hint: Option<MultipartChecksumHint>,
     /// Routing inputs; the resolved backend is pinned on the upload record so
     /// every part and the composed object follow it.
     pub routing: RoutingSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateMultipartUploadResult {
+pub struct CreateMultipartResult {
     pub record: MultipartUpload,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CreateMultipartUploadOperation {
-    input: CreateMultipartUploadInput,
-    state: CreateMultipartUploadState,
+pub struct CreateMultipartOperation {
+    input: CreateMultipartInput,
+    state: CreateMultipartState,
     txn_id: Option<TxnId>,
     resolved: Option<ResolvedBackend>,
     record: Option<MultipartUpload>,
@@ -95,14 +95,14 @@ pub struct CreateMultipartUploadOperation {
     /// part and the completion inherit exactly what was evaluated here.
     stored_policies: Vec<PlacementPolicyRef>,
     stored_subject: u64,
-    output: Option<Result<CreateMultipartUploadResult, CreateMultipartUploadError>>,
+    output: Option<Result<CreateMultipartResult, CreateMultipartError>>,
 }
 
-impl CreateMultipartUploadOperation {
-    pub fn new(input: CreateMultipartUploadInput) -> Self {
+impl CreateMultipartOperation {
+    pub fn new(input: CreateMultipartInput) -> Self {
         Self {
             input,
-            state: CreateMultipartUploadState::Init,
+            state: CreateMultipartState::Init,
             txn_id: None,
             resolved: None,
             record: None,
@@ -127,8 +127,8 @@ impl CreateMultipartUploadOperation {
         self
     }
 
-    fn emit_error(&mut self, error: CreateMultipartUploadError) -> Effects {
-        self.state = CreateMultipartUploadState::Error;
+    fn emit_error(&mut self, error: CreateMultipartError) -> Effects {
+        self.state = CreateMultipartState::Error;
         self.output = Some(Err(error));
         self.abort()
     }
@@ -144,7 +144,7 @@ impl CreateMultipartUploadOperation {
         self.resolved = Some(resolved);
         // The destination default is read before the upload exists, so no part
         // can ever be written under a rule this node was never admitted for.
-        self.state = CreateMultipartUploadState::ReadGateBucket;
+        self.state = CreateMultipartState::ReadGateBucket;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: self.input.bucket.as_bytes().into(),
@@ -154,7 +154,7 @@ impl CreateMultipartUploadOperation {
 
     fn handle_gate_bucket(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
         };
         let bucket = match value
             .as_ref()
@@ -178,7 +178,7 @@ impl CreateMultipartUploadOperation {
                 let effects = gate.start();
                 let complete = gate.is_complete();
                 self.gate = Some(gate);
-                self.state = CreateMultipartUploadState::PolicyGate;
+                self.state = CreateMultipartState::PolicyGate;
                 match complete {
                     true => self.finish_gate(),
                     false => effects,
@@ -190,7 +190,7 @@ impl CreateMultipartUploadOperation {
 
     fn handle_policy_gate(&mut self, event: Event) -> Effects {
         let Some(gate) = self.gate.as_mut() else {
-            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
         };
         let effects = gate.step(event);
         match gate.is_complete() {
@@ -201,7 +201,7 @@ impl CreateMultipartUploadOperation {
 
     fn finish_gate(&mut self) -> Effects {
         let Some(gate) = self.gate.take() else {
-            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
         };
         let outcome = match gate.finalize() {
             Ok(outcome) => outcome,
@@ -220,7 +220,7 @@ impl CreateMultipartUploadOperation {
     }
 
     fn start_transaction(&mut self) -> Effects {
-        self.state = CreateMultipartUploadState::StartTransaction;
+        self.state = CreateMultipartState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -228,7 +228,7 @@ impl CreateMultipartUploadOperation {
 
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(CreateMultipartUploadError::InvalidStateEvent {
+            return self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
                 received: event,
@@ -236,7 +236,7 @@ impl CreateMultipartUploadOperation {
         };
 
         self.txn_id = Some(txn_id);
-        self.state = CreateMultipartUploadState::CheckPurgeFence;
+        self.state = CreateMultipartState::CheckPurgeFence;
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
 
@@ -245,11 +245,11 @@ impl CreateMultipartUploadOperation {
             return self.emit_error(error.into());
         }
         let Some(resolved) = self.resolved.as_ref() else {
-            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
         };
         match fence_backend(&resolved.backend, self.txn_id) {
             Some(effect) => {
-                self.state = CreateMultipartUploadState::FenceBackend;
+                self.state = CreateMultipartState::FenceBackend;
                 smallvec![effect]
             }
             None => self.write_upload(),
@@ -265,7 +265,7 @@ impl CreateMultipartUploadOperation {
 
     fn write_upload(&mut self) -> Effects {
         let Some((txn_id, resolved)) = self.txn_id.zip(self.resolved.take()) else {
-            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
         };
         let record = MultipartUpload {
             backend: resolved.backend,
@@ -289,7 +289,7 @@ impl CreateMultipartUploadOperation {
         };
 
         self.record = Some(record.clone());
-        self.state = CreateMultipartUploadState::WriteUpload;
+        self.state = CreateMultipartState::WriteUpload;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: record.upload_id.to_bytes().to_vec().into(),
@@ -300,7 +300,7 @@ impl CreateMultipartUploadOperation {
 
     fn handle_record_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(CreateMultipartUploadError::InvalidStateEvent {
+            return self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::WriteResult)",
                 received: event,
@@ -308,15 +308,15 @@ impl CreateMultipartUploadOperation {
         };
 
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(CreateMultipartUploadError::TransactionMissing);
+            return self.emit_error(CreateMultipartError::TransactionMissing);
         };
-        self.state = CreateMultipartUploadState::CommitTransaction;
+        self.state = CreateMultipartState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(CreateMultipartUploadError::InvalidStateEvent {
+            return self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received: event,
@@ -324,18 +324,18 @@ impl CreateMultipartUploadOperation {
         };
 
         let Some(record) = self.record.clone() else {
-            return self.emit_error(CreateMultipartUploadError::CreateMultipartUploadFailed);
+            return self.emit_error(CreateMultipartError::CreateMultipartUploadFailed);
         };
         self.txn_id = None;
-        self.state = CreateMultipartUploadState::Finish;
-        self.output = Some(Ok(CreateMultipartUploadResult { record }));
+        self.state = CreateMultipartState::Finish;
+        self.output = Some(Ok(CreateMultipartResult { record }));
         smallvec![]
     }
 }
 
-impl Operation for CreateMultipartUploadOperation {
-    type Output = CreateMultipartUploadResult;
-    type Error = CreateMultipartUploadError;
+impl Operation for CreateMultipartOperation {
+    type Output = CreateMultipartResult;
+    type Error = CreateMultipartError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -346,25 +346,23 @@ impl Operation for CreateMultipartUploadOperation {
             return self.emit_error(error.clone().into());
         }
         match self.state {
-            CreateMultipartUploadState::Init => self.handle_init(),
-            CreateMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),
-            CreateMultipartUploadState::PolicyGate => self.handle_policy_gate(event),
-            CreateMultipartUploadState::StartTransaction => self.handle_transaction_started(event),
-            CreateMultipartUploadState::CheckPurgeFence => self.fence_checked(event),
-            CreateMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
-            CreateMultipartUploadState::WriteUpload => self.handle_record_written(event),
-            CreateMultipartUploadState::CommitTransaction => {
-                self.handle_transaction_committed(event)
-            }
-            CreateMultipartUploadState::Finish => smallvec![],
-            CreateMultipartUploadState::Error => self.abort(),
+            CreateMultipartState::Init => self.handle_init(),
+            CreateMultipartState::ReadGateBucket => self.handle_gate_bucket(event),
+            CreateMultipartState::PolicyGate => self.handle_policy_gate(event),
+            CreateMultipartState::StartTransaction => self.handle_transaction_started(event),
+            CreateMultipartState::CheckPurgeFence => self.fence_checked(event),
+            CreateMultipartState::FenceBackend => self.handle_backend_fenced(event),
+            CreateMultipartState::WriteUpload => self.handle_record_written(event),
+            CreateMultipartState::CommitTransaction => self.handle_transaction_committed(event),
+            CreateMultipartState::Finish => smallvec![],
+            CreateMultipartState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            CreateMultipartUploadState::Finish | CreateMultipartUploadState::Error
+            CreateMultipartState::Finish | CreateMultipartState::Error
         )
     }
 
@@ -372,7 +370,7 @@ impl Operation for CreateMultipartUploadOperation {
         match self.output {
             Some(Ok(value)) => Ok(value),
             Some(Err(error)) => Err(error),
-            None => Err(CreateMultipartUploadError::NotFinished),
+            None => Err(CreateMultipartError::NotFinished),
         }
     }
 
@@ -387,23 +385,21 @@ impl Operation for CreateMultipartUploadOperation {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{
-        CreateMultipartUploadError, CreateMultipartUploadInput, CreateMultipartUploadOperation,
-    };
+    use super::{CreateMultipartError, CreateMultipartInput, CreateMultipartOperation};
     use crate::groups::backends::BackendFenceError;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        BackendCatalog, BackendRef, GroupBackendKind, GroupRoutingInputs, GroupStorageBackend,
+        BackendCatalog, BackendRef, GroupBackendKind, GroupRoutingInputs, GroupStorage,
         MultipartUpload, RoutingError, RoutingSnapshot, RoutingTarget, StorageRoutingRule,
     };
     use aruna_core::types::TxnId;
     use std::collections::BTreeSet;
     use ulid::Ulid;
 
-    fn input(snapshot: RoutingSnapshot) -> CreateMultipartUploadInput {
-        CreateMultipartUploadInput {
+    fn input(snapshot: RoutingSnapshot) -> CreateMultipartInput {
+        CreateMultipartInput {
             bucket: "bucket".to_string(),
             key: "archive/one".to_string(),
             group_id: snapshot.group_id,
@@ -449,7 +445,7 @@ mod pure_tests {
     #[test]
     fn pins_record_backend() {
         let snapshot = snapshot().with_bucket_rules(vec![rule("archive")]);
-        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        let mut operation = CreateMultipartOperation::new(input(snapshot));
         operation.start();
         operation.step(ungoverned_bucket());
 
@@ -471,7 +467,7 @@ mod pure_tests {
     fn missing_class_pins() {
         // The pin records where the parts actually land, not what was asked.
         let snapshot = snapshot().with_bucket_rules(vec![rule("glacier")]);
-        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        let mut operation = CreateMultipartOperation::new(input(snapshot));
         operation.start();
         operation.step(ungoverned_bucket());
 
@@ -497,7 +493,7 @@ mod pure_tests {
             default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
             backend_ids: BTreeSet::from([backend_id]),
         });
-        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        let mut operation = CreateMultipartOperation::new(input(snapshot));
         operation.start();
         operation.step(ungoverned_bucket());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
@@ -519,14 +515,14 @@ mod pure_tests {
         );
         assert!(matches!(
             operation.finalize(),
-            Err(CreateMultipartUploadError::BackendFenceError(
+            Err(CreateMultipartError::BackendFenceError(
                 BackendFenceError::Unavailable
             ))
         ));
     }
 
-    fn disabled(backend_id: Ulid) -> GroupStorageBackend {
-        GroupStorageBackend {
+    fn disabled(backend_id: Ulid) -> GroupStorage {
+        GroupStorage {
             backend_id,
             group_id: Ulid::from_bytes([7u8; 16]),
             name: "tenant".to_string(),
@@ -548,7 +544,7 @@ mod pure_tests {
             exact: false,
             target: RoutingTarget::Backend(BackendRef::Node("ghost".to_string())),
         }]);
-        let mut operation = CreateMultipartUploadOperation::new(input(snapshot));
+        let mut operation = CreateMultipartOperation::new(input(snapshot));
 
         let effects = operation.start();
 
@@ -556,7 +552,7 @@ mod pure_tests {
         assert!(operation.is_complete());
         assert!(matches!(
             operation.finalize(),
-            Err(CreateMultipartUploadError::RoutingFailed(
+            Err(CreateMultipartError::RoutingFailed(
                 RoutingError::UnknownBackend(_)
             ))
         ));
