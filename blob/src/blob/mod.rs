@@ -43,7 +43,7 @@ struct Connection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ControlPlaneTimeoutKind {
+enum ControlPlaneKind {
     Connection,
     Read,
     Write,

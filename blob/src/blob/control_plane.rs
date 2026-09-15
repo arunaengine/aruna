@@ -1,4 +1,4 @@
-use super::{BlobHandler, ControlPlaneTimeoutKind};
+use super::{BlobHandler, ControlPlaneKind};
 use crate::framing::{MAX_CONTROL_PLANE_FRAME, read_frame, write_frame};
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::errors::BlobError;
@@ -11,15 +11,15 @@ use tokio::time::timeout;
 use ulid::Ulid;
 
 pub(super) fn timeout_event(
-    kind: ControlPlaneTimeoutKind,
+    kind: ControlPlaneKind,
     action: &'static str,
     timeout: Duration,
 ) -> BlobEvent {
     let message = format!("control-plane timeout after {timeout:?} while {action}");
     let error = match kind {
-        ControlPlaneTimeoutKind::Connection => BlobError::ConnectionFailed(message),
-        ControlPlaneTimeoutKind::Read => BlobError::ReadError(message),
-        ControlPlaneTimeoutKind::Write => BlobError::WriteError(message),
+        ControlPlaneKind::Connection => BlobError::ConnectionFailed(message),
+        ControlPlaneKind::Read => BlobError::ReadError(message),
+        ControlPlaneKind::Write => BlobError::WriteError(message),
     };
     BlobEvent::Error(error)
 }
@@ -27,7 +27,7 @@ pub(super) fn timeout_event(
 pub(super) async fn with_timeout<F, T>(
     future: F,
     timeout_duration: Duration,
-    kind: ControlPlaneTimeoutKind,
+    kind: ControlPlaneKind,
     action: &'static str,
 ) -> Result<T, BlobEvent>
 where
@@ -47,7 +47,7 @@ pub(super) async fn send_replication_message(
     match with_timeout(
         message.send(sender),
         timeout_duration,
-        ControlPlaneTimeoutKind::Write,
+        ControlPlaneKind::Write,
         action,
     )
     .await
@@ -66,7 +66,7 @@ pub(super) async fn read_replication_message(
     match with_timeout(
         ReplicationMessage::read(receiver),
         timeout_duration,
-        ControlPlaneTimeoutKind::Read,
+        ControlPlaneKind::Read,
         action,
     )
     .await
@@ -86,7 +86,7 @@ pub(super) async fn send_framed_message(
     match with_timeout(
         write_frame(sender, payload, MAX_CONTROL_PLANE_FRAME),
         timeout_duration,
-        ControlPlaneTimeoutKind::Write,
+        ControlPlaneKind::Write,
         action,
     )
     .await
@@ -105,7 +105,7 @@ pub(super) async fn read_framed_message(
     match with_timeout(
         read_frame(receiver, MAX_CONTROL_PLANE_FRAME),
         timeout_duration,
-        ControlPlaneTimeoutKind::Read,
+        ControlPlaneKind::Read,
         action,
     )
     .await
