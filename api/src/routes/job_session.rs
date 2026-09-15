@@ -1711,25 +1711,25 @@ mod tests {
 
     #[tokio::test]
     async fn end_answers_status() {
-        // Ending answers with the job status and lets the session go.
+        // Ending answers with the job status; the session stays registered as
+        // ended until the supervisor closes it, so ending twice is harmless.
         let owner = user(2);
         let (_dir, state, job_id, mut helper) = build_node(owner).await;
         make_ready(&state, job_id, &mut helper).await;
-        let response = end_session(
-            State(state.clone()),
-            Extension(auth_for(owner)),
-            Path(job_id.to_string()),
-        )
-        .await
-        .expect("the handler answers");
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        for _ in 0..10_000 {
-            if registry_session(&state, job_id).is_none() {
-                return;
-            }
-            tokio::task::yield_now().await;
+        for _ in 0..2 {
+            let response = end_session(
+                State(state.clone()),
+                Extension(auth_for(owner)),
+                Path(job_id.to_string()),
+            )
+            .await
+            .expect("the handler answers");
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
         }
-        panic!("an ended session stayed registered");
+        let body = session_body(&state, owner, job_id).await;
+        assert_eq!(body.state, "ended");
+        drop_session(&state, job_id);
+        assert!(registry_session(&state, job_id).is_none());
     }
 
     #[tokio::test]
@@ -1828,10 +1828,14 @@ mod tests {
             .and_then(|registry| registry.sessions().get(&job_id.to_string()))
     }
 
-    /// Ends and forgets the session, standing in for a node restart.
+    /// Ends and closes the session like a finished supervisor, standing in for
+    /// a node restart.
     fn drop_session(state: &Arc<ServerState>, job_id: JobId) {
         if let Some(session) = registry_session(state, job_id) {
             session.end(EndReason::Ended);
+        }
+        if let Some(registry) = state.get_ctx().compute_handle.as_ref() {
+            registry.sessions().close(&job_id.to_string());
         }
     }
 
