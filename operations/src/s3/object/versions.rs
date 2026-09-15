@@ -49,7 +49,7 @@ pub(crate) fn served_copy(
 const VERSION_SCAN_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListObjectVersionsState {
+pub enum ListVersionsState {
     Init,
     StartTransaction,
     ReadHeads,
@@ -61,14 +61,14 @@ pub enum ListObjectVersionsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ListObjectVersionsError {
+pub enum ListVersionsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: ListObjectVersionsState,
+        state: ListVersionsState,
         expected: &'static str,
         received: Event,
     },
@@ -81,7 +81,7 @@ pub enum ListObjectVersionsError {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ListObjectVersionsInput {
+pub struct ListVersionsInput {
     pub bucket: String,
     pub prefix: Option<String>,
     pub delimiter: Option<String>,
@@ -91,7 +91,7 @@ pub struct ListObjectVersionsInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ListObjectVersionsItem {
+pub enum ListVersionsItem {
     Version {
         key: String,
         version_id: Ulid,
@@ -109,8 +109,8 @@ pub enum ListObjectVersionsItem {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ListObjectVersionsResult {
-    pub items: Vec<ListObjectVersionsItem>,
+pub struct ListVersionsResult {
+    pub items: Vec<ListVersionsItem>,
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
@@ -119,7 +119,7 @@ pub struct ListObjectVersionsResult {
 
 #[derive(Debug, PartialEq)]
 enum PendingItem {
-    Ready(ListObjectVersionsItem),
+    Ready(ListVersionsItem),
     AwaitingLocation {
         key: String,
         version_id: Ulid,
@@ -132,9 +132,9 @@ enum PendingItem {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListObjectVersionsOperation {
-    input: ListObjectVersionsInput,
-    state: ListObjectVersionsState,
+pub struct ListVersionsOperation {
+    input: ListVersionsInput,
+    state: ListVersionsState,
     txn_id: Option<Ulid>,
     scan_prefix: Vec<u8>,
     pending_start: Option<IterStart>,
@@ -151,22 +151,22 @@ pub struct ListObjectVersionsOperation {
     version_scan_cursor: Option<Key>,
     version_window: VecDeque<(Ulid, BlobVersion)>,
     current_pending: Vec<PendingItem>,
-    items: Vec<ListObjectVersionsItem>,
+    items: Vec<ListVersionsItem>,
     is_truncated: bool,
     last_marker: Option<(String, Option<Ulid>)>,
     next_key_marker: Option<String>,
     next_version_id_marker: Option<Ulid>,
-    output: Option<Result<ListObjectVersionsResult, ListObjectVersionsError>>,
+    output: Option<Result<ListVersionsResult, ListVersionsError>>,
 }
 
-impl ListObjectVersionsOperation {
+impl ListVersionsOperation {
     pub const DEFAULT_MAX_KEYS: usize = 1_000;
     const MAX_SCAN_ROUNDS: usize = 100;
 
-    pub fn new(input: ListObjectVersionsInput) -> Self {
+    pub fn new(input: ListVersionsInput) -> Self {
         Self {
             input,
-            state: ListObjectVersionsState::Init,
+            state: ListVersionsState::Init,
             txn_id: None,
             scan_prefix: Vec::new(),
             pending_start: None,
@@ -204,8 +204,8 @@ impl ListObjectVersionsOperation {
         self
     }
 
-    fn emit_error(&mut self, error: ListObjectVersionsError) -> Effects {
-        self.state = ListObjectVersionsState::Error;
+    fn emit_error(&mut self, error: ListVersionsError) -> Effects {
+        self.state = ListVersionsState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -227,8 +227,8 @@ impl ListObjectVersionsOperation {
 
     fn handle_init(&mut self) -> Effects {
         if self.max_keys() == 0 {
-            self.state = ListObjectVersionsState::Finish;
-            self.output = Some(Ok(ListObjectVersionsResult {
+            self.state = ListVersionsState::Finish;
+            self.output = Some(Ok(ListVersionsResult {
                 items: Vec::new(),
                 common_prefixes: Vec::new(),
                 is_truncated: false,
@@ -238,7 +238,7 @@ impl ListObjectVersionsOperation {
             return smallvec![];
         }
 
-        self.state = ListObjectVersionsState::StartTransaction;
+        self.state = ListVersionsState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: true
         })]
@@ -246,7 +246,7 @@ impl ListObjectVersionsOperation {
 
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(ListObjectVersionsError::InvalidStateEvent {
+            return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
                 received: event,
@@ -327,7 +327,7 @@ impl ListObjectVersionsOperation {
                 .map(|key| IterStart::After(key.into()))
         };
 
-        self.state = ListObjectVersionsState::ReadHeads;
+        self.state = ListVersionsState::ReadHeads;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(self.scan_prefix.clone().into()),
@@ -339,7 +339,7 @@ impl ListObjectVersionsOperation {
 
     fn handle_heads_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(ListObjectVersionsError::InvalidStateEvent {
+            return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
                 received: event,
@@ -424,7 +424,7 @@ impl ListObjectVersionsOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         let start = self.version_scan_cursor.take().map(IterStart::After);
-        self.state = ListObjectVersionsState::ReadVersionsForKey;
+        self.state = ListVersionsState::ReadVersionsForKey;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
@@ -440,7 +440,7 @@ impl ListObjectVersionsOperation {
             next_start_after,
         }) = event
         else {
-            return self.emit_error(ListObjectVersionsError::InvalidStateEvent {
+            return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
                 received: event,
@@ -448,7 +448,7 @@ impl ListObjectVersionsOperation {
         };
 
         let Some((key, head_version_id)) = self.current_key.clone() else {
-            return self.emit_error(ListObjectVersionsError::ListObjectVersionsFailed);
+            return self.emit_error(ListVersionsError::ListObjectVersionsFailed);
         };
 
         for (version_key, value) in values {
@@ -494,7 +494,7 @@ impl ListObjectVersionsOperation {
             let is_latest = version_id == head_version_id;
             match version.state {
                 BlobVersionState::Deleted => {
-                    pending.push(PendingItem::Ready(ListObjectVersionsItem::DeleteMarker {
+                    pending.push(PendingItem::Ready(ListVersionsItem::DeleteMarker {
                         key: key.clone(),
                         version_id,
                         is_latest,
@@ -504,7 +504,7 @@ impl ListObjectVersionsOperation {
                 BlobVersionState::Reference {
                     cached_metadata, ..
                 } => {
-                    pending.push(PendingItem::Ready(ListObjectVersionsItem::Version {
+                    pending.push(PendingItem::Ready(ListVersionsItem::Version {
                         key: key.clone(),
                         version_id,
                         is_latest,
@@ -564,7 +564,7 @@ impl ListObjectVersionsOperation {
             );
         }
 
-        self.state = ListObjectVersionsState::ReadBlobLocations;
+        self.state = ListVersionsState::ReadBlobLocations;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: location_reads,
             txn_id: self.txn_id,
@@ -573,7 +573,7 @@ impl ListObjectVersionsOperation {
 
     fn handle_locations_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(ListObjectVersionsError::InvalidStateEvent {
+            return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
@@ -620,14 +620,14 @@ impl ListObjectVersionsOperation {
                     governed,
                 } => {
                     let Some((_key, value)) = locations.next() else {
-                        return self.emit_error(ListObjectVersionsError::ListObjectVersionsFailed);
+                        return self.emit_error(ListVersionsError::ListObjectVersionsFailed);
                     };
                     let registration = match governed.as_ref() {
                         Some(_) => match locations.next() {
                             Some((_, value)) => value,
                             None => {
                                 return self
-                                    .emit_error(ListObjectVersionsError::ListObjectVersionsFailed);
+                                    .emit_error(ListVersionsError::ListObjectVersionsFailed);
                             }
                         },
                         None => None,
@@ -646,7 +646,7 @@ impl ListObjectVersionsOperation {
                     let described = governed.is_none_or(|(copy_key, refs)| {
                         served_copy(registration.as_deref(), &copy_key, &refs, subject.as_ref())
                     });
-                    ListObjectVersionsItem::Version {
+                    ListVersionsItem::Version {
                         key,
                         version_id,
                         is_latest,
@@ -665,16 +665,16 @@ impl ListObjectVersionsOperation {
         self.advance()
     }
 
-    fn try_emit(&mut self, entry: ListObjectVersionsItem) -> bool {
+    fn try_emit(&mut self, entry: ListVersionsItem) -> bool {
         if self.emit_count() >= self.max_keys() {
             self.truncate();
             return true;
         }
         let marker = match &entry {
-            ListObjectVersionsItem::Version {
+            ListVersionsItem::Version {
                 key, version_id, ..
             }
-            | ListObjectVersionsItem::DeleteMarker {
+            | ListVersionsItem::DeleteMarker {
                 key, version_id, ..
             } => (key.clone(), Some(*version_id)),
         };
@@ -703,11 +703,11 @@ impl ListObjectVersionsOperation {
 
     fn commit(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListObjectVersionsError::NoTransactionFound);
+            return self.emit_error(ListVersionsError::NoTransactionFound);
         };
 
-        self.state = ListObjectVersionsState::CommitTransaction;
-        self.output = Some(Ok(ListObjectVersionsResult {
+        self.state = ListVersionsState::CommitTransaction;
+        self.output = Some(Ok(ListVersionsResult {
             items: std::mem::take(&mut self.items),
             common_prefixes: self.prefixes.take(),
             is_truncated: self.is_truncated,
@@ -719,21 +719,21 @@ impl ListObjectVersionsOperation {
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(ListObjectVersionsError::InvalidStateEvent {
+            return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received: event,
             });
         };
 
-        self.state = ListObjectVersionsState::Finish;
+        self.state = ListVersionsState::Finish;
         smallvec![]
     }
 }
 
-impl Operation for ListObjectVersionsOperation {
-    type Output = ListObjectVersionsResult;
-    type Error = ListObjectVersionsError;
+impl Operation for ListVersionsOperation {
+    type Output = ListVersionsResult;
+    type Error = ListVersionsError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -741,24 +741,24 @@ impl Operation for ListObjectVersionsOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(ListObjectVersionsError::StorageError(error));
+            return self.emit_error(ListVersionsError::StorageError(error));
         }
 
         match self.state {
-            ListObjectVersionsState::Init => self.handle_init(),
-            ListObjectVersionsState::StartTransaction => self.handle_transaction_started(event),
-            ListObjectVersionsState::ReadHeads => self.handle_heads_read(event),
-            ListObjectVersionsState::ReadVersionsForKey => self.handle_versions_read(event),
-            ListObjectVersionsState::ReadBlobLocations => self.handle_locations_read(event),
-            ListObjectVersionsState::CommitTransaction => self.handle_transaction_committed(event),
-            ListObjectVersionsState::Finish | ListObjectVersionsState::Error => smallvec![],
+            ListVersionsState::Init => self.handle_init(),
+            ListVersionsState::StartTransaction => self.handle_transaction_started(event),
+            ListVersionsState::ReadHeads => self.handle_heads_read(event),
+            ListVersionsState::ReadVersionsForKey => self.handle_versions_read(event),
+            ListVersionsState::ReadBlobLocations => self.handle_locations_read(event),
+            ListVersionsState::CommitTransaction => self.handle_transaction_committed(event),
+            ListVersionsState::Finish | ListVersionsState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ListObjectVersionsState::Finish | ListObjectVersionsState::Error
+            ListVersionsState::Finish | ListVersionsState::Error
         )
     }
 
@@ -766,7 +766,7 @@ impl Operation for ListObjectVersionsOperation {
         match self.output {
             Some(Ok(value)) => Ok(value),
             Some(Err(error)) => Err(error),
-            None => Err(ListObjectVersionsError::NotFinished),
+            None => Err(ListVersionsError::NotFinished),
         }
     }
 
@@ -901,8 +901,8 @@ mod test {
             .await;
     }
 
-    fn input(max_keys: usize) -> ListObjectVersionsInput {
-        ListObjectVersionsInput {
+    fn input(max_keys: usize) -> ListVersionsInput {
+        ListVersionsInput {
             bucket: "bucket".to_string(),
             prefix: None,
             delimiter: None,
@@ -926,7 +926,7 @@ mod test {
         seed_head(&storage_handle, "obj", newer).await;
 
         let result = drive(
-            ListObjectVersionsOperation::new(input(ListObjectVersionsOperation::DEFAULT_MAX_KEYS)),
+            ListVersionsOperation::new(input(ListVersionsOperation::DEFAULT_MAX_KEYS)),
             &driver_ctx,
         )
         .await
@@ -934,7 +934,7 @@ mod test {
 
         assert_eq!(result.items.len(), 2);
         match &result.items[0] {
-            ListObjectVersionsItem::Version {
+            ListVersionsItem::Version {
                 version_id,
                 is_latest,
                 location,
@@ -947,7 +947,7 @@ mod test {
             other => panic!("expected version, got {other:?}"),
         }
         match &result.items[1] {
-            ListObjectVersionsItem::Version {
+            ListVersionsItem::Version {
                 version_id,
                 is_latest,
                 ..
@@ -974,7 +974,7 @@ mod test {
         seed_head(&storage_handle, "obj", newer_head).await;
 
         let result = drive(
-            ListObjectVersionsOperation::new(input(ListObjectVersionsOperation::DEFAULT_MAX_KEYS)),
+            ListVersionsOperation::new(input(ListVersionsOperation::DEFAULT_MAX_KEYS)),
             &driver_ctx,
         )
         .await
@@ -983,7 +983,7 @@ mod test {
         assert_eq!(result.items.len(), 2);
         assert!(matches!(
             &result.items[0],
-            ListObjectVersionsItem::Version {
+            ListVersionsItem::Version {
                 version_id,
                 is_latest: true,
                 ..
@@ -991,7 +991,7 @@ mod test {
         ));
         assert!(matches!(
             &result.items[1],
-            ListObjectVersionsItem::Version {
+            ListVersionsItem::Version {
                 version_id,
                 is_latest: false,
                 ..
@@ -1019,7 +1019,7 @@ mod test {
         seed_head(&storage_handle, "obj", newer).await;
 
         let result = drive(
-            ListObjectVersionsOperation::new(input(ListObjectVersionsOperation::DEFAULT_MAX_KEYS)),
+            ListVersionsOperation::new(input(ListVersionsOperation::DEFAULT_MAX_KEYS)),
             &driver_ctx,
         )
         .await
@@ -1028,7 +1028,7 @@ mod test {
         assert_eq!(result.items.len(), 2);
         assert!(matches!(
             &result.items[0],
-            ListObjectVersionsItem::DeleteMarker {
+            ListVersionsItem::DeleteMarker {
                 version_id,
                 is_latest: true,
                 ..
@@ -1036,7 +1036,7 @@ mod test {
         ));
         assert!(matches!(
             &result.items[1],
-            ListObjectVersionsItem::Version {
+            ListVersionsItem::Version {
                 version_id,
                 is_latest: false,
                 ..
@@ -1065,7 +1065,7 @@ mod test {
         let mut collected = Vec::new();
         loop {
             let result = drive(
-                ListObjectVersionsOperation::new(ListObjectVersionsInput {
+                ListVersionsOperation::new(ListVersionsInput {
                     bucket: "bucket".to_string(),
                     prefix: None,
                     delimiter: None,
@@ -1079,7 +1079,7 @@ mod test {
             .unwrap();
 
             for item in &result.items {
-                if let ListObjectVersionsItem::Version {
+                if let ListVersionsItem::Version {
                     key, version_id, ..
                 } = item
                 {
@@ -1120,13 +1120,13 @@ mod test {
         }
 
         let result = drive(
-            ListObjectVersionsOperation::new(ListObjectVersionsInput {
+            ListVersionsOperation::new(ListVersionsInput {
                 bucket: "bucket".to_string(),
                 prefix: None,
                 delimiter: Some("/".to_string()),
                 key_marker: None,
                 version_id_marker: None,
-                max_keys: Some(ListObjectVersionsOperation::DEFAULT_MAX_KEYS),
+                max_keys: Some(ListVersionsOperation::DEFAULT_MAX_KEYS),
             }),
             &driver_ctx,
         )
@@ -1137,8 +1137,8 @@ mod test {
             .items
             .iter()
             .map(|item| match item {
-                ListObjectVersionsItem::Version { key, .. }
-                | ListObjectVersionsItem::DeleteMarker { key, .. } => key.as_str(),
+                ListVersionsItem::Version { key, .. }
+                | ListVersionsItem::DeleteMarker { key, .. } => key.as_str(),
             })
             .collect();
         assert_eq!(keys, vec!["a.txt", "z.txt"]);
@@ -1188,7 +1188,7 @@ mod test {
         seed_head(&storage_handle, "ref", version_id).await;
 
         let result = drive(
-            ListObjectVersionsOperation::new(input(ListObjectVersionsOperation::DEFAULT_MAX_KEYS)),
+            ListVersionsOperation::new(input(ListVersionsOperation::DEFAULT_MAX_KEYS)),
             &driver_ctx,
         )
         .await
@@ -1196,7 +1196,7 @@ mod test {
 
         assert_eq!(result.items.len(), 1);
         match &result.items[0] {
-            ListObjectVersionsItem::Version {
+            ListVersionsItem::Version {
                 location,
                 source_metadata: metadata,
                 is_latest,
@@ -1224,7 +1224,7 @@ mod test {
         }
 
         let result = drive(
-            ListObjectVersionsOperation::new(input(ListObjectVersionsOperation::DEFAULT_MAX_KEYS)),
+            ListVersionsOperation::new(input(ListVersionsOperation::DEFAULT_MAX_KEYS)),
             &driver_ctx,
         )
         .await
@@ -1234,8 +1234,8 @@ mod test {
             .items
             .iter()
             .map(|item| match item {
-                ListObjectVersionsItem::Version { key, .. }
-                | ListObjectVersionsItem::DeleteMarker { key, .. } => key.as_str(),
+                ListVersionsItem::Version { key, .. }
+                | ListVersionsItem::DeleteMarker { key, .. } => key.as_str(),
             })
             .collect();
         assert_eq!(keys, vec!["a/1", "aa", "b"]);
@@ -1260,7 +1260,7 @@ mod test {
         }
 
         let first = drive(
-            ListObjectVersionsOperation::new(ListObjectVersionsInput {
+            ListVersionsOperation::new(ListVersionsInput {
                 bucket: "bucket".to_string(),
                 prefix: None,
                 delimiter: Some("/".to_string()),
@@ -1279,7 +1279,7 @@ mod test {
         assert_eq!(first.next_key_marker.as_deref(), Some("b/"));
 
         let second = drive(
-            ListObjectVersionsOperation::new(ListObjectVersionsInput {
+            ListVersionsOperation::new(ListVersionsInput {
                 bucket: "bucket".to_string(),
                 prefix: None,
                 delimiter: Some("/".to_string()),
@@ -1313,7 +1313,7 @@ mod test {
         seed_head(&storage_handle, "obj", versions[4]).await;
 
         let result = drive(
-            ListObjectVersionsOperation::new(input(ListObjectVersionsOperation::DEFAULT_MAX_KEYS))
+            ListVersionsOperation::new(input(ListVersionsOperation::DEFAULT_MAX_KEYS))
                 .with_scan_limit(3),
             &driver_ctx,
         )
@@ -1324,12 +1324,12 @@ mod test {
             .items
             .iter()
             .map(|item| match item {
-                ListObjectVersionsItem::Version {
+                ListVersionsItem::Version {
                     version_id,
                     is_latest,
                     ..
                 }
-                | ListObjectVersionsItem::DeleteMarker {
+                | ListVersionsItem::DeleteMarker {
                     version_id,
                     is_latest,
                     ..

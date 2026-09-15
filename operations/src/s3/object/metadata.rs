@@ -30,7 +30,7 @@ const REFRESH_BATCH_SIZE: usize = 64;
 pub const REFERENCE_METADATA_REFRESH_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReferenceMetadataRefresh {
+pub struct ReferenceRefresh {
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
@@ -39,21 +39,21 @@ pub struct ReferenceMetadataRefresh {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReferenceMetadataRefreshJobRecord {
-    pub refresh: ReferenceMetadataRefresh,
+pub struct ReferenceRefreshRecord {
+    pub refresh: ReferenceRefresh,
     pub due_at_ms: u64,
     pub attempts: u32,
     pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueueReferenceMetadataRefreshResult {
+pub struct QueueRefreshResult {
     pub queued: bool,
     pub scheduled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReferenceMetadataRefreshDrainResult {
+pub struct ReferenceDrainResult {
     pub processed: usize,
     pub succeeded: usize,
     pub failed: usize,
@@ -62,7 +62,7 @@ pub struct ReferenceMetadataRefreshDrainResult {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ReferenceMetadataRefreshQueueError {
+pub enum ReferenceRefreshError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -74,21 +74,21 @@ pub enum ReferenceMetadataRefreshQueueError {
 }
 
 #[derive(Serialize)]
-struct ReferenceMetadataRefreshJobIdentity<'a> {
+struct ReferenceRefreshIdentity<'a> {
     bucket: &'a str,
     key: &'a str,
     version_id: Ulid,
     refreshed_at: SystemTime,
 }
 
-struct ReferenceMetadataRefreshJobScan {
-    jobs: Vec<(Vec<u8>, ReferenceMetadataRefreshJobRecord)>,
+struct ReferenceRefreshScan {
+    jobs: Vec<(Vec<u8>, ReferenceRefreshRecord)>,
     has_more_due: bool,
     next_due_at_ms: Option<u64>,
 }
 
-impl ReferenceMetadataRefreshJobRecord {
-    pub fn new(refresh: ReferenceMetadataRefresh, due_at_ms: u64) -> Self {
+impl ReferenceRefreshRecord {
+    pub fn new(refresh: ReferenceRefresh, due_at_ms: u64) -> Self {
         Self {
             refresh,
             due_at_ms,
@@ -98,8 +98,8 @@ impl ReferenceMetadataRefreshJobRecord {
     }
 }
 
-pub fn job_key(refresh: &ReferenceMetadataRefresh) -> Result<Key, ConversionError> {
-    let identity = ReferenceMetadataRefreshJobIdentity {
+pub fn job_key(refresh: &ReferenceRefresh) -> Result<Key, ConversionError> {
+    let identity = ReferenceRefreshIdentity {
         bucket: &refresh.bucket,
         key: &refresh.key,
         version_id: refresh.version_id,
@@ -110,9 +110,7 @@ pub fn job_key(refresh: &ReferenceMetadataRefresh) -> Result<Key, ConversionErro
     Ok(ByteView::from(key))
 }
 
-fn job_entry(
-    record: &ReferenceMetadataRefreshJobRecord,
-) -> Result<(String, Key, ByteView), ConversionError> {
+fn job_entry(record: &ReferenceRefreshRecord) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
         REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
         job_key(&record.refresh)?,
@@ -120,10 +118,7 @@ fn job_entry(
     ))
 }
 
-fn job_preferred(
-    candidate: &ReferenceMetadataRefreshJobRecord,
-    current: &ReferenceMetadataRefreshJobRecord,
-) -> bool {
+fn job_preferred(candidate: &ReferenceRefreshRecord, current: &ReferenceRefreshRecord) -> bool {
     (candidate.attempts, candidate.due_at_ms) > (current.attempts, current.due_at_ms)
 }
 
@@ -135,7 +130,7 @@ pub fn schedule_drain() -> Effect {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum QueueReferenceMetadataRefreshState {
+enum QueueRefreshState {
     Init,
     ReadExisting,
     WriteJob,
@@ -145,23 +140,23 @@ enum QueueReferenceMetadataRefreshState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct QueueReferenceMetadataRefreshOperation {
-    refresh: ReferenceMetadataRefresh,
-    state: QueueReferenceMetadataRefreshState,
-    output: Option<Result<QueueReferenceMetadataRefreshResult, ReferenceMetadataRefreshQueueError>>,
+pub struct QueueRefreshOperation {
+    refresh: ReferenceRefresh,
+    state: QueueRefreshState,
+    output: Option<Result<QueueRefreshResult, ReferenceRefreshError>>,
 }
 
-impl QueueReferenceMetadataRefreshOperation {
-    pub fn new(refresh: ReferenceMetadataRefresh) -> Self {
+impl QueueRefreshOperation {
+    pub fn new(refresh: ReferenceRefresh) -> Self {
         Self {
             refresh,
-            state: QueueReferenceMetadataRefreshState::Init,
+            state: QueueRefreshState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: ReferenceMetadataRefreshQueueError) -> Effects {
-        self.state = QueueReferenceMetadataRefreshState::Error;
+    fn fail(&mut self, error: ReferenceRefreshError) -> Effects {
+        self.state = QueueRefreshState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -171,7 +166,7 @@ impl QueueReferenceMetadataRefreshOperation {
             Ok(key) => key,
             Err(error) => return self.fail(error.into()),
         };
-        self.state = QueueReferenceMetadataRefreshState::ReadExisting;
+        self.state = QueueRefreshState::ReadExisting;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
             key,
@@ -180,13 +175,12 @@ impl QueueReferenceMetadataRefreshOperation {
     }
 
     fn write_job(&mut self) -> Effects {
-        let record =
-            ReferenceMetadataRefreshJobRecord::new(self.refresh.clone(), unix_timestamp_millis());
+        let record = ReferenceRefreshRecord::new(self.refresh.clone(), unix_timestamp_millis());
         let (key_space, key, value) = match job_entry(&record) {
             Ok(entry) => entry,
             Err(error) => return self.fail(error.into()),
         };
-        self.state = QueueReferenceMetadataRefreshState::WriteJob;
+        self.state = QueueRefreshState::WriteJob;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space,
             key,
@@ -196,23 +190,20 @@ impl QueueReferenceMetadataRefreshOperation {
     }
 
     fn schedule_drain(&mut self) -> Effects {
-        self.state = QueueReferenceMetadataRefreshState::ScheduleDrain;
+        self.state = QueueRefreshState::ScheduleDrain;
         smallvec![schedule_drain()]
     }
 
     fn finish(&mut self, queued: bool, scheduled: bool) -> Effects {
-        self.state = QueueReferenceMetadataRefreshState::Finish;
-        self.output = Some(Ok(QueueReferenceMetadataRefreshResult {
-            queued,
-            scheduled,
-        }));
+        self.state = QueueRefreshState::Finish;
+        self.output = Some(Ok(QueueRefreshResult { queued, scheduled }));
         smallvec![]
     }
 }
 
-impl Operation for QueueReferenceMetadataRefreshOperation {
-    type Output = QueueReferenceMetadataRefreshResult;
-    type Error = ReferenceMetadataRefreshQueueError;
+impl Operation for QueueRefreshOperation {
+    type Output = QueueRefreshResult;
+    type Error = ReferenceRefreshError;
 
     fn start(&mut self) -> Effects {
         self.read_existing()
@@ -220,34 +211,28 @@ impl Operation for QueueReferenceMetadataRefreshOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            QueueReferenceMetadataRefreshState::Init => self.read_existing(),
-            QueueReferenceMetadataRefreshState::ReadExisting => match event {
+            QueueRefreshState::Init => self.read_existing(),
+            QueueRefreshState::ReadExisting => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
                 }) => {
-                    let record = ReferenceMetadataRefreshJobRecord::new(
-                        self.refresh.clone(),
-                        unix_timestamp_millis(),
-                    );
-                    match postcard::from_bytes::<ReferenceMetadataRefreshJobRecord>(&value) {
+                    let record =
+                        ReferenceRefreshRecord::new(self.refresh.clone(), unix_timestamp_millis());
+                    match postcard::from_bytes::<ReferenceRefreshRecord>(&value) {
                         Ok(existing) if job_preferred(&existing, &record) => self.schedule_drain(),
                         Ok(_) | Err(_) => self.write_job(),
                     }
                 }
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_job(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
-                    format!("{other:?}"),
-                )),
+                other => self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
             },
-            QueueReferenceMetadataRefreshState::WriteJob => match event {
+            QueueRefreshState::WriteJob => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => self.schedule_drain(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
-                    format!("{other:?}"),
-                )),
+                other => self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
             },
-            QueueReferenceMetadataRefreshState::ScheduleDrain => match event {
+            QueueRefreshState::ScheduleDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(true, true),
                 Event::Task(TaskEvent::Error { .. }) => self.finish(true, false),
                 other => {
@@ -255,15 +240,15 @@ impl Operation for QueueReferenceMetadataRefreshOperation {
                     self.finish(true, false)
                 }
             },
-            QueueReferenceMetadataRefreshState::Finish => smallvec![],
-            QueueReferenceMetadataRefreshState::Error => smallvec![],
+            QueueRefreshState::Finish => smallvec![],
+            QueueRefreshState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            QueueReferenceMetadataRefreshState::Finish | QueueReferenceMetadataRefreshState::Error
+            QueueRefreshState::Finish | QueueRefreshState::Error
         )
     }
 
@@ -271,7 +256,7 @@ impl Operation for QueueReferenceMetadataRefreshOperation {
         match self.output {
             Some(Ok(result)) => Ok(result),
             Some(Err(error)) => Err(error),
-            None => Err(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
+            None => Err(ReferenceRefreshError::UnexpectedEvent(
                 "reference metadata refresh queue operation finished without output".to_string(),
             )),
         }
@@ -284,14 +269,14 @@ impl Operation for QueueReferenceMetadataRefreshOperation {
 
 pub async fn refresh_reference_metadata(
     context: Arc<DriverContext>,
-    refresh: ReferenceMetadataRefresh,
+    refresh: ReferenceRefresh,
 ) -> Result<(), String> {
     refresh_with_context(context.as_ref(), refresh).await
 }
 
 pub async fn refresh_with_context(
     context: &DriverContext,
-    refresh: ReferenceMetadataRefresh,
+    refresh: ReferenceRefresh,
 ) -> Result<(), String> {
     let version_key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id)
         .to_bytes()
@@ -452,9 +437,7 @@ pub async fn restore_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     }
 }
 
-pub async fn jobs_exist(
-    storage: &StorageHandle,
-) -> Result<bool, ReferenceMetadataRefreshQueueError> {
+pub async fn jobs_exist(storage: &StorageHandle) -> Result<bool, ReferenceRefreshError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
@@ -467,15 +450,13 @@ pub async fn jobs_exist(
     {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
-            format!("{other:?}"),
-        )),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 pub async fn next_timer(
     storage: &StorageHandle,
-) -> Result<Option<Duration>, ReferenceMetadataRefreshQueueError> {
+) -> Result<Option<Duration>, ReferenceRefreshError> {
     let now_ms = unix_timestamp_millis();
     let scan = scan_due_jobs(storage, now_ms, 1).await?;
     if !scan.jobs.is_empty() || scan.has_more_due {
@@ -489,7 +470,7 @@ pub async fn next_timer(
 
 pub async fn process_batch(
     context: &DriverContext,
-) -> Result<ReferenceMetadataRefreshDrainResult, ReferenceMetadataRefreshQueueError> {
+) -> Result<ReferenceDrainResult, ReferenceRefreshError> {
     let batch_started = Instant::now();
     let now_ms = unix_timestamp_millis();
     let scan = scan_due_jobs(&context.storage_handle, now_ms, REFRESH_BATCH_SIZE).await?;
@@ -535,7 +516,7 @@ pub async fn process_batch(
         );
     }
 
-    Ok(ReferenceMetadataRefreshDrainResult {
+    Ok(ReferenceDrainResult {
         processed: job_count,
         succeeded,
         failed,
@@ -552,7 +533,7 @@ async fn scan_due_jobs(
     storage: &StorageHandle,
     now_ms: u64,
     limit: usize,
-) -> Result<ReferenceMetadataRefreshJobScan, ReferenceMetadataRefreshQueueError> {
+) -> Result<ReferenceRefreshScan, ReferenceRefreshError> {
     let mut start_after = None;
     let mut jobs = Vec::new();
     let mut next_due_at_ms = None;
@@ -573,15 +554,13 @@ async fn scan_due_jobs(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
-                    format!("{other:?}"),
-                ));
+                return Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}")));
             }
         };
 
         for (key, value) in values {
             let mut key = key.to_vec();
-            let job = match postcard::from_bytes::<ReferenceMetadataRefreshJobRecord>(&value) {
+            let job = match postcard::from_bytes::<ReferenceRefreshRecord>(&value) {
                 Ok(job) => job,
                 Err(error) => {
                     warn!(error = %error, key = ?key, "Deleting malformed reference metadata refresh job");
@@ -602,7 +581,7 @@ async fn scan_due_jobs(
                     }
                     jobs.push((canonical_key, existing));
                     if jobs.len() >= limit {
-                        return Ok(ReferenceMetadataRefreshJobScan {
+                        return Ok(ReferenceRefreshScan {
                             jobs,
                             has_more_due: true,
                             next_due_at_ms,
@@ -632,7 +611,7 @@ async fn scan_due_jobs(
                 }
                 jobs.push((existing_canonical_key, existing));
                 if jobs.len() >= limit {
-                    return Ok(ReferenceMetadataRefreshJobScan {
+                    return Ok(ReferenceRefreshScan {
                         jobs,
                         has_more_due: true,
                         next_due_at_ms,
@@ -646,7 +625,7 @@ async fn scan_due_jobs(
             }
             jobs.push((key, job));
             if jobs.len() >= limit {
-                return Ok(ReferenceMetadataRefreshJobScan {
+                return Ok(ReferenceRefreshScan {
                     jobs,
                     has_more_due: true,
                     next_due_at_ms,
@@ -657,7 +636,7 @@ async fn scan_due_jobs(
         match next_start_after {
             Some(next) => start_after = Some(next),
             None => {
-                return Ok(ReferenceMetadataRefreshJobScan {
+                return Ok(ReferenceRefreshScan {
                     jobs,
                     has_more_due: false,
                     next_due_at_ms,
@@ -669,10 +648,9 @@ async fn scan_due_jobs(
 
 async fn find_duplicate(
     storage: &StorageHandle,
-    job: &ReferenceMetadataRefreshJobRecord,
+    job: &ReferenceRefreshRecord,
     skip_key: Option<&[u8]>,
-) -> Result<Option<(Vec<u8>, ReferenceMetadataRefreshJobRecord)>, ReferenceMetadataRefreshQueueError>
-{
+) -> Result<Option<(Vec<u8>, ReferenceRefreshRecord)>, ReferenceRefreshError> {
     let canonical_key = job_key(&job.refresh)?.to_vec();
     let mut selected = None;
     let mut start_after = None;
@@ -693,9 +671,7 @@ async fn find_duplicate(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
-                    format!("{other:?}"),
-                ));
+                return Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}")));
             }
         };
 
@@ -703,8 +679,7 @@ async fn find_duplicate(
             if skip_key.is_some_and(|skip_key| key.as_ref() == skip_key) {
                 continue;
             }
-            let Ok(candidate) = postcard::from_bytes::<ReferenceMetadataRefreshJobRecord>(&value)
-            else {
+            let Ok(candidate) = postcard::from_bytes::<ReferenceRefreshRecord>(&value) else {
                 continue;
             };
             if job_key(&candidate.refresh)?.as_ref() != canonical_key.as_slice() {
@@ -729,7 +704,7 @@ async fn find_duplicate(
 async fn read_job(
     storage: &StorageHandle,
     key: &[u8],
-) -> Result<Option<ReferenceMetadataRefreshJobRecord>, ReferenceMetadataRefreshQueueError> {
+) -> Result<Option<ReferenceRefreshRecord>, ReferenceRefreshError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
@@ -745,16 +720,14 @@ async fn read_job(
         )),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
-            format!("{other:?}"),
-        )),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn write_job(
     storage: &StorageHandle,
-    job: &ReferenceMetadataRefreshJobRecord,
-) -> Result<(), ReferenceMetadataRefreshQueueError> {
+    job: &ReferenceRefreshRecord,
+) -> Result<(), ReferenceRefreshError> {
     let (key_space, key, value) = job_entry(job)?;
     match storage
         .send_storage_effect(StorageEffect::Write {
@@ -767,16 +740,11 @@ async fn write_job(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
-            format!("{other:?}"),
-        )),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
-async fn delete_job(
-    storage: &StorageHandle,
-    key: Vec<u8>,
-) -> Result<(), ReferenceMetadataRefreshQueueError> {
+async fn delete_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), ReferenceRefreshError> {
     match storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
@@ -787,21 +755,19 @@ async fn delete_job(
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
-            format!("{other:?}"),
-        )),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn reschedule_job(
     storage: &StorageHandle,
     key: Vec<u8>,
-    job: &ReferenceMetadataRefreshJobRecord,
+    job: &ReferenceRefreshRecord,
     error: String,
-) -> Result<u64, ReferenceMetadataRefreshQueueError> {
+) -> Result<u64, ReferenceRefreshError> {
     let attempts = job.attempts.saturating_add(1);
     let due_at_ms = unix_timestamp_millis().saturating_add(retry_delay_ms(attempts));
-    let next_job = ReferenceMetadataRefreshJobRecord {
+    let next_job = ReferenceRefreshRecord {
         refresh: job.refresh.clone(),
         due_at_ms,
         attempts,
@@ -818,9 +784,7 @@ async fn reschedule_job(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(due_at_ms),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(ReferenceMetadataRefreshQueueError::UnexpectedEvent(
-            format!("{other:?}"),
-        )),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -895,8 +859,8 @@ mod tests {
         test: &TestState,
         metadata: SourceMetadata,
         refreshed_at: SystemTime,
-    ) -> ReferenceMetadataRefresh {
-        ReferenceMetadataRefresh {
+    ) -> ReferenceRefresh {
+        ReferenceRefresh {
             bucket: test.bucket.clone(),
             key: test.key.clone(),
             version_id: test.version_id,
@@ -985,7 +949,7 @@ mod tests {
         assert_eq!(last_refresh, expected_last_refresh);
     }
 
-    async fn read_jobs(storage: &StorageHandle) -> Vec<ReferenceMetadataRefreshJobRecord> {
+    async fn read_jobs(storage: &StorageHandle) -> Vec<ReferenceRefreshRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: REFERENCE_METADATA_REFRESH_JOB_KEYSPACE.to_string(),
@@ -1027,7 +991,7 @@ mod tests {
         write_reference_version(&test, original_metadata.clone(), last_refresh, 0).await;
 
         crate::driver::drive(
-            QueueReferenceMetadataRefreshOperation::new(refresh(
+            QueueRefreshOperation::new(refresh(
                 &test,
                 source_metadata(20, "older"),
                 SystemTime::UNIX_EPOCH + Duration::from_secs(10),
@@ -1052,11 +1016,7 @@ mod tests {
         write_reference_version(&test, source_metadata(10, "original"), last_refresh, 0).await;
 
         crate::driver::drive(
-            QueueReferenceMetadataRefreshOperation::new(refresh(
-                &test,
-                new_metadata.clone(),
-                refreshed_at,
-            )),
+            QueueRefreshOperation::new(refresh(&test, new_metadata.clone(), refreshed_at)),
             &test.context,
         )
         .await
@@ -1082,11 +1042,7 @@ mod tests {
         .await;
 
         crate::driver::drive(
-            QueueReferenceMetadataRefreshOperation::new(refresh(
-                &test,
-                new_metadata.clone(),
-                refreshed_at,
-            )),
+            QueueRefreshOperation::new(refresh(&test, new_metadata.clone(), refreshed_at)),
             &test.context,
         )
         .await
@@ -1107,21 +1063,13 @@ mod tests {
         write_reference_version(&test, source_metadata(1, "original"), last_refresh, 0).await;
 
         crate::driver::drive(
-            QueueReferenceMetadataRefreshOperation::new(refresh(
-                &test,
-                new_metadata.clone(),
-                newer,
-            )),
+            QueueRefreshOperation::new(refresh(&test, new_metadata.clone(), newer)),
             &test.context,
         )
         .await
         .expect("newer queue succeeds");
         crate::driver::drive(
-            QueueReferenceMetadataRefreshOperation::new(refresh(
-                &test,
-                source_metadata(10, "older"),
-                older,
-            )),
+            QueueRefreshOperation::new(refresh(&test, source_metadata(10, "older"), older)),
             &test.context,
         )
         .await
@@ -1140,7 +1088,7 @@ mod tests {
         let test = setup_state();
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let refresh = refresh(&test, source_metadata(30, "future"), refreshed_at);
-        let future_job = ReferenceMetadataRefreshJobRecord {
+        let future_job = ReferenceRefreshRecord {
             refresh: refresh.clone(),
             due_at_ms: unix_timestamp_millis().saturating_add(60_000),
             attempts: 1,
@@ -1162,12 +1110,9 @@ mod tests {
             other => panic!("unexpected future refresh job write event: {other:?}"),
         }
 
-        crate::driver::drive(
-            QueueReferenceMetadataRefreshOperation::new(refresh),
-            &test.context,
-        )
-        .await
-        .expect("duplicate queue succeeds");
+        crate::driver::drive(QueueRefreshOperation::new(refresh), &test.context)
+            .await
+            .expect("duplicate queue succeeds");
 
         assert_eq!(
             read_jobs(&test.context.storage_handle).await,
@@ -1179,7 +1124,7 @@ mod tests {
     async fn future_not_due() {
         let test = setup_state();
         let due_at_ms = unix_timestamp_millis().saturating_add(60_000);
-        let record = ReferenceMetadataRefreshJobRecord::new(
+        let record = ReferenceRefreshRecord::new(
             refresh(
                 &test,
                 source_metadata(20, "future"),
@@ -1232,7 +1177,7 @@ mod tests {
         let test = setup_state();
         write_corrupt_job(&test.context.storage_handle, "000-corrupt-refresh-job").await;
         crate::driver::drive(
-            QueueReferenceMetadataRefreshOperation::new(refresh(
+            QueueRefreshOperation::new(refresh(
                 &test,
                 source_metadata(20, "valid"),
                 SystemTime::UNIX_EPOCH + Duration::from_secs(20),

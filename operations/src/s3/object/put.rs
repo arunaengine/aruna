@@ -1564,7 +1564,7 @@ mod pure_tests {
     use aruna_core::structs::RealmId;
     use aruna_core::structs::{
         BackendCatalog, BackendLocation, BackendRef, GroupBackendKind, GroupRoutingInputs,
-        GroupStorageBackend, PathRestriction, RoutingError, RoutingSnapshot, RoutingTarget,
+        GroupStorage, PathRestriction, RoutingError, RoutingSnapshot, RoutingTarget,
         StorageRoutingRule,
     };
     use aruna_core::types::TxnId;
@@ -1657,9 +1657,8 @@ mod pure_tests {
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one obligation write, got {effects:?}")
         };
-        let record =
-            crate::replication::queue::LiveReplicationObligationRecord::from_bytes(value.as_ref())
-                .expect("obligation decodes");
+        let record = crate::replication::queue::LiveObligationRecord::from_bytes(value.as_ref())
+            .expect("obligation decodes");
         assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
     }
 
@@ -1834,8 +1833,8 @@ mod pure_tests {
         }
     }
 
-    fn disabled(backend_id: Ulid) -> GroupStorageBackend {
-        GroupStorageBackend {
+    fn disabled(backend_id: Ulid) -> GroupStorage {
+        GroupStorage {
             backend_id,
             group_id: Ulid::from_bytes([7u8; 16]),
             name: "tenant".to_string(),
@@ -1851,6 +1850,7 @@ mod pure_tests {
 }
 
 #[cfg(test)]
+#[path = "put_tests.rs"]
 mod test;
 
 /// F1 acceptance: no byte-materialization effect and no registration may be
@@ -2001,12 +2001,12 @@ mod decision_tests {
         assert!(!materializes(&operation.start()));
         let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
         assert!(!materializes(&effects));
-        let document = crate::tests::fixtures::policy::signed_document(realm(), &rule, 9);
+        let document = crate::tests::policy::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::tests::fixtures::policy::authority(realm()));
+        let effects = operation.step(crate::tests::policy::authority(realm()));
 
         assert!(!materializes(&effects));
         assert!(operation.is_complete());
@@ -2111,7 +2111,7 @@ mod decision_tests {
 
     fn subject_row(generation: u64, blocked: bool) -> Value {
         let mut record = aruna_core::structs::NodeSubjectRecord::seed(
-            crate::tests::fixtures::policy::subject(node(9), "eu-west"),
+            crate::tests::policy::subject(node(9), "eu-west"),
         )
         .expect("subject is valid");
         record.subject.generation = generation;
@@ -2128,12 +2128,12 @@ mod decision_tests {
         let mut operation = operation("eu-west");
         operation.start();
         operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
-        let document = crate::tests::fixtures::policy::signed_document(realm(), &rule, 9);
+        let document = crate::tests::policy::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        operation.step(crate::tests::fixtures::policy::authority(realm()));
+        operation.step(crate::tests::policy::authority(realm()));
         operation.step(fence_clear());
         operation.step(Event::Blob(aruna_core::events::BlobEvent::WriteFinished {
             location: location(),
@@ -2165,10 +2165,8 @@ mod decision_tests {
         for seed in 1..=4u8 {
             config.ensure_node(node(seed), aruna_core::structs::RealmNodeKind::Server);
         }
-        let (config_value, auth_value) = crate::tests::fixtures::policy::realm_view(
-            &config,
-            crate::tests::fixtures::policy::admin_user(realm()),
-        );
+        let (config_value, auth_value) =
+            crate::tests::policy::realm_view(&config, crate::tests::policy::admin_user(realm()));
         let key = ByteView::from(Vec::new());
         Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
@@ -2188,8 +2186,7 @@ mod decision_tests {
         operation.start();
         operation.step(read(Some(bucket(vec![requested.policy_ref()], 1))));
         operation.step(read(None));
-        let substituted =
-            crate::tests::fixtures::policy::signed_document(realm(), &policy("us-east"), 9);
+        let substituted = crate::tests::policy::signed_document(realm(), &policy("us-east"), 9);
         let effects = operation.step(opened(Some(ByteView::from(
             substituted.to_bytes().expect("document encodes"),
         ))));
@@ -2211,12 +2208,12 @@ mod decision_tests {
         let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
         assert!(!materializes(&effects));
 
-        let document = crate::tests::fixtures::policy::signed_document(realm(), &rule, 9);
+        let document = crate::tests::policy::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::tests::fixtures::policy::authority(realm()));
+        let effects = operation.step(crate::tests::policy::authority(realm()));
 
         assert!(!materializes(&effects));
         assert!(matches!(
@@ -2235,12 +2232,12 @@ mod decision_tests {
         let effects = operation.step(read(Some(bucket(Vec::new(), 0))));
         assert!(!materializes(&effects));
 
-        let document = crate::tests::fixtures::policy::signed_document(realm(), &rule, 9);
+        let document = crate::tests::policy::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(ByteView::from(cached))));
-        let effects = operation.step(crate::tests::fixtures::policy::group_authority(
+        let effects = operation.step(crate::tests::policy::group_authority(
             realm(),
             Ulid::from_bytes([8u8; 16]),
         ));
