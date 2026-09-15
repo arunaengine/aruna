@@ -1,17 +1,17 @@
 use super::*;
 
-pub(super) use crate::tests::fixtures::incoming::*;
+pub(super) use crate::tests::incoming::*;
 
 #[test]
 fn blocked_batch_waits() {
     // Nothing processed means the due head is blocked, so the next scan
     // waits instead of respinning at the 25ms batch pace.
-    let blocked = MetadataMaterializationDrainResult {
+    let blocked = MetadataDrainResult {
         processed: 0,
         has_more_due: true,
         next_due_after: None,
     };
-    let progressing = MetadataMaterializationDrainResult {
+    let progressing = MetadataDrainResult {
         processed: 4,
         ..blocked
     };
@@ -95,7 +95,7 @@ async fn paused_runtime_waits() {
     let runtime = JobsRuntime::new_paused();
 
     let shutdown = Shutdown::new();
-    install_and_start_task_queues(context, task_handle, runtime.clone(), &shutdown).await;
+    start_task_queues(context, task_handle, runtime.clone(), &shutdown).await;
 
     let stored = read_job_record(&storage, job_id, None)
         .await
@@ -156,7 +156,7 @@ async fn start_keeps_job() {
     )
     .await;
     let shutdown = Shutdown::new();
-    queues.restore_timers_and_start(&shutdown).await;
+    queues.restore_and_start(&shutdown).await;
 
     let stored = read_job_record(&storage, job_id, None)
         .await

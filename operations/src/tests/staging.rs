@@ -1,6 +1,4 @@
-use crate::connectors::create_connector::{
-    CreateSourceConnectorInput, CreateSourceConnectorOperation,
-};
+use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
 use crate::driver::{DriverContext, drive};
 use crate::s3::create_bucket::CreateBucketOperation;
 use aruna_blob::blob::BlobHandler;
@@ -66,7 +64,7 @@ pub(crate) async fn create_http_connector(
     endpoint: &str,
 ) -> SourceConnector {
     drive(
-        CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+        SourceConnectorOperation::new(SourceConnectorInput {
             group_id,
             created_by: Default::default(),
             name: "http-source".to_string(),

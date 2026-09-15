@@ -10,7 +10,7 @@ async fn restore_document_records() {
         node(1),
         target(),
         vec![node(2)],
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"restore durable work".to_vec(),
             change: change(),
         },
@@ -34,7 +34,7 @@ async fn restore_document_timer() {
         node(1),
         target(),
         vec![node(2)],
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"restore durable work".to_vec(),
             change: change(),
         },
@@ -153,7 +153,7 @@ async fn drain_keeps_timer() {
         node(1),
         target(),
         vec![node(2)],
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"direct fence".to_vec(),
             change: change(),
         },
@@ -221,7 +221,7 @@ async fn outbox_sync_retry() {
         node(1),
         target(),
         vec![node(2)],
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"retained work".to_vec(),
             change: change(),
         },
@@ -237,7 +237,7 @@ async fn outbox_sync_retry() {
             &TaskKey::DrainDocumentSyncOutbox,
             vec![key.clone()],
             Vec::new(),
-            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
                 target: Some(record.target.clone()),
                 error: "only 1/2 peers synced".to_string(),
             })),
@@ -270,7 +270,7 @@ async fn retained_outbox_timer() {
         node(1),
         target(),
         vec![node(2)],
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"retry after restart".to_vec(),
             change: change(),
         },
@@ -285,7 +285,7 @@ async fn retained_outbox_timer() {
             &TaskKey::DrainDocumentSyncOutbox,
             vec![key.clone()],
             Vec::new(),
-            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error {
+            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
                 target: Some(record.target.clone()),
                 error: "sync failed before all peers acknowledged".to_string(),
             })),
@@ -319,7 +319,7 @@ async fn tombstones_are_return() {
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let document_id = Ulid::from_parts(17, 1);
-    let tombstone = MetadataGraphLifecycleRecord::deleted(
+    let tombstone = GraphLifecycleRecord::deleted(
         "urn:graph:tombstone-before-retry".to_string(),
         RealmId::from_bytes([3; 32]),
         Ulid::from_parts(18, 1),
@@ -333,9 +333,9 @@ async fn tombstones_are_return() {
             Vec::new(),
             Vec::new(),
             Event::Net(NetEvent::DocumentSync(
-                DocumentSyncNetEvent::DocumentsReconciled {
+                DocumentNetEvent::DocumentsReconciled {
                     applied: 1,
-                    targets: vec![DocumentSyncTarget::MetadataCreateEvent {
+                    targets: vec![DocumentTarget::MetadataCreateEvent {
                         document_id,
                         event_id: Ulid::from_parts(20, 1),
                     }],
@@ -386,9 +386,9 @@ async fn drain_reconcile_wakes() {
         .finish_sync_batch(
             &TaskKey::DrainDocumentSyncOutbox,
             Vec::new(),
-            vec![DocumentSyncTarget::RealmConfig { realm_id }],
+            vec![DocumentTarget::RealmConfig { realm_id }],
             Event::Net(NetEvent::DocumentSync(
-                DocumentSyncNetEvent::DocumentsReconciled {
+                DocumentNetEvent::DocumentsReconciled {
                     applied: 0,
                     targets: Vec::new(),
                     metadata_create_events: Vec::new(),
@@ -501,9 +501,9 @@ async fn drain_reconcile_summary() {
             Vec::new(),
             Vec::new(),
             Event::Net(NetEvent::DocumentSync(
-                DocumentSyncNetEvent::DocumentsReconciled {
+                DocumentNetEvent::DocumentsReconciled {
                     applied: 1,
-                    targets: vec![DocumentSyncTarget::NodeUsage {
+                    targets: vec![DocumentTarget::NodeUsage {
                         realm_id,
                         node_id: remote,
                         group_id: None,
@@ -594,9 +594,9 @@ async fn drain_reconcile_config() {
         .finish_sync_batch(
             &TaskKey::DrainDocumentSyncOutbox,
             Vec::new(),
-            vec![DocumentSyncTarget::RealmConfig { realm_id }],
+            vec![DocumentTarget::RealmConfig { realm_id }],
             Event::Net(NetEvent::DocumentSync(
-                DocumentSyncNetEvent::DocumentsReconciled {
+                DocumentNetEvent::DocumentsReconciled {
                     applied: 0,
                     targets: Vec::new(),
                     metadata_create_events: Vec::new(),

@@ -11,20 +11,20 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct GetOidcUserInput {
+pub struct GetOidcInput {
     pub issuer: String,
     pub subject_id: String,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetOidcUserOperation {
-    input: GetOidcUserInput,
-    state: GetOidcUserState,
-    output: Option<Result<User, GetOidcUserError>>,
+pub struct GetOidcOperation {
+    input: GetOidcInput,
+    state: GetOidcState,
+    output: Option<Result<User, GetOidcError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum GetOidcUserState {
+enum GetOidcState {
     Init,
     StartTransaction,
     ReadSubjectIndex { txn_id: TxnId },
@@ -35,7 +35,7 @@ enum GetOidcUserState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetOidcUserError {
+pub enum GetOidcError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -54,25 +54,25 @@ pub enum GetOidcUserError {
     UserNotFound,
 }
 
-impl GetOidcUserOperation {
-    pub fn new(input: GetOidcUserInput) -> Self {
+impl GetOidcOperation {
+    pub fn new(input: GetOidcInput) -> Self {
         Self {
             input,
-            state: GetOidcUserState::Init,
+            state: GetOidcState::Init,
             output: None,
         }
     }
 
-    fn subject_key(&self) -> Result<String, GetOidcUserError> {
+    fn subject_key(&self) -> Result<String, GetOidcError> {
         Ok(oidc_subject_key(
             &self.input.issuer,
             &self.input.subject_id,
         )?)
     }
 
-    fn fail(&mut self, error: GetOidcUserError) -> Effects {
+    fn fail(&mut self, error: GetOidcError) -> Effects {
         let cleanup = self.abort();
-        self.state = GetOidcUserState::Error;
+        self.state = GetOidcState::Error;
         self.output = Some(Err(error));
         cleanup
     }
@@ -85,7 +85,7 @@ impl GetOidcUserOperation {
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        self.fail(GetOidcUserError::UnexpectedEvent {
+        self.fail(GetOidcError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
             got,
@@ -107,8 +107,8 @@ impl GetOidcUserOperation {
         }
     }
 
-    fn read_subject(&mut self, txn_id: TxnId) -> Result<Effects, GetOidcUserError> {
-        self.state = GetOidcUserState::ReadSubjectIndex { txn_id };
+    fn read_subject(&mut self, txn_id: TxnId) -> Result<Effects, GetOidcError> {
+        self.state = GetOidcState::ReadSubjectIndex { txn_id };
         let key = ByteView::from(self.subject_key()?.into_bytes());
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
@@ -136,10 +136,10 @@ impl GetOidcUserOperation {
         &mut self,
         txn_id: TxnId,
         value: Option<ByteView>,
-    ) -> Result<Effects, GetOidcUserError> {
-        let key = value.ok_or_else(|| GetOidcUserError::UserNotFound)?;
+    ) -> Result<Effects, GetOidcError> {
+        let key = value.ok_or_else(|| GetOidcError::UserNotFound)?;
         let user_id = UserId::from_storage_key(&key)?;
-        self.state = GetOidcUserState::ReadExistingUser { txn_id };
+        self.state = GetOidcState::ReadExistingUser { txn_id };
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: USER_KEYSPACE.to_string(),
             key: ByteView::from(user_id.to_storage_key()),
@@ -166,9 +166,9 @@ impl GetOidcUserOperation {
         &mut self,
         txn_id: TxnId,
         value: Option<ByteView>,
-    ) -> Result<Effects, GetOidcUserError> {
-        let user = User::from_bytes(&value.ok_or_else(|| GetOidcUserError::UserNotFound)?)?;
-        self.state = GetOidcUserState::CommitTransaction { user };
+    ) -> Result<Effects, GetOidcError> {
+        let user = User::from_bytes(&value.ok_or_else(|| GetOidcError::UserNotFound)?)?;
+        self.state = GetOidcState::CommitTransaction { user };
         Ok(smallvec![Effect::Storage(
             StorageEffect::CommitTransaction { txn_id }
         )])
@@ -180,18 +180,18 @@ impl GetOidcUserOperation {
             return self
                 .unexpected_event("Event::Storage(StorageEvent::TransactionCommitted)", got);
         };
-        self.state = GetOidcUserState::Finish;
+        self.state = GetOidcState::Finish;
         self.output = Some(Ok(user));
         smallvec![]
     }
 }
 
-impl Operation for GetOidcUserOperation {
+impl Operation for GetOidcOperation {
     type Output = User;
-    type Error = GetOidcUserError;
+    type Error = GetOidcError;
 
     fn start(&mut self) -> Effects {
-        self.state = GetOidcUserState::StartTransaction;
+        self.state = GetOidcState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -203,33 +203,28 @@ impl Operation for GetOidcUserOperation {
             Err(effects) => return effects,
         };
         match self.state.clone() {
-            GetOidcUserState::StartTransaction => self.handle_start_txn(event),
-            GetOidcUserState::ReadSubjectIndex { txn_id } => self.accept_subject(event, txn_id),
-            GetOidcUserState::ReadExistingUser { txn_id } => self.accept_existing(event, txn_id),
-            GetOidcUserState::CommitTransaction { user } => {
-                self.handle_commit_transaction(event, user)
-            }
-            GetOidcUserState::Init | GetOidcUserState::Finish | GetOidcUserState::Error => {
+            GetOidcState::StartTransaction => self.handle_start_txn(event),
+            GetOidcState::ReadSubjectIndex { txn_id } => self.accept_subject(event, txn_id),
+            GetOidcState::ReadExistingUser { txn_id } => self.accept_existing(event, txn_id),
+            GetOidcState::CommitTransaction { user } => self.handle_commit_transaction(event, user),
+            GetOidcState::Init | GetOidcState::Finish | GetOidcState::Error => {
                 smallvec![]
             }
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            GetOidcUserState::Finish | GetOidcUserState::Error
-        )
+        matches!(self.state, GetOidcState::Finish | GetOidcState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(GetOidcUserError::NotFinished)?
+        self.output.ok_or(GetOidcError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            GetOidcUserState::ReadSubjectIndex { txn_id }
-            | GetOidcUserState::ReadExistingUser { txn_id } => {
+            GetOidcState::ReadSubjectIndex { txn_id }
+            | GetOidcState::ReadExistingUser { txn_id } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
             _ => smallvec![],

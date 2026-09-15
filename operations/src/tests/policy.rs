@@ -2,7 +2,7 @@
 //! advertised subject and the policies this node has already resolved.
 
 use aruna_core::UserId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -154,11 +154,8 @@ pub async fn seed_gate(
     );
     let (config_value, auth_value) = realm_view(&config, user_id);
     for (target, value) in [
-        (DocumentSyncTarget::RealmConfig { realm_id }, config_value),
-        (
-            DocumentSyncTarget::RealmAuthorization { realm_id },
-            auth_value,
-        ),
+        (DocumentTarget::RealmConfig { realm_id }, config_value),
+        (DocumentTarget::RealmAuthorization { realm_id }, auth_value),
     ] {
         let _ = context
             .storage_handle
