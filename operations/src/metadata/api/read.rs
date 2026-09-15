@@ -1,17 +1,17 @@
 use super::{
-    AuthContext, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
-    DriverContext, Event, GroupId, HashMap, ListGroupOperation,
+    AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
+    DriverContext, Event, GraphLifecycleRecord, GroupId, HashMap, ListGroupOperation,
     METADATA_DISTRIBUTED_QUERY_DEADLINE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
     METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_REFERENCES_DEFAULT_LIMIT,
     METADATA_REFERENCES_MAX_LIMIT, METADATA_REGISTRY_CANDIDATE_LIMIT, MetadataApiError,
-    MetadataAuthToken, MetadataDocumentLifecycleRecord, MetadataFanoutScope, MetadataFanoutStats,
-    MetadataGraphLifecycleRecord, MetadataQueryResults, MetadataReadError, MetadataRegistryRecord,
-    NodeId, Permission, RealmId, StorageEffect, StorageEvent, StorageHandle, StorageReadError,
-    TxnId, Ulid, check_policy_limit, document_lifecycle_key, drive, graph_lifecycle_key,
-    load_document_record, load_group_records, load_pending_records, load_realm_config,
-    map_internal_error, map_query_error, merge_pending_records, parse_registry_read,
-    query_fingerprint, read_document_registry, record_materialized_read, reference_document_title,
-    replica_query_nodes, resolve_graph_reference, warn,
+    MetadataFanoutScope, MetadataFanoutStats, MetadataLifecycleRecord, MetadataQueryResults,
+    MetadataReadError, MetadataRegistryRecord, NodeId, Permission, RealmId, StorageEffect,
+    StorageEvent, StorageHandle, StorageReadError, TxnId, Ulid, check_policy_limit,
+    document_lifecycle_key, drive, graph_lifecycle_key, load_document_record, load_group_records,
+    load_pending_records, load_realm_config, map_internal_error, map_query_error,
+    merge_pending_records, parse_registry_read, query_fingerprint, read_document_registry,
+    record_materialized_read, reference_document_title, replica_query_nodes,
+    resolve_graph_reference, warn,
 };
 
 use super::distributed::run_query_distributed;
@@ -22,7 +22,7 @@ pub async fn query_metadata_document(
     context: &DriverContext,
     realm_id: RealmId,
     local_node_id: NodeId,
-    request: MetadataDocumentQueryRequest,
+    request: DocumentQueryRequest,
 ) -> Result<MetadataQueryExecution, MetadataApiError> {
     ensure_query_form(&request.query)?;
     let record = load_live_record(context, request.document_id).await?;
@@ -31,7 +31,7 @@ pub async fn query_metadata_document(
         .metadata_handle
         .as_ref()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    if request.mode == Some(MetadataApiQueryMode::Local) {
+    if request.mode == Some(ApiQueryMode::Local) {
         ensure_record_materialized(context, &record).await?;
         let results = metadata
             .query_authorized_local(request.auth, Some(vec![record.graph_iri]), request.query)
@@ -73,10 +73,8 @@ pub async fn query_metadata_document(
         holders.swap(0, index);
     }
     let remote_auth = match request.bearer_token.as_deref() {
-        Some(token) => {
-            Some(MetadataAuthToken::bearer(token).map_err(|_| MetadataApiError::BadRequest)?)
-        }
-        None => request.auth.clone().map(MetadataAuthToken::internal),
+        Some(token) => Some(AuthToken::bearer(token).map_err(|_| MetadataApiError::BadRequest)?),
+        None => request.auth.clone().map(AuthToken::internal),
     };
     let mut fanout_stats = MetadataFanoutStats::default();
     let mut auth_error = None;
@@ -354,7 +352,7 @@ pub(super) fn graph_lifecycle_deleted(
     record: &MetadataRegistryRecord,
     value: &[u8],
 ) -> Result<bool, MetadataApiError> {
-    let lifecycle: MetadataGraphLifecycleRecord = postcard::from_bytes(value)
+    let lifecycle: GraphLifecycleRecord = postcard::from_bytes(value)
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
     if lifecycle.graph_iri != record.graph_iri
         || lifecycle.realm_id != record.realm_id
@@ -372,16 +370,16 @@ pub(super) fn document_lifecycle_deleted(
     record: &MetadataRegistryRecord,
     value: &[u8],
 ) -> Result<bool, MetadataApiError> {
-    let lifecycle: MetadataDocumentLifecycleRecord = postcard::from_bytes(value)
+    let lifecycle: MetadataLifecycleRecord = postcard::from_bytes(value)
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
     let matches = match &lifecycle {
-        MetadataDocumentLifecycleRecord::Upsert { event } => {
+        MetadataLifecycleRecord::Upsert { event } => {
             event.record.document_id == record.document_id
                 && event.record.graph_iri == record.graph_iri
                 && event.record.realm_id == record.realm_id
                 && event.record.group_id == record.group_id
         }
-        MetadataDocumentLifecycleRecord::Delete { event } => {
+        MetadataLifecycleRecord::Delete { event } => {
             event.tombstone.document_id == record.document_id
                 && event.tombstone.graph_iri == record.graph_iri
                 && event.tombstone.realm_id == record.realm_id
@@ -393,10 +391,7 @@ pub(super) fn document_lifecycle_deleted(
             "metadata document lifecycle record mismatch".to_string(),
         ));
     }
-    Ok(matches!(
-        lifecycle,
-        MetadataDocumentLifecycleRecord::Delete { .. }
-    ))
+    Ok(matches!(lifecycle, MetadataLifecycleRecord::Delete { .. }))
 }
 
 pub(super) async fn load_claim_records(
@@ -457,7 +452,7 @@ pub(super) async fn is_deleted(
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
         }) => {
-            let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
+            let record: GraphLifecycleRecord = postcard::from_bytes(&value)
                 .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
             if record.graph_iri != graph_iri {
                 return Err(MetadataApiError::Internal(
@@ -762,18 +757,18 @@ pub(super) async fn ensure_permission(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetadataApiQueryMode {
+pub enum ApiQueryMode {
     Local,
     Distributed,
 }
 
 #[derive(Debug, Clone)]
-pub struct MetadataDocumentQueryRequest {
+pub struct DocumentQueryRequest {
     pub document_id: Ulid,
     pub auth: Option<AuthContext>,
     pub bearer_token: Option<String>,
     pub query: String,
-    pub mode: Option<MetadataApiQueryMode>,
+    pub mode: Option<ApiQueryMode>,
     pub allow_partial: bool,
 }
 
@@ -783,7 +778,7 @@ pub struct MetadataQueryRequest {
     pub bearer_token: Option<String>,
     pub graph_iris: Option<Vec<String>>,
     pub query: String,
-    pub mode: Option<MetadataApiQueryMode>,
+    pub mode: Option<ApiQueryMode>,
     pub target_nodes: Option<Vec<NodeId>>,
     pub allow_partial: bool,
 }
