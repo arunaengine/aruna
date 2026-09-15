@@ -1,6 +1,6 @@
 use super::*;
 use crate::openapi::ApiDoc;
-use crate::tests::fixtures::routes::{
+use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
 };
 use aruna_core::UserId;
@@ -24,9 +24,9 @@ async fn connector_crud_redacts() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Path(test.group_id.to_string()),
-        Json(CreateSourceConnectorRequest {
+        Json(CreateConnectorRequest {
             name: "refdata".to_string(),
-            kind: ApiSourceConnectorKind::S3,
+            kind: ApiConnectorKind::S3,
             public_config: HashMap::from([
                 ("bucket".to_string(), "reads".to_string()),
                 ("endpoint".to_string(), "https://s3.example.org".to_string()),
@@ -69,9 +69,9 @@ async fn connector_crud_redacts() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Path((test.group_id.to_string(), created.connector_id.clone())),
-        Json(ReplaceSourceConnectorRequest {
+        Json(ReplaceConnectorRequest {
             name: "refdata-updated".to_string(),
-            kind: ApiSourceConnectorKind::S3,
+            kind: ApiConnectorKind::S3,
             public_config: HashMap::from([
                 ("bucket".to_string(), "reads-v2".to_string()),
                 ("endpoint".to_string(), "https://s3.example.org".to_string()),
@@ -113,9 +113,9 @@ async fn connectors_require_permission() {
         State(test.state),
         Extension(Some(test.other_auth)),
         Path(test.group_id.to_string()),
-        Json(CreateSourceConnectorRequest {
+        Json(CreateConnectorRequest {
             name: "forbidden".to_string(),
-            kind: ApiSourceConnectorKind::Http,
+            kind: ApiConnectorKind::Http,
             public_config: HashMap::from([(
                 "endpoint".to_string(),
                 "https://example.org".to_string(),
@@ -138,7 +138,7 @@ async fn check_requires_permission() {
         Path(test.group_id.to_string()),
         Json(SourceConnectorRequest {
             name: "source".to_string(),
-            kind: ApiSourceConnectorKind::Http,
+            kind: ApiConnectorKind::Http,
             public_config: HashMap::from([(
                 "endpoint".to_string(),
                 "https://example.org".to_string(),
@@ -161,7 +161,7 @@ async fn check_returns_failure() {
         Path(test.group_id.to_string()),
         Json(SourceConnectorRequest {
             name: "source".to_string(),
-            kind: ApiSourceConnectorKind::Http,
+            kind: ApiConnectorKind::Http,
             public_config: HashMap::from([(
                 "endpoint".to_string(),
                 "https://example.org".to_string(),
@@ -180,7 +180,7 @@ async fn check_returns_failure() {
 
 #[test]
 fn check_maps_unreachable() {
-    let error = aruna_operations::staging::check_source::CheckStagingSourceError::Staging(
+    let error = aruna_operations::staging::check_source::CheckSourceError::Staging(
         aruna_core::errors::StagingSourceError::CheckError("connection refused".to_string()),
     );
 
@@ -194,9 +194,9 @@ async fn stored_check_resolves() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Path(test.group_id.to_string()),
-        Json(CreateSourceConnectorRequest {
+        Json(CreateConnectorRequest {
             name: "stored-source".to_string(),
-            kind: ApiSourceConnectorKind::S3,
+            kind: ApiConnectorKind::S3,
             public_config: HashMap::from([
                 ("bucket".to_string(), "reads".to_string()),
                 ("endpoint".to_string(), "https://s3.example.org".to_string()),
@@ -285,7 +285,7 @@ fn entries_normalize_prefix() {
 
 #[test]
 fn list_preserves_reason() {
-    let error = map_list_error(ListStagingSourceError::Staging(
+    let error = map_list_error(ListStagingError::Staging(
         aruna_core::errors::StagingSourceError::ListError("not an index".to_string()),
     ));
 
@@ -299,11 +299,11 @@ fn list_preserves_reason() {
 fn referenced_connector_conflicts() {
     // A still-referenced credential is a policy refusal, not an internal error.
     assert!(matches!(
-        map_replace_error(ReplaceSourceConnectorError::ReferencedByObjectVersion),
+        map_replace_error(ReplaceSourceError::ReferencedByObjectVersion),
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_delete_error(DeleteSourceConnectorError::ReferencedByObjectVersion),
+        map_delete_error(DeleteSourceError::ReferencedByObjectVersion),
         ServerError::Conflict(_)
     ));
 }

@@ -1,9 +1,9 @@
 use super::{
-    CleanupPolicy, CleanupStrategy, CreateGroupBackendRequest, backend_reclaim_status,
+    CleanupPolicy, CleanupStrategy, CreateBackendRequest, backend_reclaim_status,
     create_group_backend, delete_group_backend, enable_group_backend, list_group_backends,
 };
 use crate::error::ServerError;
-use crate::tests::fixtures::storage_routing::setup_state;
+use crate::tests::storage_routing::setup_state;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use std::collections::HashMap;
@@ -133,7 +133,7 @@ async fn rejects_unknown_kind() {
         State(test.state.clone()),
         Extension(Some(test.auth.clone())),
         Path(test.group_id.to_string()),
-        Json(CreateGroupBackendRequest {
+        Json(CreateBackendRequest {
             name: "tenant".to_string(),
             kind: "webdav".to_string(),
             public_config: HashMap::new(),
