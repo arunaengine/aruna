@@ -9,10 +9,7 @@ impl ConfigValidationCache {
         &mut self,
         storage: &StorageHandle,
         realm_id: RealmId,
-    ) -> Result<(
-        Option<&RealmConfigDocument>,
-        Option<&AdminDocumentReducerState>,
-    )> {
+    ) -> Result<(Option<&RealmConfigDocument>, Option<&AdminDocumentState>)> {
         if self
             .entry
             .as_ref()
@@ -33,7 +30,7 @@ impl ConfigValidationCache {
 pub(in crate::document_sync) async fn read_reducer_state(
     storage: &StorageHandle,
     target: &AdminDocumentTarget,
-) -> Result<Option<AdminDocumentReducerState>> {
+) -> Result<Option<AdminDocumentState>> {
     storage_read_from(
         storage,
         ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
@@ -51,10 +48,10 @@ pub(in crate::document_sync) async fn read_realm_config(
 ) -> Result<Option<RealmConfigDocument>> {
     storage_read_from(
         storage,
-        DocumentSyncTarget::RealmConfig { realm_id }
+        DocumentTarget::RealmConfig { realm_id }
             .storage_keyspace()
             .to_string(),
-        DocumentSyncTarget::RealmConfig { realm_id }.storage_key(),
+        DocumentTarget::RealmConfig { realm_id }.storage_key(),
     )
     .await?
     .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
@@ -68,10 +65,10 @@ pub(in crate::document_sync) async fn read_realm_authorization(
 ) -> Result<Option<RealmAuthorizationDocument>> {
     storage_read_from(
         storage,
-        DocumentSyncTarget::RealmAuthorization { realm_id }
+        DocumentTarget::RealmAuthorization { realm_id }
             .storage_keyspace()
             .to_string(),
-        DocumentSyncTarget::RealmAuthorization { realm_id }.storage_key(),
+        DocumentTarget::RealmAuthorization { realm_id }.storage_key(),
     )
     .await?
     .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes))
@@ -83,7 +80,7 @@ pub(in crate::document_sync) async fn read_realm_authorization(
 /// Replacing its own entry stays allowed; the flooding origin is rejected rather
 /// than trimmed, so a valid revocation is never discarded to make room.
 pub(in crate::document_sync) fn revocation_origin_full(
-    state: Option<&AdminDocumentReducerState>,
+    state: Option<&AdminDocumentState>,
     event: &AdminDocumentEvent,
     token_hash: &str,
 ) -> bool {
@@ -97,7 +94,7 @@ pub(in crate::document_sync) fn revocation_origin_full(
 
 pub(in crate::document_sync) fn revocation_origin_known(
     config: Option<&RealmConfigDocument>,
-    state: Option<&AdminDocumentReducerState>,
+    state: Option<&AdminDocumentState>,
     event: &AdminDocumentEvent,
     realm_id: RealmId,
 ) -> bool {
@@ -169,7 +166,7 @@ pub(in crate::document_sync) fn configured_node_kind<'a>(
 fn report_participation(
     op: &AdminDocumentOperation,
     current_config: Option<&RealmConfigDocument>,
-    previous_state: Option<&AdminDocumentReducerState>,
+    previous_state: Option<&AdminDocumentState>,
 ) -> ReportParticipation {
     enum Role {
         Old,
@@ -247,7 +244,7 @@ fn report_participation(
 pub(in crate::document_sync) fn validate_config_authority(
     current_config: Option<&RealmConfigDocument>,
     event: &AdminDocumentEvent,
-    previous_state: Option<&AdminDocumentReducerState>,
+    previous_state: Option<&AdminDocumentState>,
 ) -> Result<AdminEventValidation> {
     let AdminDocumentTarget::RealmConfig { realm_id } = event.target else {
         return Ok(AdminEventValidation::Rejected(
@@ -448,7 +445,7 @@ pub(in crate::document_sync) fn validate_config_authority(
 pub(in crate::document_sync) async fn validate_realm_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
-    previous_state: Option<&AdminDocumentReducerState>,
+    previous_state: Option<&AdminDocumentState>,
 ) -> Result<AdminEventValidation> {
     let AdminDocumentTarget::Realm { realm_id } = event.target else {
         return Ok(AdminEventValidation::Rejected(
@@ -503,7 +500,7 @@ pub(in crate::document_sync) async fn validate_realm_authority(
 pub(in crate::document_sync) async fn validate_user_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
-    previous_state: Option<&AdminDocumentReducerState>,
+    previous_state: Option<&AdminDocumentState>,
 ) -> Result<AdminEventValidation> {
     let AdminDocumentTarget::User { user_id } = event.target else {
         return Ok(AdminEventValidation::Rejected(
@@ -532,10 +529,10 @@ pub(in crate::document_sync) async fn validate_user_authority(
 
     let current_user = storage_read_from(
         storage,
-        DocumentSyncTarget::User { user_id }
+        DocumentTarget::User { user_id }
             .storage_keyspace()
             .to_string(),
-        DocumentSyncTarget::User { user_id }.storage_key(),
+        DocumentTarget::User { user_id }.storage_key(),
     )
     .await?
     .map(|bytes| User::from_bytes(&bytes))
@@ -593,7 +590,7 @@ pub(in crate::document_sync) async fn validate_user_authority(
 pub(in crate::document_sync) async fn validate_group_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
-    previous_state: Option<&AdminDocumentReducerState>,
+    previous_state: Option<&AdminDocumentState>,
 ) -> Result<AdminEventValidation> {
     let AdminDocumentTarget::Group { group_id } = event.target else {
         return Ok(AdminEventValidation::Rejected(
@@ -738,10 +735,10 @@ pub(in crate::document_sync) async fn validate_group_authority(
     let realm_auth = read_realm_authorization(storage, realm_id).await?;
     let group_auth = storage_read_from(
         storage,
-        DocumentSyncTarget::GroupAuthorization { group_id }
+        DocumentTarget::GroupAuthorization { group_id }
             .storage_keyspace()
             .to_string(),
-        DocumentSyncTarget::GroupAuthorization { group_id }.storage_key(),
+        DocumentTarget::GroupAuthorization { group_id }.storage_key(),
     )
     .await?
     .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
@@ -814,10 +811,10 @@ pub(in crate::document_sync) fn has_write_permission<'a>(
 /// must decode, embed its target's node, and derive a key attributing to it.
 /// The caller checks the publisher; zero-counter snapshots are valid.
 pub(in crate::document_sync) fn validate_usage_upsert(
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     bytes: &[u8],
 ) -> std::result::Result<(), String> {
-    let DocumentSyncTarget::NodeUsage { node_id, .. } = target else {
+    let DocumentTarget::NodeUsage { node_id, .. } = target else {
         return Err("target is not a node usage snapshot".to_string());
     };
     let snapshot = NodeUsageSnapshot::from_bytes(bytes)
@@ -841,7 +838,7 @@ pub(in crate::document_sync) fn validate_usage_upsert(
 /// checks the publisher; empty digests are valid and clear a node's interest
 /// while preserving single-writer ownership.
 pub(in crate::document_sync) fn validate_watch_interest(
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     bytes: &[u8],
 ) -> std::result::Result<(), String> {
     if bytes.len() > NOTIFICATION_WATCH_INTEREST_BYTES_CAP {
@@ -850,7 +847,7 @@ pub(in crate::document_sync) fn validate_watch_interest(
             NOTIFICATION_WATCH_INTEREST_BYTES_CAP
         ));
     }
-    let DocumentSyncTarget::WatchInterest { realm_id, node_id } = target else {
+    let DocumentTarget::WatchInterest { realm_id, node_id } = target else {
         return Err("target is not a watch interest digest".to_string());
     };
     let digest = WatchInterestDigest::from_bytes(bytes)
@@ -882,15 +879,15 @@ pub(in crate::document_sync) fn validate_watch_interest(
 }
 
 pub(in crate::document_sync) fn validate_watch_upsert(
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     bytes: &[u8],
-    change: &DocumentSyncChange,
+    change: &DocumentChange,
 ) -> std::result::Result<(), String> {
-    let DocumentSyncTarget::WatchSubscription { owner, watch_id } = target else {
+    let DocumentTarget::WatchSubscription { owner, watch_id } = target else {
         return Err("target is not a watch subscription".to_string());
     };
     validate_watch_target(*owner, *watch_id)?;
-    if change.kind != DocumentSyncChangeKind::Upsert || change.current.generation != 1 {
+    if change.kind != DocumentChangeKind::Upsert || change.current.generation != 1 {
         return Err(
             "watch subscription upsert must carry generation 1 upsert revision".to_string(),
         );
@@ -917,14 +914,14 @@ pub(in crate::document_sync) fn validate_watch_upsert(
 }
 
 pub(in crate::document_sync) fn validate_watch_delete(
-    target: &DocumentSyncTarget,
-    change: &DocumentSyncChange,
+    target: &DocumentTarget,
+    change: &DocumentChange,
 ) -> std::result::Result<(), String> {
-    let DocumentSyncTarget::WatchSubscription { owner, watch_id } = target else {
+    let DocumentTarget::WatchSubscription { owner, watch_id } = target else {
         return Err("target is not a watch subscription".to_string());
     };
     validate_watch_target(*owner, *watch_id)?;
-    if change.kind != DocumentSyncChangeKind::Delete || change.current.generation != 2 {
+    if change.kind != DocumentChangeKind::Delete || change.current.generation != 2 {
         return Err(
             "watch subscription delete must carry generation 2 delete revision".to_string(),
         );
@@ -949,10 +946,10 @@ pub(in crate::document_sync) fn validate_watch_target(
 /// must decode within bounds, advertise only its own node's execution sites,
 /// and match the target's node. The caller checks the publisher.
 pub(in crate::document_sync) fn validate_node_upsert(
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     bytes: &[u8],
 ) -> std::result::Result<NodeInfoDocument, String> {
-    let DocumentSyncTarget::NodeInfo { node_id, .. } = target else {
+    let DocumentTarget::NodeInfo { node_id, .. } = target else {
         return Err("target is not a node info document".to_string());
     };
     let document = NodeInfoDocument::from_bytes(bytes)
@@ -986,7 +983,7 @@ pub(in crate::document_sync) fn validate_policy_document(
     policy_id: Ulid,
     realm_id: RealmId,
     document: &PlacementPolicyDocument,
-    change: &DocumentSyncChange,
+    change: &DocumentChange,
 ) -> std::result::Result<(), String> {
     if document.policy_id() != policy_id {
         return Err(format!(
@@ -1007,7 +1004,7 @@ pub(in crate::document_sync) fn validate_policy_document(
     if let Err(error) = document.verify_publication() {
         return Err(format!("policy publication is invalid: {error}"));
     }
-    if change.kind != DocumentSyncChangeKind::Upsert {
+    if change.kind != DocumentChangeKind::Upsert {
         return Err("policy event is not an upsert".to_string());
     }
     if *change != placement_policy_change(document, change.placement) {
@@ -1022,7 +1019,7 @@ pub(in crate::document_sync) fn validate_policy_document(
 pub(in crate::document_sync) fn validate_pid_mapping(
     document_id: Ulid,
     mapping: &PersistentIdMapping,
-    change: &DocumentSyncChange,
+    change: &DocumentChange,
 ) -> std::result::Result<(), String> {
     if mapping.target != document_id {
         return Err(format!(
@@ -1086,7 +1083,7 @@ pub(in crate::document_sync) fn validate_pid_mapping(
             }
         }
     }
-    if change.kind != DocumentSyncChangeKind::Upsert {
+    if change.kind != DocumentChangeKind::Upsert {
         return Err("mapping event is not an upsert".to_string());
     }
     if *change != persistent_id_change(mapping, change.placement) {
@@ -1113,7 +1110,7 @@ pub(in crate::document_sync) struct ConfigValidationCache {
     entry: Option<(
         RealmId,
         Option<RealmConfigDocument>,
-        Option<AdminDocumentReducerState>,
+        Option<AdminDocumentState>,
     )>,
 }
 
@@ -1121,7 +1118,7 @@ pub(in crate::document_sync) async fn read_group_authorization(
     storage: &StorageHandle,
     group_id: GroupId,
 ) -> Result<Option<GroupAuthorizationDocument>> {
-    let target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let target = DocumentTarget::GroupAuthorization { group_id };
     storage_read_from(
         storage,
         target.storage_keyspace().to_string(),
@@ -1141,7 +1138,7 @@ async fn validate_admin_envelope(
     storage: &StorageHandle,
     topic_id: ::irokle::TopicId,
     authenticated_actor_id: ::irokle::ActorId,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     event: &AdminDocumentEvent,
     realm_id: RealmId,
     placement: &PlacementRef,
@@ -1188,35 +1185,35 @@ async fn validate_admin_envelope(
 /// the payload's declared target.
 fn family_matches_targets(
     family: AdminOperationFamily,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     event_target: &AdminDocumentTarget,
 ) -> bool {
     matches!(
         (family, target, event_target),
         (
             AdminOperationFamily::Group,
-            DocumentSyncTarget::GroupAuthorization { group_id },
+            DocumentTarget::GroupAuthorization { group_id },
             AdminDocumentTarget::Group { group_id: event_group_id }
         ) if group_id == event_group_id
     ) || matches!(
         (family, target, event_target),
         (
             AdminOperationFamily::RealmAuthorization,
-            DocumentSyncTarget::RealmAuthorization { realm_id },
+            DocumentTarget::RealmAuthorization { realm_id },
             AdminDocumentTarget::Realm { realm_id: event_realm_id }
         ) if realm_id == event_realm_id
     ) || matches!(
         (family, target, event_target),
         (
             AdminOperationFamily::User,
-            DocumentSyncTarget::User { user_id },
+            DocumentTarget::User { user_id },
             AdminDocumentTarget::User { user_id: event_user_id }
         ) if user_id == event_user_id
     ) || matches!(
         (family, target, event_target),
         (
             AdminOperationFamily::RealmConfig,
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             AdminDocumentTarget::RealmConfig { realm_id: event_realm_id }
         ) if realm_id == event_realm_id
     )
@@ -1425,11 +1422,11 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
 /// Whether the reducer accepts the event; a rejected reduction is malformed
 /// input, never a family authority decision.
 fn accept_reducer_event(
-    previous_state: Option<AdminDocumentReducerState>,
+    previous_state: Option<AdminDocumentState>,
     event: &AdminDocumentEvent,
 ) -> Result<AdminEventValidation> {
     let mut reducer_state =
-        previous_state.unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+        previous_state.unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
     match reducer_state.apply(event) {
         Ok(_) => Ok(AdminEventValidation::Accepted),
         Err(error) => Ok(AdminEventValidation::Rejected(format!(
@@ -1446,7 +1443,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
     storage: &StorageHandle,
     topic_id: ::irokle::TopicId,
     authenticated_actor_id: ::irokle::ActorId,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     event: &AdminDocumentEvent,
     realm_id: RealmId,
     placement: &PlacementRef,

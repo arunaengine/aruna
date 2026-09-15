@@ -13,7 +13,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
     if let Some((_, _, value)) = base_entries.first_mut() {
         *value = primary_bytes.into();
     }
-    let target = DocumentSyncTarget::MetadataRegistry {
+    let target = DocumentTarget::MetadataRegistry {
         group_id: record.group_id,
         document_id: record.document_id,
     };
@@ -192,7 +192,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
 
 pub(in crate::document_sync) async fn store_graph_lifecycle(
     storage: &StorageHandle,
-    record: &MetadataGraphLifecycleRecord,
+    record: &GraphLifecycleRecord,
     primary_bytes: Vec<u8>,
 ) -> Result<bool> {
     if !record.is_deleted() {
@@ -267,8 +267,8 @@ pub(in crate::document_sync) async fn store_graph_lifecycle(
 
 pub(in crate::document_sync) async fn store_document_lifecycle(
     storage: &StorageHandle,
-    record: &MetadataDocumentLifecycleRecord,
-    change: DocumentSyncChange,
+    record: &MetadataLifecycleRecord,
+    change: DocumentChange,
 ) -> Result<bool> {
     for _ in 0..2 {
         let txn_id = start_storage_transaction(storage).await?;
@@ -281,7 +281,7 @@ pub(in crate::document_sync) async fn store_document_lifecycle(
                 return Err(error);
             }
         };
-        let cleanup_delete = if let MetadataDocumentLifecycleRecord::Delete { event } = record
+        let cleanup_delete = if let MetadataLifecycleRecord::Delete { event } = record
             && event.tombstone.is_deleted()
         {
             let current = match delete_record_txn(storage, record.document_id(), txn_id).await {
@@ -542,7 +542,7 @@ pub(in crate::document_sync) async fn derive_policy_bucket(
     if placement == PlacementRef::NIL || placement.strategy_id.is_nil() {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let value = transaction_read(
         storage,
         REALM_CONFIG_KEYSPACE.to_string(),
@@ -682,8 +682,8 @@ pub(in crate::document_sync) async fn delete_registry_record(
 }
 
 pub(in crate::document_sync) fn delete_matches_graph(
-    delete: &MetadataDocumentDeleteRecord,
-    record: &MetadataGraphLifecycleRecord,
+    delete: &MetadataDeleteRecord,
+    record: &GraphLifecycleRecord,
 ) -> bool {
     delete_matches_registry(delete, record.group_id, record.document_id)
         && delete.tombstone.graph_iri == record.graph_iri
@@ -691,7 +691,7 @@ pub(in crate::document_sync) fn delete_matches_graph(
 }
 
 pub(in crate::document_sync) fn delete_matches_registry(
-    delete: &MetadataDocumentDeleteRecord,
+    delete: &MetadataDeleteRecord,
     group_id: Ulid,
     document_id: Ulid,
 ) -> bool {
@@ -702,18 +702,18 @@ pub(in crate::document_sync) fn delete_matches_registry(
 
 pub(in crate::document_sync) async fn current_lifecycle_entries(
     storage: &StorageHandle,
-    record: &MetadataDocumentLifecycleRecord,
-    change: &DocumentSyncChange,
+    record: &MetadataLifecycleRecord,
+    change: &DocumentChange,
     txn_id: TxnId,
 ) -> Result<Option<Vec<(String, ByteView, Value)>>> {
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+    let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
     if lifecycle_stale_txn(storage, &target, change, txn_id).await? {
         return Ok(None);
     }
     let mut acceptance_to_write = None;
-    if let MetadataDocumentLifecycleRecord::Upsert { event } = record {
+    if let MetadataLifecycleRecord::Upsert { event } = record {
         validate_metadata_event(event)?;
         if create_fence_txn(storage, event, txn_id).await? {
             return Ok(None);
@@ -727,7 +727,7 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
         )
         .await?
         .map(|value| {
-            postcard::from_bytes::<MetadataCreateEventRecord>(&value)
+            postcard::from_bytes::<MetadataEventRecord>(&value)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))
         })
         .transpose()?;
@@ -753,9 +753,9 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
     }
 
     let mut entries = match record {
-        MetadataDocumentLifecycleRecord::Upsert { event } => create_projection_entries(event)
+        MetadataLifecycleRecord::Upsert { event } => create_projection_entries(event)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
-        MetadataDocumentLifecycleRecord::Delete { event } => document_delete_entries(event)?,
+        MetadataLifecycleRecord::Delete { event } => document_delete_entries(event)?,
     };
     if let Some(event) = acceptance_to_write {
         entries.push(
@@ -777,8 +777,8 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
 
 pub(in crate::document_sync) async fn lifecycle_stale_txn(
     storage: &StorageHandle,
-    target: &DocumentSyncTarget,
-    incoming: &DocumentSyncChange,
+    target: &DocumentTarget,
+    incoming: &DocumentChange,
     txn_id: TxnId,
 ) -> Result<bool> {
     let value = transaction_read(
@@ -791,7 +791,7 @@ pub(in crate::document_sync) async fn lifecycle_stale_txn(
     let Some(value) = value else {
         return Ok(false);
     };
-    let local: DocumentSyncChange =
+    let local: DocumentChange =
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
     Ok(incoming.current <= local.current)
 }
@@ -832,9 +832,7 @@ pub(in crate::document_sync) fn registry_identity_valid(record: &MetadataRegistr
             )
 }
 
-pub(in crate::document_sync) fn validate_metadata_event(
-    event: &MetadataCreateEventRecord,
-) -> Result<()> {
+pub(in crate::document_sync) fn validate_metadata_event(event: &MetadataEventRecord) -> Result<()> {
     if !registry_identity_valid(&event.record)
         || event.record.last_event_id != event.event_id
         || event_is_create(event) && event.record.establishing_event_id != event.event_id
@@ -846,17 +844,17 @@ pub(in crate::document_sync) fn validate_metadata_event(
     Ok(())
 }
 
-pub(in crate::document_sync) fn event_is_create(event: &MetadataCreateEventRecord) -> bool {
+pub(in crate::document_sync) fn event_is_create(event: &MetadataEventRecord) -> bool {
     matches!(
         &event.payload,
-        aruna_core::metadata::MetadataCreateEventPayload::Scaffold { .. }
-            | aruna_core::metadata::MetadataCreateEventPayload::RoCrate { .. }
+        aruna_core::metadata::MetadataEventPayload::Scaffold { .. }
+            | aruna_core::metadata::MetadataEventPayload::RoCrate { .. }
     )
 }
 
 pub(in crate::document_sync) fn same_create_event(
-    accepted: &MetadataCreateEventRecord,
-    incoming: &MetadataCreateEventRecord,
+    accepted: &MetadataEventRecord,
+    incoming: &MetadataEventRecord,
 ) -> bool {
     accepted.event_id == incoming.event_id
         && registry_identity_matches(&accepted.record, &incoming.record)
@@ -897,7 +895,7 @@ pub(in crate::document_sync) async fn graph_record_txn(
     storage: &StorageHandle,
     graph_iri: &str,
     txn_id: TxnId,
-) -> Result<Option<MetadataGraphLifecycleRecord>> {
+) -> Result<Option<GraphLifecycleRecord>> {
     let value = transaction_read(
         storage,
         METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
@@ -908,7 +906,7 @@ pub(in crate::document_sync) async fn graph_record_txn(
     let Some(value) = value else {
         return Ok(None);
     };
-    let record: MetadataGraphLifecycleRecord =
+    let record: GraphLifecycleRecord =
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
     Ok(Some(record))
 }
@@ -917,7 +915,7 @@ pub(in crate::document_sync) async fn delete_record_txn(
     storage: &StorageHandle,
     document_id: Ulid,
     txn_id: TxnId,
-) -> Result<Option<MetadataDocumentDeleteRecord>> {
+) -> Result<Option<MetadataDeleteRecord>> {
     let value = transaction_read(
         storage,
         METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
@@ -928,17 +926,17 @@ pub(in crate::document_sync) async fn delete_record_txn(
     let Some(value) = value else {
         return Ok(None);
     };
-    let record: MetadataDocumentLifecycleRecord =
+    let record: MetadataLifecycleRecord =
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
     match record {
-        MetadataDocumentLifecycleRecord::Delete { event } => Ok(Some(event)),
-        MetadataDocumentLifecycleRecord::Upsert { .. } => Ok(None),
+        MetadataLifecycleRecord::Delete { event } => Ok(Some(event)),
+        MetadataLifecycleRecord::Upsert { .. } => Ok(None),
     }
 }
 
 pub(in crate::document_sync) async fn create_fence_txn(
     storage: &StorageHandle,
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
     txn_id: TxnId,
 ) -> Result<bool> {
     if let Some(delete) = delete_record_txn(storage, event.record.document_id, txn_id).await? {
@@ -974,13 +972,13 @@ pub(in crate::document_sync) async fn registry_cleanup_txn(
     storage: &StorageHandle,
     group_id: Ulid,
     document_id: Ulid,
-    delete: &MetadataDocumentDeleteRecord,
+    delete: &MetadataDeleteRecord,
     txn_id: TxnId,
 ) -> Result<Vec<(String, ByteView)>> {
     if !delete_matches_registry(delete, group_id, document_id) {
         return Ok(Vec::new());
     }
-    let target = DocumentSyncTarget::MetadataRegistry {
+    let target = DocumentTarget::MetadataRegistry {
         group_id,
         document_id,
     };
@@ -1051,7 +1049,7 @@ pub(in crate::document_sync) async fn derive_placement_txn(
     if placement == PlacementRef::NIL || placement.strategy_id.is_nil() {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let value = transaction_read(
         storage,
         REALM_CONFIG_KEYSPACE.to_string(),
@@ -1107,9 +1105,9 @@ pub(in crate::document_sync) async fn derive_placement_txn(
 }
 
 pub(in crate::document_sync) fn document_delete_entries(
-    record: &MetadataDocumentDeleteRecord,
+    record: &MetadataDeleteRecord,
 ) -> Result<Vec<(String, ByteView, Value)>> {
-    let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+    let lifecycle = MetadataLifecycleRecord::Delete {
         event: record.clone(),
     };
     let mut entries = vec![
@@ -1119,10 +1117,8 @@ pub(in crate::document_sync) fn document_delete_entries(
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
     ];
     if record.tombstone.is_deleted() {
-        let job = MetadataGraphPruneJobRecord::new(
-            record.tombstone.graph_iri.clone(),
-            unix_timestamp_millis(),
-        );
+        let job =
+            GraphPruneRecord::new(record.tombstone.graph_iri.clone(), unix_timestamp_millis());
         entries
             .push(graph_prune_entry(&job).map_err(|error| NetError::Bootstrap(error.to_string()))?);
     }
@@ -1133,10 +1129,10 @@ pub(in crate::document_sync) async fn registry_live_txn(
     storage: &StorageHandle,
     group_id: Ulid,
     document_id: Ulid,
-    delete: &MetadataDocumentDeleteRecord,
+    delete: &MetadataDeleteRecord,
     txn_id: TxnId,
 ) -> Result<(bool, Option<MetadataRegistryRecord>)> {
-    let target = DocumentSyncTarget::MetadataRegistry {
+    let target = DocumentTarget::MetadataRegistry {
         group_id,
         document_id,
     };
