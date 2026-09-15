@@ -516,7 +516,7 @@ mod pure_tests {
     use super::*;
 
     #[test]
-    fn supervision_policies_are_named() {
+    fn supervision_policies() {
         assert_eq!(supervision(Service::Rest), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::S3), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::Portal), ServiceExit::StopsNode);
@@ -527,7 +527,7 @@ mod pure_tests {
     // The real exit path consumes the policy: `StopsNode` decisions carry the
     // observed message, `ReportedOnly` decisions keep the node serving.
     #[test]
-    fn exit_decisions_follow_the_policy() {
+    fn exit_follows_policy() {
         for service in [Service::Rest, Service::S3, Service::Portal] {
             assert_eq!(
                 exit_effect(service, "observed exit"),
@@ -545,7 +545,7 @@ mod pure_tests {
     }
 
     #[test]
-    fn outcomes_map_to_exit_codes() {
+    fn outcome_exit_codes() {
         assert_eq!(ProcessOutcome::Stopped.exit_code(), None);
         assert_eq!(ProcessOutcome::StartupCancelled.exit_code(), None);
         assert_eq!(
@@ -564,7 +564,7 @@ mod pure_tests {
     }
 
     #[test]
-    fn only_server_failure_reports_a_message() {
+    fn server_failure_message() {
         assert_eq!(ProcessOutcome::Stopped.failure(), None);
         assert_eq!(ProcessOutcome::StartupCancelled.failure(), None);
         assert_eq!(ProcessOutcome::WipeComplete.failure(), None);
@@ -578,7 +578,7 @@ mod pure_tests {
     // A wipe may only claim success when the sequence released every owner and
     // the purge left nothing behind; an unfinished owner can still write.
     #[test]
-    fn wipe_admission_requires_a_complete_sequence() {
+    fn complete_wipe_required() {
         assert!(wipe_succeeded(true, 0, 0));
         assert!(!wipe_succeeded(false, 0, 0));
         assert!(!wipe_succeeded(true, 1, 0));
@@ -701,7 +701,7 @@ mod tests {
     // The owner observes the first signal through the stop token rather than
     // consuming its task handle, so `finish` remains the single consumer.
     #[tokio::test]
-    async fn first_signal_cancels_the_stop_token_and_finish_clears_tasks() {
+    async fn signal_cleanup() {
         let aborted = Arc::new(AtomicBool::new(false));
         let (signal, fire) = ControlledSignal::new(aborted.clone());
         let mut escalation = ControlledEscalation::new();
@@ -725,7 +725,7 @@ mod tests {
     // Finishing without a first signal aborts the waiter and drops the
     // never-armed escalation action once.
     #[tokio::test]
-    async fn finish_aborts_both_signal_tasks() {
+    async fn finish_aborts_signals() {
         let aborted = Arc::new(AtomicBool::new(false));
         let (signal, _fire) = ControlledSignal::new(aborted.clone());
         let mut escalation = ControlledEscalation::new();
@@ -745,7 +745,7 @@ mod tests {
     // Acquisition cleanup arms escalation after the stop was accepted, and
     // finishing then really drops the waiting action instead of detaching it.
     #[tokio::test]
-    async fn acquisition_cleanup_finish_aborts_the_escalation_task() {
+    async fn finish_aborts_escalation() {
         let (signal, fire) = ControlledSignal::new(Arc::new(AtomicBool::new(false)));
         let mut escalation = ControlledEscalation::new();
         let action = escalation.action();
@@ -778,7 +778,7 @@ mod tests {
     // The active path: an already-accepted stop lets the second signal end the
     // escalation action, and finishing still consumes each task once.
     #[tokio::test]
-    async fn active_escalation_runs_and_finish_clears_tasks() {
+    async fn escalation_completes() {
         let (signal, fire) = ControlledSignal::new(Arc::new(AtomicBool::new(false)));
         let mut escalation = ControlledEscalation::new();
         let action = escalation.action();
@@ -803,7 +803,7 @@ mod tests {
     // Repeated application runs share one runtime, so each owner must clear
     // both of its signal tasks before the next run installs its own.
     #[tokio::test]
-    async fn repeated_runs_leave_no_signal_tasks() {
+    async fn runs_clear_signals() {
         for run in 0..2 {
             let aborted = Arc::new(AtomicBool::new(false));
             let (signal, fire) = ControlledSignal::new(aborted.clone());

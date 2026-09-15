@@ -807,7 +807,7 @@ mod tests {
     // sequence instead of being left to their cancellation token. S3 handles
     // carry their connection tracker and are covered in the listener tests.
     #[tokio::test]
-    async fn portal_listener_joined_on_shutdown() {
+    async fn portal_listener_joined() {
         let dir = tempdir().expect("temp dir");
         let storage_handle = open_storage(&dir);
         let shutdown = Shutdown::new();
@@ -941,7 +941,7 @@ mod tests {
     // drain active connection work past their slice, so only the retained
     // forced cleanup can release them before storage closes.
     #[tokio::test(start_paused = true)]
-    async fn ingress_timeout_retains_s3_owners() {
+    async fn ingress_timeout_retains() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let dir = tempdir().expect("temp dir");
@@ -1027,7 +1027,7 @@ mod tests {
     // future is dropped and the scheduler must still own the running handler,
     // so a resumed drain sees it instead of reporting a clean shutdown.
     #[tokio::test]
-    async fn interrupted_task_phase_keeps_handler_owned() {
+    async fn timeout_keeps_handler() {
         use aruna_core::effects::Effect;
         use aruna_core::handle::Handle;
         use aruna_core::task::{TaskEffect, TaskKey};

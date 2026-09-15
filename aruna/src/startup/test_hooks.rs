@@ -1,9 +1,6 @@
-//! Startup instrumentation retained for binary tests.
-//!
-//! The barriers compile only under `debug_assertions`, so a release binary
-//! contains no environment read or barrier file write for them. Each hook has
-//! exactly one named consumer in `aruna/tests/observability.rs`; do not add a
-//! hook without a retained test that needs it.
+//! Startup instrumentation retained for binary tests. The barriers compile only
+//! under `debug_assertions`, so a release binary reads no environment and writes
+//! no barrier file; each hook has one consumer in `observability.rs`.
 
 #[cfg(debug_assertions)]
 use std::path::PathBuf;

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aruna_api::monitoring::Readiness;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::shutdown::Shutdown;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::drain::restore_drain_timer;
@@ -159,7 +159,7 @@ pub(crate) async fn start(
             }
             StartupPhase::RecoverStaleJobs => {
                 if let Err(error) = jobs_runtime
-                    .recover_stale_jobs_until(&driver_ctx.storage_handle, stop, || {
+                    .recover_until_stopped(&driver_ctx.storage_handle, stop, || {
                         matches!(observed_exit(), Some((_, ServiceExit::StopsNode)))
                     })
                     .await
@@ -171,7 +171,7 @@ pub(crate) async fn start(
             StartupPhase::StartTaskQueues => {
                 let task_queues = task_queues.take().expect("task queues start exactly once");
                 task_queues
-                    .restore_timers_and_start_until(&shutdown, stop, || {
+                    .start_until_stopped(&shutdown, stop, || {
                         matches!(observed_exit(), Some((_, ServiceExit::StopsNode)))
                     })
                     .await;
@@ -214,7 +214,7 @@ async fn publish_core(
     node_id: iroh::PublicKey,
     realm_id: aruna_core::structs::RealmId,
     allow_genesis: bool,
-    documents: Vec<DocumentSyncTarget>,
+    documents: Vec<DocumentTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // A device announces nothing: it holds no sync topic and is refused one.
     if documents.is_empty() {
@@ -280,7 +280,7 @@ mod tests {
     // A stop accepted before the first phase must not announce readiness or
     // start any recovery step.
     #[tokio::test]
-    async fn accepted_stop_announces_no_readiness() {
+    async fn stop_before_start() {
         let (background, _temp) = test_background().await;
         let readiness = background.readiness.clone();
         let stop = tokio_util::sync::CancellationToken::new();
@@ -297,7 +297,7 @@ mod tests {
     // A required listener that already exited is observed before the first
     // phase, so the sequence stops and readiness is never announced behind it.
     #[tokio::test]
-    async fn required_listener_failure_stops_before_readiness() {
+    async fn required_failure_stops() {
         let (background, _temp) = test_background().await;
         let readiness = background.readiness.clone();
         let mut executed = Vec::new();
@@ -321,7 +321,7 @@ mod tests {
     // An optional listener exit before readiness is reported, not fatal: every
     // required phase still runs and readiness is announced.
     #[tokio::test]
-    async fn optional_listener_failure_before_readiness_runs_every_phase() {
+    async fn optional_failure_continues() {
         let (background, _temp) = test_background().await;
         let readiness = background.readiness.clone();
         let mut executed = Vec::new();
@@ -342,7 +342,7 @@ mod tests {
     // An optional listener exit between recovery phases must not abandon the
     // phases after it: the sequence still reaches the end and readiness holds.
     #[tokio::test]
-    async fn optional_listener_failure_between_phases_keeps_running() {
+    async fn midphase_failure_continues() {
         let (background, _temp) = test_background().await;
         let readiness = background.readiness.clone();
         let mut executed = Vec::new();
@@ -376,7 +376,7 @@ mod tests {
     // A stop accepted between phases stops the sequence, and a stop racing a
     // required failure reports the failure; optional exits never mask a stop.
     #[tokio::test]
-    async fn stop_between_phases_prevents_later_phases() {
+    async fn stop_between_phases() {
         let (background, _temp) = test_background().await;
         let stop = tokio_util::sync::CancellationToken::new();
         let mut executed = Vec::new();
@@ -408,7 +408,7 @@ mod tests {
     // A required listener failure wins over a simultaneous stop: the caller
     // reports the failed service, and no later phase is admitted.
     #[tokio::test]
-    async fn required_failure_wins_over_simultaneous_stop() {
+    async fn required_failure_wins() {
         let (background, _temp) = test_background().await;
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
@@ -450,7 +450,7 @@ mod pure_tests {
     // The executed order is the tested order: readiness before recovery, the
     // job runtime opening only after stale recovery, queues before their timers.
     #[test]
-    fn startup_phases_run_in_order() {
+    fn phases_ordered() {
         let positions: Vec<usize> = STARTUP_PHASES
             .iter()
             .map(|phase| ALL_PHASES.iter().position(|known| known == phase).unwrap())
@@ -475,7 +475,7 @@ mod pure_tests {
     // Every phase is scheduled exactly once; a new phase that nobody schedules
     // would otherwise be silently skipped.
     #[test]
-    fn every_phase_is_scheduled_once() {
+    fn phases_scheduled_once() {
         for phase in ALL_PHASES {
             assert_eq!(
                 STARTUP_PHASES

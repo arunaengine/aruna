@@ -1,10 +1,6 @@
-//! Selection and construction of the node's compute executor.
-//!
-//! [`collect`] reads one explicit operator-input source into
-//! [`ComputeSettings`]; the backend modules only consume those typed values,
-//! and [`build_registry`] receives the value instead of rereading the
-//! environment. The node keeps running without compute when the operator
-//! marks compute optional.
+//! Selection and construction of the node's compute executor: [`collect`] reads
+//! one explicit operator-input source into [`ComputeSettings`], and
+//! [`build_registry`] receives that value instead of rereading the environment.
 
 // Without a compiled backend the parsed settings are only constructed, never
 // read; keep the no-backend feature check warning-free.
@@ -13,13 +9,17 @@
     allow(dead_code)
 )]
 
+#[path = "compute_setup_settings.rs"]
 mod settings;
 
 #[cfg(feature = "apptainer")]
+#[path = "compute_setup_apptainer.rs"]
 mod apptainer;
 #[cfg(feature = "docker")]
+#[path = "compute_setup_docker.rs"]
 mod docker;
 #[cfg(feature = "kubernetes")]
+#[path = "compute_setup_kubernetes.rs"]
 mod kubernetes;
 
 use aruna_compute::ExecutorRegistry;
@@ -150,10 +150,9 @@ pub(crate) fn collect(env: &dyn crate::settings::SettingsEnv) -> Result<ComputeS
     settings::collect(env).map_err(compute_error_message)
 }
 
-/// Builds the registry for the selected backend from already-collected
-/// settings, or `None` when compute is turned off. An unavailable backend is
-/// allowed only when the operator marks compute optional; invalid
-/// configuration always fails.
+/// Builds the registry for the selected backend from already-collected settings,
+/// or `None` when compute is off. An unavailable backend is allowed only when
+/// compute is optional; invalid configuration always fails.
 pub(crate) async fn build_registry(
     config: &Config,
     settings: &ComputeSettings,

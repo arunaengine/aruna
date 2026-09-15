@@ -106,7 +106,7 @@ mod tests {
     // The outcome mapping is unit-tested next to `ProcessOutcome`; this guards
     // that the process entry maps the wipe outcomes to their documented codes.
     #[test]
-    fn wipe_outcomes_stay_distinct() {
+    fn wipe_codes_distinct() {
         assert_ne!(
             ProcessOutcome::WipeComplete.exit_code(),
             ProcessOutcome::WipeIncomplete.exit_code()

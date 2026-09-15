@@ -5,11 +5,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
-    OnboardingSecret, OnboardingSyncTicket, issuer_proof_message, node_proof_message,
+    OnboardingSecret, OnboardingTicket, issuer_proof_message, node_proof_message,
 };
 use aruna_core::structs::{RealmId, StaticRealmEndpoint};
 use aruna_core::time::unix_timestamp_secs;
@@ -24,7 +24,7 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use ed25519_dalek::{Signer, SigningKey};
 use iroh::EndpointAddr;
 
-use super::error::IdentityError;
+use super::IdentityError;
 use super::{BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus};
 
 /// What this boot must do with the persisted identity.
@@ -403,7 +403,7 @@ fn validate_bootstrap_response(
         ));
     }
 
-    let ticket = OnboardingSyncTicket::decode(&response.onboarding_sync_ticket)?;
+    let ticket = OnboardingTicket::decode(&response.onboarding_sync_ticket)?;
     if ticket.payload.realm_id != expected_realm_id.to_string() {
         return Err(IdentityError::OnboardingBootstrapFailed(
             "onboarding sync ticket realm does not match bootstrap response".to_string(),
@@ -416,7 +416,7 @@ fn validate_bootstrap_response(
     }
     ticket.verify(
         expected_node_id,
-        &DocumentSyncTarget::RealmConfig {
+        &DocumentTarget::RealmConfig {
             realm_id: expected_realm_id,
         },
         unix_timestamp_secs(),
@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_response_decode_is_a_boundary() {
+    fn rejects_bad_bootstrap() {
         assert!(matches!(
             decode_bootstrap_response(b"not json"),
             Err(IdentityError::OnboardingBootstrapFailed(_))

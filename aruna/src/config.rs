@@ -1009,7 +1009,7 @@ mod tests {
         assert!(!config.temporary_bootstrap_active);
     }
     #[tokio::test]
-    async fn pending_initialization_restarts_as_initialize_realm() {
+    async fn incomplete_boot_resumes() {
         // An incomplete first startup must resume realm initialization rather
         // than mint a second identity.
         let tempdir = tempdir().unwrap();
@@ -1037,7 +1037,7 @@ mod tests {
     // A stop accepted before the identity decision resolves no configuration
     // and leaves the store without a generated identity.
     #[tokio::test]
-    async fn cancelled_resolution_skips_identity() {
+    async fn cancel_skips_identity() {
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let env = settings_env(&[("STORAGE_PATH", tempdir.path().to_str().unwrap())]);
