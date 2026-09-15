@@ -5,7 +5,7 @@ use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DEVICE_MANAGEMENT_URL_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{MANAGEMENT_URL_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::driver::DriverContext;
@@ -91,7 +91,7 @@ async fn setup(installed: Vec<String>) -> Fixture {
     if !installed.is_empty() {
         write_row(
             &state,
-            DEVICE_MANAGEMENT_URL_KEYSPACE,
+            MANAGEMENT_URL_KEYSPACE,
             realm_id.as_bytes().to_vec(),
             postcard::to_allocvec(&installed).unwrap(),
         )

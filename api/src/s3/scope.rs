@@ -91,7 +91,7 @@ pub(super) async fn resolve_scope(
     let rules = match permission_rules(context, &auth_context, root).await {
         Ok(rules) => rules,
         Err(
-            AuthorizationError::AuthDocNotFound
+            AuthorizationError::DocNotFound
             | AuthorizationError::GroupNotFound
             | AuthorizationError::InvalidGroupId
             | AuthorizationError::InvalidRealmId,

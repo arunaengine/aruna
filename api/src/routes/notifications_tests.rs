@@ -366,7 +366,7 @@ async fn excess_ids_rejected() {
         State(state),
         Extension(Some(auth_for(user_id, realm_id))),
         Json(MarkReadRequest {
-            ids: (0..=MARK_READ_MAX_IDS)
+            ids: (0..=MARK_MAX_IDS)
                 .map(|_| Ulid::generate().to_string())
                 .collect(),
             up_to_ms: None,

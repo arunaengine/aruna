@@ -6,7 +6,7 @@ use crate::tests::routes::{
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_MIRROR_REPAIR_KEYSPACE};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE, MIRROR_REPAIR_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmId;
@@ -581,7 +581,7 @@ async fn delete_stages_repair() {
         .get_ctx()
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_MIRROR_REPAIR_KEYSPACE.to_string(),
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
             key: relationship.id.to_bytes().to_vec().into(),
             txn_id: None,
         })

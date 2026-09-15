@@ -693,7 +693,7 @@ async fn caps_report_truncation() {
         user_id: hidden_owner,
         realm_id: fx.realm_id,
     };
-    for index in 0..=MAX_GROUP_SCAN_ROUNDS as u8 {
+    for index in 0..=MAX_GROUP_ROUNDS as u8 {
         let mut bytes = [16u8; 16];
         bytes[15] = index;
         seed_group(

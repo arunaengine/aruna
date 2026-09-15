@@ -1,7 +1,7 @@
 use super::*;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::SYNC_RELATIONSHIP_OUT_KEYSPACE;
+use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
@@ -57,7 +57,7 @@ async fn preflight_discloses_cleanup() {
     assert!(matches!(
         storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: SYNC_RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
                 key: sync_relationship_key("bucket", relationship.id).into(),
                 value: relationship.to_bytes().unwrap().into(),
                 txn_id: None,

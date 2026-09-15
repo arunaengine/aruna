@@ -65,10 +65,10 @@ const CONTROL_REQUEST_LIMIT: usize = 64;
 
 /// Concurrent S3 connections served at once; connections at capacity are
 /// dropped so a flood cannot spawn unbounded connection tasks.
-pub const DEFAULT_S3_MAX_CONNECTIONS: usize = 1_024;
+pub const S3_MAX_CONNECTIONS: usize = 1_024;
 /// Concurrent S3 requests processed at once, acquired before the expensive
 /// s3s parse/body/storage work.
-pub const DEFAULT_S3_MAX_CONCURRENT_REQUESTS: usize = 512;
+pub const MAX_CONCURRENT_REQUESTS: usize = 512;
 
 /// Listener deadlines of the S3 plane: how long a connection may stay silent
 /// before its first request, how long a request or response may make no I/O
@@ -638,18 +638,18 @@ impl S3Server {
             metrics,
             rate_limits,
             encryption_key,
-            connection_limit: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONNECTIONS)),
+            connection_limit: Arc::new(Semaphore::new(S3_MAX_CONNECTIONS)),
             control_limit: Arc::new(Semaphore::new(control_capacity(
-                DEFAULT_S3_MAX_CONCURRENT_REQUESTS,
+                MAX_CONCURRENT_REQUESTS,
             ))),
             bulk_limit: Arc::new(Semaphore::new(bulk_capacity(
-                DEFAULT_S3_MAX_CONCURRENT_REQUESTS,
+                MAX_CONCURRENT_REQUESTS,
             ))),
             read_limit: Arc::new(Semaphore::new(
-                bulk_capacity(DEFAULT_S3_MAX_CONCURRENT_REQUESTS).min(EGRESS_LIMIT),
+                bulk_capacity(MAX_CONCURRENT_REQUESTS).min(EGRESS_LIMIT),
             )),
             mutation_limit: Arc::new(Semaphore::new(
-                control_capacity(DEFAULT_S3_MAX_CONCURRENT_REQUESTS).min(CONTROL_EGRESS_LIMIT),
+                control_capacity(MAX_CONCURRENT_REQUESTS).min(CONTROL_EGRESS_LIMIT),
             )),
             capture_limit: Arc::new(Semaphore::new(body::DELETE_CAPTURE_LIMIT)),
             trusted_proxies: Arc::new(Vec::new()),

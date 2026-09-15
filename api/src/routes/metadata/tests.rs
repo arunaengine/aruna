@@ -32,7 +32,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, TASK_TIMER_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, TASK_TIMER_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataDeleteRecord,
@@ -797,7 +797,7 @@ async fn tombstone_hides_listing() {
         event: MetadataDeleteRecord {
             event_id: Ulid::generate(),
             tombstone: tombstone.clone(),
-            deleted_after_event_id: record.last_event_id,
+            deleted_after_id: record.last_event_id,
         },
     };
     for effect in [
@@ -853,10 +853,10 @@ async fn drain_timer_persisted() {
         .await
         .expect("projection drain scheduled");
 
-    let timer = read_task_timer(ctx.as_ref(), &TaskKey::DrainMetadataProjectionQueue)
+    let timer = read_task_timer(ctx.as_ref(), &TaskKey::DrainProjectionQueue)
         .await
         .expect("projection drain timer persisted");
-    assert_eq!(timer.key, TaskKey::DrainMetadataProjectionQueue);
+    assert_eq!(timer.key, TaskKey::DrainProjectionQueue);
 }
 
 #[tokio::test]
@@ -1136,7 +1136,7 @@ async fn seed_preview_object(test: &TestState) -> Value {
     .await;
     write_doc(
         &ctx,
-        HASH_PATHS_INDEX_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
         HashIndex::new(
             hash,
             version_id,
@@ -3544,7 +3544,7 @@ async fn preflight_distinguishes_states() {
     let w3id = preflight_w3id([31u8; 32]);
     let target = || PreflightTargetBody::ContentW3ids {
         content_w3ids: vec![w3id.clone()],
-        remove_all_resolvable_locations: false,
+        remove_resolvable_locations: false,
     };
 
     let no_references = preflight_route(
@@ -3672,7 +3672,7 @@ async fn hidden_references_concealed() {
         Some(test.auth.clone()),
         PreflightTargetBody::ContentW3ids {
             content_w3ids: vec![w3id],
-            remove_all_resolvable_locations: false,
+            remove_resolvable_locations: false,
         },
         MetadataQueryMode::Local,
         true,
@@ -3749,7 +3749,7 @@ async fn preflight_finds_ids() {
     .await;
     write_doc(
         &ctx,
-        HASH_PATHS_INDEX_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
         HashIndex::new(
             hash,
             version_id,
@@ -3797,8 +3797,8 @@ async fn preflight_finds_ids() {
     assert_eq!(target.content_w3id, preflight_w3id(hash));
     assert_eq!(target.targeted_versions.len(), 1);
     assert_eq!(target.visible_references[0].document_id, document_id);
-    assert!(target.would_remove_last_resolvable_aruna_location);
-    assert!(response.coverage.path_style_endpoint_coverage_complete);
+    assert!(target.would_remove_location);
+    assert!(response.coverage.path_style_complete);
 }
 
 async fn create_test_document(

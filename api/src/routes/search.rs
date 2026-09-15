@@ -3,7 +3,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
     MetadataQueryMode, SearchHitResponse, map_api_error, map_query_mode, map_search_hit,
 };
-use crate::routes::access::users::MIN_SEARCH_QUERY_CHARS;
+use crate::routes::access::users::MIN_QUERY_CHARS;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -388,7 +388,7 @@ pub async fn bucket_search(
 ) -> ServerResult<(StatusCode, Json<BucketsSection>)> {
     let auth = require_realm_auth(&state, auth)?;
     let query = params.q.trim();
-    if query.chars().count() < MIN_SEARCH_QUERY_CHARS {
+    if query.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
     }
     let result = search_buckets_distributed(
@@ -500,7 +500,7 @@ pub async fn object_search(
 ) -> ServerResult<(StatusCode, Json<ObjectResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let query = params.q.trim();
-    if query.chars().count() < MIN_SEARCH_QUERY_CHARS {
+    if query.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
     }
     let bucket = params
@@ -753,7 +753,7 @@ pub(crate) async fn run_unified(
         }
     }
     let q = params.q.trim().to_string();
-    if q.chars().count() < MIN_SEARCH_QUERY_CHARS {
+    if q.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
     }
     let limit = params
@@ -911,7 +911,7 @@ async fn run_groups(
     let mut truncated = false;
     // Fill the page across raw scans so a hidden first match cannot become an
     // empty page; the continuation cursor is only ever a visible group's id.
-    'fill: for round in 0..MAX_GROUP_SCAN_ROUNDS {
+    'fill: for round in 0..MAX_GROUP_ROUNDS {
         let output = drive(
             SearchGroupsOperation::new(SearchGroupsInput {
                 query: query.to_string(),
@@ -950,7 +950,7 @@ async fn run_groups(
         }
         // The round cap stopped the scan while raw matches remain and the page
         // is not yet full: report truncation instead of a false completion.
-        if round + 1 == MAX_GROUP_SCAN_ROUNDS {
+        if round + 1 == MAX_GROUP_ROUNDS {
             truncated = true;
         }
     }
@@ -963,7 +963,7 @@ async fn run_groups(
 
 /// Bounds the visibility fill loop so a realm of hidden matches cannot make one
 /// request scan without limit; the operation already batches storage internally.
-const MAX_GROUP_SCAN_ROUNDS: usize = 64;
+const MAX_GROUP_ROUNDS: usize = 64;
 
 async fn run_users(
     state: &ServerState,

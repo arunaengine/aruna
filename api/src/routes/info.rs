@@ -319,14 +319,19 @@ pub struct RealmPublicOverview {
 /// and as the replace-semantics request body for updating them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RealmQuotaConfig {
-    pub default_group_quota_bytes: Option<u64>,
+    #[serde(rename = "default_group_quota_bytes")]
+    pub default_quota_bytes: Option<u64>,
     pub grace_factor_percent: u32,
     pub warn_threshold_percent: u32,
     pub group_overrides: Vec<RealmQuotaOverride>,
-    pub max_groups_per_user: Option<u32>,
-    pub user_group_cap_overrides: Vec<GroupCapOverride>,
-    pub max_devices_per_user: Option<u32>,
-    pub device_requests_per_minute: Option<u32>,
+    #[serde(rename = "max_groups_per_user")]
+    pub groups_per_user: Option<u32>,
+    #[serde(rename = "user_group_cap_overrides")]
+    pub group_cap_overrides: Vec<GroupCapOverride>,
+    #[serde(rename = "max_devices_per_user")]
+    pub devices_per_user: Option<u32>,
+    #[serde(rename = "device_requests_per_minute")]
+    pub device_request_rate: Option<u32>,
     pub device_concurrent_pulls: Option<u32>,
 }
 
@@ -348,7 +353,7 @@ pub struct GroupCapOverride {
 impl From<QuotaConfig> for RealmQuotaConfig {
     fn from(quota: QuotaConfig) -> Self {
         Self {
-            default_group_quota_bytes: quota.default_group_quota_bytes,
+            default_quota_bytes: quota.default_quota_bytes,
             grace_factor_percent: quota.grace_factor_percent,
             warn_threshold_percent: quota.warn_threshold_percent,
             group_overrides: quota
@@ -360,17 +365,17 @@ impl From<QuotaConfig> for RealmQuotaConfig {
                     grace_factor_percent: over.grace_factor_percent,
                 })
                 .collect(),
-            max_groups_per_user: quota.max_groups_per_user,
-            user_group_cap_overrides: quota
-                .user_group_cap_overrides
+            groups_per_user: quota.groups_per_user,
+            group_cap_overrides: quota
+                .group_cap_overrides
                 .into_iter()
                 .map(|over| GroupCapOverride {
                     user_id: over.user_id.to_string(),
                     max_groups: over.max_groups,
                 })
                 .collect(),
-            max_devices_per_user: quota.max_devices_per_user,
-            device_requests_per_minute: quota.device_requests_per_minute,
+            devices_per_user: quota.devices_per_user,
+            device_request_rate: quota.device_request_rate,
             device_concurrent_pulls: quota.device_concurrent_pulls,
         }
     }
@@ -394,8 +399,8 @@ impl RealmQuotaConfig {
                 })
             })
             .collect::<ServerResult<Vec<_>>>()?;
-        let user_group_cap_overrides = self
-            .user_group_cap_overrides
+        let group_cap_overrides = self
+            .group_cap_overrides
             .into_iter()
             .map(|over| {
                 Ok(UserCapOverride {
@@ -410,14 +415,14 @@ impl RealmQuotaConfig {
             })
             .collect::<ServerResult<Vec<_>>>()?;
         Ok(QuotaConfig {
-            default_group_quota_bytes: self.default_group_quota_bytes,
+            default_quota_bytes: self.default_quota_bytes,
             grace_factor_percent: self.grace_factor_percent,
             warn_threshold_percent: self.warn_threshold_percent,
             group_overrides,
-            max_groups_per_user: self.max_groups_per_user,
-            user_group_cap_overrides,
-            max_devices_per_user: self.max_devices_per_user,
-            device_requests_per_minute: self.device_requests_per_minute,
+            groups_per_user: self.groups_per_user,
+            group_cap_overrides,
+            devices_per_user: self.devices_per_user,
+            device_request_rate: self.device_request_rate,
             device_concurrent_pulls: self.device_concurrent_pulls,
         })
     }
@@ -428,7 +433,8 @@ impl RealmQuotaConfig {
 pub struct RealmPlacementResponse {
     pub strategies: Vec<RealmPlacementStrategy>,
     pub default_strategy_id: Option<String>,
-    pub job_family_strategy_id: String,
+    #[serde(rename = "job_family_strategy_id")]
+    pub family_strategy_id: String,
     pub bindings: Vec<RealmBinding>,
     pub overrides: Vec<RealmPlacementOverride>,
     pub transitions: RealmHealthResponse,
@@ -581,7 +587,7 @@ impl RealmPlacementResponse {
                 .map(RealmPlacementStrategy::from)
                 .collect(),
             default_strategy_id: document.default_strategy_id.map(|id| id.to_string()),
-            job_family_strategy_id: document.job_family_strategy_id.to_string(),
+            family_strategy_id: document.family_strategy_id.to_string(),
             bindings: document
                 .strategy_bindings
                 .iter()
@@ -1657,7 +1663,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
 
 fn map_placement_error(error: MutatePlacementError) -> ServerError {
     match error {
-        MutatePlacementError::RealmConfigNotFound => ServerError::NotFound,
+        MutatePlacementError::ConfigMissing => ServerError::NotFound,
         MutatePlacementError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
         error @ (MutatePlacementError::AdminDocumentError(_)
         | MutatePlacementError::EmptyShardHolders { .. }
@@ -1807,7 +1813,7 @@ pub async fn set_realm_quota(
 
 fn map_quota_error(error: SetQuotaError) -> ServerError {
     match error {
-        SetQuotaError::RealmConfigNotFound => ServerError::NotFound,
+        SetQuotaError::ConfigMissing => ServerError::NotFound,
         SetQuotaError::Unauthorized | SetQuotaError::NotManagementNode => ServerError::Forbidden,
         SetQuotaError::InvalidQuota { reason } => ServerError::BadRequestReason(reason),
         SetQuotaError::StorageError(StorageError::TransactionConflict) => {
@@ -2412,8 +2418,8 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
                 max_bucket_size: info.max_bucket_size,
                 multipart_bucket: info.multipart_bucket,
                 timeouts_secs: Some(TimeoutConfigSecs {
-                    connect: info.timeouts.control_plane_connect_timeout.as_secs(),
-                    io: info.timeouts.control_plane_io_timeout.as_secs(),
+                    connect: info.timeouts.control_connect_timeout.as_secs(),
+                    io: info.timeouts.control_io_timeout.as_secs(),
                     transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
                 }),
                 backends: backend_statuses(state, info.backends).await,
@@ -2468,7 +2474,7 @@ fn map_peer_connection(
             })
             .collect(),
         last_error: admin.then(|| peer.last_error.clone()).flatten(),
-        next_retry_secs: peer.next_retry_in_secs,
+        next_retry_secs: peer.retry_in_secs,
     }
 }
 

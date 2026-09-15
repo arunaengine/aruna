@@ -299,11 +299,11 @@ fn list_preserves_reason() {
 fn referenced_connector_conflicts() {
     // A still-referenced credential is a policy refusal, not an internal error.
     assert!(matches!(
-        map_replace_error(ReplaceSourceError::ReferencedByObjectVersion),
+        map_replace_error(ReplaceSourceError::ReferencedObjectVersion),
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_delete_error(DeleteSourceError::ReferencedByObjectVersion),
+        map_delete_error(DeleteSourceError::ReferencedObjectVersion),
         ServerError::Conflict(_)
     ));
 }

@@ -52,7 +52,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-const DEFAULT_ONBOARDING_SECRET_TTL_SECS: u64 = 3600;
+const SECRET_TTL_SECS: u64 = 3600;
 /// Policy operation name device enrollment is evaluated under.
 const ENROLL_DEVICE_OPERATION: &str = "onboarding.enroll_device";
 
@@ -121,8 +121,10 @@ pub struct BootstrapResponseDoc {
     /// `"Management"`, `"Server"`, or the device form that carries its owner.
     pub mode: serde_json::Value,
     pub temporary_bootstrap_endpoint: BootstrapEndpointDoc,
-    pub wrapped_realm_private_key: Option<String>,
-    pub wrapped_realm_private_key_nonce: Option<String>,
+    #[serde(rename = "wrapped_realm_private_key")]
+    pub wrapped_realm_key: Option<String>,
+    #[serde(rename = "wrapped_realm_private_key_nonce")]
+    pub wrapped_key_nonce: Option<String>,
     pub wrapping_public_key: Option<String>,
     pub delegation_signature: Option<String>,
     pub onboarding_sync_ticket: String,
@@ -358,7 +360,7 @@ pub async fn create_onboarding_secret(
 
     let ttl = request
         .expires_in_seconds
-        .unwrap_or(DEFAULT_ONBOARDING_SECRET_TTL_SECS)
+        .unwrap_or(SECRET_TTL_SECS)
         .clamp(60, 86_400);
     let expires_at = now_timestamp().saturating_add(ttl);
 
@@ -829,8 +831,8 @@ pub async fn bootstrap_onboarding(
             realm_id: state.get_realm_id().to_string(),
             mode: OnboardingMode::Management,
             temporary_bootstrap_endpoint: bootstrap_endpoint,
-            wrapped_realm_private_key: wrapped_management_key.as_ref().map(|value| value.0.clone()),
-            wrapped_realm_private_key_nonce: wrapped_management_key
+            wrapped_realm_key: wrapped_management_key.as_ref().map(|value| value.0.clone()),
+            wrapped_key_nonce: wrapped_management_key
                 .as_ref()
                 .map(|value| value.1.clone()),
             wrapping_public_key: wrapped_management_key.as_ref().map(|value| value.2.clone()),
@@ -842,8 +844,8 @@ pub async fn bootstrap_onboarding(
             realm_id: state.get_realm_id().to_string(),
             mode: OnboardingMode::Server,
             temporary_bootstrap_endpoint: bootstrap_endpoint,
-            wrapped_realm_private_key: None,
-            wrapped_realm_private_key_nonce: None,
+            wrapped_realm_key: None,
+            wrapped_key_nonce: None,
             wrapping_public_key: None,
             delegation_signature,
             onboarding_sync_ticket: finalized.onboarding_sync_ticket,
@@ -854,8 +856,8 @@ pub async fn bootstrap_onboarding(
             realm_id: state.get_realm_id().to_string(),
             mode,
             temporary_bootstrap_endpoint: bootstrap_endpoint,
-            wrapped_realm_private_key: None,
-            wrapped_realm_private_key_nonce: None,
+            wrapped_realm_key: None,
+            wrapped_key_nonce: None,
             wrapping_public_key: None,
             delegation_signature: None,
             onboarding_sync_ticket: finalized.onboarding_sync_ticket,
@@ -940,7 +942,7 @@ fn map_finalize_error(error: BootstrapFinalizeError) -> ServerError {
             ServerError::Conflict("realm handle space is exhausted".to_string())
         }
         BootstrapFinalizeError::ReservedNodeLabel(label) => ServerError::ReservedLabel(label),
-        BootstrapFinalizeError::NodeLocationTooLong => ServerError::BadRequest,
+        BootstrapFinalizeError::LongNodeLocation => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     }
 }

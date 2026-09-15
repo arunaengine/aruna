@@ -85,7 +85,8 @@ pub struct DeletionPreflightRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multipart_key_marker: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub multipart_upload_id_marker: Option<String>,
+    #[serde(rename = "multipart_upload_id_marker")]
+    pub multipart_upload_marker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -109,14 +110,18 @@ pub struct PurgeTruncationResponse {
     pub truncated: bool,
     pub versions_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_version_key_marker: Option<String>,
+    #[serde(rename = "next_version_key_marker")]
+    pub next_version_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_version_id_marker: Option<String>,
+    #[serde(rename = "next_version_id_marker")]
+    pub next_version_marker: Option<String>,
     pub multipart_uploads_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_multipart_key_marker: Option<String>,
+    #[serde(rename = "next_multipart_key_marker")]
+    pub next_multipart_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_multipart_upload_id_marker: Option<String>,
+    #[serde(rename = "next_multipart_upload_id_marker")]
+    pub next_multipart_marker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -144,7 +149,8 @@ pub struct ReferenceCoverageResponse {
 pub struct DeletionPreflightResponse {
     pub scope: PurgeScopeRequest,
     pub counts: PurgeCountsResponse,
-    pub sync_relationships_apply_to_bucket_delete: bool,
+    #[serde(rename = "sync_relationships_apply_to_bucket_delete")]
+    pub apply_relationships_delete: bool,
     pub sync_relationships: Vec<SyncSideResponse>,
     pub permissions: PurgePermissionsResponse,
     pub truncation: PurgeTruncationResponse,
@@ -261,7 +267,7 @@ pub async fn deletion_preflight(
     let limit = request.limit.unwrap_or(DEFAULT_PREFLIGHT_LIMIT);
     if !(1..=MAX_PREFLIGHT_LIMIT).contains(&limit)
         || (request.version_id_marker.is_some() && request.version_key_marker.is_none())
-        || (request.multipart_upload_id_marker.is_some() && request.multipart_key_marker.is_none())
+        || (request.multipart_upload_marker.is_some() && request.multipart_key_marker.is_none())
     {
         return Err(ServerError::BadRequest);
     }
@@ -271,8 +277,8 @@ pub async fn deletion_preflight(
         .map(Ulid::from_string)
         .transpose()
         .map_err(|_| ServerError::BadRequest)?;
-    let multipart_upload_id_marker = request
-        .multipart_upload_id_marker
+    let multipart_upload_marker = request
+        .multipart_upload_marker
         .as_deref()
         .map(Ulid::from_string)
         .transpose()
@@ -297,7 +303,7 @@ pub async fn deletion_preflight(
             prefix: scope.list_prefix().map(str::to_string),
             delimiter: None,
             key_marker: request.multipart_key_marker,
-            upload_id_marker: multipart_upload_id_marker,
+            upload_id_marker: multipart_upload_marker,
             max_uploads: limit,
         })
         .complete_scan(),
@@ -306,9 +312,9 @@ pub async fn deletion_preflight(
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
 
-    let (items, versions_truncated, next_version_key_marker, next_version_id_marker) =
+    let (items, versions_truncated, next_version_key, next_version_marker) =
         scoped_version_page(&scope, versions);
-    let (uploads, uploads_truncated, next_multipart_key_marker, next_multipart_upload_id_marker) =
+    let (uploads, uploads_truncated, next_multipart_key, next_multipart_marker) =
         scoped_multipart_page(&scope, uploads);
     let mut current_heads = 0u64;
     let mut noncurrent_versions = 0u64;
@@ -340,7 +346,7 @@ pub async fn deletion_preflight(
                 open_multipart_uploads: uploads.len() as u64,
                 complete: !truncated,
             },
-            sync_relationships_apply_to_bucket_delete: scope.is_bucket(),
+            apply_relationships_delete: scope.is_bucket(),
             sync_relationships,
             permissions: PurgePermissionsResponse {
                 read: true,
@@ -349,11 +355,11 @@ pub async fn deletion_preflight(
             truncation: PurgeTruncationResponse {
                 truncated,
                 versions_truncated,
-                next_version_key_marker,
-                next_version_id_marker: next_version_id_marker.map(|id| id.to_string()),
+                next_version_key,
+                next_version_marker: next_version_marker.map(|id| id.to_string()),
                 multipart_uploads_truncated: uploads_truncated,
-                next_multipart_key_marker,
-                next_multipart_upload_id_marker: next_multipart_upload_id_marker
+                next_multipart_key,
+                next_multipart_marker: next_multipart_marker
                     .map(|id| id.to_string()),
             },
             reference_coverage: ReferenceCoverageResponse {
@@ -514,7 +520,7 @@ fn scoped_version_page(
     let mut items = result.items;
     let mut truncated = result.is_truncated;
     let mut key_marker = result.next_key_marker;
-    let mut version_marker = result.next_version_id_marker;
+    let mut version_marker = result.next_version_marker;
     if let StoragePurgeScope::File { key, .. } = scope {
         items.retain(|item| match item {
             ListVersionsItem::Version { key: item, .. }
@@ -541,7 +547,7 @@ fn scoped_multipart_page(
     let mut uploads = result.uploads;
     let mut truncated = result.is_truncated;
     let mut key_marker = result.next_key_marker;
-    let mut upload_marker = result.next_upload_id_marker;
+    let mut upload_marker = result.next_upload_marker;
     if let StoragePurgeScope::File { key, .. } = scope {
         uploads.retain(|upload| upload.key == *key);
         if key_marker.as_deref() != Some(key.as_str()) {

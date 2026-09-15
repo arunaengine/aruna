@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::execution::notification_watch::{
-    NOTIFICATION_WATCH_MAX_PREFIX_LEN, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
+    MAX_PREFIX_LEN, WatchAuthorizationBinding, WatchEventKind, WatchEventMask,
     WatchSubscription, parse_watch_path, watch_resource_path,
 };
 use aruna_core::structs::execution::notification::{
@@ -21,8 +21,8 @@ use aruna_operations::notifications::dispatch::{
     delete_for_user, list_for_user, mark_for_user, resolve_user_holder, subscribe_inbox_wakes,
     unread_for_user,
 };
-use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
-use aruna_operations::notifications::mark_read::MARK_READ_MAX_IDS;
+use aruna_operations::notifications::list::LIST_MAX_LIMIT;
+use aruna_operations::notifications::mark_read::MARK_MAX_IDS;
 use aruna_operations::notifications::watch::authorization::{
     WatchAuthorization, evaluate_watch_creation, watch_permission_path,
 };
@@ -54,12 +54,12 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 /// drain further wakes so a delivery storm collapses into one unread refetch.
 const NOTIFICATION_STREAM_COALESCE: Duration = Duration::from_millis(200);
 /// Remote-holder poll interval; emits only when the unread count changed.
-const NOTIFICATION_STREAM_REMOTE_POLL: Duration = Duration::from_secs(5);
+const STREAM_REMOTE_POLL: Duration = Duration::from_secs(5);
 /// State snapshot and keep-alive cadence so proxies do not cut an idle stream.
-const NOTIFICATION_STREAM_KEEP_ALIVE: Duration = Duration::from_secs(20);
+const STREAM_KEEP_ALIVE: Duration = Duration::from_secs(20);
 /// Re-resolve cadence for detecting an inbox holder that moved without a local wake.
 /// The local arm switches to remote polling after a move.
-const NOTIFICATION_STREAM_LOCAL_RECHECK: Duration = Duration::from_secs(60);
+const NOTIFICATION_STREAM_RECHECK: Duration = Duration::from_secs(60);
 
 #[derive(OpenApi)]
 #[openapi(
@@ -542,7 +542,7 @@ pub async fn list_notifications(
     let limit = query
         .limit
         .unwrap_or(DEFAULT_LIST_LIMIT)
-        .min(LIST_NOTIFICATIONS_MAX_LIMIT);
+        .min(LIST_MAX_LIMIT);
 
     let (records, next_cursor) = list_for_user(
         &state.get_ctx(),
@@ -976,18 +976,18 @@ pub async fn stream_notifications(
         recipient,
         mode,
         state.shutdown_token(),
-        NOTIFICATION_STREAM_REMOTE_POLL,
-        NOTIFICATION_STREAM_LOCAL_RECHECK,
+        STREAM_REMOTE_POLL,
+        NOTIFICATION_STREAM_RECHECK,
     );
     let events = notification_state_stream(
         unread,
         dashboard_epoch,
         dashboard_revisions,
-        NOTIFICATION_STREAM_KEEP_ALIVE,
+        STREAM_KEEP_ALIVE,
     )
     .map(state_event)
     .map(Ok::<_, Infallible>);
-    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(NOTIFICATION_STREAM_KEEP_ALIVE)))
+    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(STREAM_KEEP_ALIVE)))
 }
 
 #[utoipa::path(
@@ -1041,7 +1041,7 @@ pub async fn mark_read(
     Json(request): Json<MarkReadRequest>,
 ) -> ServerResult<(StatusCode, Json<MarkReadResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    if request.ids.len() > MARK_READ_MAX_IDS {
+    if request.ids.len() > MARK_MAX_IDS {
         return Err(ServerError::BadRequest);
     }
     let ids = request
@@ -1197,7 +1197,7 @@ pub async fn create_watch(
     let auth = require_unrestricted_auth(&state, auth)?;
     if request.path_prefix.is_empty()
         || request.path_prefix.starts_with('/')
-        || request.path_prefix.len() > NOTIFICATION_WATCH_MAX_PREFIX_LEN
+        || request.path_prefix.len() > MAX_PREFIX_LEN
         || request.events.is_empty()
     {
         record_watch_denial(&state, WatchMetricReason::InvalidResource);

@@ -240,7 +240,7 @@ fn peer_error_visibility() {
         status: aruna_core::structs::PeerConnectionStatus::Unreachable,
         active_addresses: Vec::new(),
         last_error: Some("dial refused: 10.0.0.9:4433".to_string()),
-        next_retry_in_secs: Some(5),
+        retry_in_secs: Some(5),
     };
 
     let member = super::map_peer_connection(&peer, false);
@@ -293,7 +293,7 @@ fn openapi_includes_info() {
 }
 
 async fn seed_usage_state(state: &Arc<ServerState>) {
-    use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+    use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
     use aruna_core::structs::storage::usage::{
         NodeUsageSnapshot, global_shard_key, usage_global_key,
     };
@@ -318,7 +318,7 @@ async fn seed_usage_state(state: &Arc<ServerState>) {
     let remote = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
     ctx.storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
             key: usage_global_key(remote).into(),
             value: NodeUsageSnapshot {
                 node_id: remote,
@@ -472,7 +472,7 @@ fn quota_warning_unlimited() {
     let group = Ulid::generate();
     let unlimited_group = Ulid::generate();
     let quota = QuotaConfig {
-        default_group_quota_bytes: Some(1_000),
+        default_quota_bytes: Some(1_000),
         grace_factor_percent: 110,
         warn_threshold_percent: 85,
         group_overrides: vec![aruna_core::structs::identity::realm::GroupQuotaOverride {
@@ -505,7 +505,7 @@ fn quota_warning_unlimited() {
 fn fractional_warn_threshold() {
     let group = Ulid::generate();
     let quota = QuotaConfig {
-        default_group_quota_bytes: Some(3),
+        default_quota_bytes: Some(3),
         warn_threshold_percent: 85,
         ..QuotaConfig::default()
     };
@@ -516,7 +516,7 @@ fn fractional_warn_threshold() {
     assert!(at.warning);
 
     let tiny_quota = QuotaConfig {
-        default_group_quota_bytes: Some(1),
+        default_quota_bytes: Some(1),
         warn_threshold_percent: 85,
         ..QuotaConfig::default()
     };
@@ -744,13 +744,13 @@ async fn placement_admin_gated() {
 async fn placement_binding_lifecycle() {
     let (state, realm_id, admin, _tempdir) = setup_management_state().await;
     let auth = admin_auth(realm_id, admin);
-    let job_family_strategy_id = drive(
+    let family_strategy_id = drive(
         aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
     .unwrap()
-    .job_family_strategy_id
+    .family_strategy_id
     .to_string();
     let (_, Json(initial)) =
         get_realm_placement(State(state.clone()), Extension(Some(auth.clone())))
@@ -758,7 +758,7 @@ async fn placement_binding_lifecycle() {
             .unwrap();
     assert_eq!(
         serde_json::to_value(&initial).unwrap()["job_family_strategy_id"].as_str(),
-        Some(job_family_strategy_id.as_str())
+        Some(family_strategy_id.as_str())
     );
     let initial_default = initial.default_strategy_id.unwrap();
     let strategy_id = Ulid::from_bytes([21; 16]);
@@ -776,7 +776,7 @@ async fn placement_binding_lifecycle() {
     .unwrap();
     assert_eq!(
         serde_json::to_value(after_upsert).unwrap()["job_family_strategy_id"].as_str(),
-        Some(job_family_strategy_id.as_str())
+        Some(family_strategy_id.as_str())
     );
     let _ = mutate_realm_placement(
         State(state.clone()),
@@ -1102,7 +1102,7 @@ fn placement_conflict_maps() {
 #[test]
 fn placement_missing_config() {
     assert!(matches!(
-        map_placement_error(MutatePlacementError::RealmConfigNotFound),
+        map_placement_error(MutatePlacementError::ConfigMissing),
         ServerError::NotFound
     ));
 }
@@ -1164,9 +1164,9 @@ async fn admin_sets_quota() {
         session: None,
     };
     let mut body = RealmQuotaConfig::from(QuotaConfig::default());
-    body.default_group_quota_bytes = Some(4096);
-    body.max_devices_per_user = Some(3);
-    body.device_requests_per_minute = Some(600);
+    body.default_quota_bytes = Some(4096);
+    body.devices_per_user = Some(3);
+    body.device_request_rate = Some(600);
     body.device_concurrent_pulls = Some(8);
 
     let (status, Json(stored)) = set_realm_quota(
@@ -1177,9 +1177,9 @@ async fn admin_sets_quota() {
     .await
     .unwrap();
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(stored.default_group_quota_bytes, Some(4096));
-    assert_eq!(stored.max_devices_per_user, Some(3));
-    assert_eq!(stored.device_requests_per_minute, Some(600));
+    assert_eq!(stored.default_quota_bytes, Some(4096));
+    assert_eq!(stored.devices_per_user, Some(3));
+    assert_eq!(stored.device_request_rate, Some(600));
     assert_eq!(stored.device_concurrent_pulls, Some(8));
 
     let (status, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
@@ -1187,8 +1187,8 @@ async fn admin_sets_quota() {
         .unwrap();
     assert_eq!(status, StatusCode::OK);
     let quota = info.quota.expect("realm token sees quota");
-    assert_eq!(quota.default_group_quota_bytes, Some(4096));
-    assert_eq!(quota.max_devices_per_user, Some(3));
+    assert_eq!(quota.default_quota_bytes, Some(4096));
+    assert_eq!(quota.devices_per_user, Some(3));
 }
 
 /// Anonymous callers keep what they need to authenticate; realm topology,
@@ -1201,7 +1201,7 @@ async fn realm_gates_detail() {
         .await;
     let auth = admin_auth(realm_id, admin);
     let mut body = RealmQuotaConfig::from(QuotaConfig::default());
-    body.user_group_cap_overrides = vec![GroupCapOverride {
+    body.group_cap_overrides = vec![GroupCapOverride {
         user_id: admin.to_string(),
         max_groups: Some(1),
     }];
@@ -1255,8 +1255,8 @@ async fn realm_gates_detail() {
     assert!(!info.nodes.is_empty());
     assert!(info.discovery.is_some());
     let quota = info.quota.expect("realm token sees quota");
-    assert_eq!(quota.user_group_cap_overrides.len(), 1);
-    assert_eq!(quota.user_group_cap_overrides[0].user_id, admin.to_string());
+    assert_eq!(quota.group_cap_overrides.len(), 1);
+    assert_eq!(quota.group_cap_overrides[0].user_id, admin.to_string());
 }
 
 /// Signed-out callers receive only aggregate overview values. An
@@ -1533,7 +1533,7 @@ async fn rejects_zero_cap() {
         session: None,
     };
     let mut body = RealmQuotaConfig::from(QuotaConfig::default());
-    body.max_devices_per_user = Some(0);
+    body.devices_per_user = Some(0);
 
     let error = set_realm_quota(State(state), Extension(Some(auth)), Json(body))
         .await
@@ -1557,7 +1557,7 @@ async fn rejects_zero_limits() {
     };
     for body in [
         RealmQuotaConfig {
-            device_requests_per_minute: Some(0),
+            device_request_rate: Some(0),
             ..RealmQuotaConfig::from(QuotaConfig::default())
         },
         RealmQuotaConfig {

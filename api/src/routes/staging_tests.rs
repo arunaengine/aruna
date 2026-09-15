@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
@@ -37,9 +37,9 @@ struct TestState {
     source_path: String,
     bucket: String,
     key: String,
-    auth_with_bucket_read: AuthContext,
-    auth_with_source_read: AuthContext,
-    auth_without_source_read: AuthContext,
+    auth_bucket_read: AuthContext,
+    auth_source_read: AuthContext,
+    without_source_read: AuthContext,
 }
 
 #[test]
@@ -57,7 +57,7 @@ async fn snapshot_requires_read() {
 
     let result = snapshot_blob(
         test.state.clone(),
-        test.auth_without_source_read,
+        test.without_source_read,
         StageTargetRequest {
             group_id: test.bucket_group_id.to_string(),
             connector_id: test.connector_id.to_string(),
@@ -77,7 +77,7 @@ async fn reference_auth_succeeds() {
 
     let result = reference_blob(
         test.state.clone(),
-        test.auth_with_source_read,
+        test.auth_source_read,
         StageTargetRequest {
             group_id: test.bucket_group_id.to_string(),
             connector_id: test.connector_id.to_string(),
@@ -98,7 +98,7 @@ async fn references_list_bindings() {
 
     let (status, Json(mut first)) = list_references(
         State(test.state.clone()),
-        Extension(Some(test.auth_with_bucket_read.clone())),
+        Extension(Some(test.auth_bucket_read.clone())),
         Query(ReferenceListQuery {
             bucket: test.bucket.clone(),
             prefix: Some("data/".to_string()),
@@ -113,7 +113,7 @@ async fn references_list_bindings() {
 
     let (_, Json(second)) = list_references(
         State(test.state.clone()),
-        Extension(Some(test.auth_with_bucket_read.clone())),
+        Extension(Some(test.auth_bucket_read.clone())),
         Query(ReferenceListQuery {
             bucket: test.bucket.clone(),
             prefix: Some("data/".to_string()),
@@ -184,7 +184,7 @@ async fn references_deny_read() {
 
     let result = list_references(
         State(test.state),
-        Extension(Some(test.auth_without_source_read)),
+        Extension(Some(test.without_source_read)),
         Query(ReferenceListQuery {
             bucket: test.bucket,
             prefix: None,
@@ -211,7 +211,7 @@ async fn queue_failure_repairable() {
 
     let obligation = LiveObligationRecord::new(
         test.state.get_node_id(),
-        test.auth_with_source_read.clone(),
+        test.auth_source_read.clone(),
         test.bucket.clone(),
         test.key.clone(),
         version_id,
@@ -220,7 +220,7 @@ async fn queue_failure_repairable() {
     let obligation_key = live_obligation_key(&obligation).unwrap();
     write_doc(
         &test.state.get_ctx(),
-        BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+        REPLICATION_OBLIGATION_KEYSPACE,
         obligation_key.as_ref().to_vec().into(),
         postcard::to_allocvec(&obligation).unwrap().into(),
     )
@@ -228,7 +228,7 @@ async fn queue_failure_repairable() {
 
     queue_live_replication(
         &test.state,
-        test.auth_with_source_read,
+        test.auth_source_read,
         test.bucket,
         test.key,
         version_id,
@@ -239,7 +239,7 @@ async fn queue_failure_repairable() {
     assert!(
         read_doc(
             &test.state.get_ctx(),
-            BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+            REPLICATION_OBLIGATION_KEYSPACE,
             obligation_key.as_ref().to_vec().into(),
         )
         .await
@@ -353,7 +353,7 @@ async fn batch_rejects_cap() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_with_source_read)),
+        Extension(Some(test.auth_source_read)),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: None,
@@ -376,7 +376,7 @@ async fn batch_rejects_node() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_with_source_read)),
+        Extension(Some(test.auth_source_read)),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: Some(other_node.to_string()),
@@ -398,7 +398,7 @@ async fn batch_sync_unimplemented() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_with_source_read)),
+        Extension(Some(test.auth_source_read)),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: None,
@@ -425,7 +425,7 @@ fn openapi_has_staging() {
 }
 
 async fn seed_reference_objects(test: &TestState) -> NodeId {
-    let created_by = test.auth_with_bucket_read.user_id;
+    let created_by = test.auth_bucket_read.user_id;
     let materialized_hash = [21u8; 32];
     let location = BackendLocation {
         backend: BackendRef::node_default(),
@@ -686,7 +686,7 @@ async fn setup_state() -> TestState {
         source_path,
         bucket,
         key,
-        auth_with_bucket_read: AuthContext {
+        auth_bucket_read: AuthContext {
             user_id: user_with_source_read,
             realm_id,
             path_restrictions: Some(vec![PathRestriction {
@@ -695,7 +695,7 @@ async fn setup_state() -> TestState {
             }]),
             session: None,
         },
-        auth_with_source_read: AuthContext {
+        auth_source_read: AuthContext {
             user_id: user_with_source_read,
             realm_id,
             path_restrictions: Some(vec![
@@ -710,7 +710,7 @@ async fn setup_state() -> TestState {
             ]),
             session: None,
         },
-        auth_without_source_read: AuthContext {
+        without_source_read: AuthContext {
             user_id: user_without_source_read,
             realm_id,
             path_restrictions: Some(vec![PathRestriction {

@@ -136,7 +136,7 @@ pub(super) fn attributes_parts(
         parts.truncate(max_parts);
         // With max_parts=0 the truncation empties `parts`, so fall back to
         // the marker preceding the first unreturned part (request marker/0).
-        let next_part_number_marker = is_truncated.then(|| {
+        let next_part_marker = is_truncated.then(|| {
             parts
                 .last()
                 .map(|part| part.part_number)
@@ -172,7 +172,7 @@ pub(super) fn attributes_parts(
             is_truncated: Some(is_truncated),
             max_parts: Some(i32::try_from(max_parts).unwrap_or(i32::MAX)),
             part_number_marker: requested_marker,
-            next_part_number_marker: next_part_number_marker.map(i32::from),
+            next_part_number_marker: next_part_marker.map(i32::from),
             parts: Some(object_part_list),
         }
     })

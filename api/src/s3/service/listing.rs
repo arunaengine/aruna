@@ -1,7 +1,7 @@
 //! Object, upload and version listing helpers for the S3 adapter. The trait
 //! implementation stays in `service`.
 
-use super::{ArunaS3Service, S3_URL_ENCODE_SET};
+use super::{ArunaS3Service, URL_ENCODE_SET};
 use crate::s3::checksum::{ChecksumSelection, encode_checksums};
 use crate::s3::error::IntoS3Error;
 use crate::s3::scope::SubpathScope;
@@ -199,7 +199,7 @@ impl ArunaS3Service {
 
         let encode_field = |value: String| -> String {
             if url_encoded {
-                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+                utf8_percent_encode(&value, URL_ENCODE_SET).to_string()
             } else {
                 value
             }
@@ -346,7 +346,7 @@ pub(super) fn list_parts_output(
         part_number_marker: input.part_number_marker,
         max_parts: Some(i32::try_from(max_parts).unwrap_or(i32::MAX)),
         is_truncated: Some(result.is_truncated),
-        next_part_number_marker: result.next_part_number_marker.map(i32::from),
+        next_part_number_marker: result.next_part_marker.map(i32::from),
         parts: Some(parts),
         initiator,
         owner,
@@ -368,7 +368,7 @@ pub(super) fn list_uploads_output(
         .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
     let encode_field = |value: String| -> String {
         if url_encoded {
-            utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            utf8_percent_encode(&value, URL_ENCODE_SET).to_string()
         } else {
             value
         }
@@ -419,7 +419,7 @@ pub(super) fn list_uploads_output(
         is_truncated: Some(result.is_truncated),
         next_key_marker: result.next_key_marker.map(&encode_field),
         next_upload_id_marker: result
-            .next_upload_id_marker
+            .next_upload_marker
             .map(|upload_id| upload_id.to_string()),
         uploads: Some(uploads),
         common_prefixes: Some(common_prefixes),
@@ -446,7 +446,7 @@ impl ArunaS3Service {
             .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
         let encode_field = |value: String| -> String {
             if url_encoded {
-                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+                utf8_percent_encode(&value, URL_ENCODE_SET).to_string()
             } else {
                 value
             }
@@ -520,7 +520,7 @@ impl ArunaS3Service {
             is_truncated: Some(result.is_truncated),
             next_key_marker: result.next_key_marker.map(&encode_field),
             next_version_id_marker: result
-                .next_version_id_marker
+                .next_version_marker
                 .map(|version_id| version_id.to_string()),
             versions: Some(versions),
             delete_markers: Some(delete_markers),

@@ -218,10 +218,10 @@ pub async fn metadata_reference_preflight(
     let target = match request.target {
         PreflightTargetBody::ContentW3ids {
             content_w3ids,
-            remove_all_resolvable_locations,
+            remove_resolvable_locations,
         } => ReferenceTarget::ContentW3ids {
             content_w3ids,
-            remove_all_resolvable_locations,
+            remove_resolvable_locations,
         },
         PreflightTargetBody::BucketPrefix {
             bucket,
@@ -292,8 +292,8 @@ fn map_preflight_response(execution: ReferenceExecution) -> PreflightResponse {
                     })
                     .collect(),
                 hidden_references_exist: target.hidden_references_exist,
-                would_remove_last_resolvable_aruna_location: target
-                    .would_remove_last_resolvable_aruna_location,
+                would_remove_location: target
+                    .would_remove_location,
                 location_impact_complete: target.location_impact_complete,
             })
             .collect(),
@@ -337,13 +337,13 @@ fn map_preflight_response(execution: ReferenceExecution) -> PreflightResponse {
                         aruna_operations::metadata::api::MetadataIndexState::Mixed => "mixed",
                     }
                     .to_string(),
-                    oldest_status_updated_at_ms: freshness.oldest_status_updated_at_ms,
+                    oldest_status_updated: freshness.oldest_status_updated,
                 })
                 .collect(),
             target_resolution_complete: execution.coverage.target_resolution_complete,
-            path_style_endpoint_coverage_complete: execution
+            path_style_complete: execution
                 .coverage
-                .path_style_endpoint_coverage_complete,
+                .path_style_complete,
             realm_coverage_complete: execution.coverage.realm_coverage_complete,
         },
     }

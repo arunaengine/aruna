@@ -3,7 +3,7 @@
 //! pass before anything may parse or store a request.
 
 use crate::s3::cors::parse_requested_headers;
-use crate::s3::server::body::DELETE_OBJECTS_MAX_BODY;
+use crate::s3::server::body::DELETE_MAX_BODY;
 use crate::s3::util::bucket_name_reason;
 use http::{HeaderMap, HeaderValue, Method, header};
 use s3s::host::S3Host;
@@ -67,7 +67,7 @@ impl RequestClassification {
                 .get(header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length > DELETE_OBJECTS_MAX_BODY as u64);
+                .is_some_and(|length| length > DELETE_MAX_BODY as u64);
         // A completion is the one S3 call that can legitimately run for minutes,
         // and its client sends no bytes while it waits.
         let complete_multipart = method == Method::POST && query_has_any(&parts.uri, &["uploadId"]);

@@ -321,7 +321,7 @@ async fn group_policies(
         Ok((_, auth_doc)) => Ok(auth_doc.policies),
         Err(
             aruna_operations::groups::get_group::GetGroupError::GroupNotFound
-            | aruna_operations::groups::get_group::GetGroupError::AuthDocNotFound,
+            | aruna_operations::groups::get_group::GetGroupError::DocNotFound,
         ) => Ok(Vec::new()),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
@@ -528,7 +528,7 @@ pub async fn set_realm_policies(
         SetPoliciesError::Unauthorized | SetPoliciesError::NotManagementNode => {
             ServerError::Forbidden
         }
-        SetPoliciesError::RealmConfigNotFound => ServerError::NotFound,
+        SetPoliciesError::ConfigMissing => ServerError::NotFound,
         SetPoliciesError::StaleHash => {
             ServerError::Conflict("stored realm policy set changed".to_string())
         }
@@ -706,7 +706,7 @@ pub async fn set_group_policies(
     .map_err(|error| match error {
         SetGroupError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
         SetGroupError::Unauthorized => ServerError::Forbidden,
-        SetGroupError::GroupAuthDocNotFound => ServerError::NotFound,
+        SetGroupError::GroupMissing => ServerError::NotFound,
         SetGroupError::StaleHash => {
             ServerError::Conflict("stored group policy set changed".to_string())
         }

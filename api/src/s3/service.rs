@@ -128,7 +128,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::{Instrument, debug, error, warn};
 
-const S3_URL_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+const URL_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
@@ -607,7 +607,7 @@ impl S3 for ArunaS3Service {
             .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
         let encode_field = |value: String| -> String {
             if url_encoded {
-                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+                utf8_percent_encode(&value, URL_ENCODE_SET).to_string()
             } else {
                 value
             }
@@ -725,7 +725,7 @@ impl S3 for ArunaS3Service {
             .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
         let encode_field = |value: String| -> String {
             if url_encoded {
-                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+                utf8_percent_encode(&value, URL_ENCODE_SET).to_string()
             } else {
                 value
             }

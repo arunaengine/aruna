@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, CreateSecretRequest, OnboardingMode, OnboardingPurpose,
     OnboardingSecret, OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode,
@@ -165,7 +165,7 @@ fn placement_errors_badrequest() {
         ServerError::ReservedLabel(_)
     ));
     assert!(matches!(
-        map_finalize_error(BootstrapFinalizeError::NodeLocationTooLong),
+        map_finalize_error(BootstrapFinalizeError::LongNodeLocation),
         ServerError::BadRequest
     ));
 }
@@ -231,7 +231,7 @@ async fn server_secret_consumed() {
     assert_eq!(bootstrap.mode, OnboardingMode::Server);
     assert_eq!(bootstrap.realm_id, realm_id.to_string());
     assert_eq!(bootstrap.temporary_bootstrap_endpoint.id, seed_node_id);
-    assert!(bootstrap.wrapped_realm_private_key.is_none());
+    assert!(bootstrap.wrapped_realm_key.is_none());
     assert!(bootstrap.delegation_signature.is_some());
     assert!(!bootstrap.onboarding_sync_ticket.is_empty());
 
@@ -256,7 +256,7 @@ async fn server_secret_consumed() {
         .get_ctx()
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            key_space: DOCUMENT_STATE_KEYSPACE.to_string(),
             key: reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id }),
             txn_id: None,
         }))
@@ -609,7 +609,7 @@ async fn enrolls_user_device() {
     .unwrap();
 
     assert_eq!(bootstrap.mode, OnboardingMode::User { owner: user_id });
-    assert!(bootstrap.wrapped_realm_private_key.is_none());
+    assert!(bootstrap.wrapped_realm_key.is_none());
     assert!(bootstrap.delegation_signature.is_none());
 
     let config = match state
@@ -1042,10 +1042,10 @@ async fn bootstrap_wraps_key() {
     );
     let cipher = SalsaBox::new(&sender_public_key, &transport_secret_key);
     let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(bootstrap.wrapped_realm_private_key_nonce.unwrap())
+        .decode(bootstrap.wrapped_key_nonce.unwrap())
         .unwrap();
     let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(bootstrap.wrapped_realm_private_key.unwrap())
+        .decode(bootstrap.wrapped_realm_key.unwrap())
         .unwrap();
     let nonce = crypto_box::Nonce::from(<[u8; 24]>::try_from(nonce_bytes.as_slice()).unwrap());
     let plaintext = cipher.decrypt(&nonce, ciphertext.as_ref()).unwrap();

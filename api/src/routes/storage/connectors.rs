@@ -1132,7 +1132,7 @@ fn map_get_error(
         GetSourceError::NotFound => ServerError::NotFound,
         GetSourceError::StorageError(_)
         | GetSourceError::ConversionError(_)
-        | GetSourceError::GetSourceConnectorFailed => ServerError::InternalError(error.to_string()),
+        | GetSourceError::GetConnectorFailed => ServerError::InternalError(error.to_string()),
     }
 }
 
@@ -1140,7 +1140,7 @@ fn map_replace_error(error: ReplaceSourceError) -> ServerError {
     match error {
         ReplaceSourceError::ValidationError(_) => ServerError::BadRequest,
         ReplaceSourceError::NotFound => ServerError::NotFound,
-        ReplaceSourceError::ReferencedByObjectVersion => ServerError::Conflict(error.to_string()),
+        ReplaceSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -1148,7 +1148,7 @@ fn map_replace_error(error: ReplaceSourceError) -> ServerError {
 fn map_delete_error(error: DeleteSourceError) -> ServerError {
     match error {
         DeleteSourceError::NotFound => ServerError::NotFound,
-        DeleteSourceError::ReferencedByObjectVersion => ServerError::Conflict(error.to_string()),
+        DeleteSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
         _ => ServerError::InternalError(error.to_string()),
     }
 }

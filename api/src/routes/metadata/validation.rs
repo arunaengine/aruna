@@ -85,7 +85,7 @@ pub async fn profile_validation_capabilities() -> (StatusCode, Json<ProfileCapab
                 .map(|constraint| (*constraint).to_string())
                 .collect(),
             unsupported_constraint_policy: "fail_closed".to_string(),
-            public_profile_iri_template: "https://w3id.org/aruna/profile/{id}".to_string(),
+            profile_iri_template: "https://w3id.org/aruna/profile/{id}".to_string(),
         }),
     )
 }
