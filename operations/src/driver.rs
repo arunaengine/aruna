@@ -1,18 +1,6 @@
-//! The operation runner.
-//!
-//! [`drive`] and [`drive_until`] execute a parent [`Operation`]; suboperations
-//! execute through the same effect loop with their own depth, deadline, and
-//! finalization. The runner keeps transaction ownership explicit:
-//!
-//! - [`TransactionTracker`] tracks every transaction the run started and hands
-//!   unresolved ones back to storage on drop;
-//! - [`RunState::committed`] records a commit acknowledgement, which is what
-//!   the `Operation::abort_after_commit` opt-in gates;
-//! - [`RunState::expired`] and [`RunState::cleanup_deadline`] bound cleanup
-//!   after the deadline, so a managed commit is never canceled by a timeout.
-//!
-//! Effect bodies live in `effect_adapters`; the routing-input helpers the
-//! operation surface assembles configs with are re-exported here.
+//! The operation runner: [`drive`] and [`drive_until`] execute a parent
+//! [`Operation`]; suboperations share the effect loop, effect bodies live in
+//! `effect_adapters`, and `RunState` keeps transaction ownership explicit.
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
@@ -32,37 +20,17 @@ use std::pin::Pin;
 use std::time::Duration;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
+use crate::effect_adapters;
 use crate::metadata::MetadataHandle;
-
-mod effect_adapters;
 
 pub use effect_adapters::routing::{
     GateContextError, RoutingInputsError, backend_used_bytes, bucket_snapshot, gate_context,
     node_routing, now_ms, quota_marked_routing, routing_snapshot,
 };
 
-/// Handles and capabilities one operation run may use.
-///
-/// Only `storage_handle` is required. Every other plane is optional, and a node
-/// without one keeps the explicit outcome its adapter reports:
-///
-/// - absent `blob_handle`: blob, staging-source, and local-file effects fail
-///   with `BlobError::HandleMissing`, `StagingSourceError::HandleMissing`, or a
-///   local-file error message, never a silent success;
-/// - absent `net_handle`: ordinary net effects report `NetError::ChannelClosed`;
-///   the one deliberate exception is a document publication, which reports the
-///   selected targets as `DocumentsPublished`, because the operation already
-///   decided the publication and only its fan-out is absent;
-/// - absent `metadata_handle`: metadata effects report
-///   `MetadataError::HandleMissing`;
-/// - absent `task_handle`: the task effect is still persisted, then reported as
-///   a task error with no key;
-/// - absent `compute_handle`: this runner dispatches no compute; compute
-///   callers check the registry before naming an executor.
-///
-/// Governed writes additionally consult the node's advertised placement subject
-/// through the storage handle; [`gate_context`] fails them closed when no
-/// subject was ever advertised.
+/// Handles and capabilities one operation run may use. Only `storage_handle` is
+/// required; an absent plane keeps its adapter's explicit outcome, and governed
+/// writes fail closed through [`gate_context`] without an advertised subject.
 #[derive(Clone)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
@@ -86,7 +54,7 @@ impl std::fmt::Debug for DriverContext {
     }
 }
 
-const MAX_SUBOP_DEPTH: usize = 32;
+pub(crate) const MAX_SUBOP_DEPTH: usize = 32;
 const SUBOP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TRACKED_TRANSACTIONS: usize = 32;
 
@@ -151,7 +119,7 @@ fn commit_done(transaction: Option<TransactionEffect>, event: &Event) -> bool {
 /// Whether an effect owns its own timeout and must not be canceled by the
 /// runner deadline. Managed effects finish their storage/blob round-trip so a
 /// commit acknowledgement is never lost.
-fn managed_effect(effect: &Effect) -> bool {
+pub(crate) fn managed_effect(effect: &Effect) -> bool {
     match effect {
         Effect::Blob(BlobEffect::ReleaseReservation { .. }) => true,
         Effect::Blob(BlobEffect::SpoolHidden {
@@ -350,13 +318,9 @@ fn extend_unblocked(queue: &mut VecDeque<Effect>, effects: Effects, tracker: &Tr
     }));
 }
 
-/// Explicit state the effect loop carries between dispatches.
-///
-/// The concerns stay apart on purpose: `tracker` owns every transaction this
-/// run started (including commits whose outcome is unknown), `committed` is the
-/// commit acknowledgement that gates `abort_after_commit`, and
-/// `expired`/`cleanup_deadline` bound cleanup after the deadline. `holds` keep
-/// tenant backend reservations alive until the run returns.
+/// State the effect loop carries between dispatches: the tracker owns every
+/// started transaction, `committed` gates `abort_after_commit`, and `expired`
+/// plus `cleanup_deadline` bound cleanup. `holds` pin backend reservations.
 struct RunState {
     tracker: TransactionTracker,
     holds: Vec<GroupHold>,
@@ -472,11 +436,9 @@ impl Drive for SubRun<'_> {
     }
 }
 
-/// Runs the effect queue to completion or to its deadline, then returns the
-/// explicit run state so the caller can finalize and hand off transactions.
-///
-/// `expiry_log` names the parent operation, so only a parent's deadline logs
-/// the abort-path warning; suboperation expiry stays quiet.
+/// Runs the effect queue to completion or to its deadline and returns the run
+/// state for finalization. Only a parent names `expiry_log`, so suboperation
+/// expiry stays quiet.
 async fn drive_effects(
     executable: &mut dyn Drive,
     context: &DriverContext,
@@ -602,7 +564,7 @@ async fn drive_effects(
 /// Suboperation execution: its own depth, deadline, and event finalization, but
 /// the same effect loop and transaction ownership as a parent. A depth limit is
 /// enforced by the dispatch overview before this is reached.
-fn drive_suboperation<'a>(
+pub(crate) fn drive_suboperation<'a>(
     mut operation: Box<dyn SubOperation>,
     context: &'a DriverContext,
     depth: usize,
@@ -1208,7 +1170,7 @@ mod test {
     }
 
     #[test]
-    fn deadline_abort_policy_explicit() {
+    fn deadline_abort_policy() {
         // A suboperation stops at an acknowledged commit; a parent continues
         // only through the operation's opt-in.
         assert!(DeadlineAbort::BeforeCommitOnly.allows(false));
@@ -1984,11 +1946,11 @@ mod test {
     }
 
     #[derive(Debug, PartialEq)]
-    struct StagingSourceDispatchOperation {
+    struct StagingDispatchOperation {
         observed_staging_source: bool,
     }
 
-    impl StagingSourceDispatchOperation {
+    impl StagingDispatchOperation {
         fn new() -> Self {
             Self {
                 observed_staging_source: false,
@@ -1996,7 +1958,7 @@ mod test {
         }
     }
 
-    impl Operation for StagingSourceDispatchOperation {
+    impl Operation for StagingDispatchOperation {
         type Output = bool;
         type Error = ();
 
@@ -2071,7 +2033,7 @@ mod test {
             compute_handle: None,
         };
 
-        let observed = drive(StagingSourceDispatchOperation::new(), &context)
+        let observed = drive(StagingDispatchOperation::new(), &context)
             .await
             .expect("staging source effect should be dispatched");
         assert!(observed);
