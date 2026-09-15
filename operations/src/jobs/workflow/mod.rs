@@ -51,8 +51,9 @@ struct Attempt {
 
 /// What the prepare-and-submit stage produced.
 enum AttemptOutcome {
-    /// The run stopped before the attempt reached submit; its path already
-    /// finalized the job.
+    /// The run stopped before the attempt reached submit. Paths that still
+    /// owned the claim finalized the job there; a lost claim belongs to its
+    /// new owner and is neither written nor finalized by this run.
     Stopped,
     /// The backend accepted the fenced attempt; supervision owns it now.
     Submitted(Attempt),
@@ -360,12 +361,14 @@ pub async fn run_execution_job(
                     error,
                 ));
                 tokio::select! {
-                    result = &mut recovery => Some(result),
+                    result = &mut recovery => {
+                        stop.cancel();
+                        let _ = (&mut heartbeat).await;
+                        Some(result)
+                    }
                     _ = &mut heartbeat => None,
                 }
             };
-            stop.cancel();
-            let _ = (&mut heartbeat).await;
             if resumed == Some(true) {
                 let Attempt {
                     backend,

@@ -19,12 +19,13 @@ use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{put_crate_status, read_crate_status, read_job_record};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
+use crate::forward::transport::MetadataWriteError;
 use crate::metadata::MetadataAuthToken;
 use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     mint_job_document,
 };
-use crate::metadata::forward::{MetadataWriteError, route_metadata_create};
+use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
