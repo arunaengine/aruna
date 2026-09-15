@@ -4,9 +4,7 @@ use crate::driver::{
 };
 use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::descriptor::build_source_binding;
-use crate::staging::read_source::{
-    ReadStagingSourceError, ReadStagingSourceInput, ReadStagingSourceOperation,
-};
+use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{ConversionError, StorageError};
@@ -51,7 +49,7 @@ use aruna_core::structs::{BackendLocation, BlobLocationKey};
 #[derive(Debug, Error, PartialEq)]
 pub enum MaterializeSnapshotError {
     #[error(transparent)]
-    Read(#[from] ReadStagingSourceError),
+    Read(#[from] ReadSourceError),
     #[error(transparent)]
     Write(#[from] PutObjectError),
     #[error(transparent)]
@@ -69,7 +67,7 @@ pub async fn stage_snapshot_blob(
     input: MaterializeSnapshotInput,
 ) -> Result<MaterializeSnapshotResult, MaterializeSnapshotError> {
     let read_result = drive(
-        ReadStagingSourceOperation::new(ReadStagingSourceInput {
+        ReadSourceOperation::new(ReadSourceInput {
             group_id: input.group_id,
             connector_id: input.connector_id,
             source_path: input.source_path.clone(),
@@ -220,9 +218,7 @@ async fn read_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::staging::{
-        create_http_connector, create_test_bucket, setup_driver_context,
-    };
+    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use axum::Router;
     use axum::routing::get;
     use tokio::net::TcpListener;

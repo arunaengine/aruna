@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::admin_documents::AdminDocumentOperation;
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -34,7 +34,7 @@ pub(crate) fn outbox_stream_prefixes() -> [&'static [u8]; 3] {
 }
 
 // Sort by kind and ULID; admin records also sort by origin sequence to preserve FIFO order.
-pub fn outbox_prefix(event: &DocumentSyncOutboxEvent) -> Key {
+pub fn outbox_prefix(event: &DocumentOutboxEvent) -> Key {
     let mut bytes = b"document-sync-outbox-v1/".to_vec();
     bytes.extend_from_slice(event.kind());
     bytes.push(b'/');
@@ -47,9 +47,9 @@ pub fn admin_outbox_prefix(node_id: NodeId) -> Key {
     ByteView::from(bytes)
 }
 
-pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
+pub fn outbox_key(record: &DocumentOutboxRecord) -> Key {
     let mut bytes = outbox_prefix(&record.event).to_vec();
-    if let DocumentSyncOutboxEvent::AdminOperation { event, .. } = &record.event {
+    if let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event {
         bytes.extend_from_slice(event.origin_node_id.as_bytes());
         bytes.extend_from_slice(&event.origin_seq.to_be_bytes());
     }
@@ -59,7 +59,7 @@ pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
     ByteView::from(bytes)
 }
 
-pub fn revocation_index_entry(record: &DocumentSyncOutboxRecord) -> (String, Key, Value) {
+pub fn revocation_index_entry(record: &DocumentOutboxRecord) -> (String, Key, Value) {
     (
         TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
         outbox_key(record),
@@ -67,8 +67,8 @@ pub fn revocation_index_entry(record: &DocumentSyncOutboxRecord) -> (String, Key
     )
 }
 
-fn revocation_index_key(record: &DocumentSyncOutboxRecord) -> Option<Key> {
-    let DocumentSyncOutboxEvent::AdminOperation { event, .. } = &record.event else {
+fn revocation_index_key(record: &DocumentOutboxRecord) -> Option<Key> {
+    let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event else {
         return None;
     };
     matches!(
@@ -80,12 +80,12 @@ fn revocation_index_key(record: &DocumentSyncOutboxRecord) -> Option<Key> {
 
 pub fn new_outbox_record(
     node_id: NodeId,
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     peers: Vec<NodeId>,
-    event: DocumentSyncOutboxEvent,
+    event: DocumentOutboxEvent,
     admin_placement: PlacementRef,
     allow_genesis: bool,
-) -> DocumentSyncOutboxRecord {
+) -> DocumentOutboxRecord {
     new_identified_record(
         Ulid::generate(),
         node_id,
@@ -103,19 +103,20 @@ pub fn new_outbox_record(
 pub fn new_identified_record(
     outbox_id: Ulid,
     node_id: NodeId,
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     mut peers: Vec<NodeId>,
-    event: DocumentSyncOutboxEvent,
+    event: DocumentOutboxEvent,
     admin_placement: PlacementRef,
     allow_genesis: bool,
-) -> DocumentSyncOutboxRecord {
+) -> DocumentOutboxRecord {
     crate::sync::shard_placement::sort_node_ids(&mut peers);
     let placement = match &event {
-        DocumentSyncOutboxEvent::Upsert { change, .. }
-        | DocumentSyncOutboxEvent::Delete { change } => change.placement,
-        DocumentSyncOutboxEvent::AdminOperation { .. } => admin_placement,
+        DocumentOutboxEvent::Upsert { change, .. } | DocumentOutboxEvent::Delete { change } => {
+            change.placement
+        }
+        DocumentOutboxEvent::AdminOperation { .. } => admin_placement,
     };
-    DocumentSyncOutboxRecord {
+    DocumentOutboxRecord {
         outbox_id,
         node_id,
         target,
@@ -129,12 +130,12 @@ pub fn new_identified_record(
     }
 }
 
-pub fn write_outbox_effect(record: &DocumentSyncOutboxRecord) -> Result<Effect, postcard::Error> {
+pub fn write_outbox_effect(record: &DocumentOutboxRecord) -> Result<Effect, postcard::Error> {
     write_transaction_effect(record, None)
 }
 
 #[cfg(debug_assertions)]
-fn record_ledger(record: &DocumentSyncOutboxRecord, key: &[u8], value: &[u8]) {
+fn record_ledger(record: &DocumentOutboxRecord, key: &[u8], value: &[u8]) {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
 
@@ -162,7 +163,7 @@ fn record_ledger(record: &DocumentSyncOutboxRecord, key: &[u8], value: &[u8]) {
 }
 
 pub fn outbox_write_entry(
-    record: &DocumentSyncOutboxRecord,
+    record: &DocumentOutboxRecord,
 ) -> Result<(String, ByteView, ByteView), postcard::Error> {
     let key = outbox_key(record);
     let value = ByteView::from(postcard::to_allocvec(record)?);
@@ -172,7 +173,7 @@ pub fn outbox_write_entry(
 }
 
 pub fn write_transaction_effect(
-    record: &DocumentSyncOutboxRecord,
+    record: &DocumentOutboxRecord,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, postcard::Error> {
     let (key_space, key, value) = outbox_write_entry(record)?;
@@ -194,7 +195,7 @@ pub fn schedule_drain_effect() -> Effect {
 pub async fn read_outbox_record(
     storage: &StorageHandle,
     key: &[u8],
-) -> Result<Option<DocumentSyncOutboxRecord>, String> {
+) -> Result<Option<DocumentOutboxRecord>, String> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
@@ -205,7 +206,7 @@ pub async fn read_outbox_record(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
             .map(|bytes| {
-                postcard::from_bytes::<DocumentSyncOutboxRecord>(&bytes)
+                postcard::from_bytes::<DocumentOutboxRecord>(&bytes)
                     .map_err(|error| error.to_string())
             })
             .transpose(),
@@ -215,7 +216,7 @@ pub async fn read_outbox_record(
 }
 
 pub struct OutboxReadBatch {
-    pub records: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+    pub records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
     pub has_more: bool,
     pub next_start_after: Option<Vec<u8>>,
 }
@@ -243,7 +244,7 @@ pub async fn read_outbox_records(
             let next_start_after = page.last().map(|(key, _)| key.to_vec());
             let mut records = Vec::with_capacity(page.len());
             for (key, value) in page {
-                match postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) {
+                match postcard::from_bytes::<DocumentOutboxRecord>(&value) {
                     Ok(record) => records.push((key.to_vec(), record)),
                     Err(error) => {
                         let key = key.to_vec();
@@ -310,7 +311,7 @@ pub async fn delete_outbox_records(
             };
 
             match value {
-                Some(value) => match postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) {
+                Some(value) => match postcard::from_bytes::<DocumentOutboxRecord>(&value) {
                     Ok(record) => {
                         if let Some(index_key) = revocation_index_key(&record) {
                             if read_index_value(storage, &index_key).await?.is_some() {
@@ -415,7 +416,7 @@ mod tests {
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
-    use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
+    use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use aruna_core::handle::Handle;
     use aruna_core::structs::{Actor, RealmId};
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -427,14 +428,14 @@ mod tests {
         iroh::SecretKey::from_bytes(&bytes).public()
     }
 
-    fn target() -> DocumentSyncTarget {
-        DocumentSyncTarget::RealmConfig {
+    fn target() -> DocumentTarget {
+        DocumentTarget::RealmConfig {
             realm_id: RealmId::from_bytes([7u8; 32]),
         }
     }
 
-    fn user_admin_event(user_id: UserId, origin_seq: u64) -> DocumentSyncOutboxEvent {
-        DocumentSyncOutboxEvent::admin(AdminDocumentEvent {
+    fn user_admin_event(user_id: UserId, origin_seq: u64) -> DocumentOutboxEvent {
+        DocumentOutboxEvent::admin(AdminDocumentEvent {
             event_id: Ulid::from_parts(1, u128::from(origin_seq)),
             target: AdminDocumentTarget::User { user_id },
             origin_node_id: node(1),
@@ -451,10 +452,10 @@ mod tests {
         })
     }
 
-    fn revocation_event(origin_seq: u64) -> DocumentSyncOutboxEvent {
+    fn revocation_event(origin_seq: u64) -> DocumentOutboxEvent {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let user_id = UserId::local(Ulid::from_parts(7, 1), realm_id);
-        DocumentSyncOutboxEvent::admin(AdminDocumentEvent {
+        DocumentOutboxEvent::admin(AdminDocumentEvent {
             event_id: Ulid::from_parts(2, u128::from(origin_seq)),
             target: AdminDocumentTarget::RealmConfig { realm_id },
             origin_node_id: node(1),
@@ -480,8 +481,8 @@ mod tests {
         }
     }
 
-    fn change() -> DocumentSyncChange {
-        DocumentSyncChange {
+    fn change() -> DocumentChange {
+        DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
@@ -489,14 +490,14 @@ mod tests {
                 actor: node(1),
                 updated_at_ms: 9,
             },
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement: placement(5),
         }
     }
 
-    fn delete_change() -> DocumentSyncChange {
-        DocumentSyncChange {
-            kind: DocumentSyncChangeKind::Delete,
+    fn delete_change() -> DocumentChange {
+        DocumentChange {
+            kind: DocumentChangeKind::Delete,
             ..change()
         }
     }
@@ -564,7 +565,7 @@ mod tests {
             node(1),
             target(),
             vec![node(2)],
-            DocumentSyncOutboxEvent::Upsert {
+            DocumentOutboxEvent::Upsert {
                 bytes: vec![4, 5],
                 change: change(),
             },
@@ -602,11 +603,11 @@ mod tests {
 
     #[test]
     fn prefix_kind_scoped() {
-        let upsert = DocumentSyncOutboxEvent::Upsert {
+        let upsert = DocumentOutboxEvent::Upsert {
             bytes: vec![1, 2],
             change: change(),
         };
-        let delete = DocumentSyncOutboxEvent::Delete {
+        let delete = DocumentOutboxEvent::Delete {
             change: delete_change(),
         };
 
@@ -621,7 +622,7 @@ mod tests {
             node(1),
             target(),
             vec![peer, peer],
-            DocumentSyncOutboxEvent::Upsert {
+            DocumentOutboxEvent::Upsert {
                 bytes: vec![4, 5],
                 change: change(),
             },
@@ -629,8 +630,7 @@ mod tests {
             false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
-        let decoded: DocumentSyncOutboxRecord =
-            postcard::from_bytes(&bytes).expect("record decodes");
+        let decoded: DocumentOutboxRecord = postcard::from_bytes(&bytes).expect("record decodes");
 
         assert_eq!(decoded, record);
         assert_eq!(decoded.peers, vec![peer]);
@@ -642,7 +642,7 @@ mod tests {
             node(1),
             target(),
             vec![node(3)],
-            DocumentSyncOutboxEvent::Upsert {
+            DocumentOutboxEvent::Upsert {
                 bytes: vec![4, 5],
                 change: change(),
             },
@@ -650,8 +650,7 @@ mod tests {
             true,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
-        let decoded: DocumentSyncOutboxRecord =
-            postcard::from_bytes(&bytes).expect("record decodes");
+        let decoded: DocumentOutboxRecord = postcard::from_bytes(&bytes).expect("record decodes");
 
         assert_eq!(decoded, record);
         assert!(decoded.allow_genesis);
@@ -666,15 +665,14 @@ mod tests {
             node(1),
             target(),
             vec![node(3)],
-            DocumentSyncOutboxEvent::Delete {
+            DocumentOutboxEvent::Delete {
                 change: delete_change(),
             },
             aruna_core::structs::PlacementRef::NIL,
             false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
-        let decoded: DocumentSyncOutboxRecord =
-            postcard::from_bytes(&bytes).expect("record decodes");
+        let decoded: DocumentOutboxRecord = postcard::from_bytes(&bytes).expect("record decodes");
 
         assert_eq!(decoded, record);
         assert_eq!(decoded.placement, delete_change().placement);
@@ -682,7 +680,7 @@ mod tests {
 
     #[test]
     fn kind_keys_unique() {
-        let event = DocumentSyncOutboxEvent::Upsert {
+        let event = DocumentOutboxEvent::Upsert {
             bytes: vec![1],
             change: change(),
         };
@@ -711,7 +709,7 @@ mod tests {
 
     #[test]
     fn keys_follow_id() {
-        let event = DocumentSyncOutboxEvent::Upsert {
+        let event = DocumentOutboxEvent::Upsert {
             bytes: vec![1],
             change: change(),
         };
@@ -726,7 +724,7 @@ mod tests {
         older.outbox_id = Ulid::from_parts(1, 0);
         let mut newer = new_outbox_record(
             node(1),
-            DocumentSyncTarget::RealmConfig {
+            DocumentTarget::RealmConfig {
                 realm_id: RealmId::from_bytes([9u8; 32]),
             },
             vec![node(2)],
@@ -742,7 +740,7 @@ mod tests {
     #[test]
     fn admin_keys_ordered() {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
-        let target = DocumentSyncTarget::User { user_id };
+        let target = DocumentTarget::User { user_id };
         let mut earlier = new_outbox_record(
             node(1),
             target.clone(),
@@ -772,7 +770,7 @@ mod tests {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
         let record = new_outbox_record(
             node(1),
-            DocumentSyncTarget::User { user_id },
+            DocumentTarget::User { user_id },
             Vec::new(),
             user_admin_event(user_id, 1),
             placement(9),
@@ -789,7 +787,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let record = new_outbox_record(
             node(1),
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
             revocation_event(1),
             placement(9),
@@ -810,7 +808,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let record = new_outbox_record(
             node(1),
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
             revocation_event(1),
             placement(9),
@@ -858,7 +856,7 @@ mod tests {
             node(1),
             target(),
             vec![node(2)],
-            DocumentSyncOutboxEvent::Upsert {
+            DocumentOutboxEvent::Upsert {
                 bytes: vec![4, 5],
                 change: change(),
             },
@@ -867,7 +865,7 @@ mod tests {
         );
         let admin = new_outbox_record(
             node(1),
-            DocumentSyncTarget::User { user_id },
+            DocumentTarget::User { user_id },
             Vec::new(),
             user_admin_event(user_id, 1),
             placement(9),
@@ -917,7 +915,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let record = new_outbox_record(
             node(1),
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
             revocation_event(1),
             placement(9),
@@ -948,7 +946,7 @@ mod tests {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
         let event = user_admin_event(user_id, 1);
         let outbox_id = Ulid::from_parts(5, 5);
-        let target = DocumentSyncTarget::User { user_id };
+        let target = DocumentTarget::User { user_id };
         let nil = new_identified_record(
             outbox_id,
             node(1),

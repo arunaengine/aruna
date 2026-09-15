@@ -2,16 +2,13 @@ use std::collections::VecDeque;
 
 use aruna_core::UserId;
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
-use aruna_core::metadata::{
-    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
-};
+use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::MetadataRegistryRecord;
@@ -34,7 +31,7 @@ const USER_SYNC_PAGE_SIZE: usize = 256;
 #[derive(Debug, Clone, PartialEq)]
 enum PendingDocumentSync {
     Document {
-        document: DocumentSyncTarget,
+        document: DocumentTarget,
         bytes: Option<Vec<u8>>,
     },
     UserPage {
@@ -46,7 +43,7 @@ enum PendingDocumentSync {
 #[derive(Debug, PartialEq)]
 pub struct AnnounceTopicOperation {
     topic: TopicId,
-    document: Option<DocumentSyncTarget>,
+    document: Option<DocumentTarget>,
     local_node_id: NodeId,
     peers: Vec<NodeId>,
     document_bytes: Option<Vec<u8>>,
@@ -54,7 +51,7 @@ pub struct AnnounceTopicOperation {
     allow_genesis: bool,
     state: AnnounceTopicState,
     pending: VecDeque<PendingDocumentSync>,
-    current: Option<DocumentSyncTarget>,
+    current: Option<DocumentTarget>,
     output: Option<Result<(), AnnounceTopicError>>,
 }
 
@@ -95,7 +92,7 @@ impl AnnounceTopicOperation {
     pub fn new_for_document(
         topic: TopicId,
         local_node_id: NodeId,
-        document: Option<DocumentSyncTarget>,
+        document: Option<DocumentTarget>,
         allow_genesis: bool,
     ) -> Self {
         Self::new_with_peers(topic, local_node_id, document, Vec::new(), allow_genesis)
@@ -104,7 +101,7 @@ impl AnnounceTopicOperation {
     pub fn new_with_peers(
         topic: TopicId,
         local_node_id: NodeId,
-        document: Option<DocumentSyncTarget>,
+        document: Option<DocumentTarget>,
         peers: Vec<NodeId>,
         allow_genesis: bool,
     ) -> Self {
@@ -121,7 +118,7 @@ impl AnnounceTopicOperation {
     pub fn new_with_placement(
         topic: TopicId,
         local_node_id: NodeId,
-        document: Option<DocumentSyncTarget>,
+        document: Option<DocumentTarget>,
         peers: Vec<NodeId>,
         placement: PlacementRef,
         allow_genesis: bool,
@@ -144,7 +141,7 @@ impl AnnounceTopicOperation {
     pub fn new_with_bytes(
         topic: TopicId,
         local_node_id: NodeId,
-        document: DocumentSyncTarget,
+        document: DocumentTarget,
         peers: Vec<NodeId>,
         bytes: Vec<u8>,
         allow_genesis: bool,
@@ -200,18 +197,18 @@ impl AnnounceTopicOperation {
         }
     }
 
-    fn write_outbox(&mut self, document: DocumentSyncTarget, bytes: Vec<u8>) -> Effects {
+    fn write_outbox(&mut self, document: DocumentTarget, bytes: Vec<u8>) -> Effects {
         let change = match self.document_upsert_change(&document, &bytes) {
             Ok(change) => change,
             Err(error) => return self.fail(error),
         };
-        self.write_outbox_event(document, DocumentSyncOutboxEvent::Upsert { bytes, change })
+        self.write_outbox_event(document, DocumentOutboxEvent::Upsert { bytes, change })
     }
 
     fn write_outbox_event(
         &mut self,
-        document: DocumentSyncTarget,
-        event: DocumentSyncOutboxEvent,
+        document: DocumentTarget,
+        event: DocumentOutboxEvent,
     ) -> Effects {
         self.current = Some(document.clone());
         self.state = AnnounceTopicState::WriteOutbox;
@@ -233,23 +230,23 @@ impl AnnounceTopicOperation {
 
     fn document_upsert_change(
         &self,
-        document: &DocumentSyncTarget,
+        document: &DocumentTarget,
         bytes: &[u8],
-    ) -> Result<DocumentSyncChange, AnnounceTopicError> {
+    ) -> Result<DocumentChange, AnnounceTopicError> {
         match document {
-            DocumentSyncTarget::Group { .. }
-            | DocumentSyncTarget::GroupAuthorization { .. }
-            | DocumentSyncTarget::RealmAuthorization { .. }
-            | DocumentSyncTarget::RealmConfig { .. }
-            | DocumentSyncTarget::User { .. } => Err(AnnounceTopicError::DocumentSync(
+            DocumentTarget::Group { .. }
+            | DocumentTarget::GroupAuthorization { .. }
+            | DocumentTarget::RealmAuthorization { .. }
+            | DocumentTarget::RealmConfig { .. }
+            | DocumentTarget::User { .. } => Err(AnnounceTopicError::DocumentSync(
                 "whole-document admin sync is unsupported; admin documents must sync as operations"
                     .to_string(),
             )),
-            DocumentSyncTarget::WatchSubscription { .. } => Err(AnnounceTopicError::DocumentSync(
+            DocumentTarget::WatchSubscription { .. } => Err(AnnounceTopicError::DocumentSync(
                 "watch subscriptions must sync through atomic watch CRUD outbox records"
                     .to_string(),
             )),
-            DocumentSyncTarget::MetadataRegistry {
+            DocumentTarget::MetadataRegistry {
                 group_id,
                 document_id,
             } => {
@@ -261,7 +258,7 @@ impl AnnounceTopicOperation {
                         record.group_id, record.document_id
                     )));
                 }
-                Ok(DocumentSyncChange {
+                Ok(DocumentChange {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: record.updated_at_ms,
@@ -269,15 +266,15 @@ impl AnnounceTopicOperation {
                         actor: self.local_node_id,
                         updated_at_ms: record.updated_at_ms,
                     },
-                    kind: DocumentSyncChangeKind::Upsert,
+                    kind: DocumentChangeKind::Upsert,
                     placement: self.placement,
                 })
             }
-            DocumentSyncTarget::MetadataCreateEvent {
+            DocumentTarget::MetadataCreateEvent {
                 document_id,
                 event_id,
             } => {
-                let record: MetadataCreateEventRecord = postcard::from_bytes(bytes)
+                let record: MetadataEventRecord = postcard::from_bytes(bytes)
                     .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
                 if record.record.document_id != *document_id || record.event_id != *event_id {
                     return Err(AnnounceTopicError::DocumentSync(format!(
@@ -285,7 +282,7 @@ impl AnnounceTopicOperation {
                         record.record.document_id, record.event_id
                     )));
                 }
-                Ok(DocumentSyncChange {
+                Ok(DocumentChange {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: record.record.updated_at_ms,
@@ -293,12 +290,12 @@ impl AnnounceTopicOperation {
                         actor: record.node_id,
                         updated_at_ms: record.occurred_at_ms,
                     },
-                    kind: DocumentSyncChangeKind::Upsert,
+                    kind: DocumentChangeKind::Upsert,
                     placement: self.placement,
                 })
             }
-            DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
-                let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(bytes)
+            DocumentTarget::MetadataDocumentLifecycle { document_id } => {
+                let record: MetadataLifecycleRecord = postcard::from_bytes(bytes)
                     .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
                 if record.document_id() != *document_id {
                     return Err(AnnounceTopicError::DocumentSync(format!(
@@ -312,8 +309,8 @@ impl AnnounceTopicOperation {
                     self.placement,
                 ))
             }
-            DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => {
-                let record: MetadataGraphLifecycleRecord = postcard::from_bytes(bytes)
+            DocumentTarget::MetadataGraphLifecycle { graph_iri } => {
+                let record: GraphLifecycleRecord = postcard::from_bytes(bytes)
                     .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
                 if record.graph_iri != *graph_iri {
                     return Err(AnnounceTopicError::DocumentSync(format!(
@@ -321,7 +318,7 @@ impl AnnounceTopicOperation {
                         record.graph_iri
                     )));
                 }
-                Ok(DocumentSyncChange {
+                Ok(DocumentChange {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: record.updated_at_ms,
@@ -329,11 +326,11 @@ impl AnnounceTopicOperation {
                         actor: self.local_node_id,
                         updated_at_ms: record.updated_at_ms,
                     },
-                    kind: DocumentSyncChangeKind::Upsert,
+                    kind: DocumentChangeKind::Upsert,
                     placement: self.placement,
                 })
             }
-            DocumentSyncTarget::PersistentIdMapping { document_id } => {
+            DocumentTarget::PersistentIdMapping { document_id } => {
                 let mapping = PersistentIdMapping::from_bytes(bytes)
                     .map_err(AnnounceTopicError::ConversionError)?;
                 if mapping.target != *document_id {
@@ -344,7 +341,7 @@ impl AnnounceTopicOperation {
                 }
                 Ok(persistent_id_change(&mapping, self.placement))
             }
-            DocumentSyncTarget::PlacementPolicy { policy_id } => {
+            DocumentTarget::PlacementPolicy { policy_id } => {
                 let document = PlacementPolicyDocument::from_bytes(bytes)
                     .map_err(AnnounceTopicError::ConversionError)?;
                 if document.policy_id() != *policy_id {
@@ -356,11 +353,11 @@ impl AnnounceTopicOperation {
                 Ok(placement_policy_change(&document, self.placement))
             }
             // Single-writer upserts need only this node's monotonic wall-clock generation.
-            DocumentSyncTarget::NodeUsage { .. }
-            | DocumentSyncTarget::WatchInterest { .. }
-            | DocumentSyncTarget::NodeInfo { .. } => {
+            DocumentTarget::NodeUsage { .. }
+            | DocumentTarget::WatchInterest { .. }
+            | DocumentTarget::NodeInfo { .. } => {
                 let now = aruna_core::time::unix_timestamp_millis();
-                Ok(DocumentSyncChange {
+                Ok(DocumentChange {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: now,
@@ -368,7 +365,7 @@ impl AnnounceTopicOperation {
                         actor: self.local_node_id,
                         updated_at_ms: now,
                     },
-                    kind: DocumentSyncChangeKind::Upsert,
+                    kind: DocumentChangeKind::Upsert,
                     placement: self.placement,
                 })
             }
@@ -449,7 +446,7 @@ impl Operation for AnnounceTopicOperation {
                         };
                         if user_id.realm_id == realm_id {
                             self.pending.push_back(PendingDocumentSync::Document {
-                                document: DocumentSyncTarget::User { user_id },
+                                document: DocumentTarget::User { user_id },
                                 bytes: None,
                             });
                         }
@@ -521,10 +518,10 @@ impl Operation for AnnounceTopicOperation {
 mod pure_tests {
     use super::*;
 
-    use aruna_core::document::DocumentSyncOutboxRecord;
+    use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
-    use aruna_core::metadata::MetadataGraphLifecycleRecord;
+    use aruna_core::metadata::GraphLifecycleRecord;
     use aruna_core::types::GroupId;
     use ulid::Ulid;
 
@@ -532,13 +529,13 @@ mod pure_tests {
         iroh::SecretKey::from_bytes(&[1u8; 32]).public()
     }
 
-    fn user_document() -> (UserId, DocumentSyncTarget) {
+    fn user_document() -> (UserId, DocumentTarget) {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
-        (user_id, DocumentSyncTarget::User { user_id })
+        (user_id, DocumentTarget::User { user_id })
     }
 
-    fn written_outbox_record(effects: &[Effect]) -> DocumentSyncOutboxRecord {
+    fn written_outbox_record(effects: &[Effect]) -> DocumentOutboxRecord {
         let [
             Effect::Storage(StorageEffect::Write {
                 key_space,
@@ -559,14 +556,14 @@ mod pure_tests {
     fn provided_skips_read() {
         for allow_genesis in [false, true] {
             let local_node_id = local_node_id();
-            let lifecycle = MetadataGraphLifecycleRecord::deleted(
+            let lifecycle = GraphLifecycleRecord::deleted(
                 "urn:graph:announce".to_string(),
                 RealmId::from_bytes([2u8; 32]),
                 GroupId::generate(),
                 Ulid::from_parts(1, 1),
                 42,
             );
-            let document = DocumentSyncTarget::MetadataGraphLifecycle {
+            let document = DocumentTarget::MetadataGraphLifecycle {
                 graph_iri: lifecycle.graph_iri.clone(),
             };
             let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
@@ -584,7 +581,7 @@ mod pure_tests {
             let record = written_outbox_record(effects.as_slice());
             assert_eq!(record.target, document);
             assert_eq!(record.allow_genesis, allow_genesis);
-            let DocumentSyncOutboxEvent::Upsert {
+            let DocumentOutboxEvent::Upsert {
                 bytes: actual,
                 change,
             } = record.event
@@ -592,21 +589,21 @@ mod pure_tests {
                 panic!("expected revisioned upsert");
             };
             assert_eq!(actual, bytes);
-            assert_eq!(change.kind, DocumentSyncChangeKind::Upsert);
+            assert_eq!(change.kind, DocumentChangeKind::Upsert);
         }
     }
 
     #[test]
     fn announce_stamps_placement() {
         let local_node_id = local_node_id();
-        let lifecycle = MetadataGraphLifecycleRecord::deleted(
+        let lifecycle = GraphLifecycleRecord::deleted(
             "urn:graph:placed-announce".to_string(),
             RealmId::from_bytes([2u8; 32]),
             GroupId::generate(),
             Ulid::from_parts(2, 2),
             42,
         );
-        let document = DocumentSyncTarget::MetadataGraphLifecycle {
+        let document = DocumentTarget::MetadataGraphLifecycle {
             graph_iri: lifecycle.graph_iri.clone(),
         };
         let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
@@ -632,7 +629,7 @@ mod pure_tests {
             value: Some(bytes.into()),
         }));
         let record = written_outbox_record(effects.as_slice());
-        let DocumentSyncOutboxEvent::Upsert { change, .. } = record.event else {
+        let DocumentOutboxEvent::Upsert { change, .. } = record.event else {
             panic!("expected revisioned upsert");
         };
         assert_eq!(change.placement, placement);
@@ -645,11 +642,11 @@ mod pure_tests {
         let group_id = GroupId::generate();
         let (user_id, _) = user_document();
         let admin_targets = [
-            DocumentSyncTarget::Group { group_id },
-            DocumentSyncTarget::GroupAuthorization { group_id },
-            DocumentSyncTarget::RealmAuthorization { realm_id },
-            DocumentSyncTarget::RealmConfig { realm_id },
-            DocumentSyncTarget::User { user_id },
+            DocumentTarget::Group { group_id },
+            DocumentTarget::GroupAuthorization { group_id },
+            DocumentTarget::RealmAuthorization { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
+            DocumentTarget::User { user_id },
         ];
 
         for target in admin_targets {
@@ -704,7 +701,7 @@ mod pure_tests {
     fn admin_requires_revision() {
         let local_node_id = local_node_id();
         let realm_id = RealmId::from_bytes([9u8; 32]);
-        let document = DocumentSyncTarget::RealmConfig { realm_id };
+        let document = DocumentTarget::RealmConfig { realm_id };
         let mut operation = AnnounceTopicOperation::new_with_bytes(
             document.topic_id(),
             local_node_id,
