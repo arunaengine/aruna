@@ -11,18 +11,18 @@ use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataQueryResults, MetadataSearchHit,
     ProfileValidationFinding, ProfileValidationStatus,
 };
+use aruna_core::structs::execution::job::SubmissionId;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementPolicyRef};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{
     PathClaimRecord, PersistentIdFailure, PersistentIdMapping, SyncListCursor, SyncPageLimit,
     SyncPullAck, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
-use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementPolicyRef};
-use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
-use aruna_core::structs::placement::placement_record::PlacementRef;
-use aruna_core::structs::execution::job::SubmissionId;
-use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
 use craqle::GraphReplicaSnapshot;
@@ -807,10 +807,10 @@ mod tests {
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_TOKEN_LEN;
     use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
-    use aruna_core::structs::identity::realm::RealmId;
     use tokio::sync::Semaphore;
 
     #[test]
@@ -1375,9 +1375,7 @@ mod tests {
         }
 
         let bytes = postcard::to_allocvec(&RawTransportMessage::QueryGraphs {
-            auth_token: Some(RawAuthToken::Bearer(
-                "x".repeat(MAX_TOKEN_LEN + 1),
-            )),
+            auth_token: Some(RawAuthToken::Bearer("x".repeat(MAX_TOKEN_LEN + 1))),
             graph_iris: None,
             sparql: "ASK {}".to_string(),
         })

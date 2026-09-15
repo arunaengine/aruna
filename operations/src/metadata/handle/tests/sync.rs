@@ -129,10 +129,7 @@ async fn body_timeout() {
 fn sync_defaults_buffered() {
     let options = MetadataHandleOptions::default();
 
-    assert_eq!(
-        options.sync_persist_policy,
-        FjallPersistPolicy::Buffer
-    );
+    assert_eq!(options.sync_persist_policy, FjallPersistPolicy::Buffer);
 }
 #[test]
 fn set_sync_policy() {
@@ -141,10 +138,7 @@ fn set_sync_policy() {
         .with_sync_policy(FjallPersistPolicy::SyncAll);
 
     assert_eq!(options.search_storage, MetadataSearchStorage::Memory);
-    assert_eq!(
-        options.sync_persist_policy,
-        FjallPersistPolicy::SyncAll
-    );
+    assert_eq!(options.sync_persist_policy, FjallPersistPolicy::SyncAll);
 }
 #[tokio::test]
 async fn flush_without_sync() {

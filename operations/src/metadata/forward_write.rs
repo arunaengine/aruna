@@ -38,11 +38,11 @@ use aruna_core::NodeId;
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::MetadataBatchSource;
 use aruna_core::metadata::MetadataError;
+use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::SyncRefusal;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use std::sync::Arc;
 use thiserror::Error;
@@ -555,9 +555,7 @@ pub(crate) async fn apply_forwarded_write(
         | MetadataTransportMessage::ForwardUpdateDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardDeleteDocument { config_digest, .. }
         | MetadataTransportMessage::ForwardReadDocument { config_digest, .. }
-        | MetadataTransportMessage::ForwardValidationStatus { config_digest, .. } => {
-            *config_digest
-        }
+        | MetadataTransportMessage::ForwardValidationStatus { config_digest, .. } => *config_digest,
         _ => return reject("unexpected forwarded metadata message"),
     };
     if config.digest().ok() != Some(expected_digest) {

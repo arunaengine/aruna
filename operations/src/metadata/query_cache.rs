@@ -199,11 +199,7 @@ impl Default for MetadataQueryCache {
 
 impl MetadataQueryCache {
     pub(super) fn new() -> Self {
-        Self::with_limits(
-            CACHE_MAX_ENTRIES,
-            CACHE_MAX_BYTES,
-            QUERY_CACHE_TTL,
-        )
+        Self::with_limits(CACHE_MAX_ENTRIES, CACHE_MAX_BYTES, QUERY_CACHE_TTL)
     }
 
     pub(super) fn with_limits(max_entries: usize, max_bytes: usize, ttl: Duration) -> Self {

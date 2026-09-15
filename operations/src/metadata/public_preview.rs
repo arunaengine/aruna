@@ -330,13 +330,13 @@ mod tests {
         AUTH_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX;
     use aruna_core::structs::identity::auth::{Actor, Role};
-    use aruna_core::structs::storage::blob::{BucketInfo, HashIndex};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
     };
+    use aruna_core::structs::storage::blob::{BucketInfo, HashIndex};
+    use aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
@@ -704,10 +704,11 @@ mod tests {
     async fn checks_anonymous_first() {
         let fixture = fixture(true).await;
         let mut caller = fixture.owner.clone();
-        caller.path_restrictions = Some(vec![aruna_core::structs::identity::auth::PathRestriction {
-            pattern: format!("/{}/g/*/meta/**", fixture.realm_id),
-            permission: Permission::READ,
-        }]);
+        caller.path_restrictions =
+            Some(vec![aruna_core::structs::identity::auth::PathRestriction {
+                pattern: format!("/{}/g/*/meta/**", fixture.realm_id),
+                permission: Permission::READ,
+            }]);
         let preview = restricted_files(
             &fixture.context,
             fixture.realm_id,

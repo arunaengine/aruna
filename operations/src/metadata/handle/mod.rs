@@ -10,10 +10,10 @@ use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::effects::StoragePriority;
 use aruna_core::events::Event;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataRoCratePage};
+use aruna_core::structs::SyncRelationship;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::SyncRelationship;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
@@ -65,8 +65,7 @@ mod transport;
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_CHUNK_SIZE: usize = 64 * 1024;
 const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
-const SYNC_MIRROR_TIMEOUT: Duration =
-    RECONCILE_GRACE.saturating_sub(Duration::from_secs(10));
+const SYNC_MIRROR_TIMEOUT: Duration = RECONCILE_GRACE.saturating_sub(Duration::from_secs(10));
 const GRAPH_SYNC_ATTEMPTS: usize = 3;
 const GRAPH_SYNC_AFTER: Duration = Duration::from_millis(250);
 const METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
@@ -305,9 +304,7 @@ impl ArunaValidationState for AuthValidationState {
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        match load_auth_state::<HashSet<RealmId>>(&self.storage_handle, REALMS_LIST_KEY)
-            .await
-        {
+        match load_auth_state::<HashSet<RealmId>>(&self.storage_handle, REALMS_LIST_KEY).await {
             Ok(trusted) => trusted.contains(realm_id),
             Err(error) => {
                 warn!(error = %error, "Failed to read metadata trusted realms state");

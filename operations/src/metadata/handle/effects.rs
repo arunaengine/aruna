@@ -21,8 +21,7 @@ use super::persist::{
 };
 use super::search::list_visible_graphs;
 use super::{
-    CRAQLE_LATENCY, MetadataHandle, MetadataInner, METADATA_BACKEND_THRESHOLD,
-    metadata_graph_fence,
+    CRAQLE_LATENCY, METADATA_BACKEND_THRESHOLD, MetadataHandle, MetadataInner, metadata_graph_fence,
 };
 use crate::metadata::protocol::MetadataReadError;
 

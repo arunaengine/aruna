@@ -1,12 +1,10 @@
 use super::*;
 use aruna_core::NodeId;
-use aruna_core::keyspaces::{
-    IRI_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE,
-};
+use aruna_core::keyspaces::{IRI_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE};
 use aruna_core::storage_entries::{create_event_entry, raw_revision_key};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::{FjallStorage, StorageHandle};
 use std::collections::BTreeSet;
 use std::thread;
@@ -161,9 +159,7 @@ async fn corrupt_job_only() {
 
     assert_eq!(result.processed, 0);
     assert!(!result.has_more_due);
-    assert!(
-        !storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, corrupt_key).await
-    );
+    assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, corrupt_key).await);
 }
 
 #[tokio::test]
@@ -193,9 +189,7 @@ async fn jobs_exist_deletes() {
     .await;
 
     assert!(materialization_jobs_exist(&storage).await.unwrap());
-    assert!(
-        !storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, corrupt_key).await
-    );
+    assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, corrupt_key).await);
 }
 
 #[tokio::test]
@@ -241,22 +235,8 @@ async fn corrupt_global_job() {
         .expect("corrupt global job drain succeeds");
 
     assert_eq!(result.processed, 0);
-    assert!(
-        !storage_key_exists(
-            &storage,
-            MATERIALIZATION_JOB_KEYSPACE,
-            global_key.to_vec()
-        )
-        .await
-    );
-    assert!(
-        !storage_key_exists(
-            &storage,
-            DOCUMENT_JOB_KEYSPACE,
-            document_key.to_vec()
-        )
-        .await
-    );
+    assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, global_key.to_vec()).await);
+    assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, document_key.to_vec()).await);
     assert!(
         !older_exists(&storage, document_id, newer_event_id, &BTreeSet::new())
             .await
@@ -287,14 +267,7 @@ async fn orphan_malformed_sidecar() {
             .await
             .unwrap()
     );
-    assert!(
-        !storage_key_exists(
-            &storage,
-            DOCUMENT_JOB_KEYSPACE,
-            document_key.to_vec()
-        )
-        .await
-    );
+    assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, document_key.to_vec()).await);
 }
 
 #[tokio::test]
@@ -320,14 +293,7 @@ async fn orphan_valid_sidecar() {
             .await
             .unwrap()
     );
-    assert!(
-        !storage_key_exists(
-            &storage,
-            DOCUMENT_JOB_KEYSPACE,
-            document_key.to_vec()
-        )
-        .await
-    );
+    assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, document_key.to_vec()).await);
 }
 
 #[tokio::test]
@@ -368,22 +334,8 @@ async fn orphan_global_job() {
         .expect("orphan global job drain succeeds");
 
     assert_eq!(result.processed, 0);
-    assert!(
-        !storage_key_exists(
-            &storage,
-            MATERIALIZATION_JOB_KEYSPACE,
-            global_key.to_vec()
-        )
-        .await
-    );
-    assert!(
-        !storage_key_exists(
-            &storage,
-            DOCUMENT_JOB_KEYSPACE,
-            document_key.to_vec()
-        )
-        .await
-    );
+    assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, global_key.to_vec()).await);
+    assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, document_key.to_vec()).await);
 }
 
 #[tokio::test]
@@ -409,14 +361,7 @@ async fn corrupt_job_deleted() {
             .await
             .unwrap()
     );
-    assert!(
-        !storage_key_exists(
-            &storage,
-            DOCUMENT_JOB_KEYSPACE,
-            corrupt_key
-        )
-        .await
-    );
+    assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, corrupt_key).await);
 }
 
 #[tokio::test]
@@ -585,14 +530,7 @@ async fn stale_index_pruned() {
 
     assert!(jobs.is_empty());
     assert!(!has_more_due);
-    assert!(
-        !storage_key_exists(
-            &storage,
-            MATERIALIZATION_JOB_KEYSPACE,
-            orphan_key.to_vec()
-        )
-        .await
-    );
+    assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, orphan_key.to_vec()).await);
     assert!(
         !storage_key_exists(
             &storage,
@@ -689,22 +627,8 @@ async fn failure_cap_parks() {
     assert!(matches!(parked, FinishedMaterializationJob::Parked { .. }));
     finish_completed_jobs(&storage, vec![parked]).await.unwrap();
 
-    assert!(
-        !storage_key_exists(
-            &storage,
-            MATERIALIZATION_JOB_KEYSPACE,
-            index_key.to_vec()
-        )
-        .await
-    );
-    assert!(
-        !storage_key_exists(
-            &storage,
-            DOCUMENT_JOB_KEYSPACE,
-            sidecar_key.to_vec()
-        )
-        .await
-    );
+    assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, index_key.to_vec()).await);
+    assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, sidecar_key.to_vec()).await);
     let status = read_materialization_status(&storage, document_id, None)
         .await
         .unwrap()
@@ -1130,10 +1054,10 @@ async fn park_skips_superseded() {
             .iter()
             .any(|(key_space, _, _)| key_space == DEAD_LETTER_KEYSPACE)
     );
-    assert!(plan.deletes.contains(&(
-        MATERIALIZATION_JOB_KEYSPACE.to_string(),
-        job_key.clone()
-    )));
+    assert!(
+        plan.deletes
+            .contains(&(MATERIALIZATION_JOB_KEYSPACE.to_string(), job_key.clone()))
+    );
     assert!(plan.deletes.contains(&(
         DOCUMENT_JOB_KEYSPACE.to_string(),
         document_job_key(document_id, old_event_id)
@@ -1606,22 +1530,8 @@ async fn finish_not_regress() {
             .unwrap(),
         Some(newer_status)
     );
-    assert!(
-        !storage_key_exists(
-            &storage,
-            IRI_INDEX_KEYSPACE,
-            stale_index_key,
-        )
-        .await
-    );
-    assert!(
-        !storage_key_exists(
-            &storage,
-            RAW_REVISION_KEYSPACE,
-            raw_state_key.to_vec(),
-        )
-        .await
-    );
+    assert!(!storage_key_exists(&storage, IRI_INDEX_KEYSPACE, stale_index_key,).await);
+    assert!(!storage_key_exists(&storage, RAW_REVISION_KEYSPACE, raw_state_key.to_vec(),).await);
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: MATERIALIZATION_JOB_KEYSPACE.to_string(),
@@ -1703,21 +1613,11 @@ async fn supersedes_prior_rows() {
             .to_vec()
     };
     assert!(
-        !storage_key_exists(
-            &storage,
-            IRI_INDEX_KEYSPACE,
-            key_of(first)
-        )
-        .await,
+        !storage_key_exists(&storage, IRI_INDEX_KEYSPACE, key_of(first)).await,
         "prior cursor rows must be removed"
     );
     assert!(
-        storage_key_exists(
-            &storage,
-            IRI_INDEX_KEYSPACE,
-            key_of(second)
-        )
-        .await,
+        storage_key_exists(&storage, IRI_INDEX_KEYSPACE, key_of(second)).await,
         "current cursor rows must remain"
     );
     match storage
@@ -1761,14 +1661,7 @@ async fn prune_resumes_parked() {
         .await
         .unwrap();
 
-    assert!(
-        !storage_key_exists(
-            &storage,
-            IRI_INDEX_KEYSPACE,
-            stale_key.to_vec()
-        )
-        .await
-    );
+    assert!(!storage_key_exists(&storage, IRI_INDEX_KEYSPACE, stale_key.to_vec()).await);
     assert!(
         !storage_key_exists(
             &storage,
@@ -1963,12 +1856,7 @@ async fn reschedules_batched() {
     assert_eq!(index_keys.len(), jobs.len());
     for (job, _, old_key) in &jobs {
         assert!(
-            !storage_key_exists(
-                &storage,
-                MATERIALIZATION_JOB_KEYSPACE,
-                old_key.to_vec()
-            )
-            .await
+            !storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, old_key.to_vec()).await
         );
         let row = index_keys
             .iter()

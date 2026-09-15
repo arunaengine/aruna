@@ -17,9 +17,8 @@ use tracing::{Span, debug_span, field};
 use super::effects::{graph_ids, record_error, record_query_counts};
 use super::search::select_authorized_graphs;
 use super::{
-    QUERY_PREFIXES, METADATA_QUERY_DEADLINE, QUERY_MAX_BYTES,
-    MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT,
-    MetadataHandle, MetadataInner,
+    MAX_RESULT_BYTES, METADATA_QUERY_DEADLINE, MetadataHandle, MetadataInner, QUERY_MAX_BYTES,
+    QUERY_MAX_ROWS, QUERY_PREFIXES, REGISTRY_CANDIDATE_LIMIT,
 };
 use crate::metadata::query_cache::{CachedQuery, LocalScopeKind, graphs_digest, local_key};
 #[tracing::instrument(

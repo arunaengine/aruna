@@ -8,8 +8,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    EVENT_LOG_KEYSPACE, DEAD_LETTER_KEYSPACE,
-    DOCUMENT_JOB_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
     MATERIALIZATION_PRUNE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::{
@@ -574,10 +573,7 @@ async fn read_pending_prunes(
                     warn!(key = ?key.to_vec(), "Deleting malformed metadata materialization prune entry");
                     delete_materialization_entries(
                         storage,
-                        vec![(
-                            MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
-                            key.clone(),
-                        )],
+                        vec![(MATERIALIZATION_PRUNE_KEYSPACE.to_string(), key.clone())],
                     )
                     .await?;
                     continue;
@@ -1133,10 +1129,7 @@ async fn delete_dead_letter(
 ) -> Result<(), MetadataMaterializationError> {
     delete_materialization_entries(
         storage,
-        vec![(
-            DEAD_LETTER_KEYSPACE.to_string(),
-            ByteView::from(key),
-        )],
+        vec![(DEAD_LETTER_KEYSPACE.to_string(), ByteView::from(key))],
     )
     .await
 }
@@ -1699,10 +1692,7 @@ async fn load_group_jobs(
                 Ok(_) => {}
                 Err(error) => {
                     warn!(error = %error, key = ?key.to_vec(), "Deleting malformed metadata materialization document job");
-                    malformed.push((
-                        DOCUMENT_JOB_KEYSPACE.to_string(),
-                        key,
-                    ));
+                    malformed.push((DOCUMENT_JOB_KEYSPACE.to_string(), key));
                 }
             }
         }
@@ -1954,10 +1944,7 @@ async fn delete_job(
 ) -> Result<(), MetadataMaterializationError> {
     delete_materialization_entries(
         storage,
-        vec![(
-            DOCUMENT_JOB_KEYSPACE.to_string(),
-            ByteView::from(key),
-        )],
+        vec![(DOCUMENT_JOB_KEYSPACE.to_string(), ByteView::from(key))],
     )
     .await
 }

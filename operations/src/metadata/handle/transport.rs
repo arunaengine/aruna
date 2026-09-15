@@ -421,26 +421,18 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::QueryDocument { .. } => "query_document",
         MetadataTransportMessage::DocumentQueryResults { .. } => "document_query_results",
         MetadataTransportMessage::Reject(_) => "reject",
-        MetadataTransportMessage::UpdateInvalidInput { .. } => {
-            "forwarded_update_invalid_input"
-        }
+        MetadataTransportMessage::UpdateInvalidInput { .. } => "forwarded_update_invalid_input",
         MetadataTransportMessage::ForwardAuditPage { .. } => "forward_audit_page",
         MetadataTransportMessage::ForwardedAuditPage { .. } => "forwarded_audit_page",
         MetadataTransportMessage::ForwardTokenRevocation { .. } => "forward_token_revocation",
         MetadataTransportMessage::ForwardedTokenRevoked => "forwarded_token_revoked",
-        MetadataTransportMessage::TokenRevocationCapacity => {
-            "forwarded_token_revocation_capacity"
-        }
-        MetadataTransportMessage::MetadataHistoryCapacity => {
-            "forwarded_metadata_history_capacity"
-        }
+        MetadataTransportMessage::TokenRevocationCapacity => "forwarded_token_revocation_capacity",
+        MetadataTransportMessage::MetadataHistoryCapacity => "forwarded_metadata_history_capacity",
         MetadataTransportMessage::ForwardPersistentId { .. } => "forward_persistent_id",
         MetadataTransportMessage::ForwardedPersistentId { .. } => "forwarded_persistent_id",
         MetadataTransportMessage::ForwardPlacementPolicy { .. } => "forward_placement_policy",
         MetadataTransportMessage::ForwardedPlacementPolicy { .. } => "forwarded_placement_policy",
-        MetadataTransportMessage::ForwardCreatePolicy { .. } => {
-            "forward_create_placement_policy"
-        }
+        MetadataTransportMessage::ForwardCreatePolicy { .. } => "forward_create_placement_policy",
         MetadataTransportMessage::PlacementPolicyCreated { .. } => {
             "forwarded_placement_policy_created"
         }
@@ -479,9 +471,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::FetchedGraphState { .. } => "fetched_graph_state",
         MetadataTransportMessage::ForwardApplyBatch { .. } => "forward_apply_batch",
         MetadataTransportMessage::ForwardedApplyBatch { .. } => "forwarded_apply_batch",
-        MetadataTransportMessage::GroupCreateConflict { .. } => {
-            "forwarded_group_create_conflict"
-        }
+        MetadataTransportMessage::GroupCreateConflict { .. } => "forwarded_group_create_conflict",
     }
 }
 

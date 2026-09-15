@@ -11,8 +11,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
-    PENDING_PROJECTION_KEYSPACE,
+    EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventRecord,
@@ -23,9 +22,11 @@ use aruna_core::storage_entries::{
     lifecycle_revision_change, pending_projection_key, pending_projection_target,
     registry_delete_entries,
 };
-use aruna_core::structs::storage::metadata_registry::{MetadataAuditRecord, MetadataRegistryRecord};
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::{
+    MetadataAuditRecord, MetadataRegistryRecord,
+};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use aruna_storage::StorageHandle;
@@ -877,12 +878,7 @@ async fn delete_marker_keys(
     }
     let deletes = keys
         .into_iter()
-        .map(|key| {
-            (
-                PENDING_PROJECTION_KEYSPACE.to_string(),
-                ByteView::from(key),
-            )
-        })
+        .map(|key| (PENDING_PROJECTION_KEYSPACE.to_string(), ByteView::from(key)))
         .collect();
     match context
         .storage_handle
@@ -1160,8 +1156,8 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
-    use aruna_core::structs::placement::placement_record::{PlacementRef, PlacementStrategy};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::placement::placement_record::{PlacementRef, PlacementStrategy};
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
@@ -1953,7 +1949,10 @@ mod tests {
         };
 
         let create_ref = placement_of(&create);
-        assert_ne!(create_ref, aruna_core::structs::placement::placement_record::PlacementRef::NIL);
+        assert_ne!(
+            create_ref,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL
+        );
         assert_eq!(create_ref, placement_of(&update));
     }
 

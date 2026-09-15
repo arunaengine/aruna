@@ -525,10 +525,7 @@ async fn repair_prune_job(
             transactional_batch_delete(
                 storage,
                 txn_id,
-                vec![(
-                    PRUNE_JOB_KEYSPACE.to_string(),
-                    ByteView::from(old_key),
-                )],
+                vec![(PRUNE_JOB_KEYSPACE.to_string(), ByteView::from(old_key))],
             )
             .await?;
         }
@@ -652,12 +649,7 @@ async fn reschedule_prune_job(
     let deletes = old_keys
         .iter()
         .filter(|key| key.as_slice() != next_key.as_slice())
-        .map(|key| {
-            (
-                PRUNE_JOB_KEYSPACE.to_string(),
-                ByteView::from(key.clone()),
-            )
-        })
+        .map(|key| (PRUNE_JOB_KEYSPACE.to_string(), ByteView::from(key.clone())))
         .collect::<Vec<_>>();
 
     let txn_id = start_write_transaction(storage).await?;
@@ -690,12 +682,7 @@ async fn delete_prune_jobs(
 ) -> Result<(), MetadataGraphError> {
     let deletes = keys
         .into_iter()
-        .map(|key| {
-            (
-                PRUNE_JOB_KEYSPACE.to_string(),
-                ByteView::from(key),
-            )
-        })
+        .map(|key| (PRUNE_JOB_KEYSPACE.to_string(), ByteView::from(key)))
         .collect::<Vec<_>>();
     delete_batch_entries(storage, deletes).await
 }
@@ -766,9 +753,9 @@ async fn delete_batch_entries(
 mod tests {
     use super::*;
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -1028,9 +1015,7 @@ mod tests {
 
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
-        assert!(
-            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, corrupt_key).await
-        );
+        assert!(!storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, corrupt_key).await);
     }
 
     #[tokio::test]
@@ -1054,9 +1039,7 @@ mod tests {
         .await;
 
         assert!(prune_jobs_exist(&storage).await.unwrap());
-        assert!(
-            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, corrupt_key).await
-        );
+        assert!(!storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, corrupt_key).await);
     }
 
     #[tokio::test]
@@ -1096,9 +1079,7 @@ mod tests {
 
         assert_eq!(jobs, vec![(graph_prune_key(&due_job).to_vec(), due_job)]);
         assert!(!has_more_due);
-        assert!(
-            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, misplaced_key).await
-        );
+        assert!(!storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, misplaced_key).await);
         assert!(
             storage_key_exists(
                 &storage,
@@ -1146,9 +1127,7 @@ mod tests {
 
         assert_eq!(jobs, vec![(graph_prune_key(&due_job).to_vec(), due_job)]);
         assert!(!has_more_due);
-        assert!(
-            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, misplaced_key).await
-        );
+        assert!(!storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, misplaced_key).await);
     }
 
     #[tokio::test]
@@ -1184,15 +1163,12 @@ mod tests {
         )
         .await;
 
-        let (jobs, has_more_due, next_due_ms) =
-            scan_due_prune(&storage, now_ms, 8).await.unwrap();
+        let (jobs, has_more_due, next_due_ms) = scan_due_prune(&storage, now_ms, 8).await.unwrap();
 
         assert!(jobs.is_empty());
         assert!(!has_more_due);
         assert_eq!(next_due_ms, Some(future_job.due_at_ms));
-        assert!(
-            !storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, misplaced_key).await
-        );
+        assert!(!storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, misplaced_key).await);
         assert_eq!(
             read_job_key(&storage, future_key.to_vec()).await,
             Some(future_job)
@@ -1228,20 +1204,12 @@ mod tests {
         )
         .await;
 
-        let (jobs, has_more_due, next_due_ms) =
-            scan_due_prune(&storage, now_ms, 8).await.unwrap();
+        let (jobs, has_more_due, next_due_ms) = scan_due_prune(&storage, now_ms, 8).await.unwrap();
 
         assert!(jobs.is_empty());
         assert!(!has_more_due);
         assert_eq!(next_due_ms, Some(future_job.due_at_ms));
-        assert!(
-            !storage_key_exists(
-                &storage,
-                PRUNE_JOB_KEYSPACE,
-                stale_key.to_vec(),
-            )
-            .await
-        );
+        assert!(!storage_key_exists(&storage, PRUNE_JOB_KEYSPACE, stale_key.to_vec(),).await);
         assert_eq!(
             read_job_key(&storage, future_key.to_vec()).await,
             Some(future_job)

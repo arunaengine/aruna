@@ -11,8 +11,8 @@ use aruna_core::keyspaces::API_STATE_KEYSPACE;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::auth::TokenClaims;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use byteview::ByteView;
 pub(super) async fn assert_auth_rejected(state: &AuthValidationState, token: &str, expected: &str) {
     let error = remote_auth_context(state, Some(AuthToken::bearer(token).unwrap()))
@@ -148,12 +148,7 @@ async fn member_peer_accepted() {
     let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
     let (_dir, storage) = auth_storage();
     let configured_peer = node_id_seed(12);
-    persist_auth_state(
-        &storage,
-        REALMS_LIST_KEY,
-        &HashSet::from([realm_id]),
-    )
-    .await;
+    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
     persist_realm_config(&storage, realm_id, &[configured_peer]).await;
     let state = AuthValidationState::new(storage.clone(), Some(realm_id));
 
@@ -229,12 +224,7 @@ async fn bucket_realm_mismatch() {
     let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
     let peer = node_id_seed(31);
     let (_dir, storage) = auth_storage();
-    persist_auth_state(
-        &storage,
-        REALMS_LIST_KEY,
-        &HashSet::from([realm_id]),
-    )
-    .await;
+    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
     persist_realm_config(&storage, realm_id, &[peer]).await;
     let state = AuthValidationState::new(storage.clone(), Some(realm_id));
     let auth_token = AuthToken::bearer(token).unwrap();
@@ -267,12 +257,7 @@ async fn revocation_blind_decode() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
     let (_dir, storage) = auth_storage();
-    persist_auth_state(
-        &storage,
-        REALMS_LIST_KEY,
-        &HashSet::from([realm_id]),
-    )
-    .await;
+    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
     persist_revoked_config(&storage, realm_id, &token).await;
     let state = AuthValidationState::new(storage, Some(realm_id));
 
@@ -302,12 +287,7 @@ async fn foreign_peer_rejected() {
     let wrong_realm_id = RealmId([21u8; 32]);
     let wrong_realm_peer = node_id_seed(22);
     let auth_realm_peer = node_id_seed(23);
-    persist_auth_state(
-        &storage,
-        REALMS_LIST_KEY,
-        &HashSet::from([realm_id]),
-    )
-    .await;
+    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
     persist_realm_config(&storage, wrong_realm_id, &[wrong_realm_peer]).await;
     persist_realm_config(&storage, realm_id, &[auth_realm_peer]).await;
     let state = AuthValidationState::new(storage.clone(), Some(realm_id));
@@ -388,12 +368,7 @@ async fn auth_validates_token() {
     let (_dir, storage) = auth_storage();
     // Revocation fails closed without the realm config revocation set.
     persist_realm_config(&storage, realm_id, &[]).await;
-    persist_auth_state(
-        &storage,
-        REALMS_LIST_KEY,
-        &HashSet::from([realm_id]),
-    )
-    .await;
+    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
     let state = AuthValidationState::new(storage, Some(realm_id));
 
     let auth = remote_auth_context(&state, Some(AuthToken::bearer(token).unwrap()))
@@ -418,12 +393,7 @@ async fn auth_preserves_path() {
     let (_dir, storage) = auth_storage();
     // Revocation fails closed without the realm config revocation set.
     persist_realm_config(&storage, realm_id, &[]).await;
-    persist_auth_state(
-        &storage,
-        REALMS_LIST_KEY,
-        &HashSet::from([realm_id]),
-    )
-    .await;
+    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
     let state = AuthValidationState::new(storage, Some(realm_id));
 
     let auth = remote_auth_context(&state, Some(AuthToken::bearer(token).unwrap()))
@@ -468,12 +438,7 @@ async fn replicated_revocation_rejects() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
     let (_dir, storage) = auth_storage();
-    persist_auth_state(
-        &storage,
-        REALMS_LIST_KEY,
-        &HashSet::from([realm_id]),
-    )
-    .await;
+    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
     persist_revoked_config(&storage, realm_id, &token).await;
     let state = AuthValidationState::new(storage, Some(realm_id));
 

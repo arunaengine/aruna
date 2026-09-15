@@ -218,9 +218,9 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::metadata::{MaterializationState, MaterializationStatusRecord};
     use aruna_core::storage_entries::materialization_status_entry;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_storage::storage::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;

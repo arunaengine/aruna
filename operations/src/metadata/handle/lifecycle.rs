@@ -21,10 +21,9 @@ use ulid::Ulid;
 
 use super::entity_convert::error_from_craqle;
 use super::{
-    LifecycleDeletedEntry, GRAPH_SYNC_ATTEMPTS, GRAPH_SYNC_AFTER,
-    REGISTRY_CANDIDATE_LIMIT, VISIBILITY_CACHE_TTL, MetadataHandle,
-    MetadataInner, MetadataVisibilityCache, RegistryCacheEntry, VisibilityFillResult,
-    metadata_graph_fence, summary_cache,
+    GRAPH_SYNC_AFTER, GRAPH_SYNC_ATTEMPTS, LifecycleDeletedEntry, MetadataHandle, MetadataInner,
+    MetadataVisibilityCache, REGISTRY_CANDIDATE_LIMIT, RegistryCacheEntry, VISIBILITY_CACHE_TTL,
+    VisibilityFillResult, metadata_graph_fence, summary_cache,
 };
 use crate::metadata::repository::{
     StorageReadError, iter_registry_effect, parse_lifecycle_read, parse_registry_iter,

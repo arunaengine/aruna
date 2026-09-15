@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::SyncRelationship;
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;

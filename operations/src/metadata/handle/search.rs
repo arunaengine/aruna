@@ -21,8 +21,8 @@ use ulid::Ulid;
 
 use super::effects::{graph_ids, record_error};
 use super::{
-    LifecycleVisibilityRefresh, METADATA_ENRICH_TASKS, REGISTRY_CANDIDATE_LIMIT,
-    MetadataHandle, MetadataInner, MetadataVisibilityCache,
+    LifecycleVisibilityRefresh, METADATA_ENRICH_TASKS, MetadataHandle, MetadataInner,
+    MetadataVisibilityCache, REGISTRY_CANDIDATE_LIMIT,
 };
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::driver::DriverContext;
