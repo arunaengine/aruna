@@ -2,6 +2,7 @@
 //! `OPS_SOCKET_ADDRESS`, so `/metrics` is unreachable through the public port and
 //! Kubernetes probes hit a container port not exposed via Service/Ingress.
 
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -105,8 +106,10 @@ pub struct MonitoringState {
     readiness: Readiness,
     recovery: RecoveryStatus,
     /// The queue-lag sampler owner: cancel and completion are held together, so
-    /// stopping it always releases its driver context; taken out exactly once by
-    /// [`Self::stop_queue_refresher`]. The ops HTTP task drains separately.
+    /// stopping it always releases its driver context. [`Self::stop_queue_refresher`]
+    /// keeps the owner in place while awaiting, so a caller cancelled mid-wait
+    /// releases the lock and a later call resumes on the same owner. The ops
+    /// HTTP task drains separately.
     queue_refresher: tokio::sync::Mutex<Option<QueueRefresher>>,
 }
 
@@ -152,10 +155,14 @@ impl MonitoringState {
     }
 
     /// Cancels the queue-lag sampler and awaits its completion before returning.
-    /// Call before the storage close on any teardown path; a later call is a
-    /// no-op. The ops HTTP endpoint is owned by its own task and untouched.
+    /// Call before the storage close on any teardown path; a later call sees the
+    /// remembered completion. The owner stays in place across the await, so if
+    /// this caller is dropped mid-wait the lock is released and a later or
+    /// concurrent caller resumes waiting on the same owner. The ops HTTP endpoint
+    /// is owned by its own task and untouched.
     pub async fn stop_queue_refresher(&self) {
-        let Some(refresher) = self.queue_refresher.lock().await.take() else {
+        let mut guard = self.queue_refresher.lock().await;
+        let Some(refresher) = guard.as_mut() else {
             return;
         };
         if !refresher.stop().await {
@@ -575,19 +582,27 @@ impl QueueMetrics {
     }
 }
 
-/// The queue-lag sampler: its cancellation token and its join handle are one
-/// owner, so stopping is always "cancel and await completion".
+/// The queue-lag sampler: its cancellation token, its join handle, and the
+/// observed completion are one owner, so stopping is always "cancel and await
+/// completion" and a stop dropped mid-await cannot lose the handle.
 struct QueueRefresher {
     cancel: tokio_util::sync::CancellationToken,
-    handle: tokio::task::JoinHandle<()>,
+    handle: Pin<Box<tokio::task::JoinHandle<()>>>,
+    completed: Option<bool>,
 }
 
 impl QueueRefresher {
     /// Cancels the sampler and awaits its exit. `true` means the task finished
-    /// rather than panicked or was aborted.
-    async fn stop(self) -> bool {
+    /// rather than panicked or was aborted. Idempotent and resumable: the join
+    /// result is consumed once and later calls return the remembered outcome.
+    async fn stop(&mut self) -> bool {
         self.cancel.cancel();
-        self.handle.await.is_ok()
+        if let Some(completed) = self.completed {
+            return completed;
+        }
+        let completed = self.handle.as_mut().await.is_ok();
+        self.completed = Some(completed);
+        completed
     }
 }
 
@@ -615,7 +630,11 @@ fn spawn_queue_refresher(
             }
         }
     });
-    QueueRefresher { cancel, handle }
+    QueueRefresher {
+        cancel,
+        handle: Box::pin(handle),
+        completed: None,
+    }
 }
 
 async fn register_queue_metrics(metrics: &NodeMetrics) -> Arc<QueueMetrics> {
@@ -703,6 +722,46 @@ mod tests {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// A sampler that ignores its cancel token and finishes only when the test
+    /// says so, letting a stop caller be interrupted before real completion.
+    fn controlled_refresher(
+        finished: Arc<AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> QueueRefresher {
+        let handle = tokio::spawn(async move {
+            release.notified().await;
+            finished.store(true, Ordering::SeqCst);
+        });
+        QueueRefresher {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            handle: Box::pin(handle),
+            completed: None,
+        }
+    }
+
+    fn state_with_refresher(refresher: QueueRefresher) -> Arc<MonitoringState> {
+        Arc::new(MonitoringState {
+            ctx: ctx_with_storage(StorageHandle::new().0),
+            metrics: Arc::new(NodeMetrics::new()),
+            readiness: Readiness::new(),
+            recovery: RecoveryStatus::new(),
+            queue_refresher: tokio::sync::Mutex::new(Some(refresher)),
+        })
+    }
+
+    async fn wait_for_stop_lock(state: &MonitoringState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.queue_refresher.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a stop caller must hold the refresher");
     }
 
     #[tokio::test]
@@ -957,22 +1016,23 @@ mod tests {
     }
 
     // The owner cancels and joins in one step and reports a clean completion
-    // rather than dropping the task on the floor.
+    // rather than dropping the task on the floor; the result is remembered.
     #[tokio::test(start_paused = true)]
     async fn refresher_stop_completes() {
         let metrics = NodeMetrics::new();
         let queue_metrics = register_queue_metrics(&metrics).await;
-        let refresher = spawn_queue_refresher(
+        let mut refresher = spawn_queue_refresher(
             Weak::new(),
             queue_metrics,
             tokio_util::sync::CancellationToken::new(),
         );
 
         assert!(refresher.stop().await);
+        assert!(refresher.stop().await);
     }
 
     // A sampler blocked in a storage probe must still be cancelled and joined,
-    // and stopping consumes the owner so a later close cannot race it.
+    // and the completed owner stays in place so a later stop cannot race it.
     #[tokio::test(start_paused = true)]
     async fn stop_awaits_sample() {
         let (storage, receivers) = StorageHandle::new();
@@ -989,8 +1049,81 @@ mod tests {
             .await
             .expect("cancellation must not wait for the unanswered probe");
 
-        assert!(state.queue_refresher.lock().await.is_none());
+        let guard = state.queue_refresher.lock().await;
+        let refresher = guard.as_ref().expect("completed owner is retained");
+        assert_eq!(refresher.completed, Some(true));
+        drop(guard);
         drop(receivers);
+    }
+
+    // A stop caller dropped mid-await must not lose the sampler's completion:
+    // the owner stays shared and the next stop resumes waiting for the task.
+    #[tokio::test]
+    async fn stop_resumes_cancelled() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let state = state_with_refresher(controlled_refresher(finished.clone(), release.clone()));
+
+        let caller = tokio::spawn({
+            let state = state.clone();
+            async move { state.stop_queue_refresher().await }
+        });
+        wait_for_stop_lock(&state).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        // The dropped caller released the lock without the task completing.
+        assert!(state.queue_refresher.try_lock().is_ok());
+        assert!(!finished.load(Ordering::SeqCst));
+
+        let resumed = tokio::spawn({
+            let state = state.clone();
+            async move { state.stop_queue_refresher().await }
+        });
+        wait_for_stop_lock(&state).await;
+        assert!(!resumed.is_finished(), "stop returned before completion");
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), resumed)
+            .await
+            .expect("resumed stop must complete")
+            .unwrap();
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    // Two concurrent stops must both wait for the sampler to actually finish:
+    // neither returns before the task records its completion.
+    #[tokio::test]
+    async fn concurrent_stops_agree() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let state = state_with_refresher(controlled_refresher(finished.clone(), release.clone()));
+
+        let callers: Vec<_> = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                let finished = finished.clone();
+                tokio::spawn(async move {
+                    state.stop_queue_refresher().await;
+                    assert!(
+                        finished.load(Ordering::SeqCst),
+                        "stop returned before the sampler completed"
+                    );
+                })
+            })
+            .collect();
+        wait_for_stop_lock(&state).await;
+        tokio::task::yield_now().await;
+        assert!(callers.iter().all(|caller| !caller.is_finished()));
+        assert!(!finished.load(Ordering::SeqCst));
+
+        release.notify_one();
+        for caller in callers {
+            tokio::time::timeout(Duration::from_secs(5), caller)
+                .await
+                .expect("concurrent stop must complete")
+                .unwrap();
+        }
+        assert!(finished.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
