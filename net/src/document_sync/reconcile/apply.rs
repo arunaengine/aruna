@@ -3,19 +3,17 @@ use super::*;
 impl DocumentSyncService {
     pub(in crate::document_sync) async fn apply_document_event(
         &self,
-        event: DocumentSyncEvent,
+        event: DocumentEvent,
     ) -> Result<()> {
         match event {
-            DocumentSyncEvent::Upsert {
+            DocumentEvent::Upsert {
                 target,
                 bytes,
                 change,
                 ..
             } => self.apply_upsert(target, bytes, change).await,
-            DocumentSyncEvent::Delete { target, change, .. } => {
-                self.apply_delete(target, change).await
-            }
-            DocumentSyncEvent::AdminOperation { target, event, .. } => {
+            DocumentEvent::Delete { target, change, .. } => self.apply_delete(target, change).await,
+            DocumentEvent::AdminOperation { target, event, .. } => {
                 apply_admin_operation(&self.storage, target, *event).await
             }
         }
@@ -23,9 +21,9 @@ impl DocumentSyncService {
 
     pub(in crate::document_sync) async fn apply_upsert(
         &self,
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         bytes: Vec<u8>,
-        change: DocumentSyncChange,
+        change: DocumentChange,
     ) -> Result<()> {
         if reduced_admin_target(&target).is_some() {
             return Err(NetError::Bootstrap(
@@ -33,12 +31,12 @@ impl DocumentSyncService {
                     .to_string(),
             ));
         }
-        if let DocumentSyncTarget::MetadataCreateEvent {
+        if let DocumentTarget::MetadataCreateEvent {
             document_id,
             event_id,
         } = target
         {
-            let record: MetadataCreateEventRecord = postcard::from_bytes(&bytes)
+            let record: MetadataEventRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             if record.record.document_id != document_id || record.event_id != event_id {
                 return Err(NetError::Bootstrap(format!(
@@ -50,7 +48,7 @@ impl DocumentSyncService {
             return apply_create_event(
                 &self.storage,
                 &record,
-                DocumentSyncTarget::MetadataCreateEvent {
+                DocumentTarget::MetadataCreateEvent {
                     document_id,
                     event_id,
                 },
@@ -58,8 +56,8 @@ impl DocumentSyncService {
             )
             .await;
         }
-        if let DocumentSyncTarget::MetadataDocumentLifecycle { document_id } = target {
-            let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(&bytes)
+        if let DocumentTarget::MetadataDocumentLifecycle { document_id } = target {
+            let record: MetadataLifecycleRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             if record.document_id() != document_id {
                 return Err(NetError::Bootstrap(format!(
@@ -72,7 +70,7 @@ impl DocumentSyncService {
                 .await
                 .map(|_| ());
         }
-        if let DocumentSyncTarget::MetadataRegistry {
+        if let DocumentTarget::MetadataRegistry {
             group_id,
             document_id,
         } = target
@@ -88,7 +86,7 @@ impl DocumentSyncService {
             self.apply_registry_upsert(record, bytes).await?;
             return Ok(());
         }
-        if let DocumentSyncTarget::PersistentIdMapping { document_id } = target {
+        if let DocumentTarget::PersistentIdMapping { document_id } = target {
             let mapping = PersistentIdMapping::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             validate_pid_mapping(document_id, &mapping, &change).map_err(NetError::Bootstrap)?;
@@ -104,7 +102,7 @@ impl DocumentSyncService {
                 )),
             };
         }
-        if let DocumentSyncTarget::PlacementPolicy { policy_id } = target {
+        if let DocumentTarget::PlacementPolicy { policy_id } = target {
             let document: PlacementPolicyDocument = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             validate_policy_document(policy_id, self.realm_id, &document, &change)
@@ -133,8 +131,8 @@ impl DocumentSyncService {
                 )),
             };
         }
-        if let DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } = target {
-            let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&bytes)
+        if let DocumentTarget::MetadataGraphLifecycle { graph_iri } = target {
+            let record: GraphLifecycleRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             if record.graph_iri != graph_iri {
                 return Err(NetError::Bootstrap(format!(
@@ -144,17 +142,17 @@ impl DocumentSyncService {
             }
             return self.apply_graph_lifecycle(record, bytes).await.map(|_| ());
         }
-        if let DocumentSyncTarget::NodeUsage { .. } = target {
+        if let DocumentTarget::NodeUsage { .. } = target {
             // Structural guard for the shared node-usage keyspace: re-check the
             // snapshot's self-consistency before the generic storage write.
             validate_usage_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
-        if let DocumentSyncTarget::WatchInterest { .. } = target {
+        if let DocumentTarget::WatchInterest { .. } = target {
             // Structural guard for the shared watch-interest keyspace: re-check
             // the digest's self-consistency before the generic storage write.
             validate_watch_interest(&target, &bytes).map_err(NetError::Bootstrap)?;
         }
-        if let DocumentSyncTarget::NodeInfo { .. } = target {
+        if let DocumentTarget::NodeInfo { .. } = target {
             // Structural guard for the shared node-info keyspace, mirroring the
             // node-usage guard above.
             let incoming = validate_node_upsert(&target, &bytes).map_err(NetError::Bootstrap)?;
@@ -179,9 +177,9 @@ impl DocumentSyncService {
 impl DocumentSyncService {
     pub(in crate::document_sync) async fn apply_watch_change(
         &self,
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         bytes: Option<Vec<u8>>,
-        change: DocumentSyncChange,
+        change: DocumentChange,
     ) -> Result<bool> {
         store_watch_change(&self.storage, target, bytes, change).await
     }
@@ -196,15 +194,15 @@ impl DocumentSyncService {
 
     pub(in crate::document_sync) async fn apply_document_lifecycle(
         &self,
-        record: MetadataDocumentLifecycleRecord,
-        change: DocumentSyncChange,
+        record: MetadataLifecycleRecord,
+        change: DocumentChange,
     ) -> Result<bool> {
         store_document_lifecycle(&self.storage, &record, change).await
     }
 
     pub(in crate::document_sync) async fn apply_graph_lifecycle(
         &self,
-        record: MetadataGraphLifecycleRecord,
+        record: GraphLifecycleRecord,
         primary_bytes: Vec<u8>,
     ) -> Result<bool> {
         store_graph_lifecycle(&self.storage, &record, primary_bytes).await
@@ -263,26 +261,26 @@ impl DocumentSyncService {
 
     pub(in crate::document_sync) async fn apply_delete(
         &self,
-        target: DocumentSyncTarget,
-        change: DocumentSyncChange,
+        target: DocumentTarget,
+        change: DocumentChange,
     ) -> Result<()> {
-        if change.kind != DocumentSyncChangeKind::Delete {
+        if change.kind != DocumentChangeKind::Delete {
             return Err(NetError::Bootstrap(
                 "document sync delete must carry a delete change".to_string(),
             ));
         }
-        if let DocumentSyncTarget::MetadataGraphLifecycle { .. } = target {
+        if let DocumentTarget::MetadataGraphLifecycle { .. } = target {
             return Ok(());
         }
-        if let DocumentSyncTarget::MetadataDocumentLifecycle { .. } = target {
+        if let DocumentTarget::MetadataDocumentLifecycle { .. } = target {
             return Ok(());
         }
         // A minted PID is a permanent identity: the row is never removed, only
         // flipped to Withdrawn, so a delete for it is a no-op rather than an error.
-        if let DocumentSyncTarget::PersistentIdMapping { .. } = target {
+        if let DocumentTarget::PersistentIdMapping { .. } = target {
             return Ok(());
         }
-        if let DocumentSyncTarget::MetadataRegistry {
+        if let DocumentTarget::MetadataRegistry {
             group_id,
             document_id,
         } = target
@@ -417,9 +415,9 @@ impl DocumentSyncService {
 
 pub(in crate::document_sync) async fn store_watch_change(
     storage: &StorageHandle,
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     bytes: Option<Vec<u8>>,
-    change: DocumentSyncChange,
+    change: DocumentChange,
 ) -> Result<bool> {
     for _ in 0..2 {
         let txn_id = match storage
@@ -446,7 +444,7 @@ pub(in crate::document_sync) async fn store_watch_change(
             .await
         {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => match value
-                .map(|value| postcard::from_bytes::<DocumentSyncChange>(value.as_ref()))
+                .map(|value| postcard::from_bytes::<DocumentChange>(value.as_ref()))
                 .transpose()
             {
                 Ok(current) => current,
@@ -477,9 +475,9 @@ pub(in crate::document_sync) async fn store_watch_change(
         // and any delete permanently fences delayed/replayed creates.
         let apply = match (current.as_ref().map(|local| local.kind), change.kind) {
             (None, _) => true,
-            (Some(DocumentSyncChangeKind::Upsert), DocumentSyncChangeKind::Delete) => true,
-            (Some(DocumentSyncChangeKind::Upsert), DocumentSyncChangeKind::Upsert)
-            | (Some(DocumentSyncChangeKind::Delete), _) => false,
+            (Some(DocumentChangeKind::Upsert), DocumentChangeKind::Delete) => true,
+            (Some(DocumentChangeKind::Upsert), DocumentChangeKind::Upsert)
+            | (Some(DocumentChangeKind::Delete), _) => false,
         };
         if !apply {
             let _ = storage
@@ -489,7 +487,7 @@ pub(in crate::document_sync) async fn store_watch_change(
         }
 
         let realm_id = match &target {
-            DocumentSyncTarget::WatchSubscription { owner, .. } => owner.realm_id,
+            DocumentTarget::WatchSubscription { owner, .. } => owner.realm_id,
             _ => unreachable!("watch subscription apply requires a subscription target"),
         };
         let revision_entry = match sync_revision_entry(&target, &change) {

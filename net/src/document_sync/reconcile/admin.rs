@@ -2,20 +2,20 @@ use super::*;
 
 pub(crate) async fn apply_admin_operation(
     storage: &StorageHandle,
-    document_target: DocumentSyncTarget,
+    document_target: DocumentTarget,
     event: AdminDocumentEvent,
 ) -> Result<()> {
     match (&document_target, &event.target) {
-        (DocumentSyncTarget::User { .. }, AdminDocumentTarget::User { .. }) => {
+        (DocumentTarget::User { .. }, AdminDocumentTarget::User { .. }) => {
             apply_user_operation(storage, document_target, event).await
         }
-        (DocumentSyncTarget::GroupAuthorization { .. }, AdminDocumentTarget::Group { .. }) => {
+        (DocumentTarget::GroupAuthorization { .. }, AdminDocumentTarget::Group { .. }) => {
             apply_group_authorization(storage, document_target, event).await
         }
-        (DocumentSyncTarget::RealmAuthorization { .. }, AdminDocumentTarget::Realm { .. }) => {
+        (DocumentTarget::RealmAuthorization { .. }, AdminDocumentTarget::Realm { .. }) => {
             apply_realm_authorization(storage, document_target, event).await
         }
-        (DocumentSyncTarget::RealmConfig { .. }, AdminDocumentTarget::RealmConfig { .. }) => {
+        (DocumentTarget::RealmConfig { .. }, AdminDocumentTarget::RealmConfig { .. }) => {
             apply_realm_config(storage, document_target, event).await
         }
         _ => Err(NetError::Bootstrap(
@@ -26,13 +26,13 @@ pub(crate) async fn apply_admin_operation(
 
 pub(in crate::document_sync) async fn persist_stale_event(
     storage: &StorageHandle,
-    apply_status: AdminDocumentApplyStatus,
-    reducer_state: &AdminDocumentReducerState,
+    apply_status: AdminApplyStatus,
+    reducer_state: &AdminDocumentState,
 ) -> Result<bool> {
     match apply_status {
-        AdminDocumentApplyStatus::Applied => Ok(false),
-        AdminDocumentApplyStatus::Duplicate => Ok(true),
-        AdminDocumentApplyStatus::Redundant | AdminDocumentApplyStatus::StaleOriginSequence => {
+        AdminApplyStatus::Applied => Ok(false),
+        AdminApplyStatus::Duplicate => Ok(true),
+        AdminApplyStatus::Redundant | AdminApplyStatus::StaleOriginSequence => {
             batch_write_to(
                 storage,
                 vec![
@@ -48,10 +48,10 @@ pub(in crate::document_sync) async fn persist_stale_event(
 
 pub(in crate::document_sync) async fn apply_user_operation(
     storage: &StorageHandle,
-    document_target: DocumentSyncTarget,
+    document_target: DocumentTarget,
     event: AdminDocumentEvent,
 ) -> Result<()> {
-    let DocumentSyncTarget::User { user_id } = document_target.clone() else {
+    let DocumentTarget::User { user_id } = document_target.clone() else {
         return Err(NetError::Bootstrap(
             "admin document operation sync only supports user targets".to_string(),
         ));
@@ -99,7 +99,7 @@ pub(in crate::document_sync) async fn apply_user_operation(
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let mut reducer_state = previous_state
         .clone()
-        .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+        .unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -229,9 +229,9 @@ pub(in crate::document_sync) async fn apply_user_operation(
 pub(in crate::document_sync) async fn group_reducer_entries(
     storage: &StorageHandle,
     group_id: Ulid,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
 ) -> Result<Vec<(String, ByteView, Value)>> {
-    let target = DocumentSyncTarget::Group { group_id };
+    let target = DocumentTarget::Group { group_id };
     let group =
         match storage_read_from(storage, GROUP_KEYSPACE.to_string(), target.storage_key()).await? {
             Some(bytes) => {
@@ -271,10 +271,10 @@ pub(in crate::document_sync) async fn group_reducer_entries(
 
 pub(in crate::document_sync) async fn apply_group_authorization(
     storage: &StorageHandle,
-    document_target: DocumentSyncTarget,
+    document_target: DocumentTarget,
     event: AdminDocumentEvent,
 ) -> Result<()> {
-    let DocumentSyncTarget::GroupAuthorization { group_id } = document_target.clone() else {
+    let DocumentTarget::GroupAuthorization { group_id } = document_target.clone() else {
         return Err(NetError::Bootstrap(
             "group admin operation sync only supports group authorization targets".to_string(),
         ));
@@ -322,7 +322,7 @@ pub(in crate::document_sync) async fn apply_group_authorization(
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let mut reducer_state = previous_state
         .clone()
-        .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+        .unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -372,10 +372,10 @@ pub(in crate::document_sync) async fn apply_group_authorization(
 
 pub(in crate::document_sync) async fn apply_realm_authorization(
     storage: &StorageHandle,
-    document_target: DocumentSyncTarget,
+    document_target: DocumentTarget,
     event: AdminDocumentEvent,
 ) -> Result<()> {
-    let DocumentSyncTarget::RealmAuthorization { realm_id } = document_target.clone() else {
+    let DocumentTarget::RealmAuthorization { realm_id } = document_target.clone() else {
         return Err(NetError::Bootstrap(
             "realm admin operation sync only supports realm authorization targets".to_string(),
         ));
@@ -417,7 +417,7 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     let mut reducer_state = previous_state
         .clone()
-        .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+        .unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -525,7 +525,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
 /// drops the validation snapshot the applied events just outdated.
 pub(in crate::document_sync) async fn flush_config_run(
     storage: &StorageHandle,
-    run: &mut Option<(DocumentSyncTarget, Vec<AdminDocumentEvent>)>,
+    run: &mut Option<(DocumentTarget, Vec<AdminDocumentEvent>)>,
     validation_cache: &mut ConfigValidationCache,
 ) -> Result<()> {
     if let Some((target, events)) = run.take() {
@@ -541,7 +541,7 @@ pub(in crate::document_sync) async fn flush_config_run(
 fn plan_realm_change(
     previous_config: Option<RealmConfigDocument>,
     realm_id: RealmId,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     effective_now: u64,
     now_ms: u64,
     revocation_index: Option<&RevocationIndex>,
@@ -584,10 +584,10 @@ fn plan_realm_change(
 /// materialization and commit once avoids quadratic reducer rewrites.
 pub(in crate::document_sync) async fn apply_config_events(
     storage: &StorageHandle,
-    document_target: DocumentSyncTarget,
+    document_target: DocumentTarget,
     events: Vec<AdminDocumentEvent>,
 ) -> Result<()> {
-    let DocumentSyncTarget::RealmConfig { realm_id } = document_target.clone() else {
+    let DocumentTarget::RealmConfig { realm_id } = document_target.clone() else {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports realm config targets".to_string(),
         ));
@@ -669,7 +669,7 @@ pub(in crate::document_sync) async fn apply_config_events(
             .as_ref()
             .map_or(raw_now, |state| state.revocation_floor.max(raw_now));
         let mut reducer_state = previous_state.clone().unwrap_or_else(|| {
-            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id })
+            AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id })
         });
         for event in &events {
             if let Err(error) = reducer_state.apply(event) {
@@ -774,7 +774,7 @@ pub(in crate::document_sync) async fn apply_config_events(
 
 pub(in crate::document_sync) fn materialize_group_authorization(
     auth_doc: &mut GroupAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     event: &AdminDocumentEvent,
 ) {
     if let AdminDocumentOperation::GroupJoinDecided { decision } = &event.op {
@@ -836,8 +836,8 @@ pub(in crate::document_sync) fn materialize_group_authorization(
 
 pub(in crate::document_sync) fn materialize_group_role(
     auth_doc: &mut GroupAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
-    role: &AdminDocumentRoleDefinition,
+    reducer_state: &AdminDocumentState,
+    role: &AdminRoleDefinition,
 ) {
     let role_path = group_role_path(&role.role_id);
     if reducer_state.conflicts.contains_key(&role_path)
@@ -872,7 +872,7 @@ pub(in crate::document_sync) fn materialize_group_role(
 
 pub(in crate::document_sync) fn materialize_realm_authorization(
     auth_doc: &mut RealmAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     event: &AdminDocumentEvent,
 ) {
     if let AdminDocumentOperation::RealmRoleCreated { role } = &event.op {
@@ -912,8 +912,8 @@ pub(in crate::document_sync) fn materialize_realm_authorization(
 
 pub(in crate::document_sync) fn materialize_realm_role(
     auth_doc: &mut RealmAuthorizationDocument,
-    reducer_state: &AdminDocumentReducerState,
-    role: &AdminDocumentRoleDefinition,
+    reducer_state: &AdminDocumentState,
+    role: &AdminRoleDefinition,
 ) {
     let role_path = realm_role_path(&role.role_id);
     if reducer_state.conflicts.contains_key(&role_path)
@@ -949,7 +949,7 @@ pub(in crate::document_sync) fn materialize_realm_role(
 pub(in crate::document_sync) fn materialize_user_operation(
     user_id: UserId,
     previous_user: Option<&User>,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     event: &AdminDocumentEvent,
 ) -> User {
     let mut user = previous_user.cloned().unwrap_or_else(|| User {
@@ -1022,10 +1022,10 @@ pub(in crate::document_sync) const APPLY_CONFLICT_ATTEMPTS: usize = 64;
 /// The realm a realm-config operation addresses: the sync target, payload
 /// target, and document must all name the same realm.
 fn validate_config_target(
-    document_target: &DocumentSyncTarget,
+    document_target: &DocumentTarget,
     event: &AdminDocumentEvent,
 ) -> Result<RealmId> {
-    let DocumentSyncTarget::RealmConfig { realm_id } = document_target else {
+    let DocumentTarget::RealmConfig { realm_id } = document_target else {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports realm config targets".to_string(),
         ));
@@ -1064,7 +1064,7 @@ fn validate_config_actor(realm_id: RealmId, event: &AdminDocumentEvent) -> Resul
 /// already be onboarded and the payload valid under the snapshot clock.
 fn validate_revocation_snapshot(
     previous_config: Option<&RealmConfigDocument>,
-    previous_state: Option<&AdminDocumentReducerState>,
+    previous_state: Option<&AdminDocumentState>,
     event: &AdminDocumentEvent,
     realm_id: RealmId,
     raw_now: u64,
@@ -1095,7 +1095,7 @@ fn validate_revocation_snapshot(
 
 async fn apply_realm_config(
     storage: &StorageHandle,
-    document_target: DocumentSyncTarget,
+    document_target: DocumentTarget,
     event: AdminDocumentEvent,
 ) -> Result<()> {
     let realm_id = validate_config_target(&document_target, &event)?;
@@ -1170,7 +1170,7 @@ async fn apply_realm_config(
             .map_or(raw_now, |state| state.revocation_floor.max(raw_now));
         let mut reducer_state = previous_state
             .clone()
-            .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+            .unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
         let needs_index = needs_revocation_index(
             is_revocation,
             previous_config.is_some(),

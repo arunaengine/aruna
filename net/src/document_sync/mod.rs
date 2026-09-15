@@ -19,13 +19,12 @@ use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
 use aruna_core::auth::valid_revocation_expiry;
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncEvictedDocument,
-    DocumentSyncNetEvent, DocumentSyncOutboxEvent, DocumentSyncPublish,
-    DocumentSyncReconcileResult, DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentEvent, DocumentEvictedDocument, DocumentNetEvent,
+    DocumentOutboxEvent, DocumentReconcileResult, DocumentSyncPublish, DocumentTarget,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -40,11 +39,11 @@ use aruna_core::keyspaces::{
     SYNC_QUARANTINE_USAGE_KEYSPACE, USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
-    MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
+    GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEventRecord,
+    MetadataLifecycleRecord,
 };
 use aruna_core::reducer::{
-    AdminDocumentApplyStatus, AdminDocumentReducerState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
+    AdminApplyStatus, AdminDocumentState, GROUP_DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
     GROUP_REALM_ID_PATH, MAX_LIVE_REVOCATIONS_PER_ORIGIN, REALM_CONFIG_COMPUTE_PATH,
     REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
     REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_POLICIES_PATH, REALM_CONFIG_QUOTA_PATH,
@@ -132,15 +131,15 @@ const MAX_DEFERRED_TOPICS_PER_DEPENDENCY: usize = 256;
 const SHARD_GENESIS_PROBE_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
-struct PendingMetadataCreateApply {
+struct PendingCreateApply {
     identity: SyncQuarantineIdentity,
     /// The event exactly as received, so a reject in the create batch keeps the
     /// genuine envelope instead of the payload the batch reconstructed.
-    event: DocumentSyncEvent,
-    target: DocumentSyncTarget,
-    record: MetadataCreateEventRecord,
+    event: DocumentEvent,
+    target: DocumentTarget,
+    record: MetadataEventRecord,
     bytes: Vec<u8>,
-    lifecycle_revision: Option<DocumentSyncChange>,
+    lifecycle_revision: Option<DocumentChange>,
 }
 
 /// A permanently rejected sync operation awaiting durable evidence. Evidence is
@@ -155,7 +154,7 @@ struct SyncRejection {
 impl SyncRejection {
     fn new(
         identity: SyncQuarantineIdentity,
-        event: DocumentSyncEvent,
+        event: DocumentEvent,
         reason: impl Into<String>,
     ) -> Self {
         Self {
@@ -181,7 +180,7 @@ impl SyncRejection {
 
 struct DocumentEventBatch {
     cursor: ::irokle::ActorClock,
-    events: Vec<(DocumentSyncEvent, ::irokle::ActorId, u64)>,
+    events: Vec<(DocumentEvent, ::irokle::ActorId, u64)>,
     /// Ops whose transport payload never decoded into an event. They are
     /// permanent by construction: no redelivery can make the bytes valid.
     rejections: Vec<SyncRejection>,
@@ -192,7 +191,7 @@ struct DocumentEventBatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingEviction {
     pub key: ::irokle::EvictionKey,
-    pub documents: Vec<DocumentSyncEvictedDocument>,
+    pub documents: Vec<DocumentEvictedDocument>,
 }
 
 /// Placement fence outcome. The transactional read of the realm config is the
@@ -625,7 +624,7 @@ enum DocumentSyncDependency {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeferredTopicRegistrationOutcome {
+enum DeferredRegistrationOutcome {
     Inserted,
     AlreadyRegistered,
     CapacityExceeded,

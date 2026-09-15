@@ -1,14 +1,14 @@
 use std::collections::BTreeSet;
 
 use aruna_core::admin_documents::AdminDocumentEvent;
-use aruna_core::document::{DocumentSyncEvent, DocumentSyncTarget};
-use aruna_core::metadata::MetadataGraphLifecycleRecord;
+use aruna_core::document::{DocumentEvent, DocumentTarget};
+use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::structs::{PlacementRef, SyncQuarantineIdentity};
 use aruna_storage::StorageHandle;
 use tracing::warn;
 
 use crate::document_sync::{
-    DocumentSyncDependency, DocumentSyncService, PendingMetadataCreateApply, SyncRejection,
+    DocumentSyncDependency, DocumentSyncService, PendingCreateApply, SyncRejection,
 };
 use crate::error::{NetError, Result};
 
@@ -21,17 +21,17 @@ use super::validate::{AdminEventValidation, ConfigValidationCache, validate_admi
 
 #[derive(Default)]
 pub(super) struct BatchOutcome {
-    pub(super) applied_targets: Vec<DocumentSyncTarget>,
+    pub(super) applied_targets: Vec<DocumentTarget>,
     pub(super) rejections: Vec<SyncRejection>,
-    pub(super) pending_creates: Vec<PendingMetadataCreateApply>,
-    pub(super) graph_tombstones: Vec<MetadataGraphLifecycleRecord>,
+    pub(super) pending_creates: Vec<PendingCreateApply>,
+    pub(super) graph_tombstones: Vec<GraphLifecycleRecord>,
     pub(super) cross_topic: BTreeSet<DocumentSyncDependency>,
     pub(super) satisfied: BTreeSet<DocumentSyncDependency>,
     pub(super) deferred_creates: bool,
 }
 
 struct DeferredAdmin {
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     event: AdminDocumentEvent,
     placement: PlacementRef,
     identity: SyncQuarantineIdentity,
@@ -43,7 +43,7 @@ struct DeferredAdmin {
 pub(super) struct BatchState {
     outcome: BatchOutcome,
     deferred_admin: Vec<DeferredAdmin>,
-    config_run: Option<(DocumentSyncTarget, Vec<AdminDocumentEvent>)>,
+    config_run: Option<(DocumentTarget, Vec<AdminDocumentEvent>)>,
     validation_cache: ConfigValidationCache,
 }
 
@@ -60,7 +60,7 @@ impl BatchState {
         }
     }
 
-    pub(super) fn add_target(&mut self, target: DocumentSyncTarget) {
+    pub(super) fn add_target(&mut self, target: DocumentTarget) {
         self.outcome.applied_targets.push(target);
     }
 
@@ -68,12 +68,12 @@ impl BatchState {
         self.outcome.rejections.push(rejection);
     }
 
-    pub(super) fn add_pending(&mut self, pending: PendingMetadataCreateApply) {
+    pub(super) fn add_pending(&mut self, pending: PendingCreateApply) {
         self.outcome.pending_creates.push(pending);
         self.outcome.deferred_creates = true;
     }
 
-    pub(super) fn add_tombstone(&mut self, record: MetadataGraphLifecycleRecord) {
+    pub(super) fn add_tombstone(&mut self, record: GraphLifecycleRecord) {
         self.outcome.graph_tombstones.push(record);
     }
 
@@ -90,11 +90,11 @@ impl BatchState {
     }
 }
 
-pub(super) fn is_config_candidate(event: &DocumentSyncEvent) -> bool {
+pub(super) fn is_config_candidate(event: &DocumentEvent) -> bool {
     matches!(
         event,
-        DocumentSyncEvent::AdminOperation { target, event, .. }
-            if matches!(target, DocumentSyncTarget::RealmConfig { .. })
+        DocumentEvent::AdminOperation { target, event, .. }
+            if matches!(target, DocumentTarget::RealmConfig { .. })
                 && coalescible_config_op(&event.op)
     )
 }
@@ -104,13 +104,13 @@ pub(super) async fn apply_batch_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    event: DocumentSyncEvent,
+    event: DocumentEvent,
     state: &mut BatchState,
 ) -> Result<()> {
-    if matches!(event.target(), DocumentSyncTarget::WatchSubscription { .. })
+    if matches!(event.target(), DocumentTarget::WatchSubscription { .. })
         && matches!(
             event,
-            DocumentSyncEvent::Upsert { .. } | DocumentSyncEvent::Delete { .. }
+            DocumentEvent::Upsert { .. } | DocumentEvent::Delete { .. }
         )
     {
         let outcome = apply_watch_event(service, topic_id, actor_id, identity, event).await?;
@@ -119,9 +119,9 @@ pub(super) async fn apply_batch_event(
     }
     if matches!(
         event.target(),
-        DocumentSyncTarget::NodeUsage { .. }
-            | DocumentSyncTarget::WatchInterest { .. }
-            | DocumentSyncTarget::NodeInfo { .. }
+        DocumentTarget::NodeUsage { .. }
+            | DocumentTarget::WatchInterest { .. }
+            | DocumentTarget::NodeInfo { .. }
     ) {
         let outcome = apply_shared_event(service, topic_id, actor_id, identity, event).await?;
         record_shared(outcome, state);
@@ -130,11 +130,11 @@ pub(super) async fn apply_batch_event(
 
     if matches!(
         &event,
-        DocumentSyncEvent::Upsert {
-            target: DocumentSyncTarget::MetadataRegistry { .. }
-                | DocumentSyncTarget::MetadataCreateEvent { .. }
-                | DocumentSyncTarget::MetadataDocumentLifecycle { .. }
-                | DocumentSyncTarget::MetadataGraphLifecycle { .. },
+        DocumentEvent::Upsert {
+            target: DocumentTarget::MetadataRegistry { .. }
+                | DocumentTarget::MetadataCreateEvent { .. }
+                | DocumentTarget::MetadataDocumentLifecycle { .. }
+                | DocumentTarget::MetadataGraphLifecycle { .. },
             ..
         }
     ) {
@@ -144,7 +144,7 @@ pub(super) async fn apply_batch_event(
     }
     if matches!(
         event.target(),
-        DocumentSyncTarget::PersistentIdMapping { .. } | DocumentSyncTarget::PlacementPolicy { .. }
+        DocumentTarget::PersistentIdMapping { .. } | DocumentTarget::PlacementPolicy { .. }
     ) {
         let outcome = apply_policy_event(service, topic_id, actor_id, identity, event).await?;
         record_metadata(outcome, state);
@@ -152,7 +152,7 @@ pub(super) async fn apply_batch_event(
     }
 
     match event {
-        event @ (DocumentSyncEvent::Upsert { .. } | DocumentSyncEvent::Delete { .. })
+        event @ (DocumentEvent::Upsert { .. } | DocumentEvent::Delete { .. })
             if reduced_admin_target(event.target()).is_some() =>
         {
             // Whole-document admin sync is unsupported, but must not wedge replay.
@@ -167,7 +167,7 @@ pub(super) async fn apply_batch_event(
                 "unsupported whole-document admin sync event",
             ));
         }
-        DocumentSyncEvent::AdminOperation {
+        DocumentEvent::AdminOperation {
             target,
             event,
             placement,
@@ -235,7 +235,7 @@ pub(super) async fn apply_admin_event(
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     identity: SyncQuarantineIdentity,
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     event: Box<AdminDocumentEvent>,
     placement: PlacementRef,
     origin_signature: iroh::Signature,
@@ -265,7 +265,7 @@ pub(super) async fn apply_admin_event(
             );
             state.add_rejection(SyncRejection::new(
                 identity,
-                DocumentSyncEvent::AdminOperation {
+                DocumentEvent::AdminOperation {
                     target,
                     event,
                     placement,
@@ -297,8 +297,7 @@ pub(super) async fn apply_admin_event(
     }
 
     let dependencies = satisfied_dependencies(&target, event.as_ref());
-    if matches!(target, DocumentSyncTarget::RealmConfig { .. }) && coalescible_config_op(&event.op)
-    {
+    if matches!(target, DocumentTarget::RealmConfig { .. }) && coalescible_config_op(&event.op) {
         match &mut state.config_run {
             Some((run_target, events)) if *run_target == target => events.push(*event),
             run => {
@@ -360,7 +359,7 @@ pub(super) async fn retry_admin(
                     );
                     state.add_rejection(SyncRejection::new(
                         deferred.identity,
-                        DocumentSyncEvent::AdminOperation {
+                        DocumentEvent::AdminOperation {
                             target: deferred.target,
                             event: Box::new(deferred.event),
                             placement: deferred.placement,
@@ -407,7 +406,7 @@ fn reject_unresolved(
             );
             state.add_rejection(SyncRejection::new(
                 deferred.identity,
-                DocumentSyncEvent::AdminOperation {
+                DocumentEvent::AdminOperation {
                     target: deferred.target,
                     event: Box::new(deferred.event),
                     placement: deferred.placement,
