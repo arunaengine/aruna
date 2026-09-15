@@ -7,10 +7,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{SYNC_MIRROR_REPAIR_KEYSPACE, SYNC_RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::{
-    AuthContext, Permission, SyncRelationship, SyncState, bucket_permission_path,
-    sync_relationship_key,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
+use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
@@ -26,7 +25,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::AuthToken;
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
@@ -502,7 +501,7 @@ async fn ensure_target_write(
 async fn authorize_repair(
     context: &DriverContext,
     relationship: &SyncRelationship,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     path: &str,
     permission: &Permission,
     operation: &'static str,
@@ -931,10 +930,14 @@ mod tests {
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-    use aruna_core::structs::{
-        Actor, ArunaArn, BucketInfo, Group, GroupAuthorizationDocument, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::replication::ArunaArn;
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
+    use aruna_core::structs::{ReferenceHandling, SyncMode, SyncState, SyncStatusSnapshot};
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
     use ulid::Ulid;

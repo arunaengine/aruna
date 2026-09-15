@@ -2,7 +2,7 @@ use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
-use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 use aruna_core::UserId;
@@ -11,10 +11,14 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, PathRestriction,
-    RealmId, SourceConnector, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::identity::auth::PathRestriction;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
@@ -44,7 +48,7 @@ pub struct MaterializeSnapshotResult {
     pub version_id: Ulid,
 }
 
-use aruna_core::structs::{BackendLocation, BlobLocationKey};
+use aruna_core::structs::storage::blob::{BackendLocation, BlobLocationKey};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum MaterializeSnapshotError {

@@ -27,7 +27,7 @@ async fn durable_rearm_loop(
         };
         ticks = ticks.saturating_add(1);
         restore_blob_timer(&context.storage_handle, &task_handle).await;
-        crate::s3::refresh_metadata::restore_timer(&context.storage_handle, &task_handle).await;
+        crate::s3::object::metadata::restore_timer(&context.storage_handle, &task_handle).await;
         restore_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_publish_timer(&context.storage_handle, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
@@ -239,7 +239,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::s3::refresh_metadata::restore_timer(&context.storage_handle, &task_handle).await;
+        crate::s3::object::metadata::restore_timer(&context.storage_handle, &task_handle).await;
         if stopped() {
             return;
         }
@@ -536,7 +536,7 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_refresh_queue(&self) {
-        match crate::s3::refresh_metadata::process_batch(&self.context).await {
+        match crate::s3::object::metadata::process_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainReferenceMetadataRefreshQueue, Duration::ZERO)
                     .await;

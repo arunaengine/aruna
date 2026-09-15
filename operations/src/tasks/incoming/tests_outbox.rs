@@ -135,7 +135,7 @@ fn outbox_upsert_revision() {
             bytes: vec![1, 2, 3],
             change,
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         true,
     );
 
@@ -225,7 +225,7 @@ async fn topic_page_blocks() {
             bytes: b"blocked".to_vec(),
             change: blocked_change,
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         true,
     );
     let healthy = crate::sync::document_outbox::new_identified_record(
@@ -237,7 +237,7 @@ async fn topic_page_blocks() {
             bytes: b"healthy".to_vec(),
             change: healthy_change,
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         true,
     );
     let blocked_key = outbox_key(&blocked).to_vec();
@@ -735,7 +735,7 @@ async fn blocked_keeps_backoff() {
         .expect("retry backoff mutex poisoned")
         .insert(key.clone(), 3);
     let mut blocked_change = change();
-    blocked_change.placement = aruna_core::structs::PlacementRef {
+    blocked_change.placement = aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id: Ulid::from_bytes([48; 16]),
         shard: 1,
     };
@@ -747,7 +747,7 @@ async fn blocked_keeps_backoff() {
             bytes: b"blocked".to_vec(),
             change: blocked_change,
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         false,
     );
     write_outbox_record(&storage, &record).await;
@@ -811,7 +811,7 @@ async fn deferred_head_paginates() {
             updated_at_ms: 9,
         },
         kind: DocumentChangeKind::Upsert,
-        placement: aruna_core::structs::PlacementRef {
+        placement: aruna_core::structs::placement::placement_record::PlacementRef {
             strategy_id: Ulid::from_parts(42, 1),
             shard: 3,
         },
@@ -831,7 +831,7 @@ async fn deferred_head_paginates() {
                 bytes: Vec::new(),
                 change: deferred_change,
             },
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         writes
@@ -849,7 +849,7 @@ async fn deferred_head_paginates() {
             bytes: b"realm-auth".to_vec(),
             change: change(),
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         true,
     );
     let publish_key = outbox_key(&publish_record).to_vec();
@@ -938,7 +938,7 @@ async fn rotation_streak() {
     let net = make_net_handle(realm_id, &storage, [51u8; 32]).await;
     tokio::time::pause();
     let target = DocumentTarget::RealmAuthorization { realm_id };
-    let topic = target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+    let topic = target.sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
     net.ensure_sync_topics(&[topic], Vec::new())
         .expect("shared topic genesis");
     let task_handle = TaskHandle::new();
@@ -966,7 +966,7 @@ async fn rotation_streak() {
                 bytes: index.to_be_bytes().to_vec(),
                 change: change(),
             },
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             true,
         );
         write_outbox_record(&storage, &record).await;
@@ -1081,7 +1081,7 @@ async fn draining_a_topics() {
     let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
     let topic = aruna_core::document::shard_topic_id(
         realm_id,
-        &aruna_core::structs::PlacementRef {
+        &aruna_core::structs::placement::placement_record::PlacementRef {
             strategy_id,
             shard: 0,
         },
@@ -1099,7 +1099,7 @@ async fn draining_a_topics() {
             bytes: b"config".to_vec(),
             change: change(),
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         true,
     );
     write_outbox_record(&storage, &record).await;
@@ -1129,7 +1129,7 @@ struct ConfigHarness {
     handler: OperationsTaskHandler,
     config: RealmConfigDocument,
     realm_id: RealmId,
-    placement: aruna_core::structs::PlacementRef,
+    placement: aruna_core::structs::placement::placement_record::PlacementRef,
     shard_target: DocumentTarget,
 }
 
@@ -1142,7 +1142,7 @@ async fn config_setup() -> ConfigHarness {
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.seed_default_placement();
     write_realm_config(&storage, realm_id, &config, net.node_id()).await;
-    let placement = aruna_core::structs::PlacementRef {
+    let placement = aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id: config.strategies[0].strategy_id,
         shard: 0,
     };
@@ -1152,7 +1152,7 @@ async fn config_setup() -> ConfigHarness {
         document_id: Ulid::from_parts(8, 1),
     };
     let shared_topic =
-        shared_target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+        shared_target.sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
     net.ensure_sync_topics(&[shared_topic], Vec::new())
         .expect("shared topic genesis");
     let mut shard_change = change();
@@ -1166,7 +1166,7 @@ async fn config_setup() -> ConfigHarness {
             bytes: b"shared".to_vec(),
             change: change(),
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         true,
     );
     let shard = crate::sync::document_outbox::new_identified_record(
@@ -1284,7 +1284,7 @@ async fn pull_reaches_holder() {
         .expect("ex-holder refreshes realm peers");
 
     let strategy_id = config.strategies.first().expect("a strategy").strategy_id;
-    let placement = aruna_core::structs::PlacementRef {
+    let placement = aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id,
         shard: 0,
     };
@@ -1311,7 +1311,7 @@ async fn pull_reaches_holder() {
             bytes: b"doc".to_vec(),
             change,
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         false,
     );
     let record_key = outbox_key(&record).to_vec();
@@ -1351,8 +1351,8 @@ async fn pull_reaches_holder() {
     net.shutdown().await;
 }
 
-fn admin_placement(shard: u32) -> aruna_core::structs::PlacementRef {
-    aruna_core::structs::PlacementRef {
+fn admin_placement(shard: u32) -> aruna_core::structs::placement::placement_record::PlacementRef {
+    aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id: Ulid::from_bytes([50; 16]),
         shard,
     }
@@ -1363,7 +1363,7 @@ fn admin_outbox(
     origin: aruna_core::NodeId,
     origin_seq: u64,
     target: DocumentTarget,
-    placement: aruna_core::structs::PlacementRef,
+    placement: aruna_core::structs::placement::placement_record::PlacementRef,
 ) -> DocumentOutboxRecord {
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
@@ -1379,7 +1379,7 @@ fn admin_outbox(
             origin_node_id: origin,
             origin_seq,
             observed: AdminDocumentClock::default(),
-            actor: aruna_core::structs::Actor {
+            actor: aruna_core::structs::identity::auth::Actor {
                 node_id: node(1),
                 user_id,
                 realm_id,
@@ -1405,7 +1405,7 @@ fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentOutboxRe
 
 fn shard_change(seed: u8) -> DocumentChange {
     let mut value = change();
-    value.placement = aruna_core::structs::PlacementRef {
+    value.placement = aruna_core::structs::placement::placement_record::PlacementRef {
         strategy_id: Ulid::from_bytes([seed; 16]),
         shard: 1,
     };
@@ -1421,7 +1421,7 @@ fn shard_topic_record(origin_seq: u64) -> DocumentOutboxRecord {
             bytes: vec![origin_seq as u8],
             change: change(),
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         false,
     )
 }
@@ -1468,7 +1468,7 @@ impl BoundaryHarness {
 
     fn placed_change(&self) -> DocumentChange {
         let mut value = change();
-        value.placement = aruna_core::structs::PlacementRef {
+        value.placement = aruna_core::structs::placement::placement_record::PlacementRef {
             strategy_id: Ulid::from_bytes([45; 16]),
             shard: 1,
         };
@@ -1487,7 +1487,7 @@ impl BoundaryHarness {
             target,
             Vec::new(),
             event,
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             true,
         )
     }
@@ -1518,7 +1518,7 @@ impl BoundaryHarness {
         let shared = DocumentTarget::RealmAuthorization {
             realm_id: self.realm_id,
         };
-        let topic = shared.sync_topic_id(self.realm_id, &aruna_core::structs::PlacementRef::NIL);
+        let topic = shared.sync_topic_id(self.realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
         self.net
             .ensure_sync_topics(&[topic], Vec::new())
             .expect("appended topic genesis");

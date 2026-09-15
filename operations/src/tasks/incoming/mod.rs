@@ -10,9 +10,9 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::{
-    JobExecutionClass, NotificationRecord, RealmConfigDocument, RealmId, RoCrateLimits,
-};
+use aruna_core::structs::execution::job::{JobExecutionClass, RoCrateLimits};
+use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::unix_timestamp_millis;
@@ -103,7 +103,7 @@ use crate::realm::announce_presence::{
 use crate::replication::queue::{
     BLOB_REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer,
 };
-use crate::s3::refresh_metadata::REFERENCE_METADATA_REFRESH_RETRY_AFTER;
+use crate::s3::object::metadata::REFERENCE_METADATA_REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{
     OUTBOX_DRAIN_BATCH_SIZE, read_outbox_records, read_outbox_tails, restore_outbox_timers,
 };
@@ -272,7 +272,7 @@ type StuckRecord = (
     u64,
     DocumentTarget,
     irokle::TopicId,
-    aruna_core::structs::PlacementRef,
+    aruna_core::structs::placement::placement_record::PlacementRef,
 );
 
 struct DrainInvocation {
@@ -393,7 +393,7 @@ impl OperationsTaskHandler {
     /// unsigned upserts/deletes stay in the outbox. Returns keys whose custody moved.
     async fn relay_undeliverable_records(
         &self,
-        config: Option<&aruna_core::structs::RealmConfigDocument>,
+        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
         undeliverable: &[DrainRecord],
     ) -> Vec<Vec<u8>> {
         let mut relayed = Vec::new();
@@ -436,7 +436,7 @@ impl OperationsTaskHandler {
 
     /// Whether this node is a device: configured with a kind that holds no
     /// sync topic. Unknown kinds count as infrastructure.
-    fn is_device(&self, config: Option<&aruna_core::structs::RealmConfigDocument>) -> bool {
+    fn is_device(&self, config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>) -> bool {
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             return false;
         };
@@ -451,7 +451,7 @@ impl OperationsTaskHandler {
     /// holder. Returns whether a holder took custody.
     async fn relay_admin_record(
         &self,
-        config: &aruna_core::structs::RealmConfigDocument,
+        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
         record: &DocumentOutboxRecord,
     ) -> bool {
         let DocumentOutboxEvent::AdminOperation {

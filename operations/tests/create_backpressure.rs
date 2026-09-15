@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::GroupId;
 use aruna_core::{StructuredId, UserId};
 use aruna_operations::driver::{DriverContext, drive};

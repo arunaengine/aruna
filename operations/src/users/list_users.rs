@@ -4,7 +4,9 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{AuthContext, Permission, RealmId, User};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::user::User;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -245,7 +247,9 @@ mod pure_tests {
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{Actor, AuthContext, RealmId, User};
+    use aruna_core::structs::identity::auth::{Actor, AuthContext};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::identity::user::User;
     use ulid::Ulid;
 
     fn actor(realm_id: RealmId, user_id: UserId) -> Actor {

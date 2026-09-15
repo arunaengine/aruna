@@ -1,7 +1,10 @@
 use crate::driver::DriverContext;
 use crate::notifications::inbox::upsert_inbox_records;
 use aruna_core::UserId;
-use aruna_core::structs::{NotificationClass, NotificationKind, NotificationRecord, RealmId};
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationRecord,
+};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;

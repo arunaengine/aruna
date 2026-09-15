@@ -14,7 +14,7 @@ async fn restore_document_records() {
             bytes: b"restore durable work".to_vec(),
             change: change(),
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         false,
     );
     write_outbox_record(&storage, &record).await;
@@ -38,7 +38,7 @@ async fn restore_document_timer() {
             bytes: b"restore durable work".to_vec(),
             change: change(),
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         false,
     );
     write_outbox_record(&storage, &record).await;
@@ -157,7 +157,7 @@ async fn drain_keeps_timer() {
             bytes: b"direct fence".to_vec(),
             change: change(),
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         false,
     );
     write_outbox_record(&storage, &record).await;
@@ -225,7 +225,7 @@ async fn outbox_sync_retry() {
             bytes: b"retained work".to_vec(),
             change: change(),
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         false,
     );
     let key = outbox_key(&record).to_vec();
@@ -274,7 +274,7 @@ async fn retained_outbox_timer() {
             bytes: b"retry after restart".to_vec(),
             change: change(),
         },
-        aruna_core::structs::PlacementRef::NIL,
+        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
         false,
     );
     let key = outbox_key(&record).to_vec();
@@ -411,7 +411,7 @@ async fn drain_reconcile_wakes() {
 #[tokio::test]
 async fn drain_reconcile_summary() {
     use aruna_core::keyspaces::{USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
-    use aruna_core::structs::{
+    use aruna_core::structs::storage::usage::{
         NODE_USAGE_SUMMARY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_shard_key,
         usage_global_key,
     };
@@ -542,7 +542,7 @@ async fn drain_reconcile_summary() {
 #[tokio::test]
 async fn drain_reconcile_config() {
     use aruna_core::keyspaces::USAGE_NODE_STATS_KEYSPACE;
-    use aruna_core::structs::{NODE_USAGE_SUMMARY_GLOBAL_KEY, UsageCounters};
+    use aruna_core::structs::storage::usage::{NODE_USAGE_SUMMARY_GLOBAL_KEY, UsageCounters};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 
     let temp_dir = tempdir().expect("temp dir");

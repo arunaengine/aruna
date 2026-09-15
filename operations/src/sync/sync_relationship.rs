@@ -698,7 +698,9 @@ impl Operation for DeleteRelationshipOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use aruna_core::structs::{ArunaArn, RealmId, SyncMode, SyncState, SyncStatusSnapshot};
+    use aruna_core::structs::storage::replication::ArunaArn;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
     use aruna_core::{NodeId, UserId};
     use aruna_storage::storage::FjallStorage;
     use std::time::SystemTime;

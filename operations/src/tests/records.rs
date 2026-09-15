@@ -3,21 +3,22 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::ExecutionTargetId;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     CancelAuthority, CollisionPolicy, ComputeResources, EffectiveResources, ExecutionOutputRecord,
     ExecutionReceipt, ExecutionSpec, ExecutionUpdate, JobAdmissionRecord, JobCancelRecord,
     JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope, JobRetryPolicy,
     LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
-    PhysicalExecutionState, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind,
-    ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+    PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use ulid::Ulid;
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::structs::Actor;
+use aruna_core::structs::identity::auth::Actor;
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
 
@@ -112,7 +113,7 @@ impl Family {
             group_id: Ulid::from_bytes([2u8; 16]),
             created_by: user(),
             created_at_ms: 1_000,
-            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
             payload: payload(),
             request_digest: self.request_digest,
             spec_digest: [0u8; 32],

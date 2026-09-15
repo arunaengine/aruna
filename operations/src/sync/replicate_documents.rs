@@ -4,7 +4,8 @@ use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{DocumentClass, PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_record::{DocumentClass, PlacementRef};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -383,7 +384,8 @@ impl Operation for ReplicateDocumentsOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::{PlacementStrategy, RealmNodeKind};
+    use aruna_core::structs::placement::placement_record::PlacementStrategy;
+    use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::task::TaskEvent;
     use ulid::Ulid;
 

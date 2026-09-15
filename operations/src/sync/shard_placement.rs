@@ -5,7 +5,8 @@ use aruna_core::NodeId;
 use aruna_core::document::PendingShardPlacement;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
-use aruna_core::structs::{PLACEMENT_EPOCH_PAD, PlacementRef, RealmId};
+use aruna_core::structs::placement::placement_record::{PLACEMENT_EPOCH_PAD, PlacementRef};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::Key;
@@ -140,7 +141,7 @@ fn compare_node_ids(left: &NodeId, right: &NodeId) -> Ordering {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

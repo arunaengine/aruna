@@ -15,9 +15,10 @@ use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
     sync_revision_entry, sync_revision_key,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, Permission, PlacementRef, RealmConfigDocument, RealmId, User,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::user::User;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId};
@@ -756,7 +757,10 @@ mod pure_tests {
     use aruna_core::operation::Operation;
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};
-    use aruna_core::structs::{Actor, AuthContext, PlacementRef, RealmId, User};
+    use aruna_core::structs::identity::auth::{Actor, AuthContext};
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::identity::user::User;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_core::{
@@ -1234,12 +1238,12 @@ mod pure_tests {
     fn activated_config(
         realm_id: RealmId,
         actor: &Actor,
-    ) -> aruna_core::structs::RealmConfigDocument {
-        let mut config = aruna_core::structs::RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        config.ensure_node(actor.node_id, aruna_core::structs::RealmNodeKind::Server);
+    ) -> aruna_core::structs::identity::realm::RealmConfigDocument {
+        let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, aruna_core::structs::identity::realm::RealmNodeKind::Server);
         config
             .strategies
-            .push(aruna_core::structs::PlacementStrategy {
+            .push(aruna_core::structs::placement::placement_record::PlacementStrategy {
                 strategy_id: Ulid::from_bytes([5; 16]),
                 name: "default".to_string(),
                 replica_count: Some(1),

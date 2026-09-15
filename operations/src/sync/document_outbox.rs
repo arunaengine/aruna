@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DOCUMENT_SYNC_OUTBOX_KEYSPACE, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
 };
-use aruna_core::structs::PlacementRef;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, TxnId, Value};
@@ -418,7 +418,8 @@ mod tests {
     };
     use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use aruna_core::handle::Handle;
-    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
 
@@ -474,8 +475,8 @@ mod tests {
         })
     }
 
-    fn placement(shard: u32) -> aruna_core::structs::PlacementRef {
-        aruna_core::structs::PlacementRef {
+    fn placement(shard: u32) -> aruna_core::structs::placement::placement_record::PlacementRef {
+        aruna_core::structs::placement::placement_record::PlacementRef {
             strategy_id: Ulid::from_parts(42, 1),
             shard,
         }
@@ -569,7 +570,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         write_raw_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
@@ -626,7 +627,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
@@ -646,7 +647,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             true,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
@@ -656,7 +657,7 @@ mod tests {
         assert!(decoded.allow_genesis);
         // Upsert mirrors the envelope change's ref, never the admin fallback.
         assert_eq!(decoded.placement, change().placement);
-        assert_ne!(decoded.placement, aruna_core::structs::PlacementRef::NIL);
+        assert_ne!(decoded.placement, aruna_core::structs::placement::placement_record::PlacementRef::NIL);
     }
 
     #[test]
@@ -668,7 +669,7 @@ mod tests {
             DocumentOutboxEvent::Delete {
                 change: delete_change(),
             },
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         let bytes = postcard::to_allocvec(&record).expect("record serializes");
@@ -689,7 +690,7 @@ mod tests {
             target(),
             vec![node(2)],
             event.clone(),
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         let right = new_outbox_record(
@@ -697,7 +698,7 @@ mod tests {
             target(),
             vec![node(2)],
             event,
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         let prefix = outbox_prefix(&left.event);
@@ -718,7 +719,7 @@ mod tests {
             target(),
             vec![node(2)],
             event.clone(),
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         older.outbox_id = Ulid::from_parts(1, 0);
@@ -729,7 +730,7 @@ mod tests {
             },
             vec![node(2)],
             event,
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         newer.outbox_id = Ulid::from_parts(2, 0);
@@ -860,7 +861,7 @@ mod tests {
                 bytes: vec![4, 5],
                 change: change(),
             },
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         let admin = new_outbox_record(
@@ -953,7 +954,7 @@ mod tests {
             target.clone(),
             Vec::new(),
             event.clone(),
-            aruna_core::structs::PlacementRef::NIL,
+            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
             false,
         );
         let sharded = new_identified_record(

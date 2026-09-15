@@ -8,12 +8,13 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{Actor, PathRestriction, RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::identity::auth::{Actor, PathRestriction};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::create_access::{CreateUserConfig, CreateUserOperation};
-use aruna_operations::s3::get_access::GetAccessOperation;
-use aruna_operations::s3::revoke_access::RevokeUserOperation;
+use aruna_operations::s3::access::create::{CreateUserConfig, CreateUserOperation};
+use aruna_operations::s3::access::get::GetAccessOperation;
+use aruna_operations::s3::access::revoke::RevokeUserOperation;
 use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
@@ -36,7 +37,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
 
     let restrictions = vec![PathRestriction {
         pattern: "datasets/**".to_string(),
-        permission: aruna_core::structs::Permission::READ,
+        permission: aruna_core::structs::identity::auth::Permission::READ,
     }];
     let config = CreateUserConfig {
         user_identity: UserId::local(Ulid::generate(), realm_id),
@@ -62,7 +63,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
     // Positive control: pull the whole shared realm topic from the issuer, so
     // absence afterwards proves non-replication rather than sync lag.
     let topic = aruna_core::document::DocumentTarget::RealmAuthorization { realm_id }
-        .sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
+        .sync_topic_id(realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
     nodes[1]
         .net
         .sync_document_topics(vec![topic], vec![nodes[0].net.node_id()])
@@ -75,7 +76,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
     .await;
     assert!(matches!(
         remote,
-        Err(aruna_operations::s3::get_access::GetAccessError::NotFound)
+        Err(aruna_operations::s3::access::get::GetAccessError::NotFound)
     ));
 
     drive(
@@ -91,7 +92,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
     .await;
     assert!(matches!(
         revoked,
-        Err(aruna_operations::s3::get_access::GetAccessError::NotFound)
+        Err(aruna_operations::s3::access::get::GetAccessError::NotFound)
     ));
 
     shutdown_nodes(nodes).await;

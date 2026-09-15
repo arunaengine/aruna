@@ -49,7 +49,7 @@ pub(super) fn publish_from_outbox(
     event_id: ulid::Ulid,
     target: DocumentTarget,
     event: DocumentOutboxEvent,
-    placement: aruna_core::structs::PlacementRef,
+    placement: aruna_core::structs::placement::placement_record::PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncPublish {
     match event {
@@ -81,8 +81,8 @@ pub(super) fn publish_from_outbox(
 
 pub(super) async fn load_drain_config(
     context: &Arc<DriverContext>,
-    realm_id: aruna_core::structs::RealmId,
-) -> Option<aruna_core::structs::RealmConfigDocument> {
+    realm_id: aruna_core::structs::identity::realm::RealmId,
+) -> Option<aruna_core::structs::identity::realm::RealmConfigDocument> {
     let target = DocumentTarget::RealmConfig { realm_id };
     match context
         .storage_handle
@@ -94,7 +94,7 @@ pub(super) async fn load_drain_config(
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .and_then(|bytes| aruna_core::structs::RealmConfigDocument::from_bytes(&bytes).ok()),
+            .and_then(|bytes| aruna_core::structs::identity::realm::RealmConfigDocument::from_bytes(&bytes).ok()),
         _ => None,
     }
 }
@@ -103,16 +103,16 @@ pub(super) async fn load_drain_config(
 /// kept, a NIL ref (from admin-operation emitters) is resolved from the realm
 /// config. Shared realm targets ignore placement, so resolving is harmless.
 pub(super) fn resolve_publish_placement(
-    config: Option<&aruna_core::structs::RealmConfigDocument>,
+    config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
     target: &DocumentTarget,
-    current: aruna_core::structs::PlacementRef,
-) -> aruna_core::structs::PlacementRef {
-    if current != aruna_core::structs::PlacementRef::NIL {
+    current: aruna_core::structs::placement::placement_record::PlacementRef,
+) -> aruna_core::structs::placement::placement_record::PlacementRef {
+    if current != aruna_core::structs::placement::placement_record::PlacementRef::NIL {
         return current;
     }
     match config {
         Some(config) => crate::placement::target_placement_ref(config, target, Default::default()),
-        None => aruna_core::structs::PlacementRef::NIL,
+        None => aruna_core::structs::placement::placement_record::PlacementRef::NIL,
     }
 }
 
@@ -200,7 +200,7 @@ impl OutboxBarrier {
 /// Holdership comes from the live realm config, never a local copy (rebalances leave
 /// stale copies). Without a readable config nothing is decided and the record retries.
 pub(super) fn classify_deferred_record(
-    config: Option<&aruna_core::structs::RealmConfigDocument>,
+    config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
     net_handle: &aruna_net::NetHandle,
     record: &DocumentOutboxRecord,
 ) -> DeferOutcome {
@@ -521,7 +521,7 @@ impl OperationsTaskHandler {
         &self,
         retry_key: &TaskKey,
         net_handle: &aruna_net::NetHandle,
-        config: Option<&aruna_core::structs::RealmConfigDocument>,
+        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
         realm_id: RealmId,
         records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
         invocation: &mut DrainInvocation,
@@ -596,7 +596,7 @@ impl OperationsTaskHandler {
         &self,
         retry_key: &TaskKey,
         net_handle: &aruna_net::NetHandle,
-        config: Option<&aruna_core::structs::RealmConfigDocument>,
+        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
         realm_id: RealmId,
         records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
         invocation: &mut DrainInvocation,

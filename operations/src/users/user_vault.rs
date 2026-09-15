@@ -4,7 +4,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_VAULT_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{MAX_USER_VAULT_BYTES, UserVault};
+use aruna_core::structs::identity::user_vault::{MAX_USER_VAULT_BYTES, UserVault};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -445,7 +445,7 @@ impl Operation for DeleteVaultOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     fn user() -> UserId {

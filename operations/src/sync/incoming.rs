@@ -31,7 +31,7 @@ use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::{
     BaoReadRequest, LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
 };
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::sync::document_outbox::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
@@ -43,10 +43,13 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::{
-    AuthContext, HashIndex, Permission, RealmId, ReplicationItemKind, RoCrateLimits, WatchEvent,
-    WatchEventDetail, WatchEventKind, bucket_permission_path, object_permission_path,
-    watch_resource_path,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{HashIndex, bucket_permission_path, object_permission_path};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::replication::ReplicationItemKind;
+use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
@@ -1259,10 +1262,13 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, TASK_TIMER_KEYSPACE};
-    use aruna_core::structs::{
-        Backend, BackendConfig, BucketInfo, PathRestriction, PortableSourceDescriptor,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionSourceBinding,
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+    use aruna_core::structs::identity::auth::PathRestriction;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -1288,19 +1294,19 @@ mod tests {
         // sync-eligible before any manifest is read.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let realm_id = aruna_core::structs::RealmId::from_bytes([3u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([3u8; 32]);
         let server = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let user = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let mut config =
-            aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-        config.ensure_node(server, aruna_core::structs::RealmNodeKind::Server);
+            aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(server, aruna_core::structs::identity::realm::RealmNodeKind::Server);
         config.ensure_node(
             user,
-            aruna_core::structs::RealmNodeKind::User {
+            aruna_core::structs::identity::realm::RealmNodeKind::User {
                 owner: aruna_core::UserId::nil(realm_id),
             },
         );
-        let actor = aruna_core::structs::Actor {
+        let actor = aruna_core::structs::identity::auth::Actor {
             node_id: server,
             user_id: aruna_core::UserId::nil(realm_id),
             realm_id,
@@ -1330,7 +1336,7 @@ mod tests {
         );
 
         let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        let foreign = aruna_core::structs::RealmId::from_bytes([4u8; 32]);
+        let foreign = aruna_core::structs::identity::realm::RealmId::from_bytes([4u8; 32]);
         // Devices read only through realm nodes and cannot source replication.
         assert_eq!(
             handler.bao_peer_admitted(realm_id, server, server).await,
@@ -1688,18 +1694,18 @@ mod tests {
             net_b.add_peer_addr(net_a.endpoint_addr()).await;
 
             let mut realm =
-                aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-            realm.ensure_node(net_b.node_id(), aruna_core::structs::RealmNodeKind::Server);
+                aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+            realm.ensure_node(net_b.node_id(), aruna_core::structs::identity::realm::RealmNodeKind::Server);
             let owner = UserId::nil(realm_id);
             if device_peer {
                 realm.ensure_node(
                     net_a.node_id(),
-                    aruna_core::structs::RealmNodeKind::User { owner },
+                    aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
                 );
             } else {
-                realm.ensure_node(net_a.node_id(), aruna_core::structs::RealmNodeKind::Server);
+                realm.ensure_node(net_a.node_id(), aruna_core::structs::identity::realm::RealmNodeKind::Server);
             }
-            let actor = aruna_core::structs::Actor {
+            let actor = aruna_core::structs::identity::auth::Actor {
                 node_id: net_b.node_id(),
                 user_id: owner,
                 realm_id,
@@ -1964,7 +1970,7 @@ mod tests {
         let other_node = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let target = |realm_id: RealmId, node_id: NodeId| {
             crate::replication::protocol::BaoReadTarget::ExactVersion(
-                aruna_core::structs::VersionedObjectArn {
+                aruna_core::structs::storage::replication::VersionedObjectArn {
                     realm_id,
                     node_id,
                     bucket: "bucket".to_string(),

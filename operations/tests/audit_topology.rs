@@ -7,7 +7,7 @@
 mod topology;
 
 use aruna_core::StructuredId;
-use aruna_core::structs::PlacementRef;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::audit::{
     AUDIT_DEADLINE_SECS, AuditAggregate, ListAuditOperation, ListAuditRequest, LocalPageOperation,
@@ -241,7 +241,7 @@ fn request(
     }
 }
 
-fn unique_documents(records: &[aruna_core::structs::MetadataAuditRecord]) -> usize {
+fn unique_documents(records: &[aruna_core::structs::storage::metadata_registry::MetadataAuditRecord]) -> usize {
     let mut ids: Vec<Ulid> = records.iter().map(|record| record.document_id).collect();
     ids.sort();
     ids.dedup();

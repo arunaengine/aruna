@@ -397,9 +397,11 @@ mod tests {
     use aruna_core::document::{
         DocumentChange, DocumentChangeKind, DocumentEvent, DocumentSyncRevision, DocumentTarget,
     };
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{
-        PlacementRef, RealmId, SyncQuarantineCapacity, SyncQuarantineEvidence,
-        SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
+        SyncQuarantineCapacity, SyncQuarantineEvidence, SyncQuarantineIdentity,
+        SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
     };
     use aruna_storage::storage;
     use ulid::Ulid;

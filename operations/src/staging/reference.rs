@@ -17,11 +17,15 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
 };
-use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    PlacementPolicyError, PlacementPolicyRef, RealmId, SourceConnector, SourceConnectorSecret,
-    SourceMetadata, StagingStrategy, UsageDelta, VersionKey, VersionSourceBinding,
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -543,7 +547,7 @@ async fn guard_expected_bucket(
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
@@ -552,11 +556,16 @@ mod tests {
         USAGE_STATS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{
-        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex, JobId, RoutingSnapshot,
-        SourceConnectorKind, SourceConnectorSecret, StoragePurgeFence, StoragePurgeScope,
-        UsageCounters, global_group_key, usage_group_key,
+    use aruna_core::structs::storage::blob::{
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex,
     };
+    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::storage::routing::RoutingSnapshot;
+    use aruna_core::structs::execution::source_connector::{
+        SourceConnectorKind, SourceConnectorSecret,
+    };
+    use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
+    use aruna_core::structs::storage::usage::{UsageCounters, global_group_key, usage_group_key};
     use aruna_storage::storage;
     use axum::{Router, routing::get};
     use std::collections::HashMap;

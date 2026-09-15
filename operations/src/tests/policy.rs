@@ -7,11 +7,13 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, PLACEMENT_POLICY_CACHE_KEYSPACE};
-use aruna_core::structs::{
-    Actor, NODE_SUBJECT_KEY, NodeSubjectRecord, Permission, PlacementPolicyDocument,
-    PlacementSubject, PolicyPublicationClaim, RealmConfigDocument, RealmId, RealmNodeKind, Role,
-    VerifiedPolicy,
+use aruna_core::structs::identity::auth::{Actor, Permission, Role};
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::policy_document::{
+    PlacementPolicyDocument, PolicyPublicationClaim,
 };
+use aruna_core::structs::placement::placement_policy::{PlacementSubject, VerifiedPolicy};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use ulid::Ulid;
@@ -51,14 +53,14 @@ pub(crate) fn signed_document(
 pub(crate) fn group_authorization(
     realm_id: RealmId,
     group_id: Ulid,
-) -> aruna_core::structs::GroupAuthorizationDocument {
+) -> aruna_core::structs::identity::group::GroupAuthorizationDocument {
     let role = Role {
         role_id: Ulid::from_bytes([4u8; 16]),
         name: "group_admin".to_string(),
         permissions: HashMap::from([(format!("/{realm_id}/g/{group_id}/**"), Permission::WRITE)]),
         assigned_users: HashSet::from([admin_user(realm_id)]),
     };
-    aruna_core::structs::GroupAuthorizationDocument {
+    aruna_core::structs::identity::group::GroupAuthorizationDocument {
         group_id,
         roles: HashMap::from([(role.role_id, role)]),
         policies: Vec::new(),
@@ -125,7 +127,7 @@ fn authority_view(realm_id: RealmId, group_id: Option<GroupId>) -> Event {
             key,
             Some(
                 document
-                    .to_bytes(&aruna_core::structs::Actor {
+                    .to_bytes(&aruna_core::structs::identity::auth::Actor {
                         node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
                         user_id: admin_user(realm_id),
                         realm_id,

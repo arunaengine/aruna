@@ -1,12 +1,11 @@
 use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
 use crate::driver::{DriverContext, drive};
-use crate::s3::create_bucket::CreateBucketOperation;
+use crate::s3::bucket::create::CreateBucketOperation;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
-use aruna_core::structs::{
-    Backend, BackendConfig, BucketInfo, SourceConnector, SourceConnectorKind,
-};
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
 use std::collections::HashMap;

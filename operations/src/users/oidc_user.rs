@@ -12,7 +12,10 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
-use aruna_core::structs::{Actor, PlacementRef, RealmConfigDocument, User, oidc_subject_key};
+use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::user::User;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, TxnId};
@@ -545,7 +548,8 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::{reducer_state_key, sync_revision_key};
-    use aruna_core::structs::{Actor, User, oidc_subject_key};
+    use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
+    use aruna_core::structs::identity::user::User;
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_core::{USER_SUBJECT_CLAIMS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE, UserId};
@@ -555,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn creates_user_index() {
-        let realm_id = aruna_core::structs::RealmId([3u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([3u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
             user_id: UserId::nil(realm_id),
@@ -743,7 +747,7 @@ mod tests {
 
     #[tokio::test]
     async fn writes_sync_sidecar() {
-        let realm_id = aruna_core::structs::RealmId([7u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([7u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
             user_id: UserId::nil(realm_id),
@@ -812,7 +816,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_existing_user() {
-        let realm_id = aruna_core::structs::RealmId([5u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([5u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let existing_user = User {
             user_id,
@@ -859,8 +863,8 @@ mod tests {
                 existing_user
                     .to_bytes(&Actor {
                         node_id: iroh::SecretKey::from_bytes(&[6u8; 32]).public(),
-                        user_id: UserId::nil(aruna_core::structs::RealmId([5u8; 32])),
-                        realm_id: aruna_core::structs::RealmId([5u8; 32]),
+                        user_id: UserId::nil(aruna_core::structs::identity::realm::RealmId([5u8; 32])),
+                        realm_id: aruna_core::structs::identity::realm::RealmId([5u8; 32]),
                     })
                     .unwrap()
                     .into(),

@@ -3,7 +3,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::User;
+use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
