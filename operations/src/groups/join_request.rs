@@ -13,7 +13,7 @@ use aruna_core::join_request::{
     JoinDecision, JoinDecisionKind, JoinRequest, JoinRequestState, valid_message,
 };
 use aruna_core::keyspaces::{
-    ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, decode_reducer_state};
@@ -149,7 +149,7 @@ impl GroupJoinOperation {
                 (GROUP_KEYSPACE.into(), group_key.clone()),
                 (AUTH_KEYSPACE.into(), group_key),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.into(),
+                    DOCUMENT_STATE_KEYSPACE.into(),
                     reducer_state_key(&AdminDocumentTarget::Group {
                         group_id: self.input.group_id
                     })
@@ -548,7 +548,7 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminRoleDefinition;
     use aruna_core::document::DocumentOutboxRecord;
-    use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::realm::RealmId;
 
@@ -701,7 +701,7 @@ mod pure_tests {
         duplicate_values[2].1 = Some(
             writes
                 .iter()
-                .find(|(space, _, _)| space == ADMIN_DOCUMENT_STATE_KEYSPACE)
+                .find(|(space, _, _)| space == DOCUMENT_STATE_KEYSPACE)
                 .unwrap()
                 .2
                 .clone(),
@@ -748,13 +748,13 @@ mod pure_tests {
                 .assigned_users
                 .contains(&member.user_id)
         );
-        let reducer = decode_reducer_state(value(ADMIN_DOCUMENT_STATE_KEYSPACE)).unwrap();
+        let reducer = decode_reducer_state(value(DOCUMENT_STATE_KEYSPACE)).unwrap();
         assert_eq!(
             reducer.join_requests()[0].decision.as_ref().unwrap().kind,
             JoinDecisionKind::Approved
         );
         let outbox: DocumentOutboxRecord =
-            postcard::from_bytes(value(DOCUMENT_SYNC_OUTBOX_KEYSPACE)).unwrap();
+            postcard::from_bytes(value(SYNC_OUTBOX_KEYSPACE)).unwrap();
         assert!(
             matches!(outbox.event, DocumentOutboxEvent::AdminOperation { event, .. }
         if matches!(event.op, AdminDocumentOperation::GroupJoinDecided { .. }))

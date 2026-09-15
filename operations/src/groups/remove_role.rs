@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -68,18 +68,22 @@ pub enum RemoveGroupState {
     GetGroup {
         txn_id: TxnId,
     },
-    GetAuthDocAndAdminState {
+    #[serde(rename = "GetAuthDocAndAdminState")]
+    GetAdminState {
         txn_id: TxnId,
         group: Group,
     },
-    WriteGroupAuthDocAndAdminState {
+    #[serde(rename = "WriteGroupAuthDocAndAdminState")]
+    WriteDocState {
         txn_id: TxnId,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
-        stale_conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
+        #[serde(rename = "stale_conflict_delete_keys")]
+        conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
     },
-    DeleteStaleAdminConflicts {
+    #[serde(rename = "DeleteStaleAdminConflicts")]
+    DeleteAdminConflicts {
         txn_id: TxnId,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
@@ -97,7 +101,8 @@ pub enum RemoveGroupState {
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
     },
-    ScheduleAdminDocumentOutboxDrain {
+    #[serde(rename = "ScheduleAdminDocumentOutboxDrain")]
+    ScheduleDocumentDrain {
         group: Group,
         auth_doc: GroupAuthorizationDocument,
     },
@@ -124,7 +129,7 @@ pub enum RemoveGroupError {
     #[error("No group found")]
     GroupNotFound,
     #[error("Authorization document not found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error("Role not found")]
     RoleNotFound,
     #[error("the admin role of a group cannot be deleted")]
@@ -229,7 +234,7 @@ impl RemoveGroupOperation {
     ) -> Result<Effects, RemoveGroupError> {
         let group = Group::from_bytes(&group.ok_or_else(|| RemoveGroupError::GroupNotFound)?)?;
 
-        self.state = RemoveGroupState::GetAuthDocAndAdminState { txn_id, group };
+        self.state = RemoveGroupState::GetAdminState { txn_id, group };
 
         let target = AdminDocumentTarget::Group {
             group_id: self.input.group_id,
@@ -239,7 +244,7 @@ impl RemoveGroupOperation {
             reads: vec![
                 (AUTH_KEYSPACE.to_string(), key),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
                 (
@@ -294,7 +299,7 @@ impl RemoveGroupOperation {
         realm_config_value: Option<ByteView>,
     ) -> Result<Effects, RemoveGroupError> {
         let mut auth_doc =
-            super::parse_auth_record(auth_doc)?.ok_or(RemoveGroupError::AuthDocNotFound)?;
+            super::parse_auth_record(auth_doc)?.ok_or(RemoveGroupError::DocNotFound)?;
         let role = auth_doc
             .roles
             .get(&self.input.role_id)
@@ -331,7 +336,7 @@ impl RemoveGroupOperation {
             &reducer_state,
         );
 
-        let stale_conflict_delete_keys: Vec<_> =
+        let conflict_delete_keys: Vec<_> =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state))
                 .into_iter()
                 .map(|(key_space, key)| (key_space, key.as_ref().to_vec()))
@@ -380,12 +385,12 @@ impl RemoveGroupOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = RemoveGroupState::WriteGroupAuthDocAndAdminState {
+        self.state = RemoveGroupState::WriteDocState {
             txn_id,
             group,
             auth_doc,
             admin_outbox_written: !admin_events.is_empty(),
-            stale_conflict_delete_keys,
+            conflict_delete_keys,
         };
 
         Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -401,7 +406,7 @@ impl RemoveGroupOperation {
         group: Group,
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
-        stale_conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
+        conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
     ) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
@@ -412,15 +417,15 @@ impl RemoveGroupOperation {
             );
         };
 
-        if !stale_conflict_delete_keys.is_empty() {
-            self.state = RemoveGroupState::DeleteStaleAdminConflicts {
+        if !conflict_delete_keys.is_empty() {
+            self.state = RemoveGroupState::DeleteAdminConflicts {
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
             };
             return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes: stale_conflict_delete_keys
+                deletes: conflict_delete_keys
                     .into_iter()
                     .map(|(key_space, key)| (key_space, ByteView::from(key)))
                     .collect(),
@@ -529,7 +534,7 @@ impl RemoveGroupOperation {
             );
         };
         if admin_outbox_written {
-            self.state = RemoveGroupState::ScheduleAdminDocumentOutboxDrain { group, auth_doc };
+            self.state = RemoveGroupState::ScheduleDocumentDrain { group, auth_doc };
             return smallvec![schedule_drain_effect()];
         }
 
@@ -627,24 +632,24 @@ impl Operation for RemoveGroupOperation {
             RemoveGroupState::Auth => self.handle_authorization(event),
             RemoveGroupState::StartTransaction => self.handle_start_transaction(event),
             RemoveGroupState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
-            RemoveGroupState::GetAuthDocAndAdminState { txn_id, group } => {
+            RemoveGroupState::GetAdminState { txn_id, group } => {
                 self.handle_auth_read(event, txn_id, group)
             }
-            RemoveGroupState::WriteGroupAuthDocAndAdminState {
+            RemoveGroupState::WriteDocState {
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
-                stale_conflict_delete_keys,
+                conflict_delete_keys,
             } => self.handle_document_write(
                 event,
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
-                stale_conflict_delete_keys,
+                conflict_delete_keys,
             ),
-            RemoveGroupState::DeleteStaleAdminConflicts {
+            RemoveGroupState::DeleteAdminConflicts {
                 txn_id,
                 group,
                 auth_doc,
@@ -662,7 +667,7 @@ impl Operation for RemoveGroupOperation {
                 admin_outbox_written,
                 ..
             } => self.handle_commit_transaction(event, group, auth_doc, admin_outbox_written),
-            RemoveGroupState::ScheduleAdminDocumentOutboxDrain { group, auth_doc } => {
+            RemoveGroupState::ScheduleDocumentDrain { group, auth_doc } => {
                 self.handle_drain_schedule(event, group, auth_doc)
             }
             RemoveGroupState::Init | RemoveGroupState::Finish | RemoveGroupState::Error => {
@@ -685,9 +690,9 @@ impl Operation for RemoveGroupOperation {
     fn abort(&mut self) -> Effects {
         match self.state {
             RemoveGroupState::GetGroup { txn_id }
-            | RemoveGroupState::GetAuthDocAndAdminState { txn_id, .. }
-            | RemoveGroupState::WriteGroupAuthDocAndAdminState { txn_id, .. }
-            | RemoveGroupState::DeleteStaleAdminConflicts { txn_id, .. }
+            | RemoveGroupState::GetAdminState { txn_id, .. }
+            | RemoveGroupState::WriteDocState { txn_id, .. }
+            | RemoveGroupState::DeleteAdminConflicts { txn_id, .. }
             | RemoveGroupState::ReadBucketFence { txn_id, .. }
             | RemoveGroupState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
@@ -729,7 +734,7 @@ fn materialize_role_removal(
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use aruna_core::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
@@ -876,7 +881,7 @@ pub mod test {
                     .expect("auth doc write is included");
                 let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
-                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).unwrap())
                     .collect();
                 (

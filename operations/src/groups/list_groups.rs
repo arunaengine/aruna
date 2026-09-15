@@ -179,7 +179,7 @@ pub enum ListGroupError {
     #[error("No group found")]
     GroupNotFound,
     #[error("No group found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error("Creating Group did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]

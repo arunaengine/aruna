@@ -3,9 +3,9 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, GROUP_DISPLAY_NAME_PATH};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, DISPLAY_NAME_PATH};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -26,13 +26,13 @@ use crate::sync::document_outbox::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
-pub const MAX_GROUP_NAME_LEN: usize = 256;
+pub const MAX_NAME_LEN: usize = 256;
 
 /// The one group-name rule: trimmed, non-empty and at most
 /// `MAX_GROUP_NAME_LEN` bytes. `None` means the name is refused.
 pub fn normalize_group_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    (!trimmed.is_empty() && trimmed.len() <= MAX_GROUP_NAME_LEN).then(|| trimmed.to_string())
+    (!trimmed.is_empty() && trimmed.len() <= MAX_NAME_LEN).then(|| trimmed.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,11 +64,11 @@ enum UpdateGroupState {
     AuthRealmAdmin,
     StartTransaction,
     ReadCurrent,
-    WriteGroupAndAdminState {
+    WriteGroupState {
         group: Group,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         group: Group,
     },
     ReadBucketFence {
@@ -90,7 +90,7 @@ pub enum UpdateGroupError {
     Unauthorized,
     #[error("group not found")]
     GroupNotFound,
-    #[error("group name must be non-empty and at most {MAX_GROUP_NAME_LEN} bytes")]
+    #[error("group name must be non-empty and at most {MAX_NAME_LEN} bytes")]
     InvalidDisplayName,
     #[error("stored group id does not match the requested group id")]
     GroupIdMismatch,
@@ -170,7 +170,7 @@ impl UpdateGroupOperation {
                     ByteView::from(self.config.group_id.to_bytes()),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
                 (
@@ -217,7 +217,7 @@ impl UpdateGroupOperation {
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
-            AdminDocumentOperation::GroupDisplayNameSet {
+            AdminDocumentOperation::DisplayNameSet {
                 display_name: display_name.clone(),
             },
         )?;
@@ -260,7 +260,7 @@ impl UpdateGroupOperation {
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = UpdateGroupState::WriteGroupAndAdminState {
+        self.state = UpdateGroupState::WriteGroupState {
             group,
             stale_conflict_deletes,
         };
@@ -393,7 +393,7 @@ impl Operation for UpdateGroupOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            UpdateGroupState::WriteGroupAndAdminState {
+            UpdateGroupState::WriteGroupState {
                 group,
                 stale_conflict_deletes,
             } => match event {
@@ -402,7 +402,7 @@ impl Operation for UpdateGroupOperation {
                         return self.fail(UpdateGroupError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = UpdateGroupState::DeleteStaleAdminConflicts { group };
+                        self.state = UpdateGroupState::DeleteAdminConflicts { group };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -413,7 +413,7 @@ impl Operation for UpdateGroupOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            UpdateGroupState::DeleteStaleAdminConflicts { group } => match event {
+            UpdateGroupState::DeleteAdminConflicts { group } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(group)
                 }
@@ -490,7 +490,7 @@ impl Operation for UpdateGroupOperation {
 fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentState) {
     if !reducer_state
         .conflicts
-        .contains_key(GROUP_DISPLAY_NAME_PATH)
+        .contains_key(DISPLAY_NAME_PATH)
         && let Some(display_name) = reducer_state.materialized_group_name()
     {
         group.display_name = display_name;
@@ -506,7 +506,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
@@ -610,7 +610,7 @@ mod pure_tests {
                 assert_eq!(reads.len(), 3);
                 assert_eq!(reads[0].0, GROUP_KEYSPACE);
                 assert_eq!(reads[0].1.as_ref(), group().to_bytes().as_slice());
-                assert_eq!(reads[1].0, ADMIN_DOCUMENT_STATE_KEYSPACE);
+                assert_eq!(reads[1].0, DOCUMENT_STATE_KEYSPACE);
                 assert_eq!(reads[1].1, reducer_state_key(&target));
                 assert_eq!(reads[2].0, REALM_CONFIG_KEYSPACE);
             }
@@ -635,7 +635,7 @@ mod pure_tests {
 
                 let reducer_write = writes
                     .iter()
-                    .find(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_STATE_KEYSPACE)
+                    .find(|(keyspace, _, _)| keyspace == DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state is written");
                 let reducer_state: AdminDocumentState =
                     postcard::from_bytes(reducer_write.2.as_ref()).unwrap();
@@ -646,7 +646,7 @@ mod pure_tests {
 
                 let records: Vec<DocumentOutboxRecord> = writes
                     .iter()
-                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
                     .collect();
                 assert_eq!(records.len(), 1);
@@ -656,7 +656,7 @@ mod pure_tests {
                     DocumentOutboxEvent::AdminOperation { event, .. }
                         if matches!(
                             &event.op,
-                            AdminDocumentOperation::GroupDisplayNameSet { display_name }
+                            AdminDocumentOperation::DisplayNameSet { display_name }
                                 if display_name == "Platform"
                         )
                 ));
@@ -679,7 +679,7 @@ mod pure_tests {
         assert!(
             operation
                 .step(Event::Task(TaskEvent::TimerScheduled {
-                    key: TaskKey::DrainDocumentSyncOutbox,
+                    key: TaskKey::DrainSyncOutbox,
                     after: std::time::Duration::ZERO,
                 }))
                 .is_empty()

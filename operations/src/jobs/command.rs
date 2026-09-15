@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use aruna_core::compute::SessionMount;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::{
-    DEFAULT_SESSION_MOUNT_DIR, DEFAULT_SESSION_MOUNT_PREFIX, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG,
-    SESSION_MOUNT_PATH_TAG, SESSION_MOUNT_PREFIX_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES,
+    SESSION_MOUNT_DIR, SESSION_MOUNT_PREFIX, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG,
+    MOUNT_PATH_TAG, MOUNT_PREFIX_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES,
     SESSION_TAG, SESSION_TAG_NOTEBOOK, session_runtime,
 };
 use aruna_core::structs::execution::job::JobId;
@@ -161,7 +161,8 @@ pub struct SubmitExecutionCommand {
     /// minutes. The executing node clamps it to the realm's value, so a longer
     /// request never extends the session. Refused outside a session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_idle_after_ms: Option<u64>,
+    #[serde(rename = "session_idle_after_ms")]
+    pub session_idle_ms: Option<u64>,
     /// Which part of the workspace bucket a session mounts, and where. Refused
     /// outside a session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,7 +270,7 @@ impl SubmitExecutionCommand {
     ) -> Result<(), SessionCommandError> {
         let Some(value) = self.tags.get(SESSION_TAG) else {
             if self.runtime.is_some()
-                || self.session_idle_after_ms.is_some()
+                || self.session_idle_ms.is_some()
                 || self.session_mount.is_some()
             {
                 return Err(SessionCommandError::new(format!(
@@ -287,8 +288,8 @@ impl SubmitExecutionCommand {
             SESSION_RUNTIME_TAG,
             SESSION_IDLE_TAG,
             SESSION_EXPIRY_TAG,
-            SESSION_MOUNT_PREFIX_TAG,
-            SESSION_MOUNT_PATH_TAG,
+            MOUNT_PREFIX_TAG,
+            MOUNT_PATH_TAG,
         ]
         .iter()
         .any(|tag| self.tags.contains_key(*tag))
@@ -319,7 +320,7 @@ impl SubmitExecutionCommand {
                 known.join(", ")
             ))
         })?;
-        if let Some(idle) = self.session_idle_after_ms {
+        if let Some(idle) = self.session_idle_ms {
             if idle == 0 {
                 return Err(SessionCommandError::new(
                     "session_idle_after_ms must be greater than zero",
@@ -336,9 +337,9 @@ impl SubmitExecutionCommand {
             self.workdir.as_deref().unwrap_or(SESSION_WORKDIR),
         )?;
         self.tags
-            .insert(SESSION_MOUNT_PREFIX_TAG.to_string(), mount.prefix);
+            .insert(MOUNT_PREFIX_TAG.to_string(), mount.prefix);
         self.tags
-            .insert(SESSION_MOUNT_PATH_TAG.to_string(), mount.path);
+            .insert(MOUNT_PATH_TAG.to_string(), mount.path);
         self.cpu_cores.get_or_insert(2);
         self.ram_bytes.get_or_insert(4_000_000_000);
         self.image = runtime.image.to_string();
@@ -374,7 +375,7 @@ fn mount_request(
         .and_then(|mount| mount.prefix.as_deref())
         .map(str::trim)
     {
-        None => DEFAULT_SESSION_MOUNT_PREFIX.to_string(),
+        None => SESSION_MOUNT_PREFIX.to_string(),
         Some("") => String::new(),
         Some(prefix) => {
             let folder = prefix.trim_end_matches('/');
@@ -391,7 +392,7 @@ fn mount_request(
         }
     };
     let path = match mount.and_then(|mount| mount.path.as_deref()).map(str::trim) {
-        None | Some("") => workdir.join(DEFAULT_SESSION_MOUNT_DIR),
+        None | Some("") => workdir.join(SESSION_MOUNT_DIR),
         Some(path) => normalize_container_path(path).map_err(SessionCommandError::new)?,
     };
     let below = path
@@ -425,7 +426,7 @@ mod pure_tests {
             description: None,
             image: String::new(),
             runtime: Some("python-notebook".to_string()),
-            session_idle_after_ms: Some(600_000),
+            session_idle_ms: Some(600_000),
             session_mount: None,
             entrypoint: None,
             command: Vec::new(),
@@ -456,7 +457,7 @@ mod pure_tests {
             description: None,
             image: "alpine:3".to_string(),
             runtime: None,
-            session_idle_after_ms: None,
+            session_idle_ms: None,
             session_mount: None,
             entrypoint: Some(vec!["sh".to_string()]),
             command: Vec::new(),
@@ -569,12 +570,12 @@ mod pure_tests {
         assert_eq!(
             command
                 .tags
-                .get(SESSION_MOUNT_PREFIX_TAG)
+                .get(MOUNT_PREFIX_TAG)
                 .map(String::as_str),
             Some("data/")
         );
         assert_eq!(
-            command.tags.get(SESSION_MOUNT_PATH_TAG).map(String::as_str),
+            command.tags.get(MOUNT_PATH_TAG).map(String::as_str),
             Some("/work/data")
         );
     }
@@ -596,12 +597,12 @@ mod pure_tests {
         assert_eq!(
             command
                 .tags
-                .get(SESSION_MOUNT_PREFIX_TAG)
+                .get(MOUNT_PREFIX_TAG)
                 .map(String::as_str),
             Some("raw/2024/")
         );
         assert_eq!(
-            command.tags.get(SESSION_MOUNT_PATH_TAG).map(String::as_str),
+            command.tags.get(MOUNT_PATH_TAG).map(String::as_str),
             Some("/home/user/project/raw")
         );
 
@@ -616,12 +617,12 @@ mod pure_tests {
         assert_eq!(
             command
                 .tags
-                .get(SESSION_MOUNT_PREFIX_TAG)
+                .get(MOUNT_PREFIX_TAG)
                 .map(String::as_str),
             Some("")
         );
         assert_eq!(
-            command.tags.get(SESSION_MOUNT_PATH_TAG).map(String::as_str),
+            command.tags.get(MOUNT_PATH_TAG).map(String::as_str),
             Some("/work/data")
         );
     }
@@ -668,8 +669,8 @@ mod pure_tests {
             SESSION_RUNTIME_TAG,
             SESSION_IDLE_TAG,
             SESSION_EXPIRY_TAG,
-            SESSION_MOUNT_PREFIX_TAG,
-            SESSION_MOUNT_PATH_TAG,
+            MOUNT_PREFIX_TAG,
+            MOUNT_PATH_TAG,
         ] {
             let mut command = session_command();
             command.tags.insert(tag.to_string(), "x".to_string());

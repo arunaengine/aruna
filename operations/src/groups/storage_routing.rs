@@ -3,7 +3,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE};
+use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget, validate_tenant_target,
@@ -63,7 +63,7 @@ impl GroupInputsOperation {
     fn scan_backends(&mut self, start_after: Option<Key>) -> Effects {
         self.state = LoadInputsState::ScanBackends;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: GROUP_STORAGE_BACKEND_INDEX_KEYSPACE.to_string(),
+            key_space: BACKEND_INDEX_KEYSPACE.to_string(),
             prefix: Some(index_prefix(self.group_id)),
             start: start_after.map(IterStart::After),
             limit: BACKEND_PAGE_SIZE,
@@ -85,7 +85,7 @@ impl Operation for GroupInputsOperation {
     fn start(&mut self) -> Effects {
         self.state = LoadInputsState::ReadDefault;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: GROUP_STORAGE_ROUTING_KEYSPACE.to_string(),
+            key_space: STORAGE_ROUTING_KEYSPACE.to_string(),
             key: routing_key(self.group_id),
             txn_id: None,
         })]
@@ -226,7 +226,7 @@ impl PutGroupOperation {
         };
         self.state = PutGroupState::WriteRecord;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: GROUP_STORAGE_ROUTING_KEYSPACE.to_string(),
+            key_space: STORAGE_ROUTING_KEYSPACE.to_string(),
             key: routing_key(self.record.group_id),
             value: value.into(),
             txn_id: None,
@@ -357,7 +357,7 @@ impl Operation for GroupRoutingOperation {
     fn start(&mut self) -> Effects {
         self.state = GroupRoutingState::ReadRecord;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: GROUP_STORAGE_ROUTING_KEYSPACE.to_string(),
+            key_space: STORAGE_ROUTING_KEYSPACE.to_string(),
             key: routing_key(self.group_id),
             txn_id: None,
         })]
@@ -421,7 +421,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE,
+        BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::blob::BackendRef;
@@ -496,7 +496,7 @@ mod pure_tests {
         else {
             panic!("expected one record write, got {effects:?}")
         };
-        assert_eq!(key_space, GROUP_STORAGE_ROUTING_KEYSPACE);
+        assert_eq!(key_space, STORAGE_ROUTING_KEYSPACE);
         assert_eq!(key, &routing_key(group()));
         assert_eq!(
             GroupStorageRouting::from_bytes(value.as_ref()).unwrap(),
@@ -598,7 +598,7 @@ mod pure_tests {
         else {
             panic!("expected a prefixed backend scan, got {effects:?}")
         };
-        assert_eq!(key_space, GROUP_STORAGE_BACKEND_INDEX_KEYSPACE);
+        assert_eq!(key_space, BACKEND_INDEX_KEYSPACE);
         assert_eq!(prefix, &index_prefix(group()));
 
         let mut leaving = backend(disabled, group());

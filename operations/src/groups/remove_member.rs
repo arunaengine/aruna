@@ -6,7 +6,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -67,17 +67,17 @@ pub enum RemoveFromState {
     Init,
     Auth,
     StartTransaction,
-    ReadAuthDocAndAdminState {
+    ReadAdminState {
         txn_id: TxnId,
     },
-    WriteAuthDocAndAdminState {
+    WriteAdminState {
         txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
-        stale_conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
+        conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
         was_member: bool,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
@@ -95,7 +95,7 @@ pub enum RemoveFromState {
         admin_outbox_written: bool,
         was_member: bool,
     },
-    ScheduleAdminDocumentOutboxDrain {
+    ScheduleDocumentDrain {
         auth_doc: GroupAuthorizationDocument,
         was_member: bool,
     },
@@ -127,7 +127,7 @@ pub enum RemoveFromError {
     #[error("Invalid user id")]
     InvalidUserId,
     #[error("Authorization document not found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error("cannot remove the last admin of a group")]
     LastAdmin,
     #[error(transparent)]
@@ -207,7 +207,7 @@ impl RemoveFromOperation {
     }
 
     fn emit_auth_read(&mut self, txn_id: TxnId) -> Result<Effects, RemoveFromError> {
-        self.state = RemoveFromState::ReadAuthDocAndAdminState { txn_id };
+        self.state = RemoveFromState::ReadAdminState { txn_id };
         let target = AdminDocumentTarget::Group {
             group_id: self.input.group_id,
         };
@@ -218,7 +218,7 @@ impl RemoveFromOperation {
                     ByteView::from(self.input.group_id.to_bytes()),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
                 (
@@ -271,7 +271,7 @@ impl RemoveFromOperation {
         realm_config_value: Option<ByteView>,
     ) -> Result<Effects, RemoveFromError> {
         let mut auth_doc =
-            super::parse_auth_record(auth_doc)?.ok_or(RemoveFromError::AuthDocNotFound)?;
+            super::parse_auth_record(auth_doc)?.ok_or(RemoveFromError::DocNotFound)?;
 
         let (was_member, guarded_admin_roles, role_ids) =
             remove_assignments(&mut auth_doc, &self.input)?;
@@ -330,7 +330,7 @@ impl RemoveFromOperation {
             return Err(RemoveFromError::LastAdmin);
         }
 
-        let stale_conflict_delete_keys: Vec<_> =
+        let conflict_delete_keys: Vec<_> =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state))
                 .into_iter()
                 .map(|(key_space, key)| (key_space, key.as_ref().to_vec()))
@@ -374,11 +374,11 @@ impl RemoveFromOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = RemoveFromState::WriteAuthDocAndAdminState {
+        self.state = RemoveFromState::WriteAdminState {
             txn_id,
             auth_doc,
             admin_outbox_written: !admin_events.is_empty(),
-            stale_conflict_delete_keys,
+            conflict_delete_keys,
             was_member,
         };
 
@@ -394,7 +394,7 @@ impl RemoveFromOperation {
         txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
-        stale_conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
+        conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
         was_member: bool,
     ) -> Effects {
         let got = format!("{event:?}");
@@ -406,15 +406,15 @@ impl RemoveFromOperation {
             );
         };
 
-        if !stale_conflict_delete_keys.is_empty() {
-            self.state = RemoveFromState::DeleteStaleAdminConflicts {
+        if !conflict_delete_keys.is_empty() {
+            self.state = RemoveFromState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 was_member,
             };
             return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes: stale_conflict_delete_keys
+                deletes: conflict_delete_keys
                     .into_iter()
                     .map(|(key_space, key)| (key_space, ByteView::from(key)))
                     .collect(),
@@ -523,7 +523,7 @@ impl RemoveFromOperation {
             );
         };
         if admin_outbox_written {
-            self.state = RemoveFromState::ScheduleAdminDocumentOutboxDrain {
+            self.state = RemoveFromState::ScheduleDocumentDrain {
                 auth_doc,
                 was_member,
             };
@@ -672,24 +672,24 @@ impl Operation for RemoveFromOperation {
         match self.state.clone() {
             RemoveFromState::Auth => self.handle_authorization(event),
             RemoveFromState::StartTransaction => self.handle_start_transaction(event),
-            RemoveFromState::ReadAuthDocAndAdminState { txn_id } => {
+            RemoveFromState::ReadAdminState { txn_id } => {
                 self.handle_auth_read(event, txn_id)
             }
-            RemoveFromState::WriteAuthDocAndAdminState {
+            RemoveFromState::WriteAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
-                stale_conflict_delete_keys,
+                conflict_delete_keys,
                 was_member,
             } => self.handle_auth_write(
                 event,
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
-                stale_conflict_delete_keys,
+                conflict_delete_keys,
                 was_member,
             ),
-            RemoveFromState::DeleteStaleAdminConflicts {
+            RemoveFromState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
@@ -715,7 +715,7 @@ impl Operation for RemoveFromOperation {
                 was_member,
                 ..
             } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written, was_member),
-            RemoveFromState::ScheduleAdminDocumentOutboxDrain {
+            RemoveFromState::ScheduleDocumentDrain {
                 auth_doc,
                 was_member,
             } => self.handle_drain_schedule(event, auth_doc, was_member),
@@ -738,9 +738,9 @@ impl Operation for RemoveFromOperation {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            RemoveFromState::ReadAuthDocAndAdminState { txn_id }
-            | RemoveFromState::WriteAuthDocAndAdminState { txn_id, .. }
-            | RemoveFromState::DeleteStaleAdminConflicts { txn_id, .. }
+            RemoveFromState::ReadAdminState { txn_id }
+            | RemoveFromState::WriteAdminState { txn_id, .. }
+            | RemoveFromState::DeleteAdminConflicts { txn_id, .. }
             | RemoveFromState::ReadBucketFence { txn_id, .. }
             | RemoveFromState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
@@ -811,7 +811,7 @@ fn apply_reducer_updates(
         }
         let event = state.apply_operation(
             actor,
-            AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+            AdminDocumentOperation::GroupAssignmentRemoved {
                 role_id: *role_id,
                 user_id,
             },
@@ -849,7 +849,7 @@ pub mod test {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{RoleId, TxnId};
-    use aruna_core::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
@@ -1000,7 +1000,7 @@ pub mod test {
                     .expect("auth doc write is included");
                 let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
-                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).unwrap())
                     .collect();
                 (
@@ -1037,7 +1037,7 @@ pub mod test {
         ));
         assert!(matches!(
             &events[1].op,
-            AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+            AdminDocumentOperation::GroupAssignmentRemoved {
                 role_id: event_role_id,
                 user_id: event_user_id,
             } if *event_role_id == role_id && *event_user_id == member_id
@@ -1279,7 +1279,7 @@ pub mod test {
             txn_id,
         }));
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
         assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));

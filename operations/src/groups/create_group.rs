@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -28,7 +28,7 @@ use thiserror::Error;
 use tracing::{trace, warn};
 use ulid::Ulid;
 
-use crate::groups::update_group::{MAX_GROUP_NAME_LEN, normalize_group_name};
+use crate::groups::update_group::{MAX_NAME_LEN, normalize_group_name};
 use crate::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,7 +91,7 @@ impl CreateGroupOperation {
     fn emit_owned_count(&mut self, cap: u32) -> Effects {
         self.state = CreateGroupState::CountOwnedGroups;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: GROUP_OWNER_INDEX_KEYSPACE.to_string(),
+            key_space: OWNER_INDEX_KEYSPACE.to_string(),
             prefix: Some(owner_group_prefix(self.config.actor.user_id).into()),
             start: None,
             limit: cap as usize,
@@ -113,7 +113,7 @@ impl CreateGroupOperation {
         if values.len() >= cap as usize {
             let cleanup_effects = self.abort();
             return self.fail_with_cleanup(
-                CreateGroupError::OwnedGroupLimitReached { limit: cap },
+                CreateGroupError::GroupLimitReached { limit: cap },
                 cleanup_effects,
             );
         }
@@ -175,7 +175,7 @@ impl CreateGroupOperation {
         let auth_doc = self
             .auth_doc
             .as_ref()
-            .ok_or(CreateGroupError::AuthDocNotFound)?;
+            .ok_or(CreateGroupError::DocNotFound)?;
 
         let key = group_id.to_bytes().into();
         let value = auth_doc.to_bytes(&self.config.actor)?.into();
@@ -197,7 +197,7 @@ impl CreateGroupOperation {
         let auth_doc = self
             .auth_doc
             .as_ref()
-            .ok_or(CreateGroupError::AuthDocNotFound)?;
+            .ok_or(CreateGroupError::DocNotFound)?;
         let target = AdminDocumentTarget::Group { group_id };
         let mut reducer_state = AdminDocumentState::new(target);
         let mut admin_events = Vec::new();
@@ -224,11 +224,11 @@ impl CreateGroupOperation {
         let admin_role = roles
             .iter()
             .find(|role| role.name == "admin")
-            .ok_or(CreateGroupError::AdminRoleNotFound)?;
+            .ok_or(CreateGroupError::AdminNotFound)?;
         for user_id in crate::sorted_user_ids(&admin_role.assigned_users) {
             admin_events.push(reducer_state.apply_operation(
                 &self.config.actor,
-                AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+                AdminDocumentOperation::GroupAssignmentAdded {
                     role_id: admin_role.role_id,
                     user_id,
                 },
@@ -383,7 +383,7 @@ impl CreateGroupOperation {
             Some(0) => {
                 let cleanup_effects = self.abort();
                 self.fail_with_cleanup(
-                    CreateGroupError::OwnedGroupLimitReached { limit: 0 },
+                    CreateGroupError::GroupLimitReached { limit: 0 },
                     cleanup_effects,
                 )
             }
@@ -424,7 +424,7 @@ impl CreateGroupOperation {
             .ok_or(CreateGroupError::GroupNotFound)?
             .group_id;
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: GROUP_OWNER_INDEX_KEYSPACE.to_string(),
+            key_space: OWNER_INDEX_KEYSPACE.to_string(),
             key: owner_group_key(self.config.actor.user_id, group_id).into(),
             value: ByteView::from(Vec::new()),
             txn_id: self.txn_id,
@@ -524,7 +524,7 @@ impl CreateGroupOperation {
         };
 
         if self.group.is_some() && self.auth_doc.is_some() {
-            self.state = CreateGroupState::ScheduleDocumentSyncOutboxDrain;
+            self.state = CreateGroupState::ScheduleSyncDrain;
             smallvec![schedule_drain_effect()]
         } else {
             self.fail(CreateGroupError::GroupNotFound)
@@ -541,7 +541,7 @@ impl CreateGroupOperation {
                 self.finish_after_schedule()
             }
             other => self.unexpected_event(
-                CreateGroupState::ScheduleDocumentSyncOutboxDrain,
+                CreateGroupState::ScheduleSyncDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",
                 format!("{other:?}"),
             ),
@@ -570,7 +570,7 @@ pub enum CreateGroupState {
     CreateRoles,
     ReadBucketFence,
     CommitTransaction,
-    ScheduleDocumentSyncOutboxDrain,
+    ScheduleSyncDrain,
     Finish,
     Error,
 }
@@ -584,9 +584,9 @@ pub enum CreateGroupError {
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("No auth doc found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error("No admin role found")]
-    AdminRoleNotFound,
+    AdminNotFound,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("No group found")]
@@ -594,8 +594,8 @@ pub enum CreateGroupError {
     #[error("the group's bucket cut over to a new holder set; retry the create")]
     PlacementFenced,
     #[error("owned group limit reached ({limit})")]
-    OwnedGroupLimitReached { limit: u32 },
-    #[error("group name must be non-empty and at most {MAX_GROUP_NAME_LEN} bytes")]
+    GroupLimitReached { limit: u32 },
+    #[error("group name must be non-empty and at most {MAX_NAME_LEN} bytes")]
     InvalidDisplayName,
     #[error("Creating Group did not finish")]
     NotFinished,
@@ -641,7 +641,7 @@ impl Operation for CreateGroupOperation {
             CreateGroupState::CreateRoles => self.handle_create_roles(event),
             CreateGroupState::ReadBucketFence => self.handle_bucket_fence(event),
             CreateGroupState::CommitTransaction => self.handle_commit_transaction(event),
-            CreateGroupState::ScheduleDocumentSyncOutboxDrain => self.handle_drain_schedule(event),
+            CreateGroupState::ScheduleSyncDrain => self.handle_drain_schedule(event),
             CreateGroupState::Init | CreateGroupState::Finish | CreateGroupState::Error => {
                 smallvec![]
             }
@@ -681,7 +681,7 @@ mod test {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
@@ -872,7 +872,7 @@ mod test {
             [Effect::Storage(StorageEffect::CommitTransaction { .. })]
         ));
         let writes = operation.reducer_seed_writes().unwrap();
-        let records = write_values(&writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+        let records = write_values(&writes, SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
@@ -941,10 +941,10 @@ mod test {
             group_id: group.group_id,
         };
         let reducer_state = postcard::from_bytes::<AdminDocumentState>(
-            write_values(writes, ADMIN_DOCUMENT_STATE_KEYSPACE)[0].as_ref(),
+            write_values(writes, DOCUMENT_STATE_KEYSPACE)[0].as_ref(),
         )
         .unwrap();
-        let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+        let outbox_records = write_values(writes, SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
@@ -1020,7 +1020,7 @@ mod test {
         }
         assert!(matches!(
             &events.last().unwrap().op,
-            AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
+            AdminDocumentOperation::GroupAssignmentAdded { role_id, user_id }
                 if *role_id == admin_role.role_id && *user_id == actor.user_id
         ));
         assert!(
@@ -1048,18 +1048,18 @@ mod test {
         }));
         assert_eq!(
             operation.state,
-            super::CreateGroupState::ScheduleDocumentSyncOutboxDrain
+            super::CreateGroupState::ScheduleSyncDrain
         );
         assert_eq!(
             effects.first(),
             Some(&Effect::Task(TaskEffect::ResetTimer {
-                key: TaskKey::DrainDocumentSyncOutbox,
+                key: TaskKey::DrainSyncOutbox,
                 after: Duration::ZERO,
             }))
         );
 
         let effects = operation.step(Event::Task(TaskEvent::Error {
-            key: Some(TaskKey::DrainDocumentSyncOutbox),
+            key: Some(TaskKey::DrainSyncOutbox),
             message: "schedule failed".to_string(),
         }));
         assert_eq!(operation.state, super::CreateGroupState::Finish);
@@ -1195,7 +1195,7 @@ mod test {
         let second = drive(CreateGroupOperation::new(capped("second")), &context).await;
         assert!(matches!(
             second,
-            Err(crate::groups::create_group::CreateGroupError::OwnedGroupLimitReached { limit: 1 })
+            Err(crate::groups::create_group::CreateGroupError::GroupLimitReached { limit: 1 })
         ));
 
         // Uncapped (realm admin) creation still works past the limit.

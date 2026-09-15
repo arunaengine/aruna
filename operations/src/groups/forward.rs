@@ -30,9 +30,9 @@ use tokio::time::timeout;
 use tracing::warn;
 use ulid::Ulid;
 
-pub(super) const GROUP_CREATE_PEER_LIMIT: usize = 4;
+pub(super) const CREATE_PEER_LIMIT: usize = 4;
 
-pub(super) const GROUP_CREATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const CREATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a forwarded group create did not produce a group. `Conflict` is the
 /// caller's problem (quota or a racing create) and must not be retried on
@@ -71,7 +71,7 @@ pub async fn forward_group_create(
             .filter_map(|node| NodeId::from_str(&node.node_id).ok())
             .filter(|peer| Some(*peer) != local_node_id),
         &subject,
-        GROUP_CREATE_PEER_LIMIT,
+        CREATE_PEER_LIMIT,
         |_| {},
     );
     if peers.is_empty() {
@@ -85,7 +85,7 @@ pub async fn forward_group_create(
     // that never left this node moves on.
     for peer in peers {
         match timeout(
-            GROUP_CREATE_ATTEMPT_TIMEOUT,
+            CREATE_ATTEMPT_TIMEOUT,
             metadata.request_forwarded_write(peer, message.clone()),
         )
         .await
@@ -94,7 +94,7 @@ pub async fn forward_group_create(
                 group,
                 authorization,
             })) => return Ok((*group, *authorization)),
-            Ok(Ok(MetadataTransportMessage::ForwardedGroupCreateConflict { reason })) => {
+            Ok(Ok(MetadataTransportMessage::GroupCreateConflict { reason })) => {
                 return Err(ForwardGroupError::Conflict(reason));
             }
             Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
@@ -184,15 +184,15 @@ pub(crate) async fn apply_group_create(
             group: Box::new(group),
             authorization: Box::new(authorization),
         },
-        Err(CreateGroupError::OwnedGroupLimitReached { limit }) => {
-            MetadataTransportMessage::ForwardedGroupCreateConflict {
+        Err(CreateGroupError::GroupLimitReached { limit }) => {
+            MetadataTransportMessage::GroupCreateConflict {
                 reason: format!("owned group limit reached ({limit})"),
             }
         }
         Err(
             CreateGroupError::StorageError(StorageError::TransactionConflict)
             | CreateGroupError::PlacementFenced,
-        ) => MetadataTransportMessage::ForwardedGroupCreateConflict {
+        ) => MetadataTransportMessage::GroupCreateConflict {
             reason: "concurrent group creation conflict; retry".to_string(),
         },
         Err(error) => reject(format!("group create failed: {error}")),

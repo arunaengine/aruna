@@ -5,9 +5,9 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
+use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord,
+    DUE_INDEX_PREFIX, LEASE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord,
     lease_index_key, parse_schedule_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -23,7 +23,7 @@ use super::store::{
     ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
     iter_prefix_page, read_job_record, requeue_job,
 };
-use super::{JOB_DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
+use super::{DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 
 /// Per-class claim budget. Both classes share one due index, so a saturated class
 /// must be skipped during the scan rather than claimed and released again.
@@ -89,9 +89,9 @@ pub async fn drain_job_batch(
         for _ in 0..2 {
             match scan_ready(
                 storage,
-                JOB_LEASE_INDEX_PREFIX,
+                LEASE_INDEX_PREFIX,
                 now_ms,
-                JOB_DRAIN_BATCH_SIZE,
+                DRAIN_BATCH_SIZE,
                 start_after.take(),
             )
             .await
@@ -140,7 +140,7 @@ pub async fn drain_job_batch(
                         }
                     }
                     if result.retry_after_error
-                        || expired_count != JOB_DRAIN_BATCH_SIZE
+                        || expired_count != DRAIN_BATCH_SIZE
                         || result.reconciled.saturating_sub(reconciled_before) != expired_count
                     {
                         break;
@@ -189,10 +189,10 @@ async fn claim_due_jobs(
     'pages: loop {
         let (values, next) = match iter_prefix_page(
             storage,
-            JOB_SCHEDULE_INDEX_KEYSPACE,
-            Some(ByteView::from(JOB_DUE_INDEX_PREFIX.to_vec())),
+            SCHEDULE_INDEX_KEYSPACE,
+            Some(ByteView::from(DUE_INDEX_PREFIX.to_vec())),
             start_after.take(),
-            JOB_DRAIN_BATCH_SIZE,
+            DRAIN_BATCH_SIZE,
             None,
         )
         .await
@@ -300,7 +300,7 @@ async fn claim_due_jobs(
 async fn delete_schedule_row(storage: &StorageHandle, key: Key) -> Result<(), String> {
     batch_delete(
         storage,
-        vec![(JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key)],
+        vec![(SCHEDULE_INDEX_KEYSPACE.to_string(), key)],
         None,
     )
     .await
@@ -313,8 +313,8 @@ async fn next_drain_delays(
 ) -> Result<(Option<Duration>, Option<Duration>), String> {
     let now_ms = unix_timestamp_millis();
     let delay = |ts: u64| Duration::from_millis(ts.saturating_sub(now_ms));
-    let due = first_schedule_entry(storage, JOB_DUE_INDEX_PREFIX).await?;
-    let lease = first_schedule_entry(storage, JOB_LEASE_INDEX_PREFIX).await?;
+    let due = first_schedule_entry(storage, DUE_INDEX_PREFIX).await?;
+    let lease = first_schedule_entry(storage, LEASE_INDEX_PREFIX).await?;
     // A reconciled attempt keeps its expired lease row, which would pin the lease
     // head at zero; floor only an already-due head, a future one fires on time.
     Ok((
@@ -377,7 +377,7 @@ async fn scan_ready(
     }
     let (values, next) = iter_prefix_page(
         storage,
-        JOB_SCHEDULE_INDEX_KEYSPACE,
+        SCHEDULE_INDEX_KEYSPACE,
         Some(ByteView::from(prefix.to_vec())),
         start_after,
         limit,
@@ -606,7 +606,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::generate(),
-            lease_expires_at_ms: 1,
+            lease_expires_ms: 1,
         });
         insert_job(&storage, &record).await.unwrap();
 
@@ -643,7 +643,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::generate(),
-            lease_expires_at_ms: 1,
+            lease_expires_ms: 1,
         });
         insert_job(&storage, &record).await.unwrap();
 
@@ -681,7 +681,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::generate(),
-            lease_expires_at_ms: unix_timestamp_millis() + JOB_LEASE_MS,
+            lease_expires_ms: unix_timestamp_millis() + JOB_LEASE_MS,
         });
         insert_job(&storage, &record).await.unwrap();
 
@@ -742,7 +742,7 @@ mod tests {
         let orphan = JobId::from_bytes([9u8; 16]);
         match storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
+                key_space: SCHEDULE_INDEX_KEYSPACE.to_string(),
                 key: due_index_key(1, orphan),
                 value: ByteView::from(Vec::new()),
                 txn_id: None,
@@ -760,7 +760,7 @@ mod tests {
         // Self-healed: the orphan is gone and the drain timer stops returning zero.
         assert_eq!(next_drain_delay(&storage).await.unwrap(), None);
         let (rows, _) =
-            iter_prefix_page(&storage, JOB_SCHEDULE_INDEX_KEYSPACE, None, None, 8, None)
+            iter_prefix_page(&storage, SCHEDULE_INDEX_KEYSPACE, None, None, 8, None)
                 .await
                 .unwrap();
         assert!(rows.is_empty());

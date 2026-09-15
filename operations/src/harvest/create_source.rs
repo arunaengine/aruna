@@ -45,7 +45,7 @@ pub enum CreateSourceError {
     #[error("harvest target prefix must not be empty")]
     EmptyTargetPrefix,
     #[error("harvest target prefix [{0}] leaves no room for a record identifier")]
-    TargetPrefixTooLong(String),
+    LongTargetPrefix(String),
     #[error("unsupported harvest metadata prefix [{0}]: only [oai_dc] is mapped")]
     UnsupportedMetadataPrefix(String),
     #[error("repository connector not found")]
@@ -103,7 +103,7 @@ impl CreateSourceOperation {
             return self.emit_error(if prefix_is_blank(&self.input.target_prefix) {
                 CreateSourceError::EmptyTargetPrefix
             } else {
-                CreateSourceError::TargetPrefixTooLong(self.input.target_prefix.clone())
+                CreateSourceError::LongTargetPrefix(self.input.target_prefix.clone())
             });
         };
         // The parser and the RO-Crate mapper are `oai_dc`-typed; any other
@@ -335,7 +335,7 @@ mod tests {
         assert!(refused.start().is_empty());
         assert_eq!(
             refused.finalize().unwrap_err(),
-            CreateSourceError::TargetPrefixTooLong(too_long)
+            CreateSourceError::LongTargetPrefix(too_long)
         );
     }
 

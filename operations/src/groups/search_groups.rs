@@ -32,7 +32,7 @@ pub struct SearchGroupsOperation {
     input: SearchGroupsInput,
     state: SearchGroupsState,
     matches: Vec<SearchGroupsMatch>,
-    next_storage_start_after: Option<Key>,
+    storage_start_after: Option<Key>,
     output: Option<Result<SearchGroupsOutput, SearchGroupsError>>,
 }
 
@@ -67,7 +67,7 @@ impl SearchGroupsOperation {
             input,
             state: SearchGroupsState::Init,
             matches: Vec::new(),
-            next_storage_start_after: None,
+            storage_start_after: None,
             output: None,
         }
     }
@@ -94,7 +94,7 @@ impl SearchGroupsOperation {
     }
 
     fn start_after_key(&self) -> Result<Option<Key>, SearchGroupsError> {
-        match (&self.next_storage_start_after, &self.input.start_after) {
+        match (&self.storage_start_after, &self.input.start_after) {
             (Some(key), _) => Ok(Some(key.clone())),
             (None, Some(group_id)) => {
                 let group_id = GroupId::from_string(group_id).map_err(ConversionError::from)?;
@@ -159,7 +159,7 @@ impl SearchGroupsOperation {
         }
 
         if let Some(next_start_after) = next_start_after {
-            self.next_storage_start_after = Some(next_start_after);
+            self.storage_start_after = Some(next_start_after);
             return self.emit_search_groups();
         }
 

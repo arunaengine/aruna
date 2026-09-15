@@ -79,7 +79,7 @@ impl GetGroupOperation {
         &mut self,
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, GetGroupError> {
-        let value = value.ok_or_else(|| GetGroupError::AuthDocNotFound)?;
+        let value = value.ok_or_else(|| GetGroupError::DocNotFound)?;
         let auth_doc = GroupAuthorizationDocument::from_bytes(&value)?;
         self.auth_doc = Some(auth_doc);
         if self.external_txn {
@@ -88,7 +88,7 @@ impl GetGroupOperation {
                 self.group.clone().ok_or(GetGroupError::GroupNotFound)?,
                 self.auth_doc
                     .clone()
-                    .ok_or(GetGroupError::AuthDocNotFound)?,
+                    .ok_or(GetGroupError::DocNotFound)?,
             )));
             return Ok(smallvec![]);
         }
@@ -236,7 +236,7 @@ pub enum GetGroupError {
     #[error("No group found")]
     GroupNotFound,
     #[error("No group found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error("Creating Group did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]

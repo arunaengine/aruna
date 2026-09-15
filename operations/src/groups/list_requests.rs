@@ -4,7 +4,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
-use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::storage_entries::reducer_state_key;
@@ -91,7 +91,7 @@ impl ListJoinOperation {
             })
         });
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.into(),
+            key_space: DOCUMENT_STATE_KEYSPACE.into(),
             prefix: Some(prefix),
             start,
             limit: 64,

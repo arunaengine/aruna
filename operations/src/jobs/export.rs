@@ -6,7 +6,7 @@ use aruna_core::errors::{AuthorizationError, BlobError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_STATE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -43,7 +43,7 @@ use url::Url;
 
 use super::executor::{JobContext, JobRunOutcome};
 use super::rocrate_jsonld::{
-    JsonLdKeywords, RDF_TYPE_IRI, SCHEMA_MEDIA_HTTPS_IRI, SCHEMA_MEDIA_IRI, is_file_type,
+    JsonLdKeywords, RDF_TYPE_IRI, MEDIA_HTTPS_IRI, SCHEMA_MEDIA_IRI, is_file_type,
 };
 use super::store::{put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -78,19 +78,19 @@ const REMOTE_ATTEMPTS: usize = 8;
 const MAX_LOCAL_CANDIDATES: usize = REMOTE_ATTEMPTS / 2;
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
 const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
-const SCHEMA_CONTENT_HTTPS_IRI: &str = "https://schema.org/contentUrl";
+const CONTENT_HTTPS_IRI: &str = "https://schema.org/contentUrl";
 const SCHEMA_ABOUT_IRI: &str = "http://schema.org/about";
-const SCHEMA_ABOUT_HTTPS_IRI: &str = "https://schema.org/about";
-const SCHEMA_HAS_PART_IRI: &str = "http://schema.org/hasPart";
-const SCHEMA_HAS_PART_HTTPS_IRI: &str = "https://schema.org/hasPart";
+const ABOUT_HTTPS_IRI: &str = "https://schema.org/about";
+const SCHEMA_PART_IRI: &str = "http://schema.org/hasPart";
+const PART_HTTPS_IRI: &str = "https://schema.org/hasPart";
 const SCHEMA_SUBJECT_IRI: &str = "http://schema.org/subjectOf";
-const SCHEMA_SUBJECT_HTTPS_IRI: &str = "https://schema.org/subjectOf";
+const SUBJECT_HTTPS_IRI: &str = "https://schema.org/subjectOf";
 const SCHEMA_ENCODING_IRI: &str = "http://schema.org/encodingFormat";
-const SCHEMA_ENCODING_HTTPS_IRI: &str = "https://schema.org/encodingFormat";
+const ENCODING_HTTPS_IRI: &str = "https://schema.org/encodingFormat";
 const SCHEMA_NAME_IRI: &str = "http://schema.org/name";
-const SCHEMA_NAME_HTTPS_IRI: &str = "https://schema.org/name";
+const NAME_HTTPS_IRI: &str = "https://schema.org/name";
 const LOCAL_PATH_IRI: &str = "https://w3id.org/ro/terms#localPath";
-const LOCAL_PATH_HTTP_IRI: &str = "http://w3id.org/ro/terms#localPath";
+const PATH_HTTP_IRI: &str = "http://w3id.org/ro/terms#localPath";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ExportPhase {
@@ -1067,7 +1067,7 @@ async fn check_read_txn(
     {
         Ok(allowed) => allowed,
         // Missing authorization state denies; it must not retry the job.
-        Err(AuthorizationError::AuthDocNotFound | AuthorizationError::GroupNotFound) => false,
+        Err(AuthorizationError::DocNotFound | AuthorizationError::GroupNotFound) => false,
         Err(error) => return Err(ExportFailure::Retryable(error.to_string())),
     };
     if !allowed {
@@ -1190,7 +1190,7 @@ async fn load_rules(
             Ok(loaded) => loaded,
             // A group this node cannot read grants nothing: that is a denial, not an
             // outage, so the export omits its aliases instead of retrying forever.
-            Err(AuthorizationError::AuthDocNotFound | AuthorizationError::GroupNotFound) => {
+            Err(AuthorizationError::DocNotFound | AuthorizationError::GroupNotFound) => {
                 PermissionRules::default()
             }
             Err(error) => return Err(ExportFailure::Retryable(error.to_string())),

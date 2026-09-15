@@ -4,7 +4,7 @@ use super::{backend_key, parse_read, record_writes};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
@@ -142,7 +142,7 @@ impl ReplaceBackendOperation {
                 self.txn_id = Some(txn_id);
                 self.state = ReplaceState::VerifyRecord;
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+                    key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
                     key: backend_key(self.backend_id),
                     txn_id: self.txn_id,
                 })]
@@ -180,7 +180,7 @@ impl ReplaceBackendOperation {
             Err(error) => return self.fail(error.into()),
         };
         writes.push((
-            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+            BACKEND_SECRET_KEYSPACE.to_string(),
             backend_key(self.backend_id),
             secret_bytes.into(),
         ));
@@ -255,7 +255,7 @@ impl Operation for ReplaceBackendOperation {
     fn start(&mut self) -> Effects {
         self.state = ReplaceState::ReadRecord;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
             key: backend_key(self.backend_id),
             txn_id: None,
         })]

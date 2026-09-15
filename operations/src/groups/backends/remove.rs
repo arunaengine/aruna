@@ -3,9 +3,9 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_INDEX_KEYSPACE,
-    GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BACKEND_INDEX_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE,
+    UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, BlobLocationKey};
@@ -91,7 +91,7 @@ async fn disabled_backends(context: &DriverContext) -> Result<Vec<GroupStorage>,
     loop {
         let (values, next) = iter_prefix_page(
             &context.storage_handle,
-            GROUP_STORAGE_BACKEND_KEYSPACE,
+            STORAGE_BACKEND_KEYSPACE,
             None,
             start_after,
             SCAN_PAGE_SIZE,
@@ -170,7 +170,7 @@ async fn backends_holding_data(context: &DriverContext) -> Result<BTreeSet<Backe
     loop {
         let (values, next) = iter_prefix_page(
             &context.storage_handle,
-            S3_MULTIPART_UPLOAD_KEYSPACE,
+            UPLOAD_KEYSPACE,
             None,
             start_after,
             SCAN_PAGE_SIZE,
@@ -260,7 +260,7 @@ impl RemoveBackendOperation {
                 self.txn_id = Some(txn_id);
                 self.state = RemoveState::ReadRecord;
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+                    key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
                     key: backend_key(self.backend_id),
                     txn_id: self.txn_id,
                 })]
@@ -285,15 +285,15 @@ impl RemoveBackendOperation {
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes: vec![
                 (
-                    GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+                    STORAGE_BACKEND_KEYSPACE.to_string(),
                     backend_key(record.backend_id),
                 ),
                 (
-                    GROUP_STORAGE_BACKEND_INDEX_KEYSPACE.to_string(),
+                    BACKEND_INDEX_KEYSPACE.to_string(),
                     index_key(record.group_id, record.backend_id),
                 ),
                 (
-                    GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+                    BACKEND_SECRET_KEYSPACE.to_string(),
                     backend_key(record.backend_id),
                 ),
             ],
@@ -465,7 +465,7 @@ mod tests {
         }
         write(
             context,
-            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+            BACKEND_SECRET_KEYSPACE,
             backend_key(backend_id),
             GroupStorageSecret {
                 backend_id,
@@ -506,8 +506,8 @@ mod tests {
         assert_eq!(remove_drained_backends(&ctx).await.unwrap(), 1);
 
         for key_space in [
-            GROUP_STORAGE_BACKEND_KEYSPACE,
-            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+            STORAGE_BACKEND_KEYSPACE,
+            BACKEND_SECRET_KEYSPACE,
         ] {
             assert!(
                 read(&ctx, key_space, backend_key(backend_id))
@@ -518,7 +518,7 @@ mod tests {
         assert!(
             read(
                 &ctx,
-                GROUP_STORAGE_BACKEND_INDEX_KEYSPACE,
+                BACKEND_INDEX_KEYSPACE,
                 index_key(Ulid::from_bytes([1u8; 16]), backend_id)
             )
             .await
@@ -537,7 +537,7 @@ mod tests {
         assert!(
             read(
                 &ctx,
-                GROUP_STORAGE_BACKEND_KEYSPACE,
+                STORAGE_BACKEND_KEYSPACE,
                 backend_key(backend_id)
             )
             .await
@@ -602,7 +602,7 @@ mod tests {
         seed(&ctx, backend_id, true).await;
         write(
             &ctx,
-            S3_MULTIPART_UPLOAD_KEYSPACE,
+            UPLOAD_KEYSPACE,
             upload_id.to_bytes().to_vec().into(),
             MultipartUpload {
                 upload_id,
