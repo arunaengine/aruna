@@ -4,12 +4,12 @@ use std::time::SystemTime;
 use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
 use aruna_core::audit::{AuditPageRequest, AuditPageResponse, MAX_AUDIT_PAGE_BYTES};
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit, ReceiptFrame};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::metadata::{
-    MetadataBatch, MetadataBatchSource, MetadataProfileValidationFinding,
-    MetadataProfileValidationStatus, MetadataQueryResults, MetadataSearchHit,
+    MetadataBatch, MetadataBatchSource, MetadataQueryResults, MetadataSearchHit,
+    ProfileValidationFinding, ProfileValidationStatus,
 };
 use aruna_core::structs::{
     Group, GroupAuthorizationDocument, MetadataRegistryRecord, NodeInfoDocument, PathClaimRecord,
@@ -28,16 +28,13 @@ use ulid::Ulid;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::jobs::lifecycle::ids::SubmissionRequest;
 use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
-use crate::metadata::api::{
-    MetadataReferencePreflightNodeExecution, MetadataReferencePreflightNodeRequest,
-    MetadataRoCrateExportView,
-};
-use crate::metadata::create_document::CreateMetadataDocumentPayload;
-use crate::metadata::update_document::UpdateMetadataDocumentMutation;
+use crate::metadata::api::{ReferenceNodeExecution, ReferenceNodeRequest, RoCrateExportView};
+use crate::metadata::create_document::CreateDocumentPayload;
+use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::s3::search_buckets::BucketSearchHit;
-use crate::s3::search_objects::{ObjectKeyMatch, ObjectSearchNodePage};
+use crate::s3::search_objects::{ObjectKeyMatch, SearchNodePage};
 
-pub use aruna_core::metadata::{MetadataAuthToken, MetadataAuthTokenError};
+pub use aruna_core::metadata::{AuthToken, AuthTokenError};
 
 pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const AUDIT_FRAME_OVERHEAD: usize = 256;
@@ -76,7 +73,7 @@ pub struct MetadataPathResolution {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetadataTransportMessage {
     QueryGraphs {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         graph_iris: Option<Vec<String>>,
         sparql: String,
     },
@@ -84,7 +81,7 @@ pub enum MetadataTransportMessage {
         result: Result<MetadataQueryResults, MetadataReadError>,
     },
     SearchGraphs {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
@@ -97,25 +94,25 @@ pub enum MetadataTransportMessage {
     /// bucket, forwarded to a holder. The payload mirrors the HTTP request
     /// and `auth_token` lets the holder re-run the origin's permission checks.
     ForwardCreateDocument {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         group_id: GroupId,
         document_id: Ulid,
         document_path: String,
         public: bool,
-        payload: CreateMetadataDocumentPayload,
+        payload: CreateDocumentPayload,
     },
     ForwardUpdateDocument {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         document_id: Ulid,
         /// `None` leaves the holder's current visibility untouched: the origin's
         /// record copy may be stale, so only an explicit request value travels.
         public: Option<bool>,
-        mutation: UpdateMetadataDocumentMutation,
+        mutation: UpdateDocumentMutation,
     },
     ForwardDeleteDocument {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         document_id: Ulid,
     },
@@ -130,7 +127,7 @@ pub enum MetadataTransportMessage {
         message: String,
     },
     FilteredSearchGraphs {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
@@ -139,7 +136,7 @@ pub enum MetadataTransportMessage {
         group_id: Option<GroupId>,
     },
     SearchBuckets {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         query: String,
         limit: usize,
     },
@@ -147,20 +144,20 @@ pub enum MetadataTransportMessage {
         result: Result<Vec<BucketSearchHit>, MetadataReadError>,
     },
     CreateSyncMirror {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         source_group_id: GroupId,
         relationship: Box<SyncRelationship>,
         extras: PolicyRequestExtras,
     },
     DeleteSyncMirror {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         relationship: Box<SyncRelationship>,
         extras: PolicyRequestExtras,
     },
     SyncMirrorCreated,
     SyncMirrorDeleted,
     ForwardReadDocument {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         document_id: Ulid,
     },
@@ -168,7 +165,7 @@ pub enum MetadataTransportMessage {
         result: Result<Box<MetadataRegistryRecord>, MetadataReadError>,
     },
     ForwardPathLookup {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         group_id: GroupId,
         document_path: String,
         config_digest: [u8; 32],
@@ -177,10 +174,10 @@ pub enum MetadataTransportMessage {
         result: Result<Vec<MetadataPathCandidate>, MetadataReadError>,
     },
     ForwardedWriteDenied {
-        error: MetadataWriteAuthError,
+        error: WriteAuthError,
     },
     ForwardPathResolution {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         group_id: GroupId,
         document_path: String,
         config_digest: [u8; 32],
@@ -193,10 +190,10 @@ pub enum MetadataTransportMessage {
     /// An RO-Crate export forwarded to a holder with the caller's bearer or
     /// peer-attested internal principal for another READ check.
     ForwardExportDocument {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         document_id: Ulid,
-        view: MetadataRoCrateExportView,
+        view: RoCrateExportView,
         metadata_bytes: u64,
         limit: Option<usize>,
         offset: Option<usize>,
@@ -206,7 +203,7 @@ pub enum MetadataTransportMessage {
         result: Result<u64, MetadataReadError>,
     },
     QueryDocument {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         document_id: Ulid,
         sparql: String,
@@ -225,7 +222,7 @@ pub enum MetadataTransportMessage {
     /// A User-kind node forwards a bearer-token revocation to a node that may
     /// publish realm administration events.
     ForwardTokenRevocation {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         token: String,
     },
     ForwardedTokenRevoked,
@@ -235,7 +232,7 @@ pub enum MetadataTransportMessage {
     /// holder, which is the mapping's authority. Appended last so the postcard
     /// variant indices the frame classifier depends on stay stable.
     ForwardPersistentId {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         document_id: Ulid,
         request: PersistentIdRequest,
@@ -257,7 +254,7 @@ pub enum MetadataTransportMessage {
     /// because only a holder may commit the immutable document. Appended last so
     /// existing variant indices stay stable.
     ForwardCreatePlacementPolicy {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         policy: Box<PlacementPolicy>,
         created_at_ms: u64,
     },
@@ -286,7 +283,7 @@ pub enum MetadataTransportMessage {
         limit: PageLimit,
     },
     ForwardedJobRecordPage {
-        result: Result<JobRecordPageReply, JobRecordRejection>,
+        result: Result<JobPageReply, JobRecordRejection>,
     },
     /// One scheduler's launch offer to an execution target. It carries no
     /// caller token: the target verifies the signed launch itself.
@@ -300,7 +297,7 @@ pub enum MetadataTransportMessage {
     /// family holder with the ingress-preassigned identity; the holder
     /// revalidates the caller and recomputes it. Appended to keep indices stable.
     ForwardJobSubmission {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         submission_id: SubmissionId,
         request: Box<SubmissionRequest>,
     },
@@ -310,7 +307,7 @@ pub enum MetadataTransportMessage {
     /// Authenticated live-head object inventory search. These variants are
     /// appended so every pre-existing transport discriminant remains stable.
     SearchObjects {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         query: String,
         key_match: ObjectKeyMatch,
         bucket: Option<String>,
@@ -319,39 +316,39 @@ pub enum MetadataTransportMessage {
         as_of: SystemTime,
     },
     ObjectSearchResults {
-        result: Result<ObjectSearchNodePage, MetadataReadError>,
+        result: Result<SearchNodePage, MetadataReadError>,
     },
     /// A structured Profile gate rejection returned by a holder.
     /// Appended after the object-search variants so every existing postcard
     /// discriminant, including theirs, remains stable.
     ForwardedProfileValidation {
-        findings: Vec<MetadataProfileValidationFinding>,
+        findings: Vec<ProfileValidationFinding>,
     },
     /// Read or deterministically recompute a document's revision-bound Profile
     /// status on a holder, under the caller's READ authority.
     ForwardProfileValidationStatus {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         document_id: Ulid,
         revalidate: bool,
     },
     ForwardedProfileValidationStatus {
-        result: Result<Box<MetadataProfileValidationStatus>, MetadataReadError>,
+        result: Result<Box<ProfileValidationStatus>, MetadataReadError>,
     },
     /// One node's exact-IRI backlink and location-impact partition. Appended after
     /// the existing tail variants so all prior postcard discriminants remain stable.
     ReferencePreflight {
-        auth_token: Option<MetadataAuthToken>,
-        request: Box<MetadataReferencePreflightNodeRequest>,
+        auth_token: Option<AuthToken>,
+        request: Box<ReferenceNodeRequest>,
     },
     ReferencePreflightResults {
-        result: Result<Box<MetadataReferencePreflightNodeExecution>, MetadataReadError>,
+        result: Result<Box<ReferenceNodeExecution>, MetadataReadError>,
     },
     /// An administrative event whose origin holds none of the target's shard,
     /// relayed to a holder by origin-signed envelope; no caller token, as every
     /// receiver re-authorizes against the origin. Appended to keep indices stable.
     ForwardAdminEvent {
-        target: DocumentSyncTarget,
+        target: DocumentTarget,
         event: Box<AdminDocumentEvent>,
         placement: PlacementRef,
         origin_signature: iroh::Signature,
@@ -361,7 +358,7 @@ pub enum MetadataTransportMessage {
     /// group create travels to a sync-eligible ingress under the caller's own
     /// token. That ingress authorizes the caller and originates the event.
     ForwardGroupCreate {
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         display_name: String,
     },
     ForwardedGroupCreated {
@@ -375,7 +372,7 @@ pub enum MetadataTransportMessage {
     /// as the owner; the realm node reads it back from the device and writes its
     /// own copy, so the device never pushes. Appended to keep indices stable.
     ForwardSyncPull {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         source: Box<VersionedObjectArn>,
         blake3: Option<[u8; 32]>,
         size: u64,
@@ -390,7 +387,7 @@ pub enum MetadataTransportMessage {
     /// Bounded listing of the current heads under one bucket prefix, served as
     /// a routed read with the requesting owner's authority.
     ForwardListVersions {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         bucket: String,
         prefix: String,
         cursor: Option<SyncListCursor>,
@@ -403,7 +400,7 @@ pub enum MetadataTransportMessage {
     /// no part in document sync, so this routed read is how the configuration
     /// it is judged by - revocations included - reaches it.
     FetchRealmDocuments {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
     },
     FetchedRealmDocuments {
         result: Result<RealmDocuments, SyncRefusal>,
@@ -412,7 +409,7 @@ pub enum MetadataTransportMessage {
     /// device holds no bucket, so this routed read is how the OR-Set graph, the
     /// registry record and the displayed render reach it.
     FetchGraphState {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         document_id: Ulid,
     },
     FetchedGraphState {
@@ -422,7 +419,7 @@ pub enum MetadataTransportMessage {
     /// as an `ApplyBatch` event unchanged, so both sides converge on the same
     /// OR-Set state whatever else happened meanwhile.
     ForwardApplyBatch {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         config_digest: [u8; 32],
         document_id: Ulid,
         batch: Box<MetadataBatch>,
@@ -432,7 +429,7 @@ pub enum MetadataTransportMessage {
         result: Result<Box<MetadataRegistryRecord>, SyncRefusal>,
     },
     ForwardCreateBucket {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         bucket: String,
         group_id: GroupId,
     },
@@ -506,7 +503,7 @@ pub struct RealmDocuments {
 
 /// One page of immutable records plus the cursor of the next one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobRecordPageReply {
+pub struct JobPageReply {
     pub page: JobRecordPage,
     pub next: Option<FetchCursor>,
 }
@@ -576,7 +573,7 @@ pub enum MetadataReadError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataWriteAuthError {
+pub enum WriteAuthError {
     Unauthorized,
     Forbidden,
 }
@@ -800,19 +797,19 @@ mod tests {
     #[test]
     fn transport_auth_fields() {
         assert_auth_token(MetadataTransportMessage::QueryGraphs {
-            auth_token: Some(MetadataAuthToken::bearer("query-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("query-token").unwrap()),
             graph_iris: None,
             sparql: "ASK {}".to_string(),
         });
         assert_auth_token(MetadataTransportMessage::SearchGraphs {
-            auth_token: Some(MetadataAuthToken::bearer("search-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("search-token").unwrap()),
             graph_iris: None,
             query: "dataset".to_string(),
             limit: 10,
             group_id: None,
         });
         assert_auth_token(MetadataTransportMessage::FilteredSearchGraphs {
-            auth_token: Some(MetadataAuthToken::bearer("filtered-search-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("filtered-search-token").unwrap()),
             graph_iris: None,
             query: String::new(),
             limit: 10,
@@ -821,12 +818,12 @@ mod tests {
             group_id: None,
         });
         assert_auth_token(MetadataTransportMessage::SearchBuckets {
-            auth_token: Some(MetadataAuthToken::bearer("bucket-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("bucket-token").unwrap()),
             query: "dataset".to_string(),
             limit: 10,
         });
         assert_auth_token(MetadataTransportMessage::SearchObjects {
-            auth_token: Some(MetadataAuthToken::bearer("object-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("object-token").unwrap()),
             query: "reads".to_string(),
             key_match: ObjectKeyMatch::Substring,
             bucket: Some("data".to_string()),
@@ -840,42 +837,42 @@ mod tests {
     fn writes_carry_authority() {
         // Every forwarded write carries the caller token to prevent an internal auth bypass.
         assert_auth_token(MetadataTransportMessage::ForwardCreateDocument {
-            auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("create-token").unwrap()),
             config_digest: [0; 32],
             group_id: Ulid::nil(),
             document_id: Ulid::nil(),
             document_path: "datasets/forwarded".to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::RoCrate {
+            payload: CreateDocumentPayload::RoCrate {
                 jsonld: "{}".to_string(),
             },
         });
         assert_auth_token(MetadataTransportMessage::ForwardUpdateDocument {
-            auth_token: Some(MetadataAuthToken::bearer("update-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("update-token").unwrap()),
             config_digest: [0; 32],
             document_id: Ulid::nil(),
             public: None,
-            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
+            mutation: UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: "{}".to_string(),
             },
         });
         assert_auth_token(MetadataTransportMessage::ForwardDeleteDocument {
-            auth_token: Some(MetadataAuthToken::bearer("delete-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("delete-token").unwrap()),
             config_digest: [0; 32],
             document_id: Ulid::nil(),
         });
         assert_auth_token(MetadataTransportMessage::ForwardExportDocument {
-            auth_token: Some(MetadataAuthToken::bearer("export-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("export-token").unwrap()),
             config_digest: [0; 32],
             document_id: Ulid::nil(),
-            view: MetadataRoCrateExportView::Raw,
+            view: RoCrateExportView::Raw,
             metadata_bytes: 16 * 1024 * 1024,
             limit: None,
             offset: None,
             after: None,
         });
         assert_auth_token(MetadataTransportMessage::ForwardTokenRevocation {
-            auth_token: MetadataAuthToken::bearer("revoke-token").unwrap(),
+            auth_token: AuthToken::bearer("revoke-token").unwrap(),
             token: "target-token".to_string(),
         });
     }
@@ -903,13 +900,13 @@ mod tests {
     #[test]
     fn create_round_trips() {
         let message = MetadataTransportMessage::ForwardCreateDocument {
-            auth_token: Some(MetadataAuthToken::bearer("create-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("create-token").unwrap()),
             config_digest: [0; 32],
             group_id: Ulid::from_bytes([3u8; 16]),
             document_id: Ulid::from_bytes([4u8; 16]),
             document_path: "datasets/forwarded".to_string(),
             public: false,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Forwarded".to_string(),
                 description: "Placed by a holder".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -953,7 +950,7 @@ mod tests {
     #[test]
     fn path_lookup_roundtrip() {
         let message = MetadataTransportMessage::ForwardPathLookup {
-            auth_token: Some(MetadataAuthToken::bearer("path-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("path-token").unwrap()),
             group_id: Ulid::from_bytes([3u8; 16]),
             document_path: "datasets/private".to_string(),
             config_digest: [4u8; 32],
@@ -969,7 +966,7 @@ mod tests {
     #[test]
     fn path_resolution_roundtrip() {
         let message = MetadataTransportMessage::ForwardPathResolution {
-            auth_token: Some(MetadataAuthToken::bearer("path-token").unwrap()),
+            auth_token: Some(AuthToken::bearer("path-token").unwrap()),
             group_id: Ulid::from_bytes([3u8; 16]),
             document_path: "datasets/private".to_string(),
             config_digest: [4u8; 32],
@@ -1033,7 +1030,7 @@ mod tests {
     fn oversized_tokens_rejected() {
         let oversized = "x".repeat(MAX_METADATA_BEARER_TOKEN_LEN + 1);
 
-        assert!(MetadataAuthToken::bearer(oversized).is_err());
+        assert!(AuthToken::bearer(oversized).is_err());
     }
 
     #[tokio::test]
@@ -1312,13 +1309,13 @@ mod tests {
 
     #[test]
     fn bearer_round_trips() {
-        let token = MetadataAuthToken::bearer("bearer-token").unwrap();
+        let token = AuthToken::bearer("bearer-token").unwrap();
         let bytes = postcard::to_allocvec(&token).unwrap();
 
-        let decoded = postcard::from_bytes::<MetadataAuthToken>(&bytes).unwrap();
+        let decoded = postcard::from_bytes::<AuthToken>(&bytes).unwrap();
 
         assert_eq!(decoded, token);
-        let MetadataAuthToken::Bearer(bearer) = decoded else {
+        let AuthToken::Bearer(bearer) = decoded else {
             panic!("expected bearer token");
         };
         assert_eq!(bearer.as_str(), "bearer-token");
@@ -1336,13 +1333,10 @@ mod tests {
             }]),
             session: None,
         };
-        let token = MetadataAuthToken::internal(auth);
+        let token = AuthToken::internal(auth);
         let bytes = postcard::to_allocvec(&token).unwrap();
 
-        assert_eq!(
-            postcard::from_bytes::<MetadataAuthToken>(&bytes).unwrap(),
-            token
-        );
+        assert_eq!(postcard::from_bytes::<AuthToken>(&bytes).unwrap(), token);
     }
 
     #[test]

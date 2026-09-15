@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
-    DocumentSyncRevision, DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+    DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -15,8 +15,8 @@ use aruna_core::keyspaces::{
     METADATA_PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
-    MetadataGraphLifecycleRecord, MetadataMaterializationStatusRecord,
+    GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventRecord,
+    MetadataLifecycleRecord,
 };
 use aruna_core::storage_entries::{
     delete_projection_entry, document_lifecycle_entry, event_log_key, graph_lifecycle_key,
@@ -56,7 +56,7 @@ const PENDING_PROJECTION_PAGE_SIZE: usize = 256;
 pub const METADATA_PROJECTION_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingMetadataProjectionDrainResult {
+pub struct PendingProjectionResult {
     pub markers_examined: usize,
     pub projected: usize,
     pub has_more: bool,
@@ -80,7 +80,7 @@ fn max_clock_skew() -> u64 {
     })
 }
 
-fn exceeds_clock_skew(event: &MetadataCreateEventRecord, now_ms: u64, max_skew_ms: u64) -> bool {
+fn exceeds_clock_skew(event: &MetadataEventRecord, now_ms: u64, max_skew_ms: u64) -> bool {
     let limit = now_ms.saturating_add(max_skew_ms);
     event.record.updated_at_ms > limit || event.occurred_at_ms > limit
 }
@@ -165,14 +165,13 @@ pub async fn restore_projection_timer(storage: &StorageHandle, task_handle: &Tas
 }
 
 pub async fn replay_event_log(context: &DriverContext) -> Result<usize, MetadataProjectionError> {
-    replay_event_log_until(context, || true).await
+    replay_until_stopped(context, || true).await
 }
 
 /// Replays the event log one page at a time, checking `should_continue` before
-/// each page. A stop accepted during a large replay ends it at a page boundary
-/// with every completed page already projected, so the caller can release its
-/// resources without abandoning an in-flight projection step.
-pub async fn replay_event_log_until(
+/// each page. A stop accepted during a large replay ends at a page boundary with
+/// every completed page projected, so no in-flight projection step is abandoned.
+pub async fn replay_until_stopped(
     context: &DriverContext,
     mut should_continue: impl FnMut() -> bool,
 ) -> Result<usize, MetadataProjectionError> {
@@ -223,7 +222,7 @@ pub async fn replay_event_log_until(
 
 pub async fn drain_projection_queue(
     context: &DriverContext,
-) -> Result<PendingMetadataProjectionDrainResult, MetadataProjectionError> {
+) -> Result<PendingProjectionResult, MetadataProjectionError> {
     let page = context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
@@ -258,7 +257,7 @@ pub async fn drain_projection_queue(
         targets.push(target);
     }
     let projected_from_log = project_logged_batch(context, targets, true).await?;
-    Ok(PendingMetadataProjectionDrainResult {
+    Ok(PendingProjectionResult {
         markers_examined: projected_from_log.existing_events,
         projected: projected_from_log.projected,
         has_more: next_start_after.is_some(),
@@ -284,7 +283,7 @@ pub async fn project_logged_events(
         .projected)
 }
 
-struct MetadataProjectionFromLogResult {
+struct ProjectionLogResult {
     projected: usize,
     existing_events: usize,
 }
@@ -293,7 +292,7 @@ async fn project_logged_batch(
     context: &DriverContext,
     targets: impl IntoIterator<Item = (Ulid, Ulid)>,
     delete_orphan_markers: bool,
-) -> Result<MetadataProjectionFromLogResult, MetadataProjectionError> {
+) -> Result<ProjectionLogResult, MetadataProjectionError> {
     let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
     let mut seen = BTreeSet::new();
     let mut events = Vec::new();
@@ -326,7 +325,7 @@ async fn project_logged_batch(
     delete_pending_markers(context, missing_event_markers).await?;
     let existing_events = events.len();
     let projected = project_create_events(context, events, local_node_id).await?;
-    Ok(MetadataProjectionFromLogResult {
+    Ok(ProjectionLogResult {
         projected,
         existing_events,
     })
@@ -336,7 +335,7 @@ async fn read_create_event(
     context: &DriverContext,
     document_id: Ulid,
     event_id: Ulid,
-) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
+) -> Result<MetadataEventRecord, MetadataProjectionError> {
     let value = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -360,8 +359,7 @@ async fn read_create_event(
             event_id,
         });
     };
-    let event: MetadataCreateEventRecord =
-        postcard::from_bytes(&value).map_err(ConversionError::from)?;
+    let event: MetadataEventRecord = postcard::from_bytes(&value).map_err(ConversionError::from)?;
     if event.record.document_id != document_id || event.event_id != event_id {
         return Err(MetadataProjectionError::UnexpectedEvent(format!(
             "metadata create event log target {document_id}/{event_id} did not match payload {}/{}",
@@ -373,7 +371,7 @@ async fn read_create_event(
 
 pub async fn project_create_event(
     context: &DriverContext,
-    event: MetadataCreateEventRecord,
+    event: MetadataEventRecord,
     local_node_id: Option<NodeId>,
 ) -> Result<(), MetadataProjectionError> {
     project_create_events(context, vec![event], local_node_id)
@@ -383,7 +381,7 @@ pub async fn project_create_event(
 
 pub async fn project_create_events(
     context: &DriverContext,
-    events: Vec<MetadataCreateEventRecord>,
+    events: Vec<MetadataEventRecord>,
     local_node_id: Option<NodeId>,
 ) -> Result<usize, MetadataProjectionError> {
     if events.is_empty() {
@@ -397,8 +395,7 @@ pub async fn project_create_events(
     let mut realm_configs = BTreeMap::new();
     let mut lifecycle_cache: BTreeMap<String, bool> = BTreeMap::new();
     let mut registry_cache: BTreeMap<Ulid, Option<MetadataRegistryRecord>> = BTreeMap::new();
-    let mut status_cache: BTreeMap<Ulid, Option<MetadataMaterializationStatusRecord>> =
-        BTreeMap::new();
+    let mut status_cache: BTreeMap<Ulid, Option<MaterializationStatusRecord>> = BTreeMap::new();
     let mut writes = Vec::new();
     let mut repair_deletes = Vec::new();
     let mut repaired_records = Vec::new();
@@ -580,7 +577,7 @@ pub async fn project_create_events(
         }
         if local_node_id == Some(event.node_id) {
             writes.push(document_lifecycle_entry(
-                &MetadataDocumentLifecycleRecord::Upsert {
+                &MetadataLifecycleRecord::Upsert {
                     event: Box::new(event.clone()),
                 },
             )?);
@@ -756,7 +753,7 @@ async fn transactional_projection_write(
         let Some(value) = value else {
             continue;
         };
-        let lifecycle = match postcard::from_bytes::<MetadataGraphLifecycleRecord>(value) {
+        let lifecycle = match postcard::from_bytes::<GraphLifecycleRecord>(value) {
             Ok(lifecycle) => lifecycle,
             Err(error) => {
                 abort_projection_transaction(storage, &mut owner, txn_id).await;
@@ -905,10 +902,10 @@ async fn delete_marker_keys(
 
 async fn expand_cached_holders(
     context: &DriverContext,
-    event: MetadataCreateEventRecord,
+    event: MetadataEventRecord,
     local_node_id: Option<NodeId>,
     realm_configs: &mut BTreeMap<RealmId, Option<RealmConfigDocument>>,
-) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
+) -> Result<MetadataEventRecord, MetadataProjectionError> {
     let realm_config = if local_node_id == Some(event.node_id) {
         let realm_id = event.record.realm_id;
         match realm_configs.get(&realm_id) {
@@ -927,10 +924,10 @@ async fn expand_cached_holders(
 }
 
 fn expand_event_holders(
-    mut event: MetadataCreateEventRecord,
+    mut event: MetadataEventRecord,
     _local_node_id: Option<NodeId>,
     _realm_config: Option<&RealmConfigDocument>,
-) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
+) -> Result<MetadataEventRecord, MetadataProjectionError> {
     event.record.last_event_id = event.event_id;
     let mut holders = event.record.holder_node_ids.clone();
     sort_node_ids(&mut holders);
@@ -943,7 +940,7 @@ async fn read_realm_config(
     context: &DriverContext,
     realm_id: aruna_core::structs::RealmId,
 ) -> Result<Option<RealmConfigDocument>, MetadataProjectionError> {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     match context
         .storage_handle
         .send_effect(crate::document_repository::read_effect(&target, None))
@@ -964,17 +961,17 @@ async fn read_realm_config(
 /// everywhere-bound topic rather than the replica-capped bucket topic, so every
 /// node learns the routing mapping. `None` without config or a holder; replay re-plans.
 pub fn registry_outbox_record(
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
     realm_config: Option<&RealmConfigDocument>,
     allow_genesis: bool,
-) -> Option<DocumentSyncOutboxRecord> {
+) -> Option<DocumentOutboxRecord> {
     let record = &event.record;
     let config = realm_config?;
     let placement = registry_placement(config, record);
     if placement == PlacementRef::NIL {
         return None;
     }
-    let target = DocumentSyncTarget::MetadataRegistry {
+    let target = DocumentTarget::MetadataRegistry {
         group_id: record.group_id,
         document_id: record.document_id,
     };
@@ -982,7 +979,7 @@ pub fn registry_outbox_record(
     if peers.is_empty() {
         return None;
     }
-    let change = DocumentSyncChange {
+    let change = DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: record.updated_at_ms,
@@ -990,15 +987,15 @@ pub fn registry_outbox_record(
             actor: event.node_id,
             updated_at_ms: record.updated_at_ms,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     };
-    Some(DocumentSyncOutboxRecord {
+    Some(DocumentOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
         target,
         peers,
-        event: DocumentSyncOutboxEvent::Upsert {
+        event: DocumentOutboxEvent::Upsert {
             bytes: postcard::to_allocvec(record).expect("metadata registry record serializes"),
             change,
         },
@@ -1010,14 +1007,14 @@ pub fn registry_outbox_record(
 }
 
 pub fn create_outbox_record(
-    event: &MetadataCreateEventRecord,
+    event: &MetadataEventRecord,
     realm_config: Option<&RealmConfigDocument>,
     allow_genesis: bool,
-) -> DocumentSyncOutboxRecord {
-    let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+) -> DocumentOutboxRecord {
+    let lifecycle = MetadataLifecycleRecord::Upsert {
         event: Box::new(event.clone()),
     };
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+    let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
     // The bucket is the one the create stamped; peers are its live holders, so a publish after
@@ -1027,12 +1024,12 @@ pub fn create_outbox_record(
         .map(|config| resolve_shard_holders(config, &placement))
         .unwrap_or_default();
     let change = lifecycle_revision_change(&lifecycle, event.node_id, placement);
-    DocumentSyncOutboxRecord {
+    DocumentOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
         target,
         peers,
-        event: DocumentSyncOutboxEvent::Upsert {
+        event: DocumentOutboxEvent::Upsert {
             bytes: postcard::to_allocvec(&lifecycle)
                 .expect("metadata document lifecycle event serializes"),
             change,
@@ -1073,7 +1070,7 @@ async fn metadata_graph_deleted(
         })
 }
 
-fn audit_record(event: &MetadataCreateEventRecord) -> MetadataAuditRecord {
+fn audit_record(event: &MetadataEventRecord) -> MetadataAuditRecord {
     MetadataAuditRecord {
         realm_id: event.record.realm_id,
         group_id: event.record.group_id,
@@ -1114,7 +1111,7 @@ async fn read_existing_registry(
 async fn read_materialization_status(
     context: &DriverContext,
     document_id: Ulid,
-) -> Result<Option<MetadataMaterializationStatusRecord>, MetadataProjectionError> {
+) -> Result<Option<MaterializationStatusRecord>, MetadataProjectionError> {
     let event = context
         .storage_handle
         .send_effect(read_status_effect(document_id, None))
@@ -1161,7 +1158,7 @@ async fn schedule_materialization_drain(
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::metadata::{MetadataCreateEventPayload, MetadataDocumentLifecycleRecord};
+    use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
     use aruna_core::structs::{
         PlacementRef, PlacementStrategy, RealmConfigDocument, RealmId, RealmNodeKind,
@@ -1188,7 +1185,7 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn create_event() -> MetadataCreateEventRecord {
+    fn create_event() -> MetadataEventRecord {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let group_id = Ulid::generate();
         let document_id = Ulid::generate();
@@ -1214,12 +1211,12 @@ mod tests {
             establishing_event_id: event_id,
             last_event_id: event_id,
         };
-        MetadataCreateEventRecord {
+        MetadataEventRecord {
             event_id,
             record,
             user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
             node_id: node(1),
-            payload: MetadataCreateEventPayload::Scaffold {
+            payload: MetadataEventPayload::Scaffold {
                 name: "Lifecycle Outbox".to_string(),
                 description: "Projector outbox envelope".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -1232,10 +1229,10 @@ mod tests {
     // Stands in for the create operation: stamps the bucket its origin would
     // have chosen from the buckets it holds.
     fn stamped(
-        mut event: MetadataCreateEventRecord,
+        mut event: MetadataEventRecord,
         config: &RealmConfigDocument,
-    ) -> MetadataCreateEventRecord {
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+    ) -> MetadataEventRecord {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: event.record.document_id,
         };
         let context = crate::placement::PlacementResolutionContext {
@@ -1277,7 +1274,7 @@ mod tests {
     }
 
     async fn store_realm_config(storage: &StorageHandle, config: &RealmConfigDocument) {
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: config.realm_id,
         };
         let bytes = postcard::to_allocvec(config).expect("realm config serializes");
@@ -1300,7 +1297,7 @@ mod tests {
         config
     }
 
-    async fn outbox_rows(storage: &StorageHandle) -> Vec<DocumentSyncOutboxRecord> {
+    async fn outbox_rows(storage: &StorageHandle) -> Vec<DocumentOutboxRecord> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
@@ -1451,7 +1448,7 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let event = create_event();
-        let tombstone = MetadataGraphLifecycleRecord::deleted(
+        let tombstone = GraphLifecycleRecord::deleted(
             event.record.graph_iri.clone(),
             event.record.realm_id,
             event.record.group_id,
@@ -1715,7 +1712,7 @@ mod tests {
             Event::Storage(StorageEvent::IterResult { values, .. }) => values
                 .iter()
                 .map(|(_, value)| {
-                    postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref())
+                    postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref())
                         .expect("outbox record decodes")
                 })
                 .collect::<Vec<_>>(),
@@ -1728,20 +1725,20 @@ mod tests {
             .find(|record| {
                 matches!(
                     record.target,
-                    DocumentSyncTarget::MetadataDocumentLifecycle { .. }
+                    DocumentTarget::MetadataDocumentLifecycle { .. }
                 )
             })
             .expect("origin projection writes a lifecycle outbox record");
         assert_eq!(outbox.placement, event.record.placement);
         assert_eq!(outbox.peers, expected_holders);
-        let DocumentSyncOutboxEvent::Upsert { change, .. } = &outbox.event else {
+        let DocumentOutboxEvent::Upsert { change, .. } = &outbox.event else {
             panic!("expected lifecycle upsert outbox event");
         };
         assert_eq!(change.placement, event.record.placement);
 
         let registry = records
             .iter()
-            .find(|record| matches!(record.target, DocumentSyncTarget::MetadataRegistry { .. }))
+            .find(|record| matches!(record.target, DocumentTarget::MetadataRegistry { .. }))
             .expect("origin projection writes a registry outbox record");
         let registry_ref = registry_placement(&config, &event.record);
         assert_eq!(registry.placement, registry_ref);
@@ -1793,7 +1790,7 @@ mod tests {
             Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty()
         ));
 
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: event.record.document_id,
         };
         let lifecycle = storage
@@ -1805,12 +1802,12 @@ mod tests {
         else {
             panic!("origin must retain lifecycle transfer source, got {lifecycle:?}");
         };
-        let lifecycle: MetadataDocumentLifecycleRecord =
+        let lifecycle: MetadataLifecycleRecord =
             postcard::from_bytes(&value).expect("lifecycle decodes");
         let expected_event = event;
         assert_eq!(
             lifecycle,
-            MetadataDocumentLifecycleRecord::Upsert {
+            MetadataLifecycleRecord::Upsert {
                 event: Box::new(expected_event)
             }
         );
@@ -1861,7 +1858,7 @@ mod tests {
         // one (stage 1); it still never becomes a holder of it.
         event.record.placement = crate::placement::target_placement_ref(
             &config,
-            &DocumentSyncTarget::MetadataDocumentLifecycle {
+            &DocumentTarget::MetadataDocumentLifecycle {
                 document_id: event.record.document_id,
             },
             Default::default(),
@@ -1911,24 +1908,24 @@ mod tests {
         assert!(outbox.peers.is_empty());
         assert_eq!(
             outbox.target,
-            DocumentSyncTarget::MetadataDocumentLifecycle {
+            DocumentTarget::MetadataDocumentLifecycle {
                 document_id: event.record.document_id
             }
         );
-        let DocumentSyncOutboxEvent::Upsert { bytes, change } = outbox.event else {
+        let DocumentOutboxEvent::Upsert { bytes, change } = outbox.event else {
             panic!("expected lifecycle upsert outbox event");
         };
-        let lifecycle: MetadataDocumentLifecycleRecord =
+        let lifecycle: MetadataLifecycleRecord =
             postcard::from_bytes(&bytes).expect("lifecycle payload decodes");
         assert_eq!(
             lifecycle,
-            MetadataDocumentLifecycleRecord::Upsert {
+            MetadataLifecycleRecord::Upsert {
                 event: Box::new(event.clone())
             }
         );
         assert_eq!(
             change.kind,
-            aruna_core::document::DocumentSyncChangeKind::Upsert
+            aruna_core::document::DocumentChangeKind::Upsert
         );
         assert_eq!(change.current.event_id, event.event_id);
     }
@@ -1947,8 +1944,8 @@ mod tests {
         update.record.updated_at_ms = create.record.updated_at_ms + 1;
         update.occurred_at_ms = create.occurred_at_ms + 1;
 
-        let placement_of = |event: &MetadataCreateEventRecord| {
-            let DocumentSyncOutboxEvent::Upsert { change, .. } =
+        let placement_of = |event: &MetadataEventRecord| {
+            let DocumentOutboxEvent::Upsert { change, .. } =
                 create_outbox_record(event, Some(&config), true).event
             else {
                 panic!("expected upsert outbox event");
@@ -1961,11 +1958,11 @@ mod tests {
         assert_eq!(create_ref, placement_of(&update));
     }
 
-    fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataCreateEventRecord {
+    fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataEventRecord {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let document_id = Ulid::generate();
         let event_id = Ulid::generate();
-        MetadataCreateEventRecord {
+        MetadataEventRecord {
             event_id,
             record: MetadataRegistryRecord {
                 realm_id,
@@ -1984,7 +1981,7 @@ mod tests {
             },
             user_id: UserId::nil(realm_id),
             node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
-            payload: MetadataCreateEventPayload::RoCrate {
+            payload: MetadataEventPayload::RoCrate {
                 jsonld: String::new(),
             },
             occurred_at_ms,
