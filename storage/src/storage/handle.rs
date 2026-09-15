@@ -1,10 +1,6 @@
 //! The public storage handle: lane admission, close and drain fences, the
-//! transaction cleanup registry, and reply mapping back from the worker.
-//!
-//! Routing stays contractual here: aborts always take the foreground lane,
-//! foreground work takes the write lane, and bulk handles take the bulk lane.
-//! The three queues are never collapsed, and cleanup registration happens
-//! before an effect is queued so a dropped response still aborts it.
+//! transaction cleanup registry, and reply mapping. Aborts always take the
+//! foreground lane, and cleanup registers before an effect is queued.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
