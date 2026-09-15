@@ -21,7 +21,7 @@ use crate::startup::realm::CoreAnnouncement;
 use crate::startup::test_hooks;
 
 pub(crate) struct Background {
-    pub(crate) realm_id: aruna_core::structs::RealmId,
+    pub(crate) realm_id: aruna_core::structs::identity::realm::RealmId,
     pub(crate) node_id: iroh::PublicKey,
     pub(crate) is_initial_boot: bool,
     pub(crate) driver_ctx: Arc<DriverContext>,
@@ -212,7 +212,7 @@ pub(crate) async fn start(
 async fn publish_core(
     core_ctx: Arc<DriverContext>,
     node_id: iroh::PublicKey,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     allow_genesis: bool,
     documents: Vec<DocumentTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -254,11 +254,11 @@ mod tests {
             driver_ctx.clone(),
             task_handle.clone(),
             jobs_runtime.clone(),
-            aruna_core::structs::RoCrateLimits::default(),
+            aruna_core::structs::execution::job::RoCrateLimits::default(),
         )
         .await;
         let background = Background {
-            realm_id: aruna_core::structs::RealmId::from_bytes([7u8; 32]),
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([7u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
             is_initial_boot: false,
             driver_ctx,

@@ -454,7 +454,7 @@ async fn ensure_usage_counters(
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::global_shard_keys;
+    use aruna_core::structs::storage::usage::global_shard_keys;
     use aruna_operations::driver::drive;
     use aruna_operations::node::usage_stats::RebuildStatsOperation;
 
@@ -502,7 +502,7 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::{UsageCounters, global_shard_keys};
+    use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys};
     use aruna_storage::StorageHandle;
     use std::thread;
     use tempfile::tempdir;

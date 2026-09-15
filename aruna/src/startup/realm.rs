@@ -6,7 +6,9 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::onboarding::OnboardingPhase;
-use aruna_core::structs::{Actor, NodeCapabilities, NodeUrls, RealmNodeKind};
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_net::NetHandle;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
@@ -312,7 +314,7 @@ async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<
         config.realm_id,
         config.node_id,
         aruna_operations::placement::policy::SubjectScanMode::Revalidate(
-            aruna_core::structs::ManagedCopyQuarantine::Rejoin,
+            aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
         ),
         aruna_operations::driver::now_ms(),
     )

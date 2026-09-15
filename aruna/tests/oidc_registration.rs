@@ -10,7 +10,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
-use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, User, oidc_subject_key};
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, oidc_subject_key};
+use aruna_core::structs::identity::realm::OidcProviderConfig;
+use aruna_core::structs::identity::user::User;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::realm::announce_presence::{
@@ -212,7 +214,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
 
     let realm_signing_key = generate_signing_key();
     let realm_id =
-        aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        aruna_core::structs::identity::realm::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
     let bootstrap_user = UserId::local(Ulid::generate(), realm_id);
     drive(
         CreateRealmOperation::new(CreateRealmConfig {

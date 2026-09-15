@@ -6,11 +6,14 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::onboarding::OnboardingPhase;
-use aruna_core::structs::{
-    BlobTimeoutConfig, DynamicDiscoveryMethod, NodeBackendsConfig, NodeCapabilities,
-    OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
-    RoCrateLimits,
+use aruna_core::structs::storage::blob::BlobTimeoutConfig;
+use aruna_core::structs::identity::realm::{
+    DynamicDiscoveryMethod, OidcProviderConfig, RealmConfigDocument, RealmDiscoveryConfig, RealmId,
+    RelayPolicy,
 };
+use aruna_core::structs::storage::backends::NodeBackendsConfig;
+use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
 
 use crate::identity::{
@@ -735,10 +738,11 @@ mod tests {
     };
     use crate::settings::read_settings_from;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{
-        DynamicDiscoveryMethod, NodeCapabilities, RealmConfigDocument, RealmDiscoveryConfig,
-        RealmId, RelayPolicy, StaticRealmEndpoint,
+    use aruna_core::structs::identity::realm::{
+        DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
+        StaticRealmEndpoint,
     };
+    use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_net::{RelayMethod, format_endpoint_config};
     use aruna_storage::FjallStorage;
     use std::collections::BTreeMap;

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
-use aruna_core::structs::JobId;
+use aruna_core::structs::execution::job::JobId;
 use aws_sdk_s3::primitives::ByteStream;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, ProtocolVersion};
 use rmcp::service::RunningService;

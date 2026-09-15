@@ -22,10 +22,13 @@ use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{
     CreateSecretRequest, CreateSecretResponse, OnboardingMode, OnboardingPhase,
 };
-use aruna_core::structs::{
-    Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, ManagedCopyQuarantine,
-    NodeCapabilities, NodeUrls, PathRestriction, RealmId, TokenClaims, UserAccess,
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction, TokenClaims};
+use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BlobTimeoutConfig, ManagedCopyQuarantine, UserAccess,
 };
+use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
@@ -38,7 +41,7 @@ use aruna_operations::realm::announce_presence::{
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::GetNodesOperation;
-use aruna_operations::s3::get_access::GetAccessOperation;
+use aruna_operations::s3::access::get::GetAccessOperation;
 use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::{FjallStorage, StorageHandle};

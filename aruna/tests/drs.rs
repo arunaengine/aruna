@@ -2,10 +2,10 @@
 #![recursion_limit = "256"]
 mod shared;
 
-use aruna_core::structs::HashIndex;
+use aruna_core::structs::storage::blob::HashIndex;
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
 use reqwest::StatusCode;
 use serde_json::Value;

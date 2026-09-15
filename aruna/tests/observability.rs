@@ -760,8 +760,9 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::structs::{
-        PlacementStrategy, RealmConfigDocument, RealmDiscoveryConfig, RealmNodeKind,
+    use aruna_core::structs::placement::placement_record::PlacementStrategy;
+    use aruna_core::structs::identity::realm::{
+        RealmConfigDocument, RealmDiscoveryConfig, RealmNodeKind,
     };
 
     let storage = env.open_storage().await;
@@ -848,11 +849,11 @@ async fn load_state(
 
 async fn load_realm(
     storage: &aruna_storage::StorageHandle,
-) -> TestResult<aruna_core::structs::RealmConfigDocument> {
+) -> TestResult<aruna_core::structs::identity::realm::RealmConfigDocument> {
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::structs::RealmConfigDocument;
+    use aruna_core::structs::identity::realm::RealmConfigDocument;
 
     match storage
         .send_storage_effect(StorageEffect::Iter {
@@ -921,7 +922,7 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
-    use aruna_core::structs::PlacementRef;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
     use aruna_operations::sync::document_outbox::{new_outbox_record, outbox_write_entry};
 
     let storage = env.open_storage().await;

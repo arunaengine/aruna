@@ -9,10 +9,13 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use aruna_api::s3::server::S3ServerTimeouts;
-use aruna_core::structs::{
-    Backend, BackendConfig, BackendsFile, BlobTimeoutConfig, KIND_LABEL_KEY, LOCATION_LABEL_KEY,
-    NodeBackendsConfig, OidcProviderConfig, RoCrateLimits, STORAGE_CLASS_LABEL_PREFIX,
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConfig};
+use aruna_core::structs::storage::backends::{BackendsFile, NodeBackendsConfig};
+use aruna_core::structs::storage::node_info::{
+    KIND_LABEL_KEY, LOCATION_LABEL_KEY, STORAGE_CLASS_LABEL_PREFIX,
 };
+use aruna_core::structs::identity::realm::OidcProviderConfig;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_net::IrohRuntimeConfig;
 use aruna_operations::metadata::MetadataSearchStorage;
 use aruna_storage::FjallPersistPolicy;

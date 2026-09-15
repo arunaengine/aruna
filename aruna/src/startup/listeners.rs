@@ -10,7 +10,7 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::NodeCapabilities;
+use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -29,7 +29,7 @@ pub(crate) struct ServerBindings {
     /// The optional session bridge listener, joined with the other ingress
     /// listeners instead of being left to its cancellation token.
     pub(crate) session_s3_handle: Option<S3ServerHandle>,
-    pub(crate) realm_id: aruna_core::structs::RealmId,
+    pub(crate) realm_id: aruna_core::structs::identity::realm::RealmId,
     pub(crate) node_id: iroh::PublicKey,
     pub(crate) is_initial_boot: bool,
     /// Present on a user node only: the owner's local wipe latch.
@@ -82,13 +82,13 @@ fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
 
 /// The filesystem roots a wipe has to visit, and the backends it cannot erase.
 fn backend_wipe(
-    backends: &aruna_core::structs::NodeBackendsConfig,
+    backends: &aruna_core::structs::storage::backends::NodeBackendsConfig,
 ) -> (Vec<std::path::PathBuf>, Vec<String>) {
     let mut roots = Vec::new();
     let mut unsupported = Vec::new();
     for entry in &backends.backends {
         match entry.config.backend_type {
-            aruna_core::structs::Backend::FileSystem => {
+            aruna_core::structs::storage::blob::Backend::FileSystem => {
                 roots.push(std::path::PathBuf::from(&entry.config.root));
             }
             _ => unsupported.push(entry.name.clone()),
@@ -112,10 +112,10 @@ pub(crate) async fn device_wipe_armed(wipe: Option<&Arc<DeviceWipe>>) {
 /// configuration is consumed.
 struct SessionS3 {
     address: std::net::SocketAddr,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     node_id: iroh::PublicKey,
     key: aruna_core::credential_encryption::CredentialEncryptionKey,
-    rocrate_limits: aruna_core::structs::RoCrateLimits,
+    rocrate_limits: aruna_core::structs::execution::job::RoCrateLimits,
 }
 
 /// Serves the node's S3 plane on the session bridge gateway too. A bind failure
@@ -461,7 +461,8 @@ mod tests {
     async fn session_exit_reports() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
-        use aruna_core::structs::{RealmId, RoCrateLimits};
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::execution::job::RoCrateLimits;
 
         // A real session listener that stopped on its shutdown token is
         // reported, never treated as a node failure.
@@ -647,7 +648,8 @@ mod tests {
     async fn session_listener_completes() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
-        use aruna_core::structs::{RealmId, RoCrateLimits};
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::execution::job::RoCrateLimits;
 
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
@@ -695,7 +697,8 @@ mod tests {
     async fn abort_awaits_children() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
-        use aruna_core::structs::{RealmId, RoCrateLimits};
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::execution::job::RoCrateLimits;
 
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
@@ -743,24 +746,24 @@ mod pure_tests {
 
     fn backend(
         name: &str,
-        backend_type: aruna_core::structs::Backend,
+        backend_type: aruna_core::structs::storage::blob::Backend,
         root: &str,
-    ) -> aruna_core::structs::NodeBackendEntry {
-        aruna_core::structs::NodeBackendEntry {
+    ) -> aruna_core::structs::storage::backends::NodeBackendEntry {
+        aruna_core::structs::storage::backends::NodeBackendEntry {
             name: name.to_string(),
-            config: aruna_core::structs::BackendConfig {
+            config: aruna_core::structs::storage::blob::BackendConfig {
                 backend_type,
                 root: root.to_string(),
                 service_config: std::collections::HashMap::new(),
                 bucket_prefix: None,
                 max_bucket_size: None,
                 multipart_bucket: None,
-                timeouts: aruna_core::structs::BlobTimeoutConfig::default(),
+                timeouts: aruna_core::structs::storage::blob::BlobTimeoutConfig::default(),
             },
             class: None,
             allow_tenants: true,
             quota_bytes: None,
-            cleanup: aruna_core::structs::CleanupStrategy::node_default(),
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::node_default(),
         }
     }
 
@@ -768,10 +771,10 @@ mod pure_tests {
     // cannot erase must be named instead of quietly reported as wiped.
     #[test]
     fn wipe_covers_backends() {
-        let backends = aruna_core::structs::NodeBackendsConfig {
+        let backends = aruna_core::structs::storage::backends::NodeBackendsConfig {
             backends: vec![
-                backend("hot", aruna_core::structs::Backend::FileSystem, "/srv/hot"),
-                backend("cold", aruna_core::structs::Backend::S3, ""),
+                backend("hot", aruna_core::structs::storage::blob::Backend::FileSystem, "/srv/hot"),
+                backend("cold", aruna_core::structs::storage::blob::Backend::S3, ""),
             ],
             default_name: "hot".to_string(),
             rules: Vec::new(),

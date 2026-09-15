@@ -7,7 +7,7 @@ use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::realm_presence_key;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;

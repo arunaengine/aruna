@@ -13,11 +13,12 @@ use std::time::{Duration, Instant};
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::id::NodeId;
-use aruna_core::structs::{
-    CapturedInput, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, InputMode,
-    InputSelection, InputSource, JobId, JobPayload, JobRecord, JobState, OutputDestination,
-    OutputSelection, RunCrateStatus, checksum::HASH_BLAKE3,
+use aruna_core::structs::execution::job::{
+    CapturedInput, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
+    JobPayload, JobRecord, JobState, OutputDestination, OutputSelection, RunCrateStatus,
 };
+use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::reconcile::ExternalReconciler;
@@ -29,7 +30,7 @@ use aruna_operations::jobs::store::{
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::jobs::workflow::reconcile::ComputeReconciler;
 use aruna_operations::jobs::workflow::run_execution_job;
-use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
 use shared::{
     S3Credentials, TestResult, create_bearer_token, create_group_http, create_s3_credentials,

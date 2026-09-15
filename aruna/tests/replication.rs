@@ -17,11 +17,14 @@ use aruna_core::keyspaces::{
     BLOB_REPLICATION_JOB_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE,
     SYNC_RELATIONSHIP_OUT_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
-use aruna_core::structs::{
-    AuthContext, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, PathRestriction,
-    Permission, SourceConnectorKind, StagingStrategy, SyncRelationship, SyncState, UsageCounters,
-    VersionKey, group_permission_path, sync_relationship_key,
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey, group_permission_path,
 };
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
+use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use aws_sdk_s3::Client as S3Client;
@@ -541,8 +544,8 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
                 },
             )
             .await?;
-        let source_arn = aruna_core::structs::ArunaArn::parse(&relationship.source)?;
-        let target_arn = aruna_core::structs::ArunaArn::parse(&relationship.target)?;
+        let source_arn = aruna_core::structs::storage::replication::ArunaArn::parse(&relationship.source)?;
+        let target_arn = aruna_core::structs::storage::replication::ArunaArn::parse(&relationship.target)?;
         assert_eq!(source_arn.bucket(), Some(source_bucket));
         assert_eq!(source_arn.key_prefix(), Some("selected/"));
         assert_eq!(target_arn.bucket(), Some(target_bucket));

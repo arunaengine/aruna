@@ -3,7 +3,8 @@
 mod shared;
 
 use aruna_api::routes::credentials::CreatePathRestriction;
-use aruna_core::structs::{PathRestriction, Permission, group_permission_path};
+use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+use aruna_core::structs::storage::blob::group_permission_path;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use reqwest::StatusCode;
 use shared::{
