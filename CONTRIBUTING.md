@@ -77,9 +77,12 @@ recipe checks. The local recipes are not the entire CI matrix.
   physical lines after formatting; one or two are preferred. Longer rationale
   belongs in `docs/` or the commit message.
 - **Fixtures.** Raw assets live under `tests/fixtures/` in the owning crate
-  (`operations/tests/fixtures/`, `blob/tests/fixtures/`); fixture helper code
-  lives in the crate's `tests` helper directory beside its domain
-  (`api/src/tests/assistant.rs`, `operations/src/tests/s3.rs`).
+  (`operations/tests/fixtures/`, `blob/tests/fixtures/`). Fixture helper code
+  lives in a `src/tests/` folder beside its domain when the helper family
+  qualifies under the folder threshold (four or more real entries besides
+  `mod.rs`; `api/src/tests/assistant.rs`, `operations/src/tests/s3.rs`);
+  otherwise it stays a hoisted sibling file declared with an explicit `#[path]`
+  (`aruna/src/bootstrap_tests.rs`).
 - **Behavior homes.** Bucket, object, multipart, and access operations belong
   under `operations/src/s3/<family>/`; routes under
   `api/src/routes/{execution,access,storage}/`; records under

@@ -23,11 +23,13 @@ Add behavior to the family that already owns it:
   stay flat under `api/src/routes/`;
 - persisted records: `core/src/structs/{placement,identity,storage,execution}/`;
 - effect adapters: `operations/src/effect_adapters/`;
-- test helpers and hoisted tests: beside their subject, following the
-  `aruna/src/bootstrap_tests.rs` pattern;
+- test helpers: in a `src/tests/` folder beside the domain when the helper
+  family qualifies under the folder threshold (four or more real entries
+  besides `mod.rs`; `api/src/tests/assistant.rs`,
+  `operations/src/tests/s3.rs`), otherwise a hoisted sibling file declared
+  with an explicit `#[path]` (`aruna/src/bootstrap_tests.rs`);
 - raw fixture assets: the owning crate's `tests/fixtures/`
-  (`operations/tests/fixtures/`, `blob/tests/fixtures/`), with fixture helper
-  code in `src/tests/` beside its domain (`api/src/tests/assistant.rs`).
+  (`operations/tests/fixtures/`, `blob/tests/fixtures/`).
 
 A new subfolder needs at least four real cohesive entries besides `mod.rs`,
 where a nested module folder counts as one cohesive entry; `CONTRIBUTING.md`
@@ -94,12 +96,12 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 ## Add a background queue or timer
 
 1. Add the `TaskKey` variant in `core/src/task.rs`.
-2. Handle `TaskEvent` for it in `operations/src/tasks/incoming.rs` and
+2. Handle `TaskEvent` for it in `operations/src/tasks/incoming/mod.rs` and
    register the handler/queue with the shared `TaskHandle` lifecycle owner:
    `install_task_queues` installs the handler, and
    `TaskQueues::restore_and_start` restores durable timers and starts the
    re-arm loop under the caller's `Shutdown`
-   (`operations/src/tasks/incoming_restore.rs`).
+   (`operations/src/tasks/incoming/restore.rs`).
 3. Production startup starts queues in `aruna/src/startup/background.rs`
    (`STARTUP_PHASES`); put restore/install work there, not in the task crate
    root.
@@ -109,11 +111,11 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 ## Add a compute backend
 
 1. Implement `ExecutorBackend` in `compute/src/executor/<backend>.rs`.
-2. Add the backend's typed settings to `aruna/src/compute_setup.rs` and read
-   them once in `aruna/src/compute_setup_settings.rs::collect`.
+2. Add the backend's typed settings to `aruna/src/compute_setup/mod.rs` and
+   read them once in `aruna/src/compute_setup/settings.rs::collect`.
 3. Add the feature to `compute/Cargo.toml` and `aruna/Cargo.toml`, gate the
    module at the backend boundary, build the registry in
-   `aruna/src/compute_setup_<backend>.rs`.
+   `aruna/src/compute_setup/<backend>.rs`.
 4. Check every selection locally, feature-explicit and per package, as
    `just check` and CI do:
    `cargo check -p aruna-compute --all-targets --no-default-features --features <backend>`
