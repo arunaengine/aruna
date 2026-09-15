@@ -71,7 +71,7 @@ pub enum ArunaBearerError {
     #[error(transparent)]
     FromSliceError(#[from] TryFromSliceError),
     #[error(transparent)]
-    PublicKeyConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
+    PublicConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
     #[error(transparent)]
     JwtError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
@@ -224,9 +224,9 @@ pub fn bearer_decoding_key(issuer_pubkey: &str) -> Result<DecodingKey, ArunaBear
 }
 
 /// Maximum number of issuer decoding keys retained in the process cache.
-pub const ISSUER_KEY_CACHE_CAPACITY: usize = 1024;
+pub const KEY_CACHE_CAPACITY: usize = 1024;
 /// Time an issuer decoding key is retained before it is refreshed.
-pub const ISSUER_KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
+pub const KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 /// Bounded, TTL + LRU cache of issuer decoding keys keyed by base64 public key.
 pub struct IssuerKeyCache {
@@ -254,7 +254,7 @@ impl Default for IssuerKeyCache {
 
 impl IssuerKeyCache {
     pub fn new() -> Self {
-        Self::with_limits(ISSUER_KEY_CACHE_CAPACITY, ISSUER_KEY_CACHE_TTL)
+        Self::with_limits(KEY_CACHE_CAPACITY, KEY_CACHE_TTL)
     }
 
     pub fn with_limits(capacity: usize, ttl: Duration) -> Self {
@@ -311,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn evicts_beyond_capacity() {
-        let cache = IssuerKeyCache::with_limits(2, ISSUER_KEY_CACHE_TTL);
+        let cache = IssuerKeyCache::with_limits(2, KEY_CACHE_TTL);
         for _ in 0..5 {
             let key = generate_signing_key();
             cache.get_or_insert(&pubkey_b64(&key)).await.unwrap();
@@ -451,7 +451,7 @@ mod tests {
         // An overlong token must stay rejected as it ages: the bound is the
         // signed lifetime, not the validity still remaining.
         let state = SkewState { now: FIXED_NOW };
-        let max = aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS;
+        let max = aruna_core::auth::MAX_TOKEN_LIFETIME;
         let claims = lifetime_claims(FIXED_NOW - max, FIXED_NOW + 600);
 
         assert!(matches!(

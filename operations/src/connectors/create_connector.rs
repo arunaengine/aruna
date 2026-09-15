@@ -49,7 +49,7 @@ pub enum SourceConnectorError {
     #[error(transparent)]
     ValidationError(#[from] ValidationError),
     #[error("CreateSourceConnector failed")]
-    CreateSourceConnectorFailed,
+    CreateConnectorFailed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
     InvalidStateEvent {
         state: SourceConnectorState,
@@ -114,7 +114,7 @@ impl SourceConnectorOperation {
             Err(error) => return self.emit_error(error.into()),
         };
         let mut writes = vec![(
-            aruna_core::keyspaces::SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+            aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
             source_connector_key(connector.group_id, connector.connector_id),
             connector_bytes.into(),
         )];
@@ -124,7 +124,7 @@ impl SourceConnectorOperation {
                 Err(error) => return self.emit_error(error.into()),
             };
             writes.push((
-                aruna_core::keyspaces::SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+                aruna_core::keyspaces::SOURCE_SECRET_KEYSPACE.to_string(),
                 connector_secret_key(secret.connector_id),
                 secret_bytes.into(),
             ));
@@ -149,7 +149,7 @@ impl SourceConnectorOperation {
         };
 
         let Some(connector) = self.connector.clone() else {
-            return self.emit_error(SourceConnectorError::CreateSourceConnectorFailed);
+            return self.emit_error(SourceConnectorError::CreateConnectorFailed);
         };
 
         self.state = SourceConnectorState::Finish;
@@ -190,11 +190,11 @@ impl Operation for SourceConnectorOperation {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(SourceConnectorError::CreateSourceConnectorFailed);
+            return Err(SourceConnectorError::CreateConnectorFailed);
         }
 
         self.output
-            .ok_or(SourceConnectorError::CreateSourceConnectorFailed)?
+            .ok_or(SourceConnectorError::CreateConnectorFailed)?
     }
 
     fn abort(&mut self) -> Effects {

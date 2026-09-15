@@ -5,7 +5,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    JOB_KEYSPACE, NODE_STATE_KEYSPACE, ROCRATE_UPLOAD_CLEANUP_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
+    JOB_KEYSPACE, NODE_STATE_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{BackendLocation, HiddenBlobEntry, HiddenBlobKey};
 use aruna_core::structs::execution::job::{
@@ -203,7 +203,7 @@ async fn sweep_upload_cleanups(
         time_left(deadline),
         iter_prefix_page(
             &context.storage_handle,
-            ROCRATE_UPLOAD_CLEANUP_KEYSPACE,
+            UPLOAD_CLEANUP_KEYSPACE,
             None,
             start_after,
             SWEEP_PAGE_SIZE,
@@ -683,7 +683,7 @@ async fn delete_cleanup(
     let event = tokio::time::timeout(
         time_left(deadline),
         storage.send_storage_effect(StorageEffect::Delete {
-            key_space: ROCRATE_UPLOAD_CLEANUP_KEYSPACE.to_string(),
+            key_space: UPLOAD_CLEANUP_KEYSPACE.to_string(),
             key,
             txn_id: None,
         }),

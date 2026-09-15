@@ -45,9 +45,9 @@ pub enum DeleteSourceError {
     #[error("Connector not found")]
     NotFound,
     #[error("Connector credentials are referenced by object versions")]
-    ReferencedByObjectVersion,
+    ReferencedObjectVersion,
     #[error("DeleteSourceConnector failed")]
-    DeleteSourceConnectorFailed,
+    DeleteConnectorFailed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
     InvalidStateEvent {
         state: DeleteSourceState,
@@ -170,7 +170,7 @@ impl DeleteSourceOperation {
     fn handle_scan_page(&mut self, event: Event) -> Effects {
         match parse_scan_page(event, self.input.connector_id) {
             Ok(ScanStep::Referenced) => {
-                self.abort_with_error(DeleteSourceError::ReferencedByObjectVersion)
+                self.abort_with_error(DeleteSourceError::ReferencedObjectVersion)
             }
             Ok(ScanStep::NextPage(start_after)) => self.scan_reference_versions(Some(start_after)),
             Ok(ScanStep::Complete) => self.delete_records(),
@@ -216,11 +216,11 @@ impl DeleteSourceOperation {
     fn delete_records(&mut self) -> Effects {
         let deletes = vec![
             (
-                aruna_core::keyspaces::SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+                aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
                 source_connector_key(self.input.group_id, self.input.connector_id),
             ),
             (
-                aruna_core::keyspaces::SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+                aruna_core::keyspaces::SOURCE_SECRET_KEYSPACE.to_string(),
                 connector_secret_key(self.input.connector_id),
             ),
         ];
@@ -294,11 +294,11 @@ impl Operation for DeleteSourceOperation {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(DeleteSourceError::DeleteSourceConnectorFailed);
+            return Err(DeleteSourceError::DeleteConnectorFailed);
         }
 
         self.output
-            .ok_or(DeleteSourceError::DeleteSourceConnectorFailed)?
+            .ok_or(DeleteSourceError::DeleteConnectorFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -549,7 +549,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(DeleteSourceError::ReferencedByObjectVersion)
+            Err(DeleteSourceError::ReferencedObjectVersion)
         );
     }
 
@@ -632,7 +632,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(DeleteSourceError::ReferencedByObjectVersion)
+            Err(DeleteSourceError::ReferencedObjectVersion)
         );
     }
 
@@ -757,7 +757,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Err(DeleteSourceError::ReferencedByObjectVersion));
+        assert_eq!(result, Err(DeleteSourceError::ReferencedObjectVersion));
 
         let access = drive(
             ResolveBindingOperation::new(ResolveBindingInput { source }),

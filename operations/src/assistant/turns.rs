@@ -6,11 +6,11 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{ASSISTANT_CHAT_HEAD_KEYSPACE, ASSISTANT_CHAT_TURN_KEYSPACE};
+use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHAT_TURNS,
-    MAX_ASSISTANT_TURN_BYTES,
+    AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_TURNS,
+    MAX_TURN_BYTES,
 };
 use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
@@ -215,7 +215,7 @@ impl WriteTurnOperation {
                 .next_seq
                 .saturating_sub(head.first_seq)
                 .saturating_add(1)
-                .saturating_sub(MAX_ASSISTANT_CHAT_TURNS);
+                .saturating_sub(MAX_ASSISTANT_TURNS);
             if over == 0 {
                 self.state = WriteTurnState::SumBytes { head };
                 return smallvec![iter_heads(self.user_id, Some(txn_id))];
@@ -275,7 +275,7 @@ impl WriteTurnOperation {
         let total = held
             .saturating_sub(self.freed)
             .saturating_add(self.payload.len() as u64);
-        if total > MAX_ASSISTANT_CHAT_BYTES {
+        if total > MAX_ASSISTANT_BYTES {
             return self.fail(ChatStoreError::TooLarge(BUDGET_CAP));
         }
         if self.trim.is_empty() {
@@ -287,7 +287,7 @@ impl WriteTurnOperation {
         let deletes = self
             .trim
             .iter()
-            .map(|key| (ASSISTANT_CHAT_TURN_KEYSPACE.to_string(), key.clone()))
+            .map(|key| (CHAT_TURN_KEYSPACE.to_string(), key.clone()))
             .collect();
         self.state = WriteTurnState::TrimTurns { head };
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -333,12 +333,12 @@ impl WriteTurnOperation {
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes: vec![
                 (
-                    ASSISTANT_CHAT_TURN_KEYSPACE.to_string(),
+                    CHAT_TURN_KEYSPACE.to_string(),
                     turn_key(self.user_id, &self.chat_id, self.seq),
                     turn_bytes.into(),
                 ),
                 (
-                    ASSISTANT_CHAT_HEAD_KEYSPACE.to_string(),
+                    CHAT_HEAD_KEYSPACE.to_string(),
                     head_key(self.user_id, &self.chat_id),
                     head_bytes.into(),
                 ),
@@ -373,7 +373,7 @@ impl Operation for WriteTurnOperation {
     type Error = ChatStoreError;
 
     fn start(&mut self) -> Effects {
-        if self.payload.len() > MAX_ASSISTANT_TURN_BYTES {
+        if self.payload.len() > MAX_TURN_BYTES {
             return self.fail(ChatStoreError::TooLarge(TURN_CAP));
         }
         self.state = WriteTurnState::StartTransaction;

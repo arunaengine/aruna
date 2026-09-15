@@ -6,8 +6,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
@@ -35,10 +35,10 @@ const CLEANUP_PAGE_SIZE: usize = 128;
 const MAX_CLEANUP_RETRIES: u8 = 3;
 /// An `Open` upload nobody added to or aborted is abandoned; S3 lifecycle rules
 /// use the same order of magnitude.
-const UPLOAD_OPEN_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const OPEN_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// A `Completing` upload past the completion deadline lost the request that
 /// owned it; the margin keeps the sweep off a completion still running.
-const UPLOAD_COMPLETING_TTL_MS: u64 =
+const COMPLETING_TTL_MS: u64 =
     COMPLETION_DEADLINE_MS + BLOB_CLEANUP_AFTER.as_millis() as u64;
 /// Aborts are transactional, so one run reclaims a bounded slice of the backlog.
 const UPLOAD_SWEEP_BATCH: usize = 32;
@@ -122,7 +122,7 @@ fn cleanup_row_write(work: &BlobCleanupWork, key: &Key) -> Option<Effect> {
 
 pub fn schedule_cleanup_effect() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::DrainBlobCleanupQueue,
+        key: TaskKey::DrainCleanupQueue,
         after: Duration::ZERO,
     })
 }
@@ -205,11 +205,11 @@ fn stale_upload(record: &MultipartUpload, now_ms: u64) -> bool {
         .map(|since| now_ms.saturating_sub(since.as_millis() as u64))
         .unwrap_or_default();
     match record.status {
-        MultipartUploadStatus::Open => age >= UPLOAD_OPEN_TTL_MS,
+        MultipartUploadStatus::Open => age >= OPEN_TTL_MS,
         MultipartUploadStatus::Completing => record
             .completing_since_ms
-            .map(|since| now_ms.saturating_sub(since) >= UPLOAD_COMPLETING_TTL_MS)
-            .unwrap_or(age >= UPLOAD_COMPLETING_TTL_MS),
+            .map(|since| now_ms.saturating_sub(since) >= COMPLETING_TTL_MS)
+            .unwrap_or(age >= COMPLETING_TTL_MS),
         MultipartUploadStatus::Aborting => false,
     }
 }
@@ -228,7 +228,7 @@ pub async fn sweep_stale_uploads(
     while stale.len() < UPLOAD_SWEEP_BATCH {
         let (values, next) = iter_prefix_page(
             &context.storage_handle,
-            S3_MULTIPART_UPLOAD_KEYSPACE,
+            UPLOAD_KEYSPACE,
             None,
             start_after,
             CLEANUP_PAGE_SIZE,
@@ -292,7 +292,7 @@ async fn is_removed_backend(context: &DriverContext, backend: &BackendRef) -> bo
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
             key: backend_key(*backend_id),
             txn_id: None,
         })
@@ -429,7 +429,7 @@ async fn owns_write(
             upload_id,
             part_number,
         } => (
-            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+            UPLOAD_PART_KEYSPACE,
             MultipartPartKey::new(*upload_id, *part_number)
                 .to_bytes()
                 .ok()?

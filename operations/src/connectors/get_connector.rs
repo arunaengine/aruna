@@ -42,7 +42,7 @@ pub enum GetSourceError {
     #[error("Connector not found")]
     NotFound,
     #[error("GetSourceConnector failed")]
-    GetSourceConnectorFailed,
+    GetConnectorFailed,
 }
 
 impl From<StorageReadError> for GetSourceError {
@@ -106,7 +106,7 @@ impl GetSourceOperation {
             Ok(secret) => {
                 self.has_secret_config = secret.is_some();
                 let Some(connector) = self.connector.clone() else {
-                    return self.emit_error(GetSourceError::GetSourceConnectorFailed);
+                    return self.emit_error(GetSourceError::GetConnectorFailed);
                 };
                 self.state = GetSourceState::Finish;
                 self.output = Some(Ok(GetSourceResult {
@@ -147,11 +147,11 @@ impl Operation for GetSourceOperation {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(GetSourceError::GetSourceConnectorFailed);
+            return Err(GetSourceError::GetConnectorFailed);
         }
 
         self.output
-            .ok_or(GetSourceError::GetSourceConnectorFailed)?
+            .ok_or(GetSourceError::GetConnectorFailed)?
     }
 
     fn abort(&mut self) -> Effects {

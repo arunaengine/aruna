@@ -2,7 +2,7 @@ use super::*;
 use aruna_core::events::StorageEvent;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AssistantChatTurn, MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHATS, MAX_ASSISTANT_TURN_BYTES,
+    AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_TURN_BYTES,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use ulid::Ulid;
@@ -187,7 +187,7 @@ fn lists_live_heads() {
     let mut gone = head("c", 1, 5);
     gone.deleted_at = Some(11);
     let mut operation = ListChatOperation::new(user());
-    assert!(is_iter(&operation.start(), ASSISTANT_CHAT_HEAD_KEYSPACE));
+    assert!(is_iter(&operation.start(), CHAT_HEAD_KEYSPACE));
     assert!(!operation.is_complete());
     operation.step(heads_iter(&[old.clone(), gone, new.clone()]));
 
@@ -271,7 +271,7 @@ fn creates_a_head() {
     assert_eq!(operation.start().len(), 1);
     operation.step(started());
     let effects = operation.step(head_read(None));
-    assert!(is_iter(&effects, ASSISTANT_CHAT_HEAD_KEYSPACE));
+    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
     let effects = operation.step(heads_iter(&[head("other", 1, 1)]));
     assert!(is_write(&effects));
     operation.step(written());
@@ -367,7 +367,7 @@ fn appends_a_turn() {
     assert_eq!(operation.start().len(), 1);
     operation.step(started());
     let effects = operation.step(head_read(Some(&head(CHAT, 4, 9))));
-    assert!(is_iter(&effects, ASSISTANT_CHAT_HEAD_KEYSPACE));
+    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
     let effects = operation.step(heads_iter(&[head(CHAT, 4, 9), head("other", 1, 100)]));
     let Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) = effects.first() else {
         panic!("expected a batch write, got {effects:?}");
@@ -407,7 +407,7 @@ fn rewrites_the_tail() {
     let effects = operation.step(head_read(Some(&head(CHAT, 4, 9))));
     assert_eq!(iter_start(&effects), Some((turn_key(user(), CHAT, 3), 1)));
     let effects = operation.step(turns_iter(&[turn(3, "abcd")]));
-    assert!(is_iter(&effects, ASSISTANT_CHAT_HEAD_KEYSPACE));
+    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
     assert!(is_batch_write(
         &operation.step(heads_iter(&[head(CHAT, 4, 9)]))
     ));
@@ -432,12 +432,12 @@ fn trims_old_turns() {
     let effects = operation.step(head_read(Some(&full)));
     assert_eq!(iter_start(&effects), Some((turn_key(user(), CHAT, 10), 1)));
     let effects = operation.step(turns_iter(&[turn(10, "old!!")]));
-    assert!(is_iter(&effects, ASSISTANT_CHAT_HEAD_KEYSPACE));
+    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
     let effects = operation.step(heads_iter(&[full.clone()]));
     assert_eq!(
         deleted_keys(&effects),
         vec![(
-            ASSISTANT_CHAT_TURN_KEYSPACE.to_string(),
+            CHAT_TURN_KEYSPACE.to_string(),
             turn_key(user(), CHAT, 10)
         )]
     );
@@ -484,12 +484,12 @@ fn refuses_stale_revision() {
     operation.start();
     operation.step(started());
     let effects = operation.step(head_read(Some(&head(CHAT, 4, 9))));
-    assert!(is_iter(&effects, ASSISTANT_CHAT_HEAD_KEYSPACE));
+    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
 }
 
 #[test]
 fn refuses_large_turn() {
-    let payload = "x".repeat(MAX_ASSISTANT_TURN_BYTES + 1);
+    let payload = "x".repeat(MAX_TURN_BYTES + 1);
     let mut operation = WriteTurnOperation::new(user(), CHAT.to_string(), 0, payload, None, 50);
 
     assert!(operation.start().is_empty());
@@ -502,7 +502,7 @@ fn refuses_large_turn() {
 #[test]
 fn refuses_over_budget() {
     // The bytes a write releases count in the user's favour.
-    let other = head("other", 1, MAX_ASSISTANT_CHAT_BYTES - 12);
+    let other = head("other", 1, MAX_ASSISTANT_BYTES - 12);
     let mut operation = turn_op(4, "abcd");
     operation.start();
     operation.step(started());

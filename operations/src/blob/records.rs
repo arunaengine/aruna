@@ -2,7 +2,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer, HashIndex,
@@ -158,7 +158,7 @@ pub fn add_index_effect(
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Write {
-        key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+        key_space: PATHS_INDEX_KEYSPACE.to_string(),
         key: context
             .path_index_key(blake3_hash, version_id)
             .to_bytes()?
@@ -175,7 +175,7 @@ pub fn delete_index_effect(
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Delete {
-        key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+        key_space: PATHS_INDEX_KEYSPACE.to_string(),
         key: context
             .path_index_key(blake3_hash, version_id)
             .to_bytes()?
@@ -199,7 +199,7 @@ pub fn iter_hash_page(
     limit: usize,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Iter {
-        key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+        key_space: PATHS_INDEX_KEYSPACE.to_string(),
         prefix: Some(HashIndex::hash_prefix(blake3_hash)?.into()),
         start: start_after.map(IterStart::After),
         limit,

@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::replication::dht_registration::dht_registration_effect;
 
-const HOLDER_REFRESH_PAGE_SIZE: usize = 256;
+const REFRESH_PAGE_SIZE: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RefreshState {
@@ -80,7 +80,7 @@ impl RefreshHoldersOperation {
             key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
             prefix: None,
             start: start.map(IterStart::After),
-            limit: HOLDER_REFRESH_PAGE_SIZE,
+            limit: REFRESH_PAGE_SIZE,
             txn_id: None,
         })]
     }
@@ -387,7 +387,7 @@ mod pure_tests {
             first.as_slice(),
             [Effect::Storage(StorageEffect::Iter {
                 key_space,
-                limit: HOLDER_REFRESH_PAGE_SIZE,
+                limit: REFRESH_PAGE_SIZE,
                 start: None,
                 ..
             })] if key_space == BLOB_LOCATIONS_KEYSPACE

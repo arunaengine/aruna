@@ -25,9 +25,9 @@ use crate::error::{NetError, Result};
 use crate::telemetry::{duration_ms, record_duration_ms, warn_iroh_phase, warn_iroh_request};
 
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
-const INBOUND_CONNECTION_GLOBAL_LIMIT: usize = 256;
-const INBOUND_CONNECTION_PEER_LIMIT: usize = 8;
-const INBOUND_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const INBOUND_CONNECTION_LIMIT: usize = 256;
+const CONNECTION_PEER_LIMIT: usize = 8;
+const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INBOUND_CONNECTION_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Configured node kind per realm key, shared with every subsystem that has to
@@ -183,7 +183,7 @@ struct ConnectionTimers {
 impl ConnectionTimers {
     fn new() -> Self {
         Self {
-            idle: Box::pin(tokio::time::sleep(INBOUND_CONNECTION_IDLE_TIMEOUT)),
+            idle: Box::pin(tokio::time::sleep(INBOUND_IDLE_TIMEOUT)),
             lifetime: Box::pin(tokio::time::sleep(INBOUND_CONNECTION_LIFETIME)),
         }
     }
@@ -191,7 +191,7 @@ impl ConnectionTimers {
     fn activity(&mut self) {
         self.idle
             .as_mut()
-            .reset(tokio::time::Instant::now() + INBOUND_CONNECTION_IDLE_TIMEOUT);
+            .reset(tokio::time::Instant::now() + INBOUND_IDLE_TIMEOUT);
     }
 }
 
@@ -209,7 +209,7 @@ struct InboundConnectionState {
 impl InboundConnectionBudget {
     fn acquire(self: &Arc<Self>) -> Option<InboundConnectionPermit> {
         let mut state = self.state.lock();
-        if state.global >= INBOUND_CONNECTION_GLOBAL_LIMIT {
+        if state.global >= INBOUND_CONNECTION_LIMIT {
             return None;
         }
         state.global += 1;
@@ -229,7 +229,7 @@ impl InboundConnectionPermit {
     fn admit(&mut self, peer: NodeId) -> bool {
         let mut state = self.budget.state.lock();
         let held = state.per_peer.get(&peer).copied().unwrap_or(0);
-        if held >= INBOUND_CONNECTION_PEER_LIMIT {
+        if held >= CONNECTION_PEER_LIMIT {
             return false;
         }
         *state.per_peer.entry(peer).or_insert(0) += 1;
@@ -612,7 +612,7 @@ pub async fn run_accept_loop(
     shutdown: CancellationToken,
 ) {
     let inbound_budget = Arc::new(InboundConnectionBudget::default());
-    let handshake_budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_GLOBAL_LIMIT));
+    let handshake_budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_LIMIT));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -985,7 +985,7 @@ mod tests {
     fn global_cap() {
         let budget = Arc::new(InboundConnectionBudget::default());
         let mut permits = Vec::new();
-        for _ in 0..INBOUND_CONNECTION_GLOBAL_LIMIT {
+        for _ in 0..INBOUND_CONNECTION_LIMIT {
             permits.push(budget.acquire().expect("within global limit"));
         }
         assert!(budget.acquire().is_none());
@@ -993,9 +993,9 @@ mod tests {
 
     #[test]
     fn handshake_cap() {
-        let budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_GLOBAL_LIMIT));
+        let budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_LIMIT));
         let mut permits = Vec::new();
-        for _ in 0..INBOUND_CONNECTION_GLOBAL_LIMIT {
+        for _ in 0..INBOUND_CONNECTION_LIMIT {
             permits.push(
                 budget
                     .clone()
@@ -1010,7 +1010,7 @@ mod tests {
     fn peer_cap() {
         let budget = Arc::new(InboundConnectionBudget::default());
         let mut permits = Vec::new();
-        for _ in 0..INBOUND_CONNECTION_PEER_LIMIT {
+        for _ in 0..CONNECTION_PEER_LIMIT {
             let mut permit = budget.acquire().expect("within global limit");
             assert!(permit.admit(peer(1)));
             permits.push(permit);
@@ -1024,7 +1024,7 @@ mod tests {
     fn peer_fairness() {
         let budget = Arc::new(InboundConnectionBudget::default());
         let mut first = Vec::new();
-        for _ in 0..INBOUND_CONNECTION_PEER_LIMIT {
+        for _ in 0..CONNECTION_PEER_LIMIT {
             let mut permit = budget.acquire().expect("within global limit");
             assert!(permit.admit(peer(1)));
             first.push(permit);
@@ -1225,11 +1225,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn activity_resets_idle() {
         let mut timers = ConnectionTimers::new();
-        tokio::time::advance(INBOUND_CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        tokio::time::advance(INBOUND_IDLE_TIMEOUT - Duration::from_secs(1)).await;
         timers.activity();
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(!timers.idle.is_elapsed());
-        tokio::time::advance(INBOUND_CONNECTION_IDLE_TIMEOUT).await;
+        tokio::time::advance(INBOUND_IDLE_TIMEOUT).await;
         assert!(timers.idle.is_elapsed());
     }
 

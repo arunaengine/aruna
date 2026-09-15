@@ -3,7 +3,7 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{ASSISTANT_PROVIDER_KEYSPACE, ASSISTANT_PROVIDER_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{ASSISTANT_PROVIDER_KEYSPACE, PROVIDER_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderSecret, AssistantSecretError,
@@ -127,7 +127,7 @@ impl CreateProviderOperation {
         self.txn_id = Some(txn_id);
         self.state = CreateProviderState::ReadOwnerIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: ASSISTANT_PROVIDER_OWNER_KEYSPACE.to_string(),
+            key_space: PROVIDER_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.provider.user_id),
             txn_id: Some(txn_id),
         })]
@@ -194,7 +194,7 @@ impl CreateProviderOperation {
                     provider_bytes.into(),
                 ),
                 (
-                    ASSISTANT_PROVIDER_OWNER_KEYSPACE.to_string(),
+                    PROVIDER_OWNER_KEYSPACE.to_string(),
                     owner_key(self.provider.user_id),
                     index_bytes,
                 ),
@@ -457,7 +457,7 @@ impl Operation for ListProviderOperation {
                 self.txn_id = Some(txn_id);
                 self.state = ListProviderState::ReadOwnerIndex;
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: ASSISTANT_PROVIDER_OWNER_KEYSPACE.to_string(),
+                    key_space: PROVIDER_OWNER_KEYSPACE.to_string(),
                     key: owner_key(self.user_id),
                     txn_id: Some(txn_id),
                 })]
@@ -869,7 +869,7 @@ impl Operation for DeleteProviderOperation {
                 };
                 self.state = DeleteProviderState::ReadOwnerIndex;
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: ASSISTANT_PROVIDER_OWNER_KEYSPACE.to_string(),
+                    key_space: PROVIDER_OWNER_KEYSPACE.to_string(),
                     key: owner_key(self.user_id),
                     txn_id: Some(txn_id),
                 })]
@@ -901,7 +901,7 @@ impl Operation for DeleteProviderOperation {
                         txn_id: Some(txn_id),
                     }),
                     Effect::Storage(StorageEffect::Write {
-                        key_space: ASSISTANT_PROVIDER_OWNER_KEYSPACE.to_string(),
+                        key_space: PROVIDER_OWNER_KEYSPACE.to_string(),
                         key: owner_key(self.user_id),
                         value: bytes,
                         txn_id: Some(txn_id),

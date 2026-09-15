@@ -15,10 +15,10 @@ use aruna_core::document::{
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE,
-    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, SYNC_QUARANTINE_USAGE_KEYSPACE,
+    APPLIED_OPS_KEYSPACE, SYNC_REVISION_KEYSPACE,
+    DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, QUARANTINE_USAGE_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataDeleteRecord, MetadataEventPayload, MetadataEventRecord,
@@ -37,7 +37,7 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
 use aruna_core::structs::placement::placement_record::PlacementRef;
-use aruna_core::structs::{SYNC_QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
+use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Value;
 use aruna_core::{NodeId, UserId};
@@ -52,9 +52,9 @@ use std::process::Command;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-pub(crate) const DOCUMENT_SYNC_RESTART_CHILD_PATH_ENV: &str =
+pub(crate) const CHILD_PATH_ENV: &str =
     "ARUNA_NET_DOCUMENT_SYNC_RESTART_CHILD_PATH";
-pub(crate) const DOCUMENT_SYNC_RESTART_CHILD_TEST: &str =
+pub(crate) const SYNC_CHILD_TEST: &str =
     "document_sync::tests::restart::buffered_publish_child";
 
 pub(crate) fn topic(seed: u8) -> ::irokle::TopicId {
@@ -154,10 +154,10 @@ pub(crate) async fn open_restart_service(root: &Path, storage_name: &str) -> Doc
 
 pub(crate) fn run_restart_child(root: &Path) {
     let status = Command::new(env::current_exe().expect("test binary path"))
-        .arg(DOCUMENT_SYNC_RESTART_CHILD_TEST)
+        .arg(SYNC_CHILD_TEST)
         .arg("--exact")
         .arg("--nocapture")
-        .env(DOCUMENT_SYNC_RESTART_CHILD_PATH_ENV, root)
+        .env(CHILD_PATH_ENV, root)
         .status()
         .expect("restart child process should run");
 
@@ -204,7 +204,7 @@ pub(crate) async fn reset_test_cursor(service: &DocumentSyncService, topic_id: :
     match service
         .storage
         .send_storage_effect(StorageEffect::Delete {
-            key_space: DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            key_space: APPLIED_OPS_KEYSPACE.to_string(),
             key: topic_cursor_key(topic_id),
             txn_id: None,
         })
@@ -221,7 +221,7 @@ pub(crate) async fn read_test_cursor(
 ) -> Option<::irokle::ActorClock> {
     let bytes = read_storage_value(
         storage,
-        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE,
+        APPLIED_OPS_KEYSPACE,
         topic_cursor_key(topic_id),
     )
     .await?;
@@ -404,7 +404,7 @@ pub(crate) async fn read_graph_lifecycle(
 ) -> Option<GraphLifecycleRecord> {
     read_storage_value(
         storage,
-        METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+        GRAPH_LIFECYCLE_KEYSPACE,
         graph_lifecycle_key(graph_iri),
     )
     .await
@@ -435,7 +435,7 @@ pub(crate) async fn assert_registry_present(
     .await;
     let document_index = read_registry_record(
         storage,
-        METADATA_DOCUMENT_INDEX_KEYSPACE,
+        DOCUMENT_INDEX_KEYSPACE,
         metadata_document_key(record.document_id),
     )
     .await;
@@ -470,7 +470,7 @@ pub(crate) async fn assert_registry_deleted(
     assert!(
         read_storage_value(
             storage,
-            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            DOCUMENT_INDEX_KEYSPACE,
             metadata_document_key(document_id),
         )
         .await
@@ -521,7 +521,7 @@ pub(crate) fn metadata_delete_lifecycle(
     document_id: Ulid,
     updated_at_ms: u64,
     event_id: Ulid,
-    deleted_after_event_id: Ulid,
+    deleted_after_id: Ulid,
 ) -> MetadataLifecycleRecord {
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
     MetadataLifecycleRecord::Delete {
@@ -534,7 +534,7 @@ pub(crate) fn metadata_delete_lifecycle(
                 document_id,
                 updated_at_ms,
             ),
-            deleted_after_event_id,
+            deleted_after_id,
         },
     }
 }
@@ -651,7 +651,7 @@ pub(crate) async fn read_document_lifecycle(
 ) -> MetadataLifecycleRecord {
     let value = read_storage_value(
         storage,
-        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+        DOCUMENT_LIFECYCLE_KEYSPACE,
         document_lifecycle_key(document_id),
     )
     .await
@@ -666,7 +666,7 @@ pub(crate) async fn read_lifecycle_revision(
     let target = DocumentTarget::MetadataDocumentLifecycle { document_id };
     let value = read_storage_value(
         storage,
-        DOCUMENT_SYNC_REVISION_KEYSPACE,
+        SYNC_REVISION_KEYSPACE,
         sync_revision_key(&target),
     )
     .await
@@ -820,8 +820,8 @@ pub(crate) async fn quarantine_rows(storage: &StorageHandle) -> Vec<SyncQuaranti
 pub(crate) async fn quarantine_usage(storage: &StorageHandle) -> SyncQuarantineUsage {
     match read_storage_value(
         storage,
-        SYNC_QUARANTINE_USAGE_KEYSPACE,
-        ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+        QUARANTINE_USAGE_KEYSPACE,
+        ByteView::from(QUARANTINE_USAGE_KEY),
     )
     .await
     {
@@ -834,8 +834,8 @@ pub(crate) async fn write_usage(storage: &StorageHandle, usage: SyncQuarantineUs
     batch_write_to(
         storage,
         vec![(
-            SYNC_QUARANTINE_USAGE_KEYSPACE.to_string(),
-            ByteView::from(SYNC_QUARANTINE_USAGE_KEY),
+            QUARANTINE_USAGE_KEYSPACE.to_string(),
+            ByteView::from(QUARANTINE_USAGE_KEY),
             ByteView::from(usage.to_bytes().expect("usage serializes")),
         )],
     )

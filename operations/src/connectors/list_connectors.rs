@@ -35,7 +35,7 @@ pub enum ListSourceError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("ListSourceConnectors failed")]
-    ListSourceConnectorsFailed,
+    ListConnectorsFailed,
 }
 
 impl From<StorageReadError> for ListSourceError {
@@ -129,11 +129,11 @@ impl Operation for ListSourceOperation {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(ListSourceError::ListSourceConnectorsFailed);
+            return Err(ListSourceError::ListConnectorsFailed);
         }
 
         self.output
-            .ok_or(ListSourceError::ListSourceConnectorsFailed)?
+            .ok_or(ListSourceError::ListConnectorsFailed)?
     }
 
     fn abort(&mut self) -> Effects {

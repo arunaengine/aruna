@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    GROUP_STORAGE_BACKEND_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
@@ -42,7 +42,7 @@ const RECLAIM_TICK_LIMIT: usize = 1024;
 
 pub async fn restore_reclaim_sweep(storage: &StorageHandle, task_handle: &TaskHandle) {
     let effect = TaskEffect::ShortenTimer {
-        key: TaskKey::DrainBlobReclaimQueue,
+        key: TaskKey::DrainReclaimQueue,
         after: Duration::ZERO,
     };
     if let Err(message) = persist_task_effect(storage, &effect).await {
@@ -211,7 +211,7 @@ async fn group_strategy(
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+                key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
                 key: backend_key(backend_id),
                 txn_id: None,
             })
@@ -447,7 +447,7 @@ impl ReclaimBlobOperation {
                     BackendRef::Group(backend_id) => {
                         self.state = ReclaimState::FenceBackend;
                         smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+                            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
                             key: backend_key(backend_id),
                             txn_id: self.txn_id,
                         })]
@@ -793,7 +793,7 @@ impl Operation for ReclaimBlobOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::keyspaces::HASH_PATHS_INDEX_KEYSPACE;
+    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
@@ -934,7 +934,7 @@ mod tests {
         );
         write(
             context,
-            HASH_PATHS_INDEX_KEYSPACE,
+            PATHS_INDEX_KEYSPACE,
             alias.to_bytes().unwrap(),
             Vec::new(),
         )

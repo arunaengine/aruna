@@ -8,12 +8,12 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE,
-    TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
+    DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    OUTBOX_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, MAX_LIVE_REVOCATIONS_PER_ORIGIN, RevocationIndex,
+    AdminDocumentError, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
 };
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -34,9 +34,9 @@ use crate::sync::document_outbox::{
 };
 
 const PRIVILEGED_REVOCATION_RESERVE: usize = 128;
-const SELF_SERVICE_REVOCATION_CAP: usize =
-    MAX_LIVE_REVOCATIONS_PER_ORIGIN - PRIVILEGED_REVOCATION_RESERVE;
-const SELF_SERVICE_OWNER_CAP: usize = 64;
+const REVOCATION_CAP: usize =
+    REVOCATIONS_PER_ORIGIN - PRIVILEGED_REVOCATION_RESERVE;
+const OWNER_CAP: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokeTokenAdmission {
@@ -102,12 +102,12 @@ enum RevokeTokenState {
         apply_event: bool,
         write_canonical: bool,
     },
-    WriteDocumentAndAdminState {
+    WriteDocumentState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
         schedule_drain: bool,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         document: RealmConfigDocument,
         schedule_drain: bool,
     },
@@ -117,7 +117,7 @@ enum RevokeTokenState {
     CommitTransaction {
         document: RealmConfigDocument,
     },
-    ScheduleDocumentSyncOutboxDrain {
+    ScheduleSyncDrain {
         document: RealmConfigDocument,
     },
     Finish,
@@ -133,7 +133,7 @@ pub enum RevokeTokenError {
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
-    RealmConfigNotFound,
+    ConfigMissing,
     #[error("revoked bearer token hash is malformed")]
     InvalidTokenHash,
     #[error("revoked bearer token expiry is outside the supported window")]
@@ -186,7 +186,7 @@ impl RevokeTokenOperation {
                     document.storage_key(),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
             ],
@@ -207,7 +207,7 @@ impl RevokeTokenOperation {
         }
 
         let Some(document_value) = document_value else {
-            return Err(RevokeTokenError::RealmConfigNotFound);
+            return Err(RevokeTokenError::ConfigMissing);
         };
         let document = RealmConfigDocument::from_bytes(&document_value)?;
         let target = self.admin_target();
@@ -273,10 +273,10 @@ impl RevokeTokenOperation {
             pending_live: BTreeMap::new(),
         };
         Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+            key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
             prefix: Some(admin_outbox_prefix(self.config.actor.node_id)),
             start: None,
-            limit: MAX_LIVE_REVOCATIONS_PER_ORIGIN,
+            limit: REVOCATIONS_PER_ORIGIN,
             txn_id: Some(txn_id),
         })])
     }
@@ -294,7 +294,7 @@ impl RevokeTokenOperation {
         {
             return None;
         }
-        let AdminDocumentOperation::RealmConfigTokenRevoked {
+        let AdminDocumentOperation::ConfigTokenRevoked {
             token_hash,
             expires_at,
             token_owner,
@@ -324,16 +324,16 @@ impl RevokeTokenOperation {
         for (index_key, (outbox_key, value)) in index_keys.into_iter().zip(values) {
             let Some(value) = value else {
                 pending_deletes.push((
-                    TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                    OUTBOX_INDEX_KEYSPACE.to_string(),
                     index_key,
                 ));
                 continue;
             };
             let Ok(record) = postcard::from_bytes::<DocumentOutboxRecord>(&value) else {
                 pending_deletes.extend([
-                    (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
+                    (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
                     (
-                        TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                        OUTBOX_INDEX_KEYSPACE.to_string(),
                         index_key,
                     ),
                 ]);
@@ -342,9 +342,9 @@ impl RevokeTokenOperation {
             let Some((token_hash, expires_at, token_owner)) = self.pending_revocation(&record)
             else {
                 pending_deletes.extend([
-                    (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
+                    (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
                     (
-                        TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                        OUTBOX_INDEX_KEYSPACE.to_string(),
                         index_key,
                     ),
                 ]);
@@ -352,9 +352,9 @@ impl RevokeTokenOperation {
             };
             if !revocation_retained(expires_at, self.config.now) {
                 pending_deletes.extend([
-                    (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
+                    (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
                     (
-                        TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                        OUTBOX_INDEX_KEYSPACE.to_string(),
                         index_key,
                     ),
                 ]);
@@ -392,8 +392,8 @@ impl RevokeTokenOperation {
             .count();
         let live_count = revocation_index.count(&origin);
         let origin_cap = match self.config.admission {
-            RevokeTokenAdmission::SelfService => SELF_SERVICE_REVOCATION_CAP,
-            RevokeTokenAdmission::Privileged => MAX_LIVE_REVOCATIONS_PER_ORIGIN,
+            RevokeTokenAdmission::SelfService => REVOCATION_CAP,
+            RevokeTokenAdmission::Privileged => REVOCATIONS_PER_ORIGIN,
         };
         let owner_count = revocation_index.owner_count(&origin, &self.config.token_owner)
             + pending_live
@@ -407,7 +407,7 @@ impl RevokeTokenOperation {
             && !same_origin
             && (live_count.saturating_add(pending_count) >= origin_cap
                 || (self.config.admission == RevokeTokenAdmission::SelfService
-                    && owner_count >= SELF_SERVICE_OWNER_CAP));
+                    && owner_count >= OWNER_CAP));
 
         if capacity_reached {
             let error = RevokeTokenError::CapacityReached;
@@ -492,7 +492,7 @@ impl RevokeTokenOperation {
         let admin_event = apply_event.then(|| {
             reducer_state.apply_revocation_operation(
                 &self.config.actor,
-                AdminDocumentOperation::RealmConfigTokenRevoked {
+                AdminDocumentOperation::ConfigTokenRevoked {
                     token_hash: self.config.token_hash.clone(),
                     expires_at: self.config.expires_at,
                     token_owner: self.config.token_owner,
@@ -534,7 +534,7 @@ impl RevokeTokenOperation {
         if self.output.is_none() {
             self.output = Some(Ok(document.clone()));
         }
-        self.state = RevokeTokenState::WriteDocumentAndAdminState {
+        self.state = RevokeTokenState::WriteDocumentState {
             document,
             stale_conflict_deletes,
             schedule_drain: apply_event,
@@ -661,7 +661,7 @@ impl Operation for RevokeTokenOperation {
                     let reads = index_keys
                         .iter()
                         .cloned()
-                        .map(|key| (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), key))
+                        .map(|key| (SYNC_OUTBOX_KEYSPACE.to_string(), key))
                         .collect();
                     self.state = RevokeTokenState::ReadOutboxRecords {
                         document,
@@ -718,10 +718,10 @@ impl Operation for RevokeTokenOperation {
                             pending_live,
                         };
                         smallvec![Effect::Storage(StorageEffect::Iter {
-                            key_space: TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                            key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
                             prefix: Some(admin_outbox_prefix(self.config.actor.node_id)),
                             start: Some(IterStart::After(start_after)),
-                            limit: MAX_LIVE_REVOCATIONS_PER_ORIGIN,
+                            limit: REVOCATIONS_PER_ORIGIN,
                             txn_id: Some(txn_id),
                         })]
                     } else {
@@ -767,7 +767,7 @@ impl Operation for RevokeTokenOperation {
                     self.unexpected_event("pending outbox cleanup result", format!("{other:?}"))
                 }
             },
-            RevokeTokenState::WriteDocumentAndAdminState {
+            RevokeTokenState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
                 schedule_drain,
@@ -777,7 +777,7 @@ impl Operation for RevokeTokenOperation {
                         return self.fail(RevokeTokenError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = RevokeTokenState::DeleteStaleAdminConflicts {
+                        self.state = RevokeTokenState::DeleteAdminConflicts {
                             document,
                             schedule_drain,
                         };
@@ -791,7 +791,7 @@ impl Operation for RevokeTokenOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            RevokeTokenState::DeleteStaleAdminConflicts {
+            RevokeTokenState::DeleteAdminConflicts {
                 document,
                 schedule_drain,
             } => match event {
@@ -816,7 +816,7 @@ impl Operation for RevokeTokenOperation {
             RevokeTokenState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = RevokeTokenState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state = RevokeTokenState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -825,7 +825,7 @@ impl Operation for RevokeTokenOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            RevokeTokenState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
+            RevokeTokenState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = RevokeTokenState::Finish;
                     smallvec![]
@@ -868,8 +868,8 @@ impl Operation for RevokeTokenOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        ADMIN_DOCUMENT_STATE_KEYSPACE, AdminDocumentState, AdminDocumentTarget, Event,
-        MAX_LIVE_REVOCATIONS_PER_ORIGIN, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
+        DOCUMENT_STATE_KEYSPACE, AdminDocumentState, AdminDocumentTarget, Event,
+        REVOCATIONS_PER_ORIGIN, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
         RevokeTokenOperation, StorageEffect, StorageEvent, reducer_state_key,
     };
     use crate::driver::{DriverContext, drive};
@@ -878,11 +878,11 @@ mod tests {
     use crate::sync::document_outbox::admin_outbox_prefix;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentOperation;
-    use aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS;
+    use aruna_core::auth::MAX_TOKEN_LIFETIME;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
     use aruna_core::keyspaces::{
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE, OUTBOX_INDEX_KEYSPACE,
     };
     use aruna_core::storage_entries::reducer_state_entry;
     use aruna_core::structs::identity::auth::Actor;
@@ -967,7 +967,7 @@ mod tests {
             state
                 .apply_operation(
                     actor,
-                    AdminDocumentOperation::RealmConfigTokenRevoked {
+                    AdminDocumentOperation::ConfigTokenRevoked {
                         token_hash: bearer_token_hash(&format!("seed-token-{index}")),
                         expires_at: 2_000,
                         token_owner,
@@ -1002,7 +1002,7 @@ mod tests {
                 let mut key = prefix.to_vec();
                 key.extend_from_slice(&(index as u64).to_be_bytes());
                 (
-                    TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE.to_string(),
+                    OUTBOX_INDEX_KEYSPACE.to_string(),
                     key.into(),
                     vec![1u8].into(),
                 )
@@ -1032,7 +1032,7 @@ mod tests {
                 key_space: key_space.to_string(),
                 prefix,
                 start: None,
-                limit: MAX_LIVE_REVOCATIONS_PER_ORIGIN.saturating_add(1),
+                limit: REVOCATIONS_PER_ORIGIN.saturating_add(1),
                 txn_id: None,
             })
             .await
@@ -1045,7 +1045,7 @@ mod tests {
     async fn token_records(context: &DriverContext, actor: &Actor) -> Vec<DocumentOutboxRecord> {
         iter_values(
             context,
-            DOCUMENT_SYNC_OUTBOX_KEYSPACE,
+            SYNC_OUTBOX_KEYSPACE,
             Some(admin_outbox_prefix(actor.node_id)),
         )
         .await
@@ -1057,7 +1057,7 @@ mod tests {
                 DocumentOutboxEvent::AdminOperation { event, .. }
                     if matches!(
                         &event.op,
-                        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+                        AdminDocumentOperation::ConfigTokenRevoked { .. }
                     )
             )
         })
@@ -1067,7 +1067,7 @@ mod tests {
     async fn index_values(context: &DriverContext, actor: &Actor) -> Vec<(Key, Value)> {
         iter_values(
             context,
-            TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
+            OUTBOX_INDEX_KEYSPACE,
             Some(admin_outbox_prefix(actor.node_id)),
         )
         .await
@@ -1181,7 +1181,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_live_cap() {
         let (_dir, context, actor) = setup_realm().await;
-        let state = seed_state(&actor, MAX_LIVE_REVOCATIONS_PER_ORIGIN);
+        let state = seed_state(&actor, REVOCATIONS_PER_ORIGIN);
         write_state(&context, &state).await;
 
         let result = drive(
@@ -1306,11 +1306,11 @@ mod tests {
             realm_id: actor.realm_id,
         };
         let transferred = bearer_token_hash("transfer-token");
-        let mut state = seed_state(&actor, MAX_LIVE_REVOCATIONS_PER_ORIGIN);
+        let mut state = seed_state(&actor, REVOCATIONS_PER_ORIGIN);
         state
             .apply_operation(
                 &other,
-                AdminDocumentOperation::RealmConfigTokenRevoked {
+                AdminDocumentOperation::ConfigTokenRevoked {
                     token_hash: transferred.clone(),
                     expires_at: 2_000,
                     token_owner: actor.user_id,
@@ -1340,7 +1340,7 @@ mod tests {
         let (_dir, context, actor) = setup_realm().await;
         let state = seed_state(&actor, 1);
         write_state(&context, &state).await;
-        write_index(&context, &actor, MAX_LIVE_REVOCATIONS_PER_ORIGIN).await;
+        write_index(&context, &actor, REVOCATIONS_PER_ORIGIN).await;
 
         let result = drive(
             RevokeTokenOperation::new(revocation(
@@ -1453,7 +1453,7 @@ mod tests {
         match context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                key_space: DOCUMENT_STATE_KEYSPACE.to_string(),
                 key: reducer_state_key(&target),
                 txn_id: None,
             })
@@ -1484,7 +1484,7 @@ mod tests {
             RevokeTokenOperation::new(revocation(
                 &actor,
                 &bearer_token_hash("long-expiry"),
-                1_000 + MAX_BEARER_TOKEN_LIFETIME_SECS + 301,
+                1_000 + MAX_TOKEN_LIFETIME + 301,
                 1_000,
             )),
             &context,

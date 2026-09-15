@@ -27,7 +27,7 @@ use crate::document_sync::DocumentSyncService;
 use crate::effect_handlers::{self, NetEffectContext};
 use crate::streams;
 
-pub(crate) const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 1024;
+pub(crate) const MAX_STREAM_HANDLERS: usize = 1024;
 
 /// One owner for every background loop: joining happens in one place and the
 /// handles live exactly as long as `NetInner` does.

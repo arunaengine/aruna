@@ -242,7 +242,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::HASH_PATHS_INDEX_KEYSPACE;
+    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::blob::HashIndex;
     use aruna_core::structs::identity::realm::RealmId;
@@ -285,7 +285,7 @@ mod tests {
                 txn_id: iter_txn_id,
                 limit,
                 ..
-            })] if key_space == HASH_PATHS_INDEX_KEYSPACE
+            })] if key_space == PATHS_INDEX_KEYSPACE
                 && *iter_txn_id == Some(txn_id)
                 && *limit == MAX_HASH_ALIASES + 1
         ));

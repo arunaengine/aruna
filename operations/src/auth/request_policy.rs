@@ -212,7 +212,7 @@ async fn group_scope(
             }
             compile_scope(&auth_doc.policies, "group")
         }
-        Err(GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound) => {
+        Err(GetGroupError::GroupNotFound | GetGroupError::DocNotFound) => {
             Err(group_unavailable())
         }
         Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),
@@ -251,7 +251,7 @@ async fn group_txn_scope(
             }
             compile_scope(&auth_doc.policies, "group")
         }
-        Err(GetGroupError::GroupNotFound | GetGroupError::AuthDocNotFound) => {
+        Err(GetGroupError::GroupNotFound | GetGroupError::DocNotFound) => {
             Err(group_unavailable())
         }
         Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),

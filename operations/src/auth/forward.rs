@@ -31,9 +31,9 @@ use tokio::time::timeout;
 use tracing::warn;
 use ulid::Ulid;
 
-pub(super) const TOKEN_REVOKE_PEER_LIMIT: usize = 4;
+pub(super) const REVOKE_PEER_LIMIT: usize = 4;
 
-pub(super) const TOKEN_REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const REVOKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(super) const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -85,9 +85,9 @@ where
     F: FnMut(NodeId, MetadataTransportMessage) -> Fut,
     Fut: Future<Output = Result<MetadataTransportMessage, MetadataRequestError>>,
 {
-    let mut seen = Vec::with_capacity(TOKEN_REVOKE_PEER_LIMIT);
+    let mut seen = Vec::with_capacity(REVOKE_PEER_LIMIT);
     for peer in peers.iter().copied() {
-        if seen.len() >= TOKEN_REVOKE_PEER_LIMIT {
+        if seen.len() >= REVOKE_PEER_LIMIT {
             break;
         }
         if seen.contains(&peer) {
@@ -98,7 +98,7 @@ where
         if remaining.is_zero() {
             break;
         }
-        let attempt = remaining.min(TOKEN_REVOKE_ATTEMPT_TIMEOUT);
+        let attempt = remaining.min(REVOKE_ATTEMPT_TIMEOUT);
         match timeout(attempt, request(peer, message.clone())).await {
             Err(_) => {
                 warn!(%peer, "Token revocation forwarding attempt timed out");
@@ -112,7 +112,7 @@ where
                 error: WriteAuthError::Forbidden,
             })) => return Err(MetadataApiError::Forbidden),
             Ok(Ok(MetadataTransportMessage::ForwardedWriteUnavailable))
-            | Ok(Ok(MetadataTransportMessage::ForwardedTokenRevocationCapacity)) => continue,
+            | Ok(Ok(MetadataTransportMessage::TokenRevocationCapacity)) => continue,
             Ok(Ok(MetadataTransportMessage::Reject(error))) => {
                 warn!(%peer, %error, "Peer rejected a forwarded token revocation");
                 return Err(MetadataApiError::ServiceUnavailable);
@@ -134,7 +134,7 @@ pub(super) fn rank_revoke_peers(
     peers: impl IntoIterator<Item = NodeId>,
     subject: &[u8],
 ) -> Vec<NodeId> {
-    select_top_peers(peers, subject, TOKEN_REVOKE_PEER_LIMIT, |_| {})
+    select_top_peers(peers, subject, REVOKE_PEER_LIMIT, |_| {})
 }
 
 pub(crate) async fn apply_token_revoke(
@@ -225,7 +225,7 @@ pub(crate) async fn apply_token_revoke(
     {
         Ok(_) => MetadataTransportMessage::ForwardedTokenRevoked,
         Err(RevokeTokenError::CapacityReached) => {
-            MetadataTransportMessage::ForwardedTokenRevocationCapacity
+            MetadataTransportMessage::TokenRevocationCapacity
         }
         Err(error) => reject(format!("token revocation failed: {error}")),
     }
@@ -234,7 +234,7 @@ pub(crate) async fn apply_token_revoke(
 #[cfg(test)]
 mod tests {
     use super::TOKEN_REVOKE_DEADLINE;
-    use super::TOKEN_REVOKE_PEER_LIMIT;
+    use super::REVOKE_PEER_LIMIT;
     use super::rank_revoke_peers;
     use super::run_revoke;
     use crate::metadata::api::MetadataApiError;
@@ -272,7 +272,7 @@ mod tests {
             |peer, _| {
                 calls.push(peer);
                 std::future::ready(Ok(if peer == order[0] {
-                    MetadataTransportMessage::ForwardedTokenRevocationCapacity
+                    MetadataTransportMessage::TokenRevocationCapacity
                 } else {
                     MetadataTransportMessage::ForwardedTokenRevoked
                 }))
@@ -328,7 +328,7 @@ mod tests {
             |peer, _| {
                 calls.push(peer);
                 std::future::ready(Ok(
-                    MetadataTransportMessage::ForwardedTokenRevocationCapacity,
+                    MetadataTransportMessage::TokenRevocationCapacity,
                 ))
             },
         )
@@ -375,7 +375,7 @@ mod tests {
             |peer, _| {
                 calls.push(peer);
                 std::future::ready(Ok(
-                    MetadataTransportMessage::ForwardedTokenRevocationCapacity,
+                    MetadataTransportMessage::TokenRevocationCapacity,
                 ))
             },
         )
@@ -394,7 +394,7 @@ mod tests {
         let second = rank_revoke_peers(reversed.iter().copied(), subject.as_bytes());
 
         assert_eq!(first, second);
-        assert_eq!(first.len(), TOKEN_REVOKE_PEER_LIMIT);
+        assert_eq!(first.len(), REVOKE_PEER_LIMIT);
         assert!(first.iter().all(|peer| peers.contains(peer)));
     }
 

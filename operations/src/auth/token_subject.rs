@@ -5,7 +5,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
-use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
+use aruna_core::{USER_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -93,7 +93,7 @@ impl SubjectCheckOperation {
             .get(self.subject_index)
             .ok_or(SubjectCheckError::Forbidden)?;
         Ok(Effect::Storage(StorageEffect::Read {
-            key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+            key_space: SUBJECT_INDEX_KEYSPACE.to_string(),
             key: ByteView::from(subject_id.as_bytes().to_vec()),
             txn_id: None,
         }))

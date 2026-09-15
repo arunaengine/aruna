@@ -217,7 +217,7 @@ mod test {
         let time = 1_000_000;
         let mut operation = CreateTokenOperation::new(CreateTokenConfig {
             time,
-            expiry: Some(time + aruna_core::auth::MAX_BEARER_TOKEN_LIFETIME_SECS + 1),
+            expiry: Some(time + aruna_core::auth::MAX_TOKEN_LIFETIME + 1),
             user_id: UserId::local(Ulid::generate(), realm_id),
             realm_id,
             node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),

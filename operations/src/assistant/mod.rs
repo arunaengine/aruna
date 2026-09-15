@@ -2,7 +2,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{ASSISTANT_CHAT_HEAD_KEYSPACE, ASSISTANT_CHAT_TURN_KEYSPACE};
+use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::structs::AssistantChatHead;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
@@ -49,7 +49,7 @@ fn turn_key(user_id: UserId, chat_id: &str, seq: u32) -> Key {
 
 fn read_head(user_id: UserId, chat_id: &str, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
-        key_space: ASSISTANT_CHAT_HEAD_KEYSPACE.to_string(),
+        key_space: CHAT_HEAD_KEYSPACE.to_string(),
         key: head_key(user_id, chat_id),
         txn_id,
     })
@@ -57,7 +57,7 @@ fn read_head(user_id: UserId, chat_id: &str, txn_id: Option<TxnId>) -> Effect {
 
 fn iter_heads(user_id: UserId, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Iter {
-        key_space: ASSISTANT_CHAT_HEAD_KEYSPACE.to_string(),
+        key_space: CHAT_HEAD_KEYSPACE.to_string(),
         prefix: Some(ByteView::from(head_prefix(user_id))),
         start: None,
         limit: usize::MAX,
@@ -73,7 +73,7 @@ fn iter_turns(
     txn_id: Option<TxnId>,
 ) -> Effect {
     Effect::Storage(StorageEffect::Iter {
-        key_space: ASSISTANT_CHAT_TURN_KEYSPACE.to_string(),
+        key_space: CHAT_TURN_KEYSPACE.to_string(),
         prefix: Some(ByteView::from(turn_prefix(user_id, chat_id))),
         start: Some(IterStart::At(turn_key(user_id, chat_id, seq))),
         limit,

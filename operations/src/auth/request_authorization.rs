@@ -52,7 +52,7 @@ pub async fn authorize(
         AuthorizationError::InvalidRealmId
         | AuthorizationError::InvalidGroupId
         | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => AuthorizeError::PermissionDenied,
+        | AuthorizationError::DocNotFound => AuthorizeError::PermissionDenied,
         AuthorizationError::StorageError(error) => AuthorizeError::Storage(error),
         other => AuthorizeError::CheckFailed(other.to_string()),
     })?;

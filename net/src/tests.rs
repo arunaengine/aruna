@@ -4,7 +4,7 @@ use super::*;
 pub(crate) mod document_sync_support;
 
 use crate::discovery::{
-    DHT_SIGNED_MAX_CLOCK_SKEW_SECS, select_signed_endpoint, validate_endpoint_announcement,
+    DHT_MAX_SKEW, select_signed_endpoint, validate_endpoint_announcement,
 };
 use crate::eviction::flush_evicted_documents;
 use crate::test_support::make_secret;
@@ -458,8 +458,8 @@ fn invalid_announcement_timing() {
         &secret,
         realm_id,
         endpoint_addr.clone(),
-        now + DHT_SIGNED_MAX_CLOCK_SKEW_SECS + 1,
-        now + DHT_SIGNED_MAX_CLOCK_SKEW_SECS + 301,
+        now + DHT_MAX_SKEW + 1,
+        now + DHT_MAX_SKEW + 301,
         1,
     );
     let excessive_ttl = make_announcement(&secret, realm_id, endpoint_addr, now, now + 301, 1);
@@ -619,7 +619,7 @@ async fn endpoint_only_unauthorized() -> Result<()> {
     assert!(
         !handle
             .inner
-            .dht_signed_authorized_nodes
+            .signed_authorized_nodes
             .read()
             .contains(&peer_id)
     );
@@ -768,7 +768,7 @@ async fn config_replaces_peers() -> Result<()> {
     let peers = handle.refresh_document_peers(&document).await?;
     assert_eq!(peers, expected);
     assert_eq!(handle.realm_peers().await, expected);
-    assert_eq!(*handle.inner.dht_signed_authorized_nodes.read(), expected);
+    assert_eq!(*handle.inner.signed_authorized_nodes.read(), expected);
     // The same refresh that admits a node publishes its kind, so an
     // admitted peer is never briefly ungated.
     assert!(
@@ -787,7 +787,7 @@ async fn config_replaces_peers() -> Result<()> {
     assert_eq!(peers, vec![peer_b]);
     assert_eq!(handle.realm_peers().await, vec![peer_b]);
     assert_eq!(
-        *handle.inner.dht_signed_authorized_nodes.read(),
+        *handle.inner.signed_authorized_nodes.read(),
         vec![peer_b]
     );
 
@@ -979,7 +979,7 @@ async fn teardown_after_drain() -> Result<()> {
     let complete = handle.shutdown_with_drain(Duration::from_millis(100)).await;
 
     assert!(!complete.complete());
-    assert_eq!(complete.inbound_pending_at_deadline, 1);
+    assert_eq!(complete.inbound_pending_deadline, 1);
     assert_eq!(complete.inbound_pending, 1);
     assert!(handle.inner.shutdown.is_cancelled());
     assert!(handle.inner.accept_shutdown.is_cancelled());
@@ -1138,7 +1138,7 @@ async fn failed_target_backoff() -> Result<()> {
         peer.node_id == missing_peer
             && peer.status == PeerConnectionStatus::Unreachable
             && peer.last_error.is_some()
-            && peer.next_retry_in_secs.is_some()
+            && peer.retry_in_secs.is_some()
     }));
     assert!(
         status

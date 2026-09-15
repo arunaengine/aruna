@@ -307,8 +307,8 @@ pub struct PermissionRulesOperation {
 enum PermissionRulesState {
     Init,
     StartTransaction,
-    GetRealmAuthDoc,
-    GetGroupAuthDoc,
+    GetRealmDoc,
+    GetGroupDoc,
     CollectRules,
     Finish,
     Error,
@@ -322,8 +322,8 @@ impl std::fmt::Display for PermissionRulesState {
             match self {
                 PermissionRulesState::Init => "PermissionRulesState::Init",
                 PermissionRulesState::StartTransaction => "PermissionRulesState::StartTransaction",
-                PermissionRulesState::GetRealmAuthDoc => "PermissionRulesState::GetRealmAuthDoc",
-                PermissionRulesState::GetGroupAuthDoc => "PermissionRulesState::GetGroupAuthDoc",
+                PermissionRulesState::GetRealmDoc => "PermissionRulesState::GetRealmAuthDoc",
+                PermissionRulesState::GetGroupDoc => "PermissionRulesState::GetGroupAuthDoc",
                 PermissionRulesState::CollectRules => "PermissionRulesState::CollectRules",
                 PermissionRulesState::Finish => "PermissionRulesState::Finish",
                 PermissionRulesState::Error => "PermissionRulesState::Error",
@@ -383,7 +383,7 @@ impl PermissionRulesOperation {
     fn handle_realm_auth(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         if let (
-            PermissionRulesState::GetRealmAuthDoc,
+            PermissionRulesState::GetRealmDoc,
             Event::Storage(StorageEvent::ReadResult { value, .. }),
         ) = (self.state, event)
         {
@@ -399,7 +399,7 @@ impl PermissionRulesOperation {
     fn handle_group_auth(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         if let (
-            PermissionRulesState::GetGroupAuthDoc,
+            PermissionRulesState::GetGroupDoc,
             Event::Storage(StorageEvent::ReadResult { value, .. }),
         ) = (self.state, event)
         {
@@ -462,7 +462,7 @@ impl PermissionRulesOperation {
     }
 
     fn read_realm_doc(&mut self) -> Result<Effects, AuthorizationError> {
-        self.state = PermissionRulesState::GetRealmAuthDoc;
+        self.state = PermissionRulesState::GetRealmDoc;
         let (realm, group) = PermissionRulesOperation::parse_path(&self.config.path)?;
         self.group_id = group;
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
@@ -477,12 +477,12 @@ impl PermissionRulesOperation {
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, AuthorizationError> {
         self.realm_auth_doc = Some(RealmAuthorizationDocument::from_bytes(
-            &value.ok_or_else(|| AuthorizationError::AuthDocNotFound)?,
+            &value.ok_or_else(|| AuthorizationError::DocNotFound)?,
         )?);
 
         match self.group_id {
             Some(group) => {
-                self.state = PermissionRulesState::GetGroupAuthDoc;
+                self.state = PermissionRulesState::GetGroupDoc;
                 Ok(smallvec![Effect::Storage(StorageEffect::Read {
                     txn_id: self.txn_id,
                     key_space: AUTH_KEYSPACE.to_string(),
@@ -511,7 +511,7 @@ impl PermissionRulesOperation {
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, AuthorizationError> {
         self.group_auth_doc = Some(GroupAuthorizationDocument::from_bytes(
-            &value.ok_or_else(|| AuthorizationError::AuthDocNotFound)?,
+            &value.ok_or_else(|| AuthorizationError::DocNotFound)?,
         )?);
 
         if self.external_txn {
@@ -542,7 +542,7 @@ impl PermissionRulesOperation {
         let realm_auth_doc = self
             .realm_auth_doc
             .as_ref()
-            .ok_or_else(|| AuthorizationError::AuthDocNotFound)?;
+            .ok_or_else(|| AuthorizationError::DocNotFound)?;
         let realm_id = realm_auth_doc.realm_id;
         let auth_user = self.config.auth_context.user_id;
         let mut roles = realm_auth_doc.roles.clone();
@@ -641,8 +641,8 @@ impl Operation for PermissionRulesOperation {
 
         match self.state {
             PermissionRulesState::StartTransaction => self.handle_transaction(event),
-            PermissionRulesState::GetRealmAuthDoc => self.handle_realm_auth(event),
-            PermissionRulesState::GetGroupAuthDoc => self.handle_group_auth(event),
+            PermissionRulesState::GetRealmDoc => self.handle_realm_auth(event),
+            PermissionRulesState::GetGroupDoc => self.handle_group_auth(event),
             PermissionRulesState::CollectRules => self.handle_commit(event),
             PermissionRulesState::Finish
             | PermissionRulesState::Init

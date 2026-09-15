@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{ASSISTANT_CHAT_HEAD_KEYSPACE, ASSISTANT_CHAT_TURN_KEYSPACE};
+use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{AssistantChatHead, MAX_ASSISTANT_CHATS};
 use aruna_core::types::{Effects, TxnId};
@@ -225,7 +225,7 @@ impl WriteChatOperation {
         self.state = WriteHeadState::WriteHead;
         self.output = Some(Ok(head));
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: ASSISTANT_CHAT_HEAD_KEYSPACE.to_string(),
+            key_space: CHAT_HEAD_KEYSPACE.to_string(),
             key: head_key(self.user_id, &self.chat_id),
             value: bytes.into(),
             txn_id: Some(txn_id),
@@ -384,7 +384,7 @@ impl DeleteChatOperation {
         };
         let deletes = values
             .into_iter()
-            .map(|(key, _)| (ASSISTANT_CHAT_TURN_KEYSPACE.to_string(), key))
+            .map(|(key, _)| (CHAT_TURN_KEYSPACE.to_string(), key))
             .collect();
         self.state = DeleteChatState::DeleteTurns { head };
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -415,7 +415,7 @@ impl DeleteChatOperation {
         };
         self.state = DeleteChatState::WriteHead;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: ASSISTANT_CHAT_HEAD_KEYSPACE.to_string(),
+            key_space: CHAT_HEAD_KEYSPACE.to_string(),
             key: head_key(self.user_id, &self.chat_id),
             value: bytes.into(),
             txn_id: Some(txn_id),
