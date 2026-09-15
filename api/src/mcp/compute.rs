@@ -415,7 +415,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(job_error)?;
+        .map_err(|error| job_error(map_job_request(error)))?;
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -440,7 +440,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(job_error)?;
+            .map_err(|error| job_error(map_job_request(error)))?;
         let position = session
             .submit_cell(&input.cell_id, &input.code)
             .map_err(bad_request)?;
@@ -473,7 +473,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(job_error)?;
+            .map_err(|error| job_error(map_job_request(error)))?;
         let (last_event_id, outputs) =
             session.cell_outputs(&input.cell_id, input.after.unwrap_or_default());
         Ok(Json(JsonPayload(json!({
@@ -502,7 +502,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(job_error)?;
+            .map_err(|error| job_error(map_job_request(error)))?;
         session.interrupt().map_err(bad_request)?;
         Ok(Json(JsonPayload(json!({ "interrupted": true }))))
     }
@@ -530,7 +530,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(job_error)?;
+            .map_err(|error| job_error(map_job_request(error)))?;
         session.end(aruna_compute::session::EndReason::Ended);
         Ok(Json(JsonPayload(json!({ "ended": true }))))
     }
@@ -593,7 +593,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(submit_error)?;
+        .map_err(|error| submit_error(map_job_request(error)))?;
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -618,7 +618,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(submit_error)?;
+        .map_err(|error| submit_error(map_job_request(error)))?;
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -941,20 +941,18 @@ async fn artifact_output(
     }
 }
 
-fn request_bearer(
-    parts: &http::request::Parts,
-) -> Option<crate::auth::ValidatedArunaBearerTokenCarrier> {
+fn request_bearer(parts: &http::request::Parts) -> Option<crate::auth::ValidatedBearer> {
     parts
         .extensions
-        .get::<Option<crate::auth::ValidatedArunaBearerTokenCarrier>>()
+        .get::<Option<crate::auth::ValidatedBearer>>()
         .cloned()
         .flatten()
 }
 
-/// The REST parser answers a malformed job id with "Not found", which reads to
-/// a caller as a missing job rather than a wrong argument.
+/// A malformed job id is absence to the shared parser, which reads to a caller
+/// as a missing job rather than a wrong argument.
 fn parse_job(id: &str) -> Result<aruna_core::structs::JobId, CallToolResult> {
-    crate::routes::jobs::parse_job_id(id).map_err(|_| {
+    crate::jobs::parse_job_id(id).map_err(|_| {
         bad_request(
             "id must be a 26-character job ULID such as 01JZ8Y6T0K4W7M2N9Q5R3S8V1X; read job_id \
              from run_script, submit_job, or a list_jobs entry",
@@ -1006,6 +1004,27 @@ fn submit_error(error: crate::error::ServerError) -> CallToolResult {
             "the caller needs write permission on the group and on the workspace bucket",
         ),
         error => server_error(error),
+    }
+}
+
+/// Maps the shared job outcome onto the REST status the tool explanations
+/// were written for.
+fn map_job_request(error: crate::jobs::JobRequestError) -> crate::error::ServerError {
+    use crate::error::ServerError;
+    use crate::jobs::JobRequestError;
+    match error {
+        JobRequestError::BadRequest => ServerError::BadRequest,
+        JobRequestError::BadRequestMessage(message) => ServerError::BadRequestMessage(message),
+        JobRequestError::Unauthorized => ServerError::Unauthorized,
+        JobRequestError::Forbidden => ServerError::Forbidden,
+        JobRequestError::NotFound => ServerError::NotFound,
+        JobRequestError::Conflict(message) => ServerError::Conflict(message),
+        JobRequestError::JobPlanConflict(message) => ServerError::JobPlanConflict(message),
+        JobRequestError::ComputeQuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
+        JobRequestError::ServiceUnavailableReason(message) => {
+            ServerError::ServiceUnavailableReason(message)
+        }
+        JobRequestError::InternalError(message) => ServerError::InternalError(message),
     }
 }
 
@@ -1172,4 +1191,5 @@ fn npm_package_name(spec: &str) -> &str {
 }
 
 #[cfg(test)]
+#[path = "compute_tests.rs"]
 mod pure_tests;

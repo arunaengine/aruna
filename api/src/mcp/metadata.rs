@@ -1,8 +1,6 @@
-//! MCP metadata tools.
-//!
-//! Tools convert through the shared `crate::metadata` adapter (request DTOs,
-//! operation error mapping, the local-write lookup) and never call a REST
-//! handler.
+//! MCP metadata tools. Tools convert through the shared `crate::metadata`
+//! adapter (request DTOs, error mapping, local-write lookup) and never call a
+//! REST handler.
 
 use super::data::{ReadObjectInput, read_text};
 use super::{
@@ -11,14 +9,14 @@ use super::{
 };
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
 use aruna_operations::metadata::api::{
-    ExportMetadataRoCrateRequest, MetadataDocumentQueryRequest, MetadataQueryRequest,
-    MetadataReferencesRequest, MetadataRoCrateExportView, MetadataSearchRequest, query_metadata,
-    query_metadata_document, references_metadata, search_metadata,
+    DocumentQueryRequest, ExportMetadataRequest, MetadataQueryRequest, MetadataReferencesRequest,
+    MetadataSearchRequest, RoCrateExportView, query_metadata, query_metadata_document,
+    references_metadata, search_metadata,
 };
-use aruna_operations::metadata::create_document::CreateMetadataDocumentPayload;
+use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::{export_rocrate_routed, route_metadata_update};
 use aruna_operations::metadata::profile_validation::preview_submission;
-use aruna_operations::metadata::update_document::UpdateMetadataDocumentMutation;
+use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -287,7 +285,7 @@ impl McpServer {
         .await
         .map_err(crate::metadata::map_api_error)
         .map_err(search_error)?;
-        let response = crate::metadata::MetadataSearchResponse {
+        let response = crate::metadata::SearchResultsResponse {
             hits: result
                 .hits
                 .into_iter()
@@ -358,7 +356,7 @@ impl McpServer {
             .await
             .map_err(crate::metadata::map_metadata_error)
             .map_err(server_error)?;
-        let response = crate::metadata::ProfileValidationPreviewResponse::from(preview);
+        let response = crate::metadata::ProfilePreviewResponse::from(preview);
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -384,7 +382,7 @@ impl McpServer {
             group_id,
             input.path,
             input.public.unwrap_or(false),
-            CreateMetadataDocumentPayload::RoCrate { jsonld },
+            CreateDocumentPayload::RoCrate { jsonld },
         )
         .await
         .map_err(|error| match error {
@@ -431,7 +429,7 @@ impl McpServer {
             record.as_ref(),
             document_id,
             input.public,
-            UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld },
+            UpdateDocumentMutation::ReplaceRoCrate { jsonld },
             crate::metadata::forwarded_auth_token(request_bearer(&parts)).map_err(server_error)?,
         )
         .await
@@ -478,7 +476,7 @@ impl McpServer {
                 self.state.get_ctx().as_ref(),
                 self.state.get_realm_id(),
                 self.state.get_node_id(),
-                MetadataDocumentQueryRequest {
+                DocumentQueryRequest {
                     document_id,
                     auth: Some(auth.clone()),
                     bearer_token: bearer,
@@ -676,12 +674,10 @@ fn references_error(error: crate::error::ServerError) -> CallToolResult {
     }
 }
 
-pub(crate) fn request_bearer(
-    parts: &http::request::Parts,
-) -> Option<crate::auth::ValidatedArunaBearerTokenCarrier> {
+pub(crate) fn request_bearer(parts: &http::request::Parts) -> Option<crate::auth::ValidatedBearer> {
     parts
         .extensions
-        .get::<Option<crate::auth::ValidatedArunaBearerTokenCarrier>>()
+        .get::<Option<crate::auth::ValidatedBearer>>()
         .cloned()
         .flatten()
 }
@@ -731,7 +727,7 @@ async fn authorize_summary(
 pub(crate) async fn load_raw(
     server: &McpServer,
     auth: &AuthContext,
-    bearer: Option<crate::auth::ValidatedArunaBearerTokenCarrier>,
+    bearer: Option<crate::auth::ValidatedBearer>,
     input: &IdInput,
     tool: &str,
 ) -> Result<(MetadataRegistryRecord, Value), CallToolResult> {
@@ -748,7 +744,7 @@ pub(crate) async fn load_raw(
     )
     .await
     .map_err(document_error)?;
-    let params = crate::metadata::MetadataRoCrateExportParams {
+    let params = crate::metadata::RoCrateExportParams {
         view: Some(crate::metadata::MetadataRoCrateView::Raw),
         limit: None,
         offset: None,
@@ -757,10 +753,10 @@ pub(crate) async fn load_raw(
     let export = export_rocrate_routed(
         &server.state.get_ctx(),
         server.state.get_realm_id(),
-        ExportMetadataRoCrateRequest {
+        ExportMetadataRequest {
             document_id,
             auth: Some(auth.clone()),
-            view: MetadataRoCrateExportView::Raw,
+            view: RoCrateExportView::Raw,
             limit: None,
             offset: None,
             after: None,
@@ -990,15 +986,14 @@ mod tests {
     }
 }
 
-/// In-process tool contract tests for the D016/D017 replacement: protected
-/// metadata tools are executed for the unauthenticated, wrong-actor,
-/// wrong-scope, and allowed cases, and a refusal is asserted to be exactly the
-/// authorization error, so the privileged operation behind it was not reached.
+/// In-process tool contract tests for D016/D017: metadata tools run for the
+/// unauthenticated, wrong-actor, wrong-scope, and allowed cases, and a refusal
+/// must be exactly the authorization error, proving the operation was not reached.
 #[cfg(test)]
 mod authorization_tests {
     use super::*;
     use crate::server_state::ServerState;
-    use crate::tests::fixtures::routes::{
+    use crate::tests::routes::{
         seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -1009,9 +1004,9 @@ mod authorization_tests {
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::drive;
     use aruna_operations::metadata::MetadataHandle;
-    use aruna_operations::metadata::create_document::CreateMetadataDocumentPayload;
+    use aruna_operations::metadata::create_document::CreateDocumentPayload;
     use aruna_operations::realm::announce_presence::{
-        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+        AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
     use aruna_tasks::TaskHandle;
     use ed25519_dalek::SigningKey;
@@ -1107,7 +1102,7 @@ mod authorization_tests {
         )
         .await;
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id,
                 node_id,
                 schedule_refresh: false,
@@ -1205,7 +1200,7 @@ mod authorization_tests {
             fixture.group_id,
             path.to_string(),
             false,
-            CreateMetadataDocumentPayload::RoCrate {
+            CreateDocumentPayload::RoCrate {
                 jsonld: serde_json::to_string(&draft_crate("MCP authorization fixture")).unwrap(),
             },
         )
@@ -1216,7 +1211,7 @@ mod authorization_tests {
     }
 
     #[tokio::test]
-    async fn get_dataset_requires_authentication() {
+    async fn get_requires_authentication() {
         let fixture = fixture().await;
         let result = fixture
             .server
@@ -1232,7 +1227,7 @@ mod authorization_tests {
     }
 
     #[tokio::test]
-    async fn get_dataset_denies_a_stranger_without_exporting() {
+    async fn get_denies_stranger() {
         let fixture = fixture().await;
         let document_id = seed_document(&fixture, "datasets/mcp-private").await;
 
@@ -1262,7 +1257,7 @@ mod authorization_tests {
     }
 
     #[tokio::test]
-    async fn get_dataset_denies_a_wrong_scope_token() {
+    async fn scope_mismatch_denied() {
         let fixture = fixture().await;
         let document_id = seed_document(&fixture, "datasets/mcp-scoped").await;
         let restricted = AuthContext {
@@ -1290,7 +1285,7 @@ mod authorization_tests {
     }
 
     #[tokio::test]
-    async fn replace_dataset_denies_a_stranger_without_updating() {
+    async fn replace_denies_stranger() {
         let fixture = fixture().await;
         let document_id = seed_document(&fixture, "datasets/mcp-guarded").await;
 
@@ -1342,7 +1337,7 @@ mod authorization_tests {
     }
 
     #[tokio::test]
-    async fn list_profiles_allows_the_member() {
+    async fn list_profiles_allowed() {
         let fixture = fixture().await;
         let allowed = fixture
             .server
@@ -1353,7 +1348,7 @@ mod authorization_tests {
     }
 
     #[tokio::test]
-    async fn create_dataset_allows_the_group_member() {
+    async fn create_dataset_allowed() {
         let fixture = fixture().await;
         let created = fixture
             .server

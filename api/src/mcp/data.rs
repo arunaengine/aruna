@@ -10,16 +10,16 @@ use aruna_core::structs::{
     key_content_type, object_permission_path,
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::complete_put;
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::get_object::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::list_objects::{
-    ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Object, ListObjectsV2Operation,
+    ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
 };
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
@@ -380,7 +380,7 @@ impl McpServer {
         let cursor = input.cursor.as_deref().map(decode_cursor).transpose()?;
         let limit = input.limit.unwrap_or(100).clamp(1, 200);
         let result = drive(
-            ListObjectsV2Operation::new(ListObjectsV2Input {
+            ListBucketOperation::new(ListBucketInput {
                 bucket: input.bucket.clone(),
                 group_id: bucket_info.group_id,
                 continuation_token: cursor,
@@ -615,7 +615,7 @@ impl McpServer {
         let mut scan_truncated = false;
         loop {
             let page = drive(
-                ListObjectsV2Operation::new(ListObjectsV2Input {
+                ListBucketOperation::new(ListBucketInput {
                     bucket: input.bucket.clone(),
                     group_id: bucket_info.group_id,
                     continuation_token: cursor,
@@ -696,7 +696,7 @@ impl McpServer {
         authorize_search(self, &auth, extras).await?;
         let bearer = parts
             .extensions
-            .get::<Option<crate::auth::ValidatedArunaBearerTokenCarrier>>()
+            .get::<Option<crate::auth::ValidatedBearer>>()
             .cloned()
             .flatten()
             .map(|carrier| carrier.as_str().to_string());
@@ -724,7 +724,7 @@ impl McpServer {
 
     async fn bucket_info(&self, bucket: &str) -> Result<BucketInfo, CallToolResult> {
         drive(
-            GetBucketInfoOperation::new(bucket.to_string()),
+            GetBucketOperation::new(bucket.to_string()),
             &self.state.get_ctx(),
         )
         .await
@@ -732,7 +732,7 @@ impl McpServer {
     }
 }
 
-fn entry_size(object: &ListObjectsV2Object) -> Option<u64> {
+fn entry_size(object: &ListedObject) -> Option<u64> {
     object
         .location
         .as_ref()
@@ -745,7 +745,7 @@ fn entry_size(object: &ListObjectsV2Object) -> Option<u64> {
         })
 }
 
-fn entry_time(object: &ListObjectsV2Object) -> Option<std::time::SystemTime> {
+fn entry_time(object: &ListedObject) -> Option<std::time::SystemTime> {
     object
         .version_created_at
         .or(object.last_refresh)
@@ -985,7 +985,7 @@ pub(crate) async fn write_text(
         .clone()
         .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
     let realm = drive(
-        GetRealmConfigOperation::new(server.state.get_realm_id()),
+        GetConfigOperation::new(server.state.get_realm_id()),
         &server.state.get_ctx(),
     )
     .await
@@ -1102,15 +1102,15 @@ fn bounded_bytes(max_bytes: Option<usize>) -> Result<usize, CallToolResult> {
     Ok(max_bytes)
 }
 
-fn decode_cursor(cursor: &str) -> Result<ListObjectsV2ContinuationToken, CallToolResult> {
+fn decode_cursor(cursor: &str) -> Result<ListContinuationToken, CallToolResult> {
     const REASON: &str = "cursor must be a next_cursor value copied verbatim from a previous \
                           list_objects answer for the same bucket and prefix; omit it to start at \
                           the first page";
     let bytes = STANDARD.decode(cursor).map_err(|_| bad_request(REASON))?;
-    ListObjectsV2ContinuationToken::from_bytes(&bytes).map_err(|_| bad_request(REASON))
+    ListContinuationToken::from_bytes(&bytes).map_err(|_| bad_request(REASON))
 }
 
-fn encode_cursor(cursor: &ListObjectsV2ContinuationToken) -> Result<String, CallToolResult> {
+fn encode_cursor(cursor: &ListContinuationToken) -> Result<String, CallToolResult> {
     cursor
         .to_bytes()
         .map(|bytes| STANDARD.encode(bytes))
@@ -1129,19 +1129,19 @@ async fn authorize_search(
         .map_err(server_error)
 }
 
-fn map_bucket_error(error: GetBucketInfoError) -> CallToolResult {
+fn map_bucket_error(error: GetBucketError) -> CallToolResult {
     match error {
-        GetBucketInfoError::NotFound => missing_bucket(),
-        GetBucketInfoError::StorageError(error) => internal_error(error),
-        GetBucketInfoError::ConversionError(error) => internal_error(error),
-        GetBucketInfoError::InvalidStateEvent {
+        GetBucketError::NotFound => missing_bucket(),
+        GetBucketError::StorageError(error) => internal_error(error),
+        GetBucketError::ConversionError(error) => internal_error(error),
+        GetBucketError::InvalidStateEvent {
             state,
             expected,
             received,
         } => internal_error(format!(
             "unexpected bucket lookup event in {state:?}: expected {expected}, got {received:?}"
         )),
-        GetBucketInfoError::Incomplete => internal_error("bucket lookup failed"),
+        GetBucketError::Incomplete => internal_error("bucket lookup failed"),
     }
 }
 
@@ -1258,4 +1258,5 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
 }
 
 #[cfg(test)]
+#[path = "data_tests.rs"]
 mod pure_tests;
