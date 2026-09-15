@@ -92,9 +92,10 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 3. Add the feature to `compute/Cargo.toml` and `aruna/Cargo.toml`, gate the
    module at the backend boundary, build the registry in
    `compute_setup/<backend>.rs`.
-4. Check every selection locally for the backend crate and the node:
-   `cargo check -p aruna-compute -p aruna --all-targets --no-default-features
-   --features <backend>`.
+4. Check every selection locally, feature-explicit and per package, as
+   `just check` and CI do:
+   `cargo check -p aruna-compute --all-targets --no-default-features --features <backend>`
+   `cargo check -p aruna --all-targets --no-default-features --features <backend>`.
 5. Test path/planning refusals with fixed data; keep real daemon integration
    tests separate and few.
 
@@ -135,7 +136,11 @@ its consumer in `aruna/tests/observability.rs`.
   `decision_tests` modules plus the pure `reducer::tests` family. These tests
   use no runtime, storage, network, process, or environment mutation. A module
   with that name must keep the guarantee: filesystem, database, or discovery
-  coverage belongs in an ordinary `tests` module beside it.
+  coverage belongs in an ordinary `tests` module beside it. The selection is
+  a name filter over two crates' `--lib` targets only: it compiles no other
+  crate or target and is not evidence for transport, runtime, storage,
+  process, or environment changes, which need focused module runs recorded
+  against the exact revision.
 - Runtime, storage, and multi-node behavior lives in the ordinary test modules
   and `aruna/tests`.
 - Focused loop: `cargo nextest run -p <crate> --lib --locked --profile fast`.
