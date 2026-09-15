@@ -1,15 +1,15 @@
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, blob_permission_path, ensure_permission, parse_connector_id,
-    parse_group_id, require_realm_auth,
+    ValidatedBearer, blob_permission_path, ensure_permission, parse_connector_id, parse_group_id,
+    require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::connectors::ApiSourceConnectorKind;
-use crate::routes::jobs::{
+use crate::routes::execution::jobs::{
     decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
 };
+use crate::routes::storage::connectors::ApiConnectorKind;
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
-use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
+use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::structs::{
     AuthContext, BucketInfo, JobPayload, JobRecord, JobState, Permission, SourceEntry,
     SourceEntryKind, StagingJobCheckpoint, StagingJobItem, StagingJobPhase, StagingJobPrefix,
@@ -18,20 +18,18 @@ use aruna_core::structs::{
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::replication::queue::{
-    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
-};
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::list_objects::{
-    ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Operation,
+    ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
 use aruna_operations::s3::put_object::PutObjectError;
-use aruna_operations::staging::head_source::HeadStagingSourceError;
+use aruna_operations::staging::head_source::HeadSourceError;
 use aruna_operations::staging::list_source::{
-    ListStagingSourceError, ListStagingSourceInput, ListStagingSourceOperation,
+    ListStagingError, ListStagingInput, ListStagingOperation,
 };
-use aruna_operations::staging::read_source::ReadStagingSourceError;
+use aruna_operations::staging::read_source::ReadSourceError;
 use aruna_operations::staging::reference::{
     MaterializeReferenceError, MaterializeReferenceInput, stage_reference_blob,
 };
@@ -76,7 +74,7 @@ const DEFAULT_JOB_LIMIT: usize = 50;
 const MAX_JOB_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-pub struct StagingJobListQuery {
+pub struct StagingJobQuery {
     pub limit: Option<usize>,
     pub cursor: Option<String>,
 }
@@ -98,7 +96,7 @@ pub struct ReferenceListEntry {
     pub size: u64,
     pub referenced: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<ApiSourceConnectorKind>,
+    pub kind: Option<ApiConnectorKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,7 +122,8 @@ pub enum ApiStagingStrategy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct StageBlobTargetRequest {
+#[schema(as = StageBlobTargetRequest)]
+pub struct StageTargetRequest {
     pub group_id: String,
     pub connector_id: String,
     pub source_path: String,
@@ -134,14 +133,16 @@ pub struct StageBlobTargetRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
-pub enum StageBlobRequest {
-    Snapshot(StageBlobTargetRequest),
-    Reference(StageBlobTargetRequest),
-    Sync(StageBlobTargetRequest),
+#[schema(as = StageBlobRequest)]
+pub enum StageRequest {
+    Snapshot(StageTargetRequest),
+    Reference(StageTargetRequest),
+    Sync(StageTargetRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct StageBlobResponse {
+#[schema(as = StageBlobResponse)]
+pub struct StageResponse {
     pub strategy: ApiStagingStrategy,
     pub bucket: String,
     pub key: String,
@@ -203,12 +204,14 @@ pub struct StageBatchResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct SubmitStagingJobResponse {
+#[schema(as = SubmitStagingJobResponse)]
+pub struct SubmitStagingResponse {
     pub job_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct StagingJobProgressResponse {
+#[schema(as = StagingJobProgressResponse)]
+pub struct StagingProgressResponse {
     pub items_current: u64,
     pub items_total: Option<u64>,
     pub bytes_current: u64,
@@ -217,7 +220,8 @@ pub struct StagingJobProgressResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct StagingJobErrorResponse {
+#[schema(as = StagingJobErrorResponse)]
+pub struct StagingErrorResponse {
     pub source_path: String,
     pub target_key: String,
     pub error: String,
@@ -235,12 +239,13 @@ pub struct StagingJobResponse {
     pub submitted_at: String,
     pub finished_at: Option<String>,
     pub error: Option<String>,
-    pub progress: StagingJobProgressResponse,
-    pub errors: Vec<StagingJobErrorResponse>,
+    pub progress: StagingProgressResponse,
+    pub errors: Vec<StagingErrorResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct StagingJobListResponse {
+#[schema(as = StagingJobListResponse)]
+pub struct StagingListResponse {
     pub jobs: Vec<StagingJobResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
@@ -268,7 +273,7 @@ connector's source path, both checked against the concrete path rather than a pr
 **Limits**
 - A snapshot is charged against the realm's quota ceiling for the group."#,
     request_body(
-        content = StageBlobRequest,
+        content = StageRequest,
         description = "The staging strategy and the source and target it applies to",
         example = json!({
             "strategy": "snapshot",
@@ -283,7 +288,7 @@ connector's source path, both checked against the concrete path rather than a pr
         (
             status = 201,
             description = "The object version committed on this node; content type, entity tag and modification time are echoed from the source when it reported them",
-            body = StageBlobResponse,
+            body = StageResponse,
             example = json!({
                 "strategy": "snapshot",
                 "bucket": "research-raw",
@@ -307,14 +312,14 @@ connector's source path, both checked against the concrete path rather than a pr
 pub async fn stage_blob(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Json(request): Json<StageBlobRequest>,
-) -> ServerResult<(StatusCode, Json<StageBlobResponse>)> {
+    Json(request): Json<StageRequest>,
+) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
 
     match request {
-        StageBlobRequest::Snapshot(request) => snapshot_blob(state, auth, request).await,
-        StageBlobRequest::Reference(request) => reference_blob(state, auth, request).await,
-        StageBlobRequest::Sync(_) => Err(ServerError::Unimplemented),
+        StageRequest::Snapshot(request) => snapshot_blob(state, auth, request).await,
+        StageRequest::Reference(request) => reference_blob(state, auth, request).await,
+        StageRequest::Sync(_) => Err(ServerError::Unimplemented),
     }
 }
 
@@ -423,7 +428,7 @@ pub async fn stage_batch(
     ensure_batch_capacity(0, items.len(), BATCH_LIMIT)?;
     let prefixes = request.prefixes.unwrap_or_default();
     if !prefixes.is_empty() {
-        crate::routes::connectors::ensure_data_permission(
+        crate::routes::storage::connectors::ensure_data_permission(
             &state,
             &auth,
             group_id,
@@ -447,7 +452,7 @@ pub async fn stage_batch(
         };
         let remaining = BATCH_LIMIT - items.len();
         match drive(
-            ListStagingSourceOperation::new(ListStagingSourceInput {
+            ListStagingOperation::new(ListStagingInput {
                 group_id,
                 connector_id,
                 source_path: source_prefix.clone(),
@@ -545,7 +550,7 @@ Nothing is authorized later while the job runs.
         (
             status = 202,
             description = "The job is durably queued on this node",
-            body = SubmitStagingJobResponse,
+            body = SubmitStagingResponse,
             example = json!({
                 "job_id": "01JJOB0123456789ABCDEFGHJ"
             })
@@ -563,7 +568,7 @@ pub async fn submit_staging(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<StageBatchRequest>,
-) -> ServerResult<(StatusCode, Json<SubmitStagingJobResponse>)> {
+) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
@@ -665,7 +670,7 @@ pub async fn submit_staging(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(SubmitStagingJobResponse {
+        Json(SubmitStagingResponse {
             job_id: result.job_id.to_string(),
         }),
     ))
@@ -694,7 +699,7 @@ exactly the same restrictions.
         (
             status = 200,
             description = "One page of the caller's staging jobs on this node; `next_cursor` appears only when a further page exists",
-            body = StagingJobListResponse,
+            body = StagingListResponse,
             example = json!({
                 "jobs": [
                     {
@@ -728,8 +733,8 @@ exactly the same restrictions.
 pub async fn list_staging_jobs(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Query(query): Query<StagingJobListQuery>,
-) -> ServerResult<(StatusCode, Json<StagingJobListResponse>)> {
+    Query(query): Query<StagingJobQuery>,
+) -> ServerResult<(StatusCode, Json<StagingListResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let cursor = decode_job_cursor(query.cursor.as_deref())?;
     let limit = query
@@ -752,7 +757,7 @@ pub async fn list_staging_jobs(
     }
     Ok((
         StatusCode::OK,
-        Json(StagingJobListResponse {
+        Json(StagingListResponse {
             jobs,
             next_cursor: encode_job_cursor(next_cursor),
         }),
@@ -819,7 +824,7 @@ pub async fn list_staging_jobs(
 pub async fn get_staging_job(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     AxumPath(job_id): AxumPath<String>,
 ) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
@@ -830,10 +835,10 @@ pub async fn get_staging_job(
         &state.get_ctx(),
         auth.user_id,
         job_id,
-        super::jobs::forwarded_job_auth(bearer)?,
+        crate::routes::execution::jobs::forwarded_job_auth(bearer)?,
     )
     .await
-    .map_err(super::jobs::map_job_route)?
+    .map_err(crate::routes::execution::jobs::map_job_route)?
     .filter(|(record, _)| staging_job_visible(record, &auth))
     .ok_or(ServerError::NotFound)?;
     Ok((
@@ -925,7 +930,7 @@ pub async fn list_references(
         .unwrap_or(DEFAULT_REFERENCE_LIMIT)
         .min(MAX_REFERENCE_LIMIT);
     let result = drive(
-        ListObjectsV2Operation::new(ListObjectsV2Input {
+        ListBucketOperation::new(ListBucketInput {
             bucket: query.bucket,
             group_id: bucket_info.group_id,
             continuation_token,
@@ -985,7 +990,7 @@ async fn stage_item(
     strategy: ApiStagingStrategy,
     item: &StageBatchItem,
 ) -> ServerResult<()> {
-    let target = StageBlobTargetRequest {
+    let target = StageTargetRequest {
         group_id: group_id.to_string(),
         connector_id: connector_id.to_string(),
         source_path: item.source_path.clone(),
@@ -1059,14 +1064,14 @@ fn staging_job_response(
             .unwrap_or(StagingJobPhase::Queued),
     };
     let progress = checkpoint
-        .map(|checkpoint| StagingJobProgressResponse {
+        .map(|checkpoint| StagingProgressResponse {
             items_current: checkpoint.items_current,
             items_total: checkpoint.items_total,
             bytes_current: checkpoint.bytes_current,
             bytes_total: checkpoint.bytes_total,
             current_path: checkpoint.current_path.clone(),
         })
-        .unwrap_or_else(|| StagingJobProgressResponse {
+        .unwrap_or_else(|| StagingProgressResponse {
             items_current: record.progress.current,
             items_total: record.progress.total,
             bytes_current: 0,
@@ -1103,7 +1108,7 @@ fn staging_job_response(
                 checkpoint
                     .errors
                     .iter()
-                    .map(|error| StagingJobErrorResponse {
+                    .map(|error| StagingErrorResponse {
                         source_path: error.source_path.clone(),
                         target_key: error.target_key.clone(),
                         error: error.error.clone(),
@@ -1133,20 +1138,18 @@ fn format_job_time(timestamp_ms: u64) -> String {
         .unwrap_or_default()
 }
 
-fn decode_reference_cursor(
-    cursor: Option<&str>,
-) -> ServerResult<Option<ListObjectsV2ContinuationToken>> {
+fn decode_reference_cursor(cursor: Option<&str>) -> ServerResult<Option<ListContinuationToken>> {
     cursor
         .map(|cursor| {
             let bytes = URL_SAFE_NO_PAD
                 .decode(cursor)
                 .map_err(|_| ServerError::BadRequest)?;
-            ListObjectsV2ContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
+            ListContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
         })
         .transpose()
 }
 
-fn encode_reference_cursor(token: ListObjectsV2ContinuationToken) -> ServerResult<String> {
+fn encode_reference_cursor(token: ListContinuationToken) -> ServerResult<String> {
     token
         .to_bytes()
         .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
@@ -1198,8 +1201,8 @@ fn map_prefix_entries(
 async fn snapshot_blob(
     state: Arc<ServerState>,
     auth: AuthContext,
-    request: StageBlobTargetRequest,
-) -> ServerResult<(StatusCode, Json<StageBlobResponse>)> {
+    request: StageTargetRequest,
+) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
     let bucket_info = load_bucket_info(&state, &request.bucket).await?;
@@ -1250,7 +1253,7 @@ async fn snapshot_blob(
 
     Ok((
         StatusCode::CREATED,
-        Json(StageBlobResponse {
+        Json(StageResponse {
             strategy: ApiStagingStrategy::Snapshot,
             bucket: request.bucket,
             key: request.key,
@@ -1266,8 +1269,8 @@ async fn snapshot_blob(
 async fn reference_blob(
     state: Arc<ServerState>,
     auth: AuthContext,
-    request: StageBlobTargetRequest,
-) -> ServerResult<(StatusCode, Json<StageBlobResponse>)> {
+    request: StageTargetRequest,
+) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
     let bucket_info = load_bucket_info(&state, &request.bucket).await?;
@@ -1314,7 +1317,7 @@ async fn reference_blob(
 
     Ok((
         StatusCode::CREATED,
-        Json(StageBlobResponse {
+        Json(StageResponse {
             strategy: ApiStagingStrategy::Reference,
             bucket: request.bucket,
             key: request.key,
@@ -1335,7 +1338,7 @@ async fn resolve_quota_ceiling(
     group_id: ulid::Ulid,
 ) -> ServerResult<Option<u64>> {
     let config = drive(
-        GetRealmConfigOperation::new(state.get_realm_id()),
+        GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
@@ -1345,13 +1348,13 @@ async fn resolve_quota_ceiling(
 
 async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
     match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }
@@ -1466,27 +1469,27 @@ fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
     }
 }
 
-fn map_head_error(error: HeadStagingSourceError) -> ServerError {
+fn map_head_error(error: HeadSourceError) -> ServerError {
     match error {
-        HeadStagingSourceError::Resolve(error) => map_resolution_error(error),
-        HeadStagingSourceError::Staging(error) => map_source_error(error),
+        HeadSourceError::Resolve(error) => map_resolution_error(error),
+        HeadSourceError::Staging(error) => map_source_error(error),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_read_error(error: ReadStagingSourceError) -> ServerError {
+fn map_read_error(error: ReadSourceError) -> ServerError {
     match error {
-        ReadStagingSourceError::Resolve(error) => map_resolution_error(error),
-        ReadStagingSourceError::Staging(error) => map_source_error(error),
+        ReadSourceError::Resolve(error) => map_resolution_error(error),
+        ReadSourceError::Staging(error) => map_source_error(error),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_resolution_error(error: SourceConnectorResolutionError) -> ServerError {
+fn map_resolution_error(error: SourceResolutionError) -> ServerError {
     match error {
-        SourceConnectorResolutionError::NotFound => ServerError::NotFound,
-        SourceConnectorResolutionError::InvalidSourcePath
-        | SourceConnectorResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
+        SourceResolutionError::NotFound => ServerError::NotFound,
+        SourceResolutionError::InvalidSourcePath
+        | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -1498,10 +1501,10 @@ fn map_source_error(error: StagingSourceError) -> ServerError {
     }
 }
 
-fn map_list_error(error: ListStagingSourceError) -> ServerError {
+fn map_list_error(error: ListStagingError) -> ServerError {
     match error {
-        ListStagingSourceError::Resolve(error) => map_resolution_error(error),
-        ListStagingSourceError::Staging(error) => map_source_error(error),
+        ListStagingError::Resolve(error) => map_resolution_error(error),
+        ListStagingError::Staging(error) => map_source_error(error),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -1515,7 +1518,7 @@ pub(crate) async fn queue_live_replication(
     delete_marker: bool,
 ) {
     let result = match drive(
-        QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+        LiveVersionOperation::new(LiveVersionInput {
             local_node_id: state.get_node_id(),
             auth_context,
             bucket: bucket.clone(),
@@ -1551,4 +1554,5 @@ fn format_system_time(value: std::time::SystemTime) -> String {
 }
 
 #[cfg(test)]
+#[path = "staging_tests.rs"]
 mod tests;

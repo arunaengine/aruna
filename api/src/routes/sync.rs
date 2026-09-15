@@ -1,6 +1,5 @@
 use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, ensure_permission_with,
-    require_unrestricted_auth,
+    ValidatedBearer, ensure_permission, ensure_permission_with, require_unrestricted_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
@@ -13,20 +12,20 @@ use aruna_core::structs::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::MetadataAuthToken;
+use aruna_operations::metadata::AuthToken;
 use aruna_operations::replication::protocol::ReplicationMode;
-use aruna_operations::replication::queue::{QueueBlobReplicationOperation, relationship_job_stats};
+use aruna_operations::replication::queue::{QueueBlobOperation, relationship_job_stats};
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::sync::mirror_repair::{
-    SyncMirrorRepairIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
+    SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
 };
 use aruna_operations::sync::sync_relationship::{
-    DeleteSyncRelationshipOperation, GetSyncRelationshipOperation, ListSyncRelationshipsOperation,
-    StoreSyncRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
+    DeleteRelationshipOperation, GetRelationshipOperation, ListRelationshipsOperation,
+    StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
     create_sync_relationship, remove_outgoing_relationship,
 };
 use axum::extract::{Path, Query, State};
@@ -322,7 +321,7 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
 pub async fn create_sync(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateSyncRequest>,
 ) -> ServerResult<(StatusCode, Json<SyncRelationshipResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
@@ -426,7 +425,7 @@ pub async fn create_sync(
         }
         kick_mirror_repair(&context).await;
         if remove_mirror(&state, &relationship).await {
-            clear_repair(&state, &relationship, SyncMirrorRepairIntent::Delete).await;
+            clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
         }
         return Err(error);
     }
@@ -443,13 +442,13 @@ pub async fn create_sync(
             .await;
             kick_mirror_repair(&context).await;
             if remove_mirror(&state, &relationship).await {
-                clear_repair(&state, &relationship, SyncMirrorRepairIntent::Delete).await;
+                clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
             }
         }
         return Err(error);
     }
 
-    clear_repair(&state, &relationship, SyncMirrorRepairIntent::Reconcile).await;
+    clear_repair(&state, &relationship, SyncMirrorIntent::Reconcile).await;
 
     Ok((StatusCode::CREATED, Json(map_relationship(&relationship))))
 }
@@ -736,7 +735,7 @@ creator may change a relationship, and READ on the source bucket is checked as w
 pub async fn update_sync(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(id): Path<String>,
     Json(request): Json<UpdateSyncRequest>,
 ) -> ServerResult<Json<SyncRelationshipResponse>> {
@@ -806,7 +805,7 @@ pub async fn update_sync(
             return Err(error);
         }
     };
-    clear_repair(&state, &updated, SyncMirrorRepairIntent::Reconcile).await;
+    clear_repair(&state, &updated, SyncMirrorIntent::Reconcile).await;
     // Nothing was queued while the relationship was not enabled, so resuming it
     // has to catch up on the versions written in the meantime.
     if !was_enabled && updated.state == SyncState::Enabled {
@@ -948,7 +947,7 @@ pub async fn delete_sync(
     }
     kick_mirror_repair(&context).await;
     if remove_mirror(&state, &relationship).await {
-        clear_repair(&state, &relationship, SyncMirrorRepairIntent::Delete).await;
+        clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -993,13 +992,13 @@ fn make_endpoint(
 
 async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
     match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
@@ -1058,7 +1057,7 @@ async fn ensure_sync_write(
 async fn create_mirror(
     state: &ServerState,
     auth: &AuthContext,
-    bearer: &ValidatedArunaBearerTokenCarrier,
+    bearer: &ValidatedBearer,
     source_group_id: Ulid,
     relationship: SyncRelationship,
 ) -> ServerResult<()> {
@@ -1086,7 +1085,7 @@ async fn create_mirror(
             .map(|_| ());
     }
 
-    let auth_token = MetadataAuthToken::bearer(bearer.as_str().to_string())
+    let auth_token = AuthToken::bearer(bearer.as_str().to_string())
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     request_mirror_create(
         &state.get_ctx(),
@@ -1113,7 +1112,7 @@ async fn remove_mirror(state: &ServerState, relationship: &SyncRelationship) -> 
 async fn clear_repair(
     state: &ServerState,
     relationship: &SyncRelationship,
-    expected: SyncMirrorRepairIntent,
+    expected: SyncMirrorIntent,
 ) {
     let context = state.get_ctx();
     if let Err(error) = clear_mirror_repair(&context, relationship, expected).await {
@@ -1159,7 +1158,7 @@ async fn queue_relationship(
         .map(|prefix| ReplicateScopeTarget::Prefix(prefix.to_string()))
         .unwrap_or(ReplicateScopeTarget::Bucket);
     let result = drive(
-        QueueBlobReplicationOperation::new_relationship(
+        QueueBlobOperation::new_relationship(
             ReplicateScopeInput {
                 bucket: bucket.to_string(),
                 target,
@@ -1185,7 +1184,7 @@ async fn store_relationship(
     direction: SyncRelationshipDirection,
 ) -> ServerResult<SyncRelationship> {
     drive(
-        StoreSyncRelationshipOperation::new(relationship, direction),
+        StoreRelationshipOperation::new(relationship, direction),
         &state.get_ctx(),
     )
     .await
@@ -1198,7 +1197,7 @@ async fn delete_relationship(
     direction: SyncRelationshipDirection,
 ) -> ServerResult<()> {
     drive(
-        DeleteSyncRelationshipOperation::new(relationship, direction),
+        DeleteRelationshipOperation::new(relationship, direction),
         &state.get_ctx(),
     )
     .await
@@ -1211,7 +1210,7 @@ async fn list_relationships(
     bucket: Option<String>,
 ) -> ServerResult<Vec<SyncRelationship>> {
     drive(
-        ListSyncRelationshipsOperation::new(direction, bucket),
+        ListRelationshipsOperation::new(direction, bucket),
         &state.get_ctx(),
     )
     .await
@@ -1233,7 +1232,7 @@ async fn get_relationship(
     direction: SyncRelationshipDirection,
 ) -> ServerResult<SyncRelationship> {
     drive(
-        GetSyncRelationshipOperation::new(id, direction),
+        GetRelationshipOperation::new(id, direction),
         &state.get_ctx(),
     )
     .await
@@ -1249,7 +1248,7 @@ async fn load_relationship(
     id: Ulid,
 ) -> ServerResult<(SyncRelationship, SyncRelationshipDirection)> {
     match drive(
-        GetSyncRelationshipOperation::new(id, SyncRelationshipDirection::Outgoing),
+        GetRelationshipOperation::new(id, SyncRelationshipDirection::Outgoing),
         &state.get_ctx(),
     )
     .await
@@ -1363,4 +1362,5 @@ fn map_time(value: Option<SystemTime>) -> Option<String> {
 }
 
 #[cfg(test)]
+#[path = "sync_tests.rs"]
 mod tests;

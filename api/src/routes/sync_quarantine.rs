@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::document::DocumentSyncEvent;
+use aruna_core::document::DocumentEvent;
 use aruna_core::structs::{
     AuthContext, Permission, SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage,
 };
@@ -25,10 +25,10 @@ use crate::server_state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi()]
-pub struct SyncQuarantineApiDoc;
+pub struct SyncQuarantineDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SyncQuarantineApiDoc::openapi())
+    OpenApiRouter::with_openapi(SyncQuarantineDoc::openapi())
         .routes(routes!(list_quarantine, prune_quarantine))
         .routes(routes!(inspect_quarantine))
         .routes(routes!(acknowledge_quarantine))
@@ -162,7 +162,7 @@ fn map_record(record: &SyncQuarantineRecord) -> QuarantineRecordResponse {
     }
 }
 
-fn event_summary(event: &DocumentSyncEvent) -> String {
+fn event_summary(event: &DocumentEvent) -> String {
     format!(
         "{:?} target={:?} placement={:?}",
         event.event_id(),
@@ -452,4 +452,5 @@ pub async fn prune_quarantine(
 }
 
 #[cfg(test)]
+#[path = "sync_quarantine_tests.rs"]
 mod tests;

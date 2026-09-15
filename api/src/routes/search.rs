@@ -1,9 +1,9 @@
-use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
+use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
-    MetadataQueryMode, MetadataSearchHitResponse, map_api_error, map_query_mode, map_search_hit,
+    MetadataQueryMode, SearchHitResponse, map_api_error, map_query_mode, map_search_hit,
 };
-use crate::routes::users::MIN_SEARCH_QUERY_CHARS;
+use crate::routes::access::users::MIN_SEARCH_QUERY_CHARS;
 use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::structs::{AuthContext, Permission};
@@ -11,7 +11,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::metadata::api::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    ObjectSearchExecution, ObjectSearchQueryMode, ObjectSearchRequest, search_buckets_distributed,
+    ObjectExecution, ObjectQueryMode, SearchQueryRequest, search_buckets_distributed,
     search_metadata as run_search_metadata, search_objects,
 };
 use aruna_operations::s3::search_objects::ObjectKeyMatch;
@@ -96,7 +96,8 @@ pub struct BucketSearchParams {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ObjectSearchMode {
+#[schema(as = ObjectSearchMode)]
+pub enum ObjectMode {
     Local,
     #[default]
     DistributedBestEffort,
@@ -105,22 +106,24 @@ pub enum ObjectSearchMode {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ObjectSearchMatchMode {
+#[schema(as = ObjectSearchMatchMode)]
+pub enum ObjectMatchMode {
     #[default]
     Substring,
     Prefix,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct ObjectSearchParams {
+#[schema(as = ObjectSearchParams)]
+pub struct ObjectParams {
     #[serde(default)]
     pub q: String,
     #[serde(default)]
     pub bucket: Option<String>,
     #[serde(default, rename = "match")]
-    pub match_mode: Option<ObjectSearchMatchMode>,
+    pub match_mode: Option<ObjectMatchMode>,
     #[serde(default)]
-    pub mode: Option<ObjectSearchMode>,
+    pub mode: Option<ObjectMode>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -129,14 +132,16 @@ pub struct ObjectSearchParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ObjectSearchScope {
+#[schema(as = ObjectSearchScope)]
+pub enum ObjectScope {
     ThisNode,
     Realm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ObjectSearchResultKind {
+#[schema(as = ObjectSearchResultKind)]
+pub enum ObjectResultKind {
     Object,
 }
 
@@ -147,9 +152,10 @@ pub struct ObjectSearchChecksum {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ObjectSearchHit {
-    pub kind: ObjectSearchResultKind,
-    pub mode: ObjectSearchMode,
+#[schema(as = ObjectSearchHit)]
+pub struct ObjectHit {
+    pub kind: ObjectResultKind,
+    pub mode: ObjectMode,
     pub issuer_node_id: String,
     pub group_id: String,
     pub bucket: String,
@@ -165,7 +171,8 @@ pub struct ObjectSearchHit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ObjectSearchIndexFreshness {
+#[schema(as = ObjectSearchIndexFreshness)]
+pub struct ObjectIndexFreshness {
     pub source: String,
     pub as_of: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,32 +180,35 @@ pub struct ObjectSearchIndexFreshness {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ObjectSearchPartitionCoverage {
+#[schema(as = ObjectSearchPartitionCoverage)]
+pub struct ObjectPartitionCoverage {
     pub node_id: String,
     pub observed_at: String,
     pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ObjectSearchCoverage {
-    pub scope: ObjectSearchScope,
-    pub mode: ObjectSearchMode,
-    pub index_freshness: ObjectSearchIndexFreshness,
+#[schema(as = ObjectSearchCoverage)]
+pub struct ObjectCoverage {
+    pub scope: ObjectScope,
+    pub mode: ObjectMode,
+    pub index_freshness: ObjectIndexFreshness,
     pub nodes_queried: usize,
     pub nodes_failed: usize,
     pub failed_partitions: Vec<String>,
     pub omitted_partitions: usize,
     pub complete: bool,
     pub truncated: bool,
-    pub partitions: Vec<ObjectSearchPartitionCoverage>,
+    pub partitions: Vec<ObjectPartitionCoverage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ObjectSearchResponse {
-    pub hits: Vec<ObjectSearchHit>,
+#[schema(as = ObjectSearchResponse)]
+pub struct ObjectResponse {
+    pub hits: Vec<ObjectHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    pub coverage: ObjectSearchCoverage,
+    pub coverage: ObjectCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -221,7 +231,7 @@ pub struct BucketHit {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DocumentsSection {
-    pub hits: Vec<MetadataSearchHitResponse>,
+    pub hits: Vec<SearchHitResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub nodes_queried: usize,
@@ -373,7 +383,7 @@ to its own buckets, so a bucket the caller may not read never appears.
 pub async fn bucket_search(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<BucketSearchParams>,
 ) -> ServerResult<(StatusCode, Json<BucketsSection>)> {
     let auth = require_realm_auth(&state, auth)?;
@@ -422,8 +432,8 @@ restrictions and request policies before it can be returned.
     params(
         ("q" = String, Query, description = "Case-sensitive key substring or prefix; trimmed, minimum 2 characters"),
         ("bucket" = Option<String>, Query, description = "Optional exact bucket name"),
-        ("match" = Option<ObjectSearchMatchMode>, Query, description = "Key match mode: substring (default) or prefix"),
-        ("mode" = Option<ObjectSearchMode>, Query, description = "Coverage mode: distributed_best_effort (default), distributed_strict, or local"),
+        ("match" = Option<ObjectMatchMode>, Query, description = "Key match mode: substring (default) or prefix"),
+        ("mode" = Option<ObjectMode>, Query, description = "Coverage mode: distributed_best_effort (default), distributed_strict, or local"),
         ("limit" = Option<usize>, Query, description = "Maximum merged hits (default 10, clamped to 1..=100)"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same query, bucket, match type, and mode")
     ),
@@ -431,7 +441,7 @@ restrictions and request policies before it can be returned.
         (
             status = 200,
             description = "Authorized live object heads with explicit coverage",
-            body = ObjectSearchResponse,
+            body = ObjectResponse,
             example = json!({
                 "hits": [
                     {
@@ -485,9 +495,9 @@ restrictions and request policies before it can be returned.
 pub async fn object_search(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
-    Query(params): Query<ObjectSearchParams>,
-) -> ServerResult<(StatusCode, Json<ObjectSearchResponse>)> {
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
+    Query(params): Query<ObjectParams>,
+) -> ServerResult<(StatusCode, Json<ObjectResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let query = params.q.trim();
     if query.chars().count() < MIN_SEARCH_QUERY_CHARS {
@@ -499,14 +509,14 @@ pub async fn object_search(
         .filter(|bucket| !bucket.is_empty());
     let mode = params.mode.unwrap_or_default();
     let key_match = match params.match_mode.unwrap_or_default() {
-        ObjectSearchMatchMode::Substring => ObjectKeyMatch::Substring,
-        ObjectSearchMatchMode::Prefix => ObjectKeyMatch::Prefix,
+        ObjectMatchMode::Substring => ObjectKeyMatch::Substring,
+        ObjectMatchMode::Prefix => ObjectKeyMatch::Prefix,
     };
     let result = search_objects(
         state.get_ctx().as_ref(),
         state.get_realm_id(),
         state.get_node_id(),
-        ObjectSearchRequest {
+        SearchQueryRequest {
             auth,
             bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
             query: query.to_string(),
@@ -518,11 +528,9 @@ pub async fn object_search(
                 .clamp(1, MAX_SEARCH_LIMIT),
             cursor: params.cursor,
             mode: match mode {
-                ObjectSearchMode::Local => ObjectSearchQueryMode::Local,
-                ObjectSearchMode::DistributedBestEffort => {
-                    ObjectSearchQueryMode::DistributedBestEffort
-                }
-                ObjectSearchMode::DistributedStrict => ObjectSearchQueryMode::DistributedStrict,
+                ObjectMode::Local => ObjectQueryMode::Local,
+                ObjectMode::DistributedBestEffort => ObjectQueryMode::DistributedBestEffort,
+                ObjectMode::DistributedStrict => ObjectQueryMode::DistributedStrict,
             },
             target_nodes: None,
         },
@@ -532,10 +540,7 @@ pub async fn object_search(
     Ok((StatusCode::OK, Json(map_search_response(result, mode))))
 }
 
-fn map_search_response(
-    result: ObjectSearchExecution,
-    mode: ObjectSearchMode,
-) -> ObjectSearchResponse {
+fn map_search_response(result: ObjectExecution, mode: ObjectMode) -> ObjectResponse {
     let oldest_observed_at = result
         .partitions
         .iter()
@@ -555,12 +560,12 @@ fn map_search_response(
         failed_partitions.push("fanout-cap".to_string());
     }
     let truncated = result.next_cursor.is_some();
-    ObjectSearchResponse {
+    ObjectResponse {
         hits: result
             .hits
             .into_iter()
-            .map(|hit| ObjectSearchHit {
-                kind: ObjectSearchResultKind::Object,
+            .map(|hit| ObjectHit {
+                kind: ObjectResultKind::Object,
                 mode,
                 issuer_node_id: hit.node_id.to_string(),
                 group_id: hit.group_id.to_string(),
@@ -576,15 +581,15 @@ fn map_search_response(
             })
             .collect(),
         next_cursor: result.next_cursor,
-        coverage: ObjectSearchCoverage {
+        coverage: ObjectCoverage {
             scope: match mode {
-                ObjectSearchMode::Local => ObjectSearchScope::ThisNode,
-                ObjectSearchMode::DistributedBestEffort | ObjectSearchMode::DistributedStrict => {
-                    ObjectSearchScope::Realm
+                ObjectMode::Local => ObjectScope::ThisNode,
+                ObjectMode::DistributedBestEffort | ObjectMode::DistributedStrict => {
+                    ObjectScope::Realm
                 }
             },
             mode,
-            index_freshness: ObjectSearchIndexFreshness {
+            index_freshness: ObjectIndexFreshness {
                 source: "live_heads".to_string(),
                 as_of: format_system_time(result.as_of),
                 oldest_observed_at,
@@ -598,7 +603,7 @@ fn map_search_response(
             partitions: result
                 .partitions
                 .into_iter()
-                .map(|partition| ObjectSearchPartitionCoverage {
+                .map(|partition| ObjectPartitionCoverage {
                     node_id: partition.node_id.to_string(),
                     observed_at: format_system_time(partition.observed_at),
                     truncated: partition.truncated,
@@ -715,7 +720,7 @@ so a caller never learns of a group it may not read, and the user directory sear
 pub async fn unified_search(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<SearchParams>,
 ) -> ServerResult<(StatusCode, Json<SearchResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
@@ -971,7 +976,7 @@ async fn run_users(
     if !requested {
         return Ok(None);
     }
-    match crate::routes::users::authorize_directory(state, auth, None).await {
+    match crate::routes::access::users::authorize_directory(state, auth, None).await {
         Ok(()) => {}
         Err(ServerError::Forbidden) => return Ok(None),
         Err(error) => return Err(error),
@@ -1001,4 +1006,5 @@ async fn run_users(
 }
 
 #[cfg(test)]
+#[path = "search_tests.rs"]
 mod tests;
