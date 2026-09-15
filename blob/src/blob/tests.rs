@@ -1,6 +1,6 @@
 use super::backend::{build_backend_path, build_part_path, rebuild_backend_path};
 use super::{
-    BackendRegistry, BlobHandle, BlobHandler, ControlPlaneTimeoutKind, NodeBackend,
+    BackendRegistry, BlobHandle, BlobHandler, ControlPlaneKind, NodeBackend,
     control_plane::timeout_event,
     control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
@@ -21,8 +21,8 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, GroupBackendKind,
-    GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey, MultipartUploadPartKey, RealmId,
-    ResolvedBackend, ResolvedSourceAccess, SourceConnectorKind, Status,
+    GroupStorage, GroupStorageSecret, HiddenBlobKey, MultipartPartKey, RealmId, ResolvedBackend,
+    ResolvedSourceAccess, SourceConnectorKind, Status,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
@@ -461,7 +461,7 @@ async fn copies_across_backends() {
     };
     let BlobEvent::WriteFinished { location: part } = handler
         .write_blob_part(
-            MultipartUploadPartKey::new(Ulid::generate(), 1),
+            MultipartPartKey::new(Ulid::generate(), 1),
             cold_backend(),
             test_user_id(),
             false,
@@ -670,7 +670,7 @@ async fn pins_part_area() {
 
     let BlobEvent::WriteFinished { location } = handler
         .write_blob_part(
-            MultipartUploadPartKey::new(Ulid::generate(), 1),
+            MultipartPartKey::new(Ulid::generate(), 1),
             cold_backend(),
             test_user_id(),
             false,
@@ -820,7 +820,7 @@ async fn reports_read_timeout() {
     let event = with_timeout(
         std::future::pending::<()>(),
         Duration::from_millis(1),
-        ControlPlaneTimeoutKind::Read,
+        ControlPlaneKind::Read,
         "reading replication control message",
     )
     .await
@@ -838,7 +838,7 @@ async fn reports_read_timeout() {
 fn reports_connect_timeout() {
     assert_eq!(
         timeout_event(
-            ControlPlaneTimeoutKind::Connection,
+            ControlPlaneKind::Connection,
             "opening bao replication stream",
             Duration::from_secs(30),
         ),
@@ -2352,7 +2352,7 @@ async fn s3_multipart_compose() {
     for (number, payload) in [(1u16, b"first-".to_vec()), (2, b"second".to_vec())] {
         let BlobEvent::WriteFinished { location } = handler
             .write_blob_part(
-                MultipartUploadPartKey::new(upload_id, number),
+                MultipartPartKey::new(upload_id, number),
                 cold_backend(),
                 test_user_id(),
                 false,
@@ -2385,7 +2385,7 @@ async fn s3_multipart_compose() {
 
 async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bool) {
     let key: aruna_core::types::Key = backend_id.to_bytes().to_vec().into();
-    let record = GroupStorageBackend {
+    let record = GroupStorage {
         backend_id,
         group_id: Ulid::generate(),
         name: "tenant".to_string(),
@@ -2406,7 +2406,7 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
         record.to_bytes().unwrap().into(),
     )];
     if paired {
-        let secret = GroupStorageBackendSecret {
+        let secret = GroupStorageSecret {
             backend_id,
             secret_config: HashMap::from([("access_key_id".to_string(), "id".to_string())]),
             updated_at: SystemTime::UNIX_EPOCH,
