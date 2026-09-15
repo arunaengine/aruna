@@ -5,10 +5,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    JOB_ACTIVE_USER_KEYSPACE, JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ATTEMPT_CONTROL_KEYSPACE,
-    JOB_DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OUTPUT_RECORD_KEYSPACE,
-    JOB_OWNER_INDEX_KEYSPACE, JOB_RUN_CRATE_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
-    ROCRATE_JOB_STATE_KEYSPACE, S3_PURGE_CHECKPOINT_KEYSPACE, STAGING_JOB_STATE_KEYSPACE,
+    ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
+    DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, OUTPUT_RECORD_KEYSPACE,
+    JOB_INDEX_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
+    JOB_STATE_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
@@ -32,7 +32,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::lifecycle::ids::session_of;
-use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_MUTATE_MAX_ATTEMPTS, JOB_PRUNE_SCAN_PAGE_SIZE};
+use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, MUTATE_MAX_ATTEMPTS, JOB_PRUNE_PAGE};
 use crate::tasks::queue_backoff::retry_delay_ms;
 
 mod attempt;
@@ -103,7 +103,7 @@ fn job_schedule_key(record: &JobRecord) -> Key {
             let lease = record
                 .claim
                 .as_ref()
-                .map(|claim| claim.lease_expires_at_ms)
+                .map(|claim| claim.lease_expires_ms)
                 .unwrap_or(record.due_at_ms);
             lease_index_key(lease, record.job_id)
         }
@@ -139,14 +139,14 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
             ByteView::from(record.to_bytes()?),
         ),
         (
-            JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
+            SCHEDULE_INDEX_KEYSPACE.to_string(),
             job_schedule_key(record),
             empty_value(),
         ),
     ];
     if !record.payload.is_internal() {
         writes.push((
-            JOB_OWNER_INDEX_KEYSPACE.to_string(),
+            JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(record.created_by, record.created_at_ms, record.job_id),
             empty_value(),
         ));
@@ -157,14 +157,14 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
         && !record.state.is_terminal()
     {
         writes.push((
-            JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            ACTIVE_USER_KEYSPACE.to_string(),
             job_active_key(record.created_by, kind, record.job_id),
             empty_value(),
         ));
     }
     if let Some(dedup_key) = &record.dedup_key {
         writes.push((
-            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            DEDUP_INDEX_KEYSPACE.to_string(),
             dedup_index_key(record.created_by, dedup_key),
             ByteView::from(encode_dedup_value(
                 record.job_id,
@@ -180,33 +180,33 @@ pub fn prune_delete_entries(record: &JobRecord) -> JobDeletes {
     let mut deletes = vec![
         (JOB_KEYSPACE.to_string(), job_record_key(record.job_id)),
         (
-            JOB_RUN_CRATE_KEYSPACE.to_string(),
+            RUN_CRATE_KEYSPACE.to_string(),
             run_crate_key(record.job_id),
         ),
         (
-            JOB_OWNER_INDEX_KEYSPACE.to_string(),
+            JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(record.created_by, record.created_at_ms, record.job_id),
         ),
         (
-            JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
+            SCHEDULE_INDEX_KEYSPACE.to_string(),
             job_schedule_key(record),
         ),
         (
-            STAGING_JOB_STATE_KEYSPACE.to_string(),
+            STAGING_STATE_KEYSPACE.to_string(),
             ByteView::from(record.job_id.to_bytes().to_vec()),
         ),
         (
-            ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+            JOB_STATE_KEYSPACE.to_string(),
             ByteView::from(record.job_id.to_bytes().to_vec()),
         ),
         (
-            ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+            JOB_STATE_KEYSPACE.to_string(),
             rocrate_plan_key(record.job_id),
         ),
     ];
     if let Some(kind) = ActiveJobKind::of(&record.payload) {
         deletes.push((
-            JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            ACTIVE_USER_KEYSPACE.to_string(),
             job_active_key(record.created_by, kind, record.job_id),
         ));
     }
@@ -214,7 +214,7 @@ pub fn prune_delete_entries(record: &JobRecord) -> JobDeletes {
         && let Some(dedup_key) = &record.dedup_key
     {
         deletes.push((
-            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            DEDUP_INDEX_KEYSPACE.to_string(),
             dedup_index_key(record.created_by, dedup_key),
         ));
     }
@@ -222,11 +222,11 @@ pub fn prune_delete_entries(record: &JobRecord) -> JobDeletes {
     // a terminal success, the output record stored under the same key.
     for epoch in 1..record.next_attempt_epoch {
         deletes.push((
-            JOB_ATTEMPT_CONTROL_KEYSPACE.to_string(),
+            ATTEMPT_CONTROL_KEYSPACE.to_string(),
             ByteView::from(attempt_control_key(record.job_id, epoch)),
         ));
         deletes.push((
-            JOB_OUTPUT_RECORD_KEYSPACE.to_string(),
+            OUTPUT_RECORD_KEYSPACE.to_string(),
             ByteView::from(attempt_control_key(record.job_id, epoch)),
         ));
     }
@@ -249,10 +249,10 @@ pub(super) fn index_deltas(
     let old_schedule = job_schedule_key(old);
     let new_schedule = job_schedule_key(new);
     if old_schedule != new_schedule {
-        deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), old_schedule));
+        deletes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), old_schedule));
     }
     writes.push((
-        JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
+        SCHEDULE_INDEX_KEYSPACE.to_string(),
         new_schedule,
         empty_value(),
     ));
@@ -261,7 +261,7 @@ pub(super) fn index_deltas(
         && new.is_settled()
     {
         deletes.push((
-            JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            ACTIVE_USER_KEYSPACE.to_string(),
             job_active_key(new.created_by, kind, new.job_id),
         ));
     }
@@ -294,7 +294,7 @@ where
     F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
 {
     let mut mutate = mutate;
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
@@ -339,14 +339,14 @@ pub async fn delete_finished_run(
     user_id: UserId,
     job_id: JobId,
 ) -> Result<RunDelete, JobMutationError> {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
         match Box::pin(run_delete_txn(storage, txn_id, user_id, job_id)).await {
             Ok(RunDelete::Deleted) => match commit_txn(storage, txn_id).await {
                 CommitResult::Committed => return Ok(RunDelete::Deleted),
-                CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
+                CommitResult::Conflict if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
                     tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
                 }
                 CommitResult::Conflict => break,
@@ -397,7 +397,7 @@ async fn run_delete_txn(
             JOB_ENTRY_KEYSPACE,
             Some(job_entry_prefix(job_id)),
             start_after.take(),
-            JOB_PRUNE_SCAN_PAGE_SIZE,
+            JOB_PRUNE_PAGE,
             Some(txn_id),
         )
         .await
@@ -437,7 +437,7 @@ where
     F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
     G: FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError> + Send,
 {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
@@ -527,7 +527,7 @@ pub async fn put_purge_checkpoint(
         storage,
         job_id,
         token,
-        S3_PURGE_CHECKPOINT_KEYSPACE,
+        PURGE_CHECKPOINT_KEYSPACE,
         ByteView::from(job_id.to_bytes().to_vec()),
         value,
     )
@@ -540,7 +540,7 @@ pub async fn read_purge_checkpoint(
 ) -> Result<Option<StoragePurgeCheckpoint>, JobMutationError> {
     read_raw(
         storage,
-        S3_PURGE_CHECKPOINT_KEYSPACE,
+        PURGE_CHECKPOINT_KEYSPACE,
         ByteView::from(job_id.to_bytes().to_vec()),
         None,
     )
@@ -561,7 +561,7 @@ async fn put_job_checkpoint(
     key: Key,
     value: Value,
 ) -> Result<(), JobMutationError> {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
@@ -613,7 +613,7 @@ pub async fn put_job_entry<T: Serialize>(
     let value = postcard::to_allocvec(row)
         .map(ByteView::from)
         .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
@@ -733,7 +733,7 @@ where
                     terminal_deletes.push(delete);
                 }
                 terminal_deletes.push((
-                    S3_PURGE_CHECKPOINT_KEYSPACE.to_string(),
+                    PURGE_CHECKPOINT_KEYSPACE.to_string(),
                     ByteView::from(record.job_id.to_bytes().to_vec()),
                 ));
             }
@@ -851,7 +851,7 @@ async fn insert_crate_obligation(
     let mut writes =
         job_insert_entries(&child).map_err(|error| JobMutationError::Storage(error.to_string()))?;
     writes.push((
-        JOB_RUN_CRATE_KEYSPACE.to_string(),
+        RUN_CRATE_KEYSPACE.to_string(),
         run_crate_key(record.job_id),
         ByteView::from(
             RunCrateStatus::Pending
@@ -876,7 +876,7 @@ async fn mark_crate_failed(
         return Ok(());
     }
     let key = run_crate_key(*for_job);
-    if let Some(value) = read_raw(storage, JOB_RUN_CRATE_KEYSPACE, key.clone(), Some(txn_id))
+    if let Some(value) = read_raw(storage, RUN_CRATE_KEYSPACE, key.clone(), Some(txn_id))
         .await
         .map_err(JobMutationError::Storage)?
         && !matches!(
@@ -900,7 +900,7 @@ async fn mark_crate_failed(
     batch_write(
         storage,
         vec![(
-            JOB_RUN_CRATE_KEYSPACE.to_string(),
+            RUN_CRATE_KEYSPACE.to_string(),
             key,
             ByteView::from(
                 status
@@ -929,7 +929,7 @@ async fn cleanup_dedup_entry(
         return Ok(());
     }
     let key = dedup_index_key(old.created_by, dedup_key);
-    let current = read_raw(storage, JOB_DEDUP_INDEX_KEYSPACE, key.clone(), Some(txn_id))
+    let current = read_raw(storage, DEDUP_INDEX_KEYSPACE, key.clone(), Some(txn_id))
         .await
         .map_err(JobMutationError::Storage)?;
     let still_ours = current
@@ -937,7 +937,7 @@ async fn cleanup_dedup_entry(
         .and_then(|bytes| parse_dedup_value(bytes).ok())
         .is_some_and(|(job_id, _)| job_id == old.job_id);
     if still_ours {
-        delete_raw(storage, JOB_DEDUP_INDEX_KEYSPACE, key, Some(txn_id))
+        delete_raw(storage, DEDUP_INDEX_KEYSPACE, key, Some(txn_id))
             .await
             .map_err(JobMutationError::Storage)?;
     }

@@ -21,7 +21,7 @@ use aruna_core::compute::{
 };
 use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::execution::job::{
-    JobErrorKind, JobResultPayload, JobState, MAX_RESULT_MESSAGE_BYTES, OutputDestination,
+    JobErrorKind, JobResultPayload, JobState, MAX_MESSAGE_BYTES, OutputDestination,
     OutputSelection, SessionReportDetail, SessionReportRow, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::RealmId;
@@ -237,9 +237,9 @@ fn exit_message_bounds() {
         "container exited with code 2: Error: boom"
     );
 
-    let detail = "a".repeat(MAX_RESULT_MESSAGE_BYTES) + "end";
+    let detail = "a".repeat(MAX_MESSAGE_BYTES) + "end";
     let message = exit_message(2, Some(&detail));
-    assert!(message.len() <= MAX_RESULT_MESSAGE_BYTES);
+    assert!(message.len() <= MAX_MESSAGE_BYTES);
     assert!(message.starts_with("container exited with code 2: "));
     assert!(message.ends_with("end"));
 }
@@ -599,7 +599,7 @@ async fn finalize_renews_lease() {
         .unwrap()
         .claim
         .unwrap()
-        .lease_expires_at_ms;
+        .lease_expires_ms;
 
     tokio::time::pause();
     tokio::task::yield_now().await;
@@ -615,7 +615,7 @@ async fn finalize_renews_lease() {
             .unwrap()
             .claim
             .unwrap()
-            .lease_expires_at_ms;
+            .lease_expires_ms;
         if after > before {
             break;
         }

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::BLOB_DELETE_AUDIT_KEYSPACE;
+use aruna_core::keyspaces::DELETE_AUDIT_KEYSPACE;
 use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key,
 };
@@ -200,7 +200,7 @@ async fn write_purge_audit(ctx: &JobContext, spec: &StoragePurgeSpec) -> Result<
         .driver
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: BLOB_DELETE_AUDIT_KEYSPACE.to_string(),
+            key_space: DELETE_AUDIT_KEYSPACE.to_string(),
             key: delete_audit_key(spec.group_id, ctx.job_id.as_ulid()).into(),
             value: value.into(),
             txn_id: None,
@@ -394,7 +394,7 @@ async fn count_versions(ctx: &JobContext, scope: &StoragePurgeScope) -> Result<u
             return Ok(total);
         }
         key_marker = page.next_key_marker;
-        version_marker = page.next_version_id_marker;
+        version_marker = page.next_version_marker;
         if key_marker.is_none() {
             return Err(JobError::retryable("version inventory truncated without a cursor").into());
         }
@@ -417,7 +417,7 @@ async fn count_multipart(
             return Ok(total);
         }
         key_marker = page.next_key_marker;
-        upload_marker = page.next_upload_id_marker;
+        upload_marker = page.next_upload_marker;
         if key_marker.is_none() {
             return Err(
                 JobError::retryable("multipart inventory truncated without a cursor").into(),
@@ -430,7 +430,7 @@ struct VersionPage {
     items: Vec<ListVersionsItem>,
     is_truncated: bool,
     next_key_marker: Option<String>,
-    next_version_id_marker: Option<ulid::Ulid>,
+    next_version_marker: Option<ulid::Ulid>,
 }
 
 async fn list_version_page(
@@ -457,7 +457,7 @@ async fn list_version_page(
     let mut items = result.items;
     let mut is_truncated = result.is_truncated;
     let mut next_key_marker = result.next_key_marker;
-    let mut next_version_id_marker = result.next_version_id_marker;
+    let mut next_version_marker = result.next_version_marker;
     if let StoragePurgeScope::File { key, .. } = scope {
         items.retain(|item| match item {
             ListVersionsItem::Version { key: item, .. }
@@ -466,14 +466,14 @@ async fn list_version_page(
         if next_key_marker.as_deref() != Some(key.as_str()) {
             is_truncated = false;
             next_key_marker = None;
-            next_version_id_marker = None;
+            next_version_marker = None;
         }
     }
     Ok(VersionPage {
         items,
         is_truncated,
         next_key_marker,
-        next_version_id_marker,
+        next_version_marker,
     })
 }
 
@@ -491,7 +491,7 @@ struct MultipartPage {
     uploads: Vec<MultipartUpload>,
     is_truncated: bool,
     next_key_marker: Option<String>,
-    next_upload_id_marker: Option<ulid::Ulid>,
+    next_upload_marker: Option<ulid::Ulid>,
 }
 
 async fn list_multipart_cursor(
@@ -520,20 +520,20 @@ async fn list_multipart_cursor(
     let mut uploads = result.uploads;
     let mut is_truncated = result.is_truncated;
     let mut next_key_marker = result.next_key_marker;
-    let mut next_upload_id_marker = result.next_upload_id_marker;
+    let mut next_upload_marker = result.next_upload_marker;
     if let StoragePurgeScope::File { key, .. } = scope {
         uploads.retain(|upload| upload.key == *key);
         if next_key_marker.as_deref() != Some(key.as_str()) {
             is_truncated = false;
             next_key_marker = None;
-            next_upload_id_marker = None;
+            next_upload_marker = None;
         }
     }
     Ok(MultipartPage {
         uploads,
         is_truncated,
         next_key_marker,
-        next_upload_id_marker,
+        next_upload_marker,
     })
 }
 

@@ -1,7 +1,7 @@
 use super::{
     AuthContext, Deserialize, DriverContext, Event, GroupId, GroupPermissionRules, HashMap,
-    IterStart, LIST_METADATA_PAGE_SIZE, ListGroupOperation, METADATA_EVENT_LOG_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE, METADATA_REGISTRY_CANDIDATE_LIMIT, MetadataApiError,
+    IterStart, LIST_METADATA_SIZE, ListGroupOperation, EVENT_LOG_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE, REGISTRY_CANDIDATE_LIMIT, MetadataApiError,
     MetadataEventRecord, MetadataRegistryRecord, RealmId, Serialize, StorageEffect, StorageEvent,
     drive, ensure_record_materialized, event_log_key, export_summary_jsonld, filter_live_records,
     iter_registry_effect, metadata_read_request, parse_registry_iter, pending_projection_target,
@@ -10,21 +10,21 @@ use super::{
 use aruna_core::handle::Handle;
 use futures_util::StreamExt;
 
-pub(super) const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
+pub(super) const LIST_METADATA_LIMIT: usize = 50;
 
-pub(super) const MAX_LIST_METADATA_LIMIT: usize = 1_000;
+pub(super) const MAX_METADATA_LIMIT: usize = 1_000;
 
 /// Bounds the response payload and the number of RO-Crate summary exports an
 /// unauthenticated caller can force per request. The realm-wide registry scan
 /// is removed by the cached list path, not by this clamp.
-pub(super) const ANONYMOUS_LIST_METADATA_LIMIT: usize = 100;
+pub(super) const ANONYMOUS_METADATA_LIMIT: usize = 100;
 
 /// Splits a targeted lookup from a browse page: the portal pages at 48, a
 /// run-crate or preview lookup at 1, and only a browse page pays the estimate.
-pub(super) const METADATA_ESTIMATE_MIN_LIMIT: usize = 24;
+pub(super) const ESTIMATE_MIN_LIMIT: usize = 24;
 
 // Bounded so a single summary page cannot saturate the craqle read permits.
-pub(super) const METADATA_SUMMARY_FANOUT_LIMIT: usize = 8;
+pub(super) const FANOUT_LIMIT: usize = 8;
 
 /// Order the visible metadata listing is paginated in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +76,7 @@ pub async fn list_visible_documents(
     let group_ids = check_policy_limit(match request.group_id {
         Some(group_id) => vec![group_id],
         None => drive(
-            ListGroupOperation::with_pagination(METADATA_REGISTRY_CANDIDATE_LIMIT + 1, 0),
+            ListGroupOperation::with_pagination(REGISTRY_CANDIDATE_LIMIT + 1, 0),
             context,
         )
         .await
@@ -89,14 +89,14 @@ pub async fn list_visible_documents(
     // yet; the pending keyspace is scanned once per request, never once per group.
     let recent = request.order == MetadataListOrder::Recent;
     let mut pending = if request.include_summary || recent {
-        load_pending_records(context, request.group_id, METADATA_REGISTRY_CANDIDATE_LIMIT).await?
+        load_pending_records(context, request.group_id, REGISTRY_CANDIDATE_LIMIT).await?
     } else {
         HashMap::new()
     };
 
     let mut records = Vec::new();
     for group_id in group_ids {
-        let remaining = METADATA_REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
+        let remaining = REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
         let mut group_records = load_group_records(context, group_id, remaining).await?;
         if let Some(pending_records) = pending.remove(&group_id) {
             merge_pending_records(&mut group_records, pending_records);
@@ -156,7 +156,7 @@ pub async fn list_visible_documents(
     };
 
     let mut total_estimate = None;
-    if limit >= METADATA_ESTIMATE_MIN_LIMIT {
+    if limit >= ESTIMATE_MIN_LIMIT {
         let matching = records
             .iter()
             .filter(|record| record_matches_filters(record, request.path_prefix.as_deref()))
@@ -195,7 +195,7 @@ pub async fn list_visible_documents(
             })
             .collect::<Vec<_>>();
         let summaries = stream::iter(exports)
-            .buffered(METADATA_SUMMARY_FANOUT_LIMIT)
+            .buffered(FANOUT_LIMIT)
             .collect::<Vec<_>>()
             .await;
         for (record, summary) in selected.into_iter().zip(summaries) {
@@ -229,19 +229,19 @@ pub async fn list_visible_documents(
 
 pub(super) fn effective_list_limit(requested: Option<usize>, anonymous: bool) -> usize {
     let maximum = if anonymous {
-        ANONYMOUS_LIST_METADATA_LIMIT
+        ANONYMOUS_METADATA_LIMIT
     } else {
-        MAX_LIST_METADATA_LIMIT
+        MAX_METADATA_LIMIT
     };
     requested
-        .unwrap_or(DEFAULT_LIST_METADATA_LIMIT)
+        .unwrap_or(LIST_METADATA_LIMIT)
         .clamp(1, maximum)
 }
 
 pub(super) fn check_policy_limit(
     group_ids: Vec<GroupId>,
 ) -> Result<Vec<GroupId>, MetadataApiError> {
-    if group_ids.len() > METADATA_REGISTRY_CANDIDATE_LIMIT {
+    if group_ids.len() > REGISTRY_CANDIDATE_LIMIT {
         return Err(MetadataApiError::ServiceUnavailable);
     }
     Ok(group_ids)
@@ -290,7 +290,7 @@ pub(super) async fn load_pending_records(
     group_filter: Option<GroupId>,
     limit: usize,
 ) -> Result<HashMap<GroupId, Vec<MetadataRegistryRecord>>, MetadataApiError> {
-    let limit = limit.min(METADATA_REGISTRY_CANDIDATE_LIMIT);
+    let limit = limit.min(REGISTRY_CANDIDATE_LIMIT);
     let mut targets = Vec::with_capacity(limit);
     let mut start_after = None;
     let mut scanned = 0usize;
@@ -299,10 +299,10 @@ pub(super) async fn load_pending_records(
         let page = context
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
-                key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+                key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
                 prefix: None,
                 start: start_after.take().map(IterStart::After),
-                limit: LIST_METADATA_PAGE_SIZE,
+                limit: LIST_METADATA_SIZE,
                 txn_id: None,
             })
             .await;
@@ -341,7 +341,7 @@ pub(super) async fn load_pending_records(
         .iter()
         .map(|(document_id, event_id)| {
             (
-                METADATA_EVENT_LOG_KEYSPACE.to_string(),
+                EVENT_LOG_KEYSPACE.to_string(),
                 event_log_key(*document_id, *event_id),
             )
         })

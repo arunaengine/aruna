@@ -4,7 +4,7 @@ use std::sync::Arc;
 use aruna_compute::ExecutorBackend;
 use aruna_compute::session::{EndReason, Session, SessionConfig};
 use aruna_core::compute::FenceContext;
-use aruna_core::structs::placement::compute_config::DEFAULT_SESSION_IDLE_AFTER_MS;
+use aruna_core::structs::placement::compute_config::IDLE_AFTER_MS;
 use aruna_core::structs::execution::job::{
     ExecutionSpec, JobId, JobRecord, JobResultPayload, SessionReportDetail, SessionReportRow,
 };
@@ -36,7 +36,7 @@ pub(super) async fn start_session(
     let node_id = net.node_id();
     // The credential was minted while the task was prepared; this reads the
     // same one back, so the client sees when it really expires.
-    let credential_expires_at_ms =
+    let credential_expires_ms =
         match read_job_record(&context.storage_handle, job_id, None).await {
             Ok(Some(record)) => Box::pin(mint_workspace_credential(
                 context, spec, &record, node_id, bucket,
@@ -58,7 +58,7 @@ pub(super) async fn start_session(
             workspace_bucket: bucket.to_string(),
             executor_node_id: node_id.to_string(),
             idle_after_ms,
-            credential_expires_at_ms,
+            credential_expires_ms,
         },
         backend.clone(),
         fence.clone(),
@@ -68,13 +68,13 @@ pub(super) async fn start_session(
 /// The realm's idle wait, which the request may only shorten.
 async fn realm_session_idle(context: &DriverContext) -> u64 {
     let Some(net) = context.net_handle.as_ref() else {
-        return DEFAULT_SESSION_IDLE_AFTER_MS;
+        return IDLE_AFTER_MS;
     };
     crate::metadata::api::load_realm_config(context, *net.realm_id())
         .await
-        .map(|config| config.compute.session_idle_after_ms)
+        .map(|config| config.compute.session_idle_ms)
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_SESSION_IDLE_AFTER_MS)
+        .unwrap_or(IDLE_AFTER_MS)
 }
 
 /// The stored record of a queued copy, when its id parses and it is readable.

@@ -4,7 +4,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportDetail, ImportReportRow,
     ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
-    JOB_LEASE_INDEX_PREFIX, JobPayload, ReasonCode, RoCrateLimits, parse_schedule_key,
+    LEASE_INDEX_PREFIX, JobPayload, ReasonCode, RoCrateLimits, parse_schedule_key,
     pid_dedup_key,
 };
 use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
@@ -129,7 +129,7 @@ proptest::proptest! {
 }
 
 async fn schedule_keys(storage: &StorageHandle) -> Vec<Key> {
-    let (values, _) = iter_prefix_page(storage, JOB_SCHEDULE_INDEX_KEYSPACE, None, None, 64, None)
+    let (values, _) = iter_prefix_page(storage, SCHEDULE_INDEX_KEYSPACE, None, None, 64, None)
         .await
         .expect("scan schedule index");
     values.into_iter().map(|(key, _)| key).collect()
@@ -148,7 +148,7 @@ async fn adopt_spares_live() {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: live_token,
-        lease_expires_at_ms: 10_000,
+        lease_expires_ms: 10_000,
     });
     insert_job(&storage, &record).await.unwrap();
     record_attempt_intent(
@@ -204,7 +204,7 @@ fn prune_covers_controls() {
 
     let controls: Vec<_> = deletes
         .iter()
-        .filter(|(space, _)| space == JOB_ATTEMPT_CONTROL_KEYSPACE)
+        .filter(|(space, _)| space == ATTEMPT_CONTROL_KEYSPACE)
         .map(|(_, key)| key.as_ref().to_vec())
         .collect();
     assert_eq!(
@@ -224,7 +224,7 @@ fn prune_covers_dedup() {
     let deletes = prune_delete_entries(&record);
 
     assert!(deletes.contains(&(
-        JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+        DEDUP_INDEX_KEYSPACE.to_string(),
         dedup_index_key(record.created_by, b"import"),
     )));
 }
@@ -274,7 +274,7 @@ fn prune_reclaims_pid() {
     let deletes = prune_delete_entries(&record);
 
     assert!(deletes.contains(&(
-        JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+        DEDUP_INDEX_KEYSPACE.to_string(),
         dedup_index_key(record.created_by, &dedup_key),
     )));
     assert!(record.payload.dedup_until_prune());
@@ -306,7 +306,7 @@ async fn handoff_releases_preintent() {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: token,
-        lease_expires_at_ms: 10_000,
+        lease_expires_ms: 10_000,
     });
     insert_job(&storage, &record).await.unwrap();
 
@@ -336,11 +336,11 @@ async fn claim_moves_index() {
 
     let claim = record.claim.expect("claim present");
     assert_eq!(record.state, JobState::Claimed);
-    assert_eq!(claim.lease_expires_at_ms, 5_000 + JOB_LEASE_MS);
+    assert_eq!(claim.lease_expires_ms, 5_000 + JOB_LEASE_MS);
 
     let keys = schedule_keys(&storage).await;
     assert_eq!(keys.len(), 1, "exactly one schedule index entry");
-    assert!(keys[0].starts_with(JOB_LEASE_INDEX_PREFIX));
+    assert!(keys[0].starts_with(LEASE_INDEX_PREFIX));
     let (ts, parsed) = parse_schedule_key(keys[0].as_ref()).unwrap();
     assert_eq!(ts, 5_000 + JOB_LEASE_MS);
     assert_eq!(parsed, job_id);
@@ -445,9 +445,9 @@ async fn other_write_untouched() {
     }
     for key_space in [
         JOB_KEYSPACE,
-        JOB_SCHEDULE_INDEX_KEYSPACE,
-        JOB_OWNER_INDEX_KEYSPACE,
-        JOB_DEDUP_INDEX_KEYSPACE,
+        SCHEDULE_INDEX_KEYSPACE,
+        JOB_INDEX_KEYSPACE,
+        DEDUP_INDEX_KEYSPACE,
     ] {
         let (values, _) = iter_prefix_page(&storage, key_space, None, None, 8, None)
             .await
@@ -505,7 +505,7 @@ async fn stale_checkpoint_rejected() {
         &storage,
         job_id,
         token,
-        STAGING_JOB_STATE_KEYSPACE,
+        STAGING_STATE_KEYSPACE,
         key.clone(),
         &b"newer".to_vec(),
     )
@@ -517,7 +517,7 @@ async fn stale_checkpoint_rejected() {
             &storage,
             job_id,
             Ulid::generate(),
-            STAGING_JOB_STATE_KEYSPACE,
+            STAGING_STATE_KEYSPACE,
             key.clone(),
             &b"stale".to_vec(),
         )
@@ -527,7 +527,7 @@ async fn stale_checkpoint_rejected() {
     assert_eq!(
         read_state::<Vec<u8>>(
             &storage,
-            STAGING_JOB_STATE_KEYSPACE,
+            STAGING_STATE_KEYSPACE,
             key,
             "staging checkpoint",
         )
@@ -639,7 +639,7 @@ async fn requeue_exhausts() {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: Ulid::generate(),
-        lease_expires_at_ms: 5_000,
+        lease_expires_ms: 5_000,
     });
     insert_job(&storage, &record).await.unwrap();
 
@@ -666,7 +666,7 @@ async fn permanent_cap_fails() {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: Ulid::generate(),
-        lease_expires_at_ms: 5_000,
+        lease_expires_ms: 5_000,
     });
     insert_job(&storage, &record).await.unwrap();
 
@@ -698,7 +698,7 @@ async fn exhausted_stops_sweep() {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: Ulid::generate(),
-        lease_expires_at_ms: 5_000,
+        lease_expires_ms: 5_000,
     });
     insert_job(&storage, &record).await.unwrap();
     requeue_job(&storage, job_id, None, 6_000, Some(6_000), None)
@@ -738,7 +738,7 @@ async fn cleanup_retries_forever() {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: Ulid::generate(),
-        lease_expires_at_ms: 5_000,
+        lease_expires_ms: 5_000,
     });
     insert_job(&storage, &record).await.unwrap();
 
@@ -762,7 +762,7 @@ async fn import_exhausts() {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: Ulid::generate(),
-        lease_expires_at_ms: 5_000,
+        lease_expires_ms: 5_000,
     });
     insert_job(&storage, &record).await.unwrap();
 
@@ -870,7 +870,7 @@ async fn terminal_clears_dedup() {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: token,
-        lease_expires_at_ms: 5_000,
+        lease_expires_ms: 5_000,
     });
     insert_job(&storage, &record).await.unwrap();
     assert_eq!(
@@ -899,7 +899,7 @@ async fn terminal_clears_dedup() {
     );
     let keys = schedule_keys(&storage).await;
     assert_eq!(keys.len(), 1);
-    assert!(keys[0].starts_with(aruna_core::structs::execution::job::JOB_PRUNE_INDEX_PREFIX));
+    assert!(keys[0].starts_with(aruna_core::structs::execution::job::PRUNE_INDEX_PREFIX));
 }
 
 #[tokio::test]
@@ -938,7 +938,7 @@ fn running_record(job_id: JobId, token: Ulid, lease_expires: u64) -> JobRecord {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: token,
-        lease_expires_at_ms: lease_expires,
+        lease_expires_ms: lease_expires,
     });
     record
 }
@@ -974,7 +974,7 @@ fn execution_record(job_id: JobId, token: Ulid, state: JobState) -> JobRecord {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(3),
         claim_token: token,
-        lease_expires_at_ms: 10_000,
+        lease_expires_ms: 10_000,
     });
     record
 }
@@ -1126,7 +1126,7 @@ async fn filter_scans_pages() {
     batch_write(
         &storage,
         vec![(
-            JOB_OWNER_INDEX_KEYSPACE.to_string(),
+            JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(owner, 2_000, job_id(2)),
             empty_value(),
         )],
@@ -1168,7 +1168,7 @@ async fn internal_jobs_hidden() {
 
     let (indexed, _) = iter_prefix_page(
         &storage,
-        JOB_OWNER_INDEX_KEYSPACE,
+        JOB_INDEX_KEYSPACE,
         Some(owner_index_prefix(owner)),
         None,
         1,
@@ -1181,7 +1181,7 @@ async fn internal_jobs_hidden() {
     batch_write(
         &storage,
         vec![(
-            JOB_OWNER_INDEX_KEYSPACE.to_string(),
+            JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(owner, record.created_at_ms, job_id),
             empty_value(),
         )],
@@ -1218,7 +1218,7 @@ async fn cleanup_jobs_hidden() {
 
     let (indexed, _) = iter_prefix_page(
         &storage,
-        JOB_OWNER_INDEX_KEYSPACE,
+        JOB_INDEX_KEYSPACE,
         Some(owner_index_prefix(owner)),
         None,
         1,
@@ -1231,7 +1231,7 @@ async fn cleanup_jobs_hidden() {
     batch_write(
         &storage,
         vec![(
-            JOB_OWNER_INDEX_KEYSPACE.to_string(),
+            JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(owner, record.created_at_ms, job_id),
             empty_value(),
         )],
@@ -1292,7 +1292,7 @@ async fn terminal_enqueues_cleanup() {
     record.claim = Some(JobClaim {
         holder_node_id: node_id(7),
         claim_token: token,
-        lease_expires_at_ms: 5_000,
+        lease_expires_ms: 5_000,
     });
     insert_job(&storage, &record).await.unwrap();
 
@@ -1487,7 +1487,7 @@ async fn session_skips_crate() {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(7),
             claim_token: token,
-            lease_expires_at_ms: 5_000,
+            lease_expires_ms: 5_000,
         });
         insert_job(&storage, &record).await.unwrap();
         complete_job(
@@ -1539,7 +1539,7 @@ async fn dedup_delete_guarded() {
     batch_write(
         &storage,
         vec![(
-            JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            DEDUP_INDEX_KEYSPACE.to_string(),
             dedup_index_key(record.created_by, b"k"),
             ByteView::from(encode_dedup_value(job_b, [3u8; 32])),
         )],
@@ -1575,7 +1575,7 @@ async fn external_never_requeued() {
     let (_dir, storage) = temp_storage();
     let job_id = JobId::from_bytes([0xE0; 16]);
     let mut record = execution_record(job_id, Ulid::generate(), JobState::Running);
-    record.claim.as_mut().unwrap().lease_expires_at_ms = 1;
+    record.claim.as_mut().unwrap().lease_expires_ms = 1;
     record.attempt_intent = Some(AttemptIntent {
         attempt_no: 1,
         external_name: "attempt".to_string(),
@@ -1606,7 +1606,7 @@ async fn park_sweep_budget() {
     let job_id = JobId::from_bytes([0xE4; 16]);
     let token = Ulid::generate();
     let mut record = execution_record(job_id, token, JobState::Running);
-    record.claim.as_mut().unwrap().lease_expires_at_ms = 1;
+    record.claim.as_mut().unwrap().lease_expires_ms = 1;
     record.workspace_bucket = Some("ws-test".to_string());
     record.attempt_intent = Some(AttemptIntent {
         attempt_no: 1,
@@ -1717,7 +1717,7 @@ async fn cap_sites_result() {
     let swept = JobId::from_bytes([0xE6; 16]);
     let token = Ulid::generate();
     let mut record = execution_record(swept, token, JobState::Ready);
-    record.claim.as_mut().unwrap().lease_expires_at_ms = 1;
+    record.claim.as_mut().unwrap().lease_expires_ms = 1;
     record.attempts = JOB_MAX_ATTEMPTS - 1;
     record.workspace_bucket = Some("ws-test".to_string());
     insert_job(&storage, &record).await.unwrap();
@@ -1761,7 +1761,7 @@ async fn preintent_requeues() {
     let (_dir, storage) = temp_storage();
     let job_id = JobId::from_bytes([0xE3; 16]);
     let mut record = execution_record(job_id, Ulid::generate(), JobState::Ready);
-    record.claim.as_mut().unwrap().lease_expires_at_ms = 1;
+    record.claim.as_mut().unwrap().lease_expires_ms = 1;
     insert_job(&storage, &record).await.unwrap();
 
     let outcome = requeue_job(&storage, job_id, None, 9_000, Some(9_000), None)
@@ -2010,7 +2010,7 @@ async fn output_record_cas() {
 
     let raw = read_raw(
         &storage,
-        JOB_OUTPUT_RECORD_KEYSPACE,
+        OUTPUT_RECORD_KEYSPACE,
         ByteView::from(attempt_control_key(job_id, control.attempt_epoch)),
         None,
     )

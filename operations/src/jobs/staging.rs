@@ -1,6 +1,6 @@
 use std::path::{Component, Path};
 
-use aruna_core::keyspaces::STAGING_JOB_STATE_KEYSPACE;
+use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::execution::job::{
     JobError, JobId, JobResultPayload, StagingJobCheckpoint, StagingJobDirectory, StagingJobError,
@@ -24,7 +24,7 @@ use crate::staging::list_source::{ListStagingInput, ListStagingOperation};
 use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};
 use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
 
-const STAGING_LIST_PAGE_SIZE: usize = 500;
+const STAGING_PAGE_SIZE: usize = 500;
 
 pub async fn read_staging_checkpoint(
     context: &crate::driver::DriverContext,
@@ -32,7 +32,7 @@ pub async fn read_staging_checkpoint(
 ) -> Result<Option<StagingJobCheckpoint>, String> {
     read_state(
         &context.storage_handle,
-        STAGING_JOB_STATE_KEYSPACE,
+        STAGING_STATE_KEYSPACE,
         staging_checkpoint_key(job_id),
         "staging checkpoint read",
     )
@@ -474,7 +474,7 @@ async fn discover_page(
             connector_id: spec.connector_id,
             source_path: directory.source_path.clone(),
             offset: directory.offset,
-            limit: STAGING_LIST_PAGE_SIZE,
+            limit: STAGING_PAGE_SIZE,
             recursive: false,
             files_only: false,
         }),
@@ -596,7 +596,7 @@ async fn persist_checkpoint(
         &ctx.driver.storage_handle,
         job_id,
         ctx.claim_token,
-        STAGING_JOB_STATE_KEYSPACE,
+        STAGING_STATE_KEYSPACE,
         staging_checkpoint_key(job_id),
         checkpoint,
     )

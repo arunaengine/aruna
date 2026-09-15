@@ -581,7 +581,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(7),
             claim_token: token,
-            lease_expires_at_ms: 1,
+            lease_expires_ms: 1,
         });
         insert_job(&storage, &record).await.unwrap();
         record_attempt_intent(

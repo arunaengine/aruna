@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BucketInfo, HashIndex, OBJECT_CONTENT_TYPE_KEY, UserAccess,
+    BackendLocation, BucketInfo, HashIndex, CONTENT_TYPE_KEY, UserAccess,
     bucket_permission_path, ensure_confined_path, group_permission_path, key_content_type,
     object_permission_path,
 };
@@ -94,7 +94,7 @@ pub async fn ensure_group_write(
         AuthorizationError::InvalidRealmId
         | AuthorizationError::InvalidGroupId
         | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => {
+        | AuthorizationError::DocNotFound => {
             JobError::permanent("workspace write access denied")
         }
         other => JobError::retryable(format!("workspace authorization failed: {other}")),
@@ -1119,7 +1119,7 @@ fn output_read_error(error: &BackendError) -> JobError {
 /// or a JSON result is served as itself instead of an opaque download.
 fn output_metadata(key: &str) -> HashMap<String, String> {
     HashMap::from([(
-        OBJECT_CONTENT_TYPE_KEY.to_string(),
+        CONTENT_TYPE_KEY.to_string(),
         key_content_type(key).to_string(),
     )])
 }
@@ -1614,12 +1614,12 @@ mod tests {
         // The captured put must name the type, or a chart serves as a download.
         let metadata = output_metadata("results/run-1/chart.png");
         assert_eq!(
-            metadata.get(OBJECT_CONTENT_TYPE_KEY).map(String::as_str),
+            metadata.get(CONTENT_TYPE_KEY).map(String::as_str),
             Some("image/png")
         );
         assert_eq!(
             output_metadata("out/blob")
-                .get(OBJECT_CONTENT_TYPE_KEY)
+                .get(CONTENT_TYPE_KEY)
                 .map(String::as_str),
             Some("application/octet-stream")
         );

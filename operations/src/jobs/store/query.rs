@@ -23,7 +23,7 @@ pub async fn list_user_jobs(
     loop {
         let (values, _) = iter_prefix_page(
             storage,
-            JOB_OWNER_INDEX_KEYSPACE,
+            JOB_INDEX_KEYSPACE,
             Some(prefix.clone()),
             start_after,
             limit,
@@ -133,7 +133,7 @@ pub async fn find_dedup_plan(
 ) -> Result<Option<(JobId, [u8; 32])>, String> {
     match read_raw(
         storage,
-        JOB_DEDUP_INDEX_KEYSPACE,
+        DEDUP_INDEX_KEYSPACE,
         dedup_index_key(created_by, dedup_key),
         txn_id,
     )
@@ -182,7 +182,7 @@ pub async fn first_schedule_entry(
 ) -> Result<Option<(u64, JobId)>, String> {
     let (values, _) = iter_prefix_page(
         storage,
-        JOB_SCHEDULE_INDEX_KEYSPACE,
+        SCHEDULE_INDEX_KEYSPACE,
         Some(ByteView::from(prefix.to_vec())),
         None,
         1,
@@ -194,7 +194,7 @@ pub async fn first_schedule_entry(
             Ok(parsed) => Ok(Some(parsed)),
             Err(error) => {
                 warn!(error = %error, "Deleting malformed job schedule index row");
-                delete_raw(storage, JOB_SCHEDULE_INDEX_KEYSPACE, key, None).await?;
+                delete_raw(storage, SCHEDULE_INDEX_KEYSPACE, key, None).await?;
                 Ok(None)
             }
         },
@@ -254,7 +254,7 @@ pub(crate) async fn commit_write(
 ) -> Result<CommitStep, JobMutationError> {
     match commit_txn(storage, txn_id).await {
         CommitResult::Committed => Ok(CommitStep::Committed),
-        CommitResult::Conflict if attempt + 1 < JOB_MUTATE_MAX_ATTEMPTS => {
+        CommitResult::Conflict if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
             tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
             Ok(CommitStep::Retry)
         }

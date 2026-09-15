@@ -2,9 +2,9 @@ use super::field;
 
 use super::{
     ApiQueryMode, Arc, AuthToken, BoxFuture, BucketSearchExecution, BucketSearchHit,
-    BucketSearchRequest, DriverContext, HashSet, Instant, METADATA_DISTRIBUTED_QUERY_DEADLINE,
-    METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT, METADATA_DISTRIBUTED_QUERY_MAX_NODES,
-    METADATA_QUERY_MAX_BYTES, METADATA_QUERY_MAX_ROWS, MetadataApiError, MetadataReadError, NodeId,
+    BucketSearchRequest, DriverContext, HashSet, Instant, DISTRIBUTED_QUERY_DEADLINE,
+    QUERY_FANOUT_LIMIT, QUERY_MAX_NODES,
+    QUERY_MAX_BYTES, QUERY_MAX_ROWS, MetadataApiError, MetadataReadError, NodeId,
     RealmId, SearchBucketsInput, Span, debug_span, deduplicate_fanout_nodes, discover_realm_nodes,
     map_read_error, query_fingerprint, record_elapsed_ms, search_local_buckets,
     select_fanout_nodes, short_display_id, stream, warn,
@@ -22,7 +22,7 @@ pub(super) fn ensure_query_mode(mode: &Option<ApiQueryMode>) {
 }
 
 pub(super) fn ensure_query_form(query: &str) -> Result<(), MetadataApiError> {
-    if query.len() > METADATA_QUERY_MAX_BYTES {
+    if query.len() > QUERY_MAX_BYTES {
         return Err(MetadataApiError::BadRequest);
     }
     let parsed = spargebra::SparqlParser::new()
@@ -40,7 +40,7 @@ pub(super) fn ensure_query_form(query: &str) -> Result<(), MetadataApiError> {
         spargebra::algebra::GraphPattern::Slice {
             length: Some(length),
             ..
-        } if *length > METADATA_QUERY_MAX_ROWS
+        } if *length > QUERY_MAX_ROWS
     ) {
         return Err(MetadataApiError::BadRequest);
     }
@@ -384,7 +384,7 @@ where
         deadline: scope_deadline,
     } = scope;
     let deadline = scope_deadline
-        .unwrap_or_else(|| tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE);
+        .unwrap_or_else(|| tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE);
     ensure_query_mode(&mode);
     match mode.unwrap_or(ApiQueryMode::Distributed) {
         ApiQueryMode::Local => {
@@ -427,7 +427,7 @@ where
             }
             let failed_partitions = Vec::new();
             let mut omitted_nodes = 0usize;
-            if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+            if nodes.len() > QUERY_MAX_NODES {
                 let mut subject = Vec::with_capacity(32 + operation.label().len() + 32 + 1);
                 subject.extend_from_slice(realm_id.as_bytes());
                 subject.extend_from_slice(operation.label().as_bytes());
@@ -475,7 +475,7 @@ where
                         (node_index, node_id, result)
                     }
                 }))
-                .buffer_unordered(METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT);
+                .buffer_unordered(QUERY_FANOUT_LIMIT);
             futures_util::pin_mut!(pending);
 
             loop {
@@ -571,7 +571,7 @@ pub async fn search_buckets_distributed(
     local_node_id: NodeId,
     request: BucketSearchRequest,
 ) -> Result<BucketSearchExecution, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
     let limit = request.limit.clamp(1, 50);
     let subject = query_fingerprint(
         &request.query,

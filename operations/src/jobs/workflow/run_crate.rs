@@ -131,7 +131,7 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
             AuthorizationError::InvalidRealmId
             | AuthorizationError::InvalidGroupId
             | AuthorizationError::GroupNotFound
-            | AuthorizationError::AuthDocNotFound,
+            | AuthorizationError::DocNotFound,
         ) => true,
         Err(error) => {
             return JobRunOutcome::Failed(JobError::retryable(format!(

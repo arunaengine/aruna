@@ -1,7 +1,7 @@
 use super::{
     ApiQueryMode, Arc, AuthContext, BucketSearchHit, DriverContext, GroupId, HashMap, HashSet,
-    Instant, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
-    METADATA_SEARCH_MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation,
+    Instant, MAX_RESULT_BYTES, QUERY_MAX_ROWS,
+    MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation,
     MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataQueryResults,
     MetadataReadError, MetadataSearchHit, NodeId, NodeSearchResult, ObjectKeyMatch,
     ObjectQueryMode, RealmId, ReferenceNodeExecution, SearchNodePage, SearchPageCursor,
@@ -331,7 +331,7 @@ pub(super) async fn run_search_distributed(
                 &resume,
                 node_id,
                 page_size,
-                METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+                MAX_PAGINATION_DEPTH,
             );
             let hits = match conforms_to {
                 Some(object_iri) => {
@@ -346,7 +346,7 @@ pub(super) async fn run_search_distributed(
                                     graph_iris.clone(),
                                     query.clone(),
                                     limit,
-                                    crate::metadata::iri_index::DCTERMS_CONFORMS_TO_IRI.to_string(),
+                                    crate::metadata::iri_index::DCTERMS_CONFORMS_IRI.to_string(),
                                     object_iri,
                                     group_id,
                                 )
@@ -381,7 +381,7 @@ pub(super) async fn run_search_distributed(
                 &resume,
                 node_id,
                 page_size,
-                METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+                MAX_PAGINATION_DEPTH,
             );
             let hits = match conforms_to {
                 Some(object_iri) => {
@@ -397,7 +397,7 @@ pub(super) async fn run_search_distributed(
                                     graph_iris.clone(),
                                     query.clone(),
                                     limit,
-                                    crate::metadata::iri_index::DCTERMS_CONFORMS_TO_IRI.to_string(),
+                                    crate::metadata::iri_index::DCTERMS_CONFORMS_IRI.to_string(),
                                     object_iri,
                                     group_id,
                                 )
@@ -442,7 +442,7 @@ pub(super) async fn run_search_distributed(
         node_results,
         watermark,
         page_size,
-        METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+        MAX_PAGINATION_DEPTH,
     );
     span.record("hit_count", page.hits.len() as u64);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
@@ -465,8 +465,8 @@ pub fn aggregate_query_results(
             let mut merged = Vec::new();
             let mut merged_bytes = 32usize;
             let row_limit = select_limit
-                .unwrap_or(METADATA_QUERY_MAX_ROWS)
-                .min(METADATA_QUERY_MAX_ROWS);
+                .unwrap_or(QUERY_MAX_ROWS)
+                .min(QUERY_MAX_ROWS);
             if row_limit == 0 {
                 return Ok(MetadataQueryResults::Solutions(Vec::new()));
             }
@@ -484,7 +484,7 @@ pub fn aggregate_query_results(
                                 .len()
                                 .saturating_add(1),
                         );
-                        if merged_bytes > METADATA_QUERY_MAX_RESULT_BYTES {
+                        if merged_bytes > MAX_RESULT_BYTES {
                             return Err(MetadataApiError::BadRequest);
                         }
                         merged.push(row);

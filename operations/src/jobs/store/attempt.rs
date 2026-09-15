@@ -8,7 +8,7 @@ pub async fn read_attempt_control(
 ) -> Result<Option<AttemptControl>, JobMutationError> {
     let value = read_raw(
         storage,
-        JOB_ATTEMPT_CONTROL_KEYSPACE,
+        ATTEMPT_CONTROL_KEYSPACE,
         ByteView::from(attempt_control_key(job_id, attempt_epoch)),
         txn_id,
     )
@@ -62,7 +62,7 @@ pub(super) async fn mutate_control_with<F>(
 where
     F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError>,
 {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
@@ -94,7 +94,7 @@ where
             let (mut writes, deletes) = index_deltas(&old, &record)
                 .map_err(|error| JobMutationError::Storage(error.to_string()))?;
             writes.push((
-                JOB_ATTEMPT_CONTROL_KEYSPACE.to_string(),
+                ATTEMPT_CONTROL_KEYSPACE.to_string(),
                 ByteView::from(attempt_control_key(job_id, epoch)),
                 ByteView::from(
                     control
@@ -203,7 +203,7 @@ pub async fn transition_to_preparing(
         record.state = JobState::Preparing;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
         Ok(JobMutation::Persist)
     })
@@ -222,7 +222,7 @@ pub async fn transition_to_ready(
         record.state = JobState::Ready;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
         Ok(JobMutation::Persist)
     })
@@ -252,7 +252,7 @@ pub async fn begin_external_running(
         record.state = JobState::Running;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
         Ok(JobMutation::Persist)
     })
@@ -290,7 +290,7 @@ pub async fn transition_to_cancelling(
         record.state = JobState::Cancelling;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
         Ok(JobMutation::Persist)
     })
@@ -407,7 +407,7 @@ pub async fn adopt_external_attempt(
         // Re-check the lease inside the transaction: a holder that renewed since the
         // sweep's read is alive, and stealing its claim would double-run the container.
         if let Some(claim) = &record.claim
-            && claim.lease_expires_at_ms > now_ms
+            && claim.lease_expires_ms > now_ms
         {
             return Ok(JobMutation::Skip);
         }
@@ -416,7 +416,7 @@ pub async fn adopt_external_attempt(
         record.claim = Some(JobClaim {
             holder_node_id,
             claim_token,
-            lease_expires_at_ms: now_ms.saturating_add(JOB_LEASE_MS),
+            lease_expires_ms: now_ms.saturating_add(JOB_LEASE_MS),
         });
         bump_generation(control)?;
         control.bound_token = Some(claim_token);
@@ -471,7 +471,7 @@ pub async fn put_crate_status(
     batch_write(
         storage,
         vec![(
-            JOB_RUN_CRATE_KEYSPACE.to_string(),
+            RUN_CRATE_KEYSPACE.to_string(),
             aruna_core::structs::execution::job::run_crate_key(job_id),
             ByteView::from(bytes),
         )],
@@ -487,7 +487,7 @@ pub async fn read_crate_status(
 ) -> Result<Option<aruna_core::structs::execution::job::RunCrateStatus>, String> {
     match read_raw(
         storage,
-        JOB_RUN_CRATE_KEYSPACE,
+        RUN_CRATE_KEYSPACE,
         aruna_core::structs::execution::job::run_crate_key(job_id),
         None,
     )

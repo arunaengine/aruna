@@ -32,14 +32,14 @@ pub(crate) async fn preserve_artifact_tombstone(
         storage,
         vec![
             (
-                JOB_ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
+                ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
                 artifact_tombstone_key(job_id),
                 ByteView::from(
                     postcard::to_allocvec(&tombstone).map_err(|error| error.to_string())?,
                 ),
             ),
             (
-                JOB_SCHEDULE_INDEX_KEYSPACE.to_string(),
+                SCHEDULE_INDEX_KEYSPACE.to_string(),
                 job_prune_key(expires_at_ms, job_id),
                 empty_value(),
             ),
@@ -60,7 +60,7 @@ pub(crate) async fn read_artifact_tombstone(
 ) -> Result<Option<UserId>, String> {
     read_raw(
         storage,
-        JOB_ARTIFACT_TOMBSTONE_KEYSPACE,
+        ARTIFACT_TOMBSTONE_KEYSPACE,
         artifact_tombstone_key(job_id),
         None,
     )
@@ -111,7 +111,7 @@ pub async fn claim_job(
         record.claim = Some(JobClaim {
             holder_node_id,
             claim_token: Ulid::generate(),
-            lease_expires_at_ms: now_ms.saturating_add(JOB_LEASE_MS),
+            lease_expires_ms: now_ms.saturating_add(JOB_LEASE_MS),
         });
         claimed_now = true;
         Ok(JobMutation::Persist)
@@ -140,7 +140,7 @@ pub async fn transition_to_running(
         record.has_run = true;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
         Ok(JobMutation::Persist)
     })
@@ -162,7 +162,7 @@ pub async fn renew_lease(
         guard_token(record, token)?;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
-            claim.lease_expires_at_ms = now_ms.saturating_add(JOB_LEASE_MS);
+            claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
         if let Some(progress) = &progress {
             record.progress = progress.clone();
@@ -330,7 +330,7 @@ pub async fn read_output_record(
 ) -> Result<Option<JobRecordEnvelope>, JobMutationError> {
     let value = read_raw(
         storage,
-        JOB_OUTPUT_RECORD_KEYSPACE,
+        OUTPUT_RECORD_KEYSPACE,
         ByteView::from(attempt_control_key(job_id, attempt_epoch)),
         None,
     )
@@ -355,7 +355,7 @@ pub async fn persist_output_record(
     envelope: Vec<u8>,
 ) -> Result<(), JobMutationError> {
     let write = vec![(
-        JOB_OUTPUT_RECORD_KEYSPACE.to_string(),
+        OUTPUT_RECORD_KEYSPACE.to_string(),
         ByteView::from(attempt_control_key(job_id, control.attempt_epoch)),
         ByteView::from(envelope),
     )];
@@ -480,7 +480,7 @@ pub async fn requeue_job(
             let Some(claim) = &record.claim else {
                 return Ok(JobMutation::Skip);
             };
-            if claim.lease_expires_at_ms > now {
+            if claim.lease_expires_ms > now {
                 return Ok(JobMutation::Skip);
             }
         }
@@ -618,7 +618,7 @@ pub async fn handoff_external_attempt(
         }
         if let Some(claim) = record.claim.as_mut() {
             claim.claim_token = Ulid::generate();
-            claim.lease_expires_at_ms = now_ms;
+            claim.lease_expires_ms = now_ms;
         }
         bump_generation(control)?;
         control.bound_token = None;
@@ -669,7 +669,7 @@ pub async fn record_attempt_intent(
     execution_id: Option<Ulid>,
     now_ms: u64,
 ) -> Result<AttemptCommit, JobMutationError> {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
@@ -721,7 +721,7 @@ pub async fn record_attempt_intent(
             let (mut writes, deletes) = index_deltas(&old, &record)
                 .map_err(|error| JobMutationError::Storage(error.to_string()))?;
             writes.push((
-                JOB_ATTEMPT_CONTROL_KEYSPACE.to_string(),
+                ATTEMPT_CONTROL_KEYSPACE.to_string(),
                 ByteView::from(attempt_control_key(job_id, epoch)),
                 ByteView::from(
                     control

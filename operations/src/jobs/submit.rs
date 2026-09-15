@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{JOB_ACTIVE_USER_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
+use aruna_core::keyspaces::{ACTIVE_USER_KEYSPACE, DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     ActiveJobKind, JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
@@ -214,7 +214,7 @@ impl SubmitJobOperation {
         // Must use the same index-key builder `job_insert_entries` uses, which decides
         // owner prefixing per key, or the reservation read misses its own row.
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_DEDUP_INDEX_KEYSPACE.to_string(),
+            key_space: DEDUP_INDEX_KEYSPACE.to_string(),
             key: dedup_index_key(self.record.created_by, &dedup_key),
             txn_id: Some(txn_id),
         })]
@@ -233,7 +233,7 @@ impl SubmitJobOperation {
             return self.fail(SubmitJobError::ActiveJobLimit { limit });
         }
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            key_space: ACTIVE_USER_KEYSPACE.to_string(),
             prefix: Some(job_active_prefix(self.record.created_by, kind)),
             start: None,
             limit: limit as usize,
@@ -455,7 +455,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::jobs::store::read_job_record;
     use aruna_core::keyspaces::{
-        JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
+        JOB_KEYSPACE, JOB_INDEX_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::execution::job::{
@@ -509,7 +509,7 @@ mod tests {
             owner_node_id: node_id(7),
             dedup_key,
             now_ms: 1_000,
-            retention_ms: aruna_core::structs::execution::job::DEFAULT_JOB_RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
             workspace_mode: WorkspaceMode::None,
             workspace_bucket: None,
             active_cap: None,
@@ -686,11 +686,11 @@ mod tests {
             .expect("job persisted");
         assert_eq!(record.state, JobState::Queued);
         assert_eq!(
-            count_keyspace(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await,
+            count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await,
             1
         );
-        assert_eq!(count_keyspace(&storage, JOB_OWNER_INDEX_KEYSPACE).await, 1);
-        assert_eq!(count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count_keyspace(&storage, JOB_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
@@ -703,7 +703,7 @@ mod tests {
             .await
             .unwrap();
         assert!(first.created);
-        assert_eq!(count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 1);
 
         let second = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await
@@ -799,7 +799,7 @@ mod tests {
         assert!(first.created);
         assert!(second.created);
         assert_ne!(second.job_id, first.job_id);
-        assert_eq!(count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await, 2);
+        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 2);
     }
 
     // Same idempotency key + a different plan is a JobPlanConflict, not a silent reuse.
@@ -853,9 +853,9 @@ mod tests {
         );
 
         let keys = count_keyspace(&storage, JOB_KEYSPACE).await
-            + count_keyspace(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await
-            + count_keyspace(&storage, JOB_OWNER_INDEX_KEYSPACE).await
-            + count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await;
+            + count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await
+            + count_keyspace(&storage, JOB_INDEX_KEYSPACE).await
+            + count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await;
         assert!(keys <= 4, "submit writes at most four keys, got {keys}");
     }
 
@@ -871,7 +871,7 @@ mod tests {
         let digest = submission.payload.plan_digest();
         write_raw(
             &storage,
-            JOB_DEDUP_INDEX_KEYSPACE,
+            DEDUP_INDEX_KEYSPACE,
             dedup_index_key(created_by, b"k"),
             ByteView::from(encode_dedup_value(ghost, digest)),
         )
@@ -900,7 +900,7 @@ mod tests {
         let created_by = submission.created_by;
         write_raw(
             &storage,
-            JOB_DEDUP_INDEX_KEYSPACE,
+            DEDUP_INDEX_KEYSPACE,
             dedup_index_key(created_by, b"k"),
             ByteView::from(encode_dedup_value(ghost, [0xAB; 32])),
         )
@@ -938,7 +938,7 @@ mod tests {
         .await;
         write_raw(
             &storage,
-            JOB_DEDUP_INDEX_KEYSPACE,
+            DEDUP_INDEX_KEYSPACE,
             dedup_index_key(created_by, b"k"),
             ByteView::from(encode_dedup_value(ghost, digest)),
         )

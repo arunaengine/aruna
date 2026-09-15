@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
+use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    JOB_LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload,
+    LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload,
     JobRecord, JobState, parse_schedule_key,
 };
 use aruna_core::task::TaskEvent;
@@ -31,13 +31,13 @@ use super::store::{
 };
 use super::submit::schedule_drain_effect;
 use super::{
-    JOB_CONCURRENCY_CAP, JOB_DRAIN_BATCH_SIZE, JOB_EXTERNAL_CONCURRENCY_CAP, JOB_HEARTBEAT_MS,
-    JOB_PROGRESS_FLUSH_INTERVAL_MS,
+    JOB_CONCURRENCY_CAP, DRAIN_BATCH_SIZE, EXTERNAL_CONCURRENCY_CAP, JOB_HEARTBEAT_MS,
+    FLUSH_INTERVAL_MS,
 };
 use crate::driver::DriverContext;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const DEPENDENCY_RETRY_AFTER_MS: u64 = 1_000;
+const RETRY_AFTER_MS: u64 = 1_000;
 
 struct RunningJob {
     /// Per-execution identity: a re-spawned job at the same id gets a fresh nonce so a
@@ -102,21 +102,21 @@ impl JobsRuntime {
     pub fn new_paused() -> Arc<Self> {
         Self::build(
             JOB_CONCURRENCY_CAP,
-            JOB_EXTERNAL_CONCURRENCY_CAP,
+            EXTERNAL_CONCURRENCY_CAP,
             None,
             false,
         )
     }
 
     pub fn with_capacity(cap: usize) -> Arc<Self> {
-        Self::build(cap, JOB_EXTERNAL_CONCURRENCY_CAP, None, true)
+        Self::build(cap, EXTERNAL_CONCURRENCY_CAP, None, true)
     }
 
     /// Wire the reconcile hook that receives lost external attempts (Stage 2).
     pub fn with_reconciler(reconciler: Arc<dyn ExternalReconciler>) -> Arc<Self> {
         Self::build(
             JOB_CONCURRENCY_CAP,
-            JOB_EXTERNAL_CONCURRENCY_CAP,
+            EXTERNAL_CONCURRENCY_CAP,
             Some(reconciler),
             true,
         )
@@ -510,10 +510,10 @@ impl JobsRuntime {
             }
             let (values, next) = iter_prefix_page(
                 storage,
-                JOB_SCHEDULE_INDEX_KEYSPACE,
-                Some(ByteView::from(JOB_LEASE_INDEX_PREFIX.to_vec())),
+                SCHEDULE_INDEX_KEYSPACE,
+                Some(ByteView::from(LEASE_INDEX_PREFIX.to_vec())),
                 start_after,
-                JOB_DRAIN_BATCH_SIZE,
+                DRAIN_BATCH_SIZE,
                 None,
             )
             .await?;
@@ -711,7 +711,7 @@ async fn run_job(
                 job_id,
                 token,
                 unix_timestamp_millis(),
-                DEPENDENCY_RETRY_AFTER_MS,
+                RETRY_AFTER_MS,
                 error,
             )
             .await
@@ -758,7 +758,7 @@ fn terminal_or_none(result: Result<JobRecord, JobMutationError>, job_id: JobId) 
     }
 }
 
-const TERMINAL_WRITE_MAX_ATTEMPTS: u32 = 5;
+const WRITE_MAX_ATTEMPTS: u32 = 5;
 
 /// Retry a terminal write past transient storage failures: the execution already
 /// finished, so a storage error would otherwise leave it `Running` until the sweep
@@ -771,7 +771,7 @@ where
     let mut attempt = 0;
     loop {
         match op().await {
-            Err(JobMutationError::Storage(error)) if attempt + 1 < TERMINAL_WRITE_MAX_ATTEMPTS => {
+            Err(JobMutationError::Storage(error)) if attempt + 1 < WRITE_MAX_ATTEMPTS => {
                 warn!(error = %error, "Retrying job terminal write after storage failure");
                 tokio::time::sleep(Duration::from_millis(20u64 << attempt)).await;
                 attempt += 1;
@@ -846,7 +846,7 @@ async fn heartbeat_loop(
 ) {
     let mut heartbeat = interval(Duration::from_millis(JOB_HEARTBEAT_MS));
     heartbeat.tick().await;
-    let mut flush = interval(Duration::from_millis(JOB_PROGRESS_FLUSH_INTERVAL_MS));
+    let mut flush = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
     flush.tick().await;
 
     loop {
@@ -881,7 +881,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::id::NodeId;
-    use aruna_core::keyspaces::ROCRATE_JOB_STATE_KEYSPACE;
+    use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
     use aruna_core::structs::execution::job::{
         AttemptIntent, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
         ImportRoCrateSpec, ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload,
@@ -1121,7 +1121,7 @@ mod tests {
         assert!(matches!(
             storage
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+                    key_space: JOB_STATE_KEYSPACE.to_string(),
                     key: ByteView::from(job_id.to_bytes().to_vec()),
                     txn_id: None,
                 })
@@ -1228,7 +1228,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
-            lease_expires_at_ms: 60_000,
+            lease_expires_ms: 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
 
@@ -1263,7 +1263,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::generate(),
-            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+            lease_expires_ms: unix_timestamp_millis() + 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
 
@@ -1600,7 +1600,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
-            lease_expires_at_ms: 60_000,
+            lease_expires_ms: 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
         let ctx = JobContext {
@@ -1624,7 +1624,7 @@ mod tests {
         assert!(matches!(
             storage
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+                    key_space: JOB_STATE_KEYSPACE.to_string(),
                     key: ByteView::from(job_id.to_bytes().to_vec()),
                     txn_id: None,
                 })
@@ -1679,7 +1679,7 @@ mod tests {
         assert_eq!(runtime.available_slots_for(JobExecutionClass::InProcess), 0);
         assert_eq!(
             runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
-            JOB_EXTERNAL_CONCURRENCY_CAP,
+            EXTERNAL_CONCURRENCY_CAP,
             "internal load never consumes external slots"
         );
 
@@ -1689,7 +1689,7 @@ mod tests {
         );
         assert_eq!(
             runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
-            JOB_EXTERNAL_CONCURRENCY_CAP - 1
+            EXTERNAL_CONCURRENCY_CAP - 1
         );
         assert_eq!(
             runtime.available_slots_for(JobExecutionClass::InProcess),
@@ -1717,7 +1717,7 @@ mod tests {
         );
         assert_eq!(
             runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
-            JOB_EXTERNAL_CONCURRENCY_CAP
+            EXTERNAL_CONCURRENCY_CAP
         );
     }
 
@@ -1735,7 +1735,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::generate(),
-            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+            lease_expires_ms: unix_timestamp_millis() + 60_000,
         });
         record.attempt_intent = Some(AttemptIntent {
             attempt_no: 1,
@@ -1765,7 +1765,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::generate(),
-            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+            lease_expires_ms: unix_timestamp_millis() + 60_000,
         });
         record.attempt_intent = Some(AttemptIntent {
             attempt_no: 1,
@@ -1891,7 +1891,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
-            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+            lease_expires_ms: unix_timestamp_millis() + 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
         record_attempt_intent(
@@ -1927,7 +1927,7 @@ mod tests {
     async fn expire_lease(storage: &StorageHandle, job_id: JobId) {
         mutate_job(storage, job_id, |record| {
             if let Some(claim) = record.claim.as_mut() {
-                claim.lease_expires_at_ms = 1;
+                claim.lease_expires_ms = 1;
             }
             Ok(JobMutation::Persist)
         })

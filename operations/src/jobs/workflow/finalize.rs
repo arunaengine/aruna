@@ -10,7 +10,7 @@ use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::tail_str;
 use aruna_core::structs::execution::job::{
     AttemptControl, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobRecordError,
-    JobResultPayload, MAX_RESULT_MESSAGE_BYTES, OutputObject,
+    JobResultPayload, MAX_MESSAGE_BYTES, OutputObject,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
@@ -939,7 +939,7 @@ pub(super) fn exit_message(code: i32, detail: Option<&str>) -> String {
     let Some(detail) = detail.map(str::trim).filter(|text| !text.is_empty()) else {
         return head;
     };
-    let room = MAX_RESULT_MESSAGE_BYTES.saturating_sub(head.len() + 2);
+    let room = MAX_MESSAGE_BYTES.saturating_sub(head.len() + 2);
     format!("{head}: {}", tail_str(detail, room))
 }
 
@@ -952,7 +952,7 @@ async fn capture_or_park(
 ) -> Option<LogTails> {
     let default_limits = LogLimits::default();
     let limits = LogLimits {
-        max_bytes_per_stream: default_limits.inline_tail_bytes,
+        max_stream_bytes: default_limits.inline_tail_bytes,
         ..default_limits
     };
     match backend.fetch_logs(fence, &limits).await {

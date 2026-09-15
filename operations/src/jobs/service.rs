@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 
-use super::JOB_REPORT_MAX_ROWS;
+use super::REPORT_MAX_ROWS;
 use super::protocol::{JobRequest, JobResponse, JobRouteError, WireRange, send_job_request};
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
@@ -825,7 +825,7 @@ pub async fn read_owned_report(
     if expected_digest.is_some_and(|expected| expected != report_digest) {
         return Ok(JobReportLookup::CursorConflict);
     }
-    let limit = limit.clamp(1, usize::from(JOB_REPORT_MAX_ROWS));
+    let limit = limit.clamp(1, usize::from(REPORT_MAX_ROWS));
     let (rows, next_key) =
         list_job_entries(&context.storage_handle, job_id, last_key, limit).await?;
     Ok(JobReportLookup::Ready {
@@ -893,7 +893,7 @@ pub async fn read_report_routed(
             .await
             .map_err(JobRouteError::Internal);
     };
-    let wire_limit = u16::try_from(limit.min(usize::from(JOB_REPORT_MAX_ROWS)))
+    let wire_limit = u16::try_from(limit.min(usize::from(REPORT_MAX_ROWS)))
         .map_err(|error| JobRouteError::Internal(error.to_string()))?;
     let request = auth_token.map(|auth_token| JobRequest::Report {
         auth_token,
