@@ -2,7 +2,7 @@
 #![recursion_limit = "256"]
 use std::sync::Arc;
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -19,11 +19,11 @@ use aruna_operations::node::usage_stats::{
     RealmUsageScope, load_realm_usage, publish_usage_snapshots,
 };
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -317,7 +317,7 @@ async fn bootstrap_usage_genesis(
             realm_id,
             local_node_id: node_id,
             excluded_peers: Vec::new(),
-            documents: vec![DocumentSyncTarget::NodeUsage {
+            documents: vec![DocumentTarget::NodeUsage {
                 realm_id,
                 node_id,
                 group_id: None,
@@ -428,9 +428,9 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         compute_handle: None,
     });
 
-    initialize_net_incoming_for_tests(context.clone());
+    initialize_incoming_fixture(context.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),

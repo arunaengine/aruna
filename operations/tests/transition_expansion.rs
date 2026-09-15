@@ -9,10 +9,10 @@ use aruna_core::StructuredId;
 use aruna_core::structs::{PlacementRef, RealmNodeKind};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    create_metadata_document, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,
+    mint_local_document,
 };
-use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::projector::replay_event_log;
 use ulid::Ulid;
 
@@ -185,13 +185,13 @@ async fn create_document(
     // The realm's background writers can conflict with this create, so use
     // the same retrying entry point the API uses.
     let created = create_metadata_document(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: realm.actor(node),
             group_id,
             document_id,
             document_path: document_path.to_string(),
             public: false,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: document_path.to_string(),
                 description: "expansion fixture".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -207,7 +207,7 @@ async fn create_document(
 
 async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
     drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         node.context.as_ref(),
     )
     .await

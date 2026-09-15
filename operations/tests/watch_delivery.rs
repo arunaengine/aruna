@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::document::{DocumentSyncNetEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentNetEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -19,7 +19,7 @@ use aruna_core::structs::{
     interest_node_key, watch_notification_id, watch_resource_path,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::{DocumentSyncEffect, NodeId, UserId};
+use aruna_core::{DocumentEffect, NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch::{
@@ -36,7 +36,7 @@ use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -561,8 +561,8 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     let sync_event = new_holder_node
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentSyncEffect::SyncDocument {
-                topic: DocumentSyncTarget::WatchInterest {
+            DocumentEffect::SyncDocument {
+                topic: DocumentTarget::WatchInterest {
                     realm_id,
                     node_id: old_holder,
                 }
@@ -572,7 +572,7 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
         )))
         .await;
     let reconciled = match sync_event {
-        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
             targets,
             ..
         })) => targets,
@@ -866,7 +866,7 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         jobs_runtime.clone(),
         &shutdown,
     );
-    install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+    start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,
@@ -998,7 +998,7 @@ async fn bootstrap_interest_topic(
                 realm_id,
                 local_node_id: node_id,
                 excluded_peers: Vec::new(),
-                documents: vec![DocumentSyncTarget::WatchInterest { realm_id, node_id }],
+                documents: vec![DocumentTarget::WatchInterest { realm_id, node_id }],
                 allow_genesis: index == 0,
             }),
             node.context.as_ref(),

@@ -9,8 +9,8 @@ use aruna_core::structs::TransitionLimits;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::mint_local_document;
 use aruna_operations::metadata::forward::route_metadata_update;
-use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::update_document::UpdateMetadataDocumentMutation;
+use aruna_operations::metadata::get_document::GetDocumentOperation;
+use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::placement::holds_placement;
 use aruna_operations::placement::transition::preview_transition;
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
@@ -120,7 +120,7 @@ async fn turnover_moves_holder() -> TestResult<()> {
         None,
         document_id,
         None,
-        UpdateMetadataDocumentMutation::UpsertDataEntity {
+        UpdateDocumentMutation::UpsertDataEntity {
             jsonld: r#"{"@id":"./turned-over.txt","@type":"File","name":"turned-over.txt"}"#
                 .to_string(),
         },
@@ -131,7 +131,7 @@ async fn turnover_moves_holder() -> TestResult<()> {
         let node = realm.find(*holder);
         wait_until("forwarded write reaches holder", *holder, || async {
             drive(
-                GetMetadataDocumentOperation::new(group_id, document_id),
+                GetDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
             )
             .await
@@ -146,7 +146,7 @@ async fn turnover_moves_holder() -> TestResult<()> {
 
 async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
     drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         node.context.as_ref(),
     )
     .await

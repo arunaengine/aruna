@@ -21,27 +21,23 @@ use aruna_core::structs::{
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::records::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::node::usage_stats::RebuildUsageStatsOperation;
-use aruna_operations::s3::abort_upload::{
-    AbortMultipartUploadInput, AbortMultipartUploadOperation,
-};
+use aruna_operations::node::usage_stats::RebuildStatsOperation;
+use aruna_operations::s3::abort_upload::{AbortUploadInput, AbortUploadOperation};
 use aruna_operations::s3::complete_upload::{
-    CompleteMultipartPart, CompleteMultipartUploadError, CompleteMultipartUploadInput,
-    CompleteMultipartUploadOperation, CompleteMultipartUploadResult,
+    CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
+    CompleteUploadResult,
 };
 use aruna_operations::s3::copy_object::{
-    CopyObjectInput, CopyObjectResultData, CopyReferences, CopySourceConditions,
+    CopyObjectInput, CopyReferences, CopyResultData, CopySourceConditions,
 };
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_upload::{
-    CreateMultipartUploadInput, CreateMultipartUploadOperation,
-};
+use aruna_operations::s3::create_upload::{CreateMultipartInput, CreateMultipartOperation};
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
     DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
 use aruna_operations::s3::policy_successor::{
-    MintPolicySuccessorOperation, SuccessorOutcome, SuccessorPlan,
+    MintSuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
@@ -187,7 +183,7 @@ async fn delete_object(
 
 async fn create_upload(h: &Harness, bucket: &str, key: &str, group_id: Ulid) -> Ulid {
     drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
             group_id,
@@ -237,9 +233,9 @@ async fn complete_upload(
     upload_id: Ulid,
     parts: &[UploadPartResult],
     object_size: u64,
-) -> CompleteMultipartUploadResult {
+) -> CompleteUploadResult {
     drive(
-        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+        CompleteUploadOperation::new(CompleteUploadInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
             upload_id,
@@ -334,7 +330,7 @@ async fn read_global(ctx: &DriverContext) -> UsageCounters {
 /// incremental bookkeeping produced.
 async fn assert_matches_rebuild(ctx: &DriverContext) {
     let before = effective_usage(ctx).await;
-    drive(RebuildUsageStatsOperation::new(), ctx).await.unwrap();
+    drive(RebuildStatsOperation::new(), ctx).await.unwrap();
     let after = effective_usage(ctx).await;
     assert_eq!(
         before, after,
@@ -570,7 +566,7 @@ async fn abort_preserves_counters() {
     upload_part(&h, "bucket", "abort.bin", upload_id, 1, b"discard me").await;
 
     drive(
-        AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+        AbortUploadOperation::new(AbortUploadInput {
             bucket: "bucket".to_string(),
             key: "abort.bin".to_string(),
             upload_id,
@@ -840,11 +836,11 @@ async fn try_complete_multipart(
     group_id: Ulid,
     data: &[u8],
     quota_ceiling: Option<u64>,
-) -> Result<CompleteMultipartUploadResult, CompleteMultipartUploadError> {
+) -> Result<CompleteUploadResult, CompleteUploadError> {
     let upload_id = create_upload(h, bucket, key, group_id).await;
     let part = upload_part(h, bucket, key, upload_id, 1, data).await;
     drive(
-        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+        CompleteUploadOperation::new(CompleteUploadInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
             upload_id,
@@ -888,7 +884,7 @@ async fn multipart_obeys_quota() {
         .expect_err("multipart over ceiling is rejected");
     assert!(matches!(
         error,
-        CompleteMultipartUploadError::QuotaExceeded {
+        CompleteUploadError::QuotaExceeded {
             limit: 30,
             usage: 35
         }
@@ -905,7 +901,7 @@ async fn copy_object(
     source_key: &str,
     dest_key: &str,
     group_id: Ulid,
-) -> CopyObjectResultData {
+) -> CopyResultData {
     aruna_operations::s3::copy_object::copy_object(
         &h.driver,
         CopyObjectInput {
@@ -1060,7 +1056,7 @@ async fn mint_books_bytes() {
     .unwrap();
 
     let outcome = drive(
-        MintPolicySuccessorOperation::new(SuccessorPlan {
+        MintSuccessorOperation::new(SuccessorPlan {
             context: HeadAliasContext::new(h.realm_id, group_id, h.node_id, "bucket", "ruled.txt"),
             mutation_id: Ulid::generate(),
             expected_head: head,

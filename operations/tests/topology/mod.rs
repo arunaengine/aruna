@@ -13,15 +13,15 @@ use std::sync::Arc;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::document::{DocumentSyncEffect, DocumentSyncNetEvent, DocumentSyncPublish};
+use aruna_core::document::DocumentTarget;
+use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentSyncPublish};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::reducer::AdminDocumentReducerState;
+use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::{
     Actor, AuthContext, Backend, BackendConfig, GroupAuthorizationDocument, MetadataRegistryRecord,
     NodePlacementEntry, PlacementRef, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -31,13 +31,13 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::groups::add_member::{AddUserToGroupInput, AddUserToGroupOperation};
+use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
+use aruna_operations::metadata::{AuthToken, MetadataHandle};
 use aruna_operations::placement::expand_placement::expand_realm_placement;
 use aruna_operations::placement::transition::{TransitionRequest, plan_transition};
 use aruna_operations::placement::{
@@ -45,13 +45,13 @@ use aruna_operations::placement::{
     resolve_shard_holders, strategy_for_target,
 };
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::realm::mutate_placement::{
-    MutateRealmPlacementConfig, RealmPlacementMutation, drive_placement_mutation,
+    MutatePlacementConfig, RealmPlacementMutation, drive_placement_mutation,
 };
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
@@ -134,7 +134,7 @@ impl Topology {
         let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         tracing::info!(
-            realm_config_topic = %DocumentSyncTarget::RealmConfig { realm_id }
+            realm_config_topic = %DocumentTarget::RealmConfig { realm_id }
                 .sync_topic_id(realm_id, &PlacementRef::NIL),
             "spawned realm"
         );
@@ -155,7 +155,7 @@ impl Topology {
             hang_cap(
                 "announce realm presence",
                 drive(
-                    AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                    AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                         realm_id,
                         node_id: node.node_id(),
                         schedule_refresh: true,
@@ -222,14 +222,14 @@ impl Topology {
 
     /// A bearer token for [`Topology::user_id`], signed by the realm key that the
     /// realm id is. A holder re-validates this before applying a forwarded write.
-    pub fn bearer_token(&self) -> MetadataAuthToken {
-        MetadataAuthToken::bearer(self.bearer_string()).expect("token is within the length bound")
+    pub fn bearer_token(&self) -> AuthToken {
+        AuthToken::bearer(self.bearer_string()).expect("token is within the length bound")
     }
 
     /// A bearer token for another realm principal, for fixtures that need a second
     /// authorized caller.
-    pub fn bearer_for(&self, user_id: UserId) -> MetadataAuthToken {
-        MetadataAuthToken::bearer(self.bearer_string_for(user_id))
+    pub fn bearer_for(&self, user_id: UserId) -> AuthToken {
+        AuthToken::bearer(self.bearer_string_for(user_id))
             .expect("token is within the length bound")
     }
 
@@ -257,7 +257,7 @@ impl Topology {
         hang_cap(
             "grant_group_user",
             drive(
-                AddUserToGroupOperation::new(AddUserToGroupInput {
+                AddUserOperation::new(AddUserInput {
                     actor: self.actor(self.node(0)),
                     group_id,
                     user_id,
@@ -293,7 +293,7 @@ impl Topology {
     }
 
     /// The raw signed JWT backing [`Topology::bearer_token`], for callers that pass
-    /// a bearer string rather than a [`MetadataAuthToken`].
+    /// a bearer string rather than a [`AuthToken`].
     pub fn bearer_string(&self) -> String {
         self.bearer_string_for(self.user_id)
     }
@@ -370,13 +370,13 @@ impl Topology {
         description: &str,
     ) -> TestResult<PlacementRef> {
         let created = drive(
-            CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            CreateDocumentOperation::new(CreateDocumentConfig {
                 actor: self.actor(node),
                 group_id,
                 document_id,
                 document_path: document_path.to_string(),
                 public: false,
-                payload: CreateMetadataDocumentPayload::Scaffold {
+                payload: CreateDocumentPayload::Scaffold {
                     name: document_path.to_string(),
                     description: description.to_string(),
                     date_published: "2026-01-01".to_string(),
@@ -400,7 +400,7 @@ impl Topology {
         document_path: &str,
     ) -> Option<PlacementRef> {
         let path = MetadataRegistryRecord::normalize_document_path(document_path);
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let target = DocumentTarget::MetadataDocumentLifecycle { document_id };
         let (strategy, _) = strategy_for_target(
             &self.config,
             &target,
@@ -561,7 +561,7 @@ impl Topology {
         self.config = hang_cap(
             "placement mutation",
             drive_placement_mutation(
-                MutateRealmPlacementConfig { actor, mutation },
+                MutatePlacementConfig { actor, mutation },
                 None,
                 node.context.as_ref(),
             ),
@@ -825,7 +825,7 @@ impl Topology {
         hang_cap(
             "announce late realm presence",
             drive(
-                AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                     realm_id: self.realm_id,
                     node_id,
                     schedule_refresh: true,
@@ -851,7 +851,7 @@ impl Topology {
         self.apply_config(config).await?;
         // Production onboarding admits the joiner to the shared realm topics
         // (`bootstrap_onboarding_finalize`).
-        let shared_topic = DocumentSyncTarget::RealmConfig {
+        let shared_topic = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         }
         .sync_topic_id(self.realm_id, &PlacementRef::NIL);
@@ -871,13 +871,13 @@ impl Topology {
             self.realm_id,
         )
         .await;
-        let topic = DocumentSyncTarget::RealmConfig {
+        let topic = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         }
         .sync_topic_id(self.realm_id, &PlacementRef::NIL);
         node.net
             .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentSyncEffect::SyncDocuments {
+                DocumentEffect::SyncDocuments {
                     topics: vec![topic],
                     peers: Vec::new(),
                 },
@@ -1000,9 +1000,9 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         compute_handle: None,
     });
 
-    initialize_net_incoming_for_tests(context.clone());
+    initialize_incoming_fixture(context.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new_paused(),
@@ -1118,7 +1118,7 @@ async fn install_realm_config(
         hang_cap(
             "initialize activations",
             drive_placement_mutation(
-                MutateRealmPlacementConfig {
+                MutatePlacementConfig {
                     actor: Actor {
                         node_id: nodes[0].node_id(),
                         user_id,
@@ -1196,7 +1196,7 @@ async fn seed_config_topic(
         .find(|node| !node.is_sync_eligible())
         .or_else(|| nodes.last())
         .ok_or("topology has no nodes")?;
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let placement =
         aruna_operations::placement::target_placement_ref(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
@@ -1205,8 +1205,7 @@ async fn seed_config_topic(
         user_id: aruna_core::UserId::nil(realm_id),
         realm_id,
     };
-    let mut reducer_state =
-        AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+    let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
     let event = reducer_state.apply_operation(
         &actor,
         AdminDocumentOperation::RealmConfigNodePlacementSet {
@@ -1224,7 +1223,7 @@ async fn seed_config_topic(
     match seeder
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentSyncEffect::PublishDocuments {
+            DocumentEffect::PublishDocuments {
                 documents: vec![DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event: Box::new(event),
@@ -1237,7 +1236,7 @@ async fn seed_config_topic(
         )))
         .await
     {
-        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished { .. })) => {}
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished { .. })) => {}
         other => return Err(format!("unexpected config topic seed publish: {other:?}").into()),
     }
     for node in nodes {
@@ -1247,14 +1246,14 @@ async fn seed_config_topic(
         match node
             .net
             .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentSyncEffect::SyncDocuments {
+                DocumentEffect::SyncDocuments {
                     topics: vec![topic],
                     peers: Vec::new(),
                 },
             )))
             .await
         {
-            Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
+            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
                 ..
             })) => {}
             other => return Err(format!("unexpected config topic seed sync: {other:?}").into()),
@@ -1315,14 +1314,14 @@ pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
     }))
     .await;
     let topic =
-        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+        DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
     join_all(
         nodes
             .iter()
             .filter(|node| node.is_sync_eligible())
             .map(|node| {
                 node.net.send_effect(Effect::Net(NetEffect::DocumentSync(
-                    DocumentSyncEffect::SyncDocuments {
+                    DocumentEffect::SyncDocuments {
                         topics: vec![topic],
                         peers: Vec::new(),
                     },
