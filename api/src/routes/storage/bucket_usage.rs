@@ -14,7 +14,7 @@ use utoipa_axum::routes;
 
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage_deletion::bucket_info;
+use crate::routes::storage::storage_deletion::bucket_info;
 use crate::server_state::ServerState;
 
 const DEFAULT_USAGE_LIMIT: usize = 10_000;
@@ -22,10 +22,10 @@ const MAX_USAGE_LIMIT: usize = 100_000;
 
 #[derive(OpenApi)]
 #[openapi()]
-pub struct BucketUsageApiDoc;
+pub struct BucketUsageDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketUsageApiDoc::openapi()).routes(routes!(get_bucket_usage))
+    OpenApiRouter::with_openapi(BucketUsageDoc::openapi()).routes(routes!(get_bucket_usage))
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]

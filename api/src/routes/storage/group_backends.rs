@@ -1,20 +1,18 @@
 use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage_routing::ensure_group_admin;
+use crate::routes::storage::storage_routing::ensure_group_admin;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
-    AuthContext, BackendRef, CleanupStrategy, GroupBackendKind, GroupStorageBackend,
+    AuthContext, BackendRef, CleanupStrategy, GroupBackendKind, GroupStorage,
 };
 use aruna_operations::blob::reclaim::backend_status;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::backends::create::{
-    CreateGroupBackendError, CreateGroupBackendInput, CreateGroupBackendOperation,
+    CreateBackendError, CreateBackendInput, CreateBackendOperation,
 };
 use aruna_operations::groups::backends::disable::{SetDisabledError, SetDisabledOperation};
-use aruna_operations::groups::backends::query::{
-    GetGroupBackendOperation, ListGroupBackendsOperation,
-};
-use aruna_operations::groups::backends::replace::ReplaceGroupBackendOperation;
+use aruna_operations::groups::backends::query::{GetBackendOperation, ListBackendsOperation};
+use aruna_operations::groups::backends::replace::ReplaceBackendOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -35,10 +33,10 @@ use utoipa_axum::routes;
         description = "Tenant-registered write backends on a group's own object storage"
     ))
 )]
-pub struct GroupBackendsApiDoc;
+pub struct GroupBackendsDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(GroupBackendsApiDoc::openapi())
+    OpenApiRouter::with_openapi(GroupBackendsDoc::openapi())
         .routes(routes!(create_group_backend, list_group_backends))
         .routes(routes!(
             get_group_backend,
@@ -50,7 +48,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct CreateGroupBackendRequest {
+#[schema(as = CreateGroupBackendRequest)]
+pub struct CreateBackendRequest {
     pub name: String,
     /// One of `s3`, `gcs`, `azblob`, `azdls`, `b2`.
     pub kind: String,
@@ -138,12 +137,13 @@ pub struct ReclaimStatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct ListGroupBackendsResponse {
+#[schema(as = ListGroupBackendsResponse)]
+pub struct ListBackendsResponse {
     pub backends: Vec<GroupBackendResponse>,
 }
 
-impl From<GroupStorageBackend> for GroupBackendResponse {
-    fn from(value: GroupStorageBackend) -> Self {
+impl From<GroupStorage> for GroupBackendResponse {
+    fn from(value: GroupStorage) -> Self {
         Self {
             backend_id: value.backend_id.to_string(),
             group_id: value.group_id.to_string(),
@@ -156,15 +156,11 @@ impl From<GroupStorageBackend> for GroupBackendResponse {
     }
 }
 
-fn map_create_error(error: CreateGroupBackendError) -> ServerError {
+fn map_create_error(error: CreateBackendError) -> ServerError {
     match error {
-        CreateGroupBackendError::NotFound => ServerError::NotFound,
-        CreateGroupBackendError::Invalid(error) => {
-            ServerError::BadRequestMessage(error.to_string())
-        }
-        CreateGroupBackendError::Unreachable(error) => {
-            ServerError::BadRequestMessage(error.to_string())
-        }
+        CreateBackendError::NotFound => ServerError::NotFound,
+        CreateBackendError::Invalid(error) => ServerError::BadRequestMessage(error.to_string()),
+        CreateBackendError::Unreachable(error) => ServerError::BadRequestMessage(error.to_string()),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -212,7 +208,7 @@ group's data, so the group write rights that suffice for objects are not enough.
 - An endpoint must be an `https` URL and `root` a relative path that stays below itself."#,
     params(("group_id" = String, Path, description = "Group that will own the backend, as a 26-character ULID")),
     request_body(
-        content = CreateGroupBackendRequest,
+        content = CreateBackendRequest,
         description = "Backend name, kind, the public configuration for that kind, the write-only credentials and an optional cleanup policy",
         example = json!({
             "name": "institute-archive",
@@ -274,7 +270,7 @@ pub async fn create_group_backend(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
-    Json(request): Json<CreateGroupBackendRequest>,
+    Json(request): Json<CreateBackendRequest>,
 ) -> ServerResult<(StatusCode, Json<GroupBackendResponse>)> {
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let kind = GroupBackendKind::from_str(&request.kind)
@@ -282,7 +278,7 @@ pub async fn create_group_backend(
     let cleanup = CleanupPolicy::resolve(request.cleanup)?;
 
     let record = drive(
-        CreateGroupBackendOperation::new(CreateGroupBackendInput {
+        CreateBackendOperation::new(CreateBackendInput {
             group_id,
             created_by: auth.user_id,
             name: request.name,
@@ -320,7 +316,7 @@ administrator right that registration takes.
         (
             status = 200,
             description = "Every backend the group has registered on this node, enabled and disabled alike, credentials excluded",
-            body = ListGroupBackendsResponse,
+            body = ListBackendsResponse,
             example = json!({
                 "backends": [
                     {
@@ -355,14 +351,14 @@ pub async fn list_group_backends(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
-) -> ServerResult<Json<ListGroupBackendsResponse>> {
+) -> ServerResult<Json<ListBackendsResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
 
-    let backends = drive(ListGroupBackendsOperation::new(group_id), &state.get_ctx())
+    let backends = drive(ListBackendsOperation::new(group_id), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
 
-    Ok(Json(ListGroupBackendsResponse {
+    Ok(Json(ListBackendsResponse {
         backends: backends.into_iter().map(Into::into).collect(),
     }))
 }
@@ -429,7 +425,7 @@ pub async fn get_group_backend(
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
     let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
 
-    let record = drive(GetGroupBackendOperation::new(backend_id), &state.get_ctx())
+    let record = drive(GetBackendOperation::new(backend_id), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?
         .filter(|record| record.group_id == group_id)
@@ -465,7 +461,7 @@ pub async fn get_group_backend(
         ("backend_id" = String, Path, description = "Backend to replace, as a 26-character ULID")
     ),
     request_body(
-        content = CreateGroupBackendRequest,
+        content = CreateBackendRequest,
         description = "The complete new definition. The kind and the store-naming keys must match the registered ones, and an omitted `cleanup` resets the policy to `retain`.",
         example = json!({
             "name": "institute-archive",
@@ -530,7 +526,7 @@ pub async fn replace_group_backend(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, backend_id)): Path<(String, String)>,
-    Json(request): Json<CreateGroupBackendRequest>,
+    Json(request): Json<CreateBackendRequest>,
 ) -> ServerResult<Json<GroupBackendResponse>> {
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
@@ -539,9 +535,9 @@ pub async fn replace_group_backend(
     let cleanup = CleanupPolicy::resolve(request.cleanup)?;
 
     let record = drive(
-        ReplaceGroupBackendOperation::new(
+        ReplaceBackendOperation::new(
             backend_id,
-            CreateGroupBackendInput {
+            CreateBackendInput {
                 group_id,
                 created_by: auth.user_id,
                 name: request.name,
@@ -754,7 +750,7 @@ pub async fn backend_reclaim_status(
     let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
 
-    drive(GetGroupBackendOperation::new(backend_id), &context)
+    drive(GetBackendOperation::new(backend_id), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?
         .filter(|record| record.group_id == group_id)
@@ -779,7 +775,7 @@ async fn set_disabled(
     group_id: &str,
     backend_id: &str,
     disabled: bool,
-) -> ServerResult<GroupStorageBackend> {
+) -> ServerResult<GroupStorage> {
     let (group_id, _) = admin_of_group(state, auth, group_id).await?;
     let backend_id = Ulid::from_str(backend_id).map_err(|_| ServerError::BadRequest)?;
 
@@ -795,4 +791,5 @@ async fn set_disabled(
 }
 
 #[cfg(test)]
+#[path = "group_backends_tests.rs"]
 mod tests;

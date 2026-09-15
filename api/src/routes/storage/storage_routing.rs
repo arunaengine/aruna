@@ -7,14 +7,12 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::groups::storage_routing::{
-    GetGroupRoutingOperation, GroupRoutingInputsOperation, PutGroupRoutingError,
-    PutGroupRoutingOperation,
+    GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
 };
 use aruna_operations::s3::bucket_routing::{
-    GetBucketRoutingError, GetBucketRoutingOperation, PutBucketRoutingError,
-    PutBucketRoutingOperation,
+    GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation,
 };
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -28,10 +26,10 @@ use utoipa_axum::routes;
 
 #[derive(OpenApi)]
 #[openapi()]
-pub struct StorageRoutingApiDoc;
+pub struct StorageRoutingDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageRoutingApiDoc::openapi())
+    OpenApiRouter::with_openapi(StorageRoutingDoc::openapi())
         .routes(routes!(get_bucket_routing, put_bucket_routing))
         .routes(routes!(get_group_routing, put_group_routing))
 }
@@ -50,7 +48,8 @@ pub struct RoutingTargetRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct StorageRoutingRuleRequest {
+#[schema(as = StorageRoutingRuleRequest)]
+pub struct RoutingRuleRequest {
     #[serde(default)]
     pub key_prefix: String,
     #[serde(default)]
@@ -60,13 +59,13 @@ pub struct StorageRoutingRuleRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct BucketRoutingRequest {
-    pub rules: Vec<StorageRoutingRuleRequest>,
+    pub rules: Vec<RoutingRuleRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct BucketRoutingResponse {
     pub bucket: String,
-    pub rules: Vec<StorageRoutingRuleRequest>,
+    pub rules: Vec<RoutingRuleRequest>,
     /// Advisory notes about targets this node cannot serve. The rules are
     /// stored regardless, because the record replicates to other nodes.
     pub warnings: Vec<String>,
@@ -119,10 +118,10 @@ impl From<RoutingTarget> for RoutingTargetRequest {
     }
 }
 
-impl TryFrom<StorageRoutingRuleRequest> for StorageRoutingRule {
+impl TryFrom<RoutingRuleRequest> for StorageRoutingRule {
     type Error = ServerError;
 
-    fn try_from(value: StorageRoutingRuleRequest) -> Result<Self, Self::Error> {
+    fn try_from(value: RoutingRuleRequest) -> Result<Self, Self::Error> {
         Ok(Self {
             key_prefix: value.key_prefix,
             exact: value.exact,
@@ -131,7 +130,7 @@ impl TryFrom<StorageRoutingRuleRequest> for StorageRoutingRule {
     }
 }
 
-impl From<StorageRoutingRule> for StorageRoutingRuleRequest {
+impl From<StorageRoutingRule> for RoutingRuleRequest {
     fn from(value: StorageRoutingRule) -> Self {
         Self {
             key_prefix: value.key_prefix,
@@ -141,23 +140,17 @@ impl From<StorageRoutingRule> for StorageRoutingRuleRequest {
     }
 }
 
-fn map_group_error(error: PutGroupRoutingError) -> ServerError {
+fn map_group_error(error: PutGroupError) -> ServerError {
     match error {
-        PutGroupRoutingError::InvalidTarget(reason) => {
-            ServerError::BadRequestReason(reason.to_string())
-        }
+        PutGroupError::InvalidTarget(reason) => ServerError::BadRequestReason(reason.to_string()),
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
-fn map_put_error(error: PutBucketRoutingError) -> ServerError {
+fn map_put_error(error: PutRoutingError) -> ServerError {
     match error {
-        PutBucketRoutingError::NoSuchBucket | PutBucketRoutingError::GroupMismatch => {
-            ServerError::NotFound
-        }
-        PutBucketRoutingError::InvalidRules(reason) => {
-            ServerError::BadRequestReason(reason.to_string())
-        }
+        PutRoutingError::NoSuchBucket | PutRoutingError::GroupMismatch => ServerError::NotFound,
+        PutRoutingError::InvalidRules(reason) => ServerError::BadRequestReason(reason.to_string()),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -170,7 +163,7 @@ async fn warnings_for<'a>(
     targets: impl IntoIterator<Item = &'a RoutingTarget>,
 ) -> Vec<String> {
     let context = state.get_ctx();
-    let inputs = drive(GroupRoutingInputsOperation::new(group_id), &context)
+    let inputs = drive(GroupInputsOperation::new(group_id), &context)
         .await
         .unwrap_or_default();
     let catalog = node_routing(&context)
@@ -181,13 +174,13 @@ async fn warnings_for<'a>(
 
 async fn group_of_bucket(state: &ServerState, bucket: &str) -> ServerResult<Ulid> {
     match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(info) => Ok(info.group_id),
-        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }
@@ -281,15 +274,12 @@ pub async fn get_bucket_routing(
     let group_id = group_of_bucket(&state, &bucket).await?;
     ensure_bucket_read(&state, &auth, group_id, &bucket).await?;
 
-    let rules = drive(
-        GetBucketRoutingOperation::new(bucket.clone()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| match error {
-        GetBucketRoutingError::NoSuchBucket => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
-    })?;
+    let rules = drive(GetRoutingOperation::new(bucket.clone()), &state.get_ctx())
+        .await
+        .map_err(|error| match error {
+            GetRoutingError::NoSuchBucket => ServerError::NotFound,
+            other => ServerError::InternalError(other.to_string()),
+        })?;
 
     let warnings = warnings_for(&state, group_id, rules.iter().map(|rule| &rule.target)).await;
     Ok(Json(BucketRoutingResponse {
@@ -390,7 +380,7 @@ pub async fn put_bucket_routing(
         .collect::<Result<Vec<_>, _>>()?;
 
     let stored = drive(
-        PutBucketRoutingOperation::new(bucket.clone(), group_id, rules),
+        PutRoutingOperation::new(bucket.clone(), group_id, rules),
         &state.get_ctx(),
     )
     .await
@@ -448,7 +438,7 @@ pub async fn get_group_routing(
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
 
-    let record = drive(GetGroupRoutingOperation::new(group_id), &state.get_ctx())
+    let record = drive(GroupRoutingOperation::new(group_id), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
 
@@ -526,7 +516,7 @@ pub async fn put_group_routing(
         .transpose()?;
 
     let record = drive(
-        PutGroupRoutingOperation::new(group_id, target, auth.user_id, SystemTime::now()),
+        PutGroupOperation::new(group_id, target, auth.user_id, SystemTime::now()),
         &state.get_ctx(),
     )
     .await
@@ -542,4 +532,5 @@ pub async fn put_group_routing(
 }
 
 #[cfg(test)]
+#[path = "storage_routing_tests.rs"]
 pub(crate) mod tests;

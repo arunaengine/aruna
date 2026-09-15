@@ -8,15 +8,13 @@ use aruna_core::structs::{
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::jobs::service::submit_purge_job;
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
-use aruna_operations::s3::list_uploads::{
-    ListMultipartUploadsInput, ListMultipartUploadsOperation,
-};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::list_uploads::{ListUploadsInput, ListUploadsOperation};
 use aruna_operations::s3::list_versions::{
-    ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
+    ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
 use aruna_operations::sync::sync_relationship::{
-    ListSyncRelationshipsOperation, SyncRelationshipDirection,
+    ListRelationshipsOperation, SyncRelationshipDirection,
 };
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -36,10 +34,10 @@ const MAX_PREFLIGHT_LIMIT: usize = 1_000;
 
 #[derive(OpenApi)]
 #[openapi()]
-pub struct StorageDeletionApiDoc;
+pub struct StorageDeletionDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageDeletionApiDoc::openapi())
+    OpenApiRouter::with_openapi(StorageDeletionDoc::openapi())
         .routes(routes!(deletion_preflight))
         .routes(routes!(submit_purge))
 }
@@ -123,7 +121,8 @@ pub struct PurgeTruncationResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SyncDeletionSideEffectResponse {
+#[schema(as = SyncDeletionSideEffectResponse)]
+pub struct SyncSideResponse {
     pub relationship_id: String,
     pub direction: String,
     pub source: String,
@@ -147,7 +146,7 @@ pub struct DeletionPreflightResponse {
     pub scope: PurgeScopeRequest,
     pub counts: PurgeCountsResponse,
     pub sync_relationships_apply_to_bucket_delete: bool,
-    pub sync_relationships: Vec<SyncDeletionSideEffectResponse>,
+    pub sync_relationships: Vec<SyncSideResponse>,
     pub permissions: PurgePermissionsResponse,
     pub truncation: PurgeTruncationResponse,
     /// The Realm-complete backlink service is a separate dependency. Until it
@@ -281,7 +280,7 @@ pub async fn deletion_preflight(
         .map_err(|_| ServerError::BadRequest)?;
 
     let versions = drive(
-        ListObjectVersionsOperation::new(ListObjectVersionsInput {
+        ListVersionsOperation::new(ListVersionsInput {
             bucket: scope.bucket().to_string(),
             prefix: scope.list_prefix().map(str::to_string),
             delimiter: None,
@@ -294,7 +293,7 @@ pub async fn deletion_preflight(
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let uploads = drive(
-        ListMultipartUploadsOperation::new(ListMultipartUploadsInput {
+        ListUploadsOperation::new(ListUploadsInput {
             bucket: scope.bucket().to_string(),
             prefix: scope.list_prefix().map(str::to_string),
             delimiter: None,
@@ -317,11 +316,11 @@ pub async fn deletion_preflight(
     let mut delete_markers = 0u64;
     for item in items {
         match item {
-            ListObjectVersionsItem::Version {
+            ListVersionsItem::Version {
                 is_latest: true, ..
             } => current_heads += 1,
-            ListObjectVersionsItem::Version { .. } => noncurrent_versions += 1,
-            ListObjectVersionsItem::DeleteMarker { .. } => delete_markers += 1,
+            ListVersionsItem::Version { .. } => noncurrent_versions += 1,
+            ListVersionsItem::DeleteMarker { .. } => delete_markers += 1,
         }
     }
     let truncated = versions_truncated || uploads_truncated;
@@ -462,8 +461,8 @@ pub async fn submit_purge(
         JOB_RETENTION_MS,
     )
     .await
-    .map_err(super::jobs::map_submit_error)?;
-    let urls = super::jobs::job_urls(&state, result.job_id).await?;
+    .map_err(crate::routes::execution::jobs::map_submit_error)?;
+    let urls = crate::routes::execution::jobs::job_urls(&state, result.job_id).await?;
     Ok((
         if result.created {
             StatusCode::CREATED
@@ -483,13 +482,13 @@ pub(crate) async fn bucket_info(
     bucket: &str,
 ) -> ServerResult<aruna_core::structs::BucketInfo> {
     match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(info) => Ok(info),
-        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
@@ -511,21 +510,16 @@ fn scope_permission_path(state: &ServerState, group_id: Ulid, scope: &StoragePur
 
 fn scoped_version_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::list_versions::ListObjectVersionsResult,
-) -> (
-    Vec<ListObjectVersionsItem>,
-    bool,
-    Option<String>,
-    Option<Ulid>,
-) {
+    result: aruna_operations::s3::list_versions::ListVersionsResult,
+) -> (Vec<ListVersionsItem>, bool, Option<String>, Option<Ulid>) {
     let mut items = result.items;
     let mut truncated = result.is_truncated;
     let mut key_marker = result.next_key_marker;
     let mut version_marker = result.next_version_id_marker;
     if let StoragePurgeScope::File { key, .. } = scope {
         items.retain(|item| match item {
-            ListObjectVersionsItem::Version { key: item, .. }
-            | ListObjectVersionsItem::DeleteMarker { key: item, .. } => item == key,
+            ListVersionsItem::Version { key: item, .. }
+            | ListVersionsItem::DeleteMarker { key: item, .. } => item == key,
         });
         if key_marker.as_deref() != Some(key.as_str()) {
             truncated = false;
@@ -538,7 +532,7 @@ fn scoped_version_page(
 
 fn scoped_multipart_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::list_uploads::ListMultipartUploadsResult,
+    result: aruna_operations::s3::list_uploads::ListUploadsResult,
 ) -> (
     Vec<aruna_core::structs::MultipartUpload>,
     bool,
@@ -563,7 +557,7 @@ fn scoped_multipart_page(
 async fn list_sync_effects(
     state: &ServerState,
     bucket: &str,
-) -> ServerResult<Vec<SyncDeletionSideEffectResponse>> {
+) -> ServerResult<Vec<SyncSideResponse>> {
     let mut response = Vec::new();
     let mut seen = BTreeSet::new();
     for (direction, label) in [
@@ -571,7 +565,7 @@ async fn list_sync_effects(
         (SyncRelationshipDirection::Incoming, "incoming"),
     ] {
         let relationships = drive(
-            ListSyncRelationshipsOperation::new(direction, Some(bucket.to_string())),
+            ListRelationshipsOperation::new(direction, Some(bucket.to_string())),
             &state.get_ctx(),
         )
         .await
@@ -580,7 +574,7 @@ async fn list_sync_effects(
             if !seen.insert((relationship.id, label)) {
                 continue;
             }
-            response.push(SyncDeletionSideEffectResponse {
+            response.push(SyncSideResponse {
                 relationship_id: relationship.id.to_string(),
                 direction: label.to_string(),
                 source: relationship.source.to_string(),
@@ -594,4 +588,5 @@ async fn list_sync_effects(
 }
 
 #[cfg(test)]
+#[path = "storage_deletion_tests.rs"]
 mod tests;

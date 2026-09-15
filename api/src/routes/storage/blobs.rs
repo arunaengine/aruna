@@ -4,20 +4,20 @@ use aruna_core::NodeId;
 use aruna_core::structs::{
     AuthContext, BucketInfo, CopyOrigin, Permission, bucket_permission_path, object_permission_path,
 };
-use aruna_operations::blob::holders::{GetBlobHoldersError, GetBlobHoldersOperation};
+use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::replication::locations::{
-    LocationSummaryError, LocationSummaryOperation, QueuedReplicaNodesOperation, QueuedReplicas,
-    RelationshipReplicaNodesOperation, RemoteLocationSummaryOperation,
+    LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
+    RelationshipNodesOperation, RemoteLocationOperation,
 };
 use aruna_operations::replication::protocol::{
     CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
 };
-use aruna_operations::replication::queue::QueueBlobReplicationOperation;
+use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -81,13 +81,13 @@ pub struct ReplicateBlobResponse {
 
 async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
     match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }
@@ -208,12 +208,9 @@ pub async fn replicate_blob(
         version_id: version_id.clone(),
         target_node_id: input.target_node_id.to_string(),
     };
-    let queue_result = drive(
-        QueueBlobReplicationOperation::new(input, None),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let queue_result = drive(QueueBlobOperation::new(input, None), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
     if !queue_result.scheduled {
         warn!(
             bucket = %response.bucket,
@@ -569,7 +566,7 @@ pub async fn blob_locations(
     let mut capped = false;
     // Relationship candidates come first because only they carry the stored copy path.
     match drive(
-        RelationshipReplicaNodesOperation::new(
+        RelationshipNodesOperation::new(
             local_node,
             query.bucket.clone(),
             query.path.clone(),
@@ -597,7 +594,7 @@ pub async fn blob_locations(
         }
     }
     let queued = match drive(
-        QueuedReplicaNodesOperation::new(
+        QueuedNodesOperation::new(
             query.bucket.clone(),
             query.path.clone(),
             resolved,
@@ -683,7 +680,7 @@ pub async fn blob_locations(
         let ctx = ctx.clone();
         async move {
             let answer = drive_until(
-                RemoteLocationSummaryOperation::new(node_id, request),
+                RemoteLocationOperation::new(node_id, request),
                 ctx.as_ref(),
                 deadline.min(Instant::now() + LOCATION_SUMMARY_TIMEOUT),
             )
@@ -765,12 +762,12 @@ async fn holder_nodes(
     blake3: Option<[u8; 32]>,
     realm_id: aruna_core::structs::RealmId,
     local_node: NodeId,
-) -> Result<Vec<NodeId>, GetBlobHoldersError> {
+) -> Result<Vec<NodeId>, GetHoldersError> {
     let Some(blake3) = blake3 else {
         return Ok(Vec::new());
     };
     drive_until(
-        GetBlobHoldersOperation::new(blake3, realm_id, local_node),
+        GetHoldersOperation::new(blake3, realm_id, local_node),
         ctx.as_ref(),
         Instant::now() + LOCATION_SUMMARY_TIMEOUT,
     )
@@ -792,4 +789,5 @@ fn add_candidate(candidates: &mut BTreeSet<Destination>, destination: Destinatio
 }
 
 #[cfg(test)]
+#[path = "blobs_tests.rs"]
 mod tests;
