@@ -3,12 +3,15 @@ use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::structs::{
-    AuthContext, OidcProviderConfig, Permission, TokenClaims, object_permission_path,
+    AuthContext, NodeCapabilities, OidcProviderConfig, Permission, TokenClaims,
+    object_permission_path,
 };
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_bearer_token,
+    ArunaBearerError, ArunaValidationState, decode_bearer_token,
 };
 use aruna_operations::auth::request_authorization::AuthorizeError;
+use aruna_operations::driver::drive;
+use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -33,11 +36,11 @@ const OIDC_PROVIDER_METADATA_CACHE_TTL_SECS: u64 = 300;
 #[derive(Debug)]
 pub struct OidcValidator {
     client: reqwest::Client,
-    provider_metadata_cache: RwLock<HashMap<String, CachedOidcProviderMetadata>>,
+    provider_metadata_cache: RwLock<HashMap<String, CachedProviderMetadata>>,
 }
 
 #[derive(Debug, Clone)]
-struct CachedOidcProviderMetadata {
+struct CachedProviderMetadata {
     issuer: String,
     jwks: Value,
     fetched_at: Instant,
@@ -137,7 +140,7 @@ impl OidcValidator {
     async fn fetch_provider_metadata(
         &self,
         provider: &OidcProviderConfig,
-    ) -> Result<CachedOidcProviderMetadata, OidcError> {
+    ) -> Result<CachedProviderMetadata, OidcError> {
         let discovery = self
             .client
             .get(&provider.discovery_url)
@@ -160,7 +163,7 @@ impl OidcValidator {
             .json::<Value>()
             .await?;
 
-        Ok(CachedOidcProviderMetadata {
+        Ok(CachedProviderMetadata {
             issuer: discovery.issuer,
             jwks,
             fetched_at: Instant::now(),
@@ -171,7 +174,7 @@ impl OidcValidator {
         &self,
         provider: &OidcProviderConfig,
         refresh: bool,
-    ) -> Result<CachedOidcProviderMetadata, OidcError> {
+    ) -> Result<CachedProviderMetadata, OidcError> {
         if !refresh {
             let ttl = Duration::from_secs(OIDC_PROVIDER_METADATA_CACHE_TTL_SECS);
             if let Some(metadata) = self
@@ -342,12 +345,12 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedArunaBearerTokenCarrier {
+pub struct ValidatedBearer {
     token: String,
     expires_at_secs: u64,
 }
 
-impl ValidatedArunaBearerTokenCarrier {
+impl ValidatedBearer {
     fn new(token: impl Into<String>, expires_at_secs: u64) -> Self {
         Self {
             token: token.into(),
@@ -389,10 +392,7 @@ async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Optio
 async fn extract_auth_parts(
     state: &ServerState,
     headers: &HeaderMap,
-) -> (
-    Option<AuthContext>,
-    Option<ValidatedArunaBearerTokenCarrier>,
-) {
+) -> (Option<AuthContext>, Option<ValidatedBearer>) {
     let Some(token) = bearer_token(headers) else {
         return (None, None);
     };
@@ -415,10 +415,7 @@ async fn extract_auth_parts(
     }
     (
         Some(auth_context),
-        Some(ValidatedArunaBearerTokenCarrier::new(
-            token,
-            expires_at_secs,
-        )),
+        Some(ValidatedBearer::new(token, expires_at_secs)),
     )
 }
 
@@ -441,12 +438,12 @@ pub(crate) async fn claims_for_revocation(
 struct RevocationBlindState<'a>(&'a ServerState);
 
 #[async_trait::async_trait]
-impl ArunaBearerTokenValidationState for RevocationBlindState<'_> {
+impl ArunaValidationState for RevocationBlindState<'_> {
     async fn is_token_revoked(
         &self,
         _realm_id: &aruna_core::structs::RealmId,
         _token_hash: &str,
-    ) -> Result<bool, ArunaBearerTokenError> {
+    ) -> Result<bool, ArunaBearerError> {
         Ok(false)
     }
 
@@ -457,7 +454,7 @@ impl ArunaBearerTokenValidationState for RevocationBlindState<'_> {
     async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+    ) -> Result<DecodingKey, ArunaBearerError> {
         self.0.issuer_decoding_key(issuer_pubkey).await
     }
 }
@@ -510,6 +507,43 @@ pub(crate) fn require_unrestricted_auth(
 ) -> ServerResult<AuthContext> {
     let auth = require_realm_auth(state, auth)?;
     if auth.path_restrictions.is_some() {
+        return Err(ServerError::Forbidden);
+    }
+    Ok(auth)
+}
+
+/// Reads the device owner from local replicated realm configuration.
+/// This authorizes the device surface only for its bound user on a User-kind node.
+/// Local reads keep the device plane available while the realm is unreachable.
+pub(crate) async fn require_owner(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> ServerResult<AuthContext> {
+    if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
+        return Err(ServerError::NotFound);
+    }
+    let auth = require_unrestricted_auth(state, auth)?;
+    let config = drive(
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        // A device that enrolled but has not received the configuration yet
+        // cannot resolve its owner; that resolves on its own.
+        GetConfigError::DocumentNotFound => ServerError::ServiceUnavailableReason(
+            "the realm configuration has not reached this device yet".to_string(),
+        ),
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    let node_id = state.get_node_id().to_string();
+    let owner = config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .and_then(|node| node.kind.owner())
+        .ok_or(ServerError::Forbidden)?;
+    if owner != auth.user_id {
         return Err(ServerError::Forbidden);
     }
     Ok(auth)
@@ -631,9 +665,7 @@ mod test {
     };
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::users::oidc_user::{
-        RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
-    };
+    use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::Json;
@@ -716,7 +748,7 @@ mod test {
     }
 
     #[derive(Clone)]
-    struct OidcTestServerState {
+    struct OidcServerState {
         issuer: String,
         jwks_uri: String,
         jwks: Arc<RwLock<serde_json::Value>>,
@@ -725,7 +757,7 @@ mod test {
     }
 
     #[derive(Clone)]
-    struct OidcTestServerMetrics {
+    struct OidcServerMetrics {
         discovery_requests: Arc<AtomicUsize>,
         jwks_requests: Arc<AtomicUsize>,
         jwks: Arc<RwLock<serde_json::Value>>,
@@ -742,7 +774,7 @@ mod test {
     }
 
     #[derive(Clone, Serialize, Deserialize)]
-    struct TestMultiAudienceOidcClaims {
+    struct MultiAudienceClaims {
         sub: String,
         iss: String,
         aud: Vec<String>,
@@ -753,7 +785,7 @@ mod test {
         name: Option<String>,
     }
 
-    async fn oidc_discovery(State(state): State<OidcTestServerState>) -> Json<serde_json::Value> {
+    async fn oidc_discovery(State(state): State<OidcServerState>) -> Json<serde_json::Value> {
         state.discovery_requests.fetch_add(1, Ordering::Relaxed);
         Json(serde_json::json!({
             "issuer": state.issuer,
@@ -761,7 +793,7 @@ mod test {
         }))
     }
 
-    async fn oidc_jwks(State(state): State<OidcTestServerState>) -> Json<serde_json::Value> {
+    async fn oidc_jwks(State(state): State<OidcServerState>) -> Json<serde_json::Value> {
         state.jwks_requests.fetch_add(1, Ordering::Relaxed);
         Json(state.jwks.read().await.clone())
     }
@@ -773,7 +805,7 @@ mod test {
     ) -> (
         String,
         String,
-        OidcTestServerMetrics,
+        OidcServerMetrics,
         tokio::task::JoinHandle<()>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -783,7 +815,7 @@ mod test {
         let discovery_requests = Arc::new(AtomicUsize::new(0));
         let jwks_requests = Arc::new(AtomicUsize::new(0));
         let jwks = Arc::new(RwLock::new(jwks));
-        let state = OidcTestServerState {
+        let state = OidcServerState {
             issuer: issuer.to_string(),
             jwks_uri: jwks_uri.clone(),
             jwks: jwks.clone(),
@@ -800,7 +832,7 @@ mod test {
         (
             discovery_url,
             jwks_uri,
-            OidcTestServerMetrics {
+            OidcServerMetrics {
                 discovery_requests,
                 jwks_requests,
                 jwks,
@@ -861,7 +893,7 @@ mod test {
     ) -> String {
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(kid.to_string());
-        let claims = TestMultiAudienceOidcClaims {
+        let claims = MultiAudienceClaims {
             sub: subject.to_string(),
             iss: issuer.to_string(),
             aud: audiences
@@ -1391,7 +1423,7 @@ mod test {
         let user_id = UserId::local(Ulid::generate(), realm_id);
 
         drive(
-            RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
+            ResolveOidcOperation::new(ResolveOidcInput {
                 actor: Actor {
                     node_id,
                     user_id: UserId::nil(realm_id),
@@ -1679,7 +1711,7 @@ mod test {
         let user_id = UserId::local(Ulid::generate(), realm_id);
 
         drive(
-            RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
+            ResolveOidcOperation::new(ResolveOidcInput {
                 actor: Actor {
                     node_id,
                     user_id: UserId::nil(realm_id),
