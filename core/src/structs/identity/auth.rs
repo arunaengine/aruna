@@ -267,7 +267,7 @@ mod tests {
         AuthContext, PathRestriction, Permission, SessionKind, TokenClaims, oidc_subject_key,
     };
     use crate::UserId;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     #[test]
@@ -344,7 +344,8 @@ mod tests {
 #[cfg(test)]
 mod test {
     use crate::UserId;
-    use crate::structs::{Permission, RealmId, Role};
+    use crate::structs::identity::auth::{Permission, Role};
+    use crate::structs::identity::realm::RealmId;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
 

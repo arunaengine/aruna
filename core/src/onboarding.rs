@@ -2,7 +2,7 @@ use crate::NodeId;
 use crate::UserId;
 use crate::auth::credential_hash;
 use crate::document::DocumentTarget;
-use crate::structs::{RealmId, StaticRealmEndpoint};
+use crate::structs::identity::realm::{RealmId, StaticRealmEndpoint};
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::EndpointAddr;
@@ -300,7 +300,7 @@ mod tests {
         OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingTicket, credential_hash,
     };
     use crate::document::DocumentTarget;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;
 

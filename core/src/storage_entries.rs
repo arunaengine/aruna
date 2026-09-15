@@ -31,11 +31,15 @@ use crate::metadata::{
     MetadataMaterializationRecord, ProfileValidationStatus, RawOriginBudget,
 };
 use crate::reducer::{AdminConflict, AdminDocumentState};
-use crate::structs::{
-    MetadataRegistryRecord, NotificationOutboxRecord, NotificationRecord, PLACEMENT_EPOCH_PAD,
-    PlacementRef, RealmId, User, WatchSubscription, notification_inbox_key,
-    notification_outbox_key, notification_prune_key, watch_subscription_key,
+use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+use crate::structs::execution::notification::{
+    NotificationOutboxRecord, NotificationRecord, notification_inbox_key, notification_outbox_key,
+    notification_prune_key,
 };
+use crate::structs::placement::placement_record::{PLACEMENT_EPOCH_PAD, PlacementRef};
+use crate::structs::identity::realm::RealmId;
+use crate::structs::identity::user::User;
+use crate::structs::execution::notification_watch::{WatchSubscription, watch_subscription_key};
 use crate::types::{GroupId, Key, KeySpace, Value};
 
 pub fn subject_index_key(subject_id: &str) -> Key {
@@ -871,7 +875,9 @@ mod tests {
     use crate::reducer::{
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
-    use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
+    use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use crate::structs::placement::placement_record::PlacementRef;
+    use crate::structs::identity::realm::RealmId;
     use crate::{NodeId, UserId};
 
     fn node(seed: u8) -> NodeId {

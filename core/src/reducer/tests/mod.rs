@@ -14,15 +14,21 @@ use super::{
 };
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
 use crate::auth::REVOCATION_GRACE_SECS;
-use crate::structs::{
-    AffinityEffect, AffinityRule, BindingError, BindingScope, BucketPlan, CandidateMapNode,
-    CandidatePlacementMap, CompletionProof, DocumentClass, FIRST_GRANTABLE_HANDLE,
-    GroupQuotaOverride, HandleRange, KIND_LABEL_KEY, LabelMatch, MAX_PLACEMENT_SHARD_COUNT,
-    MetadataReplicationConfig, NodePlacementEntry, PlacementBinding, PlacementOverride,
-    PlacementScope, PlacementStrategy, ProofClaim, QuotaConfig, RealmConfigDocument,
-    RealmDiscoveryConfig, RealmNodeKind, STORAGE_CLASS_LABEL_PREFIX, StrategyBinding,
-    TransitionLimits, TransitionPlan, TransitionStatus, UserCapOverride,
+use crate::structs::placement::placement_record::{
+    AffinityEffect, AffinityRule, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HandleRange,
+    LabelMatch, MAX_PLACEMENT_SHARD_COUNT, NodePlacementEntry, PlacementBinding, PlacementOverride,
+    PlacementScope, PlacementStrategy, StrategyBinding,
 };
+use crate::structs::placement::binding_directory::BindingError;
+use crate::structs::placement::placement_transition::{
+    BucketPlan, CandidateMapNode, CandidatePlacementMap, CompletionProof, ProofClaim,
+    TransitionLimits, TransitionPlan, TransitionStatus,
+};
+use crate::structs::identity::realm::{
+    GroupQuotaOverride, MetadataReplicationConfig, QuotaConfig, RealmConfigDocument,
+    RealmDiscoveryConfig, RealmNodeKind, UserCapOverride,
+};
+use crate::structs::storage::node_info::{KIND_LABEL_KEY, STORAGE_CLASS_LABEL_PREFIX};
 use crate::structured_id::PlacementHandle;
 use crate::user_validation::UserAttributeError;
 use crate::{NodeId, UserId};

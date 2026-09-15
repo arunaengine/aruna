@@ -2,7 +2,9 @@ use crate::NodeId;
 use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
-use crate::structs::{JobId, MetadataRegistryRecord, PlacementRef};
+use crate::structs::execution::job::JobId;
+use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+use crate::structs::placement::placement_record::PlacementRef;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -329,7 +331,7 @@ pub struct MintPersistentSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
 
     fn user() -> UserId {
         UserId::local(Ulid::from_bytes([2; 16]), RealmId([3; 32]))

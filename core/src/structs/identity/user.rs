@@ -1,6 +1,6 @@
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::Actor;
+use crate::structs::identity::auth::Actor;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -36,7 +36,8 @@ impl User {
 mod tests {
     use super::User;
     use crate::UserId;
-    use crate::structs::{Actor, RealmId};
+    use crate::structs::identity::auth::Actor;
+    use crate::structs::identity::realm::RealmId;
     use std::collections::HashMap;
     use ulid::Ulid;
 

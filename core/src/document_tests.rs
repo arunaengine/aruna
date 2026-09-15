@@ -13,8 +13,8 @@ use crate::keyspaces::{
     METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
     REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
-use crate::structs::PlacementRef;
-use crate::structs::RealmId;
+use crate::structs::placement::placement_record::PlacementRef;
+use crate::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
 fn test_ulid(seed: u8) -> Ulid {
@@ -45,7 +45,7 @@ fn change(
         base,
         current: revision(generation, event_seed, actor_seed),
         kind,
-        placement: crate::structs::PlacementRef::NIL,
+        placement: crate::structs::placement::placement_record::PlacementRef::NIL,
     }
 }
 
@@ -319,7 +319,7 @@ fn shard_topic_identity() {
 #[test]
 fn node_usage_keys() {
     use crate::keyspaces::USAGE_NODE_STATS_KEYSPACE;
-    use crate::structs::{usage_global_key, usage_snapshot_key};
+    use crate::structs::storage::usage::{usage_global_key, usage_snapshot_key};
 
     let realm_id = test_realm(2);
     let node_id = test_node(1);
@@ -375,7 +375,7 @@ fn node_usage_keys() {
 #[test]
 fn node_info_keys() {
     use crate::keyspaces::NODE_INFO_KEYSPACE;
-    use crate::structs::node_info_key;
+    use crate::structs::storage::node_info::node_info_key;
 
     let realm_id = test_realm(2);
     let node_id = test_node(1);
@@ -419,7 +419,7 @@ fn watch_interest_keys() {
     use crate::keyspaces::{
         NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
     };
-    use crate::structs::{interest_node_key, watch_subscription_key};
+    use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 
     let realm_id = test_realm(2);
     let node_id = test_node(1);

@@ -19,7 +19,7 @@ fn map_with(epoch: u64, seeds: &[u8]) -> CandidatePlacementMap {
                 labels: BTreeMap::new(),
             })
             .collect(),
-        selectors: vec![crate::structs::FrozenStrategySelector {
+        selectors: vec![crate::structs::placement::placement_transition::FrozenStrategySelector {
             strategy_id: transition_strategy().strategy_id,
             replica_count: Some(1),
             distinct_locations: false,
@@ -60,10 +60,10 @@ fn transition_plan(old: &[u8], target: &[u8]) -> TransitionPlan {
 
 /// The digest of the fixture's reduced barrier set (holders 1 and 2).
 fn fixture_digest(plan: &TransitionPlan, bucket: u32) -> [u8; 32] {
-    let mut transition = crate::structs::PlacementTransition::new(plan.clone());
+    let mut transition = crate::structs::placement::placement_transition::PlacementTransition::new(plan.clone());
     transition.barriers = [1u8, 2]
         .iter()
-        .map(|seed| crate::structs::BucketBarrier {
+        .map(|seed| crate::structs::placement::placement_transition::BucketBarrier {
             bucket,
             reported_by: node(*seed),
             frontier: vec![*seed],
@@ -235,7 +235,7 @@ fn foreign_reports_dropped() {
             transition_id: plan.transition_id,
             bucket: 0,
             reported_by: node(1),
-            frontier: vec![0; crate::structs::MAX_BARRIER_FRONTIER_BYTES + 1],
+            frontier: vec![0; crate::structs::placement::placement_transition::MAX_BARRIER_FRONTIER_BYTES + 1],
         },
     );
     assert!(matches!(

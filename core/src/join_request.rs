@@ -115,7 +115,8 @@ impl AdminDocumentState {
 mod tests {
     use super::*;
     use crate::admin_documents::{AdminDocumentOperation, AdminRoleDefinition};
-    use crate::structs::{Actor, RealmId};
+    use crate::structs::identity::auth::Actor;
+    use crate::structs::identity::realm::RealmId;
     use std::collections::BTreeMap;
 
     fn actor(seed: u8) -> Actor {

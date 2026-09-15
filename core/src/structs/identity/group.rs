@@ -1,8 +1,8 @@
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::Actor;
+use crate::structs::identity::auth::Actor;
 use crate::structs::identity::realm::RealmId;
-use crate::structs::{Permission, Role};
+use crate::structs::identity::auth::{Permission, Role};
 use crate::types::{GroupId, RoleId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -141,7 +141,9 @@ mod test {
     use std::collections::HashSet;
 
     use crate::UserId;
-    use crate::structs::{Actor, Group, GroupAuthorizationDocument, RealmId};
+    use crate::structs::identity::auth::Actor;
+    use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use crate::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     #[test]

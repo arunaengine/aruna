@@ -1,5 +1,6 @@
 use crate::NodeId;
-use crate::structs::{HandleRangeDirectory, RealmId};
+use crate::structs::placement::handle_allocation::HandleRangeDirectory;
+use crate::structs::identity::realm::RealmId;
 use crate::structured_id::PlacementHandle;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
@@ -684,7 +685,7 @@ mod tests {
 
     #[test]
     fn binding_round_trips() {
-        use crate::structs::RealmId;
+        use crate::structs::identity::realm::RealmId;
         use crate::structured_id::PlacementHandle;
 
         let binding = PlacementBinding {

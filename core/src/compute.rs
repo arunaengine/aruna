@@ -14,8 +14,9 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use crate::NodeId;
-use crate::structs::{
-    EffectiveResources, MAX_EXECUTOR_KIND_LEN, PlacementPolicyError, PlacementSubject,
+use crate::structs::execution::job::EffectiveResources;
+use crate::structs::placement::placement_policy::{
+    MAX_EXECUTOR_KIND_LEN, PlacementPolicyError, PlacementSubject,
 };
 
 #[path = "compute_runtimes.rs"]

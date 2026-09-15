@@ -1,5 +1,7 @@
 use crate::NodeId;
-use crate::structs::{DEFAULT_LOCATION, LabelMatch, MAX_NODE_LOCATION_LEN};
+use crate::structs::placement::placement_record::{
+    DEFAULT_LOCATION, LabelMatch, MAX_NODE_LOCATION_LEN,
+};
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

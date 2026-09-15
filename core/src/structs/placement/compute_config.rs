@@ -3,7 +3,7 @@
 //! an unconfigured link, and how long an availability sample stays meaningful.
 
 use crate::compute_quota::ComputeQuota;
-use crate::structs::MAX_NODE_LOCATION_LEN;
+use crate::structs::placement::placement_record::MAX_NODE_LOCATION_LEN;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

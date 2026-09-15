@@ -15,11 +15,13 @@ use crate::keyspaces::{
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
-use crate::structs::{
-    PLACEMENT_EPOCH_PAD, PlacementRef, RealmId, interest_node_key, node_info_key,
-    persistent_id_key, placement_policy_key, usage_global_key, usage_snapshot_key,
-    watch_subscription_key,
-};
+use crate::structs::placement::placement_record::{PLACEMENT_EPOCH_PAD, PlacementRef};
+use crate::structs::identity::realm::RealmId;
+use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
+use crate::structs::storage::node_info::node_info_key;
+use crate::structs::persistent_id_key;
+use crate::structs::placement::policy_document::placement_policy_key;
+use crate::structs::storage::usage::{usage_global_key, usage_snapshot_key};
 use crate::types::{GroupId, Key};
 use crate::{NodeId, TopicId};
 

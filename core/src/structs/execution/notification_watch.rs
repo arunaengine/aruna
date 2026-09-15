@@ -8,7 +8,9 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::{NotificationKind, PathRestriction, RealmId};
+use crate::structs::execution::notification::NotificationKind;
+use crate::structs::identity::auth::PathRestriction;
+use crate::structs::identity::realm::RealmId;
 use crate::types::{GroupId, Key};
 
 pub const NOTIFICATION_WATCH_PER_USER_CAP: usize = 50;
@@ -675,7 +677,7 @@ mod tests {
     use super::*;
     use crate::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
     use crate::storage_entries::{watch_delete_entry, watch_write_entry};
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
 
     fn user(realm: u8, user_byte: u8) -> UserId {
         UserId::new(Ulid::from_bytes([user_byte; 16]), RealmId([realm; 32]))

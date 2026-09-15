@@ -2,7 +2,8 @@
 //! generation and blocks serving until local inventory is revalidated for that generation.
 
 use crate::errors::ConversionError;
-use crate::structs::{NodePlacementEntry, PlacementPolicyError, PlacementSubject};
+use crate::structs::placement::placement_record::NodePlacementEntry;
+use crate::structs::placement::placement_policy::{PlacementPolicyError, PlacementSubject};
 use serde::{Deserialize, Serialize};
 
 /// Single-row key of the local subject record.
@@ -85,7 +86,7 @@ impl NodeSubjectRecord {
 /// therefore holds no governed data.
 pub fn storage_subject(entry: &NodePlacementEntry, generation: u64) -> PlacementSubject {
     let mut labels = entry.labels.clone();
-    crate::structs::stamp_location(&mut labels, &entry.location);
+    crate::structs::storage::node_info::stamp_location(&mut labels, &entry.location);
     PlacementSubject {
         node_id: entry.node_id,
         generation,
@@ -99,7 +100,7 @@ pub fn storage_subject(entry: &NodePlacementEntry, generation: u64) -> Placement
 #[cfg(test)]
 mod tests {
     use super::{NodeSubjectRecord, storage_subject};
-    use crate::structs::{DEFAULT_NODE_WEIGHT, NodePlacementEntry};
+    use crate::structs::placement::placement_record::{DEFAULT_NODE_WEIGHT, NodePlacementEntry};
     use std::collections::BTreeMap;
 
     fn entry(location: &str, label: Option<(&str, &str)>) -> NodePlacementEntry {

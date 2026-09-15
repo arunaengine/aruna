@@ -2,7 +2,7 @@
 //! whole compatibility contract: a peer whose frames differ never negotiates the ALPN, so it fails the
 //! connection instead of decoding foreign bytes. There is no fallback ALPN and no downgrade.
 
-use crate::structs::RealmNodeKind;
+use crate::structs::identity::realm::RealmNodeKind;
 
 /// Which side of a connection is being judged. The same table answers all
 /// three, so a protocol that is one-directional for a node kind says so in one

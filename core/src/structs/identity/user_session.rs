@@ -1,6 +1,6 @@
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::SessionKind;
+use crate::structs::identity::auth::SessionKind;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

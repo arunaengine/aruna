@@ -1,7 +1,7 @@
 use ed25519_dalek::SigningKey;
 
 use crate::id::{DhtKeyId, NodeId};
-use crate::structs::RealmId;
+use crate::structs::identity::realm::RealmId;
 
 /// Fresh Ed25519 signing key from operating-system randomness. `SigningKey::generate` needs an
 /// infallible `rand_core` generator, and no `OsRng` implements that trait, so the entropy is drawn

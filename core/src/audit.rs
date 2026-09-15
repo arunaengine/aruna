@@ -9,7 +9,8 @@ use ulid::Ulid;
 
 use crate::id::NodeId;
 use crate::metadata::AuthToken;
-use crate::structs::{MetadataAuditRecord, RealmId};
+use crate::structs::storage::metadata_registry::MetadataAuditRecord;
+use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;
 
 pub const AUDIT_KEY_BYTES: usize = 48;
@@ -507,7 +508,7 @@ fn key_document(key: &[u8]) -> Option<Ulid> {
 mod tests {
     use super::*;
     use crate::UserId;
-    use crate::structs::MetadataAuditOperation;
+    use crate::structs::storage::metadata_registry::MetadataAuditOperation;
 
     fn key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Vec<u8> {
         let mut key = Vec::with_capacity(AUDIT_KEY_BYTES);

@@ -6,7 +6,8 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::{RealmId, WatchAuthorizationBinding};
+use crate::structs::identity::realm::RealmId;
+use crate::structs::execution::notification_watch::WatchAuthorizationBinding;
 use crate::types::{GroupId, Key};
 
 pub const NOTIFICATION_DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
@@ -387,7 +388,7 @@ mod tests {
                 actor_user_id: user(1, 5),
             },
             NotificationKind::DataUploaded {
-                path: crate::structs::watch_resource_path(
+                path: crate::structs::execution::notification_watch::watch_resource_path(
                     data_group_id,
                     data_node_id,
                     "bucket",
@@ -401,7 +402,7 @@ mod tests {
                 actor_user_id: user(1, 6),
             },
             NotificationKind::SyncCompleted {
-                path: crate::structs::watch_resource_path(
+                path: crate::structs::execution::notification_watch::watch_resource_path(
                     data_group_id,
                     data_node_id,
                     "bucket",
@@ -415,7 +416,7 @@ mod tests {
                 actor_user_id: user(1, 6),
             },
             NotificationKind::SyncFailed {
-                path: crate::structs::watch_resource_path(
+                path: crate::structs::execution::notification_watch::watch_resource_path(
                     data_group_id,
                     data_node_id,
                     "bucket",
@@ -593,7 +594,7 @@ mod tests {
         let data_group_id = Ulid::generate();
         let data_node_id = make_node_id(2);
         let data_uploaded = NotificationKind::DataUploaded {
-            path: crate::structs::watch_resource_path(data_group_id, data_node_id, "bucket", "key"),
+            path: crate::structs::execution::notification_watch::watch_resource_path(data_group_id, data_node_id, "bucket", "key"),
             group_id: data_group_id,
             node_id: data_node_id,
             bucket: "bucket".to_string(),
@@ -602,7 +603,7 @@ mod tests {
             actor_user_id: user(1, 6),
         };
         let sync_completed = NotificationKind::SyncCompleted {
-            path: crate::structs::watch_resource_path(data_group_id, data_node_id, "bucket", ""),
+            path: crate::structs::execution::notification_watch::watch_resource_path(data_group_id, data_node_id, "bucket", ""),
             group_id: data_group_id,
             node_id: data_node_id,
             bucket: "bucket".to_string(),
@@ -611,7 +612,7 @@ mod tests {
             actor_user_id: user(1, 6),
         };
         let sync_failed = NotificationKind::SyncFailed {
-            path: crate::structs::watch_resource_path(data_group_id, data_node_id, "bucket", ""),
+            path: crate::structs::execution::notification_watch::watch_resource_path(data_group_id, data_node_id, "bucket", ""),
             group_id: data_group_id,
             node_id: data_node_id,
             bucket: "bucket".to_string(),

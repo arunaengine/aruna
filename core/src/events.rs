@@ -6,11 +6,14 @@ use crate::effects::{
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
-use crate::structs::{
-    BackendLocation, GroupRoutingInputs, HiddenBlobEntry, MAX_POLICY_REF_INPUT, PlacementDecision,
-    PlacementPolicyDocument, PolicyPublication, RealmId, ReplicationItemError,
-    ReplicationSuboperationResult, ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry,
-    SourceMetadata,
+use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
+use crate::structs::storage::routing::GroupRoutingInputs;
+use crate::structs::placement::placement_policy::{MAX_POLICY_REF_INPUT, PlacementDecision};
+use crate::structs::placement::policy_document::{PlacementPolicyDocument, PolicyPublication};
+use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
+use crate::structs::execution::source_access::{
+    ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::{
     document::DocumentNetEvent,

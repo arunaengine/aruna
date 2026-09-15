@@ -8,7 +8,9 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::UserId;
 use crate::errors::StorageError;
-use crate::structs::{AuthContext, MetadataAuditOperation, MetadataRegistryRecord, RealmId};
+use crate::structs::identity::auth::AuthContext;
+use crate::structs::storage::metadata_registry::{MetadataAuditOperation, MetadataRegistryRecord};
+use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;
 
 pub const MAX_METADATA_BEARER_TOKEN_LEN: usize = 4096;
@@ -1238,7 +1240,9 @@ mod tests {
         ProfileValidationStatus, apply_raw_upsert, compare_metadata_clocks, raw_quotas,
         resolve_raw_revision,
     };
-    use crate::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
+    use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use crate::structs::placement::placement_record::PlacementRef;
+    use crate::structs::identity::realm::RealmId;
     use crate::{NodeId, UserId};
     use craqle::{ActorId, VectorClock};
     use std::collections::BTreeMap;

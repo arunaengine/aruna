@@ -86,7 +86,7 @@ pub struct SourceEntry {
     /// Full stat values, for a source that has them. A listing and a later stat
     /// of the same file must derive one identity, so the local lister fills
     /// this in and every other source leaves it absent.
-    pub stat: Option<crate::structs::FileStat>,
+    pub stat: Option<crate::structs::execution::offered_directory::FileStat>,
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use crate::structs::{PathRestriction, Permission};
+use crate::structs::identity::auth::{PathRestriction, Permission};
 use globset::GlobMatcher;
 use thiserror::Error;
 
@@ -178,7 +178,7 @@ mod tests {
         MAX_RESTRICTION_PATTERN_BYTES, MAX_TOKEN_RESTRICTIONS, RestrictionLimitError,
         permission_pattern_matches, readable_roots, validate_restriction_limits,
     };
-    use crate::structs::{PathRestriction, Permission};
+    use crate::structs::identity::auth::{PathRestriction, Permission};
 
     #[test]
     fn single_star_bounded() {

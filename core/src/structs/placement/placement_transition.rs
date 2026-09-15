@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{AffinityRule, PlacementOverride, RealmId, RealmNodeKind};
+use crate::structs::placement::placement_record::{AffinityRule, PlacementOverride};
+use crate::structs::identity::realm::{RealmId, RealmNodeKind};
 
 /// Domain tag for the tuple a target holder signs to prove it verified a bucket.
 pub const TRANSITION_PROOF_DOMAIN: &[u8] = b"aruna-transition-proof-v1";

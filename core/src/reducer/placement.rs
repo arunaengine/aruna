@@ -701,7 +701,7 @@ impl AdminDocumentState {
                         plan.old_holders.contains(&reported_by)
                             && !plan.target_holders.contains(&reported_by)
                     }) {
-                        transition.drained.push(crate::structs::BucketDrain {
+                        transition.drained.push(crate::structs::placement::placement_transition::BucketDrain {
                             bucket,
                             reported_by,
                         });

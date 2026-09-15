@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::UserId;
 use crate::metadata::AuthToken;
-use crate::structs::{
+use crate::structs::execution::job::{
     JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState,
     StagingJobCheckpoint, WorkspaceMode,
 };

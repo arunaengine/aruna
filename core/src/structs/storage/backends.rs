@@ -1,7 +1,8 @@
 use crate::errors::ConversionError;
-use crate::structs::{
-    Backend, BackendConfig, BackendRef, BlobTimeoutConfig, CleanupStrategy, NodeRoutingRule,
-    RoutingTarget, validate_node_rules, validate_storage_class,
+use crate::structs::storage::blob::{Backend, BackendConfig, BackendRef, BlobTimeoutConfig};
+use crate::structs::storage::cleanup::CleanupStrategy;
+use crate::structs::storage::routing::{
+    NodeRoutingRule, RoutingTarget, validate_node_rules, validate_storage_class,
 };
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -377,7 +378,9 @@ impl RoutingEntry {
 #[cfg(test)]
 mod tests {
     use super::BackendsFile;
-    use crate::structs::{BackendRef, BlobTimeoutConfig, CleanupStrategy, RoutingTarget};
+    use crate::structs::storage::blob::{BackendRef, BlobTimeoutConfig};
+    use crate::structs::storage::cleanup::CleanupStrategy;
+    use crate::structs::storage::routing::RoutingTarget;
 
     const FILE: &str = r#"
 [backend.default]

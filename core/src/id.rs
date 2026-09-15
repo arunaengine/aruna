@@ -1,4 +1,5 @@
-use crate::{structs::RealmId, types::GroupId};
+use crate::structs::identity::realm::RealmId;
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use ulid::Ulid;

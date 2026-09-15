@@ -4,7 +4,8 @@
 
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::checked_refs;
-use crate::structs::{BucketIdentity, CurrentVersionPointer, PlacementPolicyRef};
+use crate::structs::storage::blob::{BucketIdentity, CurrentVersionPointer};
+use crate::structs::placement::placement_policy::PlacementPolicyRef;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -190,7 +191,8 @@ mod tests {
         PolicyMutationRecord, PolicyRefMode, PolicyStatus,
     };
     use crate::UserId;
-    use crate::structs::{CurrentVersionPointer, PlacementPolicyRef};
+    use crate::structs::storage::blob::CurrentVersionPointer;
+    use crate::structs::placement::placement_policy::PlacementPolicyRef;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 

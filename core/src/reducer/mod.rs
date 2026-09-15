@@ -17,15 +17,22 @@ use crate::admin_documents::{
     AdminDocumentTarget, AdminRoleDefinition,
 };
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, valid_token_hash};
-use crate::structs::{
-    Actor, BandPool, BindingScope, BucketBarrier, BucketCompletion, BucketForceFinalize,
-    CandidatePlacementMap, CompletionProof, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
-    MetadataRegistryRecord, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig,
-    PlacementActivation, PlacementBinding, PlacementOverride, PlacementStrategy,
-    PlacementTransition, QuotaConfig, RealmComputeConfig, RealmConfigDocument,
-    RealmDiscoveryConfig, RealmId, RealmNodeKind, StallReport, StrategyBinding, TransitionPlan,
-    TransitionStatus, reserved_label,
+use crate::structs::identity::auth::Actor;
+use crate::structs::placement::placement_record::{
+    BandPool, BindingScope, DocumentClass, HandleRange, MAX_PLACEMENT_SHARD_COUNT,
+    NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementStrategy, StrategyBinding,
 };
+use crate::structs::placement::placement_transition::{
+    BucketBarrier, BucketCompletion, BucketForceFinalize, CandidatePlacementMap, CompletionProof,
+    PlacementActivation, PlacementTransition, StallReport, TransitionPlan, TransitionStatus,
+};
+use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+use crate::structs::identity::realm::{
+    MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmConfigDocument,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind,
+};
+use crate::structs::placement::compute_config::RealmComputeConfig;
+use crate::structs::storage::node_info::reserved_label;
 use crate::structured_id::PlacementHandle;
 use crate::types::RoleId;
 use crate::user_validation::{

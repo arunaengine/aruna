@@ -137,7 +137,7 @@ pub fn fingerprint_complete(fingerprint: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
     use std::time::Duration;
 
     fn record() -> OfferedDirectory {

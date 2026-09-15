@@ -1,6 +1,7 @@
 use crate::NodeId;
 use crate::alpn::Alpn;
-use crate::structs::{Backend, BlobTimeoutConfig, RealmId};
+use crate::structs::storage::blob::{Backend, BlobTimeoutConfig};
+use crate::structs::identity::realm::RealmId;
 use iroh::EndpointAddr;
 
 #[derive(Debug, Clone)]

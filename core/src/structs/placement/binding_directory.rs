@@ -6,9 +6,10 @@ use std::collections::{BTreeSet, HashMap};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::structs::{
-    BindingTuple, DocumentClass, HandleRangeDirectory, PlacementBinding, PlacementScope,
+use crate::structs::placement::placement_record::{
+    BindingTuple, DocumentClass, PlacementBinding, PlacementScope,
 };
+use crate::structs::placement::handle_allocation::HandleRangeDirectory;
 use crate::structured_id::{BucketId, BucketRangeError, PlacementHandle, StructuredId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -209,7 +210,7 @@ impl BindingDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
     use crate::structured_id::MetaResourceId;
 
     fn handle(value: u32) -> PlacementHandle {

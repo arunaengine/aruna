@@ -355,7 +355,7 @@ pub struct HarvestJobSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
 
     fn user(seed: u8) -> UserId {
         UserId::local(Ulid::from_bytes([seed; 16]), RealmId([seed; 32]))

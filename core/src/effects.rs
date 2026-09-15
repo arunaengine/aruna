@@ -10,11 +10,15 @@ use crate::jobs::JobRequest;
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::{
-    BackendLocation, GroupStorage, GroupStorageSecret, HiddenBlobKey, JobRecordEnvelope,
-    JobRecordKind, PlacementPolicyRef, PlacementRef, PolicyPublicationClaim, RealmId,
-    ResolvedBackend, ResolvedSourceAccess, SubmissionId, WriteGuard,
-};
+use crate::structs::storage::blob::{BackendLocation, HiddenBlobKey, ResolvedBackend};
+use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
+use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind, SubmissionId};
+use crate::structs::placement::placement_policy::PlacementPolicyRef;
+use crate::structs::placement::placement_record::PlacementRef;
+use crate::structs::placement::policy_document::PolicyPublicationClaim;
+use crate::structs::identity::realm::RealmId;
+use crate::structs::execution::source_access::ResolvedSourceAccess;
+use crate::structs::WriteGuard;
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
 use bytes::Bytes;

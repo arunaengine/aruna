@@ -12,7 +12,7 @@ use crate::scheduling::inputs::{
 };
 use crate::scheduling::rank::{self, ScoredTarget};
 use crate::scheduling::{ExecutionPlan, RankedTarget, RejectedTarget, Selection};
-use crate::structs::RealmComputeConfig;
+use crate::structs::placement::compute_config::RealmComputeConfig;
 
 /// One planning operation over a scan that arrives in pages. The plan is only
 /// final once every page has been ranked.

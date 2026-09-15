@@ -120,7 +120,7 @@ impl SourceConnectorSecret {
 mod tests {
     use super::*;
     use crate::UserId;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
 
     fn test_user_id(seed: u8) -> UserId {
         UserId::local(Ulid::from_bytes([seed; 16]), RealmId([seed; 32]))

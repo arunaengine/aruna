@@ -147,7 +147,7 @@ pub fn credential_aad(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     fn sample_aad() -> Vec<u8> {

@@ -5,13 +5,19 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::UserId;
-use crate::structs::{
-    Actor, BandPool, BindingScope, CandidatePlacementMap, CompletionProof, HandleRange,
-    MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-    PlacementBinding, PlacementOverride, PlacementRef, PlacementStrategy, QuotaConfig,
-    RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, Role, StrategyBinding,
-    TransitionPlan,
+use crate::structs::identity::auth::{Actor, Permission, Role};
+use crate::structs::placement::placement_record::{
+    BandPool, BindingScope, HandleRange, NodePlacementEntry, PlacementBinding, PlacementOverride,
+    PlacementRef, PlacementStrategy, StrategyBinding,
 };
+use crate::structs::placement::placement_transition::{
+    CandidatePlacementMap, CompletionProof, TransitionPlan,
+};
+use crate::structs::identity::realm::{
+    MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,
+    RealmNodeKind,
+};
+use crate::structs::placement::compute_config::RealmComputeConfig;
 use crate::types::{GroupId, RoleId};
 
 /// Domain separator for the origin signature over an administrative event.
@@ -308,12 +314,17 @@ mod tests {
     use super::{AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition};
     use crate::NodeId;
     use crate::UserId;
-    use crate::structs::{
+    use crate::structs::placement::placement_record::{
         AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
-        LabelMatch, MetadataReplicationConfig, NodePlacementEntry, OidcProviderConfig, Permission,
-        PlacementBinding, PlacementOverride, PlacementScope, PlacementStrategy, QuotaConfig,
-        RealmComputeConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind, StrategyBinding,
+        LabelMatch, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementScope,
+        PlacementStrategy, StrategyBinding,
     };
+    use crate::structs::identity::realm::{
+        MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmDiscoveryConfig, RealmId,
+        RealmNodeKind,
+    };
+    use crate::structs::identity::auth::Permission;
+    use crate::structs::placement::compute_config::RealmComputeConfig;
     use crate::structured_id::PlacementHandle;
     use crate::types::{GroupId, RoleId};
     use std::collections::BTreeMap;
@@ -585,7 +596,8 @@ mod tests {
         // The origin's signature covers the placement, actor and origin, so a
         // relay cannot move or rewrite the envelope it republishes.
         use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
-        use crate::structs::{Actor, PlacementRef};
+        use crate::structs::identity::auth::Actor;
+        use crate::structs::placement::placement_record::PlacementRef;
 
         let realm_id = RealmId::from_bytes([9; 32]);
         let secret = iroh::SecretKey::from_bytes(&[11; 32]);

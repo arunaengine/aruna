@@ -1,4 +1,5 @@
-use crate::structs::{BackendLocation, SourceConnectorKind};
+use crate::structs::storage::blob::BackendLocation;
+use crate::structs::execution::source_connector::SourceConnectorKind;
 use std::array::TryFromSliceError;
 use thiserror::Error;
 
@@ -247,7 +248,7 @@ pub enum ConversionError {
     #[error("RO-Crate conversion error: {0}")]
     RoCrateError(String),
     #[error(transparent)]
-    PlacementPolicyError(#[from] crate::structs::PlacementPolicyError),
+    PlacementPolicyError(#[from] crate::structs::placement::placement_policy::PlacementPolicyError),
     #[error(transparent)]
     AdvertisementError(#[from] crate::compute::AdvertisementError),
     #[error("policy refs must be sorted and deduplicated")]

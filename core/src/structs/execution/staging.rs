@@ -1,5 +1,5 @@
 use crate::id::NodeId;
-use crate::structs::SourceConnectorKind;
+use crate::structs::execution::source_connector::SourceConnectorKind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use ulid::Ulid;

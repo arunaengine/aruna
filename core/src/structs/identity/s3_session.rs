@@ -4,7 +4,8 @@ use crate::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError, credential_aad,
 };
 use crate::errors::ConversionError;
-use crate::structs::{PathRestriction, UserAccess};
+use crate::structs::identity::auth::PathRestriction;
+use crate::structs::storage::blob::UserAccess;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
@@ -112,7 +113,7 @@ impl S3Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
 
     fn session(expiry: SystemTime) -> S3Session {
         S3Session {

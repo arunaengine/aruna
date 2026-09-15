@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange};
+use crate::structs::placement::placement_record::{
+    FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
+};
 use crate::structured_id::PlacementHandle;
 
 /// The derived view over the replicated handle-range set. Overlapping grants,
@@ -152,7 +154,9 @@ impl HandleAllocationCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::{HANDLE_BANDS, HANDLE_RANGE_SIZE, HANDLE_SPACE_END, band_start};
+    use crate::structs::placement::placement_record::{
+        HANDLE_BANDS, HANDLE_RANGE_SIZE, HANDLE_SPACE_END, band_start,
+    };
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
