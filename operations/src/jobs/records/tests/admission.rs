@@ -156,9 +156,10 @@ fn retains_non_holder() {
     // Holder authority is view-relative: a member this view does not rank is
     // retained and judged again, never projected and never dropped.
     let mut family = Family::new([5u8; 32]);
-    family
-        .config
-        .ensure_node(node(7), aruna_core::structs::identity::realm::RealmNodeKind::Server);
+    family.config.ensure_node(
+        node(7),
+        aruna_core::structs::identity::realm::RealmNodeKind::Server,
+    );
     let view = family.view();
     assert!(view.is_member(node(7)) && !view.holds(node(7)));
     let member = secret(7);

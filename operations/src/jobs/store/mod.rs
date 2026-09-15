@@ -6,9 +6,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
-    DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, OUTPUT_RECORD_KEYSPACE,
-    JOB_INDEX_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
-    JOB_STATE_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, STAGING_STATE_KEYSPACE,
+    DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE,
+    OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
+    STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
@@ -20,8 +20,8 @@ use aruna_core::structs::execution::job::{
     owner_index_prefix, parse_dedup_value, parse_entry_key, parse_owner_key, rocrate_plan_key,
     run_crate_key, validate_transition, workspace_credential_id,
 };
-use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
 use aruna_core::structs::storage::blob::UserAccess;
+use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -32,7 +32,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::lifecycle::ids::session_of;
-use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, MUTATE_MAX_ATTEMPTS, JOB_PRUNE_PAGE};
+use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_PRUNE_PAGE, MUTATE_MAX_ATTEMPTS};
 use crate::tasks::queue_backoff::retry_delay_ms;
 
 mod attempt;
@@ -179,10 +179,7 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
 pub fn prune_delete_entries(record: &JobRecord) -> JobDeletes {
     let mut deletes = vec![
         (JOB_KEYSPACE.to_string(), job_record_key(record.job_id)),
-        (
-            RUN_CRATE_KEYSPACE.to_string(),
-            run_crate_key(record.job_id),
-        ),
+        (RUN_CRATE_KEYSPACE.to_string(), run_crate_key(record.job_id)),
         (
             JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(record.created_by, record.created_at_ms, record.job_id),

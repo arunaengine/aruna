@@ -319,9 +319,7 @@ impl ReserveExecutionOperation {
         writes.extend(
             job_insert_entries(self.config.record.as_ref())?
                 .into_iter()
-                .filter(|(key_space, _, _)| {
-                    key_space != aruna_core::keyspaces::JOB_INDEX_KEYSPACE
-                }),
+                .filter(|(key_space, _, _)| key_space != aruna_core::keyspaces::JOB_INDEX_KEYSPACE),
         );
         Ok(writes)
     }

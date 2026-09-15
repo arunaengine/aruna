@@ -706,12 +706,7 @@ pub(super) fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> 
     let part_key = property_key(
         root,
         &keywords,
-        &[
-            "hasPart",
-            "schema:hasPart",
-            SCHEMA_PART_IRI,
-            PART_HTTPS_IRI,
-        ],
+        &["hasPart", "schema:hasPart", SCHEMA_PART_IRI, PART_HTTPS_IRI],
         "hasPart",
         PART_HTTPS_IRI,
     );
@@ -749,11 +744,7 @@ pub(super) fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> 
     );
     let file_type = if keywords.term_matches(
         "File",
-        &[
-            SCHEMA_MEDIA_IRI,
-            MEDIA_HTTPS_IRI,
-            "schema:MediaObject",
-        ],
+        &[SCHEMA_MEDIA_IRI, MEDIA_HTTPS_IRI, "schema:MediaObject"],
     ) {
         "File"
     } else {
@@ -785,12 +776,7 @@ pub(super) fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> 
             keywords
                 .expands_to(
                     key,
-                    &[
-                        "about",
-                        "schema:about",
-                        SCHEMA_ABOUT_IRI,
-                        ABOUT_HTTPS_IRI,
-                    ],
+                    &["about", "schema:about", SCHEMA_ABOUT_IRI, ABOUT_HTTPS_IRI],
                 )
                 .then(|| reference_id(value, keywords).map(str::to_string))
                 .flatten()

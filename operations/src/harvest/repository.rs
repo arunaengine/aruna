@@ -2,8 +2,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
-    HARVEST_PROVENANCE_KEYSPACE, HARVEST_SOURCE_KEYSPACE, CONNECTOR_INDEX_KEYSPACE,
-    CONNECTOR_SECRET_KEYSPACE,
+    CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, HARVEST_PROVENANCE_KEYSPACE,
+    HARVEST_SOURCE_KEYSPACE,
 };
 use aruna_core::structs::execution::harvest::{
     HarvestProvenance, HarvestSource, RepositoryConnector, RepositoryConnectorSecret,

@@ -11,8 +11,8 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
@@ -488,9 +488,7 @@ impl Operation for UpdateGroupOperation {
 /// Keeps the stored name when the reducer withheld the field on a conflict, so
 /// a concurrent rename never blanks the group label (decision Q2).
 fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentState) {
-    if !reducer_state
-        .conflicts
-        .contains_key(DISPLAY_NAME_PATH)
+    if !reducer_state.conflicts.contains_key(DISPLAY_NAME_PATH)
         && let Some(display_name) = reducer_state.materialized_group_name()
     {
         group.display_name = display_name;
@@ -506,8 +504,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE,
-        REALM_CONFIG_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;

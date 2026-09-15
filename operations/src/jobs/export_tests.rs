@@ -10,16 +10,15 @@ use crate::tests::staging::setup_driver_context;
 use aruna_blob::blob::{BlobHandle, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE,
-    REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef, BlobLocationKey};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
 };
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef, BlobLocationKey};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
 use std::collections::HashMap;
@@ -821,11 +820,13 @@ fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobContext 
         final_attempt: false,
         cancel: tokio_util::sync::CancellationToken::new(),
         shutdown: tokio_util::sync::CancellationToken::new(),
-        progress: ProgressReporter::from_progress(&aruna_core::structs::execution::job::JobProgress {
-            current: 0,
-            total: None,
-            unit: "entries".to_string(),
-        }),
+        progress: ProgressReporter::from_progress(
+            &aruna_core::structs::execution::job::JobProgress {
+                current: 0,
+                total: None,
+                unit: "entries".to_string(),
+            },
+        ),
     }
 }
 
@@ -1439,10 +1440,7 @@ fn reports_context_overrides() {
         document["@graph"][0][SUBJECT_HTTPS_IRI]["@id"],
         "#aruna-export-report"
     );
-    assert_eq!(
-        document["@graph"][0][PART_HTTPS_IRI]["@id"],
-        REPORT_PATH
-    );
+    assert_eq!(document["@graph"][0][PART_HTTPS_IRI]["@id"], REPORT_PATH);
     assert_eq!(
         document["@graph"][2][ENCODING_HTTPS_IRI],
         "application/json"

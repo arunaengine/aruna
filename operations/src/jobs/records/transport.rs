@@ -15,8 +15,8 @@ use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
     PhysicalExecutionState, SubmissionId,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use futures_util::future::join_all;
 use tokio::time::timeout_at;
 use tracing::warn;
@@ -288,11 +288,9 @@ pub async fn serve_job_record(
             };
             match serve_page(context, peer, request).await {
                 Ok(reply) => MetadataTransportMessage::ForwardedRecordPage { result: Ok(reply) },
-                Err(ServeError::Refused(reason)) => {
-                    MetadataTransportMessage::ForwardedRecordPage {
-                        result: Err(reason),
-                    }
-                }
+                Err(ServeError::Refused(reason)) => MetadataTransportMessage::ForwardedRecordPage {
+                    result: Err(reason),
+                },
                 Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
             }
         }

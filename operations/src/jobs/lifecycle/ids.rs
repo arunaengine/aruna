@@ -5,16 +5,16 @@
 use aruna_core::UserId;
 use aruna_core::compute::SessionMount;
 use aruna_core::compute::runtimes::{
-    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, MOUNT_PATH_TAG, MOUNT_PREFIX_TAG,
-    SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+    MOUNT_PATH_TAG, MOUNT_PREFIX_TAG, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_RUNTIME_TAG,
+    SESSION_TAG, SESSION_TAG_NOTEBOOK,
 };
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, SubmissionId, WorkspaceMode,
 };
-use aruna_core::structs::placement::placement_record::LabelMatch;
 use aruna_core::structs::placement::placement_policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
+use aruna_core::structs::placement::placement_record::LabelMatch;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -177,17 +177,10 @@ pub fn session_of(spec: &ExecutionSpec) -> Option<SessionSpec> {
     if spec.tags.get(SESSION_TAG).map(String::as_str) != Some(SESSION_TAG_NOTEBOOK) {
         return None;
     }
-    let mount = spec
-        .tags
-        .get(MOUNT_PATH_TAG)
-        .map(|path| SessionMount {
-            prefix: spec
-                .tags
-                .get(MOUNT_PREFIX_TAG)
-                .cloned()
-                .unwrap_or_default(),
-            path: path.clone(),
-        });
+    let mount = spec.tags.get(MOUNT_PATH_TAG).map(|path| SessionMount {
+        prefix: spec.tags.get(MOUNT_PREFIX_TAG).cloned().unwrap_or_default(),
+        path: path.clone(),
+    });
     Some(SessionSpec {
         runtime: spec
             .tags
@@ -292,10 +285,8 @@ mod tests {
             })
         );
 
-        spec.tags.insert(
-            MOUNT_PREFIX_TAG.to_string(),
-            "raw/2024/".to_string(),
-        );
+        spec.tags
+            .insert(MOUNT_PREFIX_TAG.to_string(), "raw/2024/".to_string());
         assert_eq!(
             session_of(&spec).unwrap().mount.unwrap().prefix,
             "raw/2024/"

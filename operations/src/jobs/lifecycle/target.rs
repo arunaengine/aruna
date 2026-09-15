@@ -15,16 +15,16 @@ use aruna_core::events::{DeclinedPolicy, Event, JobRecordEvent, LaunchDecline, N
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
     JobRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState, WorkspaceMode,
 };
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::placement_policy::{
     PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, evaluate_placement,
 };
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Effects;
@@ -240,10 +240,11 @@ async fn store_receipt(
         .flatten()
         .map(|document| document.epoch.membership_generation)
         .unwrap_or_default();
-    let launch_digest = match aruna_core::structs::execution::job::JobRecordBody::digest(&round.intent) {
-        Ok(digest) => digest,
-        Err(_) => return Err(LaunchDecline::Unauthorized),
-    };
+    let launch_digest =
+        match aruna_core::structs::execution::job::JobRecordBody::digest(&round.intent) {
+            Ok(digest) => digest,
+            Err(_) => return Err(LaunchDecline::Unauthorized),
+        };
     let receipt = ExecutionReceipt {
         execution_id,
         physical_job_id,

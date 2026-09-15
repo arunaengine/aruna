@@ -10,8 +10,8 @@ use aruna_core::structs::execution::job::{
     JobRecordContext, JobRecordKey, JobRecordKind, LaunchIntent, LocalExecution, LogicalJobSpec,
     WitnessBudgetRecord,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use ulid::Ulid;
 
 use super::keys::{budget_key, id_key};

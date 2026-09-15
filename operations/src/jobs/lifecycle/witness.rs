@@ -11,7 +11,7 @@ use aruna_core::events::{Event, LaunchDecline, LaunchOfferEvent, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    PLAN_EXPLAIN_KEYSPACE, DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
+    DEADLINE_INDEX_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
@@ -19,8 +19,8 @@ use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState, WitnessBudgetRecord,
 };
-use aruna_core::structs::placement::placement_policy::PlacementDecision;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::placement_policy::PlacementDecision;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId};
 use serde::{Deserialize, Serialize};
@@ -477,19 +477,16 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         })
         .collect();
     let sequence = mine.len() as u32;
-    let mut explain = read_row::<WitnessExplain>(
-        context,
-        PLAN_EXPLAIN_KEYSPACE,
-        &explain_key(&family, local),
-    )
-    .await
-    .unwrap_or(WitnessExplain {
-        sequence,
-        plan: empty_plan(),
-        declined: Vec::new(),
-        overlapping: false,
-        stored_at_ms: now_ms,
-    });
+    let mut explain =
+        read_row::<WitnessExplain>(context, PLAN_EXPLAIN_KEYSPACE, &explain_key(&family, local))
+            .await
+            .unwrap_or(WitnessExplain {
+                sequence,
+                plan: empty_plan(),
+                declined: Vec::new(),
+                overlapping: false,
+                stored_at_ms: now_ms,
+            });
     if let Some(envelope) = mine.iter().max_by_key(|envelope| match &envelope.record {
         JobFamilyRecord::Launch(launch) => launch.scheduler_seq,
         _ => 0,
@@ -690,8 +687,7 @@ async fn record_decline(
     target: ExecutionTargetId,
 ) {
     let key = explain_key(family, local);
-    let Some(mut explain) =
-        read_row::<WitnessExplain>(context, PLAN_EXPLAIN_KEYSPACE, &key).await
+    let Some(mut explain) = read_row::<WitnessExplain>(context, PLAN_EXPLAIN_KEYSPACE, &key).await
     else {
         return;
     };

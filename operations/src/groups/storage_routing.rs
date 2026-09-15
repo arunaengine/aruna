@@ -5,10 +5,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget, validate_tenant_target,
 };
-use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
@@ -420,9 +420,7 @@ mod pure_tests {
     use crate::groups::backends::{index_key, index_prefix};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-    use aruna_core::keyspaces::{
-        BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
-    };
+    use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};

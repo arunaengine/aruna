@@ -23,18 +23,17 @@ use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, JOB_STATE_KEYSPACE};
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::storage::blob::{
-    BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path,
-    object_permission_path,
-};
 use aruna_core::structs::execution::job::{
     ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
-    ImportRoCrateSpec, SYSTEM_ENTRY_PREFIX, JobError, JobResultPayload, ReasonCode,
-    RoCrateCheckpointRefs, RoCrateMediaType, job_entry_key, rocrate_plan_key,
+    ImportRoCrateSpec, JobError, JobResultPayload, ReasonCode, RoCrateCheckpointRefs,
+    RoCrateMediaType, SYSTEM_ENTRY_PREFIX, job_entry_key, rocrate_plan_key,
+};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
 use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::{StreamExt, stream};
@@ -64,9 +63,9 @@ use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete_bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
@@ -431,12 +430,7 @@ async fn acquire_source(
                 .source_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.content_type.as_deref())
-                .or_else(|| {
-                    result
-                        .metadata
-                        .get(CONTENT_TYPE_KEY)
-                        .map(String::as_str)
-                });
+                .or_else(|| result.metadata.get(CONTENT_TYPE_KEY).map(String::as_str));
             spool_source(
                 ctx,
                 result.blob,
@@ -2210,7 +2204,10 @@ pub(crate) mod tests {
         let JobRunOutcome::Failed(error) = cleanup_after_panic(&ctx, &spec).await else {
             panic!("panic cleanup must fail the job")
         };
-        assert_eq!(error.kind, aruna_core::structs::execution::job::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
         assert!(
             load_rocrate_upload(&driver, upload_id)
                 .await

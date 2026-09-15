@@ -7,7 +7,7 @@ use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    DUE_INDEX_PREFIX, LEASE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord,
+    DUE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord, LEASE_INDEX_PREFIX,
     lease_index_key, parse_schedule_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -415,8 +415,8 @@ mod tests {
     use aruna_core::structs::execution::job::{
         AttemptIntent, JobClaim, JobPayload, JobState, due_index_key,
     };
-    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_storage::FjallStorage;
     use std::sync::Mutex;
@@ -759,10 +759,9 @@ mod tests {
         assert!(result.claimed.is_empty());
         // Self-healed: the orphan is gone and the drain timer stops returning zero.
         assert_eq!(next_drain_delay(&storage).await.unwrap(), None);
-        let (rows, _) =
-            iter_prefix_page(&storage, SCHEDULE_INDEX_KEYSPACE, None, None, 8, None)
-                .await
-                .unwrap();
+        let (rows, _) = iter_prefix_page(&storage, SCHEDULE_INDEX_KEYSPACE, None, None, 8, None)
+            .await
+            .unwrap();
         assert!(rows.is_empty());
     }
 }

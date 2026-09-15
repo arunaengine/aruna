@@ -8,12 +8,12 @@ use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobId,
     JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
     OutputDestination, SubmissionClaim, SubmissionId, WorkspaceMode,
 };
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::time::unix_timestamp_millis;
@@ -293,10 +293,11 @@ async fn resolve_inputs(
                     .map(|metadata| metadata.content_length)
             })
             .unwrap_or_default();
-        let policies = aruna_core::structs::placement::placement_policy::PlacementPolicyRef::canonical_set(
-            &head.source_policies,
-        )
-        .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
+        let policies =
+            aruna_core::structs::placement::placement_policy::PlacementPolicyRef::canonical_set(
+                &head.source_policies,
+            )
+            .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
         captured_inputs.push(CapturedInput {
             destination_key: input.dest_key.clone(),
             source_node_id: local,
@@ -352,7 +353,10 @@ async fn resolve_inputs(
         }
         output_policies.extend(info.placement_policies);
     }
-    output_policies = aruna_core::structs::placement::placement_policy::PlacementPolicyRef::canonical_set(&output_policies)
+    output_policies =
+        aruna_core::structs::placement::placement_policy::PlacementPolicyRef::canonical_set(
+            &output_policies,
+        )
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
     Ok((captured_inputs, output_policies))
 }
@@ -930,7 +934,8 @@ mod tests {
                 state,
                 canonical_execution_id: None,
                 executions: Vec::new(),
-                outputs: aruna_core::structs::execution::job::OutputSet::new(Vec::new()).expect("empty outputs"),
+                outputs: aruna_core::structs::execution::job::OutputSet::new(Vec::new())
+                    .expect("empty outputs"),
                 cancel_requested: false,
             }),
         };

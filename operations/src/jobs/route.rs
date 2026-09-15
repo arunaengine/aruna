@@ -185,12 +185,12 @@ mod pure_tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::jobs::{JobKind, JobResponse, JobStatusView};
     use aruna_core::metadata::AuthToken;
+    use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::placement::placement_record::{
         DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
         PlacementScope,
     };
-    use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use ulid::Ulid;
 

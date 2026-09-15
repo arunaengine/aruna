@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use aruna_core::compute::SessionMount;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::{
-    SESSION_MOUNT_DIR, SESSION_MOUNT_PREFIX, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG,
-    MOUNT_PATH_TAG, MOUNT_PREFIX_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES,
-    SESSION_TAG, SESSION_TAG_NOTEBOOK, session_runtime,
+    MOUNT_PATH_TAG, MOUNT_PREFIX_TAG, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_MOUNT_DIR,
+    SESSION_MOUNT_PREFIX, SESSION_RUNTIME_TAG, SESSION_RUNTIMES, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+    session_runtime,
 };
 use aruna_core::structs::execution::job::JobId;
 use schemars::JsonSchema;
@@ -336,10 +336,8 @@ impl SubmitExecutionCommand {
             self.session_mount.as_ref(),
             self.workdir.as_deref().unwrap_or(SESSION_WORKDIR),
         )?;
-        self.tags
-            .insert(MOUNT_PREFIX_TAG.to_string(), mount.prefix);
-        self.tags
-            .insert(MOUNT_PATH_TAG.to_string(), mount.path);
+        self.tags.insert(MOUNT_PREFIX_TAG.to_string(), mount.prefix);
+        self.tags.insert(MOUNT_PATH_TAG.to_string(), mount.path);
         self.cpu_cores.get_or_insert(2);
         self.ram_bytes.get_or_insert(4_000_000_000);
         self.image = runtime.image.to_string();
@@ -568,10 +566,7 @@ mod pure_tests {
             .resolve_session(None)
             .expect("a session submit is accepted");
         assert_eq!(
-            command
-                .tags
-                .get(MOUNT_PREFIX_TAG)
-                .map(String::as_str),
+            command.tags.get(MOUNT_PREFIX_TAG).map(String::as_str),
             Some("data/")
         );
         assert_eq!(
@@ -595,10 +590,7 @@ mod pure_tests {
             .resolve_session(None)
             .expect("a chosen mount is accepted");
         assert_eq!(
-            command
-                .tags
-                .get(MOUNT_PREFIX_TAG)
-                .map(String::as_str),
+            command.tags.get(MOUNT_PREFIX_TAG).map(String::as_str),
             Some("raw/2024/")
         );
         assert_eq!(
@@ -615,10 +607,7 @@ mod pure_tests {
             .resolve_session(None)
             .expect("the whole bucket is accepted");
         assert_eq!(
-            command
-                .tags
-                .get(MOUNT_PREFIX_TAG)
-                .map(String::as_str),
+            command.tags.get(MOUNT_PREFIX_TAG).map(String::as_str),
             Some("")
         );
         assert_eq!(

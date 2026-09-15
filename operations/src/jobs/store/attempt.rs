@@ -493,9 +493,11 @@ pub async fn read_crate_status(
     )
     .await?
     {
-        Some(value) => aruna_core::structs::execution::job::RunCrateStatus::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
+        Some(value) => {
+            aruna_core::structs::execution::job::RunCrateStatus::from_bytes(value.as_ref())
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
         None => Ok(None),
     }
 }

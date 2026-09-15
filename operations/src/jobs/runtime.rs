@@ -9,8 +9,8 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload,
-    JobRecord, JobState, parse_schedule_key,
+    JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
+    LEASE_INDEX_PREFIX, parse_schedule_key,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
@@ -31,8 +31,8 @@ use super::store::{
 };
 use super::submit::schedule_drain_effect;
 use super::{
-    JOB_CONCURRENCY_CAP, DRAIN_BATCH_SIZE, EXTERNAL_CONCURRENCY_CAP, JOB_HEARTBEAT_MS,
-    FLUSH_INTERVAL_MS,
+    DRAIN_BATCH_SIZE, EXTERNAL_CONCURRENCY_CAP, FLUSH_INTERVAL_MS, JOB_CONCURRENCY_CAP,
+    JOB_HEARTBEAT_MS,
 };
 use crate::driver::DriverContext;
 
@@ -100,12 +100,7 @@ impl JobsRuntime {
     }
 
     pub fn new_paused() -> Arc<Self> {
-        Self::build(
-            JOB_CONCURRENCY_CAP,
-            EXTERNAL_CONCURRENCY_CAP,
-            None,
-            false,
-        )
+        Self::build(JOB_CONCURRENCY_CAP, EXTERNAL_CONCURRENCY_CAP, None, false)
     }
 
     pub fn with_capacity(cap: usize) -> Arc<Self> {

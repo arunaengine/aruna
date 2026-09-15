@@ -14,14 +14,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LaunchDecline, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, NODE_INFO_KEYSPACE,
-};
+use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, NODE_INFO_KEYSPACE};
+use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordKind, LaunchIntent};
+use aruna_core::structs::placement::placement_policy::PlacementSubject;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
-use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordKind, LaunchIntent};
-use aruna_core::structs::placement::placement_policy::PlacementSubject;
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};

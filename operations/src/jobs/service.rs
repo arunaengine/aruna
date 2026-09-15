@@ -4,6 +4,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::job::{
     ArtifactRef, CopyJobSpec, ExecutionSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId,
     JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
@@ -11,11 +12,10 @@ use aruna_core::structs::execution::job::{
     WorkspaceMode, pid_dedup_key, user_dedup_key,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::{JobOwnerError, RealmId};
 use aruna_core::structs::placement::placement_record::{
     DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
 };
-use aruna_core::structs::identity::realm::{JobOwnerError, RealmId};
-use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -139,8 +139,10 @@ pub(crate) fn validate_execution(
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<&str>,
 ) -> Result<(), SubmitJobError> {
-    spec.inputs =
-        aruna_core::structs::execution::job::plan_composition(spec.inputs.clone(), spec.collision_policy)?;
+    spec.inputs = aruna_core::structs::execution::job::plan_composition(
+        spec.inputs.clone(),
+        spec.collision_policy,
+    )?;
     // Nothing copies an input into a bucket any more, so one that names no
     // container path would reach nobody.
     if let Some(input) = spec
@@ -1368,11 +1370,11 @@ pub(crate) async fn kick_drain(context: &DriverContext) {
 mod tests {
     use super::super::store::{insert_job, preserve_artifact_tombstone, read_job_record};
     use super::*;
-    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
         JobState, RoCrateLimits,
     };
+    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -1412,10 +1414,12 @@ mod tests {
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: (0..=MAX_EXECUTION_OUTPUTS)
-                .map(|index| aruna_core::structs::execution::job::WorkspaceOutput {
-                    container_path: format!("/out/{index}"),
-                    dest_key: format!("out/{index}"),
-                })
+                .map(
+                    |index| aruna_core::structs::execution::job::WorkspaceOutput {
+                        container_path: format!("/out/{index}"),
+                        dest_key: format!("out/{index}"),
+                    },
+                )
                 .collect(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),

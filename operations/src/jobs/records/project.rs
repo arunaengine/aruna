@@ -286,7 +286,8 @@ impl ProjectFamilyOperation {
                     .executions
                     .iter()
                     .filter(|execution| {
-                        execution.role == aruna_core::structs::execution::job::ExecutionRole::DuplicateSuccess
+                        execution.role
+                            == aruna_core::structs::execution::job::ExecutionRole::DuplicateSuccess
                     })
                     .count()
             })
