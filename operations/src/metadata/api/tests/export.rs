@@ -1,11 +1,11 @@
 use super::list::summary_request;
 use super::*;
 
-fn raw_request(document_id: Ulid) -> ExportMetadataRoCrateRequest {
-    ExportMetadataRoCrateRequest {
+fn raw_request(document_id: Ulid) -> ExportMetadataRequest {
+    ExportMetadataRequest {
         document_id,
         auth: None,
-        view: MetadataRoCrateExportView::Raw,
+        view: RoCrateExportView::Raw,
         limit: None,
         offset: None,
         after: None,
@@ -19,12 +19,12 @@ async fn seed_raw_document(test: &MetadataTest, record: &MetadataRegistryRecord)
     {
         write_entry(test, entry).await;
     }
-    let event = MetadataCreateEventRecord {
+    let event = MetadataEventRecord {
         event_id: record.last_event_id,
         record: record.clone(),
         user_id: UserId::local(Ulid::generate(), TEST_REALM_ID),
         node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-        payload: MetadataCreateEventPayload::RoCrate {
+        payload: MetadataEventPayload::RoCrate {
             jsonld: "{\"@context\":\"https://w3id.org/ro/crate/1.1/context\",\"@graph\":[]}"
                 .to_string(),
         },
@@ -52,7 +52,7 @@ async fn raw_export_fenced() {
     )
     .await
     .expect("raw export succeeds");
-    assert!(matches!(exported, ExportMetadataRoCrateResult::Raw { .. }));
+    assert!(matches!(exported, ExportMetadataResult::Raw { .. }));
     let foreign = export_metadata_rocrate(
         &test.context,
         RealmId::from_bytes([9u8; 32]),
@@ -61,7 +61,7 @@ async fn raw_export_fenced() {
     .await;
     assert!(matches!(foreign, Err(MetadataApiError::NotFound)));
 
-    let tombstone = MetadataGraphLifecycleRecord::deleted(
+    let tombstone = GraphLifecycleRecord::deleted(
         record.graph_iri.clone(),
         record.realm_id,
         record.group_id,
@@ -280,12 +280,12 @@ pub(super) async fn seed_policy_docs(test: &MetadataTest, group_id: GroupId) {
 
 pub(super) async fn write_pending_marker(test: &MetadataTest, record: &MetadataRegistryRecord) {
     seed_policy_docs(test, record.group_id).await;
-    let event = MetadataCreateEventRecord {
+    let event = MetadataEventRecord {
         event_id: record.last_event_id,
         record: record.clone(),
         user_id: UserId::local(Ulid::generate(), TEST_REALM_ID),
         node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-        payload: MetadataCreateEventPayload::Scaffold {
+        payload: MetadataEventPayload::Scaffold {
             name: "Pending".to_string(),
             description: "Projection in flight".to_string(),
             date_published: "2026-01-01".to_string(),

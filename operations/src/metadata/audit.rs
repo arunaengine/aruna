@@ -13,7 +13,7 @@ use aruna_core::effects::{AuditPageEffect, Effect, IterStart, NetEffect, Storage
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
-use aruna_core::metadata::MetadataAuthToken;
+use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, MetadataAuditRecord, Permission, RealmConfigDocument, RealmId,
@@ -189,7 +189,7 @@ fn parse_audit_page(
 /// keyspace scan and returns the raw page. The serving node runs it to answer a
 /// peer, and the aggregator reuses the same scan for its own local page.
 #[derive(Debug, PartialEq)]
-pub struct LocalAuditPageOperation {
+pub struct LocalPageOperation {
     realm_id: RealmId,
     group_id: GroupId,
     document_id: Option<Ulid>,
@@ -199,7 +199,7 @@ pub struct LocalAuditPageOperation {
     output: Option<Result<AuditPageResponse, ListAuditError>>,
 }
 
-impl LocalAuditPageOperation {
+impl LocalPageOperation {
     pub fn new(
         realm_id: RealmId,
         group_id: GroupId,
@@ -232,7 +232,7 @@ impl LocalAuditPageOperation {
     }
 }
 
-impl Operation for LocalAuditPageOperation {
+impl Operation for LocalPageOperation {
     type Output = AuditPageResponse;
     type Error = ListAuditError;
 
@@ -366,7 +366,7 @@ pub struct ListAuditOperation {
     peers: Vec<NodeId>,
     start_after: Option<Vec<u8>>,
     limit: usize,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
     config_digest: [u8; 32],
     state: FanState,
     started: bool,
@@ -389,7 +389,7 @@ impl ListAuditOperation {
         peers: I,
         start_after: Option<Vec<u8>>,
         limit: usize,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
     ) -> Self
     where
@@ -653,7 +653,7 @@ pub async fn list_audit(
     context: &DriverContext,
     realm_id: RealmId,
     local_node: NodeId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
     request: ListAuditRequest,
     deadline: tokio::time::Instant,
 ) -> Result<AuditAggregate, ListAuditError> {
@@ -819,7 +819,7 @@ async fn local_audit_result(
         .map_err(|_| MetadataReadError::Unavailable)?;
     auth_result?;
 
-    let operation = LocalAuditPageOperation::new(
+    let operation = LocalPageOperation::new(
         realm_id,
         request.group_id,
         request.document_id,
@@ -889,7 +889,7 @@ mod tests {
     use super::{
         AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
         AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AuditPageEntry, AuditPageResponse, Effect,
-        Event, ListAuditError, ListAuditOperation, ListAuditRequest, LocalAuditPageOperation,
+        Event, ListAuditError, ListAuditOperation, ListAuditRequest, LocalPageOperation,
         MAX_AUDIT_CURSOR_CHARS, MAX_AUDIT_PAGE_SIZE, MAX_AUDIT_PEERS, MetadataReadError, NetEffect,
         NetEvent, Operation, StorageEvent, audit_member, audit_scope, authorize_admin,
         decode_cursor, drive_until, encode_cursor, list_audit, select_peers,
@@ -901,7 +901,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-    use aruna_core::metadata::MetadataAuthToken;
+    use aruna_core::metadata::AuthToken;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::{
         Actor, AuthContext, Group, GroupAuthorizationDocument, RealmAuthorizationDocument,
@@ -1582,7 +1582,7 @@ mod tests {
             peers,
             None,
             10,
-            Some(MetadataAuthToken::bearer("test").unwrap()),
+            Some(AuthToken::bearer("test").unwrap()),
             [3u8; 32],
         );
         operation.start();
@@ -1879,7 +1879,7 @@ mod tests {
         }
 
         let first = crate::driver::drive(
-            LocalAuditPageOperation::new(realm_id, group_id, None, None, 2),
+            LocalPageOperation::new(realm_id, group_id, None, None, 2),
             &context,
         )
         .await
@@ -1888,7 +1888,7 @@ mod tests {
         let cursor = first.next_start_after.expect("more records");
 
         let second = crate::driver::drive(
-            LocalAuditPageOperation::new(realm_id, group_id, None, Some(cursor), 2),
+            LocalPageOperation::new(realm_id, group_id, None, Some(cursor), 2),
             &context,
         )
         .await
@@ -1897,7 +1897,7 @@ mod tests {
         assert_eq!(second.records[0].record.document_id, second_doc);
 
         let filtered = crate::driver::drive(
-            LocalAuditPageOperation::new(realm_id, group_id, Some(second_doc), None, 50),
+            LocalPageOperation::new(realm_id, group_id, Some(second_doc), None, 50),
             &context,
         )
         .await
@@ -1905,7 +1905,7 @@ mod tests {
         assert_eq!(filtered.records.len(), 1);
 
         let foreign = crate::driver::drive(
-            LocalAuditPageOperation::new(realm_id, Ulid::from_bytes([99u8; 16]), None, None, 50),
+            LocalPageOperation::new(realm_id, Ulid::from_bytes([99u8; 16]), None, None, 50),
             &context,
         )
         .await

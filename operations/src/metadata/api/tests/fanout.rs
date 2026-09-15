@@ -91,10 +91,10 @@ fn rejects_cursor_tampering() {
     let signer = secret.public();
     let receiver = iroh::SecretKey::from_bytes(&[36u8; 32]).public();
     let fingerprint = [35u8; 32];
-    let mut cursor = ObjectSearchCursor::new_signed(
+    let mut cursor = ObjectCursor::new_signed(
         fingerprint,
         SystemTime::UNIX_EPOCH,
-        &[ObjectSearchPartitionState {
+        &[ObjectPartitionState {
             node_id: signer,
             start_after: None,
             exhausted: false,
@@ -109,16 +109,15 @@ fn rejects_cursor_tampering() {
     .expect("object search cursor signs");
 
     assert!(
-        ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, &[receiver, signer])
-            .is_ok()
+        ObjectCursor::decode(&cursor.encode().unwrap(), fingerprint, &[receiver, signer]).is_ok()
     );
     assert!(matches!(
-        ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, &[receiver]),
+        ObjectCursor::decode(&cursor.encode().unwrap(), fingerprint, &[receiver]),
         Err(MetadataApiError::InvalidCursor(_))
     ));
     cursor.payload.omitted_partitions = 1;
     assert!(matches!(
-        ObjectSearchCursor::decode(&cursor.encode().unwrap(), fingerprint, &[signer]),
+        ObjectCursor::decode(&cursor.encode().unwrap(), fingerprint, &[signer]),
         Err(MetadataApiError::InvalidCursor(_))
     ));
 }
@@ -182,7 +181,7 @@ async fn write_policy_denies() {
 fn bearer_limits() {
     assert!(matches!(
         forwarded_bearer(Some(&"x".repeat(4096))),
-        Ok(Some(MetadataAuthToken::Bearer(_)))
+        Ok(Some(AuthToken::Bearer(_)))
     ));
     assert!(matches!(
         forwarded_bearer(Some(&"x".repeat(4097))),
