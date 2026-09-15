@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::StructuredId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -12,9 +12,7 @@ use aruna_core::keyspaces::{
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
     METADATA_PENDING_PROJECTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::metadata::{
-    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataGraphLifecycleRecord,
-};
+use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventPayload, MetadataEventRecord};
 use aruna_core::storage_entries::{
     create_event_entry, create_projection_entries, event_log_prefix, graph_lifecycle_entry,
     metadata_document_key, metadata_registry_key, pending_projection_key, registry_write_entries,
@@ -26,26 +24,24 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
+    mint_local_document,
 };
-use aruna_operations::metadata::delete_document::DeleteMetadataDocumentOperation;
-use aruna_operations::metadata::get_document::{
-    GetMetadataDocumentError, GetMetadataDocumentOperation,
-};
-use aruna_operations::metadata::list_documents::ListMetadataDocumentsOperation;
+use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
+use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
+use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::{
     drain_projection_queue, project_create_events, project_logged_event, replay_event_log,
     schedule_projection_drain,
 };
 use aruna_operations::metadata::update_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
 };
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -71,13 +67,13 @@ async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
         "datasets/lost-response",
     )?
     .as_ulid();
-    let config = CreateMetadataDocumentConfig {
+    let config = CreateDocumentConfig {
         actor: test.actor.clone(),
         group_id,
         document_id,
         document_path: "datasets/lost-response".to_string(),
         public: true,
-        payload: CreateMetadataDocumentPayload::Scaffold {
+        payload: CreateDocumentPayload::Scaffold {
             name: "Lost Response".to_string(),
             description: "Retry before asynchronous projection".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -88,28 +84,25 @@ async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
     // Drive only the durable create operation, then discard its response. The
     // public wrapper has not scheduled projection, so the registry remains empty.
     let accepted = drive(
-        CreateMetadataDocumentOperation::new(config.clone()),
+        CreateDocumentOperation::new(config.clone()),
         test.context.as_ref(),
     )
     .await?;
     assert!(
-        drive(
-            ListMetadataDocumentsOperation::new(group_id),
-            test.context.as_ref(),
-        )
-        .await?
-        .is_empty()
+        drive(ListDocumentsOperation::new(group_id), test.context.as_ref(),)
+            .await?
+            .is_empty()
     );
 
     let retried = drive(
-        CreateMetadataDocumentOperation::new(config.clone()),
+        CreateDocumentOperation::new(config.clone()),
         test.context.as_ref(),
     )
     .await?;
 
     assert_eq!(retried, accepted);
     let group_error = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             group_id: Ulid::generate(),
             ..config.clone()
         }),
@@ -117,12 +110,9 @@ async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await
     .expect_err("an accepted document id cannot move groups");
-    assert_eq!(
-        group_error,
-        CreateMetadataDocumentError::DocumentAlreadyExists
-    );
+    assert_eq!(group_error, CreateDocumentError::DocumentAlreadyExists);
     let path_error = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             document_path: "datasets/other".to_string(),
             ..config
         }),
@@ -130,10 +120,7 @@ async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await
     .expect_err("an accepted document id cannot change path");
-    assert_eq!(
-        path_error,
-        CreateMetadataDocumentError::DocumentAlreadyExists
-    );
+    assert_eq!(path_error, CreateDocumentError::DocumentAlreadyExists);
     let events = read_create_events(&test, document_id).await?;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_id, accepted.event_id);
@@ -143,7 +130,7 @@ async fn lost_response_retries() -> Result<(), Box<dyn std::error::Error>> {
 impl TestContext {
     // The bucket the create operation would have chosen on this node.
     fn placement(&self, group_id: Ulid, document_id: Ulid, document_path: &str) -> PlacementRef {
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let target = DocumentTarget::MetadataDocumentLifecycle { document_id };
         let (strategy, _) = strategy_for_target(
             &self.config,
             &target,
@@ -176,13 +163,13 @@ async fn metadata_roundtrip_works() -> Result<(), Box<dyn std::error::Error>> {
     .as_ulid();
 
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: test.actor.clone(),
             group_id,
             document_id,
             document_path: "datasets/public-dataset".to_string(),
             public: false,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Initial Dataset".to_string(),
                 description: "Created through Craqle".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -210,14 +197,11 @@ async fn metadata_roundtrip_works() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(create_event.node_id, test.actor.node_id);
     assert!(matches!(
         &create_event.payload,
-        MetadataCreateEventPayload::Scaffold { name, .. } if name == "Initial Dataset"
+        MetadataEventPayload::Scaffold { name, .. } if name == "Initial Dataset"
     ));
 
-    let listed_before_projection = drive(
-        ListMetadataDocumentsOperation::new(group_id),
-        test.context.as_ref(),
-    )
-    .await?;
+    let listed_before_projection =
+        drive(ListDocumentsOperation::new(group_id), test.context.as_ref()).await?;
     assert!(listed_before_projection.is_empty());
 
     let replayed = replay_event_log(test.context.as_ref()).await?;
@@ -225,15 +209,11 @@ async fn metadata_roundtrip_works() -> Result<(), Box<dyn std::error::Error>> {
     let materialized = process_materialization_batch(test.context.as_ref()).await?;
     assert_eq!(materialized.processed, 1);
 
-    let listed = drive(
-        ListMetadataDocumentsOperation::new(group_id),
-        test.context.as_ref(),
-    )
-    .await?;
+    let listed = drive(ListDocumentsOperation::new(group_id), test.context.as_ref()).await?;
     assert_eq!(listed, vec![created.clone()]);
 
     let fetched = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         test.context.as_ref(),
     )
     .await?;
@@ -268,12 +248,12 @@ async fn metadata_roundtrip_works() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let updated = drive(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: test.actor.clone(),
             group_id,
             document_id,
             public: true,
-            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: updated_jsonld,
             },
         }),
@@ -286,7 +266,7 @@ async fn metadata_roundtrip_works() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(materialized.processed, 1);
 
     let fetched_after_update = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         test.context.as_ref(),
     )
     .await?;
@@ -299,20 +279,17 @@ async fn metadata_roundtrip_works() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     drive(
-        DeleteMetadataDocumentOperation::new(test.actor.clone(), group_id, document_id),
+        DeleteDocumentOperation::new(test.actor.clone(), group_id, document_id),
         test.context.as_ref(),
     )
     .await?;
 
     let deleted = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         test.context.as_ref(),
     )
     .await;
-    assert!(matches!(
-        deleted,
-        Err(GetMetadataDocumentError::DocumentNotFound)
-    ));
+    assert!(matches!(deleted, Err(GetDocumentError::DocumentNotFound)));
 
     if let Some(net_handle) = &test.context.net_handle {
         net_handle.shutdown().await;
@@ -339,13 +316,13 @@ async fn create_reduces_effects() -> Result<(), Box<dyn std::error::Error>> {
         .requests_total;
 
     let created = drive(
-        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor: test.actor.clone(),
             group_id,
             document_id,
             document_path: "datasets/generated-fast-path".to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Generated Fast Path".to_string(),
                 description: "Generated ids avoid duplicate foreground reads".to_string(),
                 date_published: "2026-01-01".to_string(),
@@ -398,12 +375,12 @@ async fn replay_repairs_create() -> Result<(), Box<dyn std::error::Error>> {
         establishing_event_id: event_id,
         last_event_id: event_id,
     };
-    let create_event = MetadataCreateEventRecord {
+    let create_event = MetadataEventRecord {
         event_id,
         record: record.clone(),
         user_id: test.actor.user_id,
         node_id: test.actor.node_id,
-        payload: MetadataCreateEventPayload::Scaffold {
+        payload: MetadataEventPayload::Scaffold {
             name: "Replayed Dataset".to_string(),
             description: "Recovered from the metadata WAL".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -428,13 +405,13 @@ async fn replay_repairs_create() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let before_replay = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         test.context.as_ref(),
     )
     .await;
     assert!(matches!(
         before_replay,
-        Err(GetMetadataDocumentError::DocumentNotFound)
+        Err(GetDocumentError::DocumentNotFound)
     ));
 
     let replayed = replay_event_log(test.context.as_ref()).await?;
@@ -443,7 +420,7 @@ async fn replay_repairs_create() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(materialized.processed, 1);
 
     let fetched = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         test.context.as_ref(),
     )
     .await?;
@@ -472,17 +449,14 @@ async fn queue_recovers_create() -> Result<(), Box<dyn std::error::Error>> {
     );
     write_create_event(&test, &create_event).await?;
 
-    let before_recovery = drive(
-        ListMetadataDocumentsOperation::new(group_id),
-        test.context.as_ref(),
-    )
-    .await?;
+    let before_recovery =
+        drive(ListDocumentsOperation::new(group_id), test.context.as_ref()).await?;
     assert!(before_recovery.is_empty());
 
     schedule_projection_drain(test.context.as_ref(), Duration::ZERO).await?;
     let task_handle = TaskHandle::new();
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         test.context.clone(),
         task_handle.clone(),
         aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -503,7 +477,7 @@ async fn queue_recovers_create() -> Result<(), Box<dyn std::error::Error>> {
         0
     );
     let fetched = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         test.context.as_ref(),
     )
     .await?;
@@ -533,11 +507,7 @@ async fn marker_recovers_create() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(drained.projected, 1);
     assert!(!drained.has_more);
     assert!(!projection_marker_exists(&test, document_id, create_event.event_id).await?);
-    let listed = drive(
-        ListMetadataDocumentsOperation::new(group_id),
-        test.context.as_ref(),
-    )
-    .await?;
+    let listed = drive(ListDocumentsOperation::new(group_id), test.context.as_ref()).await?;
     assert_eq!(listed, vec![record]);
     Ok(())
 }
@@ -559,11 +529,7 @@ async fn projection_deletes_marker() -> Result<(), Box<dyn std::error::Error>> {
     project_logged_event(test.context.as_ref(), document_id, create_event.event_id).await?;
 
     assert!(!projection_marker_exists(&test, document_id, create_event.event_id).await?);
-    let listed = drive(
-        ListMetadataDocumentsOperation::new(group_id),
-        test.context.as_ref(),
-    )
-    .await?;
+    let listed = drive(ListDocumentsOperation::new(group_id), test.context.as_ref()).await?;
     assert_eq!(listed, vec![record]);
     Ok(())
 }
@@ -596,11 +562,7 @@ async fn projected_replay_idempotent() -> Result<(), Box<dyn std::error::Error>>
         1
     );
 
-    let listed = drive(
-        ListMetadataDocumentsOperation::new(group_id),
-        test.context.as_ref(),
-    )
-    .await?;
+    let listed = drive(ListDocumentsOperation::new(group_id), test.context.as_ref()).await?;
     assert_eq!(listed, vec![record]);
     Ok(())
 }
@@ -634,7 +596,7 @@ async fn targeted_projection_repairs() -> Result<(), Box<dyn std::error::Error>>
     assert_eq!(materialized.processed, 1);
 
     let fetched = drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         test.context.as_ref(),
     )
     .await?;
@@ -642,13 +604,13 @@ async fn targeted_projection_repairs() -> Result<(), Box<dyn std::error::Error>>
     assert!(fetched.jsonld.contains("Targeted Dataset"));
 
     let unprojected = drive(
-        GetMetadataDocumentOperation::new(other_group_id, other_document_id),
+        GetDocumentOperation::new(other_group_id, other_document_id),
         test.context.as_ref(),
     )
     .await;
     assert!(matches!(
         unprojected,
-        Err(GetMetadataDocumentError::DocumentNotFound)
+        Err(GetDocumentError::DocumentNotFound)
     ));
 
     if let Some(net_handle) = &test.context.net_handle {
@@ -749,7 +711,7 @@ fn build_create_event(
     document_id: Ulid,
     document_path: &str,
     name: &str,
-) -> (MetadataRegistryRecord, MetadataCreateEventRecord) {
+) -> (MetadataRegistryRecord, MetadataEventRecord) {
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
     let event_id = Ulid::generate();
     let placement = test.placement(group_id, document_id, document_path);
@@ -773,12 +735,12 @@ fn build_create_event(
         establishing_event_id: event_id,
         last_event_id: event_id,
     };
-    let event = MetadataCreateEventRecord {
+    let event = MetadataEventRecord {
         event_id,
         record: record.clone(),
         user_id: test.actor.user_id,
         node_id: test.actor.node_id,
-        payload: MetadataCreateEventPayload::Scaffold {
+        payload: MetadataEventPayload::Scaffold {
             name: name.to_string(),
             description: "Recovered from the metadata WAL".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -791,7 +753,7 @@ fn build_create_event(
 
 async fn write_create_event(
     test: &TestContext,
-    create_event: &MetadataCreateEventRecord,
+    create_event: &MetadataEventRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (key_space, key, value) = create_event_entry(create_event)?;
     match test
@@ -812,7 +774,7 @@ async fn write_create_event(
 
 async fn write_pending_event(
     test: &TestContext,
-    create_event: &MetadataCreateEventRecord,
+    create_event: &MetadataEventRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let writes = create_projection_entries(create_event)?;
     match test
@@ -853,8 +815,8 @@ async fn projection_marker_exists(
 async fn write_tombstone(
     test: &TestContext,
     record: &MetadataRegistryRecord,
-) -> Result<MetadataGraphLifecycleRecord, Box<dyn std::error::Error>> {
-    let lifecycle = MetadataGraphLifecycleRecord::deleted(
+) -> Result<GraphLifecycleRecord, Box<dyn std::error::Error>> {
+    let lifecycle = GraphLifecycleRecord::deleted(
         record.graph_iri.clone(),
         record.realm_id,
         record.group_id,
@@ -936,14 +898,11 @@ async fn assert_projection_absent(
         0
     );
     let fetched = drive(
-        GetMetadataDocumentOperation::new(record.group_id, record.document_id),
+        GetDocumentOperation::new(record.group_id, record.document_id),
         test.context.as_ref(),
     )
     .await;
-    assert!(matches!(
-        fetched,
-        Err(GetMetadataDocumentError::DocumentNotFound)
-    ));
+    assert!(matches!(fetched, Err(GetDocumentError::DocumentNotFound)));
     Ok(())
 }
 
@@ -993,7 +952,7 @@ async fn iter_keyspace_count(
 async fn read_create_events(
     test: &TestContext,
     document_id: Ulid,
-) -> Result<Vec<MetadataCreateEventRecord>, Box<dyn std::error::Error>> {
+) -> Result<Vec<MetadataEventRecord>, Box<dyn std::error::Error>> {
     match test
         .context
         .storage_handle

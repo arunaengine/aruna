@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::document::{DocumentSyncTarget, shard_topic_id};
+use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -19,8 +19,8 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::node::startup::{ShardRestoreCursor, ShardRestorePass, restore_shard_pass};
 use aruna_operations::placement::process_placements::process_shard_placements;
 use aruna_operations::placement::{resolve_shard_holders, shard_subject_bytes};
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use irokle::oplog::Oplog;
@@ -385,9 +385,9 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
-    initialize_net_incoming_for_tests(context.clone());
+    initialize_incoming_fixture(context.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -464,7 +464,7 @@ async fn withholds_shared_genesis() -> Result<(), Box<dyn std::error::Error>> {
 
     let node = &nodes[0];
     let topic =
-        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+        DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
     let mut cursor = ShardRestoreCursor::default();
     let cancelled = tokio_util::sync::CancellationToken::new();
 
@@ -500,7 +500,7 @@ async fn single_shared_minter() -> Result<(), Box<dyn std::error::Error>> {
     mesh_nodes(&nodes).await;
 
     let topic =
-        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+        DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
     let (minter, follower) =
         if nodes[0].net.node_id().as_bytes() < nodes[1].net.node_id().as_bytes() {
             (&nodes[0], &nodes[1])
@@ -544,7 +544,7 @@ async fn concurrent_shared_restore() -> Result<(), Box<dyn std::error::Error>> {
     mesh_nodes(&nodes).await;
 
     let topic =
-        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+        DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
     futures_util::future::join_all(nodes.iter().map(|node| run_restore_pass(node, realm_id))).await;
 
     let minted = nodes

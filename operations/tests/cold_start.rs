@@ -7,8 +7,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
 use aruna_core::metadata::{
-    MetadataCreateCrateRequest, MetadataEffect, MetadataEvent, MetadataGraphPolicy,
-    MetadataQueryResults, MetadataRequestDurability,
+    MetadataCrateRequest, MetadataEffect, MetadataEvent, MetadataGraphPolicy, MetadataQueryResults,
+    MetadataRequestDurability,
 };
 use aruna_core::storage_entries::metadata_registry_key;
 use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
@@ -99,7 +99,7 @@ async fn write_registry_records(
 async fn create_crate_graph(handle: &MetadataHandle, index: usize) -> Result<(), BoxError> {
     let event = handle
         .send_metadata_effect(MetadataEffect::CreateCrate {
-            request: MetadataCreateCrateRequest {
+            request: MetadataCrateRequest {
                 graph_iri: graph_iri(index),
                 name: format!("Cold Start Dataset {index:05}"),
                 description: format!("Cold start corpus graph {index}"),

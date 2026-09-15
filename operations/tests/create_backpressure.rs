@@ -14,11 +14,10 @@ use aruna_core::{StructuredId, UserId};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::projector::project_logged_events;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -64,7 +63,7 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
     });
     if let Some(task_handle) = task_handle {
         let shutdown = aruna_core::shutdown::Shutdown::new();
-        install_and_start_task_queues(
+        start_task_queues(
             context.clone(),
             task_handle,
             aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -78,8 +77,8 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
     })
 }
 
-fn scaffold_payload(writer: usize, index: usize) -> CreateMetadataDocumentPayload {
-    CreateMetadataDocumentPayload::Scaffold {
+fn scaffold_payload(writer: usize, index: usize) -> CreateDocumentPayload {
+    CreateDocumentPayload::Scaffold {
         name: format!("Probe Dataset {writer}-{index}"),
         description: "Create backpressure probe".to_string(),
         date_published: "2026-06-11".to_string(),
@@ -87,7 +86,7 @@ fn scaffold_payload(writer: usize, index: usize) -> CreateMetadataDocumentPayloa
     }
 }
 
-fn rocrate_payload(document_id: Ulid) -> CreateMetadataDocumentPayload {
+fn rocrate_payload(document_id: Ulid) -> CreateDocumentPayload {
     let jsonld = format!(
         r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -109,7 +108,7 @@ fn rocrate_payload(document_id: Ulid) -> CreateMetadataDocumentPayload {
   ]
 }}"#
     );
-    CreateMetadataDocumentPayload::RoCrate { jsonld }
+    CreateDocumentPayload::RoCrate { jsonld }
 }
 
 async fn run_writer(
@@ -137,7 +136,7 @@ async fn run_writer(
         };
         let started = Instant::now();
         let created = drive(
-            CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
                 actor: actor.clone(),
                 group_id,
                 document_id,

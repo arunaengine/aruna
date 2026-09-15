@@ -11,7 +11,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_PENDING_PROJECTION_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
 use aruna_core::storage_entries::pending_projection_key;
 use aruna_core::structs::{
-    JobId, MetadataRegistryRecord, MintPersistentIdSpec, PersistentIdMapping, PersistentIdRevision,
+    JobId, MetadataRegistryRecord, MintPersistentSpec, PersistentIdMapping, PersistentIdRevision,
     PersistentIdStatus, PlacementRef, persistent_id_key, pid_dedup_key,
 };
 use aruna_operations::driver::{DriverContext, drive};
@@ -22,8 +22,7 @@ use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::forward::{route_metadata_create, route_metadata_delete};
 use aruna_operations::metadata::get_document::load_document_record;
@@ -32,9 +31,7 @@ use aruna_operations::metadata::persistent_id::forward::{
 };
 use aruna_operations::metadata::persistent_id::read_mapping;
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use ulid::Ulid;
 
 use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
@@ -92,7 +89,7 @@ async fn mint_routes_holder() -> TestResult<()> {
 async fn withdraw_precedes_mint() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: realm.actor(realm.node(0)),
         }),
         realm.node(0).context.as_ref(),
@@ -727,7 +724,7 @@ async fn submit_routed(
         || async {
             match submit_mint_pid(
                 &node.context,
-                MintPersistentIdSpec {
+                MintPersistentSpec {
                     document_id,
                     minted_by,
                 },
@@ -887,13 +884,13 @@ async fn seed_document(
         .origin_placement(origin, group_id, document_id, path)
         .ok_or("a Management node holds buckets")?;
     let created = route_metadata_create(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: realm.actor(origin),
             group_id,
             document_id,
             document_path: path.to_string(),
             public,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "PID Authority Dataset".to_string(),
                 description: "Written on a realm above the replication factor".to_string(),
                 date_published: "2026-01-01".to_string(),
