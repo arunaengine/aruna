@@ -15,7 +15,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ListJoinRequestsInput {
+pub struct ListJoinInput {
     pub auth: AuthContext,
     pub group_id: Option<Ulid>,
     pub pending_only: bool,
@@ -30,7 +30,7 @@ pub struct JoinRequestsPage {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ListJoinRequestsError {
+pub enum ListJoinError {
     #[error("not authorized to list membership requests")]
     Unauthorized,
     #[error("unexpected event while listing membership requests")]
@@ -55,15 +55,15 @@ enum State {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListJoinRequestsOperation {
-    input: ListJoinRequestsInput,
+pub struct ListJoinOperation {
+    input: ListJoinInput,
     state: State,
     requests: Vec<JoinRequestState>,
-    output: Option<Result<JoinRequestsPage, ListJoinRequestsError>>,
+    output: Option<Result<JoinRequestsPage, ListJoinError>>,
 }
 
-impl ListJoinRequestsOperation {
-    pub fn new(mut input: ListJoinRequestsInput) -> Self {
+impl ListJoinOperation {
+    pub fn new(mut input: ListJoinInput) -> Self {
         input.limit = input.limit.clamp(1, 100);
         Self {
             input,
@@ -73,7 +73,7 @@ impl ListJoinRequestsOperation {
         }
     }
 
-    fn fail(&mut self, error: ListJoinRequestsError) -> Effects {
+    fn fail(&mut self, error: ListJoinError) -> Effects {
         self.state = State::Failed;
         self.output = Some(Err(error));
         smallvec![]
@@ -103,14 +103,14 @@ impl ListJoinRequestsOperation {
         &mut self,
         values: Vec<(Key, Value)>,
         next: Option<Key>,
-    ) -> Result<Effects, ListJoinRequestsError> {
+    ) -> Result<Effects, ListJoinError> {
         for (key, value) in values {
             let state = decode_reducer_state(&value).map_err(ConversionError::from)?;
             let AdminDocumentTarget::Group { group_id } = state.target else {
-                return Err(ListJoinRequestsError::UnexpectedEvent);
+                return Err(ListJoinError::UnexpectedEvent);
             };
             if key != reducer_state_key(&state.target) {
-                return Err(ListJoinRequestsError::UnexpectedEvent);
+                return Err(ListJoinError::UnexpectedEvent);
             }
             for entry in state.join_requests() {
                 if entry.request.user_id.realm_id != self.input.auth.realm_id
@@ -155,18 +155,18 @@ impl ListJoinRequestsOperation {
     }
 }
 
-impl Operation for ListJoinRequestsOperation {
+impl Operation for ListJoinOperation {
     type Output = JoinRequestsPage;
-    type Error = ListJoinRequestsError;
+    type Error = ListJoinError;
     fn start(&mut self) -> Effects {
         if self.state != State::Init {
-            return self.fail(ListJoinRequestsError::UnexpectedEvent);
+            return self.fail(ListJoinError::UnexpectedEvent);
         }
         if self.input.auth.path_restrictions.is_some()
             || self.input.auth.user_id.is_nil()
             || self.input.auth.user_id.realm_id != self.input.auth.realm_id
         {
-            return self.fail(ListJoinRequestsError::Unauthorized);
+            return self.fail(ListJoinError::Unauthorized);
         }
         if let Some(group_id) = self.input.group_id {
             self.state = State::Auth;
@@ -189,7 +189,7 @@ impl Operation for ListJoinRequestsOperation {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
             ) => match allowed {
                 Ok(true) => self.read(None),
-                Ok(false) => self.fail(ListJoinRequestsError::Unauthorized),
+                Ok(false) => self.fail(ListJoinError::Unauthorized),
                 Err(error) => self.fail(error.into()),
             },
             (
@@ -202,14 +202,14 @@ impl Operation for ListJoinRequestsOperation {
                 Ok(effects) => effects,
                 Err(error) => self.fail(error),
             },
-            _ => self.fail(ListJoinRequestsError::UnexpectedEvent),
+            _ => self.fail(ListJoinError::UnexpectedEvent),
         }
     }
     fn is_complete(&self) -> bool {
         matches!(self.state, State::Done | State::Failed)
     }
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ListJoinRequestsError::NotFinished)?
+        self.output.ok_or(ListJoinError::NotFinished)?
     }
     fn abort(&mut self) -> Effects {
         smallvec![]

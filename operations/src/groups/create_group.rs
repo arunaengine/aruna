@@ -2,9 +2,9 @@ use crate::sync::document_outbox::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::admin_documents::{
-    AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{conflict_write_entries, reducer_state_entry};
 use aruna_core::structs::{
     Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmConfigDocument, Role,
@@ -197,7 +197,7 @@ impl CreateGroupOperation {
             .as_ref()
             .ok_or(CreateGroupError::AuthDocNotFound)?;
         let target = AdminDocumentTarget::Group { group_id };
-        let mut reducer_state = AdminDocumentReducerState::new(target);
+        let mut reducer_state = AdminDocumentState::new(target);
         let mut admin_events = Vec::new();
         let roles = sorted_roles(auth_doc);
 
@@ -214,7 +214,7 @@ impl CreateGroupOperation {
             admin_events.push(reducer_state.apply_operation(
                 &self.config.actor,
                 AdminDocumentOperation::GroupRoleCreated {
-                    role: AdminDocumentRoleDefinition::from(*role),
+                    role: AdminRoleDefinition::from(*role),
                 },
             )?);
         }
@@ -233,7 +233,7 @@ impl CreateGroupOperation {
             )?);
         }
 
-        let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+        let document_target = DocumentTarget::GroupAuthorization { group_id };
         let placement = self
             .realm_config
             .as_ref()
@@ -247,7 +247,7 @@ impl CreateGroupOperation {
                 self.config.actor.node_id,
                 document_target.clone(),
                 Vec::new(),
-                DocumentSyncOutboxEvent::admin(event),
+                DocumentOutboxEvent::admin(event),
                 placement,
                 true,
             )
@@ -453,7 +453,7 @@ impl CreateGroupOperation {
         let (Some(config), Some(group)) = (self.realm_config.as_ref(), self.group.as_ref()) else {
             return;
         };
-        let target = DocumentSyncTarget::GroupAuthorization {
+        let target = DocumentTarget::GroupAuthorization {
             group_id: group.group_id,
         };
         let placement = target_placement_ref(config, &target, Default::default());
@@ -580,7 +580,7 @@ pub enum CreateGroupError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
-    AdminDocumentReducerError(#[from] AdminDocumentReducerError),
+    AdminDocumentError(#[from] AdminDocumentError),
     #[error("No auth doc found")]
     AuthDocNotFound,
     #[error("No admin role found")]
@@ -673,18 +673,16 @@ mod test {
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
-        AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+        AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
-    use aruna_core::document::{
-        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
-    };
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::reducer::AdminDocumentReducerState;
+    use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, RealmId};
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::{Key, KeySpace, TxnId, Value};
@@ -872,7 +870,7 @@ mod test {
         let writes = operation.reducer_seed_writes().unwrap();
         let records = write_values(&writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
-            .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
+            .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
         assert!(!records.is_empty(), "an admitted create publishes");
         for record in records {
@@ -938,13 +936,13 @@ mod test {
         let target = AdminDocumentTarget::Group {
             group_id: group.group_id,
         };
-        let reducer_state = postcard::from_bytes::<AdminDocumentReducerState>(
+        let reducer_state = postcard::from_bytes::<AdminDocumentState>(
             write_values(writes, ADMIN_DOCUMENT_STATE_KEYSPACE)[0].as_ref(),
         )
         .unwrap();
         let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
             .into_iter()
-            .map(|value| postcard::from_bytes::<DocumentSyncOutboxRecord>(value.as_ref()).unwrap())
+            .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
         let stored_auth =
             GroupAuthorizationDocument::from_bytes(write_values(writes, AUTH_KEYSPACE)[0].as_ref())
@@ -979,7 +977,7 @@ mod test {
         assert_eq!(outbox_records.len(), auth_doc.roles.len() + 2);
         assert!(outbox_records.iter().all(|record| {
             record.target
-                == (DocumentSyncTarget::GroupAuthorization {
+                == (DocumentTarget::GroupAuthorization {
                     group_id: group.group_id,
                 })
         }));
@@ -989,7 +987,7 @@ mod test {
         let events = outbox_records
             .iter()
             .map(|record| match &record.event {
-                DocumentSyncOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
+                DocumentOutboxEvent::AdminOperation { event, .. } => event.as_ref(),
                 other => panic!("unexpected outbox event: {other:?}"),
             })
             .collect::<Vec<_>>();
@@ -1028,7 +1026,7 @@ mod test {
                     &event.op,
                     AdminDocumentOperation::GroupRoleCreated { role }
                         if auth_doc.roles.get(&role.role_id).is_some_and(|source| {
-                            role == &AdminDocumentRoleDefinition::from(source)
+                            role == &AdminRoleDefinition::from(source)
                         })
                 ))
         );
