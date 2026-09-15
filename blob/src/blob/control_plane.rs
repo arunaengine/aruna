@@ -3,7 +3,7 @@ use crate::framing::{MAX_CONTROL_PLANE_FRAME, read_frame, write_frame};
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
-use aruna_core::structs::BackendLocation;
+use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_net::streams::{RecvStream, SendStream};
 use std::future::Future;
 use std::time::Duration;

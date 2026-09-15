@@ -6,9 +6,8 @@ use crate::s3::auth::map_authorize_error;
 use crate::s3::checksum::{ApplyChecksums, ChecksumSelection, encode_checksums};
 use crate::s3::error::IntoS3Error;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, UserAccess, object_permission_path,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
 use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;

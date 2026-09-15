@@ -7,7 +7,8 @@ use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
 };
-use aruna_core::structs::{Actor, OidcProviderConfig, RealmId, TokenClaims};
+use aruna_core::structs::identity::auth::{Actor, TokenClaims};
+use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_operations::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, decode_bearer_token,
 };
@@ -510,10 +511,9 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
-    use aruna_core::structs::{
-        Actor, NodeCapabilities, OidcProviderConfig, RealmConfigDocument, RealmId, TokenClaims,
-        User,
-    };
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
+    use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
+    use aruna_core::structs::identity::user::User;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::announce_presence::{
@@ -736,7 +736,7 @@ mod tests {
 
     async fn read_realm_config(
         context: &DriverContext,
-        realm_id: &aruna_core::structs::RealmId,
+        realm_id: &aruna_core::structs::identity::realm::RealmId,
     ) -> RealmConfigDocument {
         match context
             .storage_handle
@@ -781,7 +781,7 @@ mod tests {
         let shutdown = aruna_core::shutdown::Shutdown::new();
         initialize_net_holder(
             context.clone(),
-            aruna_core::structs::RoCrateLimits::default(),
+            aruna_core::structs::execution::job::RoCrateLimits::default(),
             jobs_runtime.clone(),
             &shutdown,
         );
@@ -789,7 +789,7 @@ mod tests {
 
         let realm_signing_key = generate_signing_key();
         let realm_id =
-            aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+            aruna_core::structs::identity::realm::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
         let bootstrap_user = UserId::local(Ulid::generate(), realm_id);
         drive(

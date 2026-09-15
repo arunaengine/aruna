@@ -14,10 +14,14 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, NodeCapabilities,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, VersionKey,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+    CurrentVersionPointer, VersionKey,
+};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;

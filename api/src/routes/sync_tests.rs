@@ -7,9 +7,9 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_MIRROR_REPAIR_KEYSPACE};
-use aruna_core::structs::{
-    Actor, GroupAuthorizationDocument, NodeCapabilities, PathRestriction, RealmId,
-};
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::RealmId;
 use tempfile::TempDir;
 
 fn test_node(seed: u8) -> NodeId {

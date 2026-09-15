@@ -8,7 +8,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HIDDEN_RESERVATION_KEYSPACE, BUCKET_STATS_DB,
 };
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     Backend, BackendBucket, BackendLocation, BackendRef, BlobCleanupWork, HIDDEN_BLOB_PREFIX,
     HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_path,
 };

@@ -2,9 +2,10 @@ use crate::server_state::ServerState;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId,
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_core::{NodeId, UserId};
 use aruna_operations::driver::DriverContext;

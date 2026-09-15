@@ -2,7 +2,7 @@
 //! in `service`.
 
 use super::ArunaS3Service;
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::replication::queue::complete_put;
 use s3s::{S3Result, s3_error};
 

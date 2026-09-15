@@ -6,10 +6,10 @@ use super::object::restrictions_reach;
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
 use crate::s3::scope::SubpathScope;
-use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketInfo, Permission, SyncMode, SyncRelationship, UserAccess,
-    bucket_permission_path,
-};
+use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
+use aruna_core::structs::{SyncMode, SyncRelationship};
 use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
 use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
@@ -147,7 +147,7 @@ impl ArunaS3Service {
             }
             let arn = ArunaArn::parse(&rule.destination.bucket)
                 .map_err(|err| s3_error!(InvalidArgument, "{}", err.to_string()))?;
-            if arn.resource_type != aruna_core::structs::ArunaArnType::S3 {
+            if arn.resource_type != aruna_core::structs::storage::replication::ArunaArnType::S3 {
                 return Err(s3_error!(
                     InvalidArgument,
                     "Replication target ARN must use s3 type"

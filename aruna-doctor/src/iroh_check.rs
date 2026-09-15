@@ -409,7 +409,7 @@ mod tests {
     use aruna_api::routes::info::{
         InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeStatus, ServicesStatus,
     };
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};

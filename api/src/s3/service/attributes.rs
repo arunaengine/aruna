@@ -5,7 +5,7 @@
 use super::response::ObjectResponseFields;
 use crate::s3::checksum::{ChecksumSelection, EncodedChecksums, encode_checksums};
 use crate::s3::util::{checksum_response_hashes, map_checksum_type};
-use aruna_core::structs::MultipartObjectPart;
+use aruna_core::structs::storage::multipart::MultipartObjectPart;
 use aruna_operations::s3::multipart::parts::ListPartsOperation;
 use aruna_operations::s3::object::attributes::GetAttributesResult;
 use aruna_operations::s3::object::get::ObjectInfo;
@@ -210,7 +210,7 @@ pub(super) fn attributes_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{MultipartChecksumType, MultipartObjectSummary};
+    use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
     use std::collections::HashMap;
 
     fn result(part_count: usize, parts: Vec<MultipartObjectPart>) -> GetAttributesResult {

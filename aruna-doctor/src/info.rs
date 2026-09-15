@@ -1,7 +1,7 @@
 use crate::error::CliError;
 use aruna_api::routes::info::InfoResponse;
 use aruna_api::server_state::client_bind_url;
-use aruna_core::structs::BackendsFile;
+use aruna_core::structs::storage::backends::BackendsFile;
 use reqwest::Client;
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -280,7 +280,8 @@ mod tests {
     use aruna_api::server::{Server, ServerConfig};
     use aruna_api::server_state::ServerState;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{NodeCapabilities, RealmId};
+    use aruna_core::structs::identity::auth::NodeCapabilities;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::announce_presence::{
@@ -356,7 +357,7 @@ mod tests {
         let shutdown = aruna_core::shutdown::Shutdown::new();
         initialize_net_holder(
             context.clone(),
-            aruna_core::structs::RoCrateLimits::default(),
+            aruna_core::structs::execution::job::RoCrateLimits::default(),
             jobs_runtime.clone(),
             &shutdown,
         );
@@ -368,7 +369,7 @@ mod tests {
         let bootstrap_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
-                actor: aruna_core::structs::Actor {
+                actor: aruna_core::structs::identity::auth::Actor {
                     node_id: net.node_id(),
                     user_id: bootstrap_user,
                     realm_id,

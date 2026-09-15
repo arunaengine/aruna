@@ -4,9 +4,8 @@
 use std::sync::Arc;
 
 use aruna_core::document::DocumentEvent;
-use aruna_core::structs::{
-    AuthContext, Permission, SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::{SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage};
 use aruna_operations::sync::sync_quarantine::{
     QuarantineAdminError, QuarantinePageRequest, acknowledge_quarantine_row,
     list_quarantine_records, prune_quarantine_records, read_quarantine_record,

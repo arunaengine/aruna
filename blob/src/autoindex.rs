@@ -4,7 +4,7 @@
 
 use crate::egress::EgressGuard;
 use aruna_core::errors::StagingSourceError;
-use aruna_core::structs::{SourceEntry, SourceEntryKind};
+use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use std::collections::{HashMap, VecDeque};

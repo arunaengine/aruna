@@ -6,8 +6,9 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
 };
-use aruna_core::structs::{
-    Backend, BackendConfig, BackendRef, GroupBackendKind, GroupStorage, GroupStorageSecret,
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
+use aruna_core::structs::storage::group_backend::{
+    GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
 use aruna_core::types::Key;
 use std::collections::HashMap;
@@ -36,7 +37,7 @@ fn container_key(kind: GroupBackendKind) -> &'static str {
 pub(super) fn group_entry(
     record: &GroupStorage,
     secret: &GroupStorageSecret,
-    timeouts: aruna_core::structs::BlobTimeoutConfig,
+    timeouts: aruna_core::structs::storage::blob::BlobTimeoutConfig,
 ) -> Result<NodeBackend, BlobError> {
     let mut service_config: HashMap<String, String> = record.public_config.clone();
     service_config.extend(secret.secret_config.clone());
@@ -324,9 +325,11 @@ impl BlobHandler {
 mod tests {
     use super::{group_entry, group_ids};
     use aruna_core::effects::BlobEffect;
-    use aruna_core::structs::{
-        Backend, BackendRef, BlobTimeoutConfig, GroupBackendKind, GroupStorage, GroupStorageSecret,
-        ResolvedBackend,
+    use aruna_core::structs::storage::blob::{
+        Backend, BackendRef, BlobTimeoutConfig, ResolvedBackend,
+    };
+    use aruna_core::structs::storage::group_backend::{
+        GroupBackendKind, GroupStorage, GroupStorageSecret,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -346,7 +349,7 @@ mod tests {
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             disabled: false,
-            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }
     }
 

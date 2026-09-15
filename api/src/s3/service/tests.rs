@@ -11,14 +11,26 @@ use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::{
-    Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, CurrentVersionPointer, GroupAuthorizationDocument, MultipartChecksumType,
-    NotificationClass, NotificationKind, NotificationRecord, PathRestriction,
-    PortableSourceDescriptor, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
-    SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
-    WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable, bucket_permission_path,
-    watch_resource_path,
+use aruna_core::structs::identity::auth::{Actor, PathRestriction};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    CurrentVersionPointer, VersionKey, bucket_permission_path,
+};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationRecord,
+};
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::notification_watch::{
+    WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable, watch_resource_path,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::request_authorization::authorize;
@@ -159,7 +171,7 @@ fn reference_fields_present() {
     let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
     let (_dir, service) = parser_service(realm_id, node_id);
     let refreshed = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    let bare = aruna_core::structs::SourceMetadata {
+    let bare = aruna_core::structs::execution::source_access::SourceMetadata {
         content_length: 15,
         content_type: None,
         etag: None,
@@ -182,7 +194,7 @@ fn reference_fields_present() {
         "the derived etag is stable"
     );
 
-    let given = aruna_core::structs::SourceMetadata {
+    let given = aruna_core::structs::execution::source_access::SourceMetadata {
         etag: Some("\"abc-1\"".to_string()),
         ..bare
     };
@@ -493,7 +505,7 @@ async fn install_watch_authorization(
     };
     let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
     let group_auth = GroupAuthorizationDocument::default_group_doc(watcher, realm_id, group_id);
-    let group = aruna_core::structs::Group {
+    let group = aruna_core::structs::identity::group::Group {
         display_name: "watched".to_string(),
         group_id,
         realm_id,
@@ -791,7 +803,7 @@ fn setup_state() -> TestState {
         task_handle: None,
         compute_handle: None,
     });
-    let realm_id = aruna_core::structs::RealmId([9u8; 32]);
+    let realm_id = aruna_core::structs::identity::realm::RealmId([9u8; 32]);
 
     TestState {
         _storage_dir: storage_dir,
@@ -1130,7 +1142,7 @@ async fn visible_buckets(scope: &str) -> Vec<String> {
         realm_id,
         group_id,
     );
-    let group = aruna_core::structs::Group {
+    let group = aruna_core::structs::identity::group::Group {
         display_name: "listing".to_string(),
         group_id,
         realm_id,
@@ -1221,7 +1233,7 @@ async fn subpath_node() -> (TempDir, ArunaS3Service, UserAccess, Ulid) {
         group_id,
         roles: HashMap::from([(
             role_id,
-            aruna_core::structs::Role {
+            aruna_core::structs::identity::auth::Role {
                 role_id,
                 name: "imaging-reader".to_string(),
                 permissions: HashMap::from([(
@@ -1236,7 +1248,7 @@ async fn subpath_node() -> (TempDir, ArunaS3Service, UserAccess, Ulid) {
         )]),
         policies: Vec::new(),
     };
-    let group = aruna_core::structs::Group {
+    let group = aruna_core::structs::identity::group::Group {
         display_name: "imaging".to_string(),
         group_id,
         realm_id,
@@ -1377,7 +1389,7 @@ async fn write_realm_deny(service: &ArunaS3Service, user_access: &UserAccess) {
     let role_id = Ulid::generate();
     realm_auth.roles.insert(
         role_id,
-        aruna_core::structs::Role {
+        aruna_core::structs::identity::auth::Role {
             role_id,
             name: "data-deny".to_string(),
             permissions: HashMap::from([(format!("/{realm_id}/g/**"), Permission::DENY)]),
@@ -1793,7 +1805,7 @@ async fn object_path_decides() {
         session: None,
     };
     let object_path = |key: &str| {
-        aruna_core::structs::object_permission_path(
+        aruna_core::structs::storage::blob::object_permission_path(
             service.realm_id,
             group_id,
             service.node_id,
@@ -1895,7 +1907,7 @@ async fn setup_copy_authorization(
             .insert(UserId::nil(realm_id));
     }
 
-    let source_group = aruna_core::structs::Group {
+    let source_group = aruna_core::structs::identity::group::Group {
         display_name: "source".to_string(),
         group_id: source_group_id,
         realm_id,
@@ -2075,7 +2087,7 @@ async fn source_policy_denied() {
         expression: "permission == 'read'".to_string(),
         enabled: true,
     }];
-    let source_group = aruna_core::structs::Group {
+    let source_group = aruna_core::structs::identity::group::Group {
         display_name: "src".to_string(),
         group_id,
         realm_id,
@@ -2172,7 +2184,7 @@ async fn delete_uses_context() {
             .to_string(),
         enabled: true,
     }];
-    let group = aruna_core::structs::Group {
+    let group = aruna_core::structs::identity::group::Group {
         display_name: "g".to_string(),
         group_id,
         realm_id,

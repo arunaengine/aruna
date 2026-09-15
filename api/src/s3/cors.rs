@@ -1,5 +1,5 @@
 use crate::cors::{S3_PREFLIGHT_VARY, append_vary_headers};
-use aruna_core::structs::{BucketCorsConfiguration, BucketCorsRule};
+use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketCorsRule};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 use s3s::HttpResponse;

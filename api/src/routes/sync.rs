@@ -5,9 +5,11 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
+use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path, ensure_confined_path};
 use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketInfo, Permission, ReferenceHandling, SyncMode, SyncRelationship,
-    SyncState, SyncStatusSnapshot, bucket_permission_path, ensure_confined_path,
+    ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
@@ -18,7 +20,7 @@ use aruna_operations::replication::queue::{QueueBlobOperation, relationship_job_
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::sync::mirror_repair::{
     SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
@@ -978,7 +980,7 @@ fn validate_endpoint(bucket: &str, prefix: Option<&str>) -> ServerResult<()> {
 }
 
 fn make_endpoint(
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     node_id: NodeId,
     bucket: &str,
     prefix: Option<&str>,

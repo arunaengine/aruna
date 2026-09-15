@@ -2,10 +2,13 @@ use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::errors::BlobError;
-use aruna_core::structs::{
-    Backend, BackendCatalog, BackendConfig, BackendRef, BlobTimeoutConfig, CleanupStrategy,
-    NodeBackendEntry, NodeBackendsConfig, NodeRouting, NodeRoutingRule, ResolvedBackend, Status,
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BackendRef, BlobTimeoutConfig, ResolvedBackend,
 };
+use aruna_core::structs::storage::routing::{BackendCatalog, NodeRouting, NodeRoutingRule};
+use aruna_core::structs::storage::cleanup::CleanupStrategy;
+use aruna_core::structs::storage::backends::{NodeBackendEntry, NodeBackendsConfig};
+use aruna_core::structs::Status;
 use opendal::Operator;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

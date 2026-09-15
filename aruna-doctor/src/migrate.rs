@@ -9,13 +9,15 @@ use aruna_core::keyspaces::{
     JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
     JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::structs::{
-    DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS, ExecutionOutputRecord,
-    ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord, JobRecordEnvelope,
-    LaunchIntent, LogicalJobSpec, PhysicalExecutionResult, PhysicalExecutionState,
-    RealmConfigDocument, RealmId, ResultMessage, SubmissionClaim, SubmissionId,
-    WitnessBudgetRecord,
+use aruna_core::structs::placement::compute_config::{
+    DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS,
 };
+use aruna_core::structs::execution::job::{
+    ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
+    JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
+    PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
@@ -357,11 +359,14 @@ mod tests {
         JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
         JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::structs::{
-        DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS, ExecutionUpdate, JobFamilyRecord,
-        JobRecordEnvelope, PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage,
+    use aruna_core::structs::placement::compute_config::{
+        DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS,
+    };
+    use aruna_core::structs::execution::job::{
+        ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
     };
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::BTreeMap;

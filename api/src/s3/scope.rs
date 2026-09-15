@@ -4,7 +4,8 @@
 
 use aruna_core::errors::AuthorizationError;
 use aruna_core::permission_path::{path_within, readable_roots};
-use aruna_core::structs::{AuthContext, PathRestriction, Permission, UserAccess};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::auth::permission_rules::{PermissionRules, permission_rules};
 use aruna_operations::driver::DriverContext;
 use s3s::{S3Result, s3_error};
@@ -107,7 +108,7 @@ pub(super) async fn resolve_scope(
 #[cfg(test)]
 mod tests {
     use super::SubpathScope;
-    use aruna_core::structs::{PathRestriction, Permission, Role};
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission, Role};
     use aruna_operations::auth::permission_rules::{CollectedRole, PermissionRules};
 
     fn test_scope(

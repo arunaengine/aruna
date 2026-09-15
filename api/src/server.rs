@@ -194,7 +194,8 @@ mod tests {
         // outside auth, so router edits that move it inward break this.
         use crate::rate_limit::ApiRateLimits;
         use crate::server_state::ServerState;
-        use aruna_core::structs::{NodeCapabilities, RealmId};
+        use aruna_core::structs::identity::auth::NodeCapabilities;
+        use aruna_core::structs::identity::realm::RealmId;
 
         let dir = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
@@ -255,7 +256,8 @@ mod tests {
         // The MCP router's guards are route layers: they must never claim the
         // merged fallback, or `/` answers 401 instead of the swagger redirect.
         use crate::server_state::ServerState;
-        use aruna_core::structs::{NodeCapabilities, RealmId};
+        use aruna_core::structs::identity::auth::NodeCapabilities;
+        use aruna_core::structs::identity::realm::RealmId;
 
         let dir = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();

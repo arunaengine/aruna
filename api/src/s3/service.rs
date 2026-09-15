@@ -46,11 +46,13 @@ use aruna_compute::session::TouchedObject;
 use aruna_core::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{
-    ArunaArn, AuthContext, BucketInfo, COMPLETION_DEADLINE_MS, Permission, RealmId, RoCrateLimits,
-    SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot, UserAccess, credential_job_id,
-    object_permission_path,
-};
+use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
+use aruna_core::structs::storage::multipart::COMPLETION_DEADLINE_MS;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::job::{RoCrateLimits, credential_job_id};
+use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
@@ -135,7 +137,7 @@ const S3_URL_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// The ETag a reference answers with: the source's when it gave a usable one,
 /// otherwise one derived from the observation, so listings and reads agree and
 /// clients that require an ETag, such as mountpoint, keep working.
-pub(super) fn reference_etag(metadata: &aruna_core::structs::SourceMetadata) -> ETag {
+pub(super) fn reference_etag(metadata: &aruna_core::structs::execution::source_access::SourceMetadata) -> ETag {
     metadata
         .etag
         .as_deref()

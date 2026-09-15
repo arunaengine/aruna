@@ -1,6 +1,6 @@
 use crate::s3::checksum::checksum_mismatch_error;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
-use aruna_core::structs::RoutingError;
+use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::driver::{GateContextError, RoutingInputsError};
 use aruna_operations::placement::policy::PolicyGateError;
@@ -830,8 +830,8 @@ mod tests {
         // caller cannot probe which copies a node holds.
         let codes: Vec<S3ErrorCode> = [
             ManagedCopyError::Unregistered,
-            ManagedCopyError::NotServeable(aruna_core::structs::ManagedCopyState::Quarantined(
-                aruna_core::structs::ManagedCopyQuarantine::Rejoin,
+            ManagedCopyError::NotServeable(aruna_core::structs::storage::blob::ManagedCopyState::Quarantined(
+                aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
             )),
             ManagedCopyError::Mismatched,
             ManagedCopyError::NoSubject,

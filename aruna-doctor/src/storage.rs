@@ -509,17 +509,18 @@ mod tests {
         REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
     use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::s3::create_access::{
+    use aruna_operations::s3::access::create::{
         CreateUserConfig, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
     };
-    use aruna_operations::s3::create_bucket::CreateBucketOperation;
-    use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use aruna_operations::s3::bucket::create::CreateBucketOperation;
+    use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_tasks::TaskHandle;
     use fjall::Readable;
     use std::collections::BTreeMap;

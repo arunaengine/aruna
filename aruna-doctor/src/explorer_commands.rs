@@ -6,9 +6,10 @@ use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, KEYSPACE_CATALOG, NODE_STATE_KEYSPACE,
     SYNC_PLACEMENT_KEYSPACE,
 };
-use aruna_core::structs::{
-    BackendLocation, BackendRef, BackendsFile, POLICY_BULK_INTENT_KEYSPACE,
-    POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+use aruna_core::structs::storage::backends::BackendsFile;
+use aruna_core::structs::placement::policy_attachment::{
+    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
 };
 use aruna_operations::sync::shard_placement::decode_placement;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -346,10 +347,13 @@ mod tests {
     use aruna_core::keyspaces::{
         BLOB_LOCATIONS_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, KEYSPACE_CATALOG,
     };
-    use aruna_core::structs::{
-        Actor, BackendLocation, BackendRef, Group, POLICY_BULK_INTENT_KEYSPACE,
-        POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, RealmId,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::identity::group::Group;
+    use aruna_core::structs::placement::policy_attachment::{
+        POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
     use std::collections::HashMap;
     use std::time::SystemTime;

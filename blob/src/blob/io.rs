@@ -13,10 +13,11 @@ use aruna_core::handle::Handle as _;
 use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
-    HiddenBlobKey, MultipartPartKey, ResolvedBackend,
+    HiddenBlobKey, ResolvedBackend,
 };
+use aruna_core::structs::storage::multipart::MultipartPartKey;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};

@@ -6,7 +6,7 @@ use crate::s3::checksum::{ChecksumSelection, encode_checksums};
 use crate::s3::error::IntoS3Error;
 use crate::s3::scope::SubpathScope;
 use crate::s3::util::{map_checksum_algorithm, map_checksum_type};
-use aruna_core::structs::BlobHeadKey;
+use aruna_core::structs::storage::blob::BlobHeadKey;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::listing::common_prefix_of;
@@ -534,7 +534,7 @@ impl ArunaS3Service {
 #[cfg(test)]
 mod tests {
     use super::{consume_scope_page, scoped_marker};
-    use aruna_core::structs::BlobHeadKey;
+    use aruna_core::structs::storage::blob::BlobHeadKey;
 
     #[test]
     fn scoped_scan_bounded() {

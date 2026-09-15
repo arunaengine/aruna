@@ -8,7 +8,8 @@ use crate::s3::checksum::{
 use crate::s3::util::map_checksum_type;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{AuthContext, OBJECT_CONTENT_TYPE_KEY};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::blob::OBJECT_CONTENT_TYPE_KEY;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::complete::CompleteUploadResult;
 use aruna_operations::s3::object::delete::{DeleteObjectError, DeleteObjectResult};
@@ -260,7 +261,7 @@ impl ArunaS3Service {
 
     fn source_metadata_headers(
         &self,
-        metadata: &aruna_core::structs::SourceMetadata,
+        metadata: &aruna_core::structs::execution::source_access::SourceMetadata,
         last_refresh: Option<SystemTime>,
     ) -> Option<std::collections::HashMap<String, String>> {
         let mut headers = std::collections::HashMap::new();
@@ -292,10 +293,10 @@ impl ArunaS3Service {
 
     pub(super) fn build_response_fields(
         &self,
-        location: Option<&aruna_core::structs::BackendLocation>,
+        location: Option<&aruna_core::structs::storage::blob::BackendLocation>,
         info: Option<&ObjectInfo>,
         metadata: Option<&std::collections::HashMap<String, String>>,
-        source_metadata: Option<&aruna_core::structs::SourceMetadata>,
+        source_metadata: Option<&aruna_core::structs::execution::source_access::SourceMetadata>,
         last_refresh: Option<SystemTime>,
         version_created_at: Option<SystemTime>,
     ) -> ObjectResponseFields {
@@ -395,7 +396,7 @@ fn internal_delete_error(key: String, requested_version_id: Option<Ulid>) -> S3D
 mod tests {
     use super::*;
     use aruna_core::NodeId;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
 
     async fn test_service() -> (tempfile::TempDir, ArunaS3Service) {
         let dir = tempfile::tempdir().expect("tempdir");

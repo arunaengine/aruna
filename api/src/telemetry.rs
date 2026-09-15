@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::server_state::ServerState;
 use aruna_core::metrics::{RequestLabels, RouteLabels, method_label};
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::telemetry::{LatencyAggregator, RequestStages, duration_ms};
 use axum::extract::{MatchedPath, Request, State};
 use axum::middleware::Next;

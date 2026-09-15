@@ -1,18 +1,17 @@
 use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{
-    AuthContext, BackendRef, Permission, RoutingTarget, StorageRoutingRule, bucket_permission_path,
-    target_warnings,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{BackendRef, bucket_permission_path};
+use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule, target_warnings};
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::groups::storage_routing::{
     GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
 };
-use aruna_operations::s3::bucket_routing::{
+use aruna_operations::s3::bucket::routing::{
     GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation,
 };
-use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};

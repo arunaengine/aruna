@@ -22,14 +22,24 @@ use aruna_core::keyspaces::{
     S3_MULTIPART_UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
-use aruna_core::structs::{
-    BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group,
-    GroupAuthorizationDocument, HashIndex, JobFamilyId, JobRecordEnvelope, JobRecordKey,
-    ManagedCopyKey, ManagedCopyRecord, MultipartObjectKey, MultipartObjectPart,
-    MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload, NodeSubjectRecord,
-    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
-    PlacementPolicyDocument, PolicyBulkRun, PolicyIntent, PolicyIntentKey, PolicyMutationRecord,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo, CurrentVersionPointer, HashIndex,
+    ManagedCopyKey, ManagedCopyRecord, UserAccess, VersionKey,
+};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
+use aruna_core::structs::storage::multipart::{
+    MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary, MultipartPart,
+    MultipartPartKey, MultipartUpload,
+};
+use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+use aruna_core::structs::placement::policy_attachment::{
+    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBulkRun,
+    PolicyIntent, PolicyIntentKey, PolicyMutationRecord,
+};
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
@@ -246,7 +256,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         }),
         BLOB_LOCATIONS_KEYSPACE => decode_value_with(
             value,
-            aruna_core::structs::BackendLocation::from_bytes,
+            aruna_core::structs::storage::blob::BackendLocation::from_bytes,
             |data| DecodedValue::BackendLocation { data },
         ),
         BLOB_VERSIONS_KEYSPACE => decode_value_with(value, BlobVersion::from_bytes, |data| {
@@ -523,7 +533,7 @@ fn decode_explain_key(key: &[u8]) -> DecodedField {
 
 fn family_from_key(key: &[u8]) -> Option<JobFamilyId> {
     Some(JobFamilyId {
-        submission_id: aruna_core::structs::SubmissionId(key.get(..32)?.try_into().ok()?),
+        submission_id: aruna_core::structs::execution::job::SubmissionId(key.get(..32)?.try_into().ok()?),
         request_digest: key.get(32..64)?.try_into().ok()?,
     })
 }
@@ -978,16 +988,26 @@ mod tests {
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_core::structs::{
-        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, HashIndex, JobFamilyId, JobRecordEnvelope, MultipartChecksumType,
-        MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary, MultipartPart,
-        MultipartPartKey, MultipartUpload, MultipartUploadStatus, POLICY_BULK_INTENT_KEYSPACE,
-        POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PlacementPolicy,
-        PlacementPolicyDocument, PlacementPolicyRef, PolicyBulkRun, PolicyIntent,
-        PolicyIntentOutcome, PolicyMutationParams, PolicyMutationRecord, PolicyPublication,
-        PolicyRefMode, PolicyStatus, RealmConfigDocument, RealmId, placement_policy_key,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, HashIndex,
     };
+    use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope};
+    use aruna_core::structs::storage::multipart::{
+        MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
+        MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
+    };
+    use aruna_core::structs::placement::policy_attachment::{
+        POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
+        PolicyBulkRun, PolicyIntent, PolicyIntentOutcome, PolicyMutationParams,
+        PolicyMutationRecord, PolicyRefMode, PolicyStatus,
+    };
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementPolicyRef};
+    use aruna_core::structs::placement::policy_document::{
+        PlacementPolicyDocument, PolicyPublication, placement_policy_key,
+    };
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_net::dht::storage::StoredEntry;
     use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
     use aruna_operations::jobs::records::rows::PROJECTION_CACHE_VERSION;
@@ -1036,7 +1056,7 @@ mod tests {
 
     fn test_family() -> JobFamilyId {
         JobFamilyId {
-            submission_id: aruna_core::structs::SubmissionId([9u8; 32]),
+            submission_id: aruna_core::structs::execution::job::SubmissionId([9u8; 32]),
             request_digest: [8u8; 32],
         }
     }
@@ -1049,9 +1069,9 @@ mod tests {
         let family = test_family();
         JobRecordEnvelope::sign(
             RealmId::from_bytes([2u8; 32]),
-            aruna_core::structs::JobFamilyRecord::Claim(aruna_core::structs::SubmissionClaim {
+            aruna_core::structs::execution::job::JobFamilyRecord::Claim(aruna_core::structs::execution::job::SubmissionClaim {
                 submission_id: family.submission_id,
-                job_id: aruna_core::structs::JobId::from_bytes(
+                job_id: aruna_core::structs::execution::job::JobId::from_bytes(
                     Ulid::from_bytes([5u8; 16]).to_bytes(),
                 ),
                 request_digest: family.request_digest,
@@ -1085,7 +1105,7 @@ mod tests {
 
         let pending = PendingRecord {
             envelope: envelope.clone(),
-            need: PendingNeed::Evidence(aruna_core::structs::JobRecordKind::Spec),
+            need: PendingNeed::Evidence(aruna_core::structs::execution::job::JobRecordKind::Spec),
             first_seen_ms: 12,
             attempts: 2,
         };
@@ -1169,9 +1189,9 @@ mod tests {
         let execution_id = Ulid::from_bytes([1u8; 16]);
         let reservation = JobReservationRecord {
             execution_id,
-            job_id: aruna_core::structs::JobId::from_bytes(Ulid::from_bytes([5u8; 16]).to_bytes()),
-            logical_job_id: aruna_core::structs::JobId::from_bytes([5u8; 16]),
-            resources: aruna_core::structs::EffectiveResources {
+            job_id: aruna_core::structs::execution::job::JobId::from_bytes(Ulid::from_bytes([5u8; 16]).to_bytes()),
+            logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([5u8; 16]),
+            resources: aruna_core::structs::execution::job::EffectiveResources {
                 cpu_cores: 2,
                 ram_bytes: 1024,
                 disk_bytes: 2048,
@@ -1587,7 +1607,7 @@ mod tests {
     #[test]
     fn decodes_pending_placement() {
         let realm_id = RealmId::from_bytes([4_u8; 32]);
-        let placement_ref = aruna_core::structs::PlacementRef {
+        let placement_ref = aruna_core::structs::placement::placement_record::PlacementRef {
             strategy_id: ulid::Ulid::from_bytes([9_u8; 16]),
             shard: 5,
         };
@@ -2001,7 +2021,7 @@ mod tests {
         let node_id = iroh::SecretKey::from_bytes(&[3_u8; 32]).public();
         let created_by = aruna_core::UserId::local(Ulid::from_bytes([6_u8; 16]), realm_id);
         let head_key = BlobHeadKey::new("bucket", "path/file.txt");
-        let head_value = aruna_core::structs::CurrentVersionPointer::new_with_generation(
+        let head_value = aruna_core::structs::storage::blob::CurrentVersionPointer::new_with_generation(
             Ulid::from_bytes([4_u8; 16]),
             7,
         )
@@ -2075,7 +2095,7 @@ mod tests {
             other => panic!("expected backend location, got {other:?}"),
         }
 
-        let version_key = aruna_core::structs::VersionKey::new(
+        let version_key = aruna_core::structs::storage::blob::VersionKey::new(
             "bucket",
             "path/file.txt",
             Ulid::from_bytes([6_u8; 16]),

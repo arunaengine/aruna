@@ -8,7 +8,7 @@ use crate::s3::cors::{
     match_preflight_rule,
 };
 use crate::s3::server::classification::RequestClassification;
-use aruna_core::structs::BucketCorsConfiguration;
+use aruna_core::structs::storage::blob::BucketCorsConfiguration;
 use http::header;
 use http::{Method, StatusCode};
 use s3s::HttpError;
@@ -138,7 +138,7 @@ pub(super) fn apply_response_cors(
 mod tests {
     use super::*;
     use crate::s3::server::classification::RequestClassification;
-    use aruna_core::structs::BucketCorsRule;
+    use aruna_core::structs::storage::blob::BucketCorsRule;
     use http::HeaderValue;
 
     fn classification(
