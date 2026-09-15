@@ -3,7 +3,7 @@ use std::str::FromStr;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::errors::AuthorizationError;
-use aruna_core::metrics::WatchAuthorizationMetricReason;
+use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::{
     AuthContext, MetadataRegistryRecord, NotificationKind, Permission, RealmId,
     WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
@@ -42,14 +42,14 @@ pub enum WatchAuthorizationDenial {
 }
 
 impl WatchAuthorizationDenial {
-    pub const fn metric_reason(self) -> WatchAuthorizationMetricReason {
+    pub const fn metric_reason(self) -> WatchMetricReason {
         match self {
-            Self::InvalidState => WatchAuthorizationMetricReason::InvalidState,
-            Self::InvalidOwner => WatchAuthorizationMetricReason::InvalidOwner,
-            Self::TokenExpired => WatchAuthorizationMetricReason::TokenExpired,
-            Self::TokenRevoked => WatchAuthorizationMetricReason::TokenRevoked,
-            Self::TokenRestricted => WatchAuthorizationMetricReason::TokenRestricted,
-            Self::PermissionDenied => WatchAuthorizationMetricReason::PermissionDenied,
+            Self::InvalidState => WatchMetricReason::InvalidState,
+            Self::InvalidOwner => WatchMetricReason::InvalidOwner,
+            Self::TokenExpired => WatchMetricReason::TokenExpired,
+            Self::TokenRevoked => WatchMetricReason::TokenRevoked,
+            Self::TokenRestricted => WatchMetricReason::TokenRestricted,
+            Self::PermissionDenied => WatchMetricReason::PermissionDenied,
         }
     }
 }
@@ -682,7 +682,7 @@ pub async fn filter_authorized_subscriptions(
                 check_failed = true;
                 warn!(
                     parent: None,
-                    reason = WatchAuthorizationMetricReason::AuthorizationUnavailable.as_str(),
+                    reason = WatchMetricReason::AuthorizationUnavailable.as_str(),
                     "Notification watch authorization check failed"
                 );
             }

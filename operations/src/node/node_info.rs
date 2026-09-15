@@ -8,7 +8,7 @@ use aruna_core::compute_quota::{
     DemandGroup, JobReservationRecord, MAX_DEMAND_FAMILIES, MAX_DEMAND_GROUPS,
     MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability, bound_demand,
 };
-use aruna_core::document::{DocumentSyncChange, DocumentSyncTarget};
+use aruna_core::document::{DocumentChange, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -39,7 +39,7 @@ use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{REGISTRY_FILL_PAGE_SIZE, parse_registry_iter};
 use crate::placement::{build_view, held_buckets};
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
@@ -393,7 +393,7 @@ async fn next_epoch(
 }
 
 async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result<u64, String> {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     match ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -404,7 +404,7 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .and_then(|bytes| postcard::from_bytes::<DocumentSyncChange>(bytes.as_ref()).ok())
+            .and_then(|bytes| postcard::from_bytes::<DocumentChange>(bytes.as_ref()).ok())
             .map(|change| change.current.generation)
             .unwrap_or_default()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
@@ -806,7 +806,7 @@ async fn load_realm_config(
     ctx: &DriverContext,
     realm_id: RealmId,
 ) -> Result<RealmConfigDocument, String> {
-    drive(GetRealmConfigOperation::new(realm_id), ctx)
+    drive(GetConfigOperation::new(realm_id), ctx)
         .await
         .map_err(|error| format!("failed to read realm config for node info: {error}"))
 }
@@ -967,7 +967,7 @@ async fn replicate_node_info(
             realm_id,
             local_node_id: node_id,
             excluded_peers: Vec::new(),
-            documents: vec![DocumentSyncTarget::NodeInfo { realm_id, node_id }],
+            documents: vec![DocumentTarget::NodeInfo { realm_id, node_id }],
             // Shared-topic genesis is bootstrapped by publish_core_documents;
             // explicit publishes and periodic heartbeats only publish into it.
             allow_genesis: false,
@@ -1074,7 +1074,7 @@ pub async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHand
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
     use aruna_core::storage_entries::metadata_registry_key;
     use aruna_core::structs::{
@@ -1120,7 +1120,7 @@ mod tests {
             user_id: aruna_core::UserId::nil(config.realm_id),
             realm_id: config.realm_id,
         };
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: config.realm_id,
         };
         let event = ctx
@@ -1138,7 +1138,7 @@ mod tests {
         ));
     }
 
-    async fn read_outbox(ctx: &DriverContext) -> Vec<DocumentSyncOutboxRecord> {
+    async fn read_outbox(ctx: &DriverContext) -> Vec<DocumentOutboxRecord> {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
@@ -1359,9 +1359,9 @@ mod tests {
         let record = outbox
             .iter()
             .find(|record| {
-                matches!(&record.event, DocumentSyncOutboxEvent::Upsert { .. })
+                matches!(&record.event, DocumentOutboxEvent::Upsert { .. })
                     && record.target
-                        == DocumentSyncTarget::NodeInfo {
+                        == DocumentTarget::NodeInfo {
                             realm_id,
                             node_id: local,
                         }
@@ -1435,7 +1435,7 @@ mod tests {
             .into_iter()
             .filter(|record| {
                 record.target
-                    == DocumentSyncTarget::NodeInfo {
+                    == DocumentTarget::NodeInfo {
                         realm_id,
                         node_id: local,
                     }

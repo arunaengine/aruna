@@ -277,17 +277,13 @@ impl Operation for MarkReadOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::tests::fixtures::notifications::{context_with_storage, seed, user};
+    use crate::tests::notifications::{context_with_storage, seed, user};
     use aruna_core::keyspaces::NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE;
     use aruna_core::structs::{NotificationClass, notification_inbox_key};
     use aruna_storage::storage::StorageHandle;
 
     fn record(recipient: UserId, created_at_ms: u64) -> NotificationRecord {
-        crate::tests::fixtures::notifications::record(
-            recipient,
-            NotificationClass::Direct,
-            created_at_ms,
-        )
+        crate::tests::notifications::record(recipient, NotificationClass::Direct, created_at_ms)
     }
 
     async fn read_all(storage: &StorageHandle, recipient: UserId) -> Vec<NotificationRecord> {

@@ -761,4 +761,5 @@ async fn read_realm_config(
 }
 
 #[cfg(test)]
+#[path = "incoming_tests.rs"]
 mod tests;

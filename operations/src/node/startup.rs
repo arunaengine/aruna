@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::{
-    DocumentSyncNetEvent, DocumentSyncReconcileResult, DocumentSyncTarget, shard_topic_id,
+    DocumentNetEvent, DocumentReconcileResult, DocumentTarget, shard_topic_id,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::metadata::MetadataCreateEventRecord;
+use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
@@ -25,33 +25,33 @@ use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::{draining_former_holders, resolve_shard_holders};
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
-/// these; see [`DocumentSyncTarget::sync_topic_id`]).
+/// these; see [`DocumentTarget::sync_topic_id`]).
 pub const SHARED_RESTORE_TOPIC_COUNT: usize = 5;
 
 fn shared_targets(
     realm_id: RealmId,
     node_id: NodeId,
-) -> [DocumentSyncTarget; SHARED_RESTORE_TOPIC_COUNT] {
+) -> [DocumentTarget; SHARED_RESTORE_TOPIC_COUNT] {
     [
-        DocumentSyncTarget::RealmAuthorization { realm_id },
-        DocumentSyncTarget::RealmConfig { realm_id },
-        DocumentSyncTarget::NodeUsage {
+        DocumentTarget::RealmAuthorization { realm_id },
+        DocumentTarget::RealmConfig { realm_id },
+        DocumentTarget::NodeUsage {
             realm_id,
             node_id,
             group_id: None,
         },
-        DocumentSyncTarget::NodeInfo { realm_id, node_id },
-        DocumentSyncTarget::WatchInterest { realm_id, node_id },
+        DocumentTarget::NodeInfo { realm_id, node_id },
+        DocumentTarget::WatchInterest { realm_id, node_id },
     ]
 }
 
 /// Whether a shared target belongs to the realm rather than to one node.
 /// Node-owned targets are planned by that node alone; realm-wide ones need a
 /// single designated minter.
-pub(crate) fn realm_wide_target(target: &DocumentSyncTarget) -> bool {
+pub(crate) fn realm_wide_target(target: &DocumentTarget) -> bool {
     matches!(
         target,
-        DocumentSyncTarget::RealmConfig { .. } | DocumentSyncTarget::RealmAuthorization { .. }
+        DocumentTarget::RealmConfig { .. } | DocumentTarget::RealmAuthorization { .. }
     )
 }
 
@@ -735,8 +735,8 @@ async fn presence_phase(
         };
     }
     let result = crate::driver::drive(
-        crate::realm::announce_presence::AnnounceRealmPresenceOperation::new(
-            crate::realm::announce_presence::AnnounceRealmPresenceConfig {
+        crate::realm::announce_presence::AnnouncePresenceOperation::new(
+            crate::realm::announce_presence::AnnouncePresenceConfig {
                 realm_id: config.realm_id,
                 node_id: config.node_id,
                 schedule_refresh: true,
@@ -1523,10 +1523,10 @@ async fn restore_join(
 pub(crate) async fn apply_restored_reconcile(
     context: &Arc<DriverContext>,
     node_id: NodeId,
-    event: DocumentSyncNetEvent,
+    event: DocumentNetEvent,
 ) -> bool {
     let result = match event {
-        DocumentSyncNetEvent::DocumentsReconciled {
+        DocumentNetEvent::DocumentsReconciled {
             applied,
             targets,
             metadata_create_events,
@@ -1535,13 +1535,13 @@ pub(crate) async fn apply_restored_reconcile(
             if applied == 0 {
                 return true;
             }
-            DocumentSyncReconcileResult {
+            DocumentReconcileResult {
                 targets,
                 metadata_create_events,
                 metadata_graph_tombstones,
             }
         }
-        DocumentSyncNetEvent::Error { error, .. } => {
+        DocumentNetEvent::Error { error, .. } => {
             warn!(error = %error, "Failed to sync held shard topics on restart");
             return false;
         }
@@ -1568,8 +1568,8 @@ pub(crate) async fn apply_restored_reconcile(
 async fn project_restored_events(
     context: &Arc<DriverContext>,
     node_id: NodeId,
-    targets: Vec<DocumentSyncTarget>,
-    metadata_create_events: Vec<MetadataCreateEventRecord>,
+    targets: Vec<DocumentTarget>,
+    metadata_create_events: Vec<MetadataEventRecord>,
 ) {
     if !metadata_create_events.is_empty() {
         if let Err(error) =
@@ -1582,7 +1582,7 @@ async fn project_restored_events(
 
     let mut pairs = Vec::new();
     for target in targets {
-        if let DocumentSyncTarget::MetadataCreateEvent {
+        if let DocumentTarget::MetadataCreateEvent {
             document_id,
             event_id,
         } = target
@@ -1599,7 +1599,7 @@ async fn project_restored_events(
 }
 
 async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigLoad {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -1695,7 +1695,7 @@ mod tests {
                 .any(|unit| {
                     unit.kind == RestoreKind::Shared
                         && unit.topics.contains(
-                            &DocumentSyncTarget::RealmConfig { realm_id }
+                            &DocumentTarget::RealmConfig { realm_id }
                                 .sync_topic_id(realm_id, &PlacementRef::NIL),
                         )
                 })
@@ -1966,7 +1966,7 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
-        crate::sync::incoming::initialize_net_incoming_for_tests(context.clone());
+        crate::sync::incoming::initialize_incoming_fixture(context.clone());
         RecoveryNode {
             _dir: dir,
             net,
@@ -2024,7 +2024,7 @@ mod tests {
 
     async fn save_config(node: &RecoveryNode, config: &RealmConfigDocument) {
         let realm_id = config.realm_id;
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let target = DocumentTarget::RealmConfig { realm_id };
         let actor = Actor {
             node_id: node.net.node_id(),
             user_id: UserId::nil(realm_id),
@@ -2545,7 +2545,7 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage must open");
         let realm_id = RealmId([8; 32]);
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let target = DocumentTarget::RealmConfig { realm_id };
         let event = storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: target.storage_keyspace().to_string(),
