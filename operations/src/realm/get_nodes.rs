@@ -55,14 +55,14 @@ impl PartialEq<HashSet<NodeId>> for RealmPresence {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetRealmNodesOperation {
+pub struct GetNodesOperation {
     realm_id: RealmId,
-    state: GetRealmNodesState,
-    output: Option<Result<RealmPresence, GetRealmNodesError>>,
+    state: GetNodesState,
+    output: Option<Result<RealmPresence, GetNodesError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum GetRealmNodesState {
+enum GetNodesState {
     Init,
     ReadDocument,
     Finish,
@@ -70,7 +70,7 @@ enum GetRealmNodesState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetRealmNodesError {
+pub enum GetNodesError {
     #[error(transparent)]
     DhtError(#[from] DhtError),
     #[error("operation did not finish")]
@@ -83,24 +83,24 @@ pub enum GetRealmNodesError {
     },
 }
 
-impl GetRealmNodesOperation {
+impl GetNodesOperation {
     pub fn new(realm_id: RealmId) -> Self {
         Self {
             realm_id,
-            state: GetRealmNodesState::Init,
+            state: GetNodesState::Init,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: GetRealmNodesError) -> Effects {
-        self.state = GetRealmNodesState::Error;
+    fn fail(&mut self, error: GetNodesError) -> Effects {
+        self.state = GetNodesState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(GetRealmNodesError::UnexpectedEvent {
+        self.fail(GetNodesError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -108,12 +108,12 @@ impl GetRealmNodesOperation {
     }
 }
 
-impl Operation for GetRealmNodesOperation {
+impl Operation for GetNodesOperation {
     type Output = RealmPresence;
-    type Error = GetRealmNodesError;
+    type Error = GetNodesError;
 
     fn start(&mut self) -> Effects {
-        self.state = GetRealmNodesState::ReadDocument;
+        self.state = GetNodesState::ReadDocument;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
             key: realm_presence_key(&self.realm_id),
             realm_filter: Some(self.realm_id),
@@ -125,9 +125,9 @@ impl Operation for GetRealmNodesOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            GetRealmNodesState::ReadDocument => match event {
+            GetNodesState::ReadDocument => match event {
                 Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, stale, .. })) => {
-                    self.state = GetRealmNodesState::Finish;
+                    self.state = GetNodesState::Finish;
                     self.output = Some(Ok(RealmPresence::new(
                         values.into_iter().map(|entry| entry.node_id).collect(),
                         stale,
@@ -137,21 +137,18 @@ impl Operation for GetRealmNodesOperation {
                 Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => self.fail(error.into()),
                 other => self.unexpected_event("dht get result", format!("{other:?}")),
             },
-            GetRealmNodesState::Finish | GetRealmNodesState::Error | GetRealmNodesState::Init => {
+            GetNodesState::Finish | GetNodesState::Error | GetNodesState::Init => {
                 smallvec![]
             }
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            GetRealmNodesState::Finish | GetRealmNodesState::Error
-        )
+        matches!(self.state, GetNodesState::Finish | GetNodesState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(GetRealmNodesError::NotFinished))
+        self.output.unwrap_or(Err(GetNodesError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -172,7 +169,7 @@ mod pure_tests {
     }
 
     fn presence(realm_id: RealmId, stale: bool) -> RealmPresence {
-        let mut operation = GetRealmNodesOperation::new(realm_id);
+        let mut operation = GetNodesOperation::new(realm_id);
         let _ = operation.start();
         let _ = operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
             key: DhtKeyId::from_data(b"presence"),
@@ -190,7 +187,7 @@ mod pure_tests {
     #[test]
     fn requests_snapshot() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
-        let mut operation = GetRealmNodesOperation::new(realm_id);
+        let mut operation = GetNodesOperation::new(realm_id);
 
         assert!(matches!(
             operation.start().as_slice(),
