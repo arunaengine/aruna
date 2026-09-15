@@ -8,11 +8,11 @@ use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument,
-    HashPathIndexKey, JobFamilyId, JobRecordEnvelope, JobRecordKey, ManagedCopyKey,
-    ManagedCopyRecord, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, NodeSubjectRecord,
-    PlacementPolicyDocument, PolicyBulkIntent, PolicyBulkRun, PolicyMutationRecord,
-    RealmAuthorizationDocument, RealmConfigDocument, UserAccess, VersionKey,
+    HashIndex, JobFamilyId, JobRecordEnvelope, JobRecordKey, ManagedCopyKey, ManagedCopyRecord,
+    MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary, MultipartPart,
+    MultipartPartKey, MultipartUpload, NodeSubjectRecord, PlacementPolicyDocument, PolicyBulkRun,
+    PolicyIntent, PolicyMutationRecord, RealmAuthorizationDocument, RealmConfigDocument,
+    UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness::WitnessDeadline;
@@ -77,7 +77,7 @@ pub(super) struct TopicStatusOutput {
     pub(super) topic_id: String,
     pub(super) status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) pending_placement: Option<JsonPendingDocumentPlacement>,
+    pub(super) pending_placement: Option<JsonPendingPlacement>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -85,7 +85,7 @@ pub(super) struct TopicPlacementsOutput {
     pub(super) database_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) topic_id: Option<String>,
-    pub(super) placements: Vec<JsonPendingDocumentPlacement>,
+    pub(super) placements: Vec<JsonPendingPlacement>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -105,17 +105,17 @@ pub(super) enum DecodedField {
     #[serde(rename = "craqle_term_id")]
     CraqleTermId { value: String },
     #[serde(rename = "craqle_quad_key")]
-    CraqleQuadKey { value: JsonCraqleQuadKey },
+    CraqleQuadKey { value: JsonQuadKey },
     #[serde(rename = "craqle_graph_key")]
-    CraqleGraphKey { value: JsonCraqleGraphKey },
+    CraqleGraphKey { value: JsonGraphKey },
     #[serde(rename = "craqle_log_key")]
-    CraqleLogKey { value: JsonCraqleLogKey },
+    CraqleLogKey { value: JsonLogKey },
     #[serde(rename = "utf8")]
     Utf8 { value: String },
     #[serde(rename = "blob_head_key")]
     BlobHeadKey { value: BlobHeadKey },
     #[serde(rename = "hash_path_index_key")]
-    HashPathIndexKey { value: HashPathIndexKey },
+    HashIndex { value: HashIndex },
     #[serde(rename = "blob_location_key")]
     BlobLocationKey { blake3: String, backend: String },
     #[serde(rename = "version_key")]
@@ -123,20 +123,20 @@ pub(super) enum DecodedField {
     #[serde(rename = "managed_copy_key")]
     ManagedCopyKey { value: ManagedCopyKey },
     #[serde(rename = "multipart_upload_part_key")]
-    MultipartUploadPartKey { value: MultipartUploadPartKey },
+    MultipartPartKey { value: MultipartPartKey },
     #[serde(rename = "multipart_object_metadata_key")]
-    MultipartObjectMetadataKey { value: MultipartObjectMetadataKey },
+    MultipartObjectKey { value: MultipartObjectKey },
     #[serde(rename = "attempt_key")]
     AttemptKey { job_id: String, attempt_epoch: u64 },
     #[serde(rename = "policy_cache_key")]
     PolicyCacheKey { policy_id: String, digest: String },
     #[serde(rename = "policy_bulk_intent_key")]
-    PolicyBulkIntentKey { operation_id: String, key: String },
+    PolicyIntentKey { operation_id: String, key: String },
     #[serde(rename = "job_record_key")]
-    JobRecordKey { value: JsonJobRecordKey },
+    JobRecordKey { value: JsonRecordKey },
     #[serde(rename = "job_conflict_key")]
     JobConflictKey {
-        record: JsonJobRecordKey,
+        record: JsonRecordKey,
         digest: String,
     },
     #[serde(rename = "job_alias_key")]
@@ -160,10 +160,10 @@ pub(super) enum DecodedValue {
         data: GroupAuthorizationDocument,
     },
     RealmAuthorizationDocument {
-        data: JsonRealmAuthorizationDocument,
+        data: JsonAuthorizationDocument,
     },
     RealmConfigDocument {
-        data: JsonRealmConfigDocument,
+        data: JsonConfigDocument,
     },
     UserAccess {
         data: JsonUserAccess,
@@ -187,25 +187,25 @@ pub(super) enum DecodedValue {
         data: NodeSubjectRecord,
     },
     JobOutputRecord {
-        data: JsonJobRecordEnvelope,
+        data: JsonRecordEnvelope,
     },
     JobFamilyRecord {
-        data: JsonJobRecordEnvelope,
+        data: JsonRecordEnvelope,
     },
     JobPendingRecord {
-        envelope: JsonJobRecordEnvelope,
+        envelope: JsonRecordEnvelope,
         need: String,
         first_seen_ms: u64,
         attempts: u32,
     },
     JobConflictRecord {
-        envelope: JsonJobRecordEnvelope,
+        envelope: JsonRecordEnvelope,
         retained: String,
         observed_at_ms: u64,
         relayed_by: Option<String>,
     },
     JobAliasTarget {
-        data: JsonJobRecordKey,
+        data: JsonRecordKey,
     },
     JobProjectionCache {
         revision: u64,
@@ -233,10 +233,10 @@ pub(super) enum DecodedValue {
         data: ComputeDepartureReport,
     },
     PlacementPolicyDocument {
-        data: JsonPlacementPolicyDocument,
+        data: JsonPlacementDocument,
     },
     PolicyCacheEntry {
-        data: JsonPolicyCacheEntry,
+        data: JsonCacheEntry,
     },
     PolicyMutationRecord {
         data: PolicyMutationRecord,
@@ -244,14 +244,16 @@ pub(super) enum DecodedValue {
     PolicyBulkRun {
         data: PolicyBulkRun,
     },
-    PolicyBulkIntent {
-        data: PolicyBulkIntent,
+    #[serde(rename = "PolicyBulkIntent")]
+    PolicyIntent {
+        data: PolicyIntent,
     },
     MultipartUpload {
         data: MultipartUpload,
     },
-    MultipartUploadPart {
-        data: MultipartUploadPart,
+    #[serde(rename = "MultipartUploadPart")]
+    MultipartPart {
+        data: MultipartPart,
     },
     MultipartObjectSummary {
         data: MultipartObjectSummary,
@@ -266,10 +268,10 @@ pub(super) enum DecodedValue {
         data: bool,
     },
     NodeState {
-        data: JsonPersistedNodeState,
+        data: JsonPersistedState,
     },
     PendingDocumentPlacement {
-        data: JsonPendingDocumentPlacement,
+        data: JsonPendingPlacement,
     },
     OnboardingSecretRecord {
         data: OnboardingSecretRecord,
@@ -284,7 +286,7 @@ pub(super) enum DecodedValue {
         data: Vec<JsonCraqleDot>,
     },
     CraqleGraphMeta {
-        data: JsonCraqleGraphMeta,
+        data: JsonGraphMeta,
     },
     CraqleGraphDirtyToken {
         data: u64,
@@ -296,7 +298,7 @@ pub(super) enum DecodedValue {
         data: u64,
     },
     CraqleLogBatch {
-        data: JsonCraqleStoredBatch,
+        data: JsonStored,
     },
     Raw {
         hex: String,
@@ -305,7 +307,7 @@ pub(super) enum DecodedValue {
     },
 }
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(super) struct JsonCraqleQuadKey {
+pub(super) struct JsonQuadKey {
     pub(super) graph: String,
     pub(super) subject: String,
     pub(super) predicate: String,
@@ -314,7 +316,7 @@ pub(super) struct JsonCraqleQuadKey {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind")]
-pub(super) enum JsonCraqleGraphKey {
+pub(super) enum JsonGraphKey {
     Meta { graph: String },
     Dirty { graph: String, subject: String },
     Reindex { graph: String },
@@ -322,7 +324,7 @@ pub(super) enum JsonCraqleGraphKey {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind")]
-pub(super) enum JsonCraqleLogKey {
+pub(super) enum JsonLogKey {
     Head {
         graph: String,
         actor: String,
@@ -335,14 +337,14 @@ pub(super) enum JsonCraqleLogKey {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(super) struct JsonCraqleClockEntry {
+pub(super) struct JsonClockEntry {
     pub(super) actor: String,
     pub(super) counter: u64,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(super) struct JsonCraqleVectorClock {
-    pub(super) entries: Vec<JsonCraqleClockEntry>,
+pub(super) struct JsonVectorClock {
+    pub(super) entries: Vec<JsonClockEntry>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -352,21 +354,21 @@ pub(super) struct JsonCraqleDot {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(super) struct JsonCraqleGraphPolicy {
+pub(super) struct JsonGraphPolicy {
     pub(super) public: bool,
     pub(super) permission_paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(super) struct JsonCraqleGraphMeta {
+pub(super) struct JsonGraphMeta {
     pub(super) graph: String,
-    pub(super) policy: JsonCraqleGraphPolicy,
-    pub(super) clock: JsonCraqleVectorClock,
+    pub(super) policy: JsonGraphPolicy,
+    pub(super) clock: JsonVectorClock,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind")]
-pub(super) enum JsonCraqleStoredBatchOp {
+pub(super) enum JsonStoredOp {
     Add {
         subject: String,
         predicate: String,
@@ -377,17 +379,17 @@ pub(super) enum JsonCraqleStoredBatchOp {
         subject: String,
         predicate: String,
         object: String,
-        witnessed: JsonCraqleVectorClock,
+        witnessed: JsonVectorClock,
     },
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(super) struct JsonCraqleStoredBatch {
+pub(super) struct JsonStored {
     pub(super) graph: String,
     pub(super) actor: String,
     pub(super) counter: u64,
-    pub(super) base_clock: JsonCraqleVectorClock,
-    pub(super) ops: Vec<JsonCraqleStoredBatchOp>,
+    pub(super) base_clock: JsonVectorClock,
+    pub(super) ops: Vec<JsonStoredOp>,
     pub(super) timestamp: DateTime<Utc>,
 }
 
@@ -409,9 +411,9 @@ impl Serialize for JsonGroup {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct JsonRealmAuthorizationDocument(pub(super) RealmAuthorizationDocument);
+pub(super) struct JsonAuthorizationDocument(pub(super) RealmAuthorizationDocument);
 
-impl Serialize for JsonRealmAuthorizationDocument {
+impl Serialize for JsonAuthorizationDocument {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -425,9 +427,9 @@ impl Serialize for JsonRealmAuthorizationDocument {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct JsonRealmConfigDocument(pub(super) RealmConfigDocument);
+pub(super) struct JsonConfigDocument(pub(super) RealmConfigDocument);
 
-impl Serialize for JsonRealmConfigDocument {
+impl Serialize for JsonConfigDocument {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -464,9 +466,9 @@ impl Serialize for JsonUserAccess {
 /// Signed output record projection: identity, authorship and integrity only.
 /// The record body stays out of the CLI so job payloads never reach a console.
 #[derive(Debug, PartialEq)]
-pub(super) struct JsonJobRecordEnvelope(pub(super) JobRecordEnvelope);
+pub(super) struct JsonRecordEnvelope(pub(super) JobRecordEnvelope);
 
-impl Serialize for JsonJobRecordEnvelope {
+impl Serialize for JsonRecordEnvelope {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -484,9 +486,9 @@ impl Serialize for JsonJobRecordEnvelope {
 /// The signed identity a job record is stored under, rendered as hex so one
 /// key line stays readable next to its family.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct JsonJobRecordKey(pub(super) JobRecordKey);
+pub(super) struct JsonRecordKey(pub(super) JobRecordKey);
 
-impl Serialize for JsonJobRecordKey {
+impl Serialize for JsonRecordKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -532,9 +534,9 @@ pub(super) fn family_id_string(family: &JobFamilyId) -> String {
 }
 
 #[derive(Debug, PartialEq)]
-pub(super) struct JsonPlacementPolicyDocument(pub(super) PlacementPolicyDocument);
+pub(super) struct JsonPlacementDocument(pub(super) PlacementPolicyDocument);
 
-impl Serialize for JsonPlacementPolicyDocument {
+impl Serialize for JsonPlacementDocument {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -551,9 +553,9 @@ impl Serialize for JsonPlacementPolicyDocument {
 }
 
 #[derive(Debug, PartialEq)]
-pub(super) struct JsonPolicyCacheEntry(pub(super) PolicyCacheEntry);
+pub(super) struct JsonCacheEntry(pub(super) PolicyCacheEntry);
 
-impl Serialize for JsonPolicyCacheEntry {
+impl Serialize for JsonCacheEntry {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -567,8 +569,7 @@ impl Serialize for JsonPolicyCacheEntry {
                 state.serialize_field("kind", "verified")?;
                 state.serialize_field("stored_at_ms", stored_at_ms)?;
                 state.serialize_field("expires_at_ms", &None::<u64>)?;
-                state
-                    .serialize_field("document", &JsonPlacementPolicyDocument(document.clone()))?;
+                state.serialize_field("document", &JsonPlacementDocument(document.clone()))?;
             }
             PolicyCacheEntry::Unavailable {
                 stored_at_ms,
@@ -577,7 +578,7 @@ impl Serialize for JsonPolicyCacheEntry {
                 state.serialize_field("kind", "unavailable")?;
                 state.serialize_field("stored_at_ms", stored_at_ms)?;
                 state.serialize_field("expires_at_ms", &Some(*expires_at_ms))?;
-                state.serialize_field("document", &None::<JsonPlacementPolicyDocument>)?;
+                state.serialize_field("document", &None::<JsonPlacementDocument>)?;
             }
         }
         state.end()
@@ -585,9 +586,9 @@ impl Serialize for JsonPolicyCacheEntry {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct JsonPersistedNodeState(pub(super) PersistedNodeState);
+pub(super) struct JsonPersistedState(pub(super) PersistedNodeState);
 
-impl Serialize for JsonPersistedNodeState {
+impl Serialize for JsonPersistedState {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -605,9 +606,9 @@ impl Serialize for JsonPersistedNodeState {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct JsonPendingDocumentPlacement(pub(super) PendingShardPlacement);
+pub(super) struct JsonPendingPlacement(pub(super) PendingShardPlacement);
 
-impl Serialize for JsonPendingDocumentPlacement {
+impl Serialize for JsonPendingPlacement {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -674,13 +675,13 @@ impl Serialize for JsonStoredEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodedField, DecodedValue, EntryOutput, JsonPersistedNodeState};
+    use super::{DecodedField, DecodedValue, EntryOutput, JsonPersistedState};
     use aruna::identity::PersistedNodeState;
 
     // The JSON record shape is a CLI contract: the tagged key field and the
     // tagged value field with their fixed fixture values.
     #[test]
-    fn entry_output_json_pins_the_wire_shape() {
+    fn entry_output_shape() {
         let entry = EntryOutput {
             key: DecodedField::Ulid {
                 value: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
@@ -702,7 +703,7 @@ mod tests {
     // The local operator output intentionally includes the persisted network
     // secret; a redaction change would be a CLI contract decision.
     #[test]
-    fn node_state_output_keeps_the_network_secret() {
+    fn network_secret_persisted() {
         let state = PersistedNodeState {
             boot_origin: aruna::identity::BootOrigin::InitializedRealm,
             status: aruna::identity::PersistedNodeStatus::Complete,
@@ -714,7 +715,7 @@ mod tests {
                 realm_private_key_pem: "synthetic-pem".to_string(),
             },
         };
-        let json = serde_json::to_value(JsonPersistedNodeState(state)).unwrap();
+        let json = serde_json::to_value(JsonPersistedState(state)).unwrap();
         assert_eq!(
             json["net_secret_key"].as_str(),
             Some("0707070707070707070707070707070707070707070707070707070707070707")

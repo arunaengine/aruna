@@ -19,9 +19,9 @@ use ulid::Ulid;
 use super::ExplorerError;
 use super::decode::decode_entry;
 use super::present::{
-    EntriesOutput, JsonPendingDocumentPlacement, KeyspaceEntry, KeyspacesOutput,
-    LocationScanOutput, TopicListEntry, TopicPlacementsOutput, TopicStatusOutput, TopicsListOutput,
-    UnresolvedLocation, placement_topic_id,
+    EntriesOutput, JsonPendingPlacement, KeyspaceEntry, KeyspacesOutput, LocationScanOutput,
+    TopicListEntry, TopicPlacementsOutput, TopicStatusOutput, TopicsListOutput, UnresolvedLocation,
+    placement_topic_id,
 };
 use crate::error::CliError;
 
@@ -283,7 +283,7 @@ fn topic_status_output(
     let pending_placement = load_pending_placements(database_path)?
         .into_iter()
         .find(|placement| placement_topic_id(placement) == topic_id)
-        .map(JsonPendingDocumentPlacement);
+        .map(JsonPendingPlacement);
     let status = if pending_placement.is_some() {
         "under_replicated"
     } else {
@@ -311,10 +311,7 @@ fn topic_placements_output(
     Ok(TopicPlacementsOutput {
         database_path: database_path.to_string(),
         topic_id: topic_id.map(str::to_string),
-        placements: placements
-            .into_iter()
-            .map(JsonPendingDocumentPlacement)
-            .collect(),
+        placements: placements.into_iter().map(JsonPendingPlacement).collect(),
     })
 }
 

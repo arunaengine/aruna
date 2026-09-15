@@ -513,12 +513,10 @@ mod tests {
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
     use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use aruna_operations::realm::claim_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
+    use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::s3::create_access::{
-        CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
+        CreateUserConfig, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
     };
     use aruna_operations::s3::create_bucket::CreateBucketOperation;
     use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
@@ -635,7 +633,7 @@ mod tests {
             .unwrap();
 
             drive(
-                ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                ClaimInitialOperation::new(ClaimInitialInput {
                     actor: Actor {
                         node_id: config.node_id,
                         user_id: realm_admin,
@@ -663,8 +661,8 @@ mod tests {
             .unwrap();
 
             let credentials = drive(
-                CreateUserAccessOperation::new(
-                    CreateUserAccessConfig {
+                CreateUserOperation::new(
+                    CreateUserConfig {
                         user_identity: realm_admin,
                         group_id: group.0.group_id,
                         expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
