@@ -5,36 +5,34 @@ use std::sync::Arc;
 use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::errors::SourceConnectorResolutionError;
+use aruna_core::errors::SourceResolutionError;
 use aruna_core::structs::{
     AuthContext, Permission, ResolvedSourceAccess, SourceConnector, SourceConnectorKind,
     SourceEntryKind,
 };
 use aruna_operations::connectors::create_connector::{
-    CreateSourceConnectorError, CreateSourceConnectorInput, CreateSourceConnectorOperation,
+    SourceConnectorError, SourceConnectorInput, SourceConnectorOperation,
 };
 use aruna_operations::connectors::delete_connector::{
-    DeleteSourceConnectorError, DeleteSourceConnectorInput, DeleteSourceConnectorOperation,
+    DeleteSourceError, DeleteSourceInput, DeleteSourceOperation,
 };
 use aruna_operations::connectors::get_connector::{
-    GetSourceConnectorError, GetSourceConnectorInput, GetSourceConnectorOperation,
+    GetSourceError, GetSourceInput, GetSourceOperation,
 };
 use aruna_operations::connectors::list_connectors::{
-    ListSourceConnectorsError, ListSourceConnectorsInput, ListSourceConnectorsOperation,
+    ListSourceError, ListSourceInput, ListSourceOperation,
 };
 use aruna_operations::connectors::replace_connector::{
-    ReplaceSourceConnectorError, ReplaceSourceConnectorInput, ReplaceSourceConnectorOperation,
+    ReplaceSourceError, ReplaceSourceInput, ReplaceSourceOperation,
 };
 use aruna_operations::connectors::resolver::{resolve_inline_access, validate_source_path};
-use aruna_operations::connectors::secret_config::{
-    ConnectorHasSecretConfigError, ConnectorHasSecretConfigOperation,
-};
+use aruna_operations::connectors::secret_config::{HasConfigError, HasConfigOperation};
 use aruna_operations::connectors::validation::validate_connector_input;
-use aruna_operations::connectors::{ResolveSourceConnectorInput, ResolveSourceConnectorOperation};
+use aruna_operations::connectors::{ResolveConnectorInput, ResolveConnectorOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::staging::check_source::CheckStagingSourceOperation;
+use aruna_operations::staging::check_source::CheckSourceOperation;
 use aruna_operations::staging::list_source::{
-    ListStagingSourceError, ListStagingSourceInput, ListStagingSourceOperation,
+    ListStagingError, ListStagingInput, ListStagingOperation,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -72,7 +70,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ApiSourceConnectorKind {
+#[schema(as = ApiSourceConnectorKind)]
+pub enum ApiConnectorKind {
     Http,
     S3,
     Webdav,
@@ -85,45 +84,47 @@ pub enum ApiSourceConnectorKind {
     LocalDirectory,
 }
 
-impl From<ApiSourceConnectorKind> for SourceConnectorKind {
-    fn from(value: ApiSourceConnectorKind) -> Self {
+impl From<ApiConnectorKind> for SourceConnectorKind {
+    fn from(value: ApiConnectorKind) -> Self {
         match value {
-            ApiSourceConnectorKind::Http => SourceConnectorKind::Http,
-            ApiSourceConnectorKind::S3 => SourceConnectorKind::S3,
-            ApiSourceConnectorKind::Webdav => SourceConnectorKind::Webdav,
-            ApiSourceConnectorKind::Ftp => SourceConnectorKind::Ftp,
-            ApiSourceConnectorKind::ArunaNative => SourceConnectorKind::ArunaNative,
-            ApiSourceConnectorKind::LocalDirectory => SourceConnectorKind::LocalDirectory,
+            ApiConnectorKind::Http => SourceConnectorKind::Http,
+            ApiConnectorKind::S3 => SourceConnectorKind::S3,
+            ApiConnectorKind::Webdav => SourceConnectorKind::Webdav,
+            ApiConnectorKind::Ftp => SourceConnectorKind::Ftp,
+            ApiConnectorKind::ArunaNative => SourceConnectorKind::ArunaNative,
+            ApiConnectorKind::LocalDirectory => SourceConnectorKind::LocalDirectory,
         }
     }
 }
 
-impl From<SourceConnectorKind> for ApiSourceConnectorKind {
+impl From<SourceConnectorKind> for ApiConnectorKind {
     fn from(value: SourceConnectorKind) -> Self {
         match value {
-            SourceConnectorKind::Http => ApiSourceConnectorKind::Http,
-            SourceConnectorKind::S3 => ApiSourceConnectorKind::S3,
-            SourceConnectorKind::Webdav => ApiSourceConnectorKind::Webdav,
-            SourceConnectorKind::Ftp => ApiSourceConnectorKind::Ftp,
-            SourceConnectorKind::ArunaNative => ApiSourceConnectorKind::ArunaNative,
-            SourceConnectorKind::LocalDirectory => ApiSourceConnectorKind::LocalDirectory,
+            SourceConnectorKind::Http => ApiConnectorKind::Http,
+            SourceConnectorKind::S3 => ApiConnectorKind::S3,
+            SourceConnectorKind::Webdav => ApiConnectorKind::Webdav,
+            SourceConnectorKind::Ftp => ApiConnectorKind::Ftp,
+            SourceConnectorKind::ArunaNative => ApiConnectorKind::ArunaNative,
+            SourceConnectorKind::LocalDirectory => ApiConnectorKind::LocalDirectory,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateSourceConnectorRequest {
+#[schema(as = CreateSourceConnectorRequest)]
+pub struct CreateConnectorRequest {
     pub name: String,
-    pub kind: ApiSourceConnectorKind,
+    pub kind: ApiConnectorKind,
     pub public_config: HashMap<String, String>,
     #[serde(default)]
     pub secret_config: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReplaceSourceConnectorRequest {
+#[schema(as = ReplaceSourceConnectorRequest)]
+pub struct ReplaceConnectorRequest {
     pub name: String,
-    pub kind: ApiSourceConnectorKind,
+    pub kind: ApiConnectorKind,
     pub public_config: HashMap<String, String>,
     #[serde(default)]
     pub secret_config: HashMap<String, String>,
@@ -132,7 +133,7 @@ pub struct ReplaceSourceConnectorRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SourceConnectorRequest {
     pub name: String,
-    pub kind: ApiSourceConnectorKind,
+    pub kind: ApiConnectorKind,
     pub public_config: HashMap<String, String>,
     #[serde(default)]
     pub secret_config: HashMap<String, String>,
@@ -193,7 +194,7 @@ pub struct SourceConnectorResponse {
     pub connector_id: String,
     pub group_id: String,
     pub name: String,
-    pub kind: ApiSourceConnectorKind,
+    pub kind: ApiConnectorKind,
     pub public_config: HashMap<String, String>,
     pub created_at: String,
     pub updated_at: String,
@@ -202,7 +203,8 @@ pub struct SourceConnectorResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct ListSourceConnectorsResponse {
+#[schema(as = ListSourceConnectorsResponse)]
+pub struct ListSourceResponse {
     pub connectors: Vec<SourceConnectorResponse>,
 }
 
@@ -234,7 +236,7 @@ pub struct ListSourceConnectorsResponse {
   written, and a bucket containing a path or authority separator are refused as well."#,
     params(("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID")),
     request_body(
-        content = CreateSourceConnectorRequest,
+        content = CreateConnectorRequest,
         description = "Connector definition; `secret_config` may be omitted for a source that needs no credentials",
         example = json!({
             "name": "reference-data",
@@ -289,14 +291,14 @@ pub async fn create_source_connector(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
-    Json(request): Json<CreateSourceConnectorRequest>,
+    Json(request): Json<CreateConnectorRequest>,
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     let result = drive(
-        CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+        SourceConnectorOperation::new(SourceConnectorInput {
             group_id,
             created_by: auth.user_id,
             name: request.name,
@@ -338,7 +340,7 @@ pub async fn create_source_connector(
         (
             status = 200,
             description = "Every connector the group has registered on this node, credentials excluded",
-            body = ListSourceConnectorsResponse,
+            body = ListSourceResponse,
             example = json!({
                 "connectors": [
                     {
@@ -372,13 +374,13 @@ pub async fn list_source_connectors(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
-) -> ServerResult<(StatusCode, Json<ListSourceConnectorsResponse>)> {
+) -> ServerResult<(StatusCode, Json<ListSourceResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
     let result = drive(
-        ListSourceConnectorsOperation::new(ListSourceConnectorsInput { group_id }),
+        ListSourceOperation::new(ListSourceInput { group_id }),
         &state.get_ctx(),
     )
     .await
@@ -391,10 +393,7 @@ pub async fn list_source_connectors(
         connectors.push(map_connector_response(connector, has_secret_config));
     }
 
-    Ok((
-        StatusCode::OK,
-        Json(ListSourceConnectorsResponse { connectors }),
-    ))
+    Ok((StatusCode::OK, Json(ListSourceResponse { connectors })))
 }
 
 #[utoipa::path(
@@ -467,7 +466,7 @@ pub async fn get_source_connector(
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
     let result = drive(
-        GetSourceConnectorOperation::new(GetSourceConnectorInput {
+        GetSourceOperation::new(GetSourceInput {
             group_id,
             connector_id,
         }),
@@ -511,7 +510,7 @@ pub async fn get_source_connector(
         ("connector_id" = String, Path, description = "Connector to replace, as a 26-character ULID")
     ),
     request_body(
-        content = ReplaceSourceConnectorRequest,
+        content = ReplaceConnectorRequest,
         description = "The complete new connector definition; an omitted or empty `secret_config` clears the stored credentials",
         example = json!({
             "name": "reference-data",
@@ -576,7 +575,7 @@ pub async fn replace_source_connector(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((group_id, connector_id)): Path<(String, String)>,
-    Json(request): Json<ReplaceSourceConnectorRequest>,
+    Json(request): Json<ReplaceConnectorRequest>,
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
@@ -584,7 +583,7 @@ pub async fn replace_source_connector(
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     let result = drive(
-        ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+        ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id,
             connector_id,
             name: request.name,
@@ -665,7 +664,7 @@ pub async fn delete_source_connector(
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
     drive(
-        DeleteSourceConnectorOperation::new(DeleteSourceConnectorInput {
+        DeleteSourceOperation::new(DeleteSourceInput {
             group_id,
             connector_id,
         }),
@@ -857,7 +856,7 @@ pub async fn check_stored_connector(
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
     let resolved = drive(
-        ResolveSourceConnectorOperation::new(ResolveSourceConnectorInput {
+        ResolveConnectorOperation::new(ResolveConnectorInput {
             group_id,
             connector_id,
             source_path: String::new(),
@@ -973,7 +972,7 @@ pub async fn list_connector_entries(
     }
 
     let result = drive(
-        ListStagingSourceOperation::new(ListStagingSourceInput {
+        ListStagingOperation::new(ListStagingInput {
             group_id,
             connector_id,
             source_path,
@@ -1018,7 +1017,7 @@ async fn run_connector_check(
     let started = Instant::now();
     match timeout(
         CONNECTOR_CHECK_TIMEOUT,
-        drive(CheckStagingSourceOperation::new(access), &state.get_ctx()),
+        drive(CheckSourceOperation::new(access), &state.get_ctx()),
     )
     .await
     {
@@ -1038,20 +1037,20 @@ async fn run_connector_check(
 }
 
 fn check_error_message(
-    error: &aruna_operations::staging::check_source::CheckStagingSourceError,
+    error: &aruna_operations::staging::check_source::CheckSourceError,
 ) -> String {
     use aruna_core::errors::StagingSourceError;
-    use aruna_operations::staging::check_source::CheckStagingSourceError;
+    use aruna_operations::staging::check_source::CheckSourceError;
 
     match error {
-        CheckStagingSourceError::Staging(StagingSourceError::OperatorCreationFailed(_)) => {
+        CheckSourceError::Staging(StagingSourceError::OperatorCreationFailed(_)) => {
             "connector configuration is invalid".to_string()
         }
-        CheckStagingSourceError::Staging(StagingSourceError::UnsupportedKind(_)) => {
+        CheckSourceError::Staging(StagingSourceError::UnsupportedKind(_)) => {
             "connector kind is not supported".to_string()
         }
-        CheckStagingSourceError::Staging(StagingSourceError::HandleMissing)
-        | CheckStagingSourceError::Staging(StagingSourceError::ChannelClosed) => {
+        CheckSourceError::Staging(StagingSourceError::HandleMissing)
+        | CheckSourceError::Staging(StagingSourceError::ChannelClosed) => {
             "connector check is unavailable".to_string()
         }
         _ => "connector is unreachable".to_string(),
@@ -1086,15 +1085,12 @@ pub(crate) async fn ensure_data_permission(
 }
 
 async fn connector_has_secret(state: &ServerState, connector_id: Ulid) -> ServerResult<bool> {
-    drive(
-        ConnectorHasSecretConfigOperation::new(connector_id),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_secret_error)
+    drive(HasConfigOperation::new(connector_id), &state.get_ctx())
+        .await
+        .map_err(map_secret_error)
 }
 
-fn map_secret_error(error: ConnectorHasSecretConfigError) -> ServerError {
+fn map_secret_error(error: HasConfigError) -> ServerError {
     ServerError::InternalError(error.to_string())
 }
 
@@ -1119,70 +1115,65 @@ fn format_system_time(value: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()
 }
 
-fn map_create_error(error: CreateSourceConnectorError) -> ServerError {
+fn map_create_error(error: SourceConnectorError) -> ServerError {
     match error {
-        CreateSourceConnectorError::ValidationError(_) => ServerError::BadRequest,
+        SourceConnectorError::ValidationError(_) => ServerError::BadRequest,
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_connector_list(error: ListSourceConnectorsError) -> ServerError {
+fn map_connector_list(error: ListSourceError) -> ServerError {
     ServerError::InternalError(error.to_string())
 }
 
 fn map_get_error(
-    error: aruna_operations::connectors::get_connector::GetSourceConnectorError,
+    error: aruna_operations::connectors::get_connector::GetSourceError,
 ) -> ServerError {
     match error {
-        GetSourceConnectorError::NotFound => ServerError::NotFound,
-        GetSourceConnectorError::StorageError(_)
-        | GetSourceConnectorError::ConversionError(_)
-        | GetSourceConnectorError::GetSourceConnectorFailed => {
-            ServerError::InternalError(error.to_string())
-        }
+        GetSourceError::NotFound => ServerError::NotFound,
+        GetSourceError::StorageError(_)
+        | GetSourceError::ConversionError(_)
+        | GetSourceError::GetSourceConnectorFailed => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_replace_error(error: ReplaceSourceConnectorError) -> ServerError {
+fn map_replace_error(error: ReplaceSourceError) -> ServerError {
     match error {
-        ReplaceSourceConnectorError::ValidationError(_) => ServerError::BadRequest,
-        ReplaceSourceConnectorError::NotFound => ServerError::NotFound,
-        ReplaceSourceConnectorError::ReferencedByObjectVersion => {
-            ServerError::Conflict(error.to_string())
-        }
+        ReplaceSourceError::ValidationError(_) => ServerError::BadRequest,
+        ReplaceSourceError::NotFound => ServerError::NotFound,
+        ReplaceSourceError::ReferencedByObjectVersion => ServerError::Conflict(error.to_string()),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_delete_error(error: DeleteSourceConnectorError) -> ServerError {
+fn map_delete_error(error: DeleteSourceError) -> ServerError {
     match error {
-        DeleteSourceConnectorError::NotFound => ServerError::NotFound,
-        DeleteSourceConnectorError::ReferencedByObjectVersion => {
-            ServerError::Conflict(error.to_string())
-        }
+        DeleteSourceError::NotFound => ServerError::NotFound,
+        DeleteSourceError::ReferencedByObjectVersion => ServerError::Conflict(error.to_string()),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_resolution_error(error: SourceConnectorResolutionError) -> ServerError {
+fn map_resolution_error(error: SourceResolutionError) -> ServerError {
     match error {
-        SourceConnectorResolutionError::NotFound => ServerError::NotFound,
-        SourceConnectorResolutionError::InvalidSourcePath
-        | SourceConnectorResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
+        SourceResolutionError::NotFound => ServerError::NotFound,
+        SourceResolutionError::InvalidSourcePath
+        | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
-fn map_list_error(error: ListStagingSourceError) -> ServerError {
+fn map_list_error(error: ListStagingError) -> ServerError {
     match error {
-        ListStagingSourceError::Resolve(error) => map_resolution_error(error),
-        ListStagingSourceError::Staging(aruna_core::errors::StagingSourceError::NotFound) => {
+        ListStagingError::Resolve(error) => map_resolution_error(error),
+        ListStagingError::Staging(aruna_core::errors::StagingSourceError::NotFound) => {
             ServerError::NotFound
         }
-        ListStagingSourceError::Staging(error) => ServerError::BadGatewayReason(error.to_string()),
+        ListStagingError::Staging(error) => ServerError::BadGatewayReason(error.to_string()),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
 
 #[cfg(test)]
+#[path = "connectors_tests.rs"]
 mod tests;
