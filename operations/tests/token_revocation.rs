@@ -311,7 +311,7 @@ async fn seed_sync_topic(
     let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
     let event = reducer_state.apply_operation(
         &actor,
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: config
                 .placement_map
                 .first()

@@ -26,12 +26,12 @@ pub use persistence::FjallPersistPolicy;
 pub use worker::FjallStorage;
 
 pub(in crate::storage) use handle::{
-    BULK_EFFECT_QUEUE_CAPACITY, CleanupEntry, CleanupKind, MAX_TRANSACTION_CLEANUP,
-    STORAGE_EFFECT_QUEUE_CAPACITY,
+    EFFECT_QUEUE_CAPACITY, CleanupEntry, CleanupKind, MAX_TRANSACTION_CLEANUP,
+    QUEUE_CAPACITY,
 };
 pub(in crate::storage) use metrics::WorkerLifecycleGuard;
 pub(in crate::storage) use worker::{
-    BULK_READ_POOL_THREADS, READ_POOL_THREADS, Store, Txn, batch_read_with, iterate_page,
+    BULK_POOL_THREADS, READ_POOL_THREADS, Store, Txn, batch_read_with, iterate_page,
     read_last_with, spawn_read_pool, store_batch_read, store_iterate, store_last, store_read,
 };
 

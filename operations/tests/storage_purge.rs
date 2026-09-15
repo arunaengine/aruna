@@ -10,8 +10,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_PURGE_CHECKPOINT_KEYSPACE, S3_PURGE_FENCE_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    PURGE_CHECKPOINT_KEYSPACE, PURGE_FENCE_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
@@ -400,7 +400,7 @@ async fn scoped_fence_isolates() {
     assert_eq!(outside_upload.key, "allowed/outside.bin");
     let stored_upload = read_value(
         &context.driver.storage_handle,
-        S3_MULTIPART_UPLOAD_KEYSPACE,
+        UPLOAD_KEYSPACE,
         upload.upload_id.to_bytes().to_vec(),
     )
     .await
@@ -575,7 +575,7 @@ async fn purge_resumes_cleanly() {
     assert!(
         read_value(
             &context.driver.storage_handle,
-            S3_MULTIPART_UPLOAD_KEYSPACE,
+            UPLOAD_KEYSPACE,
             upload.upload_id.to_bytes().to_vec(),
         )
         .await
@@ -612,7 +612,7 @@ async fn purge_resumes_cleanly() {
     assert!(
         read_value(
             &context.driver.storage_handle,
-            S3_PURGE_FENCE_KEYSPACE,
+            PURGE_FENCE_KEYSPACE,
             fence_key("bucket").as_ref().to_vec(),
         )
         .await
@@ -621,7 +621,7 @@ async fn purge_resumes_cleanly() {
     assert!(
         read_value(
             &context.driver.storage_handle,
-            S3_PURGE_CHECKPOINT_KEYSPACE,
+            PURGE_CHECKPOINT_KEYSPACE,
             prefix_job_id.to_bytes().to_vec(),
         )
         .await
@@ -780,7 +780,7 @@ async fn seed_upload(
     };
     write_value(
         storage,
-        S3_MULTIPART_UPLOAD_KEYSPACE,
+        UPLOAD_KEYSPACE,
         upload.upload_id.to_bytes().to_vec(),
         upload.to_bytes().unwrap(),
     )

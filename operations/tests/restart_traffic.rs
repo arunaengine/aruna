@@ -21,7 +21,7 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::projector::project_logged_events;
-use aruna_operations::node::startup::{SHARED_RESTORE_TOPIC_COUNT, restore_shard_subscriptions};
+use aruna_operations::node::startup::{RESTORE_TOPIC_COUNT, restore_shard_subscriptions};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -121,13 +121,13 @@ async fn assert_restore_bound(node: &TestNode, realm_id: RealmId, created: &[(Gr
         summary.total_topics()
     );
     assert!(summary.held_shards > 0, "node 2 must hold shards");
-    assert_eq!(summary.shared_topics, SHARED_RESTORE_TOPIC_COUNT);
+    assert_eq!(summary.shared_topics, RESTORE_TOPIC_COUNT);
     assert!(
-        summary.total_topics() <= summary.held_shards + SHARED_RESTORE_TOPIC_COUNT,
+        summary.total_topics() <= summary.held_shards + RESTORE_TOPIC_COUNT,
         "restore announced {} topics, more than held_shards {} + shared {}",
         summary.total_topics(),
         summary.held_shards,
-        SHARED_RESTORE_TOPIC_COUNT
+        RESTORE_TOPIC_COUNT
     );
     assert!(
         summary.total_topics() < created.len(),
@@ -477,7 +477,7 @@ async fn spawn_node_with(
             realm_id,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
-            document_sync_storage_path: Some(dir.join("document-sync")),
+            sync_storage_path: Some(dir.join("document-sync")),
             ..NetConfig::default()
         },
         storage.clone(),
@@ -640,7 +640,7 @@ const INCIDENT_SHARDS: u32 = 128;
 /// Only this short prefix needs revision-chain ordering during peer recovery.
 const INCIDENT_METADATA_RECORDS: usize = 32;
 /// The production drain examines two full topic pages per invocation.
-const INCIDENT_LIMIT: usize = 2 * aruna_operations::sync::document_outbox::OUTBOX_DRAIN_BATCH_SIZE;
+const INCIDENT_LIMIT: usize = 2 * aruna_operations::sync::document_outbox::OUTBOX_DRAIN_SIZE;
 /// Two full invocation windows keep the scale assertion away from the boundary.
 const INCIDENT_SCALE_RECORDS: usize = 2 * INCIDENT_LIMIT;
 /// One bounded pass plus a short chain keeps peer-return coverage controllable.
@@ -1355,7 +1355,7 @@ async fn wait_auto_outbox(node: &TestNode) -> Result<(), BoxError> {
 
 /// Reads only raw queue endpoints so the watchdog does not decode the full outbox.
 async fn outbox_snapshot(node: &TestNode) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), BoxError> {
-    let key_space = aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string();
+    let key_space = aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string();
     let first = match node
         .context
         .storage_handle

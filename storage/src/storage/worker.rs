@@ -58,11 +58,11 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         | StorageEffect::SyncAll => None,
     }
 }
-const SLOW_STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
-const SLOW_QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
+const QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const MAX_GROUP_COMMIT: usize = 256;
 pub(super) const READ_POOL_THREADS: usize = 4;
-pub(super) const BULK_READ_POOL_THREADS: usize = 2;
+pub(super) const BULK_POOL_THREADS: usize = 2;
 // Count foreground effects so large batches cannot starve the bulk lane under load.
 pub(super) const FOREGROUND_PER_BULK: usize = 8;
 #[derive(Clone)]
@@ -1078,7 +1078,7 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
         span.record("result", storage_event_kind(&event));
         span.record("path", "read_pool");
         record_storage_call(operation, key_space.as_deref(), queue_wait, service_elapsed);
-        if service_elapsed >= SLOW_STORAGE_EFFECT_THRESHOLD {
+        if service_elapsed >= STORAGE_EFFECT_THRESHOLD {
             warn!(
                 event = "storage.effect.slow",
                 operation = storage_event_kind(&event),
@@ -1109,18 +1109,18 @@ impl SlowQueueAggregator {
         result: &'static str,
     ) {
         record_storage_call(operation, key_space, queue_wait, service_elapsed);
-        if service_elapsed >= SLOW_STORAGE_EFFECT_THRESHOLD {
+        if service_elapsed >= STORAGE_EFFECT_THRESHOLD {
             warn!(
                 event = "storage.effect.slow",
                 operation,
                 result,
                 queue_wait_ms = duration_ms(queue_wait),
                 service_ms = duration_ms(service_elapsed),
-                threshold_ms = duration_ms(SLOW_STORAGE_EFFECT_THRESHOLD),
+                threshold_ms = duration_ms(STORAGE_EFFECT_THRESHOLD),
                 "Slow storage effect"
             );
         }
-        if queue_wait < SLOW_STORAGE_EFFECT_THRESHOLD {
+        if queue_wait < STORAGE_EFFECT_THRESHOLD {
             return;
         }
         self.queued_count += 1;
@@ -1128,13 +1128,13 @@ impl SlowQueueAggregator {
         let now = Instant::now();
         let due = self
             .last_flush
-            .is_none_or(|last| now.duration_since(last) >= SLOW_QUEUE_LOG_INTERVAL);
+            .is_none_or(|last| now.duration_since(last) >= QUEUE_LOG_INTERVAL);
         if due {
             warn!(
                 event = "storage.queue.backlog",
                 slow_queued_effects = self.queued_count,
                 max_queue_wait_ms = duration_ms(self.max_queue_wait),
-                threshold_ms = duration_ms(SLOW_STORAGE_EFFECT_THRESHOLD),
+                threshold_ms = duration_ms(STORAGE_EFFECT_THRESHOLD),
                 "Storage effects waited longer than threshold in queue"
             );
             self.queued_count = 0;

@@ -678,7 +678,7 @@ fn worker(dir: &tempfile::TempDir, handle: &StorageHandle) -> FjallStorage {
         FjallPersistPolicy::default(),
         handle,
         super::READ_POOL_THREADS,
-        super::BULK_READ_POOL_THREADS,
+        super::BULK_POOL_THREADS,
     )
 }
 

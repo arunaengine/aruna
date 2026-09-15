@@ -7,8 +7,8 @@ use crate::compaction::Compactor;
 use crate::errors::StorageLibError;
 
 use super::{
-    BULK_EFFECT_QUEUE_CAPACITY, BULK_READ_POOL_THREADS, FjallPersistPolicy, FjallStorage,
-    READ_POOL_THREADS, STORAGE_EFFECT_QUEUE_CAPACITY, StorageHandle, Store, WorkerLifecycleGuard,
+    EFFECT_QUEUE_CAPACITY, BULK_POOL_THREADS, FjallPersistPolicy, FjallStorage,
+    READ_POOL_THREADS, QUEUE_CAPACITY, StorageHandle, Store, WorkerLifecycleGuard,
     spawn_read_pool,
 };
 
@@ -32,7 +32,7 @@ impl FjallStorage {
         path: &str,
         policy: FjallPersistPolicy,
     ) -> Result<StorageHandle, StorageLibError> {
-        Self::open_pools(path, policy, READ_POOL_THREADS, BULK_READ_POOL_THREADS)
+        Self::open_pools(path, policy, READ_POOL_THREADS, BULK_POOL_THREADS)
     }
 
     fn open_pools(
@@ -80,9 +80,9 @@ impl FjallStorage {
         bulk_threads: usize,
     ) -> Self {
         let (read_pool, mut pool_threads) =
-            spawn_read_pool(store.clone(), read_threads, STORAGE_EFFECT_QUEUE_CAPACITY);
+            spawn_read_pool(store.clone(), read_threads, QUEUE_CAPACITY);
         let (bulk_read_pool, bulk_threads) =
-            spawn_read_pool(store.clone(), bulk_threads, BULK_EFFECT_QUEUE_CAPACITY);
+            spawn_read_pool(store.clone(), bulk_threads, EFFECT_QUEUE_CAPACITY);
         pool_threads.extend(bulk_threads);
         Self {
             store,

@@ -8,12 +8,12 @@ use aruna_core::document::{
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
+use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use aruna_core::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
 use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
-    SYNC_QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity,
+    QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity,
     SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
 use aruna_core::types::Value;
@@ -59,7 +59,7 @@ async fn reset_cursor(storage: &StorageHandle, topic: &[u8]) {
     write_batch(
         storage,
         vec![(
-            DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE.to_string(),
+            APPLIED_OPS_KEYSPACE.to_string(),
             ByteView::from(key),
             ByteView::from(
                 postcard::to_allocvec(&irokle::ActorClock::default()).expect("clock serializes"),
@@ -94,7 +94,7 @@ fn seed_event(index: u64) -> DocumentEvent {
 async fn fill_store(storage: &StorageHandle) -> SyncQuarantineUsage {
     let mut usage = SyncQuarantineUsage::default();
     let mut writes = Vec::new();
-    for index in 0..SYNC_QUARANTINE_MAX_RECORDS {
+    for index in 0..QUARANTINE_MAX_RECORDS {
         let record = SyncQuarantineRecord::new(
             SyncQuarantineIdentity::from_parts([7; 32], [8; 32], index + 1),
             SyncQuarantineEvidence::from_event(&seed_event(index)),
@@ -251,7 +251,7 @@ async fn capacity_blocks_releases() {
         .expect("row is acknowledged");
     let pruned = prune_quarantine_records(&ctx, seeded_page()).await.unwrap();
     assert_eq!(pruned.pruned, 1);
-    assert_eq!(pruned.usage.records, SYNC_QUARANTINE_MAX_RECORDS - 1);
+    assert_eq!(pruned.usage.records, QUARANTINE_MAX_RECORDS - 1);
 
     // The event was never applied and its cursor never advanced, so the next
     // reconcile redelivers it and the reclaimed slot takes the evidence.
@@ -274,7 +274,7 @@ async fn capacity_blocks_releases() {
     );
     assert_eq!(
         read_quarantine_usage(&ctx).await.unwrap().records,
-        SYNC_QUARANTINE_MAX_RECORDS
+        QUARANTINE_MAX_RECORDS
     );
     assert!(
         matches!(

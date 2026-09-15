@@ -29,10 +29,10 @@ pub(super) type AsyncEffectSender = crossfire::MAsyncTx<mpsc::Array<EffectHandle
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
 pub(super) type StorageReply = (StorageEvent, ResponseToken);
 
-pub(super) const STORAGE_EFFECT_QUEUE_CAPACITY: usize = 65_536;
+pub(super) const QUEUE_CAPACITY: usize = 65_536;
 // Bulk lane queues are small so background work hits QueueFull backpressure early
 // instead of building an unbounded backlog ahead of foreground sync traffic.
-pub(super) const BULK_EFFECT_QUEUE_CAPACITY: usize = 4_096;
+pub(super) const EFFECT_QUEUE_CAPACITY: usize = 4_096;
 pub(super) const MAX_TRANSACTION_CLEANUP: usize = 1024;
 pub(super) const MAX_CLEANUP_ATTEMPTS: u8 = 2;
 #[derive(Debug, Clone, Copy)]
@@ -127,8 +127,8 @@ impl ResponseSender {
 }
 impl StorageHandle {
     pub fn new() -> (Self, StorageReceivers) {
-        let (sender, foreground) = mpsc::bounded_blocking(STORAGE_EFFECT_QUEUE_CAPACITY);
-        let (bulk_sender, bulk) = mpsc::bounded_blocking(BULK_EFFECT_QUEUE_CAPACITY);
+        let (sender, foreground) = mpsc::bounded_blocking(QUEUE_CAPACITY);
+        let (bulk_sender, bulk) = mpsc::bounded_blocking(EFFECT_QUEUE_CAPACITY);
         (
             StorageHandle {
                 write_async: sender.clone().into_async(),

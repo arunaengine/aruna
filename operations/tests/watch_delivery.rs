@@ -8,13 +8,13 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-    NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
+    WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::execution::notification_watch::{
-    NOTIFICATION_WATCH_PER_USER_CAP, WatchAuthorizationBinding, WatchEvent, WatchEventDetail,
+    WATCH_USER_CAP, WatchAuthorizationBinding, WatchEvent, WatchEventDetail,
     WatchEventKind, WatchEventMask, WatchInterestDigest, WatchSubscription, interest_node_key,
     watch_notification_id, watch_resource_path,
 };
@@ -32,7 +32,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch::{
     WatchDispatchError, create_for_user, delete_for_user, list_for_user, list_watches,
 };
-use aruna_operations::notifications::list::LIST_NOTIFICATIONS_MAX_LIMIT;
+use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::watch::emit::emit_watch_event;
 use aruna_operations::notifications::watch::interest::{
@@ -52,7 +52,7 @@ use ulid::Ulid;
 mod convergence;
 use convergence::wait_for_convergence;
 
-const LIST_LIMIT: usize = LIST_NOTIFICATIONS_MAX_LIMIT;
+const LIST_LIMIT: usize = LIST_MAX_LIMIT;
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -453,7 +453,7 @@ async fn remote_create_conflicts() -> Result<(), Box<dyn std::error::Error>> {
     install_group_authorization(&nodes, realm_id, group_id, owner).await?;
 
     // Node B is not the holder, so every create proxies to node A over the wire.
-    for index in 0..NOTIFICATION_WATCH_PER_USER_CAP {
+    for index in 0..WATCH_USER_CAP {
         create_for_user(
             nodes[1].context.as_ref(),
             nodes[1].net.node_id(),
@@ -523,7 +523,7 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     .await?;
     // The row and outbox record commit atomically; wait until the record has
     // published into topic history before changing which node holds the inbox.
-    wait_for(|| async { iter_len(old_holder_node, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await == 0 })
+    wait_for(|| async { iter_len(old_holder_node, SYNC_OUTBOX_KEYSPACE).await == 0 })
         .await?;
 
     // Deliver once before the rerank, so the post-rerank delivery below proves
@@ -1027,7 +1027,7 @@ async fn read_interest_digest(node: &TestNode, key: Vec<u8>) -> Option<WatchInte
         .context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: None,
         }))

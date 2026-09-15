@@ -521,7 +521,7 @@ async fn spawn_node_with(
             realm_id,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
-            document_sync_storage_path: Some(dir.join("document-sync")),
+            sync_storage_path: Some(dir.join("document-sync")),
             ..NetConfig::default()
         },
         storage.clone(),

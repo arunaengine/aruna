@@ -14,7 +14,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
@@ -149,7 +149,7 @@ async fn remote_export_streams() -> TestResult {
         0
     );
     assert_eq!(
-        keyspace_len(&exporter.context, HASH_PATHS_INDEX_KEYSPACE).await?,
+        keyspace_len(&exporter.context, PATHS_INDEX_KEYSPACE).await?,
         0
     );
 

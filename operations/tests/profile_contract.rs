@@ -7,10 +7,10 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataEffect, MetadataError, MetadataEvent, PROCESS_RUN_CRATE_PROFILE_IRI,
+    MetadataEffect, MetadataError, MetadataEvent, CRATE_PROFILE_IRI,
     ProfileValidationSeverity, ProfileValidationState,
 };
 use aruna_core::storage_entries::event_log_prefix;
@@ -417,7 +417,7 @@ async fn builtin_profile_enforced() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(rejected.status.profile_id, None);
     assert_eq!(
         rejected.status.profile_iri.as_deref(),
-        Some(PROCESS_RUN_CRATE_PROFILE_IRI)
+        Some(CRATE_PROFILE_IRI)
     );
     assert_eq!(rejected.status.profile_revision.as_deref(), Some("builtin"));
     assert!(
@@ -1342,7 +1342,7 @@ fn run_crate_json(document_id: Ulid, complete: bool) -> String {
                 "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
                 "hasPart": [{"@id": "s3://runs/out.txt"}],
                 "mentions": {"@id": "#run-1"},
-                "conformsTo": {"@id": PROCESS_RUN_CRATE_PROFILE_IRI}
+                "conformsTo": {"@id": CRATE_PROFILE_IRI}
             },
             action,
             {"@id": "#agent-1", "@type": "Person", "name": "Ada"},
@@ -1400,7 +1400,7 @@ async fn event_count(
         .context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+            key_space: EVENT_LOG_KEYSPACE.to_string(),
             prefix: Some(event_log_prefix(document_id)),
             start: None,
             limit: 10,

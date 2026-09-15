@@ -8,7 +8,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_NODE_STATS_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE, NODE_STATS_KEYSPACE,
     USAGE_STATS_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
@@ -650,7 +650,7 @@ async fn inject_group_snapshot(h: &Harness, group_id: Ulid, node_id: NodeId, log
         .driver
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
             key: usage_snapshot_key(group_id, node_id).into(),
             value: snapshot.to_bytes().unwrap().into(),
             txn_id: None,
@@ -718,7 +718,7 @@ async fn quota_allows_headroom() {
     // quota 100 with 110% grace => ceiling 110. Writes above the quota but under
     // the ceiling are allowed; the grace band is the budget for remote staleness.
     let quota = QuotaConfig {
-        default_group_quota_bytes: Some(100),
+        default_quota_bytes: Some(100),
         grace_factor_percent: 110,
         ..QuotaConfig::default()
     };
@@ -748,7 +748,7 @@ async fn group_override_wins() {
     create_bucket(&h, "plain-bucket", plain).await;
 
     let quota = QuotaConfig {
-        default_group_quota_bytes: Some(50),
+        default_quota_bytes: Some(50),
         grace_factor_percent: 100,
         group_overrides: vec![GroupQuotaOverride {
             group_id: overridden,

@@ -17,7 +17,7 @@ use tokio::time::{Duration, Instant};
 use tracing::warn;
 
 const TASK_COMMAND_BUFFER: usize = 1024;
-const TIMER_HANDLER_WARN_AFTER: Duration = Duration::from_secs(30);
+const HANDLER_WARN_AFTER: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub trait InboundTaskHandler: Send + Sync {
@@ -48,7 +48,7 @@ enum TaskCommand {
         after: Duration,
         response: oneshot::Sender<TaskEvent>,
     },
-    ScheduleTimerIfIdle {
+    ScheduleIdleTimer {
         key: TaskKey,
         after: Duration,
         response: oneshot::Sender<TaskEvent>,
@@ -72,7 +72,7 @@ enum TaskCommand {
     AwaitDrained {
         response: oneshot::Sender<()>,
     },
-    AbortAllRunningHandlers {
+    AbortAllHandlers {
         response: oneshot::Sender<usize>,
     },
     #[cfg(test)]
@@ -219,7 +219,7 @@ impl SchedulerState {
 
         let warn_at = task
             .started_at
-            .checked_add(TIMER_HANDLER_WARN_AFTER)
+            .checked_add(HANDLER_WARN_AFTER)
             .unwrap_or(task.started_at);
         self.running_by_id.insert(
             id,
@@ -320,7 +320,7 @@ impl SchedulerState {
                     task_run_id = run_id,
                     key = ?entry.key,
                     elapsed_ms = now.saturating_duration_since(entry.started_at).as_millis(),
-                    threshold_ms = TIMER_HANDLER_WARN_AFTER.as_millis(),
+                    threshold_ms = HANDLER_WARN_AFTER.as_millis(),
                     "Timer handler task is still running after warning threshold"
                 );
             }
@@ -418,12 +418,12 @@ impl SchedulerState {
 
         self.running_warn_deadlines.remove(&(entry.warn_at, run_id));
 
-        if !entry.warned && elapsed >= TIMER_HANDLER_WARN_AFTER {
+        if !entry.warned && elapsed >= HANDLER_WARN_AFTER {
             warn!(
                 task_run_id = run_id,
                 key = ?key,
                 elapsed_ms = elapsed.as_millis(),
-                threshold_ms = TIMER_HANDLER_WARN_AFTER.as_millis(),
+                threshold_ms = HANDLER_WARN_AFTER.as_millis(),
                 "Timer handler task exceeded warning threshold before completing"
             );
         }
@@ -529,7 +529,7 @@ impl SchedulerState {
             } => {
                 let _ = response.send(self.shorten_timer(key, after, now));
             }
-            TaskCommand::ScheduleTimerIfIdle {
+            TaskCommand::ScheduleIdleTimer {
                 key,
                 after,
                 response,
@@ -557,7 +557,7 @@ impl SchedulerState {
                     self.drained_waiters.push(response);
                 }
             }
-            TaskCommand::AbortAllRunningHandlers { response } => {
+            TaskCommand::AbortAllHandlers { response } => {
                 let _ = response.send(self.abort_all_handlers(command_tx));
             }
             #[cfg(test)]
@@ -640,11 +640,11 @@ fn spawn_timer_handler(
                     })
                     .await;
             }
-        } else if elapsed >= TIMER_HANDLER_WARN_AFTER {
+        } else if elapsed >= HANDLER_WARN_AFTER {
             warn!(
                 key = ?task.key,
                 elapsed_ms = elapsed.as_millis(),
-                threshold_ms = TIMER_HANDLER_WARN_AFTER.as_millis(),
+                threshold_ms = HANDLER_WARN_AFTER.as_millis(),
                 "Untracked timer handler task exceeded warning threshold before completing"
             );
         }
@@ -758,7 +758,7 @@ impl TaskHandle {
     }
 
     pub async fn schedule_idle_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
-        self.dispatch_command(key, |key, response| TaskCommand::ScheduleTimerIfIdle {
+        self.dispatch_command(key, |key, response| TaskCommand::ScheduleIdleTimer {
             key,
             after,
             response,
@@ -855,7 +855,7 @@ impl TaskHandle {
         let (response, aborted) = oneshot::channel();
         if self
             .command_tx
-            .send(TaskCommand::AbortAllRunningHandlers { response })
+            .send(TaskCommand::AbortAllHandlers { response })
             .await
             .is_err()
         {
@@ -1766,7 +1766,7 @@ mod tests {
                     // Hold the waiter past the caller's drain deadline.
                     let _held = response;
                     match command_rx.recv().await {
-                        Some(TaskCommand::AbortAllRunningHandlers { response }) => drop(response),
+                        Some(TaskCommand::AbortAllHandlers { response }) => drop(response),
                         _ => panic!("expected abort-all command"),
                     }
                 }

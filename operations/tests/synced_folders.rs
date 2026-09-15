@@ -539,7 +539,7 @@ async fn recovers_missing_bucket() -> TestResult<()> {
             .as_deref()
             .is_some_and(|m| m.contains(REMOTE_BUCKET))
     );
-    assert!(failed.last_error_at_ms.is_some());
+    assert!(failed.last_error_ms.is_some());
     assert_eq!(failed.observed_files, 1);
     assert_eq!(failed.last_reconcile_ms, folder.last_reconcile_ms);
 
@@ -591,7 +591,7 @@ async fn recovers_missing_bucket() -> TestResult<()> {
     assert_eq!(plan.uploads, 1);
     let recovered = read_bound(&device.context, folder.folder_id).await?;
     assert_eq!(recovered.last_error, None);
-    assert_eq!(recovered.last_error_at_ms, None);
+    assert_eq!(recovered.last_error_ms, None);
     assert_eq!(recovered.observed_files, 1);
     await_uploads(&realm).await?;
     assert_eq!(

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use aruna_blob::blob::BlobHandler;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
+use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::document::DocumentTarget;
 use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentSyncPublish};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
@@ -963,7 +963,7 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
             realm_id,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
-            document_sync_storage_path: Some(temp_dir.path().join("document-sync")),
+            sync_storage_path: Some(temp_dir.path().join("document-sync")),
             ..NetConfig::default()
         },
         storage.clone(),
@@ -1101,7 +1101,7 @@ async fn install_realm_config(
         write(
             node,
             API_STATE_KEYSPACE,
-            TRUSTED_REALMS_LIST_KEY.to_vec(),
+            REALMS_LIST_KEY.to_vec(),
             postcard::to_allocvec(&trusted)?,
         )
         .await?;
@@ -1212,7 +1212,7 @@ async fn seed_config_topic(
     let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
     let event = reducer_state.apply_operation(
         &actor,
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: config
                 .placement_map
                 .first()

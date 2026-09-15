@@ -7,12 +7,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::usage::{
-    NODE_USAGE_DIRTY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_group_key,
+    DIRTY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_group_key,
     usage_global_key, usage_group_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -260,7 +260,7 @@ async fn steady_write_publishes() -> Result<(), Box<dyn std::error::Error>> {
         "steady-state write never published a snapshot",
         || async {
             let published = read_node_stats(node, snapshot_key.clone()).await.is_some();
-            let dirty_cleared = read_node_stats(node, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            let dirty_cleared = read_node_stats(node, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_none();
             Ok(usize::from(!(published && dirty_cleared)))
@@ -304,7 +304,7 @@ async fn bootstrap_usage_genesis(
         .context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
             key: snapshot_key.clone().into(),
             value: snapshot.to_bytes()?.into(),
             txn_id: None,
@@ -348,7 +348,7 @@ async fn read_node_stats(node: &TestNode, key: Vec<u8>) -> Option<Vec<u8>> {
         .context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: aruna_core::keyspaces::USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key_space: aruna_core::keyspaces::NODE_STATS_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: None,
         }))

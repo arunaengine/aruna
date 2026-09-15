@@ -6,8 +6,8 @@ use aruna_core::effects::StorageEffect;
 use std::{env, process::Command};
 use tempfile::tempdir;
 
-const RESTART_CHILD_PATH_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_PATH";
-const RESTART_CHILD_MODE_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_MODE";
+const RESTART_PATH_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_PATH";
+const RESTART_MODE_ENV: &str = "ARUNA_STORAGE_RESTART_CHILD_MODE";
 const RESTART_CHILD_TEST: &str = "storage::tests_persistence::persistence_restart_child";
 
 fn run_restart_child(mode: &str, path: &str) {
@@ -15,8 +15,8 @@ fn run_restart_child(mode: &str, path: &str) {
         .arg(RESTART_CHILD_TEST)
         .arg("--exact")
         .arg("--nocapture")
-        .env(RESTART_CHILD_PATH_ENV, path)
-        .env(RESTART_CHILD_MODE_ENV, mode)
+        .env(RESTART_PATH_ENV, path)
+        .env(RESTART_MODE_ENV, mode)
         .status()
         .expect("restart child process should run");
 
@@ -25,10 +25,10 @@ fn run_restart_child(mode: &str, path: &str) {
 
 #[test]
 fn persistence_restart_child() {
-    let Ok(mode) = env::var(RESTART_CHILD_MODE_ENV) else {
+    let Ok(mode) = env::var(RESTART_MODE_ENV) else {
         return;
     };
-    let path = env::var(RESTART_CHILD_PATH_ENV).expect("restart child path");
+    let path = env::var(RESTART_PATH_ENV).expect("restart child path");
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     runtime.block_on(async {
