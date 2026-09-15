@@ -5,6 +5,7 @@ lint:
 
 # Static structure, naming, and comment style check; no toolchain or build.
 style:
+	python3 scripts/dev/check_style_tests.py
 	python3 scripts/dev/check_style.py
 
 # Workspace tests and doctests, as the CI tests job runs them.

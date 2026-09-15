@@ -312,6 +312,21 @@ jobs:
       - name: Run clippy
         run: cargo +nightly-2026-09-14 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  style:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Run the checker self-tests
+        run: python3 scripts/dev/check_style_tests.py
+
+      # The same static structure, naming, and comment rules `just style` runs.
+      - name: Run the style check
+        run: python3 scripts/dev/check_style.py
+
   deny:
     runs-on: ubuntu-latest
 

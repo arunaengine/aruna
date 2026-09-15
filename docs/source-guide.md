@@ -29,7 +29,7 @@ Add behavior to the family that already owns it:
   (`operations/tests/fixtures/`, `blob/tests/fixtures/`), with fixture helper
   code in `src/tests/` beside its domain (`api/src/tests/assistant.rs`).
 
-A new subfolder needs at least five real cohesive files besides `mod.rs`;
+A new subfolder needs at least four real cohesive files besides `mod.rs`;
 `CONTRIBUTING.md` owns the threshold, hoisting, and naming rules.
 
 ## One request, end to end
