@@ -17,10 +17,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BlobDeleteAuditKind, BlobDeleteAuditRecord, BlobHeadKey,
-    BlobLocationKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
-    MultipartObjectMetadataKey, PathRestriction, RealmId, ReclaimCandidate, ReclaimCandidateKey,
-    UsageDelta, VersionKey, delete_audit_key,
+    AuthContext, BackendLocation, BlobAuditKind, BlobAuditRecord, BlobHeadKey, BlobLocationKey,
+    BlobVersion, BlobVersionState, CurrentVersionPointer, MultipartObjectKey, PathRestriction,
+    RealmId, ReclaimCandidate, ReclaimCandidateKey, UsageDelta, VersionKey, delete_audit_key,
 };
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
@@ -604,7 +603,7 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
         self.state = DeleteObjectState::DeleteMultipartSummary;
-        let key = match MultipartObjectMetadataKey::summary(version_id).to_bytes() {
+        let key = match MultipartObjectKey::summary(version_id).to_bytes() {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(err.into()),
         };
@@ -624,7 +623,7 @@ impl DeleteObjectOperation {
         let Some(version_id) = self.input.version_id else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
-        let prefix = match MultipartObjectMetadataKey::part_prefix(version_id) {
+        let prefix = match MultipartObjectKey::part_prefix(version_id) {
             Ok(prefix) => prefix.into(),
             Err(err) => return self.emit_error(err.into()),
         };
@@ -748,10 +747,10 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
         };
         let (kind, version_id) = match self.version_id {
-            Some(marker) => (BlobDeleteAuditKind::DeleteMarker, Some(marker)),
-            None => (BlobDeleteAuditKind::DeleteVersion, self.input.version_id),
+            Some(marker) => (BlobAuditKind::DeleteMarker, Some(marker)),
+            None => (BlobAuditKind::DeleteVersion, self.input.version_id),
         };
-        let record = BlobDeleteAuditRecord {
+        let record = BlobAuditRecord {
             realm_id: self.input.realm_id,
             group_id: self.input.group_id,
             node_id: self.input.node_id,
@@ -990,4 +989,5 @@ impl Operation for DeleteObjectOperation {
 }
 
 #[cfg(test)]
+#[path = "delete_tests.rs"]
 mod test;

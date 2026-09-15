@@ -1,13 +1,13 @@
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::blob::records::blob_location_read;
-use crate::connectors::{ResolveVersionSourceBindingInput, resolve_binding_effect};
-use crate::s3::object_lookup::{
+use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
+use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
 };
 use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
-    ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
+    ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
@@ -66,7 +66,7 @@ pub enum HeadObjectError {
     #[error("The specified version is a delete marker.")]
     DeleteMarker,
     #[error(transparent)]
-    ResolveReferenceError(#[from] SourceConnectorResolutionError),
+    ResolveReferenceError(#[from] SourceResolutionError),
     #[error(transparent)]
     StagingSourceError(#[from] StagingSourceError),
     #[error(transparent)]
@@ -474,9 +474,7 @@ impl HeadObjectOperation {
             self.txn_id = None;
             if let Some(source) = self.reference_source.take() {
                 self.state = HeadObjectState::ResolveReferenceAccess;
-                return smallvec![resolve_binding_effect(ResolveVersionSourceBindingInput {
-                    source
-                },)];
+                return smallvec![resolve_binding_effect(ResolveBindingInput { source },)];
             }
             self.state = HeadObjectState::Finish;
             smallvec![]

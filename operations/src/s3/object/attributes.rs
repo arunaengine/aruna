@@ -1,6 +1,6 @@
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::blob::records::blob_location_read;
-use crate::s3::object_lookup::{
+use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read,
 };
@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType, MultipartObjectMetadataKey,
+    CurrentVersionPointer, ManagedCopyKey, MultipartChecksumType, MultipartObjectKey,
     MultipartObjectPart, MultipartObjectSummary, PlacementPolicyRef, SourceMetadata, VersionKey,
 };
 use aruna_core::types::Effects;
@@ -26,7 +26,7 @@ use ulid::Ulid;
 const PART_SCAN_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GetObjectAttributesState {
+pub enum GetAttributesState {
     Init,
     StartTransaction,
     GetVersion,
@@ -41,14 +41,14 @@ pub enum GetObjectAttributesState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum GetObjectAttributesError {
+pub enum GetAttributesError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: GetObjectAttributesState,
+        state: GetAttributesState,
         expected: &'static str,
         received: Event,
     },
@@ -69,7 +69,7 @@ pub enum GetObjectAttributesError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetObjectAttributesInput {
+pub struct GetAttributesInput {
     pub bucket: String,
     pub key: String,
     pub version_id: Option<Ulid>,
@@ -77,7 +77,7 @@ pub struct GetObjectAttributesInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct GetObjectAttributesResult {
+pub struct GetAttributesResult {
     pub location: Option<BackendLocation>,
     pub source_metadata: Option<SourceMetadata>,
     pub version_created_at: Option<std::time::SystemTime>,
@@ -89,9 +89,9 @@ pub struct GetObjectAttributesResult {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct GetObjectAttributesOperation {
-    input: GetObjectAttributesInput,
-    state: GetObjectAttributesState,
+pub struct GetAttributesOperation {
+    input: GetAttributesInput,
+    state: GetAttributesState,
     txn_id: Option<Ulid>,
     location: Option<BackendLocation>,
     source_metadata: Option<SourceMetadata>,
@@ -103,14 +103,14 @@ pub struct GetObjectAttributesOperation {
     source_policies: Vec<PlacementPolicyRef>,
     summary: Option<MultipartObjectSummary>,
     parts: Vec<MultipartObjectPart>,
-    output: Option<Result<GetObjectAttributesResult, GetObjectAttributesError>>,
+    output: Option<Result<GetAttributesResult, GetAttributesError>>,
 }
 
-impl GetObjectAttributesOperation {
-    pub fn new(input: GetObjectAttributesInput) -> Self {
+impl GetAttributesOperation {
+    pub fn new(input: GetAttributesInput) -> Self {
         Self {
             input,
-            state: GetObjectAttributesState::Init,
+            state: GetAttributesState::Init,
             txn_id: None,
             location: None,
             source_metadata: None,
@@ -125,27 +125,27 @@ impl GetObjectAttributesOperation {
         }
     }
 
-    fn emit_error(&mut self, error: GetObjectAttributesError) -> Effects {
-        self.state = GetObjectAttributesState::Error;
+    fn emit_error(&mut self, error: GetAttributesError) -> Effects {
+        self.state = GetAttributesState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn lookup_error(&self, expected: &'static str, error: LookupError) -> GetObjectAttributesError {
+    fn lookup_error(&self, expected: &'static str, error: LookupError) -> GetAttributesError {
         match error {
-            LookupError::Conversion(err) => GetObjectAttributesError::ConversionError(err),
-            LookupError::Managed(err) => GetObjectAttributesError::ManagedCopyError(err),
-            LookupError::InvalidEvent(received) => GetObjectAttributesError::InvalidStateEvent {
+            LookupError::Conversion(err) => GetAttributesError::ConversionError(err),
+            LookupError::Managed(err) => GetAttributesError::ManagedCopyError(err),
+            LookupError::InvalidEvent(received) => GetAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected,
                 received,
             },
-            LookupError::Missing => GetObjectAttributesError::GetObjectAttributesFailed,
+            LookupError::Missing => GetAttributesError::GetObjectAttributesFailed,
         }
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = GetObjectAttributesState::StartTransaction;
+        self.state = GetAttributesState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: true
         })]
@@ -153,7 +153,7 @@ impl GetObjectAttributesOperation {
 
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
+            return self.emit_error(GetAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
                 received: event,
@@ -162,7 +162,7 @@ impl GetObjectAttributesOperation {
 
         self.txn_id = Some(txn_id);
         if let Some(version_id) = self.input.version_id {
-            self.state = GetObjectAttributesState::GetVersion;
+            self.state = GetAttributesState::GetVersion;
             let key =
                 match VersionKey::new(&self.input.bucket, &self.input.key, version_id).to_bytes() {
                     Ok(key) => key.into(),
@@ -174,7 +174,7 @@ impl GetObjectAttributesOperation {
                 txn_id: self.txn_id,
             })]
         } else {
-            self.state = GetObjectAttributesState::GetCurrentVersion;
+            self.state = GetAttributesState::GetCurrentVersion;
             let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
                 Ok(key) => key.into(),
                 Err(err) => return self.emit_error(err.into()),
@@ -189,7 +189,7 @@ impl GetObjectAttributesOperation {
 
     fn current_version_received(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
+            return self.emit_error(GetAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
                 received: event,
@@ -197,7 +197,7 @@ impl GetObjectAttributesOperation {
         };
 
         let Some(val) = value else {
-            return self.emit_error(GetObjectAttributesError::NoSuchKey);
+            return self.emit_error(GetAttributesError::NoSuchKey);
         };
 
         let pointer = match CurrentVersionPointer::from_bytes(val.as_ref()) {
@@ -213,7 +213,7 @@ impl GetObjectAttributesOperation {
         };
 
         self.resolved_version_id = Some(pointer.version_id);
-        self.state = GetObjectAttributesState::GetVersion;
+        self.state = GetAttributesState::GetVersion;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key,
@@ -223,7 +223,7 @@ impl GetObjectAttributesOperation {
 
     fn handle_received_version(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
+            return self.emit_error(GetAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
                 received: event,
@@ -232,9 +232,9 @@ impl GetObjectAttributesOperation {
 
         let Some(val) = value else {
             return self.emit_error(if self.input.version_id.is_some() {
-                GetObjectAttributesError::NoSuchVersion
+                GetAttributesError::NoSuchVersion
             } else {
-                GetObjectAttributesError::NoSuchKey
+                GetAttributesError::NoSuchKey
             });
         };
 
@@ -244,7 +244,7 @@ impl GetObjectAttributesOperation {
         };
 
         let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
-            return self.emit_error(GetObjectAttributesError::GetObjectAttributesFailed);
+            return self.emit_error(GetAttributesError::GetObjectAttributesFailed);
         };
 
         self.read_version(version_id, version, self.input.version_id.is_some())
@@ -273,9 +273,9 @@ impl GetObjectAttributesOperation {
                 self.check_managed_copy(version_id, blob_hash, backend)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
-                GetObjectAttributesError::DeleteMarker
+                GetAttributesError::DeleteMarker
             } else {
-                GetObjectAttributesError::NoSuchKey
+                GetAttributesError::NoSuchKey
             }),
             BlobVersionState::Reference {
                 cached_metadata, ..
@@ -289,7 +289,7 @@ impl GetObjectAttributesOperation {
     }
 
     fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
-        self.state = GetObjectAttributesState::GetBlobLocation;
+        self.state = GetAttributesState::GetBlobLocation;
         smallvec![blob_location_read(&key, self.txn_id)]
     }
 
@@ -312,7 +312,7 @@ impl GetObjectAttributesOperation {
         };
         self.pending_copy = Some(check.copy_key);
         self.pending_location = Some(check.location_key);
-        self.state = GetObjectAttributesState::CheckManagedCopy;
+        self.state = GetAttributesState::CheckManagedCopy;
         smallvec![check.effect]
     }
 
@@ -357,13 +357,13 @@ impl GetObjectAttributesOperation {
             Err(err) => return self.emit_error(err.into()),
         };
 
-        self.state = GetObjectAttributesState::ReadMultipartSummary;
+        self.state = GetAttributesState::ReadMultipartSummary;
         smallvec![effect]
     }
 
     fn summary_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
+            return self.emit_error(GetAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
                 received: event,
@@ -385,11 +385,11 @@ impl GetObjectAttributesOperation {
             return self.finish_lookup();
         }
 
-        let prefix = match MultipartObjectMetadataKey::part_prefix(version_id) {
+        let prefix = match MultipartObjectKey::part_prefix(version_id) {
             Ok(prefix) => prefix,
             Err(err) => return self.emit_error(err.into()),
         };
-        self.state = GetObjectAttributesState::ReadMultipartParts;
+        self.state = GetAttributesState::ReadMultipartParts;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
@@ -401,7 +401,7 @@ impl GetObjectAttributesOperation {
 
     fn parts_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
+            return self.emit_error(GetAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
                 received: event,
@@ -426,7 +426,7 @@ impl GetObjectAttributesOperation {
 
     fn finish_lookup(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetObjectAttributesError::NoTransactionFound);
+            return self.emit_error(GetAttributesError::NoTransactionFound);
         };
         let checksum_type = self
             .summary
@@ -434,8 +434,8 @@ impl GetObjectAttributesOperation {
             .map(|summary| summary.checksum_type)
             .unwrap_or(MultipartChecksumType::FullObject);
 
-        self.state = GetObjectAttributesState::CommitTransaction;
-        self.output = Some(Ok(GetObjectAttributesResult {
+        self.state = GetAttributesState::CommitTransaction;
+        self.output = Some(Ok(GetAttributesResult {
             location: self.location.clone(),
             source_metadata: self.source_metadata.clone(),
             version_created_at: self.version_created_at,
@@ -451,21 +451,21 @@ impl GetObjectAttributesOperation {
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(GetObjectAttributesError::InvalidStateEvent {
+            return self.emit_error(GetAttributesError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received: event,
             });
         };
 
-        self.state = GetObjectAttributesState::Finish;
+        self.state = GetAttributesState::Finish;
         smallvec![]
     }
 }
 
-impl Operation for GetObjectAttributesOperation {
-    type Output = GetObjectAttributesResult;
-    type Error = GetObjectAttributesError;
+impl Operation for GetAttributesOperation {
+    type Output = GetAttributesResult;
+    type Error = GetAttributesError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -473,27 +473,27 @@ impl Operation for GetObjectAttributesOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(GetObjectAttributesError::StorageError(error));
+            return self.emit_error(GetAttributesError::StorageError(error));
         }
 
         match self.state {
-            GetObjectAttributesState::Init => self.handle_init(),
-            GetObjectAttributesState::StartTransaction => self.handle_transaction_started(event),
-            GetObjectAttributesState::GetVersion => self.handle_received_version(event),
-            GetObjectAttributesState::GetCurrentVersion => self.current_version_received(event),
-            GetObjectAttributesState::CheckManagedCopy => self.handle_managed_copy(event),
-            GetObjectAttributesState::GetBlobLocation => self.location_read(event),
-            GetObjectAttributesState::ReadMultipartSummary => self.summary_read(event),
-            GetObjectAttributesState::ReadMultipartParts => self.parts_read(event),
-            GetObjectAttributesState::CommitTransaction => self.handle_transaction_committed(event),
-            GetObjectAttributesState::Finish | GetObjectAttributesState::Error => smallvec![],
+            GetAttributesState::Init => self.handle_init(),
+            GetAttributesState::StartTransaction => self.handle_transaction_started(event),
+            GetAttributesState::GetVersion => self.handle_received_version(event),
+            GetAttributesState::GetCurrentVersion => self.current_version_received(event),
+            GetAttributesState::CheckManagedCopy => self.handle_managed_copy(event),
+            GetAttributesState::GetBlobLocation => self.location_read(event),
+            GetAttributesState::ReadMultipartSummary => self.summary_read(event),
+            GetAttributesState::ReadMultipartParts => self.parts_read(event),
+            GetAttributesState::CommitTransaction => self.handle_transaction_committed(event),
+            GetAttributesState::Finish | GetAttributesState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            GetObjectAttributesState::Finish | GetObjectAttributesState::Error
+            GetAttributesState::Finish | GetAttributesState::Error
         )
     }
 
@@ -501,7 +501,7 @@ impl Operation for GetObjectAttributesOperation {
         match self.output {
             Some(Ok(value)) => Ok(value),
             Some(Err(error)) => Err(error),
-            None => Err(GetObjectAttributesError::NotFinished),
+            None => Err(GetAttributesError::NotFinished),
         }
     }
 
@@ -627,9 +627,7 @@ mod tests {
         write(
             storage_handle,
             S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-            MultipartObjectMetadataKey::summary(version_id)
-                .to_bytes()
-                .unwrap(),
+            MultipartObjectKey::summary(version_id).to_bytes().unwrap(),
             MultipartObjectSummary {
                 checksum_type,
                 part_count: part_numbers.len(),
@@ -646,7 +644,7 @@ mod tests {
             write(
                 storage_handle,
                 S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-                MultipartObjectMetadataKey::part(version_id, *part_number)
+                MultipartObjectKey::part(version_id, *part_number)
                     .to_bytes()
                     .unwrap(),
                 MultipartObjectPart {
@@ -680,7 +678,7 @@ mod tests {
         .await;
 
         let result = drive(
-            GetObjectAttributesOperation::new(GetObjectAttributesInput {
+            GetAttributesOperation::new(GetAttributesInput {
                 bucket: "mybucket".to_string(),
                 key: "hello.txt".to_string(),
                 version_id: None,
@@ -716,7 +714,7 @@ mod tests {
         seed_current_version(&storage_handle, &location, version_id).await;
 
         let result = drive(
-            GetObjectAttributesOperation::new(GetObjectAttributesInput {
+            GetAttributesOperation::new(GetAttributesInput {
                 bucket: "mybucket".to_string(),
                 key: "hello.txt".to_string(),
                 version_id: None,
@@ -770,7 +768,7 @@ mod tests {
         .await;
 
         let result = drive(
-            GetObjectAttributesOperation::new(GetObjectAttributesInput {
+            GetAttributesOperation::new(GetAttributesInput {
                 bucket: "mybucket".to_string(),
                 key: "hello.txt".to_string(),
                 version_id: Some(version_id),
@@ -807,7 +805,7 @@ mod tests {
         .await;
 
         let result = drive(
-            GetObjectAttributesOperation::new(GetObjectAttributesInput {
+            GetAttributesOperation::new(GetAttributesInput {
                 bucket: "mybucket".to_string(),
                 key: "hello.txt".to_string(),
                 version_id: Some(version_id),
@@ -817,9 +815,6 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(GetObjectAttributesError::DeleteMarker)
-        ));
+        assert!(matches!(result, Err(GetAttributesError::DeleteMarker)));
     }
 }

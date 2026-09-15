@@ -1,5 +1,5 @@
-use crate::s3::list_versions::served_copy;
 use crate::s3::listing::PrefixTracker;
+use crate::s3::object::versions::served_copy;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -22,7 +22,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListObjectsV2State {
+pub enum ListBucketState {
     Init,
     StartTransaction,
     ReadHeads,
@@ -34,14 +34,14 @@ pub enum ListObjectsV2State {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ListObjectsV2Error {
+pub enum ListBucketError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
     InvalidStateEvent {
-        state: ListObjectsV2State,
+        state: ListBucketState,
         expected: &'static str,
         received: Event,
     },
@@ -54,10 +54,10 @@ pub enum ListObjectsV2Error {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ListObjectsV2Input {
+pub struct ListBucketInput {
     pub bucket: String,
     pub group_id: GroupId,
-    pub continuation_token: Option<ListObjectsV2ContinuationToken>,
+    pub continuation_token: Option<ListContinuationToken>,
     pub max_keys: Option<usize>,
     pub prefix: Option<String>,
     pub delimiter: Option<String>,
@@ -65,12 +65,12 @@ pub struct ListObjectsV2Input {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ListObjectsV2ContinuationToken {
+pub struct ListContinuationToken {
     pub last_key: Vec<u8>,
     pub last_common_prefix: Option<String>,
 }
 
-impl ListObjectsV2ContinuationToken {
+impl ListContinuationToken {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -81,7 +81,7 @@ impl ListObjectsV2ContinuationToken {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ListObjectsV2Object {
+pub struct ListedObject {
     pub head: BlobHeadKey,
     pub location: Option<BackendLocation>,
     pub source_metadata: Option<SourceMetadata>,
@@ -95,15 +95,15 @@ pub struct ListObjectsV2Object {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ListObjectsV2Result {
-    pub objects: Vec<ListObjectsV2Object>,
+pub struct ListBucketResult {
+    pub objects: Vec<ListedObject>,
     pub common_prefixes: Vec<String>,
-    pub continuation_token: Option<ListObjectsV2ContinuationToken>,
+    pub continuation_token: Option<ListContinuationToken>,
 }
 
 #[derive(Debug, PartialEq)]
 enum ResolvedEntry {
-    Object(ListObjectsV2Object),
+    Object(ListedObject),
     AwaitingLocation {
         head: BlobHeadKey,
         version_created_at: std::time::SystemTime,
@@ -114,16 +114,16 @@ enum ResolvedEntry {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListObjectsV2Operation {
-    input: ListObjectsV2Input,
-    state: ListObjectsV2State,
+pub struct ListBucketOperation {
+    input: ListBucketInput,
+    state: ListBucketState,
     txn_id: Option<Ulid>,
     round_candidates: Vec<(BlobHeadKey, Ulid, Vec<u8>)>,
     resolved: Vec<ResolvedEntry>,
     location_reads: Vec<(String, Key)>,
-    objects: Vec<ListObjectsV2Object>,
+    objects: Vec<ListedObject>,
     prefixes: PrefixTracker,
-    continuation_token: Option<ListObjectsV2ContinuationToken>,
+    continuation_token: Option<ListContinuationToken>,
     scan_prefix: Vec<u8>,
     scan_limit: usize,
     scan_rounds: usize,
@@ -131,17 +131,17 @@ pub struct ListObjectsV2Operation {
     cursor_group: Option<String>,
     cursor_group_prefix: Option<Vec<u8>>,
     last_consumed_key: Option<Vec<u8>>,
-    output: Option<Result<ListObjectsV2Result, ListObjectsV2Error>>,
+    output: Option<Result<ListBucketResult, ListBucketError>>,
 }
 
-impl ListObjectsV2Operation {
+impl ListBucketOperation {
     pub const DEFAULT_MAX_KEYS: usize = 1_000;
     const MAX_SCAN_ROUNDS: usize = 100;
 
-    pub fn new(input: ListObjectsV2Input) -> Self {
+    pub fn new(input: ListBucketInput) -> Self {
         Self {
             input,
-            state: ListObjectsV2State::Init,
+            state: ListBucketState::Init,
             txn_id: None,
             round_candidates: Vec::new(),
             resolved: Vec::new(),
@@ -160,8 +160,8 @@ impl ListObjectsV2Operation {
         }
     }
 
-    fn emit_error(&mut self, error: ListObjectsV2Error) -> Effects {
-        self.state = ListObjectsV2State::Error;
+    fn emit_error(&mut self, error: ListBucketError) -> Effects {
+        self.state = ListBucketState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -179,11 +179,7 @@ impl ListObjectsV2Operation {
 
     /// Record that the scan cursor now sits inside `group`, so the next round
     /// can seek past the whole group instead of re-reading its keys.
-    fn enter_cursor_group(
-        &mut self,
-        group: &str,
-        key_bytes: &[u8],
-    ) -> Result<(), ListObjectsV2Error> {
+    fn enter_cursor_group(&mut self, group: &str, key_bytes: &[u8]) -> Result<(), ListBucketError> {
         let group_prefix = BlobHeadKey::object_prefix(&self.input.bucket, group)?;
         self.cursor_group = Some(group.to_string());
         self.cursor_group_prefix = Some(group_prefix);
@@ -193,8 +189,8 @@ impl ListObjectsV2Operation {
 
     fn handle_init(&mut self) -> Effects {
         if self.max_keys() == 0 {
-            self.state = ListObjectsV2State::Finish;
-            self.output = Some(Ok(ListObjectsV2Result {
+            self.state = ListBucketState::Finish;
+            self.output = Some(Ok(ListBucketResult {
                 objects: Vec::new(),
                 common_prefixes: Vec::new(),
                 continuation_token: None,
@@ -202,7 +198,7 @@ impl ListObjectsV2Operation {
             return smallvec![];
         }
 
-        self.state = ListObjectsV2State::StartTransaction;
+        self.state = ListBucketState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: true
         })]
@@ -210,7 +206,7 @@ impl ListObjectsV2Operation {
 
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(ListObjectsV2Error::InvalidStateEvent {
+            return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
                 received: event,
@@ -267,10 +263,7 @@ impl ListObjectsV2Operation {
     /// Restore the group cursor from a continuation token so the first scan
     /// round can seek past a fully emitted common-prefix group instead of
     /// re-reading its keys one round at a time.
-    fn resume_scan_state(
-        &mut self,
-        token: &ListObjectsV2ContinuationToken,
-    ) -> Result<(), ListObjectsV2Error> {
+    fn resume_scan_state(&mut self, token: &ListContinuationToken) -> Result<(), ListBucketError> {
         self.prefixes.set_resume(token.last_common_prefix.clone());
         let Some(group) = token.last_common_prefix.as_deref() else {
             return Ok(());
@@ -309,7 +302,7 @@ impl ListObjectsV2Operation {
                 .map(|key| IterStart::After(key.into())),
         };
 
-        self.state = ListObjectsV2State::ReadHeads;
+        self.state = ListBucketState::ReadHeads;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(self.scan_prefix.clone().into()),
@@ -323,7 +316,7 @@ impl ListObjectsV2Operation {
         self.continuation_token =
             self.last_consumed_key
                 .clone()
-                .map(|last_key| ListObjectsV2ContinuationToken {
+                .map(|last_key| ListContinuationToken {
                     last_key,
                     last_common_prefix: self.cursor_group.clone(),
                 });
@@ -347,7 +340,7 @@ impl ListObjectsV2Operation {
                 ),
             );
         }
-        self.state = ListObjectsV2State::ReadBlobLocations;
+        self.state = ListBucketState::ReadBlobLocations;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
             txn_id: self.txn_id,
@@ -370,11 +363,11 @@ impl ListObjectsV2Operation {
 
     fn commit(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListObjectsV2Error::NoTransactionFound);
+            return self.emit_error(ListBucketError::NoTransactionFound);
         };
 
-        self.state = ListObjectsV2State::CommitTransaction;
-        self.output = Some(Ok(ListObjectsV2Result {
+        self.state = ListBucketState::CommitTransaction;
+        self.output = Some(Ok(ListBucketResult {
             objects: std::mem::take(&mut self.objects),
             common_prefixes: self.prefixes.take(),
             continuation_token: self.continuation_token.clone(),
@@ -392,7 +385,7 @@ impl ListObjectsV2Operation {
 
     fn handle_heads_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(ListObjectsV2Error::InvalidStateEvent {
+            return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
                 received: event,
@@ -448,7 +441,7 @@ impl ListObjectsV2Operation {
         };
 
         self.round_candidates = candidates;
-        self.state = ListObjectsV2State::ReadVersions;
+        self.state = ListBucketState::ReadVersions;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
             txn_id: self.txn_id,
@@ -457,7 +450,7 @@ impl ListObjectsV2Operation {
 
     fn round_versions_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(ListObjectsV2Error::InvalidStateEvent {
+            return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
@@ -466,7 +459,7 @@ impl ListObjectsV2Operation {
 
         let candidates = std::mem::take(&mut self.round_candidates);
         if values.len() != candidates.len() {
-            return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
+            return self.emit_error(ListBucketError::ListObjectsV2Failed);
         }
 
         let max_keys = self.max_keys();
@@ -541,19 +534,18 @@ impl ListObjectsV2Operation {
                             ..
                         } => {
                             let descriptor = source.descriptor;
-                            self.resolved
-                                .push(ResolvedEntry::Object(ListObjectsV2Object {
-                                    head,
-                                    location: None,
-                                    source_metadata: Some(cached_metadata),
-                                    referenced: true,
-                                    kind: Some(descriptor.kind),
-                                    source_path: Some(descriptor.source_path),
-                                    connector_id: source.connector_id,
-                                    origin_node_id: descriptor.origin_node_id,
-                                    last_refresh: Some(last_refresh),
-                                    version_created_at: None,
-                                }));
+                            self.resolved.push(ResolvedEntry::Object(ListedObject {
+                                head,
+                                location: None,
+                                source_metadata: Some(cached_metadata),
+                                referenced: true,
+                                kind: Some(descriptor.kind),
+                                source_path: Some(descriptor.source_path),
+                                connector_id: source.connector_id,
+                                origin_node_id: descriptor.origin_node_id,
+                                last_refresh: Some(last_refresh),
+                                version_created_at: None,
+                            }));
                         }
                         BlobVersionState::Materialized {
                             blob_hash, backend, ..
@@ -603,7 +595,7 @@ impl ListObjectsV2Operation {
 
     fn handle_locations_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(ListObjectsV2Error::InvalidStateEvent {
+            return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
@@ -631,13 +623,13 @@ impl ListObjectsV2Operation {
                     governed,
                 } => {
                     let Some((_key, value)) = locations.next() else {
-                        return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
+                        return self.emit_error(ListBucketError::ListObjectsV2Failed);
                     };
                     let registration = match governed.as_ref() {
                         Some(_) => match locations.next() {
                             Some((_, value)) => value,
                             None => {
-                                return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
+                                return self.emit_error(ListBucketError::ListObjectsV2Failed);
                             }
                         },
                         None => None,
@@ -655,7 +647,7 @@ impl ListObjectsV2Operation {
                     let described = governed.is_none_or(|(copy_key, refs)| {
                         served_copy(registration.as_deref(), &copy_key, &refs, subject.as_ref())
                     });
-                    self.objects.push(ListObjectsV2Object {
+                    self.objects.push(ListedObject {
                         head,
                         location: described.then_some(location),
                         source_metadata: None,
@@ -676,21 +668,21 @@ impl ListObjectsV2Operation {
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(ListObjectsV2Error::InvalidStateEvent {
+            return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received: event,
             });
         };
 
-        self.state = ListObjectsV2State::Finish;
+        self.state = ListBucketState::Finish;
         smallvec![]
     }
 }
 
-impl Operation for ListObjectsV2Operation {
-    type Output = ListObjectsV2Result;
-    type Error = ListObjectsV2Error;
+impl Operation for ListBucketOperation {
+    type Output = ListBucketResult;
+    type Error = ListBucketError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -698,32 +690,29 @@ impl Operation for ListObjectsV2Operation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(ListObjectsV2Error::StorageError(error));
+            return self.emit_error(ListBucketError::StorageError(error));
         }
 
         match self.state {
-            ListObjectsV2State::Init => self.handle_init(),
-            ListObjectsV2State::StartTransaction => self.handle_transaction_started(event),
-            ListObjectsV2State::ReadHeads => self.handle_heads_read(event),
-            ListObjectsV2State::ReadVersions => self.round_versions_read(event),
-            ListObjectsV2State::ReadBlobLocations => self.handle_locations_read(event),
-            ListObjectsV2State::CommitTransaction => self.handle_transaction_committed(event),
-            ListObjectsV2State::Finish | ListObjectsV2State::Error => smallvec![],
+            ListBucketState::Init => self.handle_init(),
+            ListBucketState::StartTransaction => self.handle_transaction_started(event),
+            ListBucketState::ReadHeads => self.handle_heads_read(event),
+            ListBucketState::ReadVersions => self.round_versions_read(event),
+            ListBucketState::ReadBlobLocations => self.handle_locations_read(event),
+            ListBucketState::CommitTransaction => self.handle_transaction_committed(event),
+            ListBucketState::Finish | ListBucketState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListObjectsV2State::Finish | ListObjectsV2State::Error
-        )
+        matches!(self.state, ListBucketState::Finish | ListBucketState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.output {
             Some(Ok(value)) => Ok(value),
             Some(Err(error)) => Err(error),
-            None => Err(ListObjectsV2Error::NotFinished),
+            None => Err(ListBucketError::NotFinished),
         }
     }
 
@@ -736,4 +725,5 @@ impl Operation for ListObjectsV2Operation {
 }
 
 #[cfg(test)]
+#[path = "list_tests.rs"]
 mod test;
