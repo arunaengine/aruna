@@ -28,7 +28,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_operations::s3::get_bucket::GetBucketInfoOperation;
+use aruna_operations::s3::get_bucket::GetBucketOperation;
 use aruna_operations::s3::get_object::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
@@ -306,7 +306,7 @@ async fn creates_remote_bucket() -> TestResult<()> {
     )
     .await?;
     let bucket = drive(
-        GetBucketInfoOperation::new(REMOTE_BUCKET.to_string()),
+        GetBucketOperation::new(REMOTE_BUCKET.to_string()),
         &server.context,
     )
     .await?;

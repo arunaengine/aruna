@@ -18,19 +18,18 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::materialization_queue::materialization_jobs_exist;
 use aruna_operations::metadata::projector::project_logged_events;
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::realm::get_nodes::GetNodesOperation;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -187,12 +186,9 @@ async fn run_sampler(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut index = 0usize;
     let mut waiters = Vec::new();
-    let config = drive(
-        GetRealmConfigOperation::new(realm_id),
-        targets[0].1.as_ref(),
-    )
-    .await
-    .map_err(|error| format!("realm config load failed: {error:?}"))?;
+    let config = drive(GetConfigOperation::new(realm_id), targets[0].1.as_ref())
+        .await
+        .map_err(|error| format!("realm config load failed: {error:?}"))?;
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -214,7 +210,7 @@ async fn run_sampler(
             .as_ulid();
         let t0 = Instant::now();
         let result = drive(
-            CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
                 actor,
                 group_id,
                 document_id,
@@ -263,7 +259,7 @@ async fn wait_all_visible(
         let mut still_missing = Vec::with_capacity(pending.len());
         for context in pending {
             if drive(
-                GetMetadataDocumentOperation::new(group_id, document_id),
+                GetDocumentOperation::new(group_id, document_id),
                 context.as_ref(),
             )
             .await
@@ -290,8 +286,8 @@ fn node_targets(nodes: &[TestNode]) -> Vec<(NodeId, Arc<DriverContext>)> {
         .collect()
 }
 
-fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateMetadataDocumentPayload {
-    CreateMetadataDocumentPayload::Scaffold {
+fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateDocumentPayload {
+    CreateDocumentPayload::Scaffold {
         name: format!("Bench Dataset {label}-{writer}-{index}"),
         description: "Propagation tail benchmark document".to_string(),
         date_published: "2026-06-10".to_string(),
@@ -299,7 +295,7 @@ fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateMetadataD
     }
 }
 
-fn rocrate_payload(document_id: Ulid) -> CreateMetadataDocumentPayload {
+fn rocrate_payload(document_id: Ulid) -> CreateDocumentPayload {
     let jsonld = format!(
         r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -321,7 +317,7 @@ fn rocrate_payload(document_id: Ulid) -> CreateMetadataDocumentPayload {
   ]
 }}"#
     );
-    CreateMetadataDocumentPayload::RoCrate { jsonld }
+    CreateDocumentPayload::RoCrate { jsonld }
 }
 
 // Same per-document create path as run_writer in metadata_throughput.rs, but
@@ -338,12 +334,9 @@ async fn run_paced_writer(
     let mut batches: Vec<Vec<(Ulid, Ulid)>> = targets.iter().map(|_| Vec::new()).collect();
     let mut pending = 0usize;
     let mut created = Vec::with_capacity(count);
-    let config = drive(
-        GetRealmConfigOperation::new(realm_id),
-        targets[0].1.as_ref(),
-    )
-    .await
-    .map_err(|error| format!("realm config load failed: {error:?}"))?;
+    let config = drive(GetConfigOperation::new(realm_id), targets[0].1.as_ref())
+        .await
+        .map_err(|error| format!("realm config load failed: {error:?}"))?;
 
     for index in 0..count {
         ticker.tick().await;
@@ -364,7 +357,7 @@ async fn run_paced_writer(
             rocrate_payload(document_id)
         };
         let result = drive(
-            CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
                 actor,
                 group_id,
                 document_id,
@@ -423,7 +416,7 @@ async fn wait_for_visibility(
             let mut still_missing = Vec::new();
             for &(group_id, document_id) in missing.iter() {
                 if drive(
-                    GetMetadataDocumentOperation::new(group_id, document_id),
+                    GetDocumentOperation::new(group_id, document_id),
                     context.as_ref(),
                 )
                 .await
@@ -475,7 +468,7 @@ async fn build_realm_nodes(realm_id: &RealmId, count: usize) -> Result<Vec<TestN
 
     for node in &nodes {
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id: *realm_id,
                 node_id: node.net.node_id(),
                 schedule_refresh: true,
@@ -552,9 +545,9 @@ async fn spawn_node_with(
         compute_handle: None,
     });
 
-    initialize_net_incoming_for_tests(context.clone());
+    initialize_incoming_fixture(context.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle.clone(),
         aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -619,12 +612,7 @@ async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Result
     wait_for_convergence("realm nodes did not converge", || async {
         let mut pending = 0;
         for node in nodes {
-            match drive(
-                GetRealmNodesOperation::new(*realm_id),
-                node.context.as_ref(),
-            )
-            .await
-            {
+            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
                 Ok(realm_nodes) if realm_nodes == expected => {}
                 _ => pending += 1,
             }

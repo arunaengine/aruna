@@ -11,7 +11,7 @@ use aruna_core::structs::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_operations::metadata::api::{
-    BucketSearchRequest, ObjectSearchQueryMode, ObjectSearchRequest, search_buckets_distributed,
+    BucketSearchRequest, ObjectQueryMode, SearchQueryRequest, search_buckets_distributed,
     search_objects,
 };
 use aruna_operations::s3::search_objects::ObjectKeyMatch;
@@ -100,7 +100,7 @@ async fn distributed_search_routes() -> TestResult<()> {
         origin.context.as_ref(),
         realm.realm_id,
         origin.node_id(),
-        ObjectSearchRequest {
+        SearchQueryRequest {
             auth: realm.auth_context(),
             bearer_token: Some(realm.bearer_string()),
             query: "reads/".to_string(),
@@ -108,7 +108,7 @@ async fn distributed_search_routes() -> TestResult<()> {
             bucket: Some("data".to_string()),
             limit: 1,
             cursor: None,
-            mode: ObjectSearchQueryMode::DistributedBestEffort,
+            mode: ObjectQueryMode::DistributedBestEffort,
             target_nodes: Some(vec![origin.node_id()]),
         },
     )
@@ -121,7 +121,7 @@ async fn distributed_search_routes() -> TestResult<()> {
         responder.context.as_ref(),
         realm.realm_id,
         responder.node_id(),
-        ObjectSearchRequest {
+        SearchQueryRequest {
             auth: realm.auth_context(),
             bearer_token: Some(realm.bearer_string()),
             query: "reads/".to_string(),
@@ -129,7 +129,7 @@ async fn distributed_search_routes() -> TestResult<()> {
             bucket: Some("data".to_string()),
             limit: 1,
             cursor: Some(cursor),
-            mode: ObjectSearchQueryMode::DistributedBestEffort,
+            mode: ObjectQueryMode::DistributedBestEffort,
             target_nodes: None,
         },
     )

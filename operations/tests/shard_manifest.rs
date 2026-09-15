@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aruna_core::StructuredId;
-use aruna_core::document::{DocumentSyncTarget, ShardManifest};
+use aruna_core::document::{DocumentTarget, ShardManifest};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -14,17 +14,16 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
+use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::shard::assemble_shard_manifest;
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -55,13 +54,13 @@ async fn manifest_rows_match() -> Result<(), Box<dyn std::error::Error>> {
         mint_local_document(&config, &actor, group_id, "datasets/manifest-canary")?.as_ulid();
 
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: actor.clone(),
             group_id,
             document_id,
             document_path: "datasets/manifest-canary".to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: "Manifest Canary".to_string(),
                 description: "manifest maintenance test".to_string(),
                 date_published: "2026-07-07".to_string(),
@@ -73,7 +72,7 @@ async fn manifest_rows_match() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let document_id = created.record.document_id;
 
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    let target = DocumentTarget::MetadataDocumentLifecycle { document_id };
     let placement = created.record.placement;
     assert_ne!(
         placement,
@@ -118,13 +117,13 @@ async fn manifest_rows_match() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn manifest_contains(manifest: &ShardManifest, target: &DocumentSyncTarget) -> bool {
+fn manifest_contains(manifest: &ShardManifest, target: &DocumentTarget) -> bool {
     manifest.entries.iter().any(|entry| &entry.target == target)
 }
 
 fn manifest_revision(
     manifest: &ShardManifest,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
 ) -> aruna_core::document::DocumentSyncRevision {
     manifest
         .entries
@@ -156,7 +155,7 @@ async fn build_realm_nodes(
     }
     for node in &nodes {
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id: *realm_id,
                 node_id: node.net.node_id(),
                 schedule_refresh: true,
@@ -201,9 +200,9 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
-    initialize_net_incoming_for_tests(context.clone());
+    initialize_incoming_fixture(context.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -272,12 +271,7 @@ async fn wait_node_convergence(
         || async {
             let mut pending = 0;
             for node in nodes {
-                match drive(
-                    GetRealmNodesOperation::new(*realm_id),
-                    node.context.as_ref(),
-                )
-                .await
-                {
+                match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
                     Ok(realm_nodes) if realm_nodes == expected => {}
                     _ => {
                         pending += 1;

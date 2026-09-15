@@ -11,9 +11,8 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateCrateRequest, MetadataEffect, MetadataEvent, MetadataGraphLifecycleRecord,
-    MetadataGraphPolicy, MetadataQueryResults, MetadataRequestDurability,
-    MetadataUpsertEntityRequest,
+    GraphLifecycleRecord, MetadataCrateRequest, MetadataEffect, MetadataEvent, MetadataGraphPolicy,
+    MetadataQueryResults, MetadataRequestDurability, UpsertEntityRequest,
 };
 use aruna_core::storage_entries::{graph_lifecycle_entry, metadata_registry_key};
 use aruna_core::structs::{
@@ -196,7 +195,7 @@ async fn create_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
     let event = harness
         .handle
         .send_metadata_effect(MetadataEffect::CreateCrate {
-            request: MetadataCreateCrateRequest {
+            request: MetadataCrateRequest {
                 graph_iri: graph_iri.to_string(),
                 name: name.to_string(),
                 description: format!("Crate graph {name}"),
@@ -309,7 +308,7 @@ async fn stale_cache_refreshes() -> Result<(), BoxError> {
 
     // A lifecycle tombstone written to storage is picked up by the next
     // background sweep without removing the registry record.
-    let lifecycle = MetadataGraphLifecycleRecord::deleted(
+    let lifecycle = GraphLifecycleRecord::deleted(
         new_graph_iri,
         REALM,
         harness.group_id,
@@ -430,7 +429,7 @@ async fn write_deleted_lifecycle(
     harness: &TestHarness,
     record: &MetadataRegistryRecord,
 ) -> Result<(), BoxError> {
-    let lifecycle = MetadataGraphLifecycleRecord::deleted(
+    let lifecycle = GraphLifecycleRecord::deleted(
         record.graph_iri.clone(),
         REALM,
         record.group_id,
@@ -546,7 +545,7 @@ async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
     let event = harness
         .handle
         .send_metadata_effect(MetadataEffect::CreateCrate {
-            request: MetadataCreateCrateRequest {
+            request: MetadataCrateRequest {
                 graph_iri: graph_iri.to_string(),
                 name: name.to_string(),
                 description: format!("Crate graph {name}"),
@@ -660,7 +659,7 @@ async fn lazy_matches_eager() -> Result<(), BoxError> {
     )
     .await?;
 
-    let lifecycle = MetadataGraphLifecycleRecord::deleted(
+    let lifecycle = GraphLifecycleRecord::deleted(
         deleted_record.graph_iri.clone(),
         REALM,
         group_id,
@@ -856,7 +855,7 @@ async fn concurrent_mutation_profile() -> Result<(), BoxError> {
                 let event = harness
                     .handle
                     .send_metadata_effect(MetadataEffect::UpsertDataEntity {
-                        request: MetadataUpsertEntityRequest {
+                        request: UpsertEntityRequest {
                             graph_iri,
                             jsonld,
                             durability: Default::default(),
