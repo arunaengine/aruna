@@ -1,6 +1,4 @@
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, claims_for_revocation, ensure_permission, require_realm_auth,
-};
+use crate::auth::{ValidatedBearer, claims_for_revocation, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
 use crate::server_state::ServerState;
@@ -79,7 +77,7 @@ WRITE on the token owner's `/{realm_id}/admin/u/{user_id}` path.
 pub async fn revoke_token(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<RevokeTokenRequest>,
 ) -> ServerResult<StatusCode> {
     let auth = require_realm_auth(&state, auth)?;
@@ -156,7 +154,7 @@ pub async fn revoke_token(
 }
 
 /// Whether the caller presented the very token it asks to revoke.
-fn revokes_self(caller: Option<&ValidatedArunaBearerTokenCarrier>, token: &str) -> bool {
+fn revokes_self(caller: Option<&ValidatedBearer>, token: &str) -> bool {
     caller.is_some_and(|caller| bearer_token_hash(caller.as_str()) == bearer_token_hash(token))
 }
 
@@ -182,7 +180,7 @@ mod tests {
     use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::get_config::GetRealmConfigOperation;
+    use aruna_operations::realm::get_config::GetConfigOperation;
     use aruna_storage::storage::FjallStorage;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;
@@ -322,12 +320,9 @@ mod tests {
         .await
         .unwrap();
 
-        let config = drive(
-            GetRealmConfigOperation::new(realm_id),
-            state.get_ctx().as_ref(),
-        )
-        .await
-        .unwrap();
+        let config = drive(GetConfigOperation::new(realm_id), state.get_ctx().as_ref())
+            .await
+            .unwrap();
         assert!(config.token_revoked(&bearer_token_hash(&token), unix_timestamp_secs()));
     }
 
@@ -339,7 +334,7 @@ mod tests {
         assert!(handle_token(&state, &token).await.is_ok());
 
         let ctx = state.get_ctx();
-        let mut config = drive(GetRealmConfigOperation::new(realm_id), ctx.as_ref())
+        let mut config = drive(GetConfigOperation::new(realm_id), ctx.as_ref())
             .await
             .unwrap();
         config.revoked_tokens.push(TokenRevocation {
@@ -374,7 +369,7 @@ mod tests {
         realm_id: RealmId,
         config: &aruna_core::structs::RealmConfigDocument,
     ) {
-        let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id };
+        let target = aruna_core::document::DocumentTarget::RealmConfig { realm_id };
         store_bytes(
             ctx,
             target.storage_keyspace(),
@@ -437,12 +432,9 @@ mod tests {
 
         assert!(matches!(error, ServerError::Forbidden));
         assert!(handle_token(&state, &token).await.is_ok());
-        let config = drive(
-            GetRealmConfigOperation::new(realm_id),
-            state.get_ctx().as_ref(),
-        )
-        .await
-        .unwrap();
+        let config = drive(GetConfigOperation::new(realm_id), state.get_ctx().as_ref())
+            .await
+            .unwrap();
         assert!(config.revoked_tokens.is_empty());
     }
 
@@ -553,12 +545,9 @@ mod tests {
 
         assert!(matches!(error, ServerError::BadRequest));
         assert!(handle_token(&state, &foreign_token).await.is_ok());
-        let config = drive(
-            GetRealmConfigOperation::new(realm_id),
-            state.get_ctx().as_ref(),
-        )
-        .await
-        .unwrap();
+        let config = drive(GetConfigOperation::new(realm_id), state.get_ctx().as_ref())
+            .await
+            .unwrap();
         assert!(config.revoked_tokens.is_empty());
     }
 
