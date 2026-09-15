@@ -6,11 +6,13 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::structs::{
-    BackendCatalog, BackendRef, BucketInfo, GroupRoutingInputs, NODE_SUBJECT_KEY, NodeRouting,
-    NodeSubjectRecord, RealmId, RoutingSnapshot, StorageRoutingRule, UsageCounters,
-    usage_backend_keys,
+use aruna_core::structs::storage::routing::{
+    BackendCatalog, GroupRoutingInputs, NodeRouting, RoutingSnapshot, StorageRoutingRule,
 };
+use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_keys};
 use aruna_core::types::GroupId;
 use thiserror::Error;
 use tracing::warn;
@@ -247,11 +249,13 @@ mod tests {
     use crate::tests::staging::setup_driver_context;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{GROUP_STORAGE_ROUTING_KEYSPACE, NODE_SUBJECT_KEYSPACE};
-    use aruna_core::structs::{
-        BackendRef, GroupBackendKind, GroupStorage, GroupStorageRouting, PlacementSubject,
-        ResolvedBackend, RoutingTarget, StorageRoutingRule, UsageCounters, resolve_backend,
-        usage_backend_key,
+    use aruna_core::structs::storage::blob::{BackendRef, ResolvedBackend};
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+    use aruna_core::structs::storage::routing::{
+        GroupStorageRouting, RoutingTarget, StorageRoutingRule, resolve_backend,
     };
+    use aruna_core::structs::placement::placement_policy::PlacementSubject;
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key};
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -283,7 +287,7 @@ mod tests {
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: Default::default(),
             disabled: false,
-            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         };
         for (key_space, key, value) in crate::groups::backends::record_writes(&record).unwrap() {
             write_value(context, &key_space, key.to_vec(), value.to_vec()).await;

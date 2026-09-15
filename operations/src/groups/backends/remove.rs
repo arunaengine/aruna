@@ -8,9 +8,9 @@ use aruna_core::keyspaces::{
     S3_MULTIPART_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    BackendRef, BlobCleanupWork, BlobLocationKey, GroupStorage, MultipartUpload,
-};
+use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, BlobLocationKey};
+use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
@@ -407,10 +407,10 @@ impl Operation for RemoveBackendOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{
-        BackendLocation, CleanupStrategy, GroupBackendKind, GroupStorageSecret,
-        MultipartUploadStatus,
-    };
+    use aruna_core::structs::storage::blob::BackendLocation;
+    use aruna_core::structs::storage::cleanup::CleanupStrategy;
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorageSecret};
+    use aruna_core::structs::storage::multipart::MultipartUploadStatus;
     use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::time::SystemTime;

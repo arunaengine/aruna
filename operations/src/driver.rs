@@ -727,15 +727,14 @@ mod test {
         DeadlineAbort, DriverContext, MAX_TRACKED_TRANSACTIONS, TransactionEffect,
         TransactionState, TransactionTracker, drive, extend_unblocked,
     };
-    use aruna_core::{
-        effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect},
-        errors::StorageError,
-        events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent},
-        operation::{Operation, boxed_suboperation},
-        structs::{ResolvedSourceAccess, SourceConnectorKind},
-        task::{TaskEffect, TaskKey},
-        types::TxnId,
-    };
+    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
+    use aruna_core::operation::{Operation, boxed_suboperation};
+    use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::task::{TaskEffect, TaskKey};
+    use aruna_core::types::TxnId;
     use aruna_storage::storage;
     use byteview::ByteView;
     use std::collections::VecDeque;
@@ -1043,8 +1042,8 @@ mod test {
                 .await
                 .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
-            aruna_core::structs::BackendConfig {
-                backend_type: aruna_core::structs::Backend::FileSystem,
+            aruna_core::structs::storage::blob::BackendConfig {
+                backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
                 root: blob_root,
                 service_config: std::collections::HashMap::new(),
                 bucket_prefix: Some("aruna-test-".to_string()),
@@ -1350,8 +1349,8 @@ mod test {
                 .await
                 .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
-            aruna_core::structs::BackendConfig {
-                backend_type: aruna_core::structs::Backend::FileSystem,
+            aruna_core::structs::storage::blob::BackendConfig {
+                backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
                 root: blob_root,
                 service_config: std::collections::HashMap::new(),
                 bucket_prefix: Some("aruna-test-".to_string()),
@@ -1894,7 +1893,7 @@ mod test {
             smallvec::smallvec![
                 Effect::Task(TaskEffect::CancelTimer {
                     key: TaskKey::RealmPresence {
-                        realm_id: aruna_core::structs::RealmId::from_bytes([0u8; 32]),
+                        realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([0u8; 32]),
                         node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
                     },
                 }),
@@ -2009,8 +2008,8 @@ mod test {
                 .await
                 .unwrap();
         let blob_handle = aruna_blob::blob::BlobHandler::new(
-            aruna_core::structs::BackendConfig {
-                backend_type: aruna_core::structs::Backend::FileSystem,
+            aruna_core::structs::storage::blob::BackendConfig {
+                backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
                 root: blob_root,
                 service_config: std::collections::HashMap::new(),
                 bucket_prefix: Some("aruna-test-".to_string()),

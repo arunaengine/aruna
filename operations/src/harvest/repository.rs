@@ -5,7 +5,7 @@ use aruna_core::keyspaces::{
     HARVEST_PROVENANCE_KEYSPACE, HARVEST_SOURCE_KEYSPACE, REPOSITORY_CONNECTOR_INDEX_KEYSPACE,
     REPOSITORY_CONNECTOR_SECRET_KEYSPACE,
 };
-use aruna_core::structs::{
+use aruna_core::structs::execution::harvest::{
     HarvestProvenance, HarvestSource, RepositoryConnector, RepositoryConnectorSecret,
     harvest_provenance_key, harvest_provenance_prefix,
 };

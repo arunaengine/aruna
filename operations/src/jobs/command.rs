@@ -11,7 +11,7 @@ use aruna_core::compute::runtimes::{
     SESSION_MOUNT_PATH_TAG, SESSION_MOUNT_PREFIX_TAG, SESSION_RUNTIME_TAG, SESSION_RUNTIMES,
     SESSION_TAG, SESSION_TAG_NOTEBOOK, session_runtime,
 };
-use aruna_core::structs::JobId;
+use aruna_core::structs::execution::job::JobId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

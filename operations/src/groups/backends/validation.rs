@@ -1,5 +1,6 @@
 use crate::endpoint_screening;
-use aruna_core::structs::{GroupBackendKind, GroupStorage, ensure_confined_path};
+use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+use aruna_core::structs::storage::blob::ensure_confined_path;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
@@ -238,7 +239,7 @@ fn normalize(
 #[cfg(test)]
 mod pure_tests {
     use super::{GroupBackendError, validate_backend_input};
-    use aruna_core::structs::GroupBackendKind;
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
     use std::collections::HashMap;
 
     fn config(pairs: &[(&str, &str)]) -> HashMap<String, String> {

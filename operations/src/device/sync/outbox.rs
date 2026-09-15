@@ -9,10 +9,13 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
 use aruna_core::metadata::AuthToken;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
-    AuthContext, EntrySide, EntryState, FolderState, RealmId, SyncBase, SyncPullAck, SyncRefusal,
-    SyncedBytes, SyncedFolder, VersionedObjectArn,
+    EntrySide, EntryState, FolderState, SyncBase, SyncPullAck, SyncRefusal, SyncedBytes,
+    SyncedFolder,
 };
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, TxnId};
@@ -446,7 +449,8 @@ mod tests {
     use crate::driver::DriverContext;
     use crate::tests::device::context;
     use aruna_core::keyspaces::SYNC_UPLOAD_OUTBOX_KEYSPACE;
-    use aruna_core::structs::{FolderState, RealmId, SyncedFolder};
+    use aruna_core::structs::{FolderState, SyncedFolder};
+    use aruna_core::structs::identity::realm::RealmId;
 
     fn node_id() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[1u8; 32]).public()

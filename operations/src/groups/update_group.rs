@@ -9,9 +9,10 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, GROUP_DISPLAY_
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, Group, Permission, PlacementRef, RealmConfigDocument,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::group::Group;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
@@ -511,7 +512,9 @@ mod pure_tests {
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::reducer_state_key;
-    use aruna_core::structs::{Actor, AuthContext, Group, RealmId};
+    use aruna_core::structs::identity::auth::{Actor, AuthContext};
+    use aruna_core::structs::identity::group::Group;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{GroupId, TxnId};
     use byteview::ByteView;

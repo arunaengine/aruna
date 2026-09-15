@@ -1,4 +1,4 @@
-use aruna_core::structs::HarvestGranularity;
+use aruna_core::structs::execution::harvest::HarvestGranularity;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 use thiserror::Error;

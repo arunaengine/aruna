@@ -20,10 +20,10 @@ use aruna_core::reducer::{AdminDocumentError, decode_reducer_state};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, NotificationOutboxRecord, Permission,
-    RealmConfigDocument, ResourceEvent,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::execution::notification::{NotificationOutboxRecord, ResourceEvent};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -550,7 +550,7 @@ mod pure_tests {
     use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
     use aruna_core::reducer::AdminDocumentState;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
 
     #[test]
     fn membership_is_atomic() {
@@ -695,7 +695,7 @@ mod pure_tests {
         let notification = NotificationOutboxRecord::from_bytes(&notifications[0].2).unwrap();
         assert_eq!(notification.record.recipient, actor.user_id);
         assert!(
-            matches!(notification.record.kind, aruna_core::structs::NotificationKind::GroupJoinRequested { group_id: notified_group, actor_user_id, .. } if notified_group == group_id && actor_user_id == requestor.user_id)
+            matches!(notification.record.kind, aruna_core::structs::execution::notification::NotificationKind::GroupJoinRequested { group_id: notified_group, actor_user_id, .. } if notified_group == group_id && actor_user_id == requestor.user_id)
         );
         let mut duplicate_values = values.clone();
         duplicate_values[2].1 = Some(

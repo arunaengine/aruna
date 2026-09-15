@@ -3,7 +3,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -314,7 +314,7 @@ mod test {
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_core::UserId;
-    use aruna_core::structs::Actor;
+    use aruna_core::structs::identity::auth::Actor;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -349,8 +349,8 @@ mod test {
         };
 
         let actor = Actor {
-            user_id: UserId::local(Ulid::generate(), aruna_core::structs::RealmId([0u8; 32])),
-            realm_id: aruna_core::structs::RealmId([0u8; 32]),
+            user_id: UserId::local(Ulid::generate(), aruna_core::structs::identity::realm::RealmId([0u8; 32])),
+            realm_id: aruna_core::structs::identity::realm::RealmId([0u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
         };
 

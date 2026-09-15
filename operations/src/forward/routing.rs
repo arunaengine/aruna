@@ -6,9 +6,9 @@ use crate::metadata::create_document::resolve_metadata_id;
 use crate::placement::holds_placement;
 use crate::placement::resolve_shard_holders;
 use aruna_core::NodeId;
-use aruna_core::structs::PlacementRef;
-use aruna_core::structs::RealmConfigDocument;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::realm::RealmId;
 use std::sync::Arc;
 use ulid::Ulid;
 

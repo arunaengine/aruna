@@ -5,10 +5,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{
-    GroupRoutingInputs, GroupStorage, GroupStorageRouting, RoutingError, RoutingTarget,
-    validate_tenant_target,
+use aruna_core::structs::storage::routing::{
+    GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget, validate_tenant_target,
 };
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
@@ -424,9 +424,10 @@ mod pure_tests {
         GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_ROUTING_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{
-        BackendRef, GroupBackendKind, GroupRoutingInputs, GroupStorage, GroupStorageRouting,
-        RoutingError, RoutingTarget,
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+    use aruna_core::structs::storage::routing::{
+        GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget,
     };
     use aruna_core::types::Effects;
     use std::collections::{BTreeSet, HashMap};
@@ -459,7 +460,7 @@ mod pure_tests {
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             disabled: false,
-            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }
     }
 

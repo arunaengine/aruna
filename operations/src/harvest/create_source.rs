@@ -4,7 +4,7 @@ use aruna_core::UserId;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{HarvestSelector, HarvestSource, RepositoryConnector};
+use aruna_core::structs::execution::harvest::{HarvestSelector, HarvestSource, RepositoryConnector};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -233,7 +233,7 @@ mod tests {
     use crate::harvest::target_path::{DIGEST_SEGMENT_BYTES, HARVEST_PATH_BYTES};
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
-    use aruna_core::structs::RepositoryConnectorKind;
+    use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::tempdir;

@@ -41,7 +41,7 @@ fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
 #[cfg(test)]
 mod pure_tests {
     use super::task_effect_key;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::TaskEffect;
 
     #[test]

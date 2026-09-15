@@ -11,8 +11,9 @@ use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
-    SyncedFolder, WriteGuard, decide, fingerprint_complete,
+    SyncedFolder, WriteGuard, decide,
 };
+use aruna_core::structs::execution::offered_directory::fingerprint_complete;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -774,7 +775,9 @@ fn fail(operation: &mut ReconcileFolderOperation, error: ReconcileError) -> Effe
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::structs::{FileStat, FolderMode, FolderState, RealmId, RemoteBinding};
+    use aruna_core::structs::execution::offered_directory::FileStat;
+    use aruna_core::structs::{FolderMode, FolderState, RemoteBinding};
+    use aruna_core::structs::identity::realm::RealmId;
     use byteview::ByteView;
 
     fn folder() -> SyncedFolder {

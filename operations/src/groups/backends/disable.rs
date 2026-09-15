@@ -4,7 +4,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::GroupStorage;
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -243,7 +243,7 @@ mod pure_tests {
         GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{GroupBackendKind, GroupStorage};
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::types::{Effects, TxnId};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -264,7 +264,7 @@ mod pure_tests {
             updated_at: SystemTime::UNIX_EPOCH,
             created_by: aruna_core::UserId::default(),
             disabled,
-            cleanup: aruna_core::structs::CleanupStrategy::Retain,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }
     }
 

@@ -15,9 +15,10 @@ use std::time::Duration;
 
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
-    AuthContext, FolderState, Observed, RemoteBinding, RemoteHead, SyncListCursor, SyncPageLimit,
-    SyncRefusal, SyncVersionPage, SyncedFolder,
+    FolderState, Observed, RemoteBinding, RemoteHead, SyncListCursor, SyncPageLimit, SyncRefusal,
+    SyncVersionPage, SyncedFolder,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;

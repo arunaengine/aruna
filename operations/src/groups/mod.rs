@@ -15,7 +15,7 @@ pub mod storage_routing;
 pub mod update_group;
 
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::GroupAuthorizationDocument;
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use byteview::ByteView;
 
 pub(crate) fn parse_auth_record(

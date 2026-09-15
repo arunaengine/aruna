@@ -7,7 +7,7 @@ use aruna_core::keyspaces::{
     GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{GroupStorage, GroupStorageSecret};
+use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -306,7 +306,8 @@ mod pure_tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{CleanupStrategy, GroupBackendKind, GroupStorage};
+    use aruna_core::structs::storage::cleanup::CleanupStrategy;
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::types::{Effects, TxnId};
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};

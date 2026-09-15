@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DEVICE_REPLICA_KEYSPACE;
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use craqle::VectorClock;
@@ -293,7 +293,7 @@ pub fn mark_edited(replica: &mut ReplicaRecord, local_clock: VectorClock) {
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
 
     fn replica() -> ReplicaRecord {
         ReplicaRecord::new(

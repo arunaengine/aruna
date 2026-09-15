@@ -2,7 +2,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 

@@ -13,10 +13,10 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, PlacementRef, RealmConfigDocument,
-    RealmId,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, KeySpace, RoleId, TxnId};
 use byteview::ByteView;
@@ -29,7 +29,7 @@ use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use aruna_core::structs::Permission;
+use aruna_core::structs::identity::auth::Permission;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoveGroupConfig {
@@ -735,9 +735,9 @@ pub mod test {
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
-    use aruna_core::structs::{
-        Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, RealmId, Role,
-    };
+    use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::TxnId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;

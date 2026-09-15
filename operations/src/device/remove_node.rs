@@ -14,7 +14,8 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{Actor, RealmConfigDocument};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -389,7 +390,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::{RealmId, RealmNodeKind};
+    use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
     use tempfile::tempdir;
     use ulid::Ulid;
 

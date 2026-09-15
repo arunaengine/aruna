@@ -6,7 +6,7 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JOB_DUE_INDEX_PREFIX, JOB_LEASE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord,
     lease_index_key, parse_schedule_key,
 };
@@ -412,10 +412,11 @@ mod tests {
     use crate::jobs::JOB_LEASE_MS;
     use crate::jobs::store::insert_job;
     use aruna_core::UserId;
-    use aruna_core::structs::{
-        AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobPayload, JobState, RealmId,
-        due_index_key,
+    use aruna_core::structs::execution::job::{
+        AttemptIntent, JobClaim, JobPayload, JobState, due_index_key,
     };
+    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_storage::FjallStorage;
     use std::sync::Mutex;

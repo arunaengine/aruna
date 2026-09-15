@@ -6,7 +6,10 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_SECRET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{CleanupStrategy, GroupBackendKind, GroupStorage, GroupStorageSecret};
+use aruna_core::structs::storage::cleanup::CleanupStrategy;
+use aruna_core::structs::storage::group_backend::{
+    GroupBackendKind, GroupStorage, GroupStorageSecret,
+};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -227,7 +230,8 @@ mod pure_tests {
         GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{CleanupStrategy, GroupBackendKind, GroupStorage};
+    use aruna_core::structs::storage::cleanup::CleanupStrategy;
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use std::collections::HashMap;
     use ulid::Ulid;
 

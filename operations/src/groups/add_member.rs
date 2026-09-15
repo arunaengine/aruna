@@ -12,10 +12,11 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, GroupAuthorizationDocument, Permission, PlacementRef, RealmConfigDocument,
-    ResourceEvent,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, RoleId, TxnId};
@@ -830,10 +831,13 @@ pub mod test {
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, NotificationOutboxRecord, NotificationRecord,
-        Permission, PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind, Role,
+    use aruna_core::structs::identity::auth::{Actor, Permission, Role};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::execution::notification::{
+        NotificationOutboxRecord, NotificationRecord,
     };
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::task::TaskEvent;
     use aruna_core::task::TaskKey;
     use aruna_core::types::{RoleId, TxnId};
@@ -1340,7 +1344,7 @@ pub mod test {
             blob_handle: None,
         };
 
-        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
 

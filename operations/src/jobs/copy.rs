@@ -3,18 +3,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::{BucketInfo, CopyJobSpec, JobError, JobResultPayload};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::execution::job::{CopyJobSpec, JobError, JobResultPayload};
 
 use super::executor::{JobContext, JobRunOutcome};
 use crate::driver::drive;
 use crate::realm::get_config::GetConfigOperation;
-use crate::s3::copy_object::{
+use crate::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_tracked,
 };
-use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
-use crate::s3::get_object::GetObjectError;
-use crate::s3::head_object::{HeadObjectInput, HeadObjectOperation};
-use crate::s3::put_object::PutObjectError;
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::get::GetObjectError;
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::put::PutObjectError;
 
 /// How often the bytes pulled so far reach the job's progress.
 const PROGRESS_TICK: Duration = Duration::from_secs(1);
@@ -159,19 +160,23 @@ mod tests {
     use super::*;
     use crate::driver::DriverContext;
     use crate::jobs::executor::ProgressReporter;
-    use crate::s3::copy_object::test::{
+    use crate::s3::object::copy::test::{
         full_context, seed_bucket, spawn_reference_server, write_version,
     };
-    use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
+    use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::id::NodeId;
-    use aruna_core::structs::{
-        Actor, AuthContext, BlobVersion, JobErrorKind, JobId, JobProgress,
-        PortableSourceDescriptor, RealmConfigDocument, RealmId, SourceConnectorKind,
-        SourceMetadata, StagingStrategy, VersionSourceBinding,
+    use aruna_core::structs::identity::auth::{Actor, AuthContext};
+    use aruna_core::structs::storage::blob::BlobVersion;
+    use aruna_core::structs::execution::job::{JobErrorKind, JobId, JobProgress};
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::types::GroupId;
     use futures_util::StreamExt;
     use std::collections::HashMap;

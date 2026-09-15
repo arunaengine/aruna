@@ -14,10 +14,12 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{conflict_write_entries, reducer_state_entry};
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, PlacementRef, RealmConfigDocument, Role,
-    owner_group_key, owner_group_prefix,
+use aruna_core::structs::identity::auth::{Actor, Role};
+use aruna_core::structs::identity::group::{
+    Group, GroupAuthorizationDocument, owner_group_key, owner_group_prefix,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
@@ -683,7 +685,9 @@ mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
-    use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, RealmId};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
     use aruna_core::types::{Key, KeySpace, TxnId, Value};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -789,13 +793,13 @@ mod test {
 
     /// A realm whose buckets are activated at generation one, so a create
     /// resolves a generation and takes the group bucket's fence.
-    fn activated_config(actor: &Actor) -> aruna_core::structs::RealmConfigDocument {
+    fn activated_config(actor: &Actor) -> aruna_core::structs::identity::realm::RealmConfigDocument {
         let mut config =
-            aruna_core::structs::RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
-        config.ensure_node(actor.node_id, aruna_core::structs::RealmNodeKind::Server);
+            aruna_core::structs::identity::realm::RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, aruna_core::structs::identity::realm::RealmNodeKind::Server);
         config
             .strategies
-            .push(aruna_core::structs::PlacementStrategy {
+            .push(aruna_core::structs::placement::placement_record::PlacementStrategy {
                 strategy_id: Ulid::from_bytes([5; 16]),
                 name: "default".to_string(),
                 replica_count: Some(1),
@@ -1090,7 +1094,7 @@ mod test {
             compute_handle: None,
         };
 
-        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let group_config = CreateGroupConfig {
@@ -1170,7 +1174,7 @@ mod test {
             compute_handle: None,
         };
 
-        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let actor = Actor {

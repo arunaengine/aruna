@@ -12,10 +12,11 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, GroupAuthorizationDocument, Permission, PlacementRef, RealmConfigDocument,
-    ResourceEvent,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, KeySpace, RoleId, TxnId};
@@ -840,13 +841,16 @@ pub mod test {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::storage_entries::reducer_state_key;
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, NotificationOutboxRecord, NotificationRecord,
-        RealmId,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::execution::notification::{
+        NotificationOutboxRecord, NotificationRecord,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{RoleId, TxnId};
-    use aruna_core::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, structs::Permission, structs::Role};
+    use aruna_core::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;

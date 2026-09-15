@@ -14,10 +14,10 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, PlacementRef, RealmConfigDocument,
-    RealmId, Role,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Role};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId};
@@ -35,8 +35,8 @@ use crate::sync::document_outbox::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
-use aruna_core::structs::Permission;
-use aruna_core::structs::ResourceEvent;
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::execution::notification::ResourceEvent;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddRoleConfig {
@@ -1040,10 +1040,12 @@ pub mod test {
     use aruna_core::operation::Operation;
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
-    use aruna_core::structs::{
-        Actor, AuthContext, Group, GroupAuthorizationDocument, NotificationOutboxRecord,
-        NotificationRecord, Permission, RealmId, Role,
+    use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::execution::notification::{
+        NotificationOutboxRecord, NotificationRecord,
     };
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{RoleId, TxnId};
     use aruna_core::{
@@ -1149,7 +1151,7 @@ pub mod test {
 
     #[test]
     fn rejects_reserved_names() {
-        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let actor = Actor {
@@ -1160,7 +1162,7 @@ pub mod test {
 
         for name in ["admin", "user", " admin "] {
             let mut operation = AddRoleOperation::new(AddRoleConfig {
-                auth_context: aruna_core::structs::AuthContext {
+                auth_context: aruna_core::structs::identity::auth::AuthContext {
                     user_id,
                     realm_id,
                     path_restrictions: None,
@@ -1187,7 +1189,7 @@ pub mod test {
 
     #[test]
     fn rejects_public_writes() {
-        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let actor = Actor {
@@ -1198,7 +1200,7 @@ pub mod test {
 
         for permission in [Permission::WRITE, Permission::DENY] {
             let mut operation = AddRoleOperation::new(AddRoleConfig {
-                auth_context: aruna_core::structs::AuthContext {
+                auth_context: aruna_core::structs::identity::auth::AuthContext {
                     user_id,
                     realm_id,
                     path_restrictions: None,
@@ -1225,8 +1227,8 @@ pub mod test {
 
     #[test]
     fn rejects_foreign_nil() {
-        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
-        let other_realm_id = aruna_core::structs::RealmId([2u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1u8; 32]);
+        let other_realm_id = aruna_core::structs::identity::realm::RealmId([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([4u8; 16]);
         let actor = Actor {
@@ -1235,7 +1237,7 @@ pub mod test {
             realm_id,
         };
         let mut operation = AddRoleOperation::new(AddRoleConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id,
                 realm_id,
                 path_restrictions: None,
@@ -1263,7 +1265,7 @@ pub mod test {
     fn rejects_unconfined_paths() {
         // Patterns outside the group subtree (other group, realm admin, wildcard
         // group, unrooted) must be refused before any effect is emitted.
-        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let other_group = Ulid::from_bytes([9u8; 16]);
@@ -1280,7 +1282,7 @@ pub mod test {
             format!("{realm_id}/g/{group_id}/data/**"),
         ] {
             let mut operation = AddRoleOperation::new(AddRoleConfig {
-                auth_context: aruna_core::structs::AuthContext {
+                auth_context: aruna_core::structs::identity::auth::AuthContext {
                     user_id,
                     realm_id,
                     path_restrictions: None,
@@ -1304,7 +1306,7 @@ pub mod test {
 
     #[tokio::test]
     pub async fn test_add_role() {
-        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let group_id = Ulid::generate();
@@ -1316,7 +1318,7 @@ pub mod test {
             roles: auth_doc.roles.keys().copied().collect(),
             owner: user_id,
         };
-        let auth_context = aruna_core::structs::AuthContext {
+        let auth_context = aruna_core::structs::identity::auth::AuthContext {
             user_id,
             realm_id,
             path_restrictions: None,
@@ -1698,13 +1700,13 @@ pub mod test {
 
     /// A realm whose buckets are activated at generation one, so an add-role
     /// resolves a generation and takes the group bucket's fence.
-    fn activated_config(actor: &Actor) -> aruna_core::structs::RealmConfigDocument {
+    fn activated_config(actor: &Actor) -> aruna_core::structs::identity::realm::RealmConfigDocument {
         let mut config =
-            aruna_core::structs::RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
-        config.ensure_node(actor.node_id, aruna_core::structs::RealmNodeKind::Server);
+            aruna_core::structs::identity::realm::RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, aruna_core::structs::identity::realm::RealmNodeKind::Server);
         config
             .strategies
-            .push(aruna_core::structs::PlacementStrategy {
+            .push(aruna_core::structs::placement::placement_record::PlacementStrategy {
                 strategy_id: Ulid::from_bytes([5; 16]),
                 name: "default".to_string(),
                 replica_count: Some(1),

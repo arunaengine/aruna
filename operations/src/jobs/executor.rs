@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aruna_core::id::NodeId;
-use aruna_core::structs::{JobError, JobId, JobPayload, JobProgress, JobResultPayload};
+use aruna_core::structs::execution::job::{
+    JobError, JobId, JobPayload, JobProgress, JobResultPayload,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::DriverContext;

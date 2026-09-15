@@ -10,13 +10,20 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    ArtifactRef, ArunaArn, ArunaArnType, BackendLocation, BlobVersion, BucketInfo,
-    ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportReportSource,
-    ExportRoCrateResult, ExportRoCrateSpec, HashIndex, JobError, JobId, JobResultPayload,
-    ManagedCopyKey, Permission, RealmId, ReasonCode, RoCrateCheckpointRefs, VersionKey,
-    VersionedObjectArn, W3idIdentifier, ensure_confined_path, object_permission_path,
+use aruna_core::structs::execution::job::{
+    ArtifactRef, ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportReportSource,
+    ExportRoCrateResult, ExportRoCrateSpec, JobError, JobId, JobResultPayload, ReasonCode,
+    RoCrateCheckpointRefs,
 };
+use aruna_core::structs::storage::replication::{
+    ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
+};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
+    ensure_confined_path, object_permission_path,
+};
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 use async_zip::{Compression, ZipDateTime, ZipDateTimeBuilder, ZipEntryBuilder};

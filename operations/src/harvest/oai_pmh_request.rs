@@ -1,6 +1,6 @@
 use url::Url;
 
-use aruna_core::structs::{HarvestGranularity, HarvestSelector};
+use aruna_core::structs::execution::harvest::{HarvestGranularity, HarvestSelector};
 
 /// Default OAI-PMH metadata schema when a source does not pin one.
 pub const DEFAULT_METADATA_PREFIX: &str = "oai_dc";
