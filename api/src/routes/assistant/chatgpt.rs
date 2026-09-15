@@ -298,7 +298,7 @@ pub async fn start_login(
             user_code: device.user_code,
             verification_url: format!("{}/codex/device", state.chatgpt_issuer()),
             interval_seconds: interval,
-            expires_at: crate::routes::sessions::unix_rfc3339(expires_at),
+            expires_at: crate::routes::access::sessions::unix_rfc3339(expires_at),
         }),
     ))
 }
@@ -536,4 +536,5 @@ pub(super) async fn fresh_provider(
 }
 
 #[cfg(test)]
+#[path = "chatgpt_tests.rs"]
 mod tests;

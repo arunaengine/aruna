@@ -1,13 +1,13 @@
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::sessions::unix_rfc3339;
+use crate::routes::access::sessions::unix_rfc3339;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::{AssistantChatHead, AssistantChatTurn, AuthContext};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::assistant::{
-    ChatStoreError, DeleteChatOperation, ListChatHeadsOperation, ReadChatTurnsOperation,
-    WriteChatHeadOperation, WriteChatTurnOperation,
+    ChatStoreError, DeleteChatOperation, ListChatOperation, ReadChatOperation, WriteChatOperation,
+    WriteTurnOperation,
 };
 use aruna_operations::driver::drive;
 use axum::extract::{Path, Query, State};
@@ -42,12 +42,14 @@ pub struct ChatHeadResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct ChatHeadListResponse {
+#[schema(as = ChatHeadListResponse)]
+pub struct ChatListResponse {
     pub chats: Vec<ChatHeadResponse>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct SaveChatHeadRequest {
+#[schema(as = SaveChatHeadRequest)]
+pub struct SaveChatRequest {
     /// 1 to 80 characters after trimming.
     pub title: String,
     /// At most 200 characters.
@@ -66,12 +68,14 @@ pub struct ChatTurnResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct ChatTurnListResponse {
+#[schema(as = ChatTurnListResponse)]
+pub struct TurnListResponse {
     pub turns: Vec<ChatTurnResponse>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct SaveChatTurnRequest {
+#[schema(as = SaveChatTurnRequest)]
+pub struct SaveTurnRequest {
     pub payload: String,
     /// The head revision the caller last read. Absent skips the check.
     pub revision: Option<u64>,
@@ -175,7 +179,7 @@ refused. Chats are self-scoped, so a caller reaches only their own.
 - A deleted chat is left out.
 - Chats live on the node that received them and are not replicated to the realm's other nodes."#,
     responses(
-        (status = 200, description = "The caller's live chats", body = ChatHeadListResponse,
+        (status = 200, description = "The caller's live chats", body = ChatListResponse,
             example = json!({
                 "chats": [{
                     "id": "c-01JCNCTR0123456789ABCDEF",
@@ -197,15 +201,15 @@ refused. Chats are self-scoped, so a caller reaches only their own.
 pub async fn list_chats(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-) -> ServerResult<(StatusCode, Json<ChatHeadListResponse>)> {
+) -> ServerResult<(StatusCode, Json<ChatListResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let chats = drive(ListChatHeadsOperation::new(auth.user_id), &state.get_ctx())
+    let chats = drive(ListChatOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_chat_error)?
         .into_iter()
         .map(head_response)
         .collect();
-    Ok((StatusCode::OK, Json(ChatHeadListResponse { chats })))
+    Ok((StatusCode::OK, Json(ChatListResponse { chats })))
 }
 
 #[utoipa::path(
@@ -230,7 +234,7 @@ refused. Chats are self-scoped, so a caller writes only their own.
 - A user keeps at most 20 live chats."#,
     params(("id" = String, Path, description = "Chat id chosen by the portal, 1 to 64 characters from A-Z, a-z, 0-9, _ and -")),
     request_body(
-        content = SaveChatHeadRequest,
+        content = SaveChatRequest,
         description = "The title and subject to store, and the revision they were read at",
         example = json!({
             "title": "Sequencing run QC",
@@ -264,14 +268,14 @@ pub async fn put_chat(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
-    Json(request): Json<SaveChatHeadRequest>,
+    Json(request): Json<SaveChatRequest>,
 ) -> ServerResult<(StatusCode, Json<ChatHeadResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     let title = check_title(&request.title)?;
     let subject = check_subject(request.subject)?;
     let head = drive(
-        WriteChatHeadOperation::new(
+        WriteChatOperation::new(
             auth.user_id,
             id,
             title,
@@ -305,7 +309,7 @@ refused. Chats are self-scoped, so a caller reaches only their own.
         ChatTurnsQuery
     ),
     responses(
-        (status = 200, description = "The live turns of the chat", body = ChatTurnListResponse,
+        (status = 200, description = "The live turns of the chat", body = TurnListResponse,
             example = json!({
                 "turns": [{
                     "seq": 2,
@@ -326,11 +330,11 @@ pub async fn get_turns(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<String>,
     Query(query): Query<ChatTurnsQuery>,
-) -> ServerResult<(StatusCode, Json<ChatTurnListResponse>)> {
+) -> ServerResult<(StatusCode, Json<TurnListResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     let turns = drive(
-        ReadChatTurnsOperation::new(auth.user_id, id, query.after),
+        ReadChatOperation::new(auth.user_id, id, query.after),
         &state.get_ctx(),
     )
     .await
@@ -338,7 +342,7 @@ pub async fn get_turns(
     .into_iter()
     .map(turn_response)
     .collect();
-    Ok((StatusCode::OK, Json(ChatTurnListResponse { turns })))
+    Ok((StatusCode::OK, Json(TurnListResponse { turns })))
 }
 
 #[utoipa::path(
@@ -372,7 +376,7 @@ refused. Chats are self-scoped, so a caller writes only their own.
         ("seq" = u32, Path, description = "The head's next_seq to append, or one below it to rewrite the tail turn")
     ),
     request_body(
-        content = SaveChatTurnRequest,
+        content = SaveTurnRequest,
         description = "The turn payload as the portal encodes it, and the head revision it was read at",
         example = json!({
             "payload": "{\"messages\":[],\"history\":[]}",
@@ -406,12 +410,12 @@ pub async fn put_turn(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((id, seq)): Path<(String, u32)>,
-    Json(request): Json<SaveChatTurnRequest>,
+    Json(request): Json<SaveTurnRequest>,
 ) -> ServerResult<(StatusCode, Json<ChatHeadResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     let head = drive(
-        WriteChatTurnOperation::new(
+        WriteTurnOperation::new(
             auth.user_id,
             id,
             seq,
@@ -466,4 +470,5 @@ pub async fn delete_chat(
 }
 
 #[cfg(test)]
+#[path = "chats_tests.rs"]
 mod tests;

@@ -422,4 +422,5 @@ pub(super) async fn fetch_models(
 }
 
 #[cfg(test)]
+#[path = "proxy_tests.rs"]
 mod tests;
