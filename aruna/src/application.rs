@@ -1,7 +1,6 @@
-//! The ordered node lifecycle.
-//!
-//! `run_node` acquires resources, prepares the realm, binds listeners, starts
-//! background work, supervises ingress, and then runs the ordered shutdown.
+//! The ordered node lifecycle: acquire resources, prepare the realm, bind
+//! listeners, start background work, supervise ingress, then run the ordered
+//! shutdown (`run_node`).
 
 use aruna_operations::device::wipe as device_wipe;
 
@@ -18,8 +17,11 @@ use crate::startup::resources::NodeResources;
 pub enum ProcessOutcome {
     /// The node drained and stopped normally.
     Stopped,
-    /// The operator asked to stop while startup was still acquiring/binding;
-    /// no readiness was announced and no background work started.
+    /// The node stopped, but the shutdown sequence left an owner or a
+    /// persistence step unresolved; the stores were not verified clean.
+    StoppedIncomplete,
+    /// The operator asked to stop before startup completed; no later phase
+    /// was admitted and every acquired owner was released.
     StartupCancelled,
     /// Ingress failed before any signal; the node shut down because of it.
     ServerFailure(String),
@@ -34,7 +36,7 @@ impl ProcessOutcome {
     pub fn exit_code(&self) -> Option<i32> {
         match self {
             Self::Stopped | Self::StartupCancelled => None,
-            Self::ServerFailure(_) => Some(1),
+            Self::ServerFailure(_) | Self::StoppedIncomplete => Some(1),
             Self::WipeComplete => Some(device_wipe::WIPED_EXIT_CODE),
             Self::WipeIncomplete => Some(device_wipe::WIPE_INCOMPLETE_EXIT_CODE),
         }
@@ -44,9 +46,11 @@ impl ProcessOutcome {
     pub fn failure(&self) -> Option<&str> {
         match self {
             Self::ServerFailure(message) => Some(message),
-            Self::Stopped | Self::StartupCancelled | Self::WipeComplete | Self::WipeIncomplete => {
-                None
-            }
+            Self::Stopped
+            | Self::StoppedIncomplete
+            | Self::StartupCancelled
+            | Self::WipeComplete
+            | Self::WipeIncomplete => None,
         }
     }
 }
@@ -71,13 +75,9 @@ pub enum ServiceExit {
     ReportedOnly,
 }
 
-/// The named supervision policy per long-lived server. The ops listener is
-/// deliberately `ReportedOnly`: it must answer `/readyz` and `/healthz` through
-/// the entire drain, its task logs an unexpected exit, and the shutdown
-/// sequence aborts it at the very end. The session bridge is also
-/// `ReportedOnly`: its bind and exit are optional and only sessions are
-/// affected. Changing a policy here is an explicit behavior change, not a side
-/// effect of moving code.
+/// The named supervision policy per long-lived server. `ReportedOnly` (ops,
+/// session bridge) logs an unexpected exit and keeps serving; the ops listener
+/// must answer `/readyz` through the drain. Changing a policy is behavior.
 pub fn supervision(service: Service) -> ServiceExit {
     match service {
         Service::Rest | Service::S3 | Service::Portal => ServiceExit::StopsNode,
@@ -96,19 +96,22 @@ fn exit_effect(service: Service, message: &str) -> Option<&str> {
 
 /// Owns the process signal tasks for one `run_node`: the first-signal waiter
 /// that bridges into the startup stop token, and the second-signal escalation
-/// armed for every drain. `finish` runs on every exit path, so an application
-/// run never leaves a signal task behind.
+/// armed for every drain. `finish` runs on every exit path.
 struct SignalTasks {
     stop: tokio_util::sync::CancellationToken,
     first: Option<tokio::task::JoinHandle<()>>,
     escalation: Option<tokio::task::JoinHandle<()>>,
+    escalation_action: Option<EscalationAction>,
 }
 
+/// The second-signal action the escalation task owns; tests substitute a
+/// controllable future for the OS signal wait and the process exit.
+type EscalationAction = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
 impl SignalTasks {
-    /// Installs the OS signal handlers before readiness or background work can
-    /// start. One token carries "stop accepted" to every startup boundary, so a
-    /// stop during preparation or recovery does not wait behind the next
-    /// fallible stage.
+    /// Installs the OS signal handlers before readiness or background work. One
+    /// token carries "stop accepted" to every startup boundary, so a stop during
+    /// preparation does not wait behind the next fallible stage.
     fn install() -> Self {
         Self::with_first(wait_for_signal())
     }
@@ -116,6 +119,15 @@ impl SignalTasks {
     /// The same lifecycle with a controllable first signal, so tests need no
     /// OS signal or runtime timing.
     fn with_first(first_signal: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        Self::with_signals(first_signal, arm_signal_exit())
+    }
+
+    /// The same lifecycle with a controllable escalation action, so a test can
+    /// drive the active second-signal path without exiting its runner.
+    fn with_signals(
+        first_signal: impl std::future::Future<Output = ()> + Send + 'static,
+        escalation_action: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self {
         let stop = tokio_util::sync::CancellationToken::new();
         let bridge = stop.clone();
         let first = tokio::spawn(async move {
@@ -126,6 +138,7 @@ impl SignalTasks {
             stop,
             first: Some(first),
             escalation: None,
+            escalation_action: Some(Box::pin(escalation_action)),
         }
     }
 
@@ -133,17 +146,20 @@ impl SignalTasks {
         self.stop.clone()
     }
 
-    /// Applies the second-signal policy consistently across every drain: when a
-    /// stop was already accepted, a second signal exits immediately; otherwise
-    /// escalation arms as soon as the first signal arrives.
+    /// Applies the second-signal policy consistently across every drain; the
+    /// spawned task owns the escalation action directly, so aborting it
+    /// leaves no nested task behind.
     fn arm_escalation(&mut self) {
         if self.escalation.is_some() {
             return;
         }
+        let Some(action) = self.escalation_action.take() else {
+            return;
+        };
         let stop = self.stop.clone();
         self.escalation = Some(tokio::spawn(async move {
             stop.cancelled().await;
-            let _ = arm_signal_exit().await;
+            action.await;
         }));
     }
 
@@ -154,6 +170,7 @@ impl SignalTasks {
             escalation.abort();
             let _ = escalation.await;
         }
+        self.escalation_action = None;
         if let Some(first) = self.first.take() {
             first.abort();
             let _ = first.await;
@@ -244,7 +261,8 @@ async fn run_node_owned(
 
     // Background startup applies the same required-versus-optional service
     // policy as steady-state supervision, so an optional listener exit never
-    // abandons required recovery phases.
+    // abandons required recovery phases; a required failure is retained.
+    let mut failure: Option<String> = None;
     match start_background(
         Background {
             realm_id: bindings.realm_id,
@@ -272,8 +290,9 @@ async fn run_node_owned(
             return Ok(ProcessOutcome::StartupCancelled);
         }
         BackgroundOutcome::RequiredListenerFailed(service) => {
-            // Fall through to the failure select, which names the service.
-            tracing::error!(service = ?service, "Required listener exited during background startup");
+            failure = Some(format!(
+                "Required listener {service:?} exited during background startup"
+            ));
         }
     }
 
@@ -294,11 +313,9 @@ async fn run_node_owned(
     // Every long-lived server exit is classified by the one named policy: a
     // `StopsNode` exit ends serving with its message, a `ReportedOnly` exit is
     // logged and the node keeps waiting on the remaining servers.
-    let mut failure: Option<String> = None;
     loop {
         let observed = tokio::select! {
             message = s3_exit(s3_handle.as_mut()) => {
-                s3_handle = None;
                 Some((Service::S3, message))
             }
             result = rest_handle.as_mut().expect("rest server handle is present") => {
@@ -314,7 +331,6 @@ async fn run_node_owned(
                 Some((Service::Portal, message))
             }
             message = session_s3_exit(session_s3_handle.as_mut()) => {
-                session_s3_handle = None;
                 Some((Service::SessionS3, message))
             }
             _ = device_wipe_armed(device_wipe.as_ref()) => None,
@@ -347,7 +363,7 @@ async fn run_node_owned(
     // escalation; after a first signal it arms immediately.
     signals.arm_escalation();
 
-    NodeShutdown {
+    let shutdown_outcome = NodeShutdown {
         shutdown: resources.shutdown,
         readiness: resources.readiness,
         rest: rest_handle,
@@ -366,6 +382,7 @@ async fn run_node_owned(
     }
     .run()
     .await;
+    let shutdown_complete = shutdown_outcome.complete();
 
     // The stores keep their files open until the shutdown sequence finished, so
     // the owner's wipe erases the roots here.
@@ -373,29 +390,40 @@ async fn run_node_owned(
         let failed = device_wipe::purge(wipe.roots());
         // Only complete erasure reports wiped status. Remaining paths or unsupported stores
         // use a different exit code so supervisors do not treat the device as erased.
-        return Ok(if failed.is_empty() && wipe.unsupported().is_empty() {
-            tracing::info!("Wiped this device on its owner's request");
-            ProcessOutcome::WipeComplete
-        } else {
-            tracing::error!(
-                paths = failed.len(),
-                backends = wipe.unsupported().join(","),
-                "The device wipe did not erase everything this node stores"
-            );
-            ProcessOutcome::WipeIncomplete
-        });
+        // An incomplete sequence can still have owners writing behind the purge.
+        return Ok(
+            if wipe_succeeded(shutdown_complete, failed.len(), wipe.unsupported().len()) {
+                tracing::info!("Wiped this device on its owner's request");
+                ProcessOutcome::WipeComplete
+            } else {
+                tracing::error!(
+                    paths = failed.len(),
+                    backends = wipe.unsupported().join(","),
+                    shutdown_complete,
+                    "The device wipe did not erase everything this node stores"
+                );
+                ProcessOutcome::WipeIncomplete
+            },
+        );
     }
 
-    Ok(match failure {
-        Some(failure) => ProcessOutcome::ServerFailure(failure),
-        None => ProcessOutcome::Stopped,
+    Ok(match (failure, shutdown_complete) {
+        (Some(failure), _) => ProcessOutcome::ServerFailure(failure),
+        (None, true) => ProcessOutcome::Stopped,
+        (None, false) => ProcessOutcome::StoppedIncomplete,
     })
 }
 
+/// Only a sequence that released every owner and reported its persistence
+/// steps can claim the purge erased the device; unfinished owners may still
+/// write behind the removed roots.
+fn wipe_succeeded(shutdown_complete: bool, failed_paths: usize, unsupported: usize) -> bool {
+    shutdown_complete && failed_paths == 0 && unsupported == 0
+}
+
 /// Observes a finished ingress listener between startup phases and classifies
-/// it with the one named supervision policy. Required listeners are reported
-/// before the optional session bridge, so a dead required server is never
-/// masked by an optional exit.
+/// it under the named policy. Required listeners are checked before the
+/// optional session bridge, so a dead required server is never masked.
 fn observed_listener_exit(bindings: &ServerBindings) -> Option<(Service, ServiceExit)> {
     if bindings.rest_handle.is_finished() {
         Some((Service::Rest, supervision(Service::Rest)))
@@ -422,10 +450,9 @@ fn observed_listener_exit(bindings: &ServerBindings) -> Option<(Service, Service
     }
 }
 
-/// Runs the ordered teardown for everything acquired before background work
-/// started, including bound listeners when they already exist. The caller
-/// decides whether the stop is a cancellation or a failure, and every early
-/// drain applies the same second-signal policy as the normal one.
+/// Runs the ordered teardown for everything acquired before background work,
+/// including bound listeners. The caller decides whether the stop is a
+/// cancellation or a failure; every early drain keeps the second-signal policy.
 async fn release_unready(
     signals: &mut SignalTasks,
     resources: NodeResources,
@@ -525,6 +552,7 @@ mod pure_tests {
             ProcessOutcome::ServerFailure("rest stopped".to_string()).exit_code(),
             Some(1)
         );
+        assert_eq!(ProcessOutcome::StoppedIncomplete.exit_code(), Some(1));
         assert_eq!(
             ProcessOutcome::WipeComplete.exit_code(),
             Some(device_wipe::WIPED_EXIT_CODE)
@@ -545,6 +573,16 @@ mod pure_tests {
             ProcessOutcome::ServerFailure("s3 stopped".to_string()).failure(),
             Some("s3 stopped")
         );
+    }
+
+    // A wipe may only claim success when the sequence released every owner and
+    // the purge left nothing behind; an unfinished owner can still write.
+    #[test]
+    fn wipe_admission_requires_a_complete_sequence() {
+        assert!(wipe_succeeded(true, 0, 0));
+        assert!(!wipe_succeeded(false, 0, 0));
+        assert!(!wipe_succeeded(true, 1, 0));
+        assert!(!wipe_succeeded(true, 0, 1));
     }
 }
 
@@ -589,38 +627,110 @@ mod tests {
         }
     }
 
-    // A first signal cancels the startup token, and finishing the owner leaves
-    // no signal task behind.
+    /// A controllable escalation action replacing the OS second-signal wait
+    /// and process exit; it reports arming and completion and records a real
+    /// drop, so no test needs a signal or can exit its runner.
+    struct ControlledEscalation {
+        fire: Option<oneshot::Sender<()>>,
+        armed: Option<oneshot::Receiver<()>>,
+        completed: Option<oneshot::Receiver<()>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl ControlledEscalation {
+        fn new() -> Self {
+            Self {
+                fire: None,
+                armed: None,
+                completed: None,
+                dropped: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn action(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static {
+            let (fire, fired) = oneshot::channel();
+            let (armed, armed_rx) = oneshot::channel();
+            let (completed, completed_rx) = oneshot::channel();
+            self.fire = Some(fire);
+            self.armed = Some(armed_rx);
+            self.completed = Some(completed_rx);
+            let dropped = self.dropped.clone();
+            async move {
+                let _dropped = DropRecorder(dropped);
+                let _ = armed.send(());
+                let _ = fired.await;
+                let _ = completed.send(());
+            }
+        }
+
+        async fn wait_until_armed(&mut self) {
+            self.armed
+                .take()
+                .expect("the escalation action was created")
+                .await
+                .expect("the escalation action armed");
+        }
+
+        async fn wait_until_completed(&mut self) {
+            self.completed
+                .take()
+                .expect("the escalation action was created")
+                .await
+                .expect("the escalation action completed");
+        }
+
+        fn fire_second(&mut self) {
+            self.fire
+                .take()
+                .expect("the escalation action is armed")
+                .send(())
+                .expect("the escalation action still waits for its second signal");
+        }
+    }
+
+    /// Sets its flag when the wrapped future drops, so an aborted escalation
+    /// cannot leave a detached task holding the action.
+    struct DropRecorder(Arc<AtomicBool>);
+
+    impl Drop for DropRecorder {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // The owner observes the first signal through the stop token rather than
+    // consuming its task handle, so `finish` remains the single consumer.
     #[tokio::test]
     async fn first_signal_cancels_the_stop_token_and_finish_clears_tasks() {
         let aborted = Arc::new(AtomicBool::new(false));
         let (signal, fire) = ControlledSignal::new(aborted.clone());
-        let mut signals = SignalTasks::with_first(signal);
+        let mut escalation = ControlledEscalation::new();
+        let action = escalation.action();
+        let mut signals = SignalTasks::with_signals(signal, action);
         let stop = signals.stop();
         assert!(!stop.is_cancelled());
 
         fire.send(())
             .expect("the bridge is waiting for the first signal");
-        signals
-            .first
-            .as_mut()
-            .expect("the first-signal task is retained")
-            .await
-            .expect("the first-signal task completes");
+        stop.cancelled().await;
         assert!(stop.is_cancelled());
 
         signals.finish().await;
         assert!(signals.first.is_none());
         assert!(signals.escalation.is_none());
+        assert!(signals.escalation_action.is_none());
+        assert!(aborted.load(Ordering::SeqCst));
     }
 
-    // Finishing without a signal aborts the waiter once and clears the
-    // escalation too, so repeated application runs leave nothing behind.
+    // Finishing without a first signal aborts the waiter and drops the
+    // never-armed escalation action once.
     #[tokio::test]
     async fn finish_aborts_both_signal_tasks() {
         let aborted = Arc::new(AtomicBool::new(false));
         let (signal, _fire) = ControlledSignal::new(aborted.clone());
-        let mut signals = SignalTasks::with_first(signal);
+        let mut escalation = ControlledEscalation::new();
+        let action = escalation.action();
+        let mut signals = SignalTasks::with_signals(signal, action);
         signals.arm_escalation();
         assert!(signals.escalation.is_some());
 
@@ -629,5 +739,99 @@ mod tests {
         assert!(aborted.load(Ordering::SeqCst));
         assert!(signals.first.is_none());
         assert!(signals.escalation.is_none());
+        assert!(signals.escalation_action.is_none());
+    }
+
+    // Acquisition cleanup arms escalation after the stop was accepted, and
+    // finishing then really drops the waiting action instead of detaching it.
+    #[tokio::test]
+    async fn acquisition_cleanup_finish_aborts_the_escalation_task() {
+        let (signal, fire) = ControlledSignal::new(Arc::new(AtomicBool::new(false)));
+        let mut escalation = ControlledEscalation::new();
+        let action = escalation.action();
+        let mut signals = SignalTasks::with_signals(signal, action);
+        let stop = signals.stop();
+
+        fire.send(())
+            .expect("the bridge is waiting for the first signal");
+        stop.cancelled().await;
+        signals.arm_escalation();
+        escalation.wait_until_armed().await;
+        assert!(
+            !signals
+                .escalation
+                .as_ref()
+                .expect("the escalation task is retained")
+                .is_finished()
+        );
+
+        signals.finish().await;
+
+        assert!(signals.first.is_none());
+        assert!(signals.escalation.is_none());
+        assert!(
+            escalation.dropped.load(Ordering::SeqCst),
+            "finish must drop the escalation action, not only its wrapper"
+        );
+    }
+
+    // The active path: an already-accepted stop lets the second signal end the
+    // escalation action, and finishing still consumes each task once.
+    #[tokio::test]
+    async fn active_escalation_runs_and_finish_clears_tasks() {
+        let (signal, fire) = ControlledSignal::new(Arc::new(AtomicBool::new(false)));
+        let mut escalation = ControlledEscalation::new();
+        let action = escalation.action();
+        let mut signals = SignalTasks::with_signals(signal, action);
+        let stop = signals.stop();
+
+        fire.send(())
+            .expect("the bridge is waiting for the first signal");
+        stop.cancelled().await;
+        signals.arm_escalation();
+        escalation.wait_until_armed().await;
+
+        escalation.fire_second();
+        escalation.wait_until_completed().await;
+
+        signals.finish().await;
+        assert!(signals.first.is_none());
+        assert!(signals.escalation.is_none());
+        assert!(signals.escalation_action.is_none());
+    }
+
+    // Repeated application runs share one runtime, so each owner must clear
+    // both of its signal tasks before the next run installs its own.
+    #[tokio::test]
+    async fn repeated_runs_leave_no_signal_tasks() {
+        for run in 0..2 {
+            let aborted = Arc::new(AtomicBool::new(false));
+            let (signal, fire) = ControlledSignal::new(aborted.clone());
+            let mut escalation = ControlledEscalation::new();
+            let action = escalation.action();
+            let dropped = escalation.dropped.clone();
+            let mut signals = SignalTasks::with_signals(signal, action);
+
+            fire.send(())
+                .expect("the bridge is waiting for the first signal");
+            signals.stop().cancelled().await;
+            signals.arm_escalation();
+            escalation.wait_until_armed().await;
+            signals.finish().await;
+
+            assert!(signals.first.is_none(), "run {run} retained the first task");
+            assert!(
+                signals.escalation.is_none(),
+                "run {run} retained the second task"
+            );
+            assert!(
+                aborted.load(Ordering::SeqCst),
+                "run {run} left the first task running"
+            );
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "run {run} left the second task running"
+            );
+        }
     }
 }
