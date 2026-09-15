@@ -1,6 +1,6 @@
 use crate::NodeId;
 use crate::errors::ConversionError;
-use crate::structs::BackendRef;
+use crate::structs::storage::blob::BackendRef;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -3,8 +3,8 @@ use aruna_core::events::StorageEvent;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AssistantChatTurn, MAX_ASSISTANT_CHAT_BYTES, MAX_ASSISTANT_CHATS, MAX_ASSISTANT_TURN_BYTES,
-    RealmId,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
 const CHAT: &str = "c-1";

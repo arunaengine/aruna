@@ -1,11 +1,14 @@
 use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
 use crate::scheduling::*;
-use crate::structs::{
-    EffectiveResources, LocationLink, PlacementPolicy, PlacementPolicyRef, PlacementSelector,
-    PlacementSubject, PolicyResolution, RealmComputeConfig, RealmNodeKind, SubmissionId,
-    VerifiedPolicy, VersionedObjectArn,
+use crate::structs::execution::job::{EffectiveResources, SubmissionId};
+use crate::structs::placement::compute_config::{LocationLink, RealmComputeConfig};
+use crate::structs::placement::placement_policy::{
+    PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, PolicyResolution,
+    VerifiedPolicy,
 };
+use crate::structs::identity::realm::RealmNodeKind;
+use crate::structs::storage::replication::VersionedObjectArn;
 use std::collections::BTreeMap;
 use ulid::Ulid;
 
@@ -66,7 +69,7 @@ pub(crate) fn resolved_input(key: &str, seed: u8) -> ResolvedInput {
     ResolvedInput {
         destination_key: key.to_string(),
         source: VersionedObjectArn {
-            realm_id: crate::structs::RealmId::from_bytes([1u8; 32]),
+            realm_id: crate::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
             node_id: node(1),
             bucket: "bucket".to_string(),
             key: key.to_string(),

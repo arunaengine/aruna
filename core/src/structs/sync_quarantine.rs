@@ -364,7 +364,9 @@ mod tests {
     use crate::UserId;
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
     use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
-    use crate::structs::{Actor, PlacementRef, RealmId};
+    use crate::structs::identity::auth::Actor;
+    use crate::structs::placement::placement_record::PlacementRef;
+    use crate::structs::identity::realm::RealmId;
 
     fn node() -> NodeId {
         NodeId::from_bytes(&[1u8; 32]).unwrap()

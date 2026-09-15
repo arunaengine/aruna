@@ -1,7 +1,7 @@
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::types::{Effects, TxnId};
 
 use crate::auth::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
@@ -86,7 +86,8 @@ mod test {
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
-    use aruna_core::structs::{Actor, AuthContext, Permission, RealmId};
+    use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -183,7 +184,7 @@ mod test {
                 realm_id,
                 actor: actor.clone(),
                 group_id,
-                role: aruna_core::structs::Role {
+                role: aruna_core::structs::identity::auth::Role {
                     role_id: Ulid::generate(),
                     name: "public-read".to_string(),
                     permissions: HashMap::from([(
@@ -254,7 +255,7 @@ mod test {
                     realm_id,
                     actor: actor.clone(),
                     group_id,
-                    role: aruna_core::structs::Role {
+                    role: aruna_core::structs::identity::auth::Role {
                         role_id: Ulid::generate(),
                         name: name.to_string(),
                         permissions: HashMap::from([(
@@ -305,7 +306,7 @@ mod test {
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
 
         let realm_config = CreateRealmConfig {
-            actor: aruna_core::structs::Actor {
+            actor: aruna_core::structs::identity::auth::Actor {
                 node_id,
                 user_id: admin_id,
                 realm_id,
@@ -331,7 +332,7 @@ mod test {
         let user_id = UserId::local(Ulid::generate(), realm_id);
 
         let group_config = CreateGroupConfig {
-            actor: aruna_core::structs::Actor {
+            actor: aruna_core::structs::identity::auth::Actor {
                 node_id,
                 user_id,
                 realm_id,
@@ -346,7 +347,7 @@ mod test {
 
         // A group member has the required permission.
         let perm_config = CheckPermissionsConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id,
                 realm_id,
                 path_restrictions: None,
@@ -366,7 +367,7 @@ mod test {
 
         // A nonmember has no group permissions.
         let perm_config = CheckPermissionsConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id: UserId::local(Ulid::generate(), realm_id),
                 realm_id,
                 path_restrictions: None,
@@ -386,7 +387,7 @@ mod test {
 
         // A missing group is an error.
         let perm_config = CheckPermissionsConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id,
                 realm_id,
                 path_restrictions: None,
@@ -424,7 +425,7 @@ mod test {
         let _auth_doc = drive(add_user_operation, &context).await.unwrap();
 
         let mut perm_config = CheckPermissionsConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id: reader,
                 realm_id,
                 path_restrictions: None,
@@ -449,7 +450,7 @@ mod test {
         // A deny role overrides read permission.
         let denied_user = UserId::local(Ulid::generate(), realm_id);
         let add_role_input = AddRoleConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id,
                 realm_id,
                 path_restrictions: None,
@@ -462,7 +463,7 @@ mod test {
                 realm_id,
             },
             group_id,
-            role: aruna_core::structs::Role {
+            role: aruna_core::structs::identity::auth::Role {
                 role_id: Ulid::generate(),
                 name: "denied".to_string(),
                 permissions: HashMap::from([(
@@ -477,7 +478,7 @@ mod test {
         let _result = drive(add_role_operation, &context).await.unwrap();
 
         let perm_config = CheckPermissionsConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id: denied_user,
                 realm_id,
                 path_restrictions: None,
@@ -496,7 +497,7 @@ mod test {
 
         // A user without a realm role cannot read realm roles.
         let perm_config = CheckPermissionsConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id: denied_user,
                 realm_id,
                 path_restrictions: None,
@@ -510,7 +511,7 @@ mod test {
 
         // A realm administrator can write realm roles.
         let perm_config = CheckPermissionsConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id: admin_id,
                 realm_id,
                 path_restrictions: None,
@@ -551,7 +552,7 @@ mod test {
         let _auth_doc = drive(add_user_operation, &context).await.unwrap();
 
         let perm_config = CheckPermissionsConfig {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id: new_admin,
                 realm_id,
                 path_restrictions: None,

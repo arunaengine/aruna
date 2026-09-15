@@ -3,7 +3,8 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::structs::{AuthContext, RealmConfigDocument, RealmId, TokenClaims};
+use aruna_core::structs::identity::auth::{AuthContext, TokenClaims};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
@@ -300,7 +301,7 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::Actor;
+    use aruna_core::structs::identity::auth::Actor;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
 

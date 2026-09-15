@@ -9,7 +9,8 @@ use aruna_core::request_policy::{
     CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, PolicySession,
     RequestPolicy, policy_set_hash,
 };
-use aruna_core::structs::{AuthContext, RealmId};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{GroupId, TxnId};
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
@@ -393,7 +394,7 @@ impl PolicyRequestExtras {
 /// Builds the policy request for one authorized action.
 pub fn policy_request(
     path: &str,
-    permission: &aruna_core::structs::Permission,
+    permission: &aruna_core::structs::identity::auth::Permission,
     user: Option<&aruna_core::UserId>,
 ) -> PolicyRequest {
     PolicyRequest::basic(
@@ -409,7 +410,7 @@ pub fn policy_request(
 /// headers, and an already-parsed body.
 pub fn policy_request_with(
     path: &str,
-    permission: &aruna_core::structs::Permission,
+    permission: &aruna_core::structs::identity::auth::Permission,
     auth: Option<&AuthContext>,
     extras: PolicyRequestExtras,
 ) -> PolicyRequest {
@@ -430,11 +431,11 @@ pub fn policy_request_with(
     request
 }
 
-fn permission_label(permission: &aruna_core::structs::Permission) -> String {
+fn permission_label(permission: &aruna_core::structs::identity::auth::Permission) -> String {
     match permission {
-        aruna_core::structs::Permission::READ => "read".to_string(),
-        aruna_core::structs::Permission::WRITE => "write".to_string(),
-        aruna_core::structs::Permission::DENY => "deny".to_string(),
+        aruna_core::structs::identity::auth::Permission::READ => "read".to_string(),
+        aruna_core::structs::identity::auth::Permission::WRITE => "write".to_string(),
+        aruna_core::structs::identity::auth::Permission::DENY => "deny".to_string(),
     }
 }
 
@@ -526,7 +527,7 @@ mod tests {
         let extras = PolicyRequestExtras::operation("s3.PutObject");
         let request = policy_request_with(
             "/r/g/x/data/o",
-            &aruna_core::structs::Permission::WRITE,
+            &aruna_core::structs::identity::auth::Permission::WRITE,
             None,
             extras,
         );
@@ -604,13 +605,13 @@ mod tests {
     }
 
     async fn seed_realm(context: &DriverContext, realm_id: RealmId) {
-        let actor = aruna_core::structs::Actor {
+        let actor = aruna_core::structs::identity::auth::Actor {
             node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
             user_id: aruna_core::UserId::nil(realm_id),
             realm_id,
         };
         let config =
-            aruna_core::structs::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+            aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         let event = context
             .storage_handle
             .send_storage_effect(aruna_core::effects::StorageEffect::Write {

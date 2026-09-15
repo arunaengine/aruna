@@ -5,7 +5,7 @@
 use aruna_core::UserId;
 use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
 use aruna_core::id::NodeId;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ExecutionSpec, InputMode, InputSource, JobPayload, JobState, WorkspaceMode,
 };
 use thiserror::Error;
@@ -17,7 +17,7 @@ use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::api::load_realm_config;
 use crate::node::node_info::read_operator_drain;
 use crate::realm::mutate_placement::node_kind;
-use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Unfinished runs one status scan counts before it stops. A device queues its
 /// owner's work, not a realm's, so the count is bounded instead of paged.
@@ -331,11 +331,16 @@ mod tests {
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::structs::{
-        Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, InputSelection, NodeUrls, OutputDestination, OutputSelection,
-        RealmConfigDocument, RealmId, RealmNodeKind, VersionKey, WorkspaceMode,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::execution::job::{
+        InputSelection, OutputDestination, OutputSelection, WorkspaceMode,
+    };
+    use aruna_core::structs::storage::node_info::NodeUrls;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;

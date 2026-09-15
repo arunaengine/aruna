@@ -8,7 +8,9 @@ use aruna_core::id::DhtKeyId;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BlobLocationKey, RealmId, RoCrateLimits};
+use aruna_core::structs::storage::blob::BlobLocationKey;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -319,7 +321,7 @@ mod pure_tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    use aruna_core::structs::BackendRef;
+    use aruna_core::structs::storage::blob::BackendRef;
 
     fn location_key(seed: u8) -> Vec<u8> {
         BlobLocationKey::new([seed; 32], BackendRef::node_default()).to_bytes()

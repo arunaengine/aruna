@@ -11,7 +11,7 @@ use aruna_core::events::Event;
 use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
 };
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::{TaskEvent, TaskKey};
 use craqle::ActorId;
 use thiserror::Error;
@@ -282,7 +282,9 @@ mod tests {
         MetadataBatch, MetadataBatchSource, MetadataCrateRequest, MetadataEffect, MetadataEvent,
         MetadataGraphPolicy, MetadataRequestDurability,
     };
-    use aruna_core::structs::{MetadataRegistryRecord, PlacementRef, RealmId};
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::identity::realm::RealmId;
     use craqle::VectorClock;
     use std::sync::Arc;
     use ulid::Ulid;

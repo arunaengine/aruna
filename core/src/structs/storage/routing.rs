@@ -1,6 +1,7 @@
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::{BackendRef, CleanupStrategy, ResolvedBackend};
+use crate::structs::storage::blob::{BackendRef, ResolvedBackend};
+use crate::structs::storage::cleanup::CleanupStrategy;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -605,7 +606,7 @@ mod tests {
         StorageRoutingRule, resolve_backend, target_warnings, validate_rule_set,
         validate_storage_class, validate_tenant_rules, validate_tenant_target,
     };
-    use crate::structs::{BackendRef, ResolvedBackend};
+    use crate::structs::storage::blob::{BackendRef, ResolvedBackend};
     use std::collections::BTreeSet;
     use ulid::Ulid;
 

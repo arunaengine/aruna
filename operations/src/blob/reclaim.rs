@@ -10,10 +10,12 @@ use aruna_core::keyspaces::{
     GROUP_STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, CleanupStrategy,
-    GroupStorage, HashIndex, ReclaimCandidate, ReclaimCandidateKey, VersionKey,
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, HashIndex,
+    VersionKey,
 };
+use aruna_core::structs::storage::cleanup::{CleanupStrategy, ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId};
 use aruna_storage::StorageHandle;
@@ -792,7 +794,8 @@ impl Operation for ReclaimBlobOperation {
 mod tests {
     use super::*;
     use aruna_core::keyspaces::HASH_PATHS_INDEX_KEYSPACE;
-    use aruna_core::structs::{RealmId, UsageCounters, usage_backend_key, usage_hash_key};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -916,7 +919,7 @@ mod tests {
     }
 
     fn shard_of_hash() -> usize {
-        aruna_core::structs::shard_for_hash(&HASH)
+        aruna_core::structs::storage::usage::shard_for_hash(&HASH)
     }
 
     async fn add_alias(context: &DriverContext, version_id: Ulid, pins: bool) {
@@ -1259,7 +1262,7 @@ mod tests {
             backend_id,
             group_id: Ulid::from_bytes([2u8; 16]),
             name: "tenant".to_string(),
-            kind: aruna_core::structs::GroupBackendKind::S3,
+            kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
             public_config: HashMap::new(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,

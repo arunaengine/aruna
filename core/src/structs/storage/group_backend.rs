@@ -1,6 +1,6 @@
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::CleanupStrategy;
+use crate::structs::storage::cleanup::CleanupStrategy;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -120,8 +120,8 @@ impl GroupStorageSecret {
 mod tests {
     use super::{GroupBackendKind, GroupStorage, GroupStorageSecret};
     use crate::UserId;
-    use crate::structs::CleanupStrategy;
-    use crate::structs::RealmId;
+    use crate::structs::storage::cleanup::CleanupStrategy;
+    use crate::structs::identity::realm::RealmId;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;

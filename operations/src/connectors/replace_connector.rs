@@ -5,7 +5,9 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{SourceConnector, SourceConnectorKind, SourceConnectorSecret};
+use aruna_core::structs::execution::source_connector::{
+    SourceConnector, SourceConnectorKind, SourceConnectorSecret,
+};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -436,10 +438,9 @@ mod tests {
     use crate::staging::descriptor::build_source_binding;
     use aruna_core::effects::IterStart;
     use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
-    use aruna_core::structs::{
-        BlobVersion, ResolvedSourceAccess, SourceMetadata, StagingStrategy, VersionKey,
-        VersionSourceBinding,
-    };
+    use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+    use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+    use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
     use aruna_storage::storage;
     use tempfile::{TempDir, tempdir};
 

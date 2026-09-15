@@ -1,5 +1,5 @@
 use crate::errors::ConversionError;
-use crate::structs::BackendRef;
+use crate::structs::storage::blob::BackendRef;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 
@@ -93,7 +93,7 @@ impl ReclaimCandidate {
 #[cfg(test)]
 mod tests {
     use super::{CleanupStrategy, ReclaimCandidate, ReclaimCandidateKey};
-    use crate::structs::BackendRef;
+    use crate::structs::storage::blob::BackendRef;
     use std::time::SystemTime;
 
     #[test]

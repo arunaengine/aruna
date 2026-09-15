@@ -4,7 +4,7 @@ use std::str::FromStr;
 use ulid::Ulid;
 
 use crate::errors::ConversionError;
-use crate::structs::RealmId;
+use crate::structs::identity::realm::RealmId;
 use crate::types::Key;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -119,7 +119,7 @@ impl Default for UserId {
 #[cfg(test)]
 mod tests {
     use super::UserId;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
     use std::str::FromStr;
     use ulid::Ulid;
 

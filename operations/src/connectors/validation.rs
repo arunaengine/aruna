@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::endpoint_screening;
-use aruna_core::structs::{OFFERED_DIRECTORY_BUCKET, SourceConnectorKind};
+use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

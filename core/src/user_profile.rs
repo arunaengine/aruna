@@ -1,4 +1,4 @@
-use crate::structs::User;
+use crate::structs::identity::user::User;
 use std::collections::HashMap;
 
 pub const VISIBILITY_PREFIX: &str = "profile.visibility.";
@@ -44,7 +44,7 @@ impl User {
 mod tests {
     use super::*;
     use crate::UserId;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     #[test]

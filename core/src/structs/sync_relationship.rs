@@ -1,6 +1,6 @@
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::{ArunaArn, ArunaArnType};
+use crate::structs::storage::replication::{ArunaArn, ArunaArnType};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use ulid::Ulid;
@@ -134,7 +134,7 @@ pub fn sync_state_key(
     key: &str,
     version_id: Ulid,
 ) -> Result<Vec<u8>, ConversionError> {
-    let version_key = crate::structs::VersionKey::new(bucket, key, version_id).to_bytes()?;
+    let version_key = crate::structs::storage::blob::VersionKey::new(bucket, key, version_id).to_bytes()?;
     let mut key = Vec::with_capacity(16 + version_key.len());
     key.extend_from_slice(&relationship_id.to_bytes());
     key.extend_from_slice(&version_key);
@@ -153,7 +153,7 @@ fn validate_endpoint(arn: &ArunaArn, endpoint: &str) -> Result<(), ConversionErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
     use crate::{NodeId, UserId};
 
     fn test_node(seed: u8) -> NodeId {

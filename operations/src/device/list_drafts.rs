@@ -138,7 +138,7 @@ mod tests {
     use crate::driver::drive;
     use crate::tests::device::context;
     use aruna_core::UserId;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     #[tokio::test]

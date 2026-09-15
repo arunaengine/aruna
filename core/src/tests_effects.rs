@@ -1,11 +1,12 @@
 use crate::compute::ExecutionTargetId;
-use crate::structs::{JobRecordEnvelope, RealmId};
+use crate::structs::execution::job::JobRecordEnvelope;
+use crate::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
 /// Test fixture shared with the event frames: one signed output record whose
 /// encoded size grows with the output count and key width.
 pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::{
+    use crate::structs::execution::job::{
         ExecutionOutputRecord, JobFamilyRecord, JobId, OutputObject, OutputSet, SubmissionId,
     };
 
@@ -39,7 +40,8 @@ pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvel
 
 /// One signed launch whose encoded size grows with the executor-kind width.
 pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::{JobFamilyRecord, JobId, LaunchIntent, PlacementRef, SubmissionId};
+    use crate::structs::execution::job::{JobFamilyRecord, JobId, LaunchIntent, SubmissionId};
+    use crate::structs::placement::placement_record::PlacementRef;
 
     let secret = iroh::SecretKey::from_bytes(&[4u8; 32]);
     let record = JobFamilyRecord::Launch(Box::new(LaunchIntent {
@@ -69,7 +71,7 @@ pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
 
 /// One signed receipt whose encoded size grows with the executor-kind width.
 pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::{ExecutionReceipt, JobFamilyRecord, JobId, SubmissionId};
+    use crate::structs::execution::job::{ExecutionReceipt, JobFamilyRecord, JobId, SubmissionId};
 
     let secret = iroh::SecretKey::from_bytes(&[6u8; 32]);
     let record = JobFamilyRecord::Receipt(Box::new(ExecutionReceipt {

@@ -3,7 +3,8 @@ use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
 };
-use aruna_core::structs::{BlobVersion, BlobVersionState, SourceConnector, SourceConnectorSecret};
+use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
 use ulid::Ulid;
@@ -125,7 +126,7 @@ pub fn references_connector(version: &BlobVersion, connector_id: Ulid) -> bool {
 mod pure_tests {
     use super::*;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::{SourceConnector, SourceConnectorKind};
+    use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
     use std::collections::HashMap;
     use std::time::SystemTime;
 

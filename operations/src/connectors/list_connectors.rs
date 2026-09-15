@@ -1,7 +1,7 @@
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
-use aruna_core::structs::SourceConnector;
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -146,7 +146,7 @@ mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     use crate::driver::{DriverContext, drive};
-    use aruna_core::structs::SourceConnectorKind;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::tempdir;

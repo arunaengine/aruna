@@ -8,7 +8,8 @@ use crate::auth::request_policy::{
 };
 use crate::driver::{DriverContext, drive};
 use aruna_core::errors::{AuthorizationError, StorageError};
-use aruna_core::structs::{AuthContext, Permission, RealmId};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

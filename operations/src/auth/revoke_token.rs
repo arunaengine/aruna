@@ -18,7 +18,8 @@ use aruna_core::reducer::{
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{Actor, RealmConfigDocument};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -884,7 +885,8 @@ mod tests {
         DOCUMENT_SYNC_OUTBOX_KEYSPACE, TOKEN_REVOCATION_OUTBOX_INDEX_KEYSPACE,
     };
     use aruna_core::storage_entries::reducer_state_entry;
-    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::{Key, Value};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;

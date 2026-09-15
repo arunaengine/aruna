@@ -4,7 +4,7 @@
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
-use crate::structs::FileStat;
+use crate::structs::execution::offered_directory::FileStat;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -648,7 +648,7 @@ impl TryFrom<usize> for SyncPageLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
 
     fn base(fingerprint: &str, hash: u8, remote: Option<Ulid>) -> SyncBase {
         SyncBase {

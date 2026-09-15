@@ -7,7 +7,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
 use aruna_core::metadata::{AuthToken, MetadataError};
-use aruna_core::structs::{Actor, AuthContext, RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structured_id::StructuredId;
 use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
@@ -508,7 +509,7 @@ mod tests {
     use crate::tests::device::context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use std::sync::Arc;
     use ulid::Ulid;
 

@@ -3,9 +3,9 @@ use crate::admin_documents::{
     AdminRoleDefinition,
 };
 use crate::reducer::*;
-use crate::structs::{
-    Actor, MetadataReplicationConfig, OidcProviderConfig, Permission, RealmDiscoveryConfig,
-    RealmId, RealmNodeKind,
+use crate::structs::identity::auth::{Actor, Permission};
+use crate::structs::identity::realm::{
+    MetadataReplicationConfig, OidcProviderConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind,
 };
 use crate::types::{GroupId, RoleId};
 use crate::{NodeId, UserId};

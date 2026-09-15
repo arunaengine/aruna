@@ -18,10 +18,11 @@ use aruna_core::keyspaces::{
     DEVICE_MANAGEMENT_URL_KEYSPACE, DEVICE_REALM_MARKER_KEYSPACE, GROUP_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, NodeInfoDocument, RealmConfigDocument,
-    RealmId, SyncRefusal,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::SyncRefusal;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, Value};
 use rand::seq::SliceRandom;
@@ -689,7 +690,7 @@ async fn write_batch(context: &Arc<DriverContext>, writes: Vec<(String, Key, Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{RealmNodeKind, TokenRevocation};
+    use aruna_core::structs::identity::realm::{RealmNodeKind, TokenRevocation};
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

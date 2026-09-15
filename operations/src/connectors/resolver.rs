@@ -6,11 +6,12 @@ use aruna_core::errors::SourceResolutionError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::OFFERED_DIRECTORY_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{
-    OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory, ResolvedSourceAccess,
-    ResolvedSourceConnector, SourceConnector, SourceConnectorKind, StagingStrategy,
-    VersionSourceBinding,
+use aruna_core::structs::execution::offered_directory::{
+    OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
+use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, ResolvedSourceConnector};
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use ulid::Ulid;
@@ -357,7 +358,7 @@ pub fn resolve_inline_access(
     build_source_access(kind, public_config, Some(secret_config), "", None, true)
 }
 
-pub(crate) fn secret_fingerprint(secret: &aruna_core::structs::SourceConnectorSecret) -> [u8; 16] {
+pub(crate) fn secret_fingerprint(secret: &aruna_core::structs::execution::source_connector::SourceConnectorSecret) -> [u8; 16] {
     let mut entries = secret.secret_config.iter().collect::<Vec<_>>();
     entries.sort_unstable_by_key(|(key, _)| *key);
 
@@ -643,8 +644,8 @@ mod tests {
     #[test]
     fn merges_descriptor_secret() {
         let source = VersionSourceBinding {
-            strategy: aruna_core::structs::StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::Ftp,
                 public_config: HashMap::from([
                     (
@@ -686,8 +687,8 @@ mod tests {
     #[test]
     fn rejects_invalid_selector() {
         let source = VersionSourceBinding {
-            strategy: aruna_core::structs::StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::Http,
                 public_config: HashMap::from([(
                     "endpoint".to_string(),
@@ -710,8 +711,8 @@ mod tests {
     #[test]
     fn accepts_persisted_selector() {
         let source = VersionSourceBinding {
-            strategy: aruna_core::structs::StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::Http,
                 public_config: HashMap::from([(
                     "endpoint".to_string(),
@@ -733,8 +734,8 @@ mod tests {
     #[test]
     fn requires_connector_id() {
         let source = VersionSourceBinding {
-            strategy: aruna_core::structs::StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::Http,
                 public_config: HashMap::from([(
                     "endpoint".to_string(),
@@ -805,9 +806,9 @@ mod tests {
         ));
 
         let source = build_source_binding(
-            aruna_core::structs::StagingStrategy::Reference,
+            aruna_core::structs::execution::staging::StagingStrategy::Reference,
             &created.connector,
-            &aruna_core::structs::SourceMetadata {
+            &aruna_core::structs::execution::source_access::SourceMetadata {
                 content_length: 42,
                 content_type: Some("text/plain".to_string()),
                 etag: None,
@@ -884,7 +885,7 @@ mod tests {
         let origin = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::ArunaNative,
                 public_config: HashMap::from([(
                     ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
@@ -923,7 +924,7 @@ mod tests {
         let origin = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::ArunaNative,
                 public_config: HashMap::new(),
                 source_path: "source-bucket/data.txt".to_string(),
@@ -943,7 +944,7 @@ mod tests {
     fn offered_binding(bucket: &str, connector_id: Option<Ulid>) -> VersionSourceBinding {
         VersionSourceBinding {
             strategy: StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::LocalDirectory,
                 public_config: HashMap::from([(
                     OFFERED_DIRECTORY_BUCKET.to_string(),

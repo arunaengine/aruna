@@ -7,10 +7,11 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
-use aruna_core::structs::{
-    BackendLocation, CopyOrigin, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState,
-    NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementPolicyError, PlacementPolicyRef, VersionKey,
+use aruna_core::structs::storage::blob::{
+    BackendLocation, CopyOrigin, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState, VersionKey,
 };
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -377,11 +378,13 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
-    use aruna_core::structs::CopyOrigin;
-    use aruna_core::structs::{
+    use aruna_core::structs::storage::blob::CopyOrigin;
+    use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
-        ManagedCopyState, NodeSubjectRecord, PlacementPolicyRef, PlacementSubject, VersionKey,
+        ManagedCopyState, VersionKey,
     };
+    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
@@ -813,10 +816,10 @@ mod pure_tests {
 mod driver_tests {
     use super::{CopyRegistration, ManagedCopyError, register_effect, scan_effect, version_scope};
     use crate::driver::{DriverContext, drive};
-    use crate::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-    use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-    use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-    use crate::s3::put_object::{
+    use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+    use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+    use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+    use crate::s3::object::put::{
         PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
     };
     use aruna_blob::blob::BlobHandler;
@@ -829,11 +832,14 @@ mod driver_tests {
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{
+    use aruna_core::structs::storage::blob::{
         Backend, BackendConfig, BackendRef, BlobVersion, ManagedCopyKey, ManagedCopyQuarantine,
-        ManagedCopyRecord, ManagedCopyState, NODE_SUBJECT_KEY, NodeSubjectRecord,
-        PlacementPolicyRef, PlacementSubject, RealmId, RoutingSnapshot, VersionKey,
+        ManagedCopyRecord, ManagedCopyState, VersionKey,
     };
+    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::GroupId;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;

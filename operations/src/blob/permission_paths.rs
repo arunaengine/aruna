@@ -3,7 +3,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::HashIndex;
+use aruna_core::structs::storage::blob::HashIndex;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -244,7 +244,8 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::HASH_PATHS_INDEX_KEYSPACE;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{HashIndex, RealmId};
+    use aruna_core::structs::storage::blob::HashIndex;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;

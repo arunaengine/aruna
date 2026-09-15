@@ -1,6 +1,7 @@
 use crate::NodeId;
 use crate::errors::ConversionError;
-use crate::structs::{AuthContext, JobId};
+use crate::structs::identity::auth::AuthContext;
+use crate::structs::execution::job::JobId;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 

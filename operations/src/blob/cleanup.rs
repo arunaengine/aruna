@@ -9,11 +9,16 @@ use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
     S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, COMPLETION_DEADLINE_MS,
-    GroupStorage, MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus, RealmId,
-    RoCrateLimits, WriteOwner,
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
 };
+use aruna_core::structs::storage::multipart::{
+    COMPLETION_DEADLINE_MS, MultipartPart, MultipartPartKey, MultipartUpload,
+    MultipartUploadStatus,
+};
+use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use tracing::{error, warn};
@@ -22,7 +27,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
-use crate::s3::abort_upload::{AbortUploadInput, AbortUploadOperation};
+use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -462,9 +467,10 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
-    use aruna_core::structs::{
-        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, RoCrateLimits, WriteOwner,
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
     };
+    use aruna_core::structs::execution::job::RoCrateLimits;
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -486,7 +492,7 @@ mod tests {
     }
 
     fn delete_work() -> Vec<u8> {
-        let realm_id = aruna_core::structs::RealmId::from_bytes([3u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([3u8; 32]);
         BlobCleanupWork::DeleteBlob {
             location: BackendLocation {
                 backend: BackendRef::node_default(),

@@ -1,7 +1,8 @@
 use aruna_core::UserId;
 use aruna_core::auth::valid_token_lifetime;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{NodeCapabilities, RealmId, SessionRef, TokenClaims};
+use aruna_core::structs::identity::auth::{NodeCapabilities, SessionRef, TokenClaims};
+use aruna_core::structs::identity::realm::RealmId;
 use base64::Engine;
 use chrono::Months;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -165,7 +166,10 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{NodeCapabilities, RealmId, SessionKind, SessionRef, TokenClaims};
+    use aruna_core::structs::identity::auth::{
+        NodeCapabilities, SessionKind, SessionRef, TokenClaims,
+    };
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
