@@ -6,8 +6,8 @@ use super::*;
 use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use crate::jobs::store::{
-    ClaimOutcome, claim_job, insert_job, put_crate_status, read_attempt_control,
-    record_attempt_started, set_cancel_requested,
+    ClaimOutcome, claim_job, handoff_external_attempt, insert_job, put_crate_status,
+    read_attempt_control, record_attempt_started, set_cancel_requested,
 };
 use crate::jobs::workflow::workspace::mint_workspace_credential;
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
@@ -16,8 +16,8 @@ use aruna_compute::ExecutorRegistry;
 use aruna_compute::session::{EndReason, Session};
 use aruna_core::UserId;
 use aruna_core::compute::{
-    AttemptPhase, AttemptStatus, CancelEvidence, LogLimits, LogTails, NOBODY, NetworkAccess,
-    ReconcileEvidence, StagingMode, TaskOutput, TaskSpec, UserSpec,
+    AdoptableEvidence, AttemptPhase, AttemptStatus, CancelEvidence, LogLimits, LogTails, NOBODY,
+    NetworkAccess, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, UserSpec,
 };
 use aruna_core::structs::{
     FIRST_GRANTABLE_HANDLE, JobErrorKind, JobResultPayload, JobState, MAX_RESULT_MESSAGE_BYTES,
@@ -48,6 +48,8 @@ enum StubReconcile {
     NotFound,
     Unavailable,
     Waiting,
+    Pending,
+    Adopted,
 }
 
 struct StubBackend {
@@ -59,6 +61,9 @@ struct StubBackend {
     logs_fail: AtomicBool,
     cancel_lost: AtomicBool,
     cancels: AtomicUsize,
+    reconcile_started: Notify,
+    image_started: Notify,
+    image_stall: AtomicBool,
 }
 
 impl StubBackend {
@@ -72,6 +77,9 @@ impl StubBackend {
             logs_fail: AtomicBool::new(false),
             cancel_lost: AtomicBool::new(false),
             cancels: AtomicUsize::new(0),
+            reconcile_started: Notify::new(),
+            image_started: Notify::new(),
+            image_stall: AtomicBool::new(false),
         })
     }
 }
@@ -92,6 +100,10 @@ impl ExecutorBackend for StubBackend {
         _image: &str,
         _cancel: &CancellationToken,
     ) -> Result<String, BackendError> {
+        if self.image_stall.load(Ordering::Relaxed) {
+            self.image_started.notify_one();
+            std::future::pending::<()>().await;
+        }
         Ok(
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
@@ -173,6 +185,20 @@ impl ExecutorBackend for StubBackend {
                 ReconcileEvidence::Unavailable(BackendError::Unavailable("down".to_string()))
             }
             StubReconcile::Waiting => ReconcileEvidence::Absent,
+            StubReconcile::Pending => {
+                self.reconcile_started.notify_one();
+                std::future::pending::<ReconcileEvidence>().await
+            }
+            StubReconcile::Adopted => ReconcileEvidence::Adoptable(AdoptableEvidence {
+                status: AttemptStatus {
+                    phase: AttemptPhase::Running,
+                    backend_ref: "attempt".to_string(),
+                    started_at_ms: Some(1),
+                    finished_at_ms: None,
+                    detail: None,
+                },
+                resume: ResumePoint::Observe,
+            }),
         }
     }
     async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
@@ -1285,4 +1311,176 @@ async fn stored_site_starts() {
             .await
             .is_ok()
     );
+}
+
+/// A claimed external execution exactly as `run_execution_job` receives it,
+/// with a context that resolves `backend`.
+async fn claimed_execution(
+    storage: &StorageHandle,
+    backend: Arc<StubBackend>,
+) -> (
+    Arc<DriverContext>,
+    aruna_net::NetHandle,
+    JobRecord,
+    ulid::Ulid,
+) {
+    let (context, net) = net_context(storage.clone()).await;
+    let mut context = context;
+    Arc::get_mut(&mut context).unwrap().compute_handle =
+        Some(Arc::new(ExecutorRegistry::new().with_backend(backend)));
+
+    let job_id = job_id();
+    let record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(execution_spec()),
+        UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+        node_id(7),
+        1,
+        1,
+        None,
+    );
+    insert_job(storage, &record).await.unwrap();
+    let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node_id(7), 2).await.unwrap()
+    else {
+        panic!("claim failed");
+    };
+    let token = claimed.claim.as_ref().unwrap().claim_token;
+    (context, net, claimed, token)
+}
+
+/// Rotate or release the claim so the running heartbeat's next renewal loses
+/// the token: a recorded intent rotates it, a still-staging job is released.
+async fn lose_claim(storage: &StorageHandle, job_id: JobId, token: ulid::Ulid) -> JobRecord {
+    handoff_external_attempt(storage, job_id, token, unix_timestamp_millis())
+        .await
+        .unwrap();
+    let taken_over = read_job_record(storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        taken_over
+            .claim
+            .as_ref()
+            .is_none_or(|claim| claim.claim_token != token),
+        "the stored claim must no longer match the run's token"
+    );
+    taken_over
+}
+
+// The reconciliation select may consume the heartbeat's completion when the
+// claim is lost; polling the finished handle again panics and must not adopt.
+#[tokio::test]
+async fn lost_claim_consumes_heartbeat() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let backend = StubBackend::new(StubReconcile::Pending);
+    let (ctx, net, record, token) = claimed_execution(&storage, backend.clone()).await;
+    let job_id = record.job_id;
+
+    let run = tokio::spawn(run_execution_job(ctx, record, CancellationToken::new()));
+    backend.reconcile_started.notified().await;
+    assert_eq!(backend.submits.lock().unwrap().len(), 1);
+    let taken_over = lose_claim(&storage, job_id, token).await;
+
+    // The heartbeat notices the rotated token at its next real interval; the
+    // claim-loss path must consume that completion exactly once.
+    tokio::time::timeout(Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000), run)
+        .await
+        .expect("the heartbeat completion must be consumed exactly once")
+        .expect("the workflow task must not panic");
+
+    let after = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, taken_over, "a lost claim must not be written");
+    assert_eq!(after.state, JobState::Ready);
+    assert!(after.result.is_none());
+    assert_eq!(
+        backend.submits.lock().unwrap().len(),
+        1,
+        "recovery must not submit again"
+    );
+    net.shutdown().await;
+}
+
+// Recovery's adoption verdict starts supervision; the still-pending heartbeat
+// is stopped and awaited once before the adopted attempt is supervised.
+#[tokio::test]
+async fn recovery_wins_adoption() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let backend = StubBackend::new(StubReconcile::Adopted);
+    backend.logs_fail.store(true, Ordering::Relaxed);
+    let (ctx, net, record, _token) = claimed_execution(&storage, backend.clone()).await;
+    let job_id = record.job_id;
+
+    Box::pin(run_execution_job(ctx, record, CancellationToken::new())).await;
+
+    let stored = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(stored.state, JobState::Ready, "the adopted attempt ran");
+    assert!(stored.started_at_ms.is_some());
+    assert_eq!(
+        backend.submits.lock().unwrap().len(),
+        1,
+        "adoption must not submit again"
+    );
+    net.shutdown().await;
+}
+
+// A lease renewal failure ends the run while preparation is still pending; the
+// lost claim must not be written to or submitted to.
+#[tokio::test]
+async fn heartbeat_failure_stops_run() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let backend = StubBackend::new(StubReconcile::NotFound);
+    backend.image_stall.store(true, Ordering::Relaxed);
+    let (ctx, net, record, token) = claimed_execution(&storage, backend.clone()).await;
+    let job_id = record.job_id;
+
+    let run = tokio::spawn(run_execution_job(ctx, record, CancellationToken::new()));
+    backend.image_started.notified().await;
+    let taken_over = lose_claim(&storage, job_id, token).await;
+
+    tokio::time::timeout(Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000), run)
+        .await
+        .expect("a lost claim ends the run")
+        .expect("the workflow task must not panic");
+
+    let after = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, taken_over, "a lost claim must not be written");
+    assert_eq!(after.state, JobState::Queued);
+    assert!(backend.submits.lock().unwrap().is_empty());
+    net.shutdown().await;
+}
+
+// A cancellation seen by reconciliation stops the heartbeat once and
+// terminalizes without adopting the ambiguous attempt.
+#[tokio::test]
+async fn cancellation_skips_adoption() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let backend = StubBackend::new(StubReconcile::Pending);
+    let (ctx, net, record, _token) = claimed_execution(&storage, backend.clone()).await;
+    let job_id = record.job_id;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    Box::pin(run_execution_job(ctx, record, cancel)).await;
+
+    let stored = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert_eq!(backend.submits.lock().unwrap().len(), 1);
+    net.shutdown().await;
 }
