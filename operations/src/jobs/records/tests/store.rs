@@ -12,9 +12,9 @@ use crate::jobs::records::admit::Admission;
 use crate::jobs::records::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::tests::fixtures::records::{Family, REALM};
+use crate::tests::records::{Family, REALM};
 
-use crate::tests::fixtures::records::context as fixture;
+use crate::tests::records::context as fixture;
 
 async fn append(
     context: &DriverContext,
@@ -121,8 +121,8 @@ async fn keeps_attempt_state() {
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;
     let mut logical = aruna_core::structs::JobRecord::new(
         family.job_id,
-        aruna_core::structs::JobPayload::Execution(crate::tests::fixtures::records::payload()),
-        crate::tests::fixtures::records::user(),
+        aruna_core::structs::JobPayload::Execution(crate::tests::records::payload()),
+        crate::tests::records::user(),
         family.holder.public(),
         1_000,
         1_000,

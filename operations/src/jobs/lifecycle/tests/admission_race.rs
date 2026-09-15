@@ -19,7 +19,7 @@ use crate::jobs::lifecycle::target::commit_receipt;
 use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::{iter_prefix_page, read_job_record};
-use crate::tests::fixtures::records::{Family, REALM, context};
+use crate::tests::records::{Family, REALM, context};
 
 pub(super) fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {

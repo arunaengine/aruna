@@ -487,14 +487,14 @@ impl JobsRuntime {
     /// the in-process ones and route external attempts to the reconcile hook,
     /// since a blind requeue would double-run; a restart costs them no attempt.
     pub async fn recover_stale_jobs(&self, storage: &StorageHandle) -> Result<usize, String> {
-        self.recover_stale_jobs_until(storage, &CancellationToken::new(), || false)
+        self.recover_until_stopped(storage, &CancellationToken::new(), || false)
             .await
     }
 
     /// [`Self::recover_stale_jobs`] with an explicit stop and a required-service
     /// failure probe. Both are checked before every recovery unit, so an accepted
     /// stop or observed failure lets the current unit finish and admits no next.
-    pub async fn recover_stale_jobs_until(
+    pub async fn recover_until_stopped(
         &self,
         storage: &StorageHandle,
         stop: &CancellationToken,
@@ -1794,7 +1794,7 @@ mod tests {
     // An observed required-service failure while one recovery unit is pending
     // lets that unit finish and admits no next one.
     #[tokio::test]
-    async fn recovery_stops_between_units() {
+    async fn stop_between_units() {
         let (_dir, storage) = temp_storage();
         let reconciler = Arc::new(BlockingReconciler::default());
         let runtime = JobsRuntime::with_reconciler(reconciler.clone());
@@ -1809,7 +1809,7 @@ mod tests {
 
         let stop = CancellationToken::new();
         let failure = std::sync::atomic::AtomicBool::new(false);
-        let recover = runtime.recover_stale_jobs_until(&storage, &stop, || {
+        let recover = runtime.recover_until_stopped(&storage, &stop, || {
             failure.load(std::sync::atomic::Ordering::SeqCst)
         });
         tokio::pin!(recover);
@@ -1837,7 +1837,7 @@ mod tests {
 
     // A stop accepted before recovery admits no recovery unit at all.
     #[tokio::test]
-    async fn pre_cancelled_recovery_start_no_unit() {
+    async fn cancel_before_recovery() {
         let (_dir, storage) = temp_storage();
         let recorder = Arc::new(RecordingReconciler::default());
         let runtime = JobsRuntime::with_reconciler(recorder.clone());
@@ -1850,7 +1850,7 @@ mod tests {
         stop.cancel();
         assert_eq!(
             runtime
-                .recover_stale_jobs_until(&storage, &stop, || false)
+                .recover_until_stopped(&storage, &stop, || false)
                 .await
                 .unwrap(),
             0

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::lifecycle::witness::{suppressed, witness_rank};
 use crate::replication::bao_read::BaoReadError;
-use crate::tests::fixtures::records::{Family, node};
+use crate::tests::records::{Family, node};
 
 #[test]
 fn ranks_witnesses() {

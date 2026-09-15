@@ -13,13 +13,11 @@ use super::executor::{JobContext, JobRunOutcome};
 use super::store::{put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
-use crate::realm::get_config::GetRealmConfigOperation;
-use crate::replication::queue::{
-    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
-};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::staging::head_source::{HeadStagingSourceInput, HeadStagingSourceOperation};
-use crate::staging::list_source::{ListStagingSourceInput, ListStagingSourceOperation};
+use crate::realm::get_config::GetConfigOperation;
+use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
+use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
+use crate::staging::list_source::{ListStagingInput, ListStagingOperation};
 use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};
 use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
 
@@ -334,7 +332,7 @@ async fn stage_item(
     // Without the replication seed peers never learn about the staged version, so
     // the item is not a success.
     if let Err(error) = drive(
-        QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+        LiveVersionOperation::new(LiveVersionInput {
             local_node_id: spec.node_id,
             auth_context: spec.auth_context.clone(),
             bucket: spec.bucket.clone(),
@@ -366,7 +364,7 @@ async fn inspect_item(
 ) -> Result<u64, ItemFailure> {
     let _ = ensure_item_permission(ctx, spec, item).await?;
     drive(
-        HeadStagingSourceOperation::new(HeadStagingSourceInput {
+        HeadSourceOperation::new(HeadSourceInput {
             group_id: spec.group_id,
             connector_id: spec.connector_id,
             source_path: item.source_path.clone(),
@@ -422,9 +420,9 @@ async fn load_live_bucket(
     ctx: &JobContext,
     bucket: &str,
 ) -> Result<aruna_core::structs::BucketInfo, ItemFailure> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await {
+    match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
         Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketInfoError::NotFound) => Err(ItemFailure::Stage(
+        Err(GetBucketError::NotFound) => Err(ItemFailure::Stage(
             "destination bucket no longer exists".to_string(),
         )),
         Err(error) => Err(ItemFailure::System(error.to_string())),
@@ -436,7 +434,7 @@ async fn current_quota(
     spec: &StagingJobSpec,
 ) -> Result<Option<u64>, ItemFailure> {
     drive(
-        GetRealmConfigOperation::new(spec.auth_context.realm_id),
+        GetConfigOperation::new(spec.auth_context.realm_id),
         &ctx.driver,
     )
     .await
@@ -468,7 +466,7 @@ async fn discover_page(
         return Err(ItemFailure::Denied("permission denied".to_string()));
     }
     drive(
-        ListStagingSourceOperation::new(ListStagingSourceInput {
+        ListStagingOperation::new(ListStagingInput {
             group_id: spec.group_id,
             connector_id: spec.connector_id,
             source_path: directory.source_path.clone(),

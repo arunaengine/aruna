@@ -4,7 +4,7 @@ use aruna_core::structs::{AttemptIntent, JobError, JobErrorKind, JobId, JobResul
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{JobMutationError, authorize_cleanup, record_attempt_tombstone};
 use crate::driver::drive;
-use crate::s3::revoke_access::{RevokeUserAccessError, RevokeUserAccessOperation};
+use crate::s3::revoke_access::{RevokeUserError, RevokeUserOperation};
 
 pub async fn run_terminal_cleanup(
     ctx: &JobContext,
@@ -22,12 +22,12 @@ pub async fn run_terminal_cleanup(
 
 async fn revoke_credential(ctx: &JobContext, access_key: &str) -> Result<(), JobError> {
     match drive(
-        RevokeUserAccessOperation::new(access_key.to_string()),
+        RevokeUserOperation::new(access_key.to_string()),
         &ctx.driver,
     )
     .await
     {
-        Ok(_) | Err(RevokeUserAccessError::NotFound) => Ok(()),
+        Ok(_) | Err(RevokeUserError::NotFound) => Ok(()),
         Err(error) => Err(revoke_error(error)),
     }
 }
@@ -93,7 +93,7 @@ async fn cleanup_attempt(
 
 /// A live workspace key outlives a terminal job, so no revocation failure is
 /// treated as permanent: the only proven-final case is `NotFound`, already Ok.
-fn revoke_error(error: RevokeUserAccessError) -> JobError {
+fn revoke_error(error: RevokeUserError) -> JobError {
     JobError::retryable(format!("workspace credential revoke failed: {error}"))
 }
 
@@ -148,8 +148,8 @@ mod tests {
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::{insert_job, record_attempt_intent};
     use crate::s3::create_bucket::CreateBucketOperation;
-    use crate::s3::get_access::GetUserAccessOperation;
-    use crate::s3::get_bucket::GetBucketInfoOperation;
+    use crate::s3::get_access::GetAccessOperation;
+    use crate::s3::get_bucket::GetBucketOperation;
 
     struct StubBackend {
         kind: ExecutorKind,
@@ -425,7 +425,7 @@ mod tests {
     }
 
     async fn bucket_exists(ctx: &JobContext, bucket: &str) -> bool {
-        drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver)
+        drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver)
             .await
             .is_ok()
     }
@@ -536,10 +536,10 @@ mod tests {
                 JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
             ));
         }
-        let stored = drive(GetUserAccessOperation::new(access.access_key), &ctx.driver).await;
+        let stored = drive(GetAccessOperation::new(access.access_key), &ctx.driver).await;
         assert!(matches!(
             stored,
-            Err(crate::s3::get_access::GetUserAccessError::NotFound)
+            Err(crate::s3::get_access::GetAccessError::NotFound)
         ));
     }
 

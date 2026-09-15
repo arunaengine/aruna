@@ -15,7 +15,7 @@ use crate::jobs::records::{
     AppendRecordConfig, AppendRecordOperation, FamilyReadError, RecordOrigin, load_family_complete,
     load_kind_complete,
 };
-use crate::tests::fixtures::records::{Family, REALM, context};
+use crate::tests::records::{Family, REALM, context};
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
 async fn seed(ctx: &DriverContext, family: &Family) -> (LogicalJobSpec, ExecutionReceipt) {

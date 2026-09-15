@@ -26,7 +26,7 @@ use super::load_kind_complete;
 use super::rows::PendingNeed;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
-use crate::metadata::protocol::{JobRecordPageReply, MetadataTransportMessage};
+use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
 use crate::node::dashboard::notify_dashboard_change;
 use crate::placement::holds_placement;
@@ -173,7 +173,7 @@ async fn fetch_records(
             };
         match reply {
             MetadataTransportMessage::ForwardedJobRecordPage {
-                result: Ok(JobRecordPageReply { page, next }),
+                result: Ok(JobPageReply { page, next }),
             } => {
                 return JobRecordEvent::Fetched {
                     holder: *holder,
@@ -426,7 +426,7 @@ async fn serve_page(
     context: &Arc<DriverContext>,
     peer: NodeId,
     request: PageRequest,
-) -> Result<JobRecordPageReply, ServeError> {
+) -> Result<JobPageReply, ServeError> {
     let authority = holder_view(context, peer, request.placement).await?;
     let derived = authority
         .config
@@ -464,7 +464,7 @@ async fn serve_page(
         warn!(error = %error, "Job record page exceeds its bound");
         ServeError::Unavailable
     })?;
-    Ok(JobRecordPageReply {
+    Ok(JobPageReply {
         page,
         next: audit.next,
     })
@@ -507,7 +507,7 @@ pub async fn serve_launch_offer(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::tests::fixtures::records::Family;
+    use crate::tests::records::Family;
     use aruna_core::structs::JobRecordBody;
 
     #[test]

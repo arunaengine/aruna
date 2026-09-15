@@ -40,8 +40,8 @@ use crate::jobs::service::{mint_local_job, validate_execution};
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::{MetadataAuthToken, MetadataWritePeerError};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::metadata::{AuthToken, WritePeerError};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
@@ -99,7 +99,7 @@ pub async fn submit_external_job(
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<String>,
     retention_ms: u64,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
     validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
     store_workspace(&mut spec, workspace_mode, workspace_bucket.clone())
@@ -170,12 +170,12 @@ async fn forward_device(
     request: SubmissionRequest,
     config: &RealmConfigDocument,
     local: NodeId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
     reference_shape(&request.spec)?;
     // A device may not assert an auth context for the realm, so the caller's own
     // bearer token is the only credential a holder accepts from it.
-    if !matches!(auth_token, Some(MetadataAuthToken::Bearer(_))) {
+    if !matches!(auth_token, Some(AuthToken::Bearer(_))) {
         return Err(SubmitJobError::AuthorityDenied);
     }
     let identity = request.identity().map_err(SubmitJobError::Conversion)?;
@@ -322,16 +322,16 @@ async fn resolve_inputs(
     }
     let mut output_policies = Vec::new();
     for bucket in buckets {
-        let info = match drive(GetBucketInfoOperation::new(bucket.clone()), context).await {
+        let info = match drive(GetBucketOperation::new(bucket.clone()), context).await {
             Ok(info) => info,
-            Err(GetBucketInfoError::NotFound) => {
+            Err(GetBucketError::NotFound) => {
                 return Err(SubmitJobError::InvalidWorkspace(format!(
                     "s3://{bucket}: output bucket not found"
                 )));
             }
             Err(
-                error @ (GetBucketInfoError::ConversionError(_)
-                | GetBucketInfoError::InvalidStateEvent { .. }),
+                error @ (GetBucketError::ConversionError(_)
+                | GetBucketError::InvalidStateEvent { .. }),
             ) => {
                 return Err(SubmitJobError::InvalidWorkspace(format!(
                     "s3://{bucket}: {error}"
@@ -639,7 +639,7 @@ async fn forward_once(
     identity: &RequestIdentity,
     view: &FamilyView,
     local: NodeId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<AcceptedSubmission, SubmitJobError> {
     let (Some(metadata), Some(auth_token)) = (context.metadata_handle.as_ref(), auth_token) else {
         return Err(SubmitJobError::PlacementUnavailable(
@@ -703,7 +703,7 @@ async fn forward_once(
 pub async fn serve_submission(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     submission_id: SubmissionId,
     request: SubmissionRequest,
 ) -> MetadataTransportMessage {
@@ -714,7 +714,7 @@ pub async fn serve_submission(
 async fn admit_forwarded(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     submission_id: SubmissionId,
     mut request: SubmissionRequest,
 ) -> Result<SubmissionAck, SubmissionRefusal> {
@@ -725,8 +725,8 @@ async fn admit_forwarded(
         .authorize_write_peer(peer, Some(auth_token))
         .await
         .map_err(|error| match error {
-            MetadataWritePeerError::Unauthorized => SubmissionRefusal::Unauthorized,
-            MetadataWritePeerError::Unavailable(_) => SubmissionRefusal::Unavailable,
+            WritePeerError::Unauthorized => SubmissionRefusal::Unauthorized,
+            WritePeerError::Unavailable(_) => SubmissionRefusal::Unavailable,
         })?;
     // The forwarded request keeps its own submitter: a relay may not re-attribute
     // a plan to another caller, and the identity is recomputed from that caller.
@@ -863,7 +863,7 @@ mod tests {
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
-    use crate::tests::fixtures::records::{node, payload};
+    use crate::tests::records::{node, payload};
 
     fn family(seed: u8) -> JobFamilyId {
         JobFamilyId {

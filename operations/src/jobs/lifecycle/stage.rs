@@ -9,7 +9,7 @@ use aruna_core::structs::{
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::blob::holders::GetBlobHoldersOperation;
+use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -37,7 +37,7 @@ pub async fn stage_remote_input(
         .ok_or_else(|| JobError::retryable("remote staging needs a net handle"))?;
     let realm_id = *net.realm_id();
     let mut holders = drive(
-        GetBlobHoldersOperation::new(blake3, realm_id, net.node_id()),
+        GetHoldersOperation::new(blake3, realm_id, net.node_id()),
         context,
     )
     .await

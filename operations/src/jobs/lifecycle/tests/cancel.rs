@@ -23,7 +23,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::store::read_job_record;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::tests::fixtures::records::{Family, REALM, user};
+use crate::tests::records::{Family, REALM, user};
 
 fn auth(user_id: UserId) -> AuthContext {
     AuthContext {
