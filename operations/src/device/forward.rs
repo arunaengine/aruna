@@ -47,15 +47,15 @@ use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::authorize::ForwardAuthError;
-use super::authorize::authorize_forwarded_caller;
-use super::authorize::authorize_write;
-use super::authorize::is_sync_eligible;
-use super::authorize::peer_acts_for;
-use super::replay::HeldRecordError;
-use super::replay::held_record;
-use super::routing::holds_metadata_id;
-use super::transport::reject;
+use crate::forward::authorize::ForwardAuthError;
+use crate::forward::authorize::authorize_forwarded_caller;
+use crate::forward::authorize::authorize_write;
+use crate::forward::authorize::is_sync_eligible;
+use crate::forward::authorize::peer_acts_for;
+use crate::forward::replay::HeldRecordError;
+use crate::forward::replay::held_record;
+use crate::forward::routing::holds_metadata_id;
+use crate::forward::transport::reject;
 use std::str::FromStr;
 
 pub(super) const DEVICE_GROUP_SCAN_PAGE: usize = 10_000;
@@ -469,4 +469,103 @@ pub(super) async fn run_device_batch(
                 SyncRefusal::Unavailable
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEVICE_GROUP_SCAN_PAGE;
+    use super::device_group_documents;
+    use crate::driver::DriverContext;
+    use aruna_core::NodeId;
+    use aruna_core::UserId;
+    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::Event;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::structs::Actor;
+    use aruna_core::structs::Group;
+    use aruna_core::structs::GroupAuthorizationDocument;
+    use aruna_core::structs::RealmId;
+    use std::sync::Arc;
+    use ulid::Ulid;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[tokio::test]
+    async fn finds_later_membership() {
+        // The only matching group sits just beyond the legacy default page.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let member = UserId::local(Ulid::from_bytes([8u8; 16]), realm_id);
+        let other = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
+        let actor = Actor {
+            node_id: node(1),
+            user_id: member,
+            realm_id,
+        };
+        let mut writes = Vec::with_capacity((DEVICE_GROUP_SCAN_PAGE + 1) * 2);
+        for seed in 1..=DEVICE_GROUP_SCAN_PAGE + 1 {
+            let group_id = Ulid::from(seed as u128);
+            let group = Group {
+                display_name: seed.to_string(),
+                group_id,
+                realm_id,
+                roles: Default::default(),
+                owner: other,
+            };
+            let authorization = GroupAuthorizationDocument::default_group_doc(
+                if seed > DEVICE_GROUP_SCAN_PAGE {
+                    member
+                } else {
+                    other
+                },
+                realm_id,
+                group_id,
+            );
+            for (target, bytes) in [
+                (
+                    DocumentSyncTarget::Group { group_id },
+                    group.to_bytes(&actor).unwrap(),
+                ),
+                (
+                    DocumentSyncTarget::GroupAuthorization { group_id },
+                    authorization.to_bytes(&actor).unwrap(),
+                ),
+            ] {
+                writes.push((
+                    target.storage_keyspace().to_string(),
+                    target.storage_key(),
+                    aruna_core::types::Value::from(bytes),
+                ));
+            }
+        }
+        assert!(matches!(
+            context
+                .storage_handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+
+        let documents = device_group_documents(&context, member).await;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].group.group_id,
+            Ulid::from((DEVICE_GROUP_SCAN_PAGE + 1) as u128)
+        );
+    }
 }

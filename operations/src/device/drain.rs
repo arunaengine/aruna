@@ -18,11 +18,12 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
     CreateMetadataDocumentPayload, mint_forward_document,
 };
-use crate::metadata::forward::{MetadataWriteError, apply_batch_routed, route_metadata_create};
+use crate::metadata::forward::{apply_batch_routed, route_metadata_create};
 use crate::metadata::update_document::UpdateMetadataDocumentError;
 use crate::placement::process_placements::load_realm_config;
 
@@ -510,7 +511,7 @@ mod tests {
         MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishState, publish_entry,
     };
     use crate::driver::{DriverContext, drive};
-    use crate::metadata::forward::MetadataWriteError;
+    use crate::forward::transport::MetadataWriteError;
     use crate::tests::fixtures::device::context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
