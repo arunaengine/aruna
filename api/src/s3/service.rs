@@ -2,6 +2,8 @@
 
 mod attributes;
 mod bucket;
+mod copy;
+mod listing;
 mod multipart;
 mod object;
 mod response;
@@ -12,13 +14,14 @@ use self::attributes::{
 };
 use self::response::{attach_reference_refresh, object_metadata, reference_metadata_refresh};
 
-use self::multipart::parse_upload_marker;
-use self::object::{
-    ObjectListingPage, copy_source_conditions, marker_continuation_token, next_marker_for,
-    object_range_request,
+use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
+use self::listing::{
+    ObjectListingPage, list_parts_output, list_uploads_output, marker_continuation_token,
+    next_marker_for,
 };
+use self::multipart::parse_upload_marker;
+use self::object::object_range_request;
 
-use crate::s3::auth::map_authorize_error;
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, checksum_mode_enabled, encode_checksums,
     parse_completion_checksum, parse_upload_checksum, validate_delete_checksum,
@@ -33,9 +36,9 @@ use crate::s3::scope::SubpathScope;
 use crate::s3::server::DeleteObjectsBody;
 use crate::s3::util::{
     checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
-    map_checksum_algorithm, map_checksum_type, parse_checksum_hint, parse_checksum_type,
-    parse_completed_part, parse_copy_source, parse_part_number, parse_source_range,
-    parse_upload_id, parse_version_id, reject_sse, validate_object_key,
+    map_checksum_type, parse_checksum_hint, parse_checksum_type, parse_completed_part,
+    parse_copy_source, parse_part_number, parse_source_range, parse_upload_id, parse_version_id,
+    reject_sse, validate_object_key,
 };
 use aruna_compute::session::TouchedObject;
 use aruna_core::NodeId;
@@ -49,7 +52,6 @@ use aruna_core::structs::{
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
-use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{
     DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
@@ -91,7 +93,7 @@ use aruna_operations::s3::list_uploads::{
     ListMultipartUploadsInput as LMUI, ListMultipartUploadsOperation,
 };
 use aruna_operations::s3::list_versions::{
-    ListObjectVersionsInput as LOVI, ListObjectVersionsItem, ListObjectVersionsOperation,
+    ListObjectVersionsInput as LOVI, ListObjectVersionsOperation,
 };
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
@@ -102,25 +104,23 @@ use aruna_operations::sync::sync_relationship::SyncRelationshipDirection;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
-    ChecksumType, CommonPrefix, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopyPartResult, CreateBucketInput,
-    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-    DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerEntry,
+    ChecksumType, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput,
+    CopyObjectOutput, CreateBucketInput, CreateBucketOutput, CreateMultipartUploadInput,
+    CreateMultipartUploadOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketInput,
+    DeleteBucketOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput,
     DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, ETag,
     EncodingType, Error as S3DeleteError, GetBucketCorsInput, GetBucketCorsOutput,
     GetBucketLocationInput, GetBucketLocationOutput, GetBucketReplicationInput,
     GetBucketReplicationOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
     GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, Initiator,
-    ListBucketsInput, ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
+    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
+    ListBucketsOutput, ListMultipartUploadsInput, ListMultipartUploadsOutput,
     ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
     ListObjectsV2Input, ListObjectsV2Output, ListPartsInput, ListPartsOutput, MetadataDirective,
-    MultipartUpload as S3MultipartUpload, ObjectVersion, ObjectVersionStorageClass, Owner, Part,
-    PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
-    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectInput, PutObjectOutput,
-    StorageClass, StreamingBlob, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput,
-    UploadPartOutput,
+    Owner, PutBucketCorsInput, PutBucketCorsOutput, PutBucketReplicationInput,
+    PutBucketReplicationOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
+    PutObjectInput, PutObjectOutput, StreamingBlob, UploadPartCopyInput, UploadPartCopyOutput,
+    UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -695,7 +695,6 @@ impl S3 for ArunaS3Service {
             "Received PUT Request"
         );
 
-        // Extract access check result
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
@@ -836,25 +835,6 @@ impl S3 for ArunaS3Service {
 
         let (source_bucket, source_key, source_version_id) =
             parse_copy_source(&req.input.copy_source)?;
-
-        // The auth layer only authorized the destination path; authorize the source here.
-        let source_bucket_info = drive(
-            GetBucketInfoOperation::new(source_bucket.clone()),
-            &self.state,
-        )
-        .await
-        .map_err(IntoS3Error::into_s3_error)?;
-
-        let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
-            AuthContext {
-                user_id: user_access.user_identity,
-                realm_id: user_access.user_identity.realm_id,
-                path_restrictions: user_access.path_restrictions.clone(),
-                session: None,
-            }
-        } else {
-            AuthContext::anonymous(self.realm_id)
-        };
         let source_extras = req
             .extensions
             .get::<PolicyRequestExtras>()
@@ -863,22 +843,14 @@ impl S3 for ArunaS3Service {
                 error!(error = "Missing policy context");
                 s3_error!(InternalError, "Missing policy context")
             })?;
-        authorize(
-            &self.state,
-            self.realm_id,
-            &source_auth_context,
-            &object_permission_path(
-                self.realm_id,
-                source_bucket_info.group_id,
-                self.node_id,
-                &source_bucket,
+        let (source_bucket_info, source_auth_context) = self
+            .authorize_copy_source(
+                &user_access,
+                source_bucket.clone(),
                 &source_key,
-            ),
-            &Permission::READ,
-            source_extras,
-        )
-        .await
-        .map_err(map_authorize_error)?;
+                source_extras,
+            )
+            .await?;
 
         let dest_bucket = req.input.bucket.clone();
         let dest_key = req.input.key.clone();
@@ -956,35 +928,7 @@ impl S3 for ArunaS3Service {
         )
         .await;
 
-        let e_tag = match &result.location {
-            Some(location) => location
-                .hashes
-                .get(HASH_MD5)
-                .map(|value| ETag::Strong(hex::encode(value))),
-            None => result.source_metadata.as_ref().map(reference_etag),
-        };
-        let mut copy_object_result = CopyObjectResult {
-            e_tag,
-            last_modified: Some(result.created_at.into()),
-            ..Default::default()
-        };
-        if let Some(location) = &result.location {
-            copy_object_result.apply_checksums(encode_checksums(
-                &location.hashes,
-                ChecksumSelection::AllStored,
-                ChecksumType::from_static(ChecksumType::FULL_OBJECT),
-                None,
-            ));
-        }
-
-        Ok(S3Response::new(CopyObjectOutput {
-            copy_object_result: Some(copy_object_result),
-            version_id: Some(result.version_id.to_string()),
-            copy_source_version_id: result
-                .source_version_id
-                .map(|version_id| version_id.to_string()),
-            ..Default::default()
-        }))
+        Ok(copy_object_response(result))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1186,25 +1130,6 @@ impl S3 for ArunaS3Service {
 
         let (source_bucket, source_key, source_version_id) =
             parse_copy_source(&req.input.copy_source)?;
-
-        // The auth layer only authorized the destination path; authorize the source here.
-        let source_bucket_info = drive(
-            GetBucketInfoOperation::new(source_bucket.clone()),
-            &self.state,
-        )
-        .await
-        .map_err(IntoS3Error::into_s3_error)?;
-
-        let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
-            AuthContext {
-                user_id: user_access.user_identity,
-                realm_id: user_access.user_identity.realm_id,
-                path_restrictions: user_access.path_restrictions.clone(),
-                session: None,
-            }
-        } else {
-            AuthContext::anonymous(self.realm_id)
-        };
         let source_extras = req
             .extensions
             .get::<PolicyRequestExtras>()
@@ -1213,22 +1138,14 @@ impl S3 for ArunaS3Service {
                 error!(error = "Missing policy context");
                 s3_error!(InternalError, "Missing policy context")
             })?;
-        authorize(
-            &self.state,
-            self.realm_id,
-            &source_auth_context,
-            &object_permission_path(
-                self.realm_id,
-                source_bucket_info.group_id,
-                self.node_id,
-                &source_bucket,
+        let (source_bucket_info, source_auth_context) = self
+            .authorize_copy_source(
+                &user_access,
+                source_bucket.clone(),
                 &source_key,
-            ),
-            &Permission::READ,
-            source_extras,
-        )
-        .await
-        .map_err(map_authorize_error)?;
+                source_extras,
+            )
+            .await?;
 
         let result = upload_part_copy(
             &self.state,
@@ -1251,29 +1168,7 @@ impl S3 for ArunaS3Service {
         .await
         .map_err(IntoS3Error::into_s3_error)?;
 
-        let mut copy_part_result = CopyPartResult {
-            e_tag: result
-                .part_location
-                .hashes
-                .get(HASH_MD5)
-                .map(|value| ETag::Strong(hex::encode(value))),
-            last_modified: Some(result.part_location.created_at.into()),
-            ..Default::default()
-        };
-        copy_part_result.apply_checksums(encode_checksums(
-            &result.part_location.hashes,
-            ChecksumSelection::AllStored,
-            ChecksumType::from_static(ChecksumType::FULL_OBJECT),
-            None,
-        ));
-
-        Ok(S3Response::new(UploadPartCopyOutput {
-            copy_part_result: Some(copy_part_result),
-            copy_source_version_id: result
-                .source_version_id
-                .map(|version_id| version_id.to_string()),
-            ..Default::default()
-        }))
+        Ok(copy_part_response(result))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1436,7 +1331,6 @@ impl S3 for ArunaS3Service {
             "Received GET Request"
         );
 
-        // Extract access check result
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
@@ -1793,75 +1687,7 @@ impl S3 for ArunaS3Service {
         .await
         .map_err(IntoS3Error::into_s3_error)?;
 
-        let checksum_algorithm = result
-            .upload
-            .checksum_hint
-            .as_ref()
-            .and_then(|hint| hint.algorithm)
-            .and_then(map_checksum_algorithm);
-        let checksum_type = result
-            .upload
-            .checksum_hint
-            .as_ref()
-            .map(|hint| map_checksum_type(hint.checksum_type));
-        let initiator = Some(Initiator {
-            display_name: None,
-            id: Some(result.upload.created_by.to_string()),
-        });
-        let owner = Some(Owner {
-            display_name: None,
-            id: Some(result.upload.group_id.to_string()),
-        });
-
-        let parts = result
-            .parts
-            .into_iter()
-            .map(|part| {
-                let checksums = encode_checksums(
-                    &part.location.hashes,
-                    ChecksumSelection::AllStored,
-                    ChecksumType::from_static(ChecksumType::FULL_OBJECT),
-                    None,
-                );
-                Part {
-                    part_number: Some(i32::from(part.part_number)),
-                    size: Some(part.location.blob_size as i64),
-                    last_modified: Some(part.created_at.into()),
-                    e_tag: part
-                        .location
-                        .hashes
-                        .get(HASH_MD5)
-                        .map(|value| ETag::Strong(hex::encode(value))),
-                    checksum_crc32: checksums.checksum_crc32,
-                    checksum_crc32c: checksums.checksum_crc32c,
-                    checksum_crc64nvme: checksums.checksum_crc64nvme,
-                    checksum_md5: None,
-                    checksum_sha1: checksums.checksum_sha1,
-                    checksum_sha256: checksums.checksum_sha256,
-                    checksum_sha512: None,
-                    checksum_xxhash128: None,
-                    checksum_xxhash3: None,
-                    checksum_xxhash64: None,
-                }
-            })
-            .collect();
-
-        Ok(S3Response::new(ListPartsOutput {
-            bucket: Some(req.input.bucket),
-            key: Some(req.input.key),
-            upload_id: Some(req.input.upload_id),
-            part_number_marker: req.input.part_number_marker,
-            max_parts: Some(i32::try_from(max_parts).unwrap_or(i32::MAX)),
-            is_truncated: Some(result.is_truncated),
-            next_part_number_marker: result.next_part_number_marker.map(i32::from),
-            parts: Some(parts),
-            initiator,
-            owner,
-            storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
-            checksum_algorithm,
-            checksum_type,
-            ..Default::default()
-        }))
+        Ok(list_parts_output(req.input, max_parts, result))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1907,71 +1733,7 @@ impl S3 for ArunaS3Service {
         .await
         .map_err(IntoS3Error::into_s3_error)?;
 
-        let url_encoded = req
-            .input
-            .encoding_type
-            .as_ref()
-            .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
-        let encode_field = |value: String| -> String {
-            if url_encoded {
-                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
-            } else {
-                value
-            }
-        };
-
-        let uploads: Vec<S3MultipartUpload> = result
-            .uploads
-            .into_iter()
-            .map(|record| S3MultipartUpload {
-                key: Some(encode_field(record.key)),
-                upload_id: Some(record.upload_id.to_string()),
-                initiated: Some(record.created_at.into()),
-                initiator: Some(Initiator {
-                    display_name: None,
-                    id: Some(record.created_by.to_string()),
-                }),
-                owner: Some(Owner {
-                    display_name: None,
-                    id: Some(record.group_id.to_string()),
-                }),
-                storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
-                checksum_algorithm: record
-                    .checksum_hint
-                    .as_ref()
-                    .and_then(|hint| hint.algorithm)
-                    .and_then(map_checksum_algorithm),
-                checksum_type: record
-                    .checksum_hint
-                    .as_ref()
-                    .map(|hint| map_checksum_type(hint.checksum_type)),
-            })
-            .collect();
-        let common_prefixes: Vec<CommonPrefix> = result
-            .common_prefixes
-            .into_iter()
-            .map(|prefix| CommonPrefix {
-                prefix: Some(encode_field(prefix)),
-            })
-            .collect();
-
-        Ok(S3Response::new(ListMultipartUploadsOutput {
-            bucket: Some(bucket),
-            prefix: prefix.map(&encode_field),
-            delimiter: delimiter.map(&encode_field),
-            key_marker: key_marker.map(&encode_field),
-            upload_id_marker: requested_upload_id_marker,
-            max_uploads: Some(i32::try_from(max_uploads).unwrap_or(i32::MAX)),
-            is_truncated: Some(result.is_truncated),
-            next_key_marker: result.next_key_marker.map(&encode_field),
-            next_upload_id_marker: result
-                .next_upload_id_marker
-                .map(|upload_id| upload_id.to_string()),
-            uploads: Some(uploads),
-            common_prefixes: Some(common_prefixes),
-            encoding_type: req.input.encoding_type,
-            ..Default::default()
-        }))
+        Ok(list_uploads_output(req.input, max_uploads, result))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -2027,99 +1789,7 @@ impl S3 for ArunaS3Service {
         .await
         .map_err(IntoS3Error::into_s3_error)?;
 
-        let owner = Some(Owner {
-            display_name: None,
-            id: Some(group_id.to_string()),
-        });
-        let url_encoded = req
-            .input
-            .encoding_type
-            .as_ref()
-            .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
-        let encode_field = |value: String| -> String {
-            if url_encoded {
-                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
-            } else {
-                value
-            }
-        };
-
-        let mut versions = Vec::new();
-        let mut delete_markers = Vec::new();
-        for item in result.items {
-            match item {
-                ListObjectVersionsItem::Version {
-                    key,
-                    version_id,
-                    is_latest,
-                    location,
-                    source_metadata,
-                    created_at,
-                } => {
-                    let response_fields = self.build_response_fields(
-                        location.as_ref(),
-                        None,
-                        None,
-                        source_metadata.as_ref(),
-                        None,
-                        Some(created_at),
-                    );
-                    versions.push(ObjectVersion {
-                        key: Some(encode_field(key)),
-                        version_id: Some(version_id.to_string()),
-                        is_latest: Some(is_latest),
-                        last_modified: Some(created_at.into()),
-                        e_tag: response_fields.e_tag,
-                        size: response_fields.content_length,
-                        owner: owner.clone(),
-                        storage_class: Some(ObjectVersionStorageClass::from_static(
-                            ObjectVersionStorageClass::STANDARD,
-                        )),
-                        ..Default::default()
-                    });
-                }
-                ListObjectVersionsItem::DeleteMarker {
-                    key,
-                    version_id,
-                    is_latest,
-                    created_at,
-                } => {
-                    delete_markers.push(DeleteMarkerEntry {
-                        key: Some(encode_field(key)),
-                        version_id: Some(version_id.to_string()),
-                        is_latest: Some(is_latest),
-                        last_modified: Some(created_at.into()),
-                        owner: owner.clone(),
-                    });
-                }
-            }
-        }
-        let common_prefixes: Vec<CommonPrefix> = result
-            .common_prefixes
-            .into_iter()
-            .map(|prefix| CommonPrefix {
-                prefix: Some(encode_field(prefix)),
-            })
-            .collect();
-
-        Ok(S3Response::new(ListObjectVersionsOutput {
-            name: Some(bucket),
-            prefix: prefix.map(&encode_field),
-            delimiter: delimiter.map(&encode_field),
-            key_marker: key_marker.map(&encode_field),
-            version_id_marker: requested_version_id_marker,
-            max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
-            is_truncated: Some(result.is_truncated),
-            next_key_marker: result.next_key_marker.map(&encode_field),
-            next_version_id_marker: result
-                .next_version_id_marker
-                .map(|version_id| version_id.to_string()),
-            versions: Some(versions),
-            delete_markers: Some(delete_markers),
-            common_prefixes: Some(common_prefixes),
-            encoding_type: req.input.encoding_type,
-            ..Default::default()
-        }))
+        Ok(self.list_versions_output(req.input, group_id, max_keys, result))
     }
 
     #[tracing::instrument(err, skip(self, req))]
