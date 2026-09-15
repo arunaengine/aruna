@@ -487,10 +487,27 @@ impl JobsRuntime {
     /// the in-process ones and route external attempts to the reconcile hook,
     /// since a blind requeue would double-run; a restart costs them no attempt.
     pub async fn recover_stale_jobs(&self, storage: &StorageHandle) -> Result<usize, String> {
+        self.recover_stale_jobs_until(storage, &CancellationToken::new(), || false)
+            .await
+    }
+
+    /// [`Self::recover_stale_jobs`] with an explicit stop and a required-service
+    /// failure probe. Both are checked before every recovery unit, so an accepted
+    /// stop or observed failure lets the current unit finish and admits no next.
+    pub async fn recover_stale_jobs_until(
+        &self,
+        storage: &StorageHandle,
+        stop: &CancellationToken,
+        should_stop: impl Fn() -> bool,
+    ) -> Result<usize, String> {
+        let stopped = || stop.is_cancelled() || should_stop();
         let now_ms = unix_timestamp_millis();
         let mut job_ids = Vec::new();
         let mut start_after = None;
         loop {
+            if stopped() {
+                break;
+            }
             let (values, next) = iter_prefix_page(
                 storage,
                 JOB_SCHEDULE_INDEX_KEYSPACE,
@@ -513,6 +530,9 @@ impl JobsRuntime {
 
         let mut recovered = 0;
         for job_id in job_ids {
+            if stopped() {
+                break;
+            }
             let Some(record) = read_job_record(storage, job_id, None).await? else {
                 continue;
             };
@@ -1734,6 +1754,108 @@ mod tests {
         assert_eq!(after.attempts, 0, "the restart spends no attempt");
         assert!(after.claim.is_some());
         assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
+    }
+
+    fn external_running_record(job_id: JobId) -> JobRecord {
+        let mut record = probe_record(job_id, 3, 0, None);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: Ulid::generate(),
+            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+        });
+        record.attempt_intent = Some(AttemptIntent {
+            attempt_no: 1,
+            external_name: "attempt".to_string(),
+            executor_kind: "docker".to_string(),
+            pinned_image: "alpine@sha256:digest".to_string(),
+            attempt_epoch: 1,
+        });
+        record
+    }
+
+    #[derive(Default)]
+    struct BlockingReconciler {
+        seen: std::sync::Mutex<Vec<JobId>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalReconciler for BlockingReconciler {
+        async fn reconcile_lost_attempt(&self, _storage: &StorageHandle, record: JobRecord) {
+            self.seen.lock().unwrap().push(record.job_id);
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    // An observed required-service failure while one recovery unit is pending
+    // lets that unit finish and admits no next one.
+    #[tokio::test]
+    async fn recovery_stops_between_units() {
+        let (_dir, storage) = temp_storage();
+        let reconciler = Arc::new(BlockingReconciler::default());
+        let runtime = JobsRuntime::with_reconciler(reconciler.clone());
+        let first = JobId::from_bytes([0xE9; 16]);
+        let second = JobId::from_bytes([0xEA; 16]);
+        insert_job(&storage, &external_running_record(first))
+            .await
+            .unwrap();
+        insert_job(&storage, &external_running_record(second))
+            .await
+            .unwrap();
+
+        let stop = CancellationToken::new();
+        let failure = std::sync::atomic::AtomicBool::new(false);
+        let recover = runtime.recover_stale_jobs_until(&storage, &stop, || {
+            failure.load(std::sync::atomic::Ordering::SeqCst)
+        });
+        tokio::pin!(recover);
+        tokio::select! {
+            _ = &mut recover => panic!("recovery must hold on the first recovery unit"),
+            _ = reconciler.entered.notified() => {}
+        }
+        assert_eq!(reconciler.seen.lock().unwrap().len(), 1);
+
+        // The failure arrives while the unit is still pending; releasing it
+        // finishes that unit and the loop starts no next one.
+        failure.store(true, std::sync::atomic::Ordering::SeqCst);
+        reconciler.release.notify_one();
+        assert_eq!(recover.await.unwrap(), 0);
+        let processed = reconciler.seen.lock().unwrap().clone();
+        assert_eq!(processed.len(), 1, "no next recovery unit after the stop");
+        let unprocessed = if processed[0] == first { second } else { first };
+        let untouched = read_job_record(&storage, unprocessed, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.state, JobState::Running);
+        assert!(untouched.claim.is_some());
+    }
+
+    // A stop accepted before recovery admits no recovery unit at all.
+    #[tokio::test]
+    async fn pre_cancelled_recovery_start_no_unit() {
+        let (_dir, storage) = temp_storage();
+        let recorder = Arc::new(RecordingReconciler::default());
+        let runtime = JobsRuntime::with_reconciler(recorder.clone());
+        let job_id = JobId::from_bytes([0xEB; 16]);
+        insert_job(&storage, &external_running_record(job_id))
+            .await
+            .unwrap();
+
+        let stop = CancellationToken::new();
+        stop.cancel();
+        assert_eq!(
+            runtime
+                .recover_stale_jobs_until(&storage, &stop, || false)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(recorder.seen.lock().unwrap().is_empty());
     }
 
     struct AdoptingReconciler;

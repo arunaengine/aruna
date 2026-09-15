@@ -367,7 +367,7 @@ impl OperationsTaskHandler {
         // A User-kind device registers no holdership: the realm refuses its DHT
         // puts. An unreadable config is bootstrap, which registers.
         if matches!(
-            crate::metadata::forward::is_user_origin(
+            crate::forward::routing::is_user_origin(
                 &self.context,
                 *net_handle.realm_id(),
                 net_handle.node_id()
@@ -482,7 +482,7 @@ impl OperationsTaskHandler {
         if holders.is_empty() {
             return false;
         }
-        match crate::metadata::forward::relay_admin_event(
+        match crate::realm::forward::relay_admin_event(
             &self.context,
             &holders,
             record.target.clone(),
@@ -714,8 +714,7 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 // A User-kind device is DHT read-only and never publishes
                 // presence. An unreadable config is bootstrap, which announces.
                 if matches!(
-                    crate::metadata::forward::is_user_origin(&self.context, realm_id, node_id)
-                        .await,
+                    crate::forward::routing::is_user_origin(&self.context, realm_id, node_id).await,
                     Ok(true)
                 ) {
                     return;
