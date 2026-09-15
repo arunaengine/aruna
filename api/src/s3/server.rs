@@ -11,7 +11,7 @@ mod response;
 pub(crate) use body::DeleteObjectsBody;
 
 use self::activity::{
-    ActiveRequestGuard, ConnectionActivity, should_watch_stream_idle, spawn_response_watch,
+    ActiveRequestGuard, ConnectionActivity, should_watch_idle, spawn_response_watch,
     spawn_stream_idle, spawn_total_deadline,
 };
 use self::classification::RequestClassification;
@@ -31,7 +31,7 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
 use aruna_core::structs::{BucketCorsConfiguration, RealmId, RoCrateLimits};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use futures_core::future::BoxFuture;
 use http::{Method, Request};
 use hyper::body::Incoming;
@@ -371,7 +371,7 @@ impl PreparedRequest {
 
         // Stage: watch the request body for idleness; an ended body has nothing
         // left to protect.
-        if should_watch_stream_idle(self.body_end) {
+        if should_watch_idle(self.body_end) {
             spawn_stream_idle(&self.stream);
         } else {
             self.stream.stop();
@@ -973,14 +973,14 @@ impl Service<Request<Incoming>> for WrappingService {
 async fn load_bucket_cors(
     driver_ctx: Arc<DriverContext>,
     bucket: Option<String>,
-) -> Result<Option<BucketCorsConfiguration>, GetBucketInfoError> {
+) -> Result<Option<BucketCorsConfiguration>, GetBucketError> {
     let Some(bucket) = bucket else {
         return Ok(None);
     };
 
-    match drive(GetBucketInfoOperation::new(bucket), driver_ctx.as_ref()).await {
+    match drive(GetBucketOperation::new(bucket), driver_ctx.as_ref()).await {
         Ok(bucket_info) => Ok(bucket_info.cors_configuration),
-        Err(GetBucketInfoError::NotFound) => Ok(None),
+        Err(GetBucketError::NotFound) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -1208,7 +1208,7 @@ mod tests {
     // The handle reports how its accept loop ended, including cancellation and
     // panic, so supervision selects keep their named failure messages.
     #[tokio::test]
-    async fn exit_reports_stop_abort_and_panic() {
+    async fn exit_reports_cause() {
         let handle = |task| S3ServerHandle {
             task: Some(task),
             connections: TaskTracker::new(),
@@ -1231,7 +1231,7 @@ mod tests {
     // only after the connection children released, not merely after the accept
     // task was cancelled.
     #[tokio::test]
-    async fn forced_abort_waits_for_accepted_connections() {
+    async fn abort_awaits_connections() {
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
@@ -1286,7 +1286,7 @@ mod tests {
     // An expired phase deadline drops the wait future but not the owner: the
     // retained handle still aborts and awaits the active connection child.
     #[tokio::test(start_paused = true)]
-    async fn interrupted_wait_keeps_the_owner() {
+    async fn wait_keeps_owner() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 

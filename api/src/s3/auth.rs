@@ -14,11 +14,11 @@ use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::session::{
-    GetS3SessionOperation, S3SessionError, TouchS3SessionConfig, TouchS3SessionOperation,
+    GetS3Operation, S3SessionError, TouchS3Config, TouchS3Operation,
 };
 use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use http::{HeaderMap, Uri};
@@ -201,7 +201,7 @@ impl S3Access for AuthProvider {
 
         if let Some(token_hash) = session_token_hash {
             drive(
-                TouchS3SessionOperation::new(TouchS3SessionConfig {
+                TouchS3Operation::new(TouchS3Config {
                     access_key: access_key_id,
                     token_hash,
                     now,
@@ -445,10 +445,10 @@ impl AuthProvider {
                 "The Access Key Id you provided does not exist in our records."
             ));
         }
-        let operation = GetUserAccessOperation::new(access_key_id.to_string());
+        let operation = GetAccessOperation::new(access_key_id.to_string());
         match drive(operation, self.driver_ctx.as_ref()).await {
             Ok(user_access) => Ok(user_access),
-            Err(GetUserAccessError::NotFound) => Err(s3_error!(
+            Err(GetAccessError::NotFound) => Err(s3_error!(
                 InvalidAccessKeyId,
                 "The Access Key Id you provided does not exist in our records."
             )),
@@ -465,7 +465,7 @@ impl AuthProvider {
             ));
         }
         match drive(
-            GetS3SessionOperation::new(access_key_id.to_string()),
+            GetS3Operation::new(access_key_id.to_string()),
             self.driver_ctx.as_ref(),
         )
         .await
@@ -484,7 +484,7 @@ impl AuthProvider {
     /// Checks that the issuer proven by local decryption still belongs to this realm.
     async fn issuer_in_realm(&self, issued_by: &[u8; 32]) -> S3Result<bool> {
         let config = drive(
-            GetRealmConfigOperation::new(self.realm_id),
+            GetConfigOperation::new(self.realm_id),
             self.driver_ctx.as_ref(),
         )
         .await
@@ -498,10 +498,10 @@ impl AuthProvider {
     }
 
     async fn find_bucket_info(&self, bucket: &str) -> S3Result<Option<BucketInfo>> {
-        let operation = GetBucketInfoOperation::new(bucket.to_string());
+        let operation = GetBucketOperation::new(bucket.to_string());
         match drive(operation, self.driver_ctx.as_ref()).await {
             Ok(bucket_info) => Ok(Some(bucket_info)),
-            Err(GetBucketInfoError::NotFound) => Ok(None),
+            Err(GetBucketError::NotFound) => Ok(None),
             Err(_) => Err(s3_error!(InternalError, "Failed to query bucket")),
         }
     }

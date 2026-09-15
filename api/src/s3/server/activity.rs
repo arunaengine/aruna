@@ -1,10 +1,6 @@
-//! Connection, stream and total-lifetime activity tracking for the S3
-//! listener.
-//!
+//! Connection, stream and total-lifetime activity tracking for the S3 listener:
 //! [`ConnectionActivity`] only records progress and broadcasts generation
-//! changes. The small policy functions decide when a watcher may cancel, and
-//! the async adapters at the bottom tie those decisions to Tokio timers, so
-//! the request path itself needs no timer details.
+//! changes, while the policy functions and adapters decide when to cancel.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -216,7 +212,7 @@ pub(super) fn should_expire_total(activity: &ConnectionActivity) -> bool {
 
 /// An unread request body is watched for idleness; a body that already ended
 /// has no stall left to observe.
-pub(super) fn should_watch_stream_idle(body_end: bool) -> bool {
+pub(super) fn should_watch_idle(body_end: bool) -> bool {
     !body_end
 }
 
@@ -545,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn total_deadline_skips_finished() {
+    fn deadline_skips_finished() {
         let running = ConnectionActivity::default();
         assert!(should_expire_total(&running));
         running.cancel();
@@ -556,13 +552,13 @@ mod tests {
     }
 
     #[test]
-    fn idle_watch_skips_ended_body() {
-        assert!(!should_watch_stream_idle(true));
-        assert!(should_watch_stream_idle(false));
+    fn ended_body_unwatched() {
+        assert!(!should_watch_idle(true));
+        assert!(should_watch_idle(false));
     }
 
     #[test]
-    fn response_cancels_on_idle_or_deadline() {
+    fn response_cancel_policy() {
         let deadline = ConnectionActivity::default();
         assert!(should_cancel_response(true, &deadline));
         assert!(!should_cancel_response(false, &deadline));

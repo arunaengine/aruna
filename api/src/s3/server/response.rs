@@ -1,9 +1,6 @@
-//! Protocol responses and CORS answers of the S3 listener.
-//!
-//! These builders decide status codes, headers and bodies for requests that
-//! never reach the s3s service: rate limits, oversized bodies, invalid buckets,
-//! timeouts and CORS preflight. Keeping them here keeps those S3-specific
-//! shapes out of the shared REST/MCP layers.
+//! Protocol responses and CORS answers of the S3 listener. These builders decide
+//! status, headers, and bodies for requests that never reach the s3s service
+//! (rate limits, oversized bodies, invalid buckets, timeouts, preflight).
 
 use crate::cors::CorsConfig;
 use crate::s3::cors::{
@@ -185,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_matches_bucket_rule() {
+    fn preflight_bucket_rule() {
         let classification =
             classification(Method::OPTIONS, Some("https://portal.test"), Some("PUT"));
         let response = preflight_response(
@@ -207,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_bucket_refusal_is_forbidden() {
+    fn preflight_refusal_forbidden() {
         let classification =
             classification(Method::OPTIONS, Some("https://elsewhere.test"), Some("PUT"));
         let response = preflight_response(
@@ -220,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_falls_back_to_node_allowlist() {
+    fn preflight_allowlist_fallback() {
         let classification =
             classification(Method::OPTIONS, Some("https://portal.test"), Some("PUT"));
         let cors = CorsConfig::new(vec!["https://portal.test".to_string()]);
@@ -233,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn non_preflight_stays_untouched() {
+    fn skips_non_preflight() {
         let classification = classification(Method::PUT, Some("https://portal.test"), None);
         assert!(
             preflight_response(
@@ -246,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_response_uses_bucket_rule() {
+    fn bucket_cors_applies() {
         let classification = classification(Method::PUT, Some("https://portal.test"), None);
         let mut response = http::Response::new(s3s::Body::empty());
         apply_response_cors(

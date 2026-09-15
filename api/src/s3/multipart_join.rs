@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_operations::s3::complete_upload::CompleteMultipartUploadResult;
+use aruna_operations::s3::multipart::complete::CompleteUploadResult;
 use aruna_tasks::join_registry::{JoinRegistry, JoinWatch, await_joined};
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use ulid::Ulid;
@@ -15,7 +15,7 @@ const COMPLETION_RETENTION: Duration = Duration::from_secs(600);
 /// Bucket, object key and upload id: an upload id alone would let a request
 /// for another key join this completion and skip its own target validation.
 pub type CompletionKey = (String, String, Ulid);
-pub type CompletionOutcome = Arc<Result<CompleteMultipartUploadResult, CompletionFailure>>;
+pub type CompletionOutcome = Arc<Result<CompleteUploadResult, CompletionFailure>>;
 pub type CompletionRegistry = JoinRegistry<CompletionKey, CompletionOutcome>;
 
 pub fn completion_registry() -> CompletionRegistry {
