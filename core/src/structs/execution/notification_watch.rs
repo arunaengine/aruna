@@ -17,7 +17,7 @@ pub const NOTIFICATION_WATCH_INTEREST_ENTRY_CAP: usize = 1024;
 pub const NOTIFICATION_WATCH_INTEREST_BYTES_CAP: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DataWatchResourcePath<'a> {
+pub struct DataResourcePath<'a> {
     pub group_id: GroupId,
     pub node_id: NodeId,
     pub bucket: &'a str,
@@ -28,7 +28,7 @@ pub fn watch_resource_path(group_id: GroupId, node_id: NodeId, bucket: &str, key
     format!("s3/{group_id}/{node_id}/{bucket}/{key}")
 }
 
-pub fn parse_watch_path(path: &str) -> Option<DataWatchResourcePath<'_>> {
+pub fn parse_watch_path(path: &str) -> Option<DataResourcePath<'_>> {
     let mut segments = path.strip_prefix("s3/")?.splitn(4, '/');
     let raw_group_id = segments.next()?;
     let raw_node_id = segments.next()?;
@@ -43,7 +43,7 @@ pub fn parse_watch_path(path: &str) -> Option<DataWatchResourcePath<'_>> {
     {
         return None;
     }
-    Some(DataWatchResourcePath {
+    Some(DataResourcePath {
         group_id,
         node_id,
         bucket,
@@ -952,7 +952,7 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(
             parse_watch_path(&first),
-            Some(DataWatchResourcePath {
+            Some(DataResourcePath {
                 group_id,
                 node_id: first_node,
                 bucket: "bucket",
