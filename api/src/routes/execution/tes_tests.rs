@@ -1483,7 +1483,7 @@ async fn basic_scopes_tasks() {
     let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
         .await
         .unwrap();
-    let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
+    let page: TesTasksResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(page.tasks.len(), 1);
     assert_eq!(page.tasks[0].id, Some(visible_id.to_string()));
 }
@@ -1521,7 +1521,7 @@ async fn lists_zero_pagesize() {
     let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
         .await
         .unwrap();
-    let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
+    let page: TesTasksResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(page.tasks.len(), 1);
 }
 
@@ -1567,7 +1567,7 @@ async fn lists_derived_tags() {
     let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
         .await
         .unwrap();
-    let page: TesListTasksResponse = serde_json::from_slice(&body).unwrap();
+    let page: TesTasksResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(page.tasks.len(), 1);
     assert_eq!(page.tasks[0].id, Some(target.to_string()));
     assert_eq!(

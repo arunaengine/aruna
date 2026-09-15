@@ -32,16 +32,16 @@ fn conflict_is_retryable() {
     // conflict, not as a rejected configuration.
     use aruna_core::errors::StorageError;
 
-    let conflict = map_compute_error(SetRealmComputeError::StorageError(
+    let conflict = map_compute_error(SetComputeError::StorageError(
         StorageError::TransactionConflict,
     ));
     assert!(matches!(conflict, ServerError::Conflict(_)));
     assert!(matches!(
-        map_compute_error(SetRealmComputeError::RealmConfigNotFound),
+        map_compute_error(SetComputeError::RealmConfigNotFound),
         ServerError::NotFound
     ));
     assert!(matches!(
-        map_compute_error(SetRealmComputeError::InvalidCompute {
+        map_compute_error(SetComputeError::InvalidCompute {
             reason: "zero bandwidth".to_string()
         }),
         ServerError::BadRequestReason(_)
@@ -54,9 +54,7 @@ fn capacity_is_unavailable() {
     use aruna_core::errors::StorageError;
 
     assert!(matches!(
-        map_compute_error(SetRealmComputeError::StorageError(
-            StorageError::CleanupCapacity
-        )),
+        map_compute_error(SetComputeError::StorageError(StorageError::CleanupCapacity)),
         ServerError::ServiceUnavailableReason(_)
     ));
 }
