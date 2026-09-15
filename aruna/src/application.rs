@@ -391,26 +391,10 @@ async fn run_node_owned(
     let shutdown_complete = shutdown_outcome.complete();
 
     // The stores keep their files open until the shutdown sequence finished, so
-    // the owner's wipe erases the roots here.
+    // the owner's wipe erases the roots here, and only a completed sequence may
+    // reach the destructive purge.
     if let Some(wipe) = device_wipe.filter(|wipe| wipe.is_armed()) {
-        let failed = device_wipe::purge(wipe.roots());
-        // Only complete erasure reports wiped status. Remaining paths or unsupported stores
-        // use a different exit code so supervisors do not treat the device as erased.
-        // An incomplete sequence can still have owners writing behind the purge.
-        return Ok(
-            if wipe_succeeded(shutdown_complete, failed.len(), wipe.unsupported().len()) {
-                tracing::info!("Wiped this device on its owner's request");
-                ProcessOutcome::WipeComplete
-            } else {
-                tracing::error!(
-                    paths = failed.len(),
-                    backends = wipe.unsupported().join(","),
-                    shutdown_complete,
-                    "The device wipe did not erase everything this node stores"
-                );
-                ProcessOutcome::WipeIncomplete
-            },
-        );
+        return Ok(decide_wipe(&wipe, shutdown_complete, device_wipe::purge));
     }
 
     Ok(match (failure, shutdown_complete) {
@@ -418,6 +402,38 @@ async fn run_node_owned(
         (None, true) => ProcessOutcome::Stopped,
         (None, false) => ProcessOutcome::StoppedIncomplete,
     })
+}
+
+/// Decides the armed wipe: an unfinished shutdown declines the destructive
+/// purge and leaves the armed intent in place, so no unfinished owner is erased
+/// behind. A completed sequence purges exactly once and classifies the result.
+fn decide_wipe(
+    wipe: &device_wipe::DeviceWipe,
+    shutdown_complete: bool,
+    purge: impl FnOnce(&[std::path::PathBuf]) -> Vec<std::path::PathBuf>,
+) -> ProcessOutcome {
+    if !shutdown_complete {
+        tracing::error!(
+            backends = wipe.unsupported().join(","),
+            "The device wipe was declined because the shutdown sequence did not complete"
+        );
+        return ProcessOutcome::WipeIncomplete;
+    }
+    // Only complete erasure reports wiped status. Remaining paths or unsupported stores
+    // use a different exit code so supervisors do not treat the device as erased.
+    let failed = purge(wipe.roots());
+    if wipe_succeeded(shutdown_complete, failed.len(), wipe.unsupported().len()) {
+        tracing::info!("Wiped this device on its owner's request");
+        ProcessOutcome::WipeComplete
+    } else {
+        tracing::error!(
+            paths = failed.len(),
+            backends = wipe.unsupported().join(","),
+            shutdown_complete,
+            "The device wipe did not erase everything this node stores"
+        );
+        ProcessOutcome::WipeIncomplete
+    }
 }
 
 /// Only a sequence that released every owner and reported its persistence
@@ -602,6 +618,78 @@ mod pure_tests {
         assert!(!wipe_succeeded(false, 0, 0));
         assert!(!wipe_succeeded(true, 1, 0));
         assert!(!wipe_succeeded(true, 0, 1));
+    }
+
+    /// A purge boundary that records every invocation and answers with a fixed
+    /// failure list, so the decision is exercised without touching a filesystem.
+    #[derive(Default)]
+    struct RecordingPurge {
+        calls: std::cell::RefCell<Vec<Vec<std::path::PathBuf>>>,
+        failures: Vec<std::path::PathBuf>,
+    }
+
+    impl RecordingPurge {
+        fn purge(&self, roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+            self.calls.borrow_mut().push(roots.to_vec());
+            self.failures.clone()
+        }
+    }
+
+    // An unfinished shutdown must not reach the destructive call: the recorder
+    // stays empty, the roots are untouched, and the armed intent survives.
+    #[test]
+    fn wipe_declined_incomplete() {
+        let roots = vec![
+            std::path::PathBuf::from("/tmp/aruna-wipe-root-a"),
+            std::path::PathBuf::from("/tmp/aruna-wipe-root-b"),
+        ];
+        let wipe = device_wipe::DeviceWipe::new(roots, Vec::new());
+        wipe.arm();
+
+        let purge = RecordingPurge::default();
+        let outcome = decide_wipe(&wipe, false, |passed| purge.purge(passed));
+
+        assert_eq!(outcome, ProcessOutcome::WipeIncomplete);
+        assert!(
+            purge.calls.borrow().is_empty(),
+            "an unfinished shutdown must not purge the wipe roots"
+        );
+        assert!(wipe.is_armed(), "a declined wipe keeps its armed intent");
+    }
+
+    // After a completed sequence the purge runs exactly once with the wipe's
+    // roots, and the result distinguishes complete erasure from path failures
+    // and unsupported stores.
+    #[test]
+    fn wipe_classified_complete() {
+        let roots = vec![
+            std::path::PathBuf::from("/tmp/aruna-wipe-root-a"),
+            std::path::PathBuf::from("/tmp/aruna-wipe-root-b"),
+        ];
+        let wipe = device_wipe::DeviceWipe::new(roots.clone(), Vec::new());
+
+        let purge = RecordingPurge::default();
+        let outcome = decide_wipe(&wipe, true, |passed| purge.purge(passed));
+        assert_eq!(outcome, ProcessOutcome::WipeComplete);
+        assert_eq!(
+            purge.calls.borrow().as_slice(),
+            std::slice::from_ref(&roots),
+            "the purge must see the wipe's roots exactly once"
+        );
+
+        let purge = RecordingPurge {
+            failures: vec![roots[0].clone()],
+            ..RecordingPurge::default()
+        };
+        let outcome = decide_wipe(&wipe, true, |passed| purge.purge(passed));
+        assert_eq!(outcome, ProcessOutcome::WipeIncomplete);
+        assert_eq!(purge.calls.borrow().len(), 1);
+
+        let unsupported = device_wipe::DeviceWipe::new(roots, vec!["object-store".to_string()]);
+        let purge = RecordingPurge::default();
+        let outcome = decide_wipe(&unsupported, true, |passed| purge.purge(passed));
+        assert_eq!(outcome, ProcessOutcome::WipeIncomplete);
+        assert_eq!(purge.calls.borrow().len(), 1);
     }
 }
 
@@ -919,5 +1007,33 @@ mod tests {
             cancellation_outcome(&incomplete),
             ProcessOutcome::StoppedIncomplete
         );
+    }
+
+    // The real purge boundary: an unfinished shutdown leaves the files in
+    // place, and the completed sequence then erases the root contents.
+    #[test]
+    fn wipe_roots_retained() {
+        let root = tempfile::tempdir().expect("temp dir");
+        std::fs::write(root.path().join("object"), b"data").expect("fixture file");
+        let wipe = device_wipe::DeviceWipe::new(vec![root.path().to_path_buf()], Vec::new());
+
+        assert_eq!(
+            decide_wipe(&wipe, false, device_wipe::purge),
+            ProcessOutcome::WipeIncomplete
+        );
+        assert!(
+            root.path().join("object").exists(),
+            "an unfinished shutdown must not erase the roots"
+        );
+
+        assert_eq!(
+            decide_wipe(&wipe, true, device_wipe::purge),
+            ProcessOutcome::WipeComplete
+        );
+        assert!(
+            !root.path().join("object").exists(),
+            "the completed wipe must erase the root contents"
+        );
+        assert!(root.path().is_dir(), "the wipe keeps the root itself");
     }
 }
