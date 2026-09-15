@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-pub const DEFAULT_MAX_HTTP_BODY_SIZE: usize = 1024 * 1024;
+pub const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 // Backstop for handler response creation; interactive operations use tighter deadlines.
 // Streaming bodies are unbounded, and handler-owned request bodies use exempt routes.
@@ -35,7 +35,7 @@ pub struct Server {
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub http_addr: SocketAddr,
-    pub max_http_body_size: usize,
+    pub max_body_size: usize,
     pub cors: CorsConfig,
 }
 
@@ -69,7 +69,7 @@ impl Server {
 
         let mut router = Router::new()
             .nest("/api/v1", api_v1)
-            .layer(DefaultBodyLimit::max(self.config.max_http_body_size))
+            .layer(DefaultBodyLimit::max(self.config.max_body_size))
             .merge(swagger_ui());
         if self.mcp_enabled {
             router = router.merge(crate::mcp::router(
@@ -177,7 +177,7 @@ async fn redirect_swagger(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_HTTP_BODY_SIZE, Server, ServerConfig, TIMEOUT_EXEMPT_ROUTES, is_exempt,
+        MAX_BODY_SIZE, Server, ServerConfig, TIMEOUT_EXEMPT_ROUTES, is_exempt,
     };
     use axum::Router;
     use axum::body::Body;
@@ -231,7 +231,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: "127.0.0.1:0".parse().unwrap(),
-                max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+                max_body_size: MAX_BODY_SIZE,
                 cors: crate::cors::CorsConfig::default(),
             },
         )
@@ -292,7 +292,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: "127.0.0.1:0".parse().unwrap(),
-                max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+                max_body_size: MAX_BODY_SIZE,
                 cors: crate::cors::CorsConfig::default(),
             },
         )

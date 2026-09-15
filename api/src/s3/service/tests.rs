@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
@@ -389,7 +389,7 @@ async fn put_survives_queue() {
     let obligation_key = live_obligation_key(&obligation).unwrap();
     write_storage_value(
         &storage_handle,
-        BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+        REPLICATION_OBLIGATION_KEYSPACE,
         obligation_key.as_ref().to_vec(),
         postcard::to_allocvec(&obligation).unwrap(),
     )
@@ -421,7 +421,7 @@ async fn put_survives_queue() {
     assert!(
         read_storage_value(
             &storage_handle,
-            BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+            REPLICATION_OBLIGATION_KEYSPACE,
             obligation_key.as_ref().to_vec(),
         )
         .await

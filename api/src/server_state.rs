@@ -3,7 +3,7 @@ use crate::error::OidcError;
 use crate::openapi::ApiDoc;
 use crate::routes::management_relay::ManagementUrlCache;
 use aruna_core::NodeId;
-use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
+use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -22,7 +22,7 @@ use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::onboarding::issue_ticket::{
-    IssueSyncInput, IssueSyncOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
+    IssueSyncInput, IssueSyncOperation, TICKET_TTL_SECS,
 };
 use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
@@ -47,8 +47,8 @@ use tracing::warn;
 use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
 
-pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
-pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
+pub const ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
+pub const ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
 pub(crate) const DOWNLOAD_SLOTS: usize = 256;
 
@@ -87,7 +87,7 @@ impl IdentityState {
 
     async fn persist_trusted_realms(&self, driver_ctx: &DriverContext) {
         let trusted_realms = self.trusted_realms_list.read().await.clone();
-        persist_state(driver_ctx, TRUSTED_REALMS_LIST_KEY, &trusted_realms).await;
+        persist_state(driver_ctx, REALMS_LIST_KEY, &trusted_realms).await;
     }
 
     async fn claim_initial_admin(
@@ -146,7 +146,7 @@ impl IdentityState {
             return;
         };
         let claimed = initial_admin_claim.load(Ordering::Acquire);
-        persist_state(driver_ctx, INITIAL_REALM_ADMIN_CLAIMED_KEY, &claimed).await;
+        persist_state(driver_ctx, ADMIN_CLAIMED_KEY, &claimed).await;
     }
 }
 
@@ -284,13 +284,13 @@ impl ServerState {
     ) -> Self {
         let mut trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
             driver_ctx.as_ref(),
-            TRUSTED_REALMS_LIST_KEY,
+            REALMS_LIST_KEY,
         )
         .await
         .unwrap_or_default();
         let initial_admin_claim = if claim_initial_admin_enabled {
             Some(Arc::new(AtomicBool::new(
-                load_persisted_state::<bool>(driver_ctx.as_ref(), INITIAL_REALM_ADMIN_CLAIMED_KEY)
+                load_persisted_state::<bool>(driver_ctx.as_ref(), ADMIN_CLAIMED_KEY)
                     .await
                     .unwrap_or(false),
             )))
@@ -646,7 +646,7 @@ impl ServerState {
                     node_id,
                     issuer_node_id: self.identity.node_id,
                     now: chrono::Utc::now().timestamp().max(0) as u64,
-                    ttl_secs: ONBOARDING_SYNC_TICKET_TTL_SECS,
+                    ttl_secs: TICKET_TTL_SECS,
                 }),
                 &self.driver_ctx,
             )

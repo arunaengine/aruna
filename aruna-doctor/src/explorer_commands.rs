@@ -3,13 +3,13 @@
 
 use aruna_core::document::PendingShardPlacement;
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, KEYSPACE_CATALOG, NODE_STATE_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE, KEYSPACE_CATALOG, NODE_STATE_KEYSPACE,
     SYNC_PLACEMENT_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::backends::BackendsFile;
 use aruna_core::structs::placement::policy_attachment::{
-    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
+    BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
 };
 use aruna_operations::sync::shard_placement::decode_placement;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -146,8 +146,8 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
 fn defined_keyspaces() -> Vec<&'static str> {
     let mut keyspaces = KEYSPACE_CATALOG.to_vec();
     keyspaces.extend([
-        POLICY_BULK_INTENT_KEYSPACE,
-        POLICY_BULK_RUN_KEYSPACE,
+        BULK_INTENT_KEYSPACE,
+        BULK_RUN_KEYSPACE,
         POLICY_MUTATION_KEYSPACE,
     ]);
     keyspaces
@@ -196,12 +196,12 @@ fn known_group_backends(
     let mut known = BTreeSet::new();
     if !keyspaces
         .iter()
-        .any(|name| name == GROUP_STORAGE_BACKEND_KEYSPACE)
+        .any(|name| name == STORAGE_BACKEND_KEYSPACE)
     {
         return Ok(known);
     }
     let keyspace = db.keyspace(
-        GROUP_STORAGE_BACKEND_KEYSPACE,
+        STORAGE_BACKEND_KEYSPACE,
         KeyspaceCreateOptions::default,
     )?;
     for entry in db.read_tx().iter(&keyspace) {
@@ -345,13 +345,13 @@ mod tests {
     use super::super::present::{DecodedField, DecodedValue};
     use super::{list_entries, list_keyspaces, location_scan};
     use aruna_core::keyspaces::{
-        BLOB_LOCATIONS_KEYSPACE, GROUP_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE, KEYSPACE_CATALOG,
+        BLOB_LOCATIONS_KEYSPACE, GROUP_KEYSPACE, STORAGE_BACKEND_KEYSPACE, KEYSPACE_CATALOG,
     };
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::identity::group::Group;
     use aruna_core::structs::placement::policy_attachment::{
-        POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
+        BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
     };
     use aruna_core::structs::identity::realm::RealmId;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
@@ -398,7 +398,7 @@ mod tests {
                 .unwrap();
             let group_backends = db
                 .keyspace(
-                    GROUP_STORAGE_BACKEND_KEYSPACE,
+                    STORAGE_BACKEND_KEYSPACE,
                     KeyspaceCreateOptions::default,
                 )
                 .unwrap();
@@ -488,8 +488,8 @@ mod tests {
             .iter()
             .copied()
             .chain([
-                POLICY_BULK_INTENT_KEYSPACE,
-                POLICY_BULK_RUN_KEYSPACE,
+                BULK_INTENT_KEYSPACE,
+                BULK_RUN_KEYSPACE,
                 POLICY_MUTATION_KEYSPACE,
             ])
             .filter(|name| *name != GROUP_KEYSPACE)

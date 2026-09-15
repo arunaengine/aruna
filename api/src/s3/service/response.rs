@@ -9,7 +9,7 @@ use crate::s3::util::map_checksum_type;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::blob::OBJECT_CONTENT_TYPE_KEY;
+use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::complete::CompleteUploadResult;
 use aruna_operations::s3::object::delete::{DeleteObjectError, DeleteObjectResult};
@@ -43,7 +43,7 @@ pub(super) fn object_metadata(
 ) -> std::collections::HashMap<String, String> {
     if let Some(content_type) = content_type {
         metadata.insert(
-            OBJECT_CONTENT_TYPE_KEY.to_string(),
+            CONTENT_TYPE_KEY.to_string(),
             content_type.to_string(),
         );
     }
@@ -301,7 +301,7 @@ impl ArunaS3Service {
         version_created_at: Option<SystemTime>,
     ) -> ObjectResponseFields {
         let mut response_metadata = metadata.cloned().unwrap_or_default();
-        let content_type = response_metadata.remove(OBJECT_CONTENT_TYPE_KEY);
+        let content_type = response_metadata.remove(CONTENT_TYPE_KEY);
         if let Some(source_headers) = source_metadata
             .and_then(|metadata| self.source_metadata_headers(metadata, last_refresh))
         {

@@ -3,23 +3,23 @@
 //! fall back to a raw hex record instead of failing the whole listing.
 
 use aruna::identity::PersistedNodeState;
-use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
-use aruna_core::auth::TRUSTED_REALMS_LIST_KEY;
+use aruna_api::server_state::ADMIN_CLAIMED_KEY;
+use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::compute_quota::{ComputeDepartureReport, JobReservationRecord};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, COMPUTE_DEPARTURE_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE,
     CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE,
-    DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
-    JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
-    JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
-    JOB_WITNESS_DEADLINE_INDEX_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE,
+    APPLIED_OPS_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
+    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    OUTPUT_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+    DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE, MANAGED_COPY_KEYSPACE,
     NODE_STATE_KEYSPACE, NODE_SUBJECT_KEYSPACE, ONBOARDING_KEYSPACE,
-    PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
+    POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    S3_BUCKET_KEYSPACE, OBJECT_METADATA_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::storage::blob::{
@@ -34,7 +34,7 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
 use aruna_core::structs::placement::policy_attachment::{
-    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBulkRun,
+    BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBulkRun,
     PolicyIntent, PolicyIntentKey, PolicyMutationRecord,
 };
 use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
@@ -65,13 +65,13 @@ use super::present::{
     JsonStored, JsonStoredEntry, JsonStoredOp, JsonUserAccess, JsonVectorClock, family_id_string,
 };
 
-const CRAQLE_DOT_ENCODING_TAG: u8 = b'D';
-const CRAQLE_BATCH_LOG_ENCODING_TAG: u8 = b'B';
-const CRAQLE_GRAPH_META_PREFIX: u8 = b'M';
-const CRAQLE_GRAPH_DIRTY_PREFIX: u8 = b'D';
-const CRAQLE_GRAPH_REINDEX_PREFIX: u8 = b'R';
-const CRAQLE_LOG_HEAD_PREFIX: u8 = b'H';
-const CRAQLE_LOG_BATCH_PREFIX: u8 = b'B';
+const DOT_ENCODING_TAG: u8 = b'D';
+const BATCH_ENCODING_TAG: u8 = b'B';
+const GRAPH_META_PREFIX: u8 = b'M';
+const GRAPH_DIRTY_PREFIX: u8 = b'D';
+const GRAPH_REINDEX_PREFIX: u8 = b'R';
+const LOG_HEAD_PREFIX: u8 = b'H';
+const LOG_BATCH_PREFIX: u8 = b'B';
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct CraqleTermId(pub(super) u128);
 
@@ -174,45 +174,45 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         USER_ACCESS_KEYSPACE
         | S3_BUCKET_KEYSPACE
         | API_STATE_KEYSPACE
-        | DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE
+        | APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
         | NODE_SUBJECT_KEYSPACE
         | COMPUTE_DEPARTURE_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
-        JOB_FAMILY_RECORD_KEYSPACE | JOB_FAMILY_PENDING_KEYSPACE | JOB_FAMILY_OUTBOX_KEYSPACE => {
+        FAMILY_RECORD_KEYSPACE | FAMILY_PENDING_KEYSPACE | FAMILY_OUTBOX_KEYSPACE => {
             decode_record_key(key)
         }
-        JOB_FAMILY_CONFLICT_KEYSPACE => decode_conflict_key(key),
-        JOB_FAMILY_ALIAS_KEYSPACE => decode_alias_key(key),
-        JOB_FAMILY_PROJECTION_KEYSPACE => decode_family_key(key),
-        JOB_WITNESS_DEADLINE_KEYSPACE => decode_deadline_key(key),
-        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE => decode_family_key(key),
-        JOB_PLAN_EXPLAIN_KEYSPACE => decode_explain_key(key),
+        FAMILY_CONFLICT_KEYSPACE => decode_conflict_key(key),
+        FAMILY_ALIAS_KEYSPACE => decode_alias_key(key),
+        FAMILY_PROJECTION_KEYSPACE => decode_family_key(key),
+        WITNESS_DEADLINE_KEYSPACE => decode_deadline_key(key),
+        DEADLINE_INDEX_KEYSPACE => decode_family_key(key),
+        PLAN_EXPLAIN_KEYSPACE => decode_explain_key(key),
         JOB_RESERVATION_KEYSPACE => decode_ulid_key(key),
-        PLACEMENT_POLICY_KEYSPACE | POLICY_MUTATION_KEYSPACE | POLICY_BULK_RUN_KEYSPACE => {
+        PLACEMENT_POLICY_KEYSPACE | POLICY_MUTATION_KEYSPACE | BULK_RUN_KEYSPACE => {
             decode_policy_id(keyspace_name, key)
         }
-        PLACEMENT_POLICY_CACHE_KEYSPACE => decode_policy_cache(key),
-        POLICY_BULK_INTENT_KEYSPACE => PolicyIntentKey::from_bytes(key)
+        POLICY_CACHE_KEYSPACE => decode_policy_cache(key),
+        BULK_INTENT_KEYSPACE => PolicyIntentKey::from_bytes(key)
             .map(|value| DecodedField::PolicyIntentKey {
                 operation_id: value.operation_id.to_string(),
                 key: value.key,
             })
             .unwrap_or_else(|_| raw_field(key)),
-        JOB_OUTPUT_RECORD_KEYSPACE => decode_attempt_key(key),
+        OUTPUT_RECORD_KEYSPACE => decode_attempt_key(key),
         SYNC_PLACEMENT_KEYSPACE => raw_field(key),
-        S3_MULTIPART_UPLOAD_KEYSPACE => decode_ulid_key(key),
-        S3_MULTIPART_UPLOAD_PART_KEYSPACE => MultipartPartKey::from_bytes(key)
+        UPLOAD_KEYSPACE => decode_ulid_key(key),
+        UPLOAD_PART_KEYSPACE => MultipartPartKey::from_bytes(key)
             .map(|value| DecodedField::MultipartPartKey { value })
             .unwrap_or_else(|_| raw_field(key)),
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE => MultipartObjectKey::from_bytes(key)
+        OBJECT_METADATA_KEYSPACE => MultipartObjectKey::from_bytes(key)
             .map(|value| DecodedField::MultipartObjectKey { value })
             .unwrap_or_else(|_| raw_field(key)),
         DHT_KEYSPACE => decode_dht_key(key),
         BLOB_HEAD_KEYSPACE => BlobHeadKey::from_bytes(key)
             .map(|value| DecodedField::BlobHeadKey { value })
             .unwrap_or_else(|_| raw_field(key)),
-        HASH_PATHS_INDEX_KEYSPACE => HashIndex::from_bytes(key)
+        PATHS_INDEX_KEYSPACE => HashIndex::from_bytes(key)
             .map(|value| DecodedField::HashIndex { value })
             .unwrap_or_else(|_| raw_field(key)),
         BLOB_VERSIONS_KEYSPACE => VersionKey::from_bytes(key)
@@ -268,21 +268,21 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         NODE_SUBJECT_KEYSPACE => decode_value_with(value, NodeSubjectRecord::from_bytes, |data| {
             DecodedValue::NodeSubjectRecord { data }
         }),
-        JOB_OUTPUT_RECORD_KEYSPACE => decode_value_with(
+        OUTPUT_RECORD_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<JobRecordEnvelope>(bytes),
             |data| DecodedValue::JobOutputRecord {
                 data: JsonRecordEnvelope(data),
             },
         ),
-        JOB_FAMILY_RECORD_KEYSPACE => decode_value_with(
+        FAMILY_RECORD_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<JobRecordEnvelope>(bytes),
             |data| DecodedValue::JobFamilyRecord {
                 data: JsonRecordEnvelope(data),
             },
         ),
-        JOB_FAMILY_PENDING_KEYSPACE => decode_value_with(
+        FAMILY_PENDING_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<PendingRecord>(bytes),
             |data| DecodedValue::JobPendingRecord {
@@ -292,7 +292,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 attempts: data.attempts,
             },
         ),
-        JOB_FAMILY_CONFLICT_KEYSPACE => decode_value_with(
+        FAMILY_CONFLICT_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<ConflictRecord>(bytes),
             |data| DecodedValue::JobConflictRecord {
@@ -302,12 +302,12 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 relayed_by: data.relayed_by.map(|node| node.to_string()),
             },
         ),
-        JOB_FAMILY_ALIAS_KEYSPACE => decode_value_with(value, JobRecordKey::from_bytes, |data| {
+        FAMILY_ALIAS_KEYSPACE => decode_value_with(value, JobRecordKey::from_bytes, |data| {
             DecodedValue::JobAliasTarget {
                 data: JsonRecordKey(data),
             }
         }),
-        JOB_FAMILY_PROJECTION_KEYSPACE => decode_value_with(
+        FAMILY_PROJECTION_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<ProjectionCache>(bytes),
             |data| DecodedValue::JobProjectionCache {
@@ -316,7 +316,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 projected: data.projection.is_some(),
             },
         ),
-        JOB_FAMILY_OUTBOX_KEYSPACE => decode_value_with(
+        FAMILY_OUTBOX_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<OutboxEntry>(bytes),
             |data| DecodedValue::JobOutboxEntry { data },
@@ -328,12 +328,12 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 data: JsonJobReservation(data),
             },
         ),
-        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE | JOB_WITNESS_DEADLINE_KEYSPACE => decode_value_with(
+        DEADLINE_INDEX_KEYSPACE | WITNESS_DEADLINE_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<WitnessDeadline>(bytes),
             |data| DecodedValue::JobWitnessDeadline { data },
         ),
-        JOB_PLAN_EXPLAIN_KEYSPACE => decode_value_with(
+        PLAN_EXPLAIN_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<WitnessExplain>(bytes),
             |data| DecodedValue::JobPlanExplain {
@@ -361,7 +361,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 }
             })
         }
-        PLACEMENT_POLICY_CACHE_KEYSPACE => {
+        POLICY_CACHE_KEYSPACE => {
             decode_value_with(value, PolicyCacheEntry::from_bytes, |data| {
                 DecodedValue::PolicyCacheEntry {
                     data: JsonCacheEntry(data),
@@ -373,26 +373,26 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 DecodedValue::PolicyMutationRecord { data }
             })
         }
-        POLICY_BULK_RUN_KEYSPACE => decode_value_with(value, PolicyBulkRun::from_bytes, |data| {
+        BULK_RUN_KEYSPACE => decode_value_with(value, PolicyBulkRun::from_bytes, |data| {
             DecodedValue::PolicyBulkRun { data }
         }),
-        POLICY_BULK_INTENT_KEYSPACE => decode_value_with(value, PolicyIntent::from_bytes, |data| {
+        BULK_INTENT_KEYSPACE => decode_value_with(value, PolicyIntent::from_bytes, |data| {
             DecodedValue::PolicyIntent { data }
         }),
-        S3_MULTIPART_UPLOAD_KEYSPACE => {
+        UPLOAD_KEYSPACE => {
             decode_value_with(value, MultipartUpload::from_bytes, |data| {
                 DecodedValue::MultipartUpload { data }
             })
         }
-        S3_MULTIPART_UPLOAD_PART_KEYSPACE => {
+        UPLOAD_PART_KEYSPACE => {
             decode_value_with(value, MultipartPart::from_bytes, |data| {
                 DecodedValue::MultipartPart { data }
             })
         }
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE => decode_object_metadata(key, value),
+        OBJECT_METADATA_KEYSPACE => decode_object_metadata(key, value),
         AUTH_KEYSPACE => decode_auth_value(value),
         API_STATE_KEYSPACE => decode_api_state(key, value),
-        DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE => {
+        APPLIED_OPS_KEYSPACE => {
             raw_value(value, Some("document sync applied op".to_string()))
         }
         NODE_STATE_KEYSPACE => decode_value_with(
@@ -581,18 +581,18 @@ fn decode_auth_value(value: &[u8]) -> DecodedValue {
 
 fn decode_api_state(key: &[u8], value: &[u8]) -> DecodedValue {
     match key {
-        TRUSTED_REALMS_LIST_KEY => postcard::from_bytes::<HashSet<RealmId>>(value)
+        REALMS_LIST_KEY => postcard::from_bytes::<HashSet<RealmId>>(value)
             .map(|data| {
                 let mut data = data
                     .into_iter()
                     .map(|realm_id| realm_id.to_string())
                     .collect::<Vec<_>>();
                 data.sort();
-                DecodedValue::ApiTrustedRealmsList { data }
+                DecodedValue::TrustedRealmsList { data }
             })
             .unwrap_or_else(|error| raw_value(value, Some(error.to_string()))),
-        INITIAL_REALM_ADMIN_CLAIMED_KEY => postcard::from_bytes::<bool>(value)
-            .map(|data| DecodedValue::ApiInitialRealmAdminClaimed { data })
+        ADMIN_CLAIMED_KEY => postcard::from_bytes::<bool>(value)
+            .map(|data| DecodedValue::RealmAdminClaimed { data })
             .unwrap_or_else(|error| raw_value(value, Some(error.to_string()))),
         _ => raw_value(value, Some("unsupported api_state key".to_string())),
     }
@@ -721,14 +721,14 @@ fn decode_quad_key(key: &[u8]) -> Result<CraqleQuadParts, String> {
 
 fn decode_graph_key(key: &[u8]) -> Result<CraqleGraphParts, String> {
     match key.first().copied() {
-        Some(CRAQLE_GRAPH_META_PREFIX) if key.len() == 17 => Ok(CraqleGraphParts::Meta {
+        Some(GRAPH_META_PREFIX) if key.len() == 17 => Ok(CraqleGraphParts::Meta {
             graph: decode_term_id(&key[1..17], "craqle graph meta graph")?,
         }),
-        Some(CRAQLE_GRAPH_DIRTY_PREFIX) if key.len() == 33 => Ok(CraqleGraphParts::Dirty {
+        Some(GRAPH_DIRTY_PREFIX) if key.len() == 33 => Ok(CraqleGraphParts::Dirty {
             graph: decode_term_id(&key[1..17], "craqle graph dirty graph")?,
             subject: decode_term_id(&key[17..33], "craqle graph dirty subject")?,
         }),
-        Some(CRAQLE_GRAPH_REINDEX_PREFIX) if key.len() == 17 => Ok(CraqleGraphParts::Reindex {
+        Some(GRAPH_REINDEX_PREFIX) if key.len() == 17 => Ok(CraqleGraphParts::Reindex {
             graph: decode_term_id(&key[1..17], "craqle graph reindex graph")?,
         }),
         Some(prefix) => Err(format!(
@@ -742,7 +742,7 @@ fn decode_graph_key(key: &[u8]) -> Result<CraqleGraphParts, String> {
 
 fn decode_log_key(key: &[u8]) -> Result<CraqleLogParts, String> {
     match key.first().copied() {
-        Some(CRAQLE_LOG_HEAD_PREFIX) if key.len() == 49 => Ok(CraqleLogParts::Head {
+        Some(LOG_HEAD_PREFIX) if key.len() == 49 => Ok(CraqleLogParts::Head {
             graph: decode_term_id(&key[1..17], "craqle log head graph")?,
             actor: CraqleActorId::from_bytes(
                 key[17..49]
@@ -750,7 +750,7 @@ fn decode_log_key(key: &[u8]) -> Result<CraqleLogParts, String> {
                     .map_err(|_| "invalid craqle log head actor".to_string())?,
             ),
         }),
-        Some(CRAQLE_LOG_BATCH_PREFIX) if key.len() == 57 => Ok(CraqleLogParts::Batch {
+        Some(LOG_BATCH_PREFIX) if key.len() == 57 => Ok(CraqleLogParts::Batch {
             graph: decode_term_id(&key[1..17], "craqle log batch graph")?,
             actor: CraqleActorId::from_bytes(
                 key[17..49]
@@ -769,7 +769,7 @@ fn decode_log_key(key: &[u8]) -> Result<CraqleLogParts, String> {
 }
 
 fn decode_craqle_dots(value: &[u8]) -> Result<Vec<JsonCraqleDot>, String> {
-    let dots = if value.first().copied() == Some(CRAQLE_DOT_ENCODING_TAG) {
+    let dots = if value.first().copied() == Some(DOT_ENCODING_TAG) {
         if !(value.len() - 1).is_multiple_of(40) {
             return Err(format!("invalid craqle dot payload length {}", value.len()));
         }
@@ -799,12 +799,12 @@ fn decode_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
         Ok(CraqleGraphParts::Dirty { .. }) => decode_value_with(
             value,
             |bytes| decode_craqle_u64(bytes, "craqle graph dirty token"),
-            |data| DecodedValue::CraqleGraphDirtyToken { data },
+            |data| DecodedValue::GraphDirtyToken { data },
         ),
         Ok(CraqleGraphParts::Reindex { .. }) => decode_value_with(
             value,
             |bytes| decode_craqle_u64(bytes, "craqle graph reindex token"),
-            |data| DecodedValue::CraqleGraphReindexToken { data },
+            |data| DecodedValue::GraphReindexToken { data },
         ),
         Err(error) => raw_value(value, Some(error)),
     }
@@ -814,7 +814,7 @@ fn decode_log_batch(key: &[u8], value: &[u8]) -> Result<JsonStored, String> {
     let CraqleLogParts::Batch { graph, .. } = decode_log_key(key)? else {
         return Err("craqle log batch value requires a batch key".to_string());
     };
-    if value.first().copied() != Some(CRAQLE_BATCH_LOG_ENCODING_TAG) {
+    if value.first().copied() != Some(BATCH_ENCODING_TAG) {
         return Err("unsupported craqle log batch encoding".to_string());
     }
     let batch = postcard::from_bytes::<CraqleStoredBatch>(&value[1..])
@@ -966,8 +966,8 @@ mod tests {
     };
     use super::super::present::{JsonGraphKey, JsonLogKey, JsonQuadKey, JsonStoredOp};
     use super::{
-        CRAQLE_BATCH_LOG_ENCODING_TAG, CRAQLE_DOT_ENCODING_TAG, CRAQLE_GRAPH_META_PREFIX,
-        CRAQLE_LOG_BATCH_PREFIX, CraqleQuadOp, CraqleStoredBatch, CraqleStoredMeta, CraqleTermId,
+        BATCH_ENCODING_TAG, DOT_ENCODING_TAG, GRAPH_META_PREFIX,
+        LOG_BATCH_PREFIX, CraqleQuadOp, CraqleStoredBatch, CraqleStoredMeta, CraqleTermId,
         decode_entry, raw_field,
     };
     use aruna::identity::{
@@ -978,14 +978,14 @@ mod tests {
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         COMPUTE_DEPARTURE_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
-        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-        JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
-        JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
-        JOB_OUTPUT_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
-        JOB_WITNESS_DEADLINE_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
-        PLACEMENT_POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
-        S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-        S3_MULTIPART_UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, PATHS_INDEX_KEYSPACE,
+        FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+        OUTPUT_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+        WITNESS_DEADLINE_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
+        POLICY_CACHE_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        S3_BUCKET_KEYSPACE, OBJECT_METADATA_KEYSPACE, UPLOAD_KEYSPACE,
+        UPLOAD_PART_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::identity::auth::Actor;
@@ -999,7 +999,7 @@ mod tests {
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
     use aruna_core::structs::placement::policy_attachment::{
-        POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
+        BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
         PolicyBulkRun, PolicyIntent, PolicyIntentOutcome, PolicyMutationParams,
         PolicyMutationRecord, PolicyRefMode, PolicyStatus,
     };
@@ -1093,7 +1093,7 @@ mod tests {
         let key_bytes = key.to_bytes();
 
         let record = decode_entry(
-            JOB_FAMILY_RECORD_KEYSPACE,
+            FAMILY_RECORD_KEYSPACE,
             &key_bytes,
             &postcard::to_allocvec(&envelope).unwrap(),
         );
@@ -1110,7 +1110,7 @@ mod tests {
             attempts: 2,
         };
         let decoded = decode_entry(
-            JOB_FAMILY_PENDING_KEYSPACE,
+            FAMILY_PENDING_KEYSPACE,
             &key_bytes,
             &postcard::to_allocvec(&pending).unwrap(),
         );
@@ -1131,7 +1131,7 @@ mod tests {
         let mut conflict_key = key_bytes.to_vec();
         conflict_key.extend_from_slice(&[3u8; 32]);
         let decoded = decode_entry(
-            JOB_FAMILY_CONFLICT_KEYSPACE,
+            FAMILY_CONFLICT_KEYSPACE,
             &conflict_key,
             &postcard::to_allocvec(&conflict).unwrap(),
         );
@@ -1143,7 +1143,7 @@ mod tests {
 
         let mut alias_key = Ulid::from_bytes([5u8; 16]).to_bytes().to_vec();
         alias_key.extend_from_slice(&test_family().to_bytes());
-        let decoded = decode_entry(JOB_FAMILY_ALIAS_KEYSPACE, &alias_key, &key_bytes);
+        let decoded = decode_entry(FAMILY_ALIAS_KEYSPACE, &alias_key, &key_bytes);
         assert!(matches!(decoded.key, DecodedField::JobAliasKey { .. }));
         assert!(matches!(decoded.value, DecodedValue::JobAliasTarget { .. }));
 
@@ -1154,7 +1154,7 @@ mod tests {
             projection: None,
         };
         let decoded = decode_entry(
-            JOB_FAMILY_PROJECTION_KEYSPACE,
+            FAMILY_PROJECTION_KEYSPACE,
             &test_family().to_bytes(),
             &postcard::to_allocvec(&cache).unwrap(),
         );
@@ -1175,7 +1175,7 @@ mod tests {
             rejections: 0,
         };
         let decoded = decode_entry(
-            JOB_FAMILY_OUTBOX_KEYSPACE,
+            FAMILY_OUTBOX_KEYSPACE,
             &key_bytes,
             &postcard::to_allocvec(&outbox).unwrap(),
         );
@@ -1222,7 +1222,7 @@ mod tests {
         let mut deadline_key = 22u64.to_be_bytes().to_vec();
         deadline_key.extend_from_slice(&test_family().to_bytes());
         let decoded = decode_entry(
-            JOB_WITNESS_DEADLINE_KEYSPACE,
+            WITNESS_DEADLINE_KEYSPACE,
             &deadline_key,
             &postcard::to_allocvec(&deadline).unwrap(),
         );
@@ -1248,7 +1248,7 @@ mod tests {
         let mut explain_key = test_family().to_bytes().to_vec();
         explain_key.extend_from_slice(test_node().as_bytes());
         let decoded = decode_entry(
-            JOB_PLAN_EXPLAIN_KEYSPACE,
+            PLAN_EXPLAIN_KEYSPACE,
             &explain_key,
             &postcard::to_allocvec(&explain).unwrap(),
         );
@@ -1296,7 +1296,7 @@ mod tests {
         let mut key = job_id.to_bytes().to_vec();
         key.extend_from_slice(&7_u64.to_be_bytes());
 
-        let decoded = decode_entry(JOB_OUTPUT_RECORD_KEYSPACE, &key, b"not-an-envelope");
+        let decoded = decode_entry(OUTPUT_RECORD_KEYSPACE, &key, b"not-an-envelope");
 
         assert_eq!(
             decoded.key,
@@ -1376,7 +1376,7 @@ mod tests {
         key.extend_from_slice(&policy_ref.digest);
 
         let decoded = decode_entry(
-            PLACEMENT_POLICY_CACHE_KEYSPACE,
+            POLICY_CACHE_KEYSPACE,
             &key,
             &entry.to_bytes().unwrap(),
         );
@@ -1455,7 +1455,7 @@ mod tests {
         };
 
         let decoded = decode_entry(
-            POLICY_BULK_RUN_KEYSPACE,
+            BULK_RUN_KEYSPACE,
             &PolicyBulkRun::key(operation_id).unwrap(),
             &run.to_bytes().unwrap(),
         );
@@ -1481,7 +1481,7 @@ mod tests {
         };
 
         let decoded = decode_entry(
-            POLICY_BULK_INTENT_KEYSPACE,
+            BULK_INTENT_KEYSPACE,
             &intent.key().to_bytes().unwrap(),
             &intent.to_bytes().unwrap(),
         );
@@ -1706,7 +1706,7 @@ mod tests {
         };
 
         let decoded = decode_entry(
-            S3_MULTIPART_UPLOAD_KEYSPACE,
+            UPLOAD_KEYSPACE,
             &upload.upload_id.to_bytes(),
             &upload.to_bytes().unwrap(),
         );
@@ -1749,7 +1749,7 @@ mod tests {
         };
 
         let decoded = decode_entry(
-            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+            UPLOAD_PART_KEYSPACE,
             &key.to_bytes().unwrap(),
             &part.to_bytes().unwrap(),
         );
@@ -1773,7 +1773,7 @@ mod tests {
         };
 
         let decoded = decode_entry(
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            OBJECT_METADATA_KEYSPACE,
             &key.to_bytes().unwrap(),
             &summary.to_bytes().unwrap(),
         );
@@ -1800,7 +1800,7 @@ mod tests {
         };
 
         let decoded = decode_entry(
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            OBJECT_METADATA_KEYSPACE,
             &key.to_bytes().unwrap(),
             &part.to_bytes().unwrap(),
         );
@@ -1818,7 +1818,7 @@ mod tests {
     fn invalid_metadata_raw() {
         let key = MultipartObjectKey::summary(Ulid::from_bytes([3_u8; 16]));
         let decoded = decode_entry(
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            OBJECT_METADATA_KEYSPACE,
             &key.to_bytes().unwrap(),
             b"broken",
         );
@@ -1868,7 +1868,7 @@ mod tests {
         key.extend_from_slice(&predicate.to_be_bytes());
         key.extend_from_slice(&object.to_be_bytes());
 
-        let mut value = vec![CRAQLE_DOT_ENCODING_TAG];
+        let mut value = vec![DOT_ENCODING_TAG];
         value.extend_from_slice(actor.as_bytes());
         value.extend_from_slice(&7_u64.to_be_bytes());
 
@@ -1898,7 +1898,7 @@ mod tests {
     fn decodes_graph_meta() {
         let graph = 9_u128;
         let actor = CraqleActorId::from_bytes([5_u8; 32]);
-        let mut key = vec![CRAQLE_GRAPH_META_PREFIX];
+        let mut key = vec![GRAPH_META_PREFIX];
         key.extend_from_slice(&graph.to_be_bytes());
 
         let value = postcard::to_allocvec(&CraqleStoredMeta {
@@ -1941,7 +1941,7 @@ mod tests {
         let object = 15_u128;
         let actor = CraqleActorId::from_bytes([3_u8; 32]);
 
-        let mut key = vec![CRAQLE_LOG_BATCH_PREFIX];
+        let mut key = vec![LOG_BATCH_PREFIX];
         key.extend_from_slice(&graph.to_be_bytes());
         key.extend_from_slice(actor.as_bytes());
         key.extend_from_slice(&17_u64.to_be_bytes());
@@ -1959,7 +1959,7 @@ mod tests {
             timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
         };
 
-        let mut value = vec![CRAQLE_BATCH_LOG_ENCODING_TAG];
+        let mut value = vec![BATCH_ENCODING_TAG];
         value.extend_from_slice(&postcard::to_allocvec(&batch).unwrap());
 
         let decoded = decode_entry(CRAQLE_LOG_KEYSPACE, &key, &value);
@@ -2111,7 +2111,7 @@ mod tests {
         }
 
         let decoded_index = decode_entry(
-            HASH_PATHS_INDEX_KEYSPACE,
+            PATHS_INDEX_KEYSPACE,
             &hash_path_key.to_bytes().unwrap(),
             &[],
         );

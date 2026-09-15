@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aruna_api::cors::CorsConfig;
-use aruna_api::server::{DEFAULT_MAX_HTTP_BODY_SIZE, Server, ServerConfig};
+use aruna_api::server::{MAX_BODY_SIZE, Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
@@ -250,7 +250,7 @@ async fn start_server(state: Arc<ServerState>) -> (String, CancellationToken, Se
             state,
             ServerConfig {
                 http_addr: address,
-                max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+                max_body_size: MAX_BODY_SIZE,
                 cors: CorsConfig::default(),
             },
         )
@@ -312,7 +312,7 @@ async fn mcp_transport_contract() {
             fixture.state.clone(),
             ServerConfig {
                 http_addr: address,
-                max_http_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+                max_body_size: MAX_BODY_SIZE,
                 cors: CorsConfig::default(),
             },
         )

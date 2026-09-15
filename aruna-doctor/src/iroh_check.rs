@@ -13,7 +13,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-const MAX_DHT_RESPONSE_SIZE: usize = 1024 * 1024;
+const MAX_DHT_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 struct IrohCheckOutput {
@@ -244,7 +244,7 @@ async fn check_with_endpoint(
     let mut response_len = [0u8; 4];
     with_timeout("read_dht_pong", timeout, recv.read_exact(&mut response_len)).await?;
     let response_len = u32::from_be_bytes(response_len) as usize;
-    if response_len > MAX_DHT_RESPONSE_SIZE {
+    if response_len > MAX_DHT_SIZE {
         return Err(iroh_check_error(
             "read_dht_pong",
             format!("response too large: {response_len} bytes"),

@@ -16,18 +16,18 @@ const RECORD_BEGIN_KEYSPACE: u8 = 1;
 const RECORD_ENTRY: u8 = 2;
 const RECORD_END_KEYSPACE: u8 = 3;
 const RECORD_FOOTER: u8 = 4;
-const IMPORT_TXN_ENTRY_LIMIT: usize = 1_000;
+const TXN_ENTRY_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotStats {
-    pub created_at_unix_seconds: u64,
+    pub created_unix_seconds: u64,
     pub keyspace_count: u64,
     pub entry_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportStats {
-    pub snapshot_created_at_unix_seconds: u64,
+    pub snapshot_created_unix: u64,
     pub keyspace_count: u64,
     pub entry_count: u64,
     pub target_path: PathBuf,
@@ -70,7 +70,7 @@ pub async fn snapshot(database_path: String, target_path: String) -> Result<(), 
 
     println!(
         "Snapshot created: keyspaces={}, entries={}, created_at={}",
-        stats.keyspace_count, stats.entry_count, stats.created_at_unix_seconds,
+        stats.keyspace_count, stats.entry_count, stats.created_unix_seconds,
     );
 
     Ok(())
@@ -109,7 +109,7 @@ pub fn snapshot_database(
     let mut keyspace_names = db.list_keyspace_names();
     keyspace_names.sort();
 
-    let created_at_unix_seconds = SystemTime::now()
+    let created_unix_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(std::io::Error::other)?
         .as_secs();
@@ -122,7 +122,7 @@ pub fn snapshot_database(
     let mut hasher = Hasher::new();
     let snapshot = db.read_tx();
 
-    write_header(&mut writer, created_at_unix_seconds)?;
+    write_header(&mut writer, created_unix_seconds)?;
 
     let mut keyspace_count = 0_u64;
     let mut entry_count = 0_u64;
@@ -149,7 +149,7 @@ pub fn snapshot_database(
     writer.get_ref().sync_all()?;
 
     Ok(SnapshotStats {
-        created_at_unix_seconds,
+        created_unix_seconds,
         keyspace_count,
         entry_count,
     })
@@ -165,7 +165,7 @@ pub fn import_new_database(
 
     let file = File::open(snapshot_path)?;
     let mut reader = BufReader::new(file);
-    let snapshot_created_at_unix_seconds = read_header(&mut reader)?;
+    let snapshot_created_unix = read_header(&mut reader)?;
 
     let db = OptimisticTxDatabase::builder(target_db_path)
         .manual_journal_persist(true)
@@ -268,7 +268,7 @@ pub fn import_new_database(
                 ensure_reader_exhausted(&mut reader)?;
                 db.persist(PersistMode::Buffer)?;
                 return Ok(ImportStats {
-                    snapshot_created_at_unix_seconds,
+                    snapshot_created_unix,
                     keyspace_count,
                     entry_count,
                     target_path: target_db_path.to_path_buf(),
@@ -311,7 +311,7 @@ impl ImportKeyspaceState {
             self.pending_txn_entries += 1;
         }
 
-        if self.pending_txn_entries >= IMPORT_TXN_ENTRY_LIMIT {
+        if self.pending_txn_entries >= TXN_ENTRY_LIMIT {
             self.commit_pending_txn()?;
         }
 
@@ -350,11 +350,11 @@ fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
 
 fn write_header(
     writer: &mut BufWriter<File>,
-    created_at_unix_seconds: u64,
+    created_unix_seconds: u64,
 ) -> Result<(), SnapshotError> {
     writer.write_all(SNAPSHOT_MAGIC)?;
     writer.write_all(&SNAPSHOT_VERSION.to_be_bytes())?;
-    writer.write_all(&created_at_unix_seconds.to_be_bytes())?;
+    writer.write_all(&created_unix_seconds.to_be_bytes())?;
     Ok(())
 }
 
@@ -582,7 +582,7 @@ mod tests {
                 BackendConfig {
                     backend_type: Backend::FileSystem,
                     bucket_prefix: config.blob_bucket_prefix.clone(),
-                    max_bucket_size: config.blob_max_bucket_size,
+                    max_bucket_size: config.blob_bucket_size,
                     multipart_bucket: config.blob_multipart_bucket.clone(),
                     root: config.blob_root.clone(),
                     service_config: std::collections::HashMap::new(),

@@ -61,7 +61,7 @@ async fn fetch_prerelease_url(releases_url: &str) -> Result<String, CliError> {
     }
 
     let releases: Vec<GithubRelease> = request.send().await?.error_for_status()?.json().await?;
-    select_artifact(&releases).ok_or(CliError::MissingPortalWebsiteArtifact {
+    select_artifact(&releases).ok_or(CliError::PortalArtifactMissing {
         repo: WEBSITE_REPO,
         asset: PORTAL_ARTIFACT_NAME,
     })

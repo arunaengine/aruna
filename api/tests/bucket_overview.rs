@@ -13,7 +13,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::storage::blob::{
@@ -237,7 +237,7 @@ async fn setup() -> Fixture {
     let upload_id = Ulid::from_bytes([15u8; 16]);
     write_value(
         &state,
-        S3_MULTIPART_UPLOAD_KEYSPACE,
+        UPLOAD_KEYSPACE,
         upload_id.to_bytes().to_vec(),
         MultipartUpload {
             upload_id,

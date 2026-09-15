@@ -250,7 +250,7 @@ async fn preflight_counts_versions() {
             version_key_marker: None,
             version_id_marker: None,
             multipart_key_marker: None,
-            multipart_upload_id_marker: None,
+            multipart_upload_marker: None,
         }),
     )
     .await
@@ -262,7 +262,7 @@ async fn preflight_counts_versions() {
     assert!(file.counts.complete);
     assert!(file.permissions.read);
     assert!(file.permissions.purge);
-    assert!(!file.sync_relationships_apply_to_bucket_delete);
+    assert!(!file.apply_relationships_delete);
 
     let (_, Json(bucket)) = deletion_preflight(
         State(fixture.state.clone()),
@@ -275,12 +275,12 @@ async fn preflight_counts_versions() {
             version_key_marker: None,
             version_id_marker: None,
             multipart_key_marker: None,
-            multipart_upload_id_marker: None,
+            multipart_upload_marker: None,
         }),
     )
     .await
     .unwrap();
-    assert!(bucket.sync_relationships_apply_to_bucket_delete);
+    assert!(bucket.apply_relationships_delete);
     assert!(bucket.sync_relationships.is_empty());
 }
 

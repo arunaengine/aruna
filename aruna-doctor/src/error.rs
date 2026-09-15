@@ -65,10 +65,10 @@ pub enum CliError {
     #[error("portal config value {0} is required")]
     MissingPortalConfig(&'static str),
     #[error("no prerelease in {repo} contains portal artifact {asset}")]
-    MissingPortalWebsiteArtifact {
+    PortalArtifactMissing {
         repo: &'static str,
         asset: &'static str,
     },
     #[error("OIDC provider '{0}' is not configured")]
-    OidcProviderNotFound(String),
+    OidcNotFound(String),
 }

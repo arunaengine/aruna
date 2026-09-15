@@ -269,10 +269,12 @@ pub(super) enum DecodedValue {
     MultipartObjectPart {
         data: MultipartObjectPart,
     },
-    ApiTrustedRealmsList {
+    #[serde(rename = "ApiTrustedRealmsList")]
+    TrustedRealmsList {
         data: Vec<String>,
     },
-    ApiInitialRealmAdminClaimed {
+    #[serde(rename = "ApiInitialRealmAdminClaimed")]
+    RealmAdminClaimed {
         data: bool,
     },
     NodeState {
@@ -296,10 +298,12 @@ pub(super) enum DecodedValue {
     CraqleGraphMeta {
         data: JsonGraphMeta,
     },
-    CraqleGraphDirtyToken {
+    #[serde(rename = "CraqleGraphDirtyToken")]
+    GraphDirtyToken {
         data: u64,
     },
-    CraqleGraphReindexToken {
+    #[serde(rename = "CraqleGraphReindexToken")]
+    GraphReindexToken {
         data: u64,
     },
     CraqleLogHead {
@@ -720,7 +724,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: None,
             identity: aruna::identity::PersistedNodeIdentity::Management {
-                realm_private_key_pem: "synthetic-pem".to_string(),
+                realm_private_pem: "synthetic-pem".to_string(),
             },
         };
         let json = serde_json::to_value(JsonPersistedState(state)).unwrap();

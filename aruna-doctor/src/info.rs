@@ -22,18 +22,27 @@ struct ConfigView {
     /// single filesystem backend rooted at `blob_root`.
     blob_backends: Vec<BackendView>,
     blob_bucket_prefix: Option<String>,
-    blob_max_bucket_size: Option<u64>,
+    #[serde(rename = "blob_max_bucket_size")]
+    blob_bucket_size: Option<u64>,
     blob_multipart_bucket: Option<String>,
-    blob_control_plane_connect_timeout_secs: u64,
-    blob_control_plane_io_timeout_secs: u64,
-    blob_transfer_idle_timeout_secs: u64,
+    #[serde(rename = "blob_control_plane_connect_timeout_secs")]
+    connect_timeout_secs: u64,
+    #[serde(rename = "blob_control_plane_io_timeout_secs")]
+    io_timeout_secs: u64,
+    #[serde(rename = "blob_transfer_idle_timeout_secs")]
+    transfer_idle_secs: u64,
     http_socket_addr: String,
     http_base_url: String,
-    p2p_socket_addr: String,
-    max_concurrent_uni_streams: Option<u64>,
-    max_concurrent_bidi_streams: Option<u64>,
-    p2p_additional_relay_urls: Vec<String>,
-    default_metadata_replication_factor: u32,
+    #[serde(rename = "p2p_socket_addr")]
+    p2p_addr: String,
+    #[serde(rename = "max_concurrent_uni_streams")]
+    max_uni_streams: Option<u64>,
+    #[serde(rename = "max_concurrent_bidi_streams")]
+    max_bidi_streams: Option<u64>,
+    #[serde(rename = "p2p_additional_relay_urls")]
+    additional_urls: Vec<String>,
+    #[serde(rename = "default_metadata_replication_factor")]
+    metadata_replication_factor: u32,
     s3_host: String,
     api_public_url: Option<String>,
     s3_public_url: Option<String>,
@@ -190,29 +199,29 @@ impl ConfigView {
             blob_root: blob_root.unwrap_or_default(),
             blob_backends: backend_views()?,
             blob_bucket_prefix: dotenvy::var("BLOB_BUCKET_PREFIX").ok(),
-            blob_max_bucket_size: parse_optional_env("BLOB_MAX_BUCKET_SIZE")?.or(Some(100_000)),
+            blob_bucket_size: parse_optional_env("BLOB_MAX_BUCKET_SIZE")?.or(Some(100_000)),
             blob_multipart_bucket: dotenvy::var("BLOB_MULTIPART_BUCKET")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .or(Some("uploaded-parts".to_string())),
-            blob_control_plane_connect_timeout_secs: parse_optional_env(
+            connect_timeout_secs: parse_optional_env(
                 "BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS",
             )?
             .unwrap_or(30),
-            blob_control_plane_io_timeout_secs: parse_optional_env(
+            io_timeout_secs: parse_optional_env(
                 "BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS",
             )?
             .unwrap_or(30),
-            blob_transfer_idle_timeout_secs: parse_optional_env("BLOB_TRANSFER_IDLE_TIMEOUT_SECS")?
+            transfer_idle_secs: parse_optional_env("BLOB_TRANSFER_IDLE_TIMEOUT_SECS")?
                 .unwrap_or(30 * 60),
             http_socket_addr: http_socket_addr.to_string(),
             http_base_url: http_base_url(http_socket_addr),
-            p2p_socket_addr: dotenvy::var("P2P_SOCKET_ADDRESS")
+            p2p_addr: dotenvy::var("P2P_SOCKET_ADDRESS")
                 .unwrap_or_else(|_| http_socket_addr.to_string()),
-            max_concurrent_uni_streams: parse_optional_env("MAX_CONCURRENT_UNI_STREAMS")?,
-            max_concurrent_bidi_streams: parse_optional_env("MAX_CONCURRENT_BIDI_STREAMS")?,
-            p2p_additional_relay_urls: parse_list_env("P2P_ADDITIONAL_RELAY_URLS"),
-            default_metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
+            max_uni_streams: parse_optional_env("MAX_CONCURRENT_UNI_STREAMS")?,
+            max_bidi_streams: parse_optional_env("MAX_CONCURRENT_BIDI_STREAMS")?,
+            additional_urls: parse_list_env("P2P_ADDITIONAL_RELAY_URLS"),
+            metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
                 .unwrap_or(3)
                 .max(1),
             s3_host: dotenvy::var("S3_HOST").unwrap_or_default(),
@@ -414,7 +423,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: addr,
-                max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+                max_body_size: aruna_api::server::MAX_BODY_SIZE,
                 cors: aruna_api::cors::CorsConfig::default(),
             },
         );
@@ -472,17 +481,17 @@ mod tests {
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
         let settings = aruna::settings::read_settings().unwrap();
 
-        assert_eq!(view.blob_max_bucket_size, Some(100_000));
+        assert_eq!(view.blob_bucket_size, Some(100_000));
         assert_eq!(
             view.blob_multipart_bucket.as_deref(),
             Some("uploaded-parts")
         );
-        assert_eq!(view.default_metadata_replication_factor, 1);
-        assert_eq!(view.blob_max_bucket_size, settings.blob_max_bucket_size);
+        assert_eq!(view.metadata_replication_factor, 1);
+        assert_eq!(view.blob_bucket_size, settings.blob_bucket_size);
         assert_eq!(view.blob_multipart_bucket, settings.blob_multipart_bucket);
         assert_eq!(
-            view.default_metadata_replication_factor,
-            settings.default_metadata_replication_factor
+            view.metadata_replication_factor,
+            settings.metadata_replication_factor
         );
     }
 
@@ -497,7 +506,7 @@ mod tests {
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
 
         assert_eq!(
-            view.p2p_additional_relay_urls,
+            view.additional_urls,
             vec![
                 "https://relay-a.example".to_string(),
                 "https://relay-b.example".to_string(),

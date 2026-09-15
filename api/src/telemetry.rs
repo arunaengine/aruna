@@ -15,8 +15,8 @@ use tracing::{Instrument, Span, error, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
 
-const DEFAULT_SLOW_REQUEST_THRESHOLD_MS: u64 = 500;
-const SLOW_REQUEST_THRESHOLD_ENV: &str = "ARUNA_SLOW_REQUEST_THRESHOLD_MS";
+const REQUEST_THRESHOLD_MS: u64 = 500;
+const REQUEST_THRESHOLD_ENV: &str = "ARUNA_SLOW_REQUEST_THRESHOLD_MS";
 
 // Unbiased per-route request latency histograms flushed as `latency.summary`.
 static HTTP_LATENCY: LazyLock<LatencyAggregator> = LazyLock::new(|| LatencyAggregator::new("http"));
@@ -24,7 +24,7 @@ static HTTP_LATENCY: LazyLock<LatencyAggregator> = LazyLock::new(|| LatencyAggre
 fn slow_request_threshold() -> Duration {
     static THRESHOLD: OnceLock<Duration> = OnceLock::new();
     *THRESHOLD.get_or_init(|| {
-        parse_slow_threshold(std::env::var(SLOW_REQUEST_THRESHOLD_ENV).ok().as_deref())
+        parse_slow_threshold(std::env::var(REQUEST_THRESHOLD_ENV).ok().as_deref())
     })
 }
 
@@ -32,7 +32,7 @@ fn parse_slow_threshold(value: Option<&str>) -> Duration {
     Duration::from_millis(
         value
             .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_SLOW_REQUEST_THRESHOLD_MS),
+            .unwrap_or(REQUEST_THRESHOLD_MS),
     )
 }
 

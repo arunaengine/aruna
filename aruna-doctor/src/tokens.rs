@@ -3,7 +3,7 @@ use aruna::config::load;
 use aruna_api::routes::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use aruna_api::server_state::load_persisted_state;
 use aruna_core::UserId;
-use aruna_core::auth::{TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
 };
@@ -168,7 +168,7 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
     .map_err(|err| std::io::Error::other(err.to_string()))?;
     if matches!(claim_result, ClaimInitialResult::AlreadyClaimed) {
         return Err(std::io::Error::other(
-            ClaimInitialError::InitialAdministratorAlreadyClaimed.to_string(),
+            ClaimInitialError::AdministratorAlreadyClaimed.to_string(),
         )
         .into());
     }
@@ -241,7 +241,7 @@ pub async fn create_oidc_token(
     let provider = load_oidc_providers()?
         .into_iter()
         .next()
-        .ok_or_else(|| CliError::OidcProviderNotFound("No OIDC configured".to_string()))?;
+        .ok_or_else(|| CliError::OidcNotFound("No OIDC configured".to_string()))?;
 
     let client = Client::builder().build()?;
     let oidc_token = request_oidc_token(&client, &provider, &username, &password, &scope).await?;
@@ -411,7 +411,7 @@ impl DoctorValidationState {
         let mut revoked_token_hashes = HashSet::<String, ahash::RandomState>::default();
         let trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
             driver_ctx,
-            TRUSTED_REALMS_LIST_KEY,
+            REALMS_LIST_KEY,
         )
         .await
         .unwrap_or_default();
@@ -879,7 +879,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: addr,
-                max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+                max_body_size: aruna_api::server::MAX_BODY_SIZE,
                 cors: aruna_api::cors::CorsConfig::default(),
             },
         )
