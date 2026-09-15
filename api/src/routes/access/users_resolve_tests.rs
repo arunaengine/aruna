@@ -1,6 +1,6 @@
 use super::{ResolveUsersRequest, resolve_users};
 use crate::error::ServerError;
-use crate::tests::fixtures::users::{realm_auth, setup_state};
+use crate::tests::users::{realm_auth, setup_state};
 use aruna_core::UserId;
 use aruna_core::structs::RealmId;
 use axum::extract::State;

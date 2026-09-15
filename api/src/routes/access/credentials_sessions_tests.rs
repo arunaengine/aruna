@@ -49,8 +49,8 @@ async fn issue_session(
 ) -> S3SessionCredentials {
     let now = SystemTime::now();
     drive(
-        CreateS3SessionOperation::new(
-            CreateS3SessionConfig {
+        CreateS3Operation::new(
+            CreateS3Config {
                 user_identity,
                 group_id,
                 now,
@@ -68,7 +68,7 @@ async fn issue_session(
 
 async fn stored_session(state: &ServerState, access_key: &str) -> Option<S3Session> {
     drive(
-        GetS3SessionOperation::new(access_key.to_string()),
+        GetS3Operation::new(access_key.to_string()),
         &state.get_ctx(),
     )
     .await
@@ -77,7 +77,7 @@ async fn stored_session(state: &ServerState, access_key: &str) -> Option<S3Sessi
 
 #[test]
 fn mint_needs_group() {
-    assert!(serde_json::from_value::<CreateS3SessionRequest>(serde_json::json!({})).is_err());
+    assert!(serde_json::from_value::<S3SessionRequest>(serde_json::json!({})).is_err());
 }
 
 #[test]
@@ -294,9 +294,7 @@ async fn revoke_drops_session() {
     let refreshed = refresh_s3_session(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-            "bearer",
-        ))),
+        Extension(Some(ValidatedBearer::new_for_test("bearer"))),
         Path(issued.access_key_id.clone()),
     )
     .await;

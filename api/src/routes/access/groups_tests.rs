@@ -1,12 +1,12 @@
 use super::{
-    AddGroupMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, GroupInfoResponse,
+    AddMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, GroupInfoResponse,
     ListGroupsQuery, UpdateGroupRequest, add_group_member, create_group, get_group,
     get_group_usage, list_data_paths, list_group_members, list_groups, run_get_group, update_group,
 };
-use crate::auth::ValidatedArunaBearerTokenCarrier;
+use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
-use crate::tests::fixtures::routes::{seed_realm_auth, test_context, test_state, test_storage};
+use crate::tests::routes::{seed_realm_auth, test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -202,8 +202,8 @@ async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
     .await
     .unwrap();
     drive(
-        aruna_operations::realm::claim_admin::ClaimInitialRealmAdminOperation::new(
-            aruna_operations::realm::claim_admin::ClaimInitialRealmAdminInput { actor },
+        aruna_operations::realm::claim_admin::ClaimInitialOperation::new(
+            aruna_operations::realm::claim_admin::ClaimInitialInput { actor },
         ),
         &driver_ctx,
     )
@@ -231,7 +231,7 @@ async fn update_config(
 ) {
     let realm_id = state.get_realm_id();
     let mut config = drive(
-        aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
+        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -255,9 +255,7 @@ async fn new_group(state: &Arc<ServerState>, user_id: UserId, name: &str) -> Ser
     create_group(
         State(state.clone()),
         Extension(Some(member_auth(user_id))),
-        Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
-            "token",
-        ))),
+        Extension(Some(ValidatedBearer::new_for_test("token"))),
         Json(CreateGroupRequest {
             name: name.to_string(),
         }),
@@ -285,7 +283,7 @@ async fn device_refuses_add() {
         State(state.clone()),
         Extension(Some(member_auth(admin))),
         Path(Ulid::generate().to_string()),
-        Json(AddGroupMemberRequest {
+        Json(AddMemberRequest {
             user_id: admin.to_string(),
             role_ids: None,
         }),
@@ -1101,7 +1099,7 @@ async fn policy_denies_role() {
         State(state.clone()),
         Extension(Some(member_auth(owner))),
         Path(group_id.to_string()),
-        Json(super::CreateGroupRoleRequest {
+        Json(super::CreateRoleRequest {
             name: "readers".to_string(),
             permissions: HashMap::from([(
                 format!("/{realm_id}/g/{group_id}/data/**"),

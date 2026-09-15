@@ -9,14 +9,10 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
 use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId, RealmNodeKind};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::onboarding::create_secret::{
-    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-};
-use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
+use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::realm::ensure_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
+use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::{Path, State};
@@ -78,7 +74,7 @@ async fn setup_devices() -> Fixture {
     .unwrap();
     for (device, device_owner) in [(node(2), owner), (node(3), other)] {
         drive(
-            EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+            EnsureConfigOperation::new(EnsureConfigParams {
                 actor: actor.clone(),
                 target_node_id: device,
                 target_node_kind: RealmNodeKind::User {
@@ -97,7 +93,7 @@ async fn setup_devices() -> Fixture {
 
     for secret_owner in [owner, other] {
         drive(
-            CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+            CreateSecretOperation::new(CreateSecretInput {
                 record: OnboardingSecretRecord {
                     enrollment_id: Ulid::generate(),
                     secret_hash: Ulid::generate().to_string(),
@@ -116,7 +112,7 @@ async fn setup_devices() -> Fixture {
     }
 
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: Actor {
                 node_id: node(1),
                 user_id: admin,
