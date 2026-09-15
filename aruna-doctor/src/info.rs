@@ -284,11 +284,11 @@ mod tests {
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::announce_presence::{
-        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+        AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::sync::incoming::initialize_net_holder;
-    use aruna_operations::tasks::incoming::install_and_start_task_queues;
+    use aruna_operations::tasks::incoming::start_task_queues;
     use aruna_tasks::TaskHandle;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -360,7 +360,7 @@ mod tests {
             jobs_runtime.clone(),
             &shutdown,
         );
-        install_and_start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+        start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
         let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
@@ -384,7 +384,7 @@ mod tests {
         .await
         .unwrap();
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id,
                 node_id: net.node_id(),
                 schedule_refresh: false,

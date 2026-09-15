@@ -24,13 +24,12 @@ use aruna_core::keyspaces::{
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
     BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group,
-    GroupAuthorizationDocument, HashPathIndexKey, JobFamilyId, JobRecordEnvelope, JobRecordKey,
-    ManagedCopyKey, ManagedCopyRecord, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    NodeSubjectRecord, POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE,
-    POLICY_MUTATION_KEYSPACE, PlacementPolicyDocument, PolicyBulkIntent, PolicyBulkIntentKey,
-    PolicyBulkRun, PolicyMutationRecord, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    UserAccess, VersionKey,
+    GroupAuthorizationDocument, HashIndex, JobFamilyId, JobRecordEnvelope, JobRecordKey,
+    ManagedCopyKey, ManagedCopyRecord, MultipartObjectKey, MultipartObjectPart,
+    MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload, NodeSubjectRecord,
+    POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE,
+    PlacementPolicyDocument, PolicyBulkRun, PolicyIntent, PolicyIntentKey, PolicyMutationRecord,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
@@ -49,13 +48,11 @@ use std::collections::HashSet;
 use ulid::Ulid;
 
 use super::present::{
-    DecodedField, DecodedValue, EntryOutput, JsonCraqleClockEntry, JsonCraqleDot,
-    JsonCraqleGraphKey, JsonCraqleGraphMeta, JsonCraqleGraphPolicy, JsonCraqleLogKey,
-    JsonCraqleQuadKey, JsonCraqleStoredBatch, JsonCraqleStoredBatchOp, JsonCraqleVectorClock,
-    JsonGroup, JsonJobRecordEnvelope, JsonJobRecordKey, JsonJobReservation,
-    JsonPendingDocumentPlacement, JsonPersistedNodeState, JsonPlacementPolicyDocument,
-    JsonPolicyCacheEntry, JsonRealmAuthorizationDocument, JsonRealmConfigDocument, JsonStoredEntry,
-    JsonUserAccess, family_id_string,
+    DecodedField, DecodedValue, EntryOutput, JsonAuthorizationDocument, JsonCacheEntry,
+    JsonClockEntry, JsonConfigDocument, JsonCraqleDot, JsonGraphKey, JsonGraphMeta,
+    JsonGraphPolicy, JsonGroup, JsonJobReservation, JsonLogKey, JsonPendingPlacement,
+    JsonPersistedState, JsonPlacementDocument, JsonQuadKey, JsonRecordEnvelope, JsonRecordKey,
+    JsonStored, JsonStoredEntry, JsonStoredOp, JsonUserAccess, JsonVectorClock, family_id_string,
 };
 
 const CRAQLE_DOT_ENCODING_TAG: u8 = b'D';
@@ -69,13 +66,13 @@ const CRAQLE_LOG_BATCH_PREFIX: u8 = b'B';
 pub(super) struct CraqleTermId(pub(super) u128);
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub(super) struct CraqleStoredGraphMeta {
+pub(super) struct CraqleStoredMeta {
     pub(super) policy: CraqleGraphPolicy,
     pub(super) clock: CraqleVectorClock,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub(super) enum CraqleStoredQuadOp {
+pub(super) enum CraqleQuadOp {
     Add {
         subject: CraqleTermId,
         predicate: CraqleTermId,
@@ -95,12 +92,12 @@ pub(super) struct CraqleStoredBatch {
     pub(super) actor: CraqleActorId,
     pub(super) counter: u64,
     pub(super) base_clock: CraqleVectorClock,
-    pub(super) ops: Vec<CraqleStoredQuadOp>,
+    pub(super) ops: Vec<CraqleQuadOp>,
     pub(super) timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct CraqleQuadKeyParts {
+pub(super) struct CraqleQuadParts {
     pub(super) graph: CraqleTermId,
     pub(super) subject: CraqleTermId,
     pub(super) predicate: CraqleTermId,
@@ -108,7 +105,7 @@ pub(super) struct CraqleQuadKeyParts {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CraqleGraphKeyParts {
+pub(super) enum CraqleGraphParts {
     Meta {
         graph: CraqleTermId,
     },
@@ -122,7 +119,7 @@ pub(super) enum CraqleGraphKeyParts {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CraqleLogKeyParts {
+pub(super) enum CraqleLogParts {
     Head {
         graph: CraqleTermId,
         actor: CraqleActorId,
@@ -186,8 +183,8 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
             decode_policy_id(keyspace_name, key)
         }
         PLACEMENT_POLICY_CACHE_KEYSPACE => decode_policy_cache(key),
-        POLICY_BULK_INTENT_KEYSPACE => PolicyBulkIntentKey::from_bytes(key)
-            .map(|value| DecodedField::PolicyBulkIntentKey {
+        POLICY_BULK_INTENT_KEYSPACE => PolicyIntentKey::from_bytes(key)
+            .map(|value| DecodedField::PolicyIntentKey {
                 operation_id: value.operation_id.to_string(),
                 key: value.key,
             })
@@ -195,18 +192,18 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         JOB_OUTPUT_RECORD_KEYSPACE => decode_attempt_key(key),
         SYNC_PLACEMENT_KEYSPACE => raw_field(key),
         S3_MULTIPART_UPLOAD_KEYSPACE => decode_ulid_key(key),
-        S3_MULTIPART_UPLOAD_PART_KEYSPACE => MultipartUploadPartKey::from_bytes(key)
-            .map(|value| DecodedField::MultipartUploadPartKey { value })
+        S3_MULTIPART_UPLOAD_PART_KEYSPACE => MultipartPartKey::from_bytes(key)
+            .map(|value| DecodedField::MultipartPartKey { value })
             .unwrap_or_else(|_| raw_field(key)),
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE => MultipartObjectMetadataKey::from_bytes(key)
-            .map(|value| DecodedField::MultipartObjectMetadataKey { value })
+        S3_MULTIPART_OBJECT_METADATA_KEYSPACE => MultipartObjectKey::from_bytes(key)
+            .map(|value| DecodedField::MultipartObjectKey { value })
             .unwrap_or_else(|_| raw_field(key)),
         DHT_KEYSPACE => decode_dht_key(key),
         BLOB_HEAD_KEYSPACE => BlobHeadKey::from_bytes(key)
             .map(|value| DecodedField::BlobHeadKey { value })
             .unwrap_or_else(|_| raw_field(key)),
-        HASH_PATHS_INDEX_KEYSPACE => HashPathIndexKey::from_bytes(key)
-            .map(|value| DecodedField::HashPathIndexKey { value })
+        HASH_PATHS_INDEX_KEYSPACE => HashIndex::from_bytes(key)
+            .map(|value| DecodedField::HashIndex { value })
             .unwrap_or_else(|_| raw_field(key)),
         BLOB_VERSIONS_KEYSPACE => VersionKey::from_bytes(key)
             .map(|value| DecodedField::VersionKey { value })
@@ -232,7 +229,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         REALM_CONFIG_KEYSPACE => {
             decode_value_with(value, RealmConfigDocument::from_bytes, |data| {
                 DecodedValue::RealmConfigDocument {
-                    data: JsonRealmConfigDocument(data),
+                    data: JsonConfigDocument(data),
                 }
             })
         }
@@ -265,21 +262,21 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
             value,
             |bytes| postcard::from_bytes::<JobRecordEnvelope>(bytes),
             |data| DecodedValue::JobOutputRecord {
-                data: JsonJobRecordEnvelope(data),
+                data: JsonRecordEnvelope(data),
             },
         ),
         JOB_FAMILY_RECORD_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<JobRecordEnvelope>(bytes),
             |data| DecodedValue::JobFamilyRecord {
-                data: JsonJobRecordEnvelope(data),
+                data: JsonRecordEnvelope(data),
             },
         ),
         JOB_FAMILY_PENDING_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<PendingRecord>(bytes),
             |data| DecodedValue::JobPendingRecord {
-                envelope: JsonJobRecordEnvelope(data.envelope),
+                envelope: JsonRecordEnvelope(data.envelope),
                 need: pending_need_string(data.need),
                 first_seen_ms: data.first_seen_ms,
                 attempts: data.attempts,
@@ -289,7 +286,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
             value,
             |bytes| postcard::from_bytes::<ConflictRecord>(bytes),
             |data| DecodedValue::JobConflictRecord {
-                envelope: JsonJobRecordEnvelope(data.envelope),
+                envelope: JsonRecordEnvelope(data.envelope),
                 retained: hex::encode(data.retained),
                 observed_at_ms: data.observed_at_ms,
                 relayed_by: data.relayed_by.map(|node| node.to_string()),
@@ -297,7 +294,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         ),
         JOB_FAMILY_ALIAS_KEYSPACE => decode_value_with(value, JobRecordKey::from_bytes, |data| {
             DecodedValue::JobAliasTarget {
-                data: JsonJobRecordKey(data),
+                data: JsonRecordKey(data),
             }
         }),
         JOB_FAMILY_PROJECTION_KEYSPACE => decode_value_with(
@@ -350,14 +347,14 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         PLACEMENT_POLICY_KEYSPACE => {
             decode_value_with(value, PlacementPolicyDocument::from_bytes, |data| {
                 DecodedValue::PlacementPolicyDocument {
-                    data: JsonPlacementPolicyDocument(data),
+                    data: JsonPlacementDocument(data),
                 }
             })
         }
         PLACEMENT_POLICY_CACHE_KEYSPACE => {
             decode_value_with(value, PolicyCacheEntry::from_bytes, |data| {
                 DecodedValue::PolicyCacheEntry {
-                    data: JsonPolicyCacheEntry(data),
+                    data: JsonCacheEntry(data),
                 }
             })
         }
@@ -369,19 +366,17 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         POLICY_BULK_RUN_KEYSPACE => decode_value_with(value, PolicyBulkRun::from_bytes, |data| {
             DecodedValue::PolicyBulkRun { data }
         }),
-        POLICY_BULK_INTENT_KEYSPACE => {
-            decode_value_with(value, PolicyBulkIntent::from_bytes, |data| {
-                DecodedValue::PolicyBulkIntent { data }
-            })
-        }
+        POLICY_BULK_INTENT_KEYSPACE => decode_value_with(value, PolicyIntent::from_bytes, |data| {
+            DecodedValue::PolicyIntent { data }
+        }),
         S3_MULTIPART_UPLOAD_KEYSPACE => {
             decode_value_with(value, MultipartUpload::from_bytes, |data| {
                 DecodedValue::MultipartUpload { data }
             })
         }
         S3_MULTIPART_UPLOAD_PART_KEYSPACE => {
-            decode_value_with(value, MultipartUploadPart::from_bytes, |data| {
-                DecodedValue::MultipartUploadPart { data }
+            decode_value_with(value, MultipartPart::from_bytes, |data| {
+                DecodedValue::MultipartPart { data }
             })
         }
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE => decode_object_metadata(key, value),
@@ -394,14 +389,14 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
             value,
             |bytes| postcard::from_bytes::<PersistedNodeState>(bytes),
             |data| DecodedValue::NodeState {
-                data: JsonPersistedNodeState(data),
+                data: JsonPersistedState(data),
             },
         ),
         SYNC_PLACEMENT_KEYSPACE => decode_value_with(
             value,
             aruna_operations::sync::shard_placement::decode_placement,
             |data| DecodedValue::PendingDocumentPlacement {
-                data: JsonPendingDocumentPlacement(data),
+                data: JsonPendingPlacement(data),
             },
         ),
         ONBOARDING_KEYSPACE => decode_value_with(
@@ -458,7 +453,7 @@ fn decode_policy_cache(key: &[u8]) -> DecodedField {
 fn decode_record_key(key: &[u8]) -> DecodedField {
     JobRecordKey::from_bytes(key)
         .map(|value| DecodedField::JobRecordKey {
-            value: JsonJobRecordKey(value),
+            value: JsonRecordKey(value),
         })
         .unwrap_or_else(|_| raw_field(key))
 }
@@ -471,7 +466,7 @@ fn decode_conflict_key(key: &[u8]) -> DecodedField {
     };
     match JobRecordKey::from_bytes(record) {
         Ok(record) => DecodedField::JobConflictKey {
-            record: JsonJobRecordKey(record),
+            record: JsonRecordKey(record),
             digest: hex::encode(digest),
         },
         Err(_) => raw_field(key),
@@ -561,7 +556,7 @@ fn decode_auth_value(value: &[u8]) -> DecodedValue {
     }
     if let Ok(data) = RealmAuthorizationDocument::from_bytes(value) {
         return DecodedValue::RealmAuthorizationDocument {
-            data: JsonRealmAuthorizationDocument(data),
+            data: JsonAuthorizationDocument(data),
         };
     }
 
@@ -594,13 +589,13 @@ fn decode_api_state(key: &[u8], value: &[u8]) -> DecodedValue {
 }
 
 fn decode_object_metadata(key: &[u8], value: &[u8]) -> DecodedValue {
-    match MultipartObjectMetadataKey::from_bytes(key) {
-        Ok(MultipartObjectMetadataKey::Summary { .. }) => {
+    match MultipartObjectKey::from_bytes(key) {
+        Ok(MultipartObjectKey::Summary { .. }) => {
             decode_value_with(value, MultipartObjectSummary::from_bytes, |data| {
                 DecodedValue::MultipartObjectSummary { data }
             })
         }
-        Ok(MultipartObjectMetadataKey::Part { .. }) => {
+        Ok(MultipartObjectKey::Part { .. }) => {
             decode_value_with(value, MultipartObjectPart::from_bytes, |data| {
                 DecodedValue::MultipartObjectPart { data }
             })
@@ -699,14 +694,14 @@ fn decode_craqle_u64(bytes: &[u8], context: &'static str) -> Result<u64, String>
     Ok(u64::from_be_bytes(raw))
 }
 
-fn decode_quad_key(key: &[u8]) -> Result<CraqleQuadKeyParts, String> {
+fn decode_quad_key(key: &[u8]) -> Result<CraqleQuadParts, String> {
     if key.len() != 64 {
         return Err(format!(
             "invalid craqle quad key: expected 64 bytes, found {}",
             key.len()
         ));
     }
-    Ok(CraqleQuadKeyParts {
+    Ok(CraqleQuadParts {
         graph: decode_term_id(&key[0..16], "craqle quad graph")?,
         subject: decode_term_id(&key[16..32], "craqle quad subject")?,
         predicate: decode_term_id(&key[32..48], "craqle quad predicate")?,
@@ -714,16 +709,16 @@ fn decode_quad_key(key: &[u8]) -> Result<CraqleQuadKeyParts, String> {
     })
 }
 
-fn decode_graph_key(key: &[u8]) -> Result<CraqleGraphKeyParts, String> {
+fn decode_graph_key(key: &[u8]) -> Result<CraqleGraphParts, String> {
     match key.first().copied() {
-        Some(CRAQLE_GRAPH_META_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Meta {
+        Some(CRAQLE_GRAPH_META_PREFIX) if key.len() == 17 => Ok(CraqleGraphParts::Meta {
             graph: decode_term_id(&key[1..17], "craqle graph meta graph")?,
         }),
-        Some(CRAQLE_GRAPH_DIRTY_PREFIX) if key.len() == 33 => Ok(CraqleGraphKeyParts::Dirty {
+        Some(CRAQLE_GRAPH_DIRTY_PREFIX) if key.len() == 33 => Ok(CraqleGraphParts::Dirty {
             graph: decode_term_id(&key[1..17], "craqle graph dirty graph")?,
             subject: decode_term_id(&key[17..33], "craqle graph dirty subject")?,
         }),
-        Some(CRAQLE_GRAPH_REINDEX_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Reindex {
+        Some(CRAQLE_GRAPH_REINDEX_PREFIX) if key.len() == 17 => Ok(CraqleGraphParts::Reindex {
             graph: decode_term_id(&key[1..17], "craqle graph reindex graph")?,
         }),
         Some(prefix) => Err(format!(
@@ -735,9 +730,9 @@ fn decode_graph_key(key: &[u8]) -> Result<CraqleGraphKeyParts, String> {
     }
 }
 
-fn decode_log_key(key: &[u8]) -> Result<CraqleLogKeyParts, String> {
+fn decode_log_key(key: &[u8]) -> Result<CraqleLogParts, String> {
     match key.first().copied() {
-        Some(CRAQLE_LOG_HEAD_PREFIX) if key.len() == 49 => Ok(CraqleLogKeyParts::Head {
+        Some(CRAQLE_LOG_HEAD_PREFIX) if key.len() == 49 => Ok(CraqleLogParts::Head {
             graph: decode_term_id(&key[1..17], "craqle log head graph")?,
             actor: CraqleActorId::from_bytes(
                 key[17..49]
@@ -745,7 +740,7 @@ fn decode_log_key(key: &[u8]) -> Result<CraqleLogKeyParts, String> {
                     .map_err(|_| "invalid craqle log head actor".to_string())?,
             ),
         }),
-        Some(CRAQLE_LOG_BATCH_PREFIX) if key.len() == 57 => Ok(CraqleLogKeyParts::Batch {
+        Some(CRAQLE_LOG_BATCH_PREFIX) if key.len() == 57 => Ok(CraqleLogParts::Batch {
             graph: decode_term_id(&key[1..17], "craqle log batch graph")?,
             actor: CraqleActorId::from_bytes(
                 key[17..49]
@@ -784,19 +779,19 @@ fn decode_craqle_dots(value: &[u8]) -> Result<Vec<JsonCraqleDot>, String> {
 
 fn decode_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
     match decode_graph_key(key) {
-        Ok(CraqleGraphKeyParts::Meta { graph }) => decode_value_with(
+        Ok(CraqleGraphParts::Meta { graph }) => decode_value_with(
             value,
-            |bytes| postcard::from_bytes::<CraqleStoredGraphMeta>(bytes),
+            |bytes| postcard::from_bytes::<CraqleStoredMeta>(bytes),
             |data| DecodedValue::CraqleGraphMeta {
                 data: json_graph_meta(graph, data),
             },
         ),
-        Ok(CraqleGraphKeyParts::Dirty { .. }) => decode_value_with(
+        Ok(CraqleGraphParts::Dirty { .. }) => decode_value_with(
             value,
             |bytes| decode_craqle_u64(bytes, "craqle graph dirty token"),
             |data| DecodedValue::CraqleGraphDirtyToken { data },
         ),
-        Ok(CraqleGraphKeyParts::Reindex { .. }) => decode_value_with(
+        Ok(CraqleGraphParts::Reindex { .. }) => decode_value_with(
             value,
             |bytes| decode_craqle_u64(bytes, "craqle graph reindex token"),
             |data| DecodedValue::CraqleGraphReindexToken { data },
@@ -805,8 +800,8 @@ fn decode_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
     }
 }
 
-fn decode_log_batch(key: &[u8], value: &[u8]) -> Result<JsonCraqleStoredBatch, String> {
-    let CraqleLogKeyParts::Batch { graph, .. } = decode_log_key(key)? else {
+fn decode_log_batch(key: &[u8], value: &[u8]) -> Result<JsonStored, String> {
+    let CraqleLogParts::Batch { graph, .. } = decode_log_key(key)? else {
         return Err("craqle log batch value requires a batch key".to_string());
     };
     if value.first().copied() != Some(CRAQLE_BATCH_LOG_ENCODING_TAG) {
@@ -819,12 +814,12 @@ fn decode_log_batch(key: &[u8], value: &[u8]) -> Result<JsonCraqleStoredBatch, S
 
 fn decode_log_value(key: &[u8], value: &[u8]) -> DecodedValue {
     match decode_log_key(key) {
-        Ok(CraqleLogKeyParts::Head { .. }) => decode_value_with(
+        Ok(CraqleLogParts::Head { .. }) => decode_value_with(
             value,
             |bytes| decode_craqle_u64(bytes, "craqle log head"),
             |data| DecodedValue::CraqleLogHead { data },
         ),
-        Ok(CraqleLogKeyParts::Batch { .. }) => decode_value_with(
+        Ok(CraqleLogParts::Batch { .. }) => decode_value_with(
             value,
             |bytes| decode_log_batch(key, bytes),
             |data| DecodedValue::CraqleLogBatch { data },
@@ -837,8 +832,8 @@ fn term_id_string(id: CraqleTermId) -> String {
     format!("{:032x}", id.0)
 }
 
-fn json_quad_key(parts: CraqleQuadKeyParts) -> JsonCraqleQuadKey {
-    JsonCraqleQuadKey {
+fn json_quad_key(parts: CraqleQuadParts) -> JsonQuadKey {
+    JsonQuadKey {
         graph: term_id_string(parts.graph),
         subject: term_id_string(parts.subject),
         predicate: term_id_string(parts.predicate),
@@ -846,32 +841,32 @@ fn json_quad_key(parts: CraqleQuadKeyParts) -> JsonCraqleQuadKey {
     }
 }
 
-fn json_graph_key(parts: CraqleGraphKeyParts) -> JsonCraqleGraphKey {
+fn json_graph_key(parts: CraqleGraphParts) -> JsonGraphKey {
     match parts {
-        CraqleGraphKeyParts::Meta { graph } => JsonCraqleGraphKey::Meta {
+        CraqleGraphParts::Meta { graph } => JsonGraphKey::Meta {
             graph: term_id_string(graph),
         },
-        CraqleGraphKeyParts::Dirty { graph, subject } => JsonCraqleGraphKey::Dirty {
+        CraqleGraphParts::Dirty { graph, subject } => JsonGraphKey::Dirty {
             graph: term_id_string(graph),
             subject: term_id_string(subject),
         },
-        CraqleGraphKeyParts::Reindex { graph } => JsonCraqleGraphKey::Reindex {
+        CraqleGraphParts::Reindex { graph } => JsonGraphKey::Reindex {
             graph: term_id_string(graph),
         },
     }
 }
 
-fn json_log_key(parts: CraqleLogKeyParts) -> JsonCraqleLogKey {
+fn json_log_key(parts: CraqleLogParts) -> JsonLogKey {
     match parts {
-        CraqleLogKeyParts::Head { graph, actor } => JsonCraqleLogKey::Head {
+        CraqleLogParts::Head { graph, actor } => JsonLogKey::Head {
             graph: term_id_string(graph),
             actor: actor.to_string(),
         },
-        CraqleLogKeyParts::Batch {
+        CraqleLogParts::Batch {
             graph,
             actor,
             counter,
-        } => JsonCraqleLogKey::Batch {
+        } => JsonLogKey::Batch {
             graph: term_id_string(graph),
             actor: actor.to_string(),
             counter,
@@ -886,12 +881,12 @@ fn json_craqle_dot(dot: CraqleDot) -> JsonCraqleDot {
     }
 }
 
-fn json_vector_clock(clock: CraqleVectorClock) -> JsonCraqleVectorClock {
-    JsonCraqleVectorClock {
+fn json_vector_clock(clock: CraqleVectorClock) -> JsonVectorClock {
+    JsonVectorClock {
         entries: clock
             .0
             .into_iter()
-            .map(|(actor, counter)| JsonCraqleClockEntry {
+            .map(|(actor, counter)| JsonClockEntry {
                 actor: actor.to_string(),
                 counter,
             })
@@ -899,26 +894,26 @@ fn json_vector_clock(clock: CraqleVectorClock) -> JsonCraqleVectorClock {
     }
 }
 
-fn json_graph_policy(policy: CraqleGraphPolicy) -> JsonCraqleGraphPolicy {
+fn json_graph_policy(policy: CraqleGraphPolicy) -> JsonGraphPolicy {
     let mut permission_paths = policy.permission_paths;
     permission_paths.sort();
     permission_paths.dedup();
-    JsonCraqleGraphPolicy {
+    JsonGraphPolicy {
         public: policy.public,
         permission_paths,
     }
 }
 
-fn json_graph_meta(graph: CraqleTermId, meta: CraqleStoredGraphMeta) -> JsonCraqleGraphMeta {
-    JsonCraqleGraphMeta {
+fn json_graph_meta(graph: CraqleTermId, meta: CraqleStoredMeta) -> JsonGraphMeta {
+    JsonGraphMeta {
         graph: term_id_string(graph),
         policy: json_graph_policy(meta.policy),
         clock: json_vector_clock(meta.clock),
     }
 }
 
-fn json_stored_batch(graph: CraqleTermId, batch: CraqleStoredBatch) -> JsonCraqleStoredBatch {
-    JsonCraqleStoredBatch {
+fn json_stored_batch(graph: CraqleTermId, batch: CraqleStoredBatch) -> JsonStored {
+    JsonStored {
         graph: term_id_string(graph),
         actor: batch.actor.to_string(),
         counter: batch.counter,
@@ -927,23 +922,23 @@ fn json_stored_batch(graph: CraqleTermId, batch: CraqleStoredBatch) -> JsonCraql
             .ops
             .into_iter()
             .map(|op| match op {
-                CraqleStoredQuadOp::Add {
+                CraqleQuadOp::Add {
                     subject,
                     predicate,
                     object,
                     dot,
-                } => JsonCraqleStoredBatchOp::Add {
+                } => JsonStoredOp::Add {
                     subject: term_id_string(subject),
                     predicate: term_id_string(predicate),
                     object: term_id_string(object),
                     dot: json_craqle_dot(dot),
                 },
-                CraqleStoredQuadOp::Remove {
+                CraqleQuadOp::Remove {
                     subject,
                     predicate,
                     object,
                     witnessed,
-                } => JsonCraqleStoredBatchOp::Remove {
+                } => JsonStoredOp::Remove {
                     subject: term_id_string(subject),
                     predicate: term_id_string(predicate),
                     object: term_id_string(object),
@@ -957,15 +952,13 @@ fn json_stored_batch(graph: CraqleTermId, batch: CraqleStoredBatch) -> JsonCraql
 #[cfg(test)]
 mod tests {
     use super::super::present::{
-        DecodedField, DecodedValue, JsonPlacementPolicyDocument, JsonPolicyCacheEntry,
+        DecodedField, DecodedValue, JsonCacheEntry, JsonPlacementDocument,
     };
-    use super::super::present::{
-        JsonCraqleGraphKey, JsonCraqleLogKey, JsonCraqleQuadKey, JsonCraqleStoredBatchOp,
-    };
+    use super::super::present::{JsonGraphKey, JsonLogKey, JsonQuadKey, JsonStoredOp};
     use super::{
         CRAQLE_BATCH_LOG_ENCODING_TAG, CRAQLE_DOT_ENCODING_TAG, CRAQLE_GRAPH_META_PREFIX,
-        CRAQLE_LOG_BATCH_PREFIX, CraqleStoredBatch, CraqleStoredGraphMeta, CraqleStoredQuadOp,
-        CraqleTermId, decode_entry, raw_field,
+        CRAQLE_LOG_BATCH_PREFIX, CraqleQuadOp, CraqleStoredBatch, CraqleStoredMeta, CraqleTermId,
+        decode_entry, raw_field,
     };
     use aruna::identity::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -987,14 +980,13 @@ mod tests {
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::{
         Actor, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-        CurrentVersionPointer, HashPathIndexKey, JobFamilyId, JobRecordEnvelope,
-        MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-        MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-        MultipartUploadStatus, POLICY_BULK_INTENT_KEYSPACE, POLICY_BULK_RUN_KEYSPACE,
-        POLICY_MUTATION_KEYSPACE, PlacementPolicy, PlacementPolicyDocument, PlacementPolicyRef,
-        PolicyBulkIntent, PolicyBulkRun, PolicyBulkStatus, PolicyIntentOutcome,
-        PolicyMutationParams, PolicyMutationRecord, PolicyPublication, PolicyRefMode,
-        RealmConfigDocument, RealmId, placement_policy_key,
+        CurrentVersionPointer, HashIndex, JobFamilyId, JobRecordEnvelope, MultipartChecksumType,
+        MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary, MultipartPart,
+        MultipartPartKey, MultipartUpload, MultipartUploadStatus, POLICY_BULK_INTENT_KEYSPACE,
+        POLICY_BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PlacementPolicy,
+        PlacementPolicyDocument, PlacementPolicyRef, PolicyBulkRun, PolicyIntent,
+        PolicyIntentOutcome, PolicyMutationParams, PolicyMutationRecord, PolicyPublication,
+        PolicyRefMode, PolicyStatus, RealmConfigDocument, RealmId, placement_policy_key,
     };
     use aruna_net::dht::storage::StoredEntry;
     use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
@@ -1344,7 +1336,7 @@ mod tests {
         assert_eq!(
             decoded.value,
             DecodedValue::PlacementPolicyDocument {
-                data: JsonPlacementPolicyDocument(document)
+                data: JsonPlacementDocument(document)
             }
         );
     }
@@ -1379,7 +1371,7 @@ mod tests {
         assert_eq!(
             decoded.value,
             DecodedValue::PolicyCacheEntry {
-                data: JsonPolicyCacheEntry(entry)
+                data: JsonCacheEntry(entry)
             }
         );
     }
@@ -1439,7 +1431,7 @@ mod tests {
             ),
             generation: 3,
             target_refs: Vec::new(),
-            status: PolicyBulkStatus::Active,
+            status: PolicyStatus::Active,
         };
 
         let decoded = decode_entry(
@@ -1460,7 +1452,7 @@ mod tests {
     #[test]
     fn decodes_bulk_intent() {
         let operation_id = Ulid::from_bytes([25_u8; 16]);
-        let intent = PolicyBulkIntent {
+        let intent = PolicyIntent {
             operation_id,
             key: "a.tar".to_string(),
             observed_head: CurrentVersionPointer::new(Ulid::from_bytes([26_u8; 16])),
@@ -1476,15 +1468,12 @@ mod tests {
 
         assert_eq!(
             decoded.key,
-            DecodedField::PolicyBulkIntentKey {
+            DecodedField::PolicyIntentKey {
                 operation_id: operation_id.to_string(),
                 key: "a.tar".to_string(),
             }
         );
-        assert_eq!(
-            decoded.value,
-            DecodedValue::PolicyBulkIntent { data: intent }
-        );
+        assert_eq!(decoded.value, DecodedValue::PolicyIntent { data: intent });
     }
     #[test]
     fn unknown_keyspace_raw() {
@@ -1717,8 +1706,8 @@ mod tests {
     fn decodes_upload_part() {
         let realm_id = RealmId::from_bytes([9_u8; 32]);
         let created_by = aruna_core::UserId::local(Ulid::from_bytes([11_u8; 16]), realm_id);
-        let key = MultipartUploadPartKey::new(Ulid::from_bytes([2_u8; 16]), 5);
-        let part = MultipartUploadPart {
+        let key = MultipartPartKey::new(Ulid::from_bytes([2_u8; 16]), 5);
+        let part = MultipartPart {
             part_number: 5,
             location: BackendLocation {
                 backend: BackendRef::node_default(),
@@ -1746,17 +1735,17 @@ mod tests {
         );
         assert_eq!(
             decoded.key,
-            DecodedField::MultipartUploadPartKey { value: key.clone() }
+            DecodedField::MultipartPartKey { value: key.clone() }
         );
         match decoded.value {
-            DecodedValue::MultipartUploadPart { data } => assert_eq!(data, part),
+            DecodedValue::MultipartPart { data } => assert_eq!(data, part),
             other => panic!("expected multipart upload part, got {other:?}"),
         }
     }
 
     #[test]
     fn decodes_object_summary() {
-        let key = MultipartObjectMetadataKey::summary(Ulid::from_bytes([1_u8; 16]));
+        let key = MultipartObjectKey::summary(Ulid::from_bytes([1_u8; 16]));
         let summary = MultipartObjectSummary {
             checksum_type: MultipartChecksumType::Composite,
             part_count: 3,
@@ -1770,7 +1759,7 @@ mod tests {
         );
         assert_eq!(
             decoded.key,
-            DecodedField::MultipartObjectMetadataKey { value: key.clone() }
+            DecodedField::MultipartObjectKey { value: key.clone() }
         );
         match decoded.value {
             DecodedValue::MultipartObjectSummary { data } => assert_eq!(data, summary),
@@ -1780,7 +1769,7 @@ mod tests {
 
     #[test]
     fn decodes_object_part() {
-        let key = MultipartObjectMetadataKey::part(Ulid::from_bytes([5_u8; 16]), 2);
+        let key = MultipartObjectKey::part(Ulid::from_bytes([5_u8; 16]), 2);
         let part = MultipartObjectPart {
             part_number: 2,
             size: 64,
@@ -1797,7 +1786,7 @@ mod tests {
         );
         assert_eq!(
             decoded.key,
-            DecodedField::MultipartObjectMetadataKey { value: key.clone() }
+            DecodedField::MultipartObjectKey { value: key.clone() }
         );
         match decoded.value {
             DecodedValue::MultipartObjectPart { data } => assert_eq!(data, part),
@@ -1807,7 +1796,7 @@ mod tests {
 
     #[test]
     fn invalid_metadata_raw() {
-        let key = MultipartObjectMetadataKey::summary(Ulid::from_bytes([3_u8; 16]));
+        let key = MultipartObjectKey::summary(Ulid::from_bytes([3_u8; 16]));
         let decoded = decode_entry(
             S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
             &key.to_bytes().unwrap(),
@@ -1867,7 +1856,7 @@ mod tests {
         assert_eq!(
             decoded.key,
             DecodedField::CraqleQuadKey {
-                value: JsonCraqleQuadKey {
+                value: JsonQuadKey {
                     graph: format!("{graph:032x}"),
                     subject: format!("{subject:032x}"),
                     predicate: format!("{predicate:032x}"),
@@ -1892,7 +1881,7 @@ mod tests {
         let mut key = vec![CRAQLE_GRAPH_META_PREFIX];
         key.extend_from_slice(&graph.to_be_bytes());
 
-        let value = postcard::to_allocvec(&CraqleStoredGraphMeta {
+        let value = postcard::to_allocvec(&CraqleStoredMeta {
             policy: CraqleGraphPolicy {
                 public: true,
                 permission_paths: vec!["/b".to_string(), "/a".to_string(), "/a".to_string()],
@@ -1905,7 +1894,7 @@ mod tests {
         match decoded.key {
             DecodedField::CraqleGraphKey { value } => assert_eq!(
                 value,
-                JsonCraqleGraphKey::Meta {
+                JsonGraphKey::Meta {
                     graph: format!("{graph:032x}")
                 }
             ),
@@ -1941,7 +1930,7 @@ mod tests {
             actor,
             counter: 17,
             base_clock: CraqleVectorClock(BTreeMap::from([(actor, 16_u64)])),
-            ops: vec![CraqleStoredQuadOp::Add {
+            ops: vec![CraqleQuadOp::Add {
                 subject: CraqleTermId(subject),
                 predicate: CraqleTermId(predicate),
                 object: CraqleTermId(object),
@@ -1957,7 +1946,7 @@ mod tests {
         match decoded.key {
             DecodedField::CraqleLogKey { value } => assert_eq!(
                 value,
-                JsonCraqleLogKey::Batch {
+                JsonLogKey::Batch {
                     graph: format!("{graph:032x}"),
                     actor: actor.to_string(),
                     counter: 17,
@@ -1974,7 +1963,7 @@ mod tests {
                 assert_eq!(data.base_clock.entries[0].counter, 16);
                 assert_eq!(data.ops.len(), 1);
                 match &data.ops[0] {
-                    JsonCraqleStoredBatchOp::Add {
+                    JsonStoredOp::Add {
                         subject: got_subject,
                         predicate: got_predicate,
                         object: got_object,
@@ -2041,7 +2030,7 @@ mod tests {
             created_by,
             None,
         );
-        let hash_path_key = HashPathIndexKey::new(
+        let hash_path_key = HashIndex::new(
             [9_u8; 32],
             Ulid::from_bytes([4_u8; 16]),
             realm_id,
@@ -2108,7 +2097,7 @@ mod tests {
         );
         assert_eq!(
             decoded_index.key,
-            DecodedField::HashPathIndexKey {
+            DecodedField::HashIndex {
                 value: hash_path_key.clone()
             }
         );
