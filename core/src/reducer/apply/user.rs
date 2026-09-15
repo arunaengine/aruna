@@ -1,10 +1,10 @@
 use super::*;
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_user(
         &mut self,
         event: &AdminDocumentEvent,
-    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
             AdminDocumentOperation::UserNameSet { name } => self.apply_user_name(event, name),
             AdminDocumentOperation::UserSubjectIdAdded { subject_id } => {
@@ -22,8 +22,8 @@ impl AdminDocumentReducerState {
                 validate_attribute_key(key)?;
                 self.apply_user_attribute(event, key, None);
             }
-            _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
+            _ => return Err(AdminDocumentError::UnsupportedTarget),
         }
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     }
 }

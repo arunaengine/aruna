@@ -1,15 +1,15 @@
 use super::*;
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_placement(
         &mut self,
         event: &AdminDocumentEvent,
         realm_id: &RealmId,
-    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
             AdminDocumentOperation::RealmConfigNodePlacementSet { entry } => {
                 if let Some(label) = reserved_label(&entry.labels) {
-                    return Err(AdminDocumentReducerError::ReservedPlacementLabel(
+                    return Err(AdminDocumentError::ReservedPlacementLabel(
                         label.to_string(),
                     ));
                 }
@@ -24,20 +24,20 @@ impl AdminDocumentReducerState {
             }
             AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy } => {
                 if strategy.replica_count == Some(0) {
-                    return Err(AdminDocumentReducerError::ZeroPlacementReplicaCount);
+                    return Err(AdminDocumentError::ZeroPlacementReplicaCount);
                 }
                 if strategy.shard_count == 0
                     || !strategy.shard_count.is_power_of_two()
                     || strategy.shard_count > MAX_PLACEMENT_SHARD_COUNT
                 {
-                    return Err(AdminDocumentReducerError::InvalidPlacementShardCount);
+                    return Err(AdminDocumentError::InvalidPlacementShardCount);
                 }
                 if self
                     .materialized_strategies()
                     .get(&strategy.strategy_id)
                     .is_some_and(|current| current.shard_count != strategy.shard_count)
                 {
-                    return Err(AdminDocumentReducerError::PlacementShardCountChanged);
+                    return Err(AdminDocumentError::PlacementShardCountChanged);
                 }
                 self.apply_placement_field(
                     event,
@@ -47,7 +47,7 @@ impl AdminDocumentReducerState {
             }
             AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id } => {
                 if self.materialized_family_strategy() == Some(*strategy_id) {
-                    return Err(AdminDocumentReducerError::JobFamilyRemoved);
+                    return Err(AdminDocumentError::JobFamilyRemoved);
                 }
                 self.apply_placement_field(event, placement_strategy_path(strategy_id), None);
             }
@@ -60,13 +60,13 @@ impl AdminDocumentReducerState {
             }
             AdminDocumentOperation::RealmConfigJobFamilySet { strategy_id } => {
                 if strategy_id.is_nil() {
-                    return Err(AdminDocumentReducerError::NilJobFamily);
+                    return Err(AdminDocumentError::NilJobFamily);
                 }
                 if self
                     .materialized_family_strategy()
                     .is_some_and(|current| current != *strategy_id)
                 {
-                    return Err(AdminDocumentReducerError::JobFamilyChanged);
+                    return Err(AdminDocumentError::JobFamilyChanged);
                 }
                 self.apply_config_setting(
                     event,
@@ -102,7 +102,7 @@ impl AdminDocumentReducerState {
                 // twice would make its selection weight ambiguous.
                 let mut seen = BTreeSet::new();
                 if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
-                    return Err(AdminDocumentReducerError::InvalidCandidateMap);
+                    return Err(AdminDocumentError::InvalidCandidateMap);
                 }
                 self.apply_immutable_value(
                     event,
@@ -115,7 +115,7 @@ impl AdminDocumentReducerState {
                 candidate_map_epoch,
             } => {
                 if *candidate_map_epoch == 0 {
-                    return Err(AdminDocumentReducerError::InvalidCandidateMap);
+                    return Err(AdminDocumentError::InvalidCandidateMap);
                 }
                 self.apply_immutable_value(
                     event,
@@ -125,6 +125,6 @@ impl AdminDocumentReducerState {
             }
             _ => return self.apply_transition(event, realm_id),
         }
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     }
 }

@@ -1,10 +1,10 @@
 use super::*;
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_realm(
         &mut self,
         event: &AdminDocumentEvent,
-    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
             AdminDocumentOperation::RealmRoleAdded { role_id } => {
                 self.apply_realm_role(event, role_id, role_id.to_string());
@@ -18,8 +18,8 @@ impl AdminDocumentReducerState {
             AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
                 self.apply_realm_assignment(event, role_id, user_id, None);
             }
-            _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
+            _ => return Err(AdminDocumentError::UnsupportedTarget),
         }
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     }
 }

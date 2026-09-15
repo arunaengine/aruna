@@ -225,7 +225,7 @@ pub struct TargetScore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::scheduling::{node, request, resolved_input};
+    use crate::tests::scheduling::{node, request, resolved_input};
 
     #[test]
     fn canonical_sorts_inputs() {

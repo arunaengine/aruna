@@ -3,7 +3,7 @@ use crate::NodeId;
 use crate::compute::{ExecutorAvailability, NetworkAccess, ResourceEnvelope, StagingMode};
 use crate::structs::{LabelMatch, PlacementSelector, RealmNodeKind};
 
-use crate::tests::fixtures::scheduling::*;
+use crate::tests::scheduling::*;
 
 /// `count` advertisements, in the canonical order the planner ranks them in.
 fn scanned(count: u8) -> Vec<TargetCandidate> {

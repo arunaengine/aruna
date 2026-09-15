@@ -81,9 +81,9 @@ fn repeated_revocations_bound() {
 
     for (index, event) in events.iter().enumerate() {
         let expected = if index == 0 {
-            AdminDocumentApplyStatus::Applied
+            AdminApplyStatus::Applied
         } else {
-            AdminDocumentApplyStatus::Redundant
+            AdminApplyStatus::Redundant
         };
         assert_eq!(state.apply(event), Ok(expected));
     }
@@ -152,7 +152,7 @@ fn compaction_canonicalizes() {
     let mut state = realm_config_state();
     state.user_subject_ids.insert(
         longer_path.clone(),
-        AdminDocumentAttributeVersion {
+        AdminAttributeVersion {
             value: Some("5000".to_string()),
             dot: longer.dot(),
         },
@@ -162,7 +162,7 @@ fn compaction_canonicalizes() {
         .insert(longer_path.clone(), BTreeSet::from([equal.dot()]));
     state.user_subject_ids.insert(
         shorter_path,
-        AdminDocumentAttributeVersion {
+        AdminAttributeVersion {
             value: Some("3000".to_string()),
             dot: shorter.dot(),
         },
@@ -253,16 +253,16 @@ fn stale_conflict_removed() {
     let mut state = realm_config_state();
     state.user_subject_ids.insert(
         path.clone(),
-        AdminDocumentAttributeVersion {
+        AdminAttributeVersion {
             value: Some("5000".to_string()),
             dot: canonical.dot(),
         },
     );
     state.conflicts.insert(
         path.clone(),
-        AdminDocumentConflict {
+        AdminConflict {
             path: path.clone(),
-            values: vec![AdminDocumentConflictValue {
+            values: vec![AdminConflictValue {
                 value: Some("4000".to_string()),
                 dot: stale.dot(),
             }],
@@ -384,7 +384,7 @@ fn indexed_apply_refreshes() {
 
     assert_eq!(
         state.apply_revocation_event(&event, &mut index),
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     );
     assert_eq!(
         index.origin(&crate::auth::bearer_token_hash("indexed")),
@@ -518,7 +518,7 @@ fn rejects_malformed_hash() {
 
     assert_eq!(
         state.apply(&event),
-        Err(AdminDocumentReducerError::InvalidTokenHash)
+        Err(AdminDocumentError::InvalidTokenHash)
     );
     assert!(state.materialized_revoked_tokens().is_empty());
 }

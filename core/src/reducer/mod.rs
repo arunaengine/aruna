@@ -14,7 +14,7 @@ use crate::NodeId;
 use crate::UserId;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
-    AdminDocumentRoleDefinition, AdminDocumentTarget,
+    AdminDocumentTarget, AdminRoleDefinition,
 };
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, valid_token_hash};
 use crate::structs::{
@@ -29,7 +29,7 @@ use crate::structs::{
 use crate::structured_id::PlacementHandle;
 use crate::types::RoleId;
 use crate::user_validation::{
-    UserAttributeValidationError, validate_attribute_key, validate_attribute_value,
+    UserAttributeError, validate_attribute_key, validate_attribute_value,
 };
 
 mod apply;
@@ -45,7 +45,7 @@ use placement::{candidate_map_value, transition_plan_value, transition_proof_val
 pub use revocation::{MAX_LIVE_REVOCATIONS_PER_ORIGIN, revoked_token_entry, revoked_token_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdminDocumentApplyStatus {
+pub enum AdminApplyStatus {
     Applied,
     Duplicate,
     Redundant,
@@ -53,7 +53,7 @@ pub enum AdminDocumentApplyStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum AdminDocumentReducerError {
+pub enum AdminDocumentError {
     #[error("admin document event target does not match reducer state")]
     TargetMismatch,
     #[error("admin document event operation is not supported for target")]
@@ -61,7 +61,7 @@ pub enum AdminDocumentReducerError {
     #[error("invalid group join request or decision")]
     InvalidJoinRequest,
     #[error(transparent)]
-    InvalidUserAttribute(#[from] UserAttributeValidationError),
+    InvalidUserAttribute(#[from] UserAttributeError),
     #[error("placement labels must not set the derived label `{0}`")]
     ReservedPlacementLabel(String),
     #[error("placement strategy replica count must not be zero")]
@@ -96,32 +96,32 @@ pub enum AdminDocumentReducerError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminDocumentAttributeVersion {
+pub struct AdminAttributeVersion {
     pub value: Option<String>,
     pub dot: AdminDocumentDot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminDocumentConflictValue {
+pub struct AdminConflictValue {
     pub value: Option<String>,
     pub dot: AdminDocumentDot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminDocumentConflict {
+pub struct AdminConflict {
     pub path: String,
-    pub values: Vec<AdminDocumentConflictValue>,
+    pub values: Vec<AdminConflictValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminDocumentReducerState {
+pub struct AdminDocumentState {
     pub target: AdminDocumentTarget,
     pub clock: AdminDocumentClock,
     pub applied_event_ids: BTreeSet<Ulid>,
-    pub user_attributes: BTreeMap<String, AdminDocumentAttributeVersion>,
-    pub conflicts: BTreeMap<String, AdminDocumentConflict>,
-    pub user_name: Option<AdminDocumentAttributeVersion>,
-    pub user_subject_ids: BTreeMap<String, AdminDocumentAttributeVersion>,
+    pub user_attributes: BTreeMap<String, AdminAttributeVersion>,
+    pub conflicts: BTreeMap<String, AdminConflict>,
+    pub user_name: Option<AdminAttributeVersion>,
+    pub user_subject_ids: BTreeMap<String, AdminAttributeVersion>,
     pub equivalent_value_dots: BTreeMap<String, BTreeSet<AdminDocumentDot>>,
     pub revocation_floor: u64,
     pub revocation_next_expiry: Option<u64>,
@@ -160,11 +160,11 @@ pub struct RevocationIndex {
     next_expiry: Option<u64>,
 }
 
-pub fn decode_reducer_state(bytes: &[u8]) -> Result<AdminDocumentReducerState, postcard::Error> {
+pub fn decode_reducer_state(bytes: &[u8]) -> Result<AdminDocumentState, postcard::Error> {
     postcard::from_bytes(bytes)
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub fn new(target: AdminDocumentTarget) -> Self {
         Self {
             target,
@@ -184,7 +184,7 @@ impl AdminDocumentReducerState {
         &mut self,
         actor: &Actor,
         op: AdminDocumentOperation,
-    ) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
+    ) -> Result<AdminDocumentEvent, AdminDocumentError> {
         let observed = self.clock.clone();
         let event = AdminDocumentEvent {
             event_id: Ulid::generate(),
@@ -204,7 +204,7 @@ impl AdminDocumentReducerState {
         actor: &Actor,
         op: AdminDocumentOperation,
         index: &mut RevocationIndex,
-    ) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
+    ) -> Result<AdminDocumentEvent, AdminDocumentError> {
         let observed = self.clock.clone();
         let event = AdminDocumentEvent {
             event_id: Ulid::generate(),
@@ -223,12 +223,12 @@ impl AdminDocumentReducerState {
         &mut self,
         event: &AdminDocumentEvent,
         index: &mut RevocationIndex,
-    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
         if event.target != self.target {
-            return Err(AdminDocumentReducerError::TargetMismatch);
+            return Err(AdminDocumentError::TargetMismatch);
         }
         if self.applied_event_ids.contains(&event.event_id) {
-            return Ok(AdminDocumentApplyStatus::Duplicate);
+            return Ok(AdminApplyStatus::Duplicate);
         }
         let AdminDocumentOperation::RealmConfigTokenRevoked {
             token_hash,
@@ -236,13 +236,13 @@ impl AdminDocumentReducerState {
             token_owner,
         } = &event.op
         else {
-            return Err(AdminDocumentReducerError::UnsupportedTarget);
+            return Err(AdminDocumentError::UnsupportedTarget);
         };
         if !matches!(&event.target, AdminDocumentTarget::RealmConfig { .. }) {
-            return Err(AdminDocumentReducerError::UnsupportedTarget);
+            return Err(AdminDocumentError::UnsupportedTarget);
         }
         if !valid_token_hash(token_hash) {
-            return Err(AdminDocumentReducerError::InvalidTokenHash);
+            return Err(AdminDocumentError::InvalidTokenHash);
         }
         Ok(index.apply(self, event, token_hash, *expires_at, *token_owner))
     }
@@ -280,9 +280,9 @@ impl AdminDocumentReducerState {
         &mut self,
         event: &AdminDocumentEvent,
         path: &str,
-        current: Option<AdminDocumentAttributeVersion>,
+        current: Option<AdminAttributeVersion>,
         value: Option<String>,
-    ) -> Option<AdminDocumentAttributeVersion> {
+    ) -> Option<AdminAttributeVersion> {
         if self.event_path_stale(event, path) {
             return current;
         }
@@ -334,9 +334,9 @@ impl AdminDocumentReducerState {
         &mut self,
         event: &AdminDocumentEvent,
         path: &str,
-        current: Option<AdminDocumentAttributeVersion>,
+        current: Option<AdminAttributeVersion>,
         value: String,
-    ) -> Option<AdminDocumentAttributeVersion> {
+    ) -> Option<AdminAttributeVersion> {
         self.reduce_value(event, path, current, Some(value))
     }
 
@@ -359,7 +359,7 @@ impl AdminDocumentReducerState {
             })
     }
 
-    fn version_for_path(&self, path: &str) -> Option<&AdminDocumentAttributeVersion> {
+    fn version_for_path(&self, path: &str) -> Option<&AdminAttributeVersion> {
         if path == USER_NAME_PATH {
             return self.user_name.as_ref();
         }
@@ -387,7 +387,7 @@ impl AdminDocumentReducerState {
     fn take_version_dots(
         &mut self,
         path: &str,
-        version: &AdminDocumentAttributeVersion,
+        version: &AdminAttributeVersion,
     ) -> BTreeSet<AdminDocumentDot> {
         let mut dots = self.equivalent_value_dots.remove(path).unwrap_or_default();
         dots.insert(version.dot);
@@ -399,29 +399,27 @@ impl AdminDocumentReducerState {
         path: &str,
         value: Option<String>,
         mut dots: BTreeSet<AdminDocumentDot>,
-    ) -> AdminDocumentAttributeVersion {
+    ) -> AdminAttributeVersion {
         let dot = dots.pop_first().expect("admin value has a causal dot");
         if dots.is_empty() {
             self.equivalent_value_dots.remove(path);
         } else {
             self.equivalent_value_dots.insert(path.to_string(), dots);
         }
-        AdminDocumentAttributeVersion { value, dot }
+        AdminAttributeVersion { value, dot }
     }
 
     fn record_conflict_value(&mut self, path: &str, value: Option<String>, dot: AdminDocumentDot) {
-        let conflict =
-            self.conflicts
-                .entry(path.to_string())
-                .or_insert_with(|| AdminDocumentConflict {
-                    path: path.to_string(),
-                    values: Vec::new(),
-                });
+        let conflict = self
+            .conflicts
+            .entry(path.to_string())
+            .or_insert_with(|| AdminConflict {
+                path: path.to_string(),
+                values: Vec::new(),
+            });
 
         if !conflict.values.iter().any(|candidate| candidate.dot == dot) {
-            conflict
-                .values
-                .push(AdminDocumentConflictValue { value, dot });
+            conflict.values.push(AdminConflictValue { value, dot });
             conflict.values.sort_by_key(|value| value.dot);
         }
     }

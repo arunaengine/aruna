@@ -1,11 +1,11 @@
 use super::*;
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_group(
         &mut self,
         event: &AdminDocumentEvent,
         group_id: &crate::types::GroupId,
-    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
             AdminDocumentOperation::GroupCreated {
                 realm_id,
@@ -42,10 +42,10 @@ impl AdminDocumentReducerState {
                     || request.user_id.realm_id != event.actor.realm_id
                     || !crate::join_request::valid_message(&request.message)
                 {
-                    return Err(AdminDocumentReducerError::InvalidJoinRequest);
+                    return Err(AdminDocumentError::InvalidJoinRequest);
                 }
                 let value = serde_json::to_string(request)
-                    .map_err(|_| AdminDocumentReducerError::InvalidJoinRequest)?;
+                    .map_err(|_| AdminDocumentError::InvalidJoinRequest)?;
                 self.apply_group_field(
                     event,
                     &crate::join_request::request_path(request.request_id),
@@ -69,10 +69,10 @@ impl AdminDocumentReducerState {
                     || (decision.kind == JoinDecisionKind::Withdrawn
                         && decision.user_id != event.actor.user_id)
                 {
-                    return Err(AdminDocumentReducerError::InvalidJoinRequest);
+                    return Err(AdminDocumentError::InvalidJoinRequest);
                 }
                 let value = serde_json::to_string(decision)
-                    .map_err(|_| AdminDocumentReducerError::InvalidJoinRequest)?;
+                    .map_err(|_| AdminDocumentError::InvalidJoinRequest)?;
                 self.apply_group_field(
                     event,
                     &crate::join_request::decision_path(decision.request_id),
@@ -90,8 +90,8 @@ impl AdminDocumentReducerState {
             AdminDocumentOperation::GroupPoliciesSet { policies } => {
                 self.apply_group_field(event, GROUP_POLICIES_PATH, Some(policies_value(policies)));
             }
-            _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
+            _ => return Err(AdminDocumentError::UnsupportedTarget),
         }
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     }
 }

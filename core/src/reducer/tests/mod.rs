@@ -1,8 +1,7 @@
 use super::{
-    AdminDocumentApplyStatus, AdminDocumentAttributeVersion, AdminDocumentConflict,
-    AdminDocumentConflictValue, AdminDocumentReducerError, AdminDocumentReducerState,
-    GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH, REALM_CONFIG_DEFAULT_STRATEGY_PATH,
-    REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
+    AdminApplyStatus, AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentError,
+    AdminDocumentState, GROUP_DISPLAY_NAME_PATH, GROUP_REALM_ID_PATH,
+    REALM_CONFIG_DEFAULT_STRATEGY_PATH, REALM_CONFIG_DESCRIPTION_PATH, REALM_CONFIG_DISCOVERY_PATH,
     REALM_CONFIG_METADATA_REPLICATION_PATH, REALM_CONFIG_QUOTA_PATH, USER_NAME_PATH,
     binding_scope_key, config_node_path, config_oidc_path, decode_node_kind, group_role_path,
     group_user_path, handle_range_path, metadata_replication_value, node_kind_value,
@@ -22,15 +21,15 @@ use crate::structs::{
     MetadataReplicationConfig, NodePlacementEntry, PlacementBinding, PlacementOverride,
     PlacementScope, PlacementStrategy, ProofClaim, QuotaConfig, RealmConfigDocument,
     RealmDiscoveryConfig, RealmNodeKind, STORAGE_CLASS_LABEL_PREFIX, StrategyBinding,
-    TransitionLimits, TransitionPlan, TransitionStatus, UserGroupCapOverride,
+    TransitionLimits, TransitionPlan, TransitionStatus, UserCapOverride,
 };
 use crate::structured_id::PlacementHandle;
-use crate::user_validation::UserAttributeValidationError;
+use crate::user_validation::UserAttributeError;
 use crate::{NodeId, UserId};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 
-use crate::tests::fixtures::reducer::*;
+use crate::tests::reducer::*;
 mod group;
 mod placement;
 mod realm_config;
