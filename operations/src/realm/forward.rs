@@ -23,9 +23,9 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::warn;
 
-pub(super) const ADMIN_RELAY_PEER_LIMIT: usize = 3;
+pub(super) const RELAY_PEER_LIMIT: usize = 3;
 
-pub(super) const ADMIN_RELAY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const RELAY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Hands an origin-signed administrative envelope to a holder of its shard: the
 /// origin holds none of that shard so cannot publish; the holder republishes the
@@ -52,15 +52,15 @@ pub async fn relay_admin_event(
         .iter()
         .copied()
         .filter(|peer| Some(*peer) != local_node_id)
-        .take(ADMIN_RELAY_PEER_LIMIT)
+        .take(RELAY_PEER_LIMIT)
     {
         match timeout(
-            ADMIN_RELAY_ATTEMPT_TIMEOUT,
+            RELAY_ATTEMPT_TIMEOUT,
             metadata.request_forwarded_write(peer, message.clone()),
         )
         .await
         {
-            Ok(Ok(MetadataTransportMessage::ForwardedAdminEventQueued)) => return Ok(()),
+            Ok(Ok(MetadataTransportMessage::AdminEventQueued)) => return Ok(()),
             Ok(Ok(MetadataTransportMessage::Reject(error))) => {
                 // A rejection is a verdict on the envelope, not on this peer.
                 warn!(%peer, %error, "Holder rejected a relayed admin event");
@@ -181,7 +181,7 @@ pub(crate) async fn apply_admin_relay(
     {
         warn!(%message, "Failed to schedule the drain for a relayed admin event");
     }
-    MetadataTransportMessage::ForwardedAdminEventQueued
+    MetadataTransportMessage::AdminEventQueued
 }
 
 #[cfg(test)]

@@ -162,7 +162,7 @@ impl CreateRealmOperation {
             self.config.node_location.as_deref(),
             self.config.node_weight,
         )
-        .map_err(|_| CreateRealmError::NodeLocationTooLong)?;
+        .map_err(|_| CreateRealmError::LongNodeLocation)?;
         Ok(NodePlacementEntry {
             node_id: self.config.actor.node_id,
             location,
@@ -178,16 +178,16 @@ impl CreateRealmOperation {
         let config_doc = self
             .config_doc
             .as_ref()
-            .ok_or(CreateRealmError::RealmConfigDocNotFound)?;
+            .ok_or(CreateRealmError::ConfigDocMissing)?;
         let auth_doc = self
             .auth_doc
             .as_ref()
-            .ok_or(CreateRealmError::AuthDocNotFound)?;
+            .ok_or(CreateRealmError::DocNotFound)?;
         let realm_admin_role = auth_doc
             .roles
             .values()
             .find(|role| role.name == "realm_admin")
-            .ok_or(CreateRealmError::RealmAdminRoleNotFound)?;
+            .ok_or(CreateRealmError::AdminRoleMissing)?;
 
         let realm_target = AdminDocumentTarget::Realm { realm_id };
         let mut realm_state = AdminDocumentState::new(realm_target);
@@ -202,7 +202,7 @@ impl CreateRealmOperation {
         let mut config_state = AdminDocumentState::new(config_target);
         let config_node_event = config_state.apply_operation(
             &self.config.actor,
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: self.config.actor.node_id,
                 kind: RealmNodeKind::Management,
             },
@@ -211,13 +211,13 @@ impl CreateRealmOperation {
         for pool in &config_doc.band_pools {
             config_events.push(config_state.apply_operation(
                 &self.config.actor,
-                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool: *pool },
+                AdminDocumentOperation::BandPoolAssigned { pool: *pool },
             )?);
         }
         for range in &config_doc.placement_handle_ranges {
             config_events.push(config_state.apply_operation(
                 &self.config.actor,
-                AdminDocumentOperation::RealmConfigHandleRangeGranted { range: *range },
+                AdminDocumentOperation::HandleRangeGranted { range: *range },
             )?);
         }
         let mut oidc_providers = self.config.oidc_providers.clone();
@@ -225,19 +225,19 @@ impl CreateRealmOperation {
         for provider in oidc_providers {
             config_events.push(config_state.apply_operation(
                 &self.config.actor,
-                AdminDocumentOperation::RealmConfigOidcProviderUpserted { provider },
+                AdminDocumentOperation::OidcProviderUpserted { provider },
             )?);
         }
         config_events.push(config_state.apply_operation(
             &self.config.actor,
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: config_doc.metadata_replication.clone(),
                 discovery: config_doc.discovery.clone(),
             },
         )?);
         config_events.push(config_state.apply_operation(
             &self.config.actor,
-            AdminDocumentOperation::RealmConfigDescriptionSet {
+            AdminDocumentOperation::ConfigDescriptionSet {
                 description: config_doc.description.clone(),
             },
         )?);
@@ -248,19 +248,19 @@ impl CreateRealmOperation {
         )?);
         config_events.push(config_state.apply_operation(
             &self.config.actor,
-            AdminDocumentOperation::RealmConfigNodePlacementSet {
+            AdminDocumentOperation::NodePlacementSet {
                 entry: self.creating_node_placement()?,
             },
         )?);
         for map in &config_doc.candidate_maps {
             config_events.push(config_state.apply_operation(
                 &self.config.actor,
-                AdminDocumentOperation::RealmConfigCandidateMapPublished { map: map.clone() },
+                AdminDocumentOperation::CandidateMapPublished { map: map.clone() },
             )?);
             for strategy in &config_doc.strategies {
                 config_events.push(config_state.apply_operation(
                     &self.config.actor,
-                    AdminDocumentOperation::RealmConfigActivationsInitialized {
+                    AdminDocumentOperation::ConfigActivationsInitialized {
                         strategy_id: strategy.strategy_id,
                         candidate_map_epoch: map.epoch,
                     },
@@ -312,7 +312,7 @@ impl CreateRealmOperation {
             self.output = Some(Ok((config.clone(), auth.clone())));
             smallvec![]
         } else {
-            self.fail(CreateRealmError::RealmConfigDocNotFound)
+            self.fail(CreateRealmError::ConfigDocMissing)
         }
     }
 
@@ -417,10 +417,10 @@ impl CreateRealmOperation {
         };
 
         if self.auth_doc.is_some() && self.config_doc.is_some() {
-            self.state = CreateRealmState::ScheduleDocumentSyncOutboxDrain;
+            self.state = CreateRealmState::ScheduleSyncDrain;
             smallvec![schedule_drain_effect()]
         } else {
-            self.fail(CreateRealmError::RealmConfigDocNotFound)
+            self.fail(CreateRealmError::ConfigDocMissing)
         }
     }
 
@@ -429,7 +429,7 @@ impl CreateRealmOperation {
             Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_after_schedule(),
             Event::Task(TaskEvent::Error { .. }) => self.finish_after_schedule(),
             other => self.unexpected_event(
-                CreateRealmState::ScheduleDocumentSyncOutboxDrain,
+                CreateRealmState::ScheduleSyncDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",
                 format!("{other:?}"),
             ),
@@ -444,7 +444,7 @@ pub enum CreateRealmState {
     CreateAuthDoc,
     CreateConfigDoc,
     CommitTransaction,
-    ScheduleDocumentSyncOutboxDrain,
+    ScheduleSyncDrain,
     Finish,
     Error,
 }
@@ -458,13 +458,13 @@ pub enum CreateRealmError {
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("authorization document not found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error("realm config document not found")]
-    RealmConfigDocNotFound,
+    ConfigDocMissing,
     #[error("realm_admin role not found")]
-    RealmAdminRoleNotFound,
+    AdminRoleMissing,
     #[error("placement location must be at most 64 characters")]
-    NodeLocationTooLong,
+    LongNodeLocation,
     #[error("No transaction found")]
     NoTransactionFound,
     #[error(transparent)]
@@ -505,7 +505,7 @@ impl Operation for CreateRealmOperation {
             CreateRealmState::CreateAuthDoc => self.handle_auth_create(event),
             CreateRealmState::CreateConfigDoc => self.handle_config_create(event),
             CreateRealmState::CommitTransaction => self.handle_commit_transaction(event),
-            CreateRealmState::ScheduleDocumentSyncOutboxDrain => self.handle_outbox_schedule(event),
+            CreateRealmState::ScheduleSyncDrain => self.handle_outbox_schedule(event),
             CreateRealmState::Init | CreateRealmState::Finish | CreateRealmState::Error => {
                 smallvec![]
             }
@@ -547,7 +547,7 @@ pub(crate) fn seed_placement_events(
     for strategy in &document.strategies {
         events.push(state.apply_operation(
             actor,
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: strategy.clone(),
             },
         )?);
@@ -555,7 +555,7 @@ pub(crate) fn seed_placement_events(
     for binding in &document.placement_bindings {
         events.push(state.apply_operation(
             actor,
-            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+            AdminDocumentOperation::PlacementBindingAppended {
                 binding: binding.clone(),
             },
         )?);
@@ -563,19 +563,19 @@ pub(crate) fn seed_placement_events(
     if let Some(strategy_id) = document.default_strategy_id {
         events.push(state.apply_operation(
             actor,
-            AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+            AdminDocumentOperation::ConfigStrategySet { strategy_id },
         )?);
     }
     events.push(state.apply_operation(
         actor,
-        AdminDocumentOperation::RealmConfigJobFamilySet {
-            strategy_id: document.job_family_strategy_id,
+        AdminDocumentOperation::JobFamilySet {
+            strategy_id: document.family_strategy_id,
         },
     )?);
     for binding in &document.strategy_bindings {
         events.push(state.apply_operation(
             actor,
-            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+            AdminDocumentOperation::StrategyBindingSet {
                 binding: binding.clone(),
             },
         )?);
@@ -596,7 +596,7 @@ mod test {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
@@ -657,7 +657,7 @@ mod test {
         too_long.node_location = Some("x".repeat(65));
         assert_eq!(
             CreateRealmOperation::new(too_long).creating_node_placement(),
-            Err(super::CreateRealmError::NodeLocationTooLong)
+            Err(super::CreateRealmError::LongNodeLocation)
         );
     }
 
@@ -738,7 +738,7 @@ mod test {
         assert!(config_doc.has_node(actor.node_id));
         assert_eq!(config_doc.description, "A realm description");
 
-        let states = write_values(writes, ADMIN_DOCUMENT_STATE_KEYSPACE)
+        let states = write_values(writes, DOCUMENT_STATE_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<AdminDocumentState>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
@@ -781,7 +781,7 @@ mod test {
 
         let seeded_strategies = config_doc.strategies.clone();
         let seeded_default_strategy_id = config_doc.default_strategy_id.unwrap();
-        let seeded_family_strategy_id = config_doc.job_family_strategy_id;
+        let seeded_family_strategy_id = config_doc.family_strategy_id;
         let seeded_bindings = config_doc.strategy_bindings.clone();
         let seeded_placements = config_doc.placement_bindings.clone();
         assert_eq!(seeded_strategies.len(), 3);
@@ -809,7 +809,7 @@ mod test {
         assert_eq!(config_state.materialized_strategy_bindings().len(), 5);
         assert_eq!(config_state.materialized_placement_bindings().len(), 2);
 
-        let outbox_records = write_values(writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+        let outbox_records = write_values(writes, SYNC_OUTBOX_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
@@ -850,123 +850,123 @@ mod test {
             vec![
                 (
                     1,
-                    AdminDocumentOperation::RealmConfigNodeEnsured {
+                    AdminDocumentOperation::ConfigNodeEnsured {
                         node_id: actor.node_id,
                         kind: RealmNodeKind::Management,
                     },
                 ),
                 (
                     2,
-                    AdminDocumentOperation::RealmConfigBandPoolAssigned {
+                    AdminDocumentOperation::BandPoolAssigned {
                         pool: config_doc.band_pools[0],
                     },
                 ),
                 (
                     3,
-                    AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                    AdminDocumentOperation::HandleRangeGranted {
                         range: config_doc.placement_handle_ranges[0],
                     },
                 ),
                 (
                     4,
-                    AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                    AdminDocumentOperation::OidcProviderUpserted {
                         provider: alpha_provider,
                     },
                 ),
                 (
                     5,
-                    AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+                    AdminDocumentOperation::OidcProviderUpserted {
                         provider: beta_provider,
                     },
                 ),
                 (
                     6,
-                    AdminDocumentOperation::RealmConfigSettingsSet {
+                    AdminDocumentOperation::ConfigSettingsSet {
                         metadata_replication: config_doc.metadata_replication,
                         discovery: config_doc.discovery,
                     },
                 ),
                 (
                     7,
-                    AdminDocumentOperation::RealmConfigDescriptionSet {
+                    AdminDocumentOperation::ConfigDescriptionSet {
                         description: config_doc.description,
                     },
                 ),
                 (
                     8,
-                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    AdminDocumentOperation::PlacementStrategyUpserted {
                         strategy: seeded_strategies[0].clone(),
                     },
                 ),
                 (
                     9,
-                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    AdminDocumentOperation::PlacementStrategyUpserted {
                         strategy: seeded_strategies[1].clone(),
                     },
                 ),
                 (
                     10,
-                    AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                    AdminDocumentOperation::PlacementStrategyUpserted {
                         strategy: seeded_strategies[2].clone(),
                     },
                 ),
                 (
                     11,
-                    AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                    AdminDocumentOperation::PlacementBindingAppended {
                         binding: seeded_placements[0].clone(),
                     },
                 ),
                 (
                     12,
-                    AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                    AdminDocumentOperation::PlacementBindingAppended {
                         binding: seeded_placements[1].clone(),
                     },
                 ),
                 (
                     13,
-                    AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                    AdminDocumentOperation::ConfigStrategySet {
                         strategy_id: seeded_default_strategy_id,
                     },
                 ),
                 (
                     14,
-                    AdminDocumentOperation::RealmConfigJobFamilySet {
+                    AdminDocumentOperation::JobFamilySet {
                         strategy_id: seeded_family_strategy_id,
                     },
                 ),
                 (
                     15,
-                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                    AdminDocumentOperation::StrategyBindingSet {
                         binding: seeded_bindings[0].clone(),
                     },
                 ),
                 (
                     16,
-                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                    AdminDocumentOperation::StrategyBindingSet {
                         binding: seeded_bindings[1].clone(),
                     },
                 ),
                 (
                     17,
-                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                    AdminDocumentOperation::StrategyBindingSet {
                         binding: seeded_bindings[2].clone(),
                     },
                 ),
                 (
                     18,
-                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                    AdminDocumentOperation::StrategyBindingSet {
                         binding: seeded_bindings[3].clone(),
                     },
                 ),
                 (
                     19,
-                    AdminDocumentOperation::RealmConfigStrategyBindingSet {
+                    AdminDocumentOperation::StrategyBindingSet {
                         binding: seeded_bindings[4].clone(),
                     },
                 ),
                 (
                     20,
-                    AdminDocumentOperation::RealmConfigNodePlacementSet {
+                    AdminDocumentOperation::NodePlacementSet {
                         entry: NodePlacementEntry {
                             node_id: actor.node_id,
                             location: String::new(),
@@ -979,27 +979,27 @@ mod test {
                 ),
                 (
                     21,
-                    AdminDocumentOperation::RealmConfigCandidateMapPublished {
+                    AdminDocumentOperation::CandidateMapPublished {
                         map: config_doc.candidate_maps[0].clone(),
                     },
                 ),
                 (
                     22,
-                    AdminDocumentOperation::RealmConfigActivationsInitialized {
+                    AdminDocumentOperation::ConfigActivationsInitialized {
                         strategy_id: seeded_strategies[0].strategy_id,
                         candidate_map_epoch: 1,
                     },
                 ),
                 (
                     23,
-                    AdminDocumentOperation::RealmConfigActivationsInitialized {
+                    AdminDocumentOperation::ConfigActivationsInitialized {
                         strategy_id: seeded_strategies[1].strategy_id,
                         candidate_map_epoch: 1,
                     },
                 ),
                 (
                     24,
-                    AdminDocumentOperation::RealmConfigActivationsInitialized {
+                    AdminDocumentOperation::ConfigActivationsInitialized {
                         strategy_id: seeded_strategies[2].strategy_id,
                         candidate_map_epoch: 1,
                     },
@@ -1028,7 +1028,7 @@ mod test {
                 .as_ref(),
         )
         .unwrap();
-        let config_state = write_values(writes, ADMIN_DOCUMENT_STATE_KEYSPACE)
+        let config_state = write_values(writes, DOCUMENT_STATE_KEYSPACE)
             .into_iter()
             .map(|value| postcard::from_bytes::<AdminDocumentState>(value.as_ref()).unwrap())
             .find(|state| state.target == (AdminDocumentTarget::RealmConfig { realm_id }))
@@ -1122,18 +1122,18 @@ mod test {
         }));
         assert_eq!(
             operation.state,
-            super::CreateRealmState::ScheduleDocumentSyncOutboxDrain
+            super::CreateRealmState::ScheduleSyncDrain
         );
         assert_eq!(
             effects.first(),
             Some(&Effect::Task(TaskEffect::ResetTimer {
-                key: TaskKey::DrainDocumentSyncOutbox,
+                key: TaskKey::DrainSyncOutbox,
                 after: Duration::ZERO,
             }))
         );
 
         let effects = operation.step(Event::Task(TaskEvent::Error {
-            key: Some(TaskKey::DrainDocumentSyncOutbox),
+            key: Some(TaskKey::DrainSyncOutbox),
             message: "schedule failed".to_string(),
         }));
         assert_eq!(operation.state, super::CreateRealmState::Finish);

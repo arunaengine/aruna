@@ -7,9 +7,9 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, REALM_CONFIG_COMPUTE_PATH};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_COMPUTE_PATH};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -54,17 +54,17 @@ enum SetComputeState {
     Auth,
     StartTransaction,
     ReadCurrent,
-    WriteDocumentAndAdminState {
+    WriteDocumentState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         document: RealmConfigDocument,
     },
     CommitTransaction {
         document: RealmConfigDocument,
     },
-    ScheduleDocumentSyncOutboxDrain {
+    ScheduleSyncDrain {
         document: RealmConfigDocument,
     },
     Finish,
@@ -80,7 +80,7 @@ pub enum SetComputeError {
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
-    RealmConfigNotFound,
+    ConfigMissing,
     #[error("caller may not write the realm configuration")]
     Unauthorized,
     #[error("this node is not a realm management node")]
@@ -133,7 +133,7 @@ impl SetComputeOperation {
                     document.storage_key(),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
             ],
@@ -157,7 +157,7 @@ impl SetComputeOperation {
             })?;
 
         let Some(document_value) = document_value else {
-            return Err(SetComputeError::RealmConfigNotFound);
+            return Err(SetComputeError::ConfigMissing);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         if !is_management(&document, self.config.actor.node_id) {
@@ -184,7 +184,7 @@ impl SetComputeOperation {
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
-            AdminDocumentOperation::RealmConfigComputeSet {
+            AdminDocumentOperation::ConfigComputeSet {
                 compute: self.config.compute.clone(),
             },
         )?;
@@ -216,7 +216,7 @@ impl SetComputeOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = SetComputeState::WriteDocumentAndAdminState {
+        self.state = SetComputeState::WriteDocumentState {
             document,
             stale_conflict_deletes,
         };
@@ -321,7 +321,7 @@ impl Operation for SetComputeOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            SetComputeState::WriteDocumentAndAdminState {
+            SetComputeState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
             } => match event {
@@ -330,7 +330,7 @@ impl Operation for SetComputeOperation {
                         return self.fail(SetComputeError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = SetComputeState::DeleteStaleAdminConflicts { document };
+                        self.state = SetComputeState::DeleteAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -341,7 +341,7 @@ impl Operation for SetComputeOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            SetComputeState::DeleteStaleAdminConflicts { document } => match event {
+            SetComputeState::DeleteAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
@@ -351,7 +351,7 @@ impl Operation for SetComputeOperation {
             SetComputeState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = SetComputeState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state = SetComputeState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -360,7 +360,7 @@ impl Operation for SetComputeOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            SetComputeState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
+            SetComputeState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = SetComputeState::Finish;
                     smallvec![]
@@ -402,7 +402,7 @@ impl Operation for SetComputeOperation {
 fn apply_reducer_compute(document: &mut RealmConfigDocument, reducer_state: &AdminDocumentState) {
     if !reducer_state
         .conflicts
-        .contains_key(REALM_CONFIG_COMPUTE_PATH)
+        .contains_key(CONFIG_COMPUTE_PATH)
         && let Some(compute) = reducer_state.materialized_realm_compute()
     {
         document.compute = compute;
@@ -512,7 +512,7 @@ mod tests {
             links: vec![LocationLink {
                 from: "eu-west".to_string(),
                 to: "us-east".to_string(),
-                bandwidth_bytes_per_sec: 125_000_000,
+                bandwidth_per_sec: 125_000_000,
             }],
             group_quotas: vec![GroupComputeQuota {
                 group_id: Ulid::from_bytes([7u8; 16]),
@@ -572,7 +572,7 @@ mod tests {
             links: vec![LocationLink {
                 from: "eu-west".to_string(),
                 to: "us-east".to_string(),
-                bandwidth_bytes_per_sec: 0,
+                bandwidth_per_sec: 0,
             }],
             ..RealmComputeConfig::default()
         };

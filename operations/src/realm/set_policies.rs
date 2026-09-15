@@ -3,9 +3,9 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, REALM_CONFIG_POLICIES_PATH};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_POLICIES_PATH};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -55,17 +55,17 @@ enum SetPoliciesState {
     Auth,
     StartTransaction,
     ReadCurrent,
-    WriteDocumentAndAdminState {
+    WriteDocumentState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         document: RealmConfigDocument,
     },
     CommitTransaction {
         document: RealmConfigDocument,
     },
-    ScheduleDocumentSyncOutboxDrain {
+    ScheduleSyncDrain {
         document: RealmConfigDocument,
     },
     Finish,
@@ -81,7 +81,7 @@ pub enum SetPoliciesError {
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
-    RealmConfigNotFound,
+    ConfigMissing,
     #[error("caller may not write the realm configuration")]
     Unauthorized,
     #[error("this node is not a realm management node")]
@@ -136,7 +136,7 @@ impl SetPoliciesOperation {
                     document.storage_key(),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
             ],
@@ -156,7 +156,7 @@ impl SetPoliciesOperation {
             .map_err(|reason| SetPoliciesError::InvalidPolicies { reason })?;
 
         let Some(document_value) = document_value else {
-            return Err(SetPoliciesError::RealmConfigNotFound);
+            return Err(SetPoliciesError::ConfigMissing);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         if !is_management(&document, self.config.actor.node_id) {
@@ -189,7 +189,7 @@ impl SetPoliciesOperation {
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
-            AdminDocumentOperation::RealmConfigPoliciesSet {
+            AdminDocumentOperation::ConfigPoliciesSet {
                 policies: self.config.policies.clone(),
             },
         )?;
@@ -222,7 +222,7 @@ impl SetPoliciesOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = SetPoliciesState::WriteDocumentAndAdminState {
+        self.state = SetPoliciesState::WriteDocumentState {
             document,
             stale_conflict_deletes,
         };
@@ -326,7 +326,7 @@ impl Operation for SetPoliciesOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            SetPoliciesState::WriteDocumentAndAdminState {
+            SetPoliciesState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
             } => match event {
@@ -335,7 +335,7 @@ impl Operation for SetPoliciesOperation {
                         return self.fail(SetPoliciesError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = SetPoliciesState::DeleteStaleAdminConflicts { document };
+                        self.state = SetPoliciesState::DeleteAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -346,7 +346,7 @@ impl Operation for SetPoliciesOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            SetPoliciesState::DeleteStaleAdminConflicts { document } => match event {
+            SetPoliciesState::DeleteAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
@@ -356,7 +356,7 @@ impl Operation for SetPoliciesOperation {
             SetPoliciesState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = SetPoliciesState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state = SetPoliciesState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -365,7 +365,7 @@ impl Operation for SetPoliciesOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            SetPoliciesState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
+            SetPoliciesState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = SetPoliciesState::Finish;
                     smallvec![]
@@ -410,7 +410,7 @@ impl Operation for SetPoliciesOperation {
 fn apply_reducer_policies(document: &mut RealmConfigDocument, reducer_state: &AdminDocumentState) {
     if !reducer_state
         .conflicts
-        .contains_key(REALM_CONFIG_POLICIES_PATH)
+        .contains_key(CONFIG_POLICIES_PATH)
         && let Some(policies) = reducer_state.materialized_realm_policies()
     {
         document.request_policies = policies;

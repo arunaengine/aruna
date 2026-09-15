@@ -6,7 +6,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, config_node_path, overlay_placement, parse_config_node,
@@ -39,7 +39,7 @@ pub struct EnsureConfigParams {
     pub actor: Actor,
     pub target_node_id: NodeId,
     pub target_node_kind: RealmNodeKind,
-    pub default_metadata_replication_factor: u32,
+    pub metadata_replication_factor: u32,
     pub realm_description: String,
     pub create_if_missing: bool,
     pub reject_kind_mismatch: bool,
@@ -66,11 +66,11 @@ enum EnsureConfigState {
     Init,
     StartTransaction,
     ReadCurrent,
-    WriteDocumentAndAdminState {
+    WriteDocumentState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         document: RealmConfigDocument,
     },
     CommitNoop {
@@ -79,7 +79,7 @@ enum EnsureConfigState {
     CommitTransaction {
         document: RealmConfigDocument,
     },
-    ScheduleDocumentSyncOutboxDrain {
+    ScheduleSyncDrain {
         document: RealmConfigDocument,
     },
     Finish,
@@ -95,7 +95,7 @@ pub enum EnsureConfigError {
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
-    RealmConfigNotFound,
+    ConfigMissing,
     #[error("realm config node {node_id} already exists with a different kind")]
     NodeKindMismatch { node_id: NodeId },
     #[error("realm handle space is fully assigned")]
@@ -150,7 +150,7 @@ impl EnsureConfigOperation {
                     document.storage_key(),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
             ],
@@ -297,13 +297,13 @@ impl EnsureConfigOperation {
         if let Some(pool) = resources.seed_pool {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
-                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
+                AdminDocumentOperation::BandPoolAssigned { pool },
             )?);
         }
         if !resources.range_is_noop {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
-                AdminDocumentOperation::RealmConfigHandleRangeGranted {
+                AdminDocumentOperation::HandleRangeGranted {
                     range: resources.assigned_range,
                 },
             )?);
@@ -311,13 +311,13 @@ impl EnsureConfigOperation {
         if let Some(binding) = resources.job_binding {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
-                AdminDocumentOperation::RealmConfigPlacementBindingAppended { binding },
+                AdminDocumentOperation::PlacementBindingAppended { binding },
             )?);
         }
         if let Some(pool) = resources.transfer_pool {
             events.push(reducer_state.apply_operation(
                 &self.config.actor,
-                AdminDocumentOperation::RealmConfigBandPoolAssigned { pool },
+                AdminDocumentOperation::BandPoolAssigned { pool },
             )?);
         }
         // Reducer events preserve fresh placement identity and family routing during rebuilds.
@@ -349,7 +349,7 @@ impl EnsureConfigOperation {
                 let mut document = RealmConfigDocument::new(
                     self.config.actor.realm_id,
                     Vec::new(),
-                    self.config.default_metadata_replication_factor,
+                    self.config.metadata_replication_factor,
                 );
                 document.description = self.config.realm_description.clone();
                 // Seed default placement so no production path ever constructs a
@@ -357,7 +357,7 @@ impl EnsureConfigOperation {
                 document.seed_default_placement();
                 document
             }
-            None => return Err(EnsureConfigError::RealmConfigNotFound),
+            None => return Err(EnsureConfigError::ConfigMissing),
         };
 
         if self.config.reject_kind_mismatch {
@@ -446,7 +446,7 @@ impl EnsureConfigOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = EnsureConfigState::WriteDocumentAndAdminState {
+        self.state = EnsureConfigState::WriteDocumentState {
             document,
             stale_conflict_deletes,
         };
@@ -528,7 +528,7 @@ impl Operation for EnsureConfigOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            EnsureConfigState::WriteDocumentAndAdminState {
+            EnsureConfigState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
             } => match event {
@@ -537,7 +537,7 @@ impl Operation for EnsureConfigOperation {
                         return self.fail(EnsureConfigError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = EnsureConfigState::DeleteStaleAdminConflicts { document };
+                        self.state = EnsureConfigState::DeleteAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -548,7 +548,7 @@ impl Operation for EnsureConfigOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            EnsureConfigState::DeleteStaleAdminConflicts { document } => match event {
+            EnsureConfigState::DeleteAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
@@ -570,7 +570,7 @@ impl Operation for EnsureConfigOperation {
             EnsureConfigState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = EnsureConfigState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state = EnsureConfigState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -579,7 +579,7 @@ impl Operation for EnsureConfigOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            EnsureConfigState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
+            EnsureConfigState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = EnsureConfigState::Finish;
                     smallvec![]
@@ -670,7 +670,7 @@ fn apply_node_ensure(
         origin_seq: observed.sequence_for(&actor.node_id) + 1,
         observed,
         actor: actor.clone(),
-        op: AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind },
+        op: AdminDocumentOperation::ConfigNodeEnsured { node_id, kind },
     };
     state.apply(&event)?;
     Ok(event)
@@ -744,12 +744,12 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::{
-        AdminConflict, AdminConflictValue, AdminDocumentState, REALM_CONFIG_DEFAULT_STRATEGY_PATH,
+        AdminConflict, AdminConflictValue, AdminDocumentState, CONFIG_STRATEGY_PATH,
     };
     use aruna_core::storage_entries::reducer_conflict_key;
     use aruna_core::structs::identity::auth::Actor;
@@ -786,7 +786,7 @@ mod pure_tests {
             target_node_id: actor.node_id,
             target_node_kind: RealmNodeKind::Management,
             actor,
-            default_metadata_replication_factor: factor,
+            metadata_replication_factor: factor,
             realm_description: "Ensured Realm".to_string(),
             create_if_missing: true,
             reject_kind_mismatch: false,
@@ -856,9 +856,9 @@ mod pure_tests {
         let stored =
             RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
         let state: AdminDocumentState =
-            postcard::from_bytes(write_value(&writes, ADMIN_DOCUMENT_STATE_KEYSPACE)).unwrap();
+            postcard::from_bytes(write_value(&writes, DOCUMENT_STATE_KEYSPACE)).unwrap();
         let outbox: DocumentOutboxRecord =
-            postcard::from_bytes(write_value(&writes, DOCUMENT_SYNC_OUTBOX_KEYSPACE)).unwrap();
+            postcard::from_bytes(write_value(&writes, SYNC_OUTBOX_KEYSPACE)).unwrap();
         assert_eq!(stored.metadata_replication.default_replication_factor, 7);
         assert_eq!(stored.description, "Ensured Realm");
         assert!(stored.has_node(actor.node_id));
@@ -876,7 +876,7 @@ mod pure_tests {
             &outbox.event,
             DocumentOutboxEvent::AdminOperation { event, .. }
                 if event.target == target
-                    && matches!(event.op, AdminDocumentOperation::RealmConfigNodeEnsured { .. })
+                    && matches!(event.op, AdminDocumentOperation::ConfigNodeEnsured { .. })
         ));
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
@@ -886,7 +886,7 @@ mod pure_tests {
             effects.first(),
             Some(&Effect::Storage(StorageEffect::BatchDelete {
                 deletes: vec![(
-                    ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+                    DOCUMENT_CONFLICT_KEYSPACE.to_string(),
                     reducer_conflict_key(&target, &path),
                 )],
                 txn_id: Some(txn_id),
@@ -908,7 +908,7 @@ mod pure_tests {
         let stored =
             RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
         let state: AdminDocumentState =
-            postcard::from_bytes(write_value(&writes, ADMIN_DOCUMENT_STATE_KEYSPACE)).unwrap();
+            postcard::from_bytes(write_value(&writes, DOCUMENT_STATE_KEYSPACE)).unwrap();
 
         let bindings = state.materialized_strategy_bindings();
         assert!(!bindings.is_empty());
@@ -970,7 +970,7 @@ mod pure_tests {
         );
         let stored =
             RealmConfigDocument::from_bytes(write_value(&writes, REALM_CONFIG_KEYSPACE)).unwrap();
-        let state = write_value(&writes, ADMIN_DOCUMENT_STATE_KEYSPACE).to_vec();
+        let state = write_value(&writes, DOCUMENT_STATE_KEYSPACE).to_vec();
         (stored, state)
     }
 
@@ -1151,7 +1151,7 @@ mod pure_tests {
                 origin_seq: 1,
                 observed: AdminDocumentClock::default(),
                 actor: actor.clone(),
-                op: AdminDocumentOperation::RealmConfigNodeEnsured {
+                op: AdminDocumentOperation::ConfigNodeEnsured {
                     node_id: actor.node_id,
                     kind: RealmNodeKind::Management,
                 },
@@ -1171,7 +1171,7 @@ mod pure_tests {
                 origin_seq: 2,
                 observed: AdminDocumentClock::default(),
                 actor: actor.clone(),
-                op: AdminDocumentOperation::RealmConfigHandleRangeGranted { range },
+                op: AdminDocumentOperation::HandleRangeGranted { range },
             })
             .unwrap();
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -1211,7 +1211,7 @@ mod pure_tests {
             Effect::Storage(StorageEffect::BatchWrite { writes, .. })
                 if writes
                     .iter()
-                    .any(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .any(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
         )));
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
@@ -1228,10 +1228,10 @@ mod pure_tests {
         let actor = actor(11, realm_id);
         let document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         let mut operation = EnsureConfigOperation::new(config(actor, 3));
-        operation.state = EnsureConfigState::ScheduleDocumentSyncOutboxDrain { document };
+        operation.state = EnsureConfigState::ScheduleSyncDrain { document };
 
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
 
@@ -1272,19 +1272,19 @@ mod pure_tests {
             strategy_id: Some(strategy.strategy_id),
         };
         for op in [
-            AdminDocumentOperation::RealmConfigNodePlacementSet {
+            AdminDocumentOperation::NodePlacementSet {
                 entry: entry.clone(),
             },
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: strategy.clone(),
             },
-            AdminDocumentOperation::RealmConfigDefaultStrategySet {
+            AdminDocumentOperation::ConfigStrategySet {
                 strategy_id: strategy.strategy_id,
             },
-            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+            AdminDocumentOperation::StrategyBindingSet {
                 binding: binding.clone(),
             },
-            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+            AdminDocumentOperation::PlacementOverrideSet {
                 record: record.clone(),
             },
         ] {
@@ -1312,7 +1312,7 @@ mod pure_tests {
         state
             .apply_operation(
                 &actor,
-                AdminDocumentOperation::RealmConfigNodeEnsured {
+                AdminDocumentOperation::ConfigNodeEnsured {
                     node_id: device,
                     kind: RealmNodeKind::User {
                         owner: UserId::nil(realm_id),
@@ -1333,7 +1333,7 @@ mod pure_tests {
         state
             .apply_operation(
                 &actor,
-                AdminDocumentOperation::RealmConfigNodeRemoved { node_id: device },
+                AdminDocumentOperation::ConfigNodeRemoved { node_id: device },
             )
             .unwrap();
         overlay_reducer_state(&mut config, &state, 0);
@@ -1379,7 +1379,7 @@ mod pure_tests {
                     origin_seq: 1,
                     observed: AdminDocumentClock::default(),
                     actor: actor.clone(),
-                    op: AdminDocumentOperation::RealmConfigDefaultStrategySet { strategy_id },
+                    op: AdminDocumentOperation::ConfigStrategySet { strategy_id },
                 })
                 .unwrap();
         }
@@ -1387,7 +1387,7 @@ mod pure_tests {
         assert!(
             state
                 .conflicts
-                .contains_key(REALM_CONFIG_DEFAULT_STRATEGY_PATH)
+                .contains_key(CONFIG_STRATEGY_PATH)
         );
         assert_eq!(state.materialized_default_strategy(), None);
 

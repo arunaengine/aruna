@@ -6,7 +6,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE};
+use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -57,16 +57,16 @@ impl std::fmt::Debug for ClaimInitialOperation {
 pub enum ClaimInitialState {
     Init,
     StartTransaction,
-    ReadAuthDocAndAdminState {
+    ReadAdminState {
         txn_id: TxnId,
     },
-    WriteAuthDocAndAdminState {
+    WriteAdminState {
         txn_id: TxnId,
         auth_doc: RealmAuthorizationDocument,
         admin_outbox_written: bool,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         txn_id: TxnId,
         auth_doc: RealmAuthorizationDocument,
         admin_outbox_written: bool,
@@ -76,7 +76,7 @@ pub enum ClaimInitialState {
         auth_doc: RealmAuthorizationDocument,
         admin_outbox_written: bool,
     },
-    ScheduleAdminDocumentOutboxDrain {
+    ScheduleDocumentDrain {
         auth_doc: RealmAuthorizationDocument,
     },
     AbortTransaction,
@@ -98,11 +98,11 @@ pub enum ClaimInitialError {
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
     #[error("authorization document not found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error("realm_admin role not found")]
-    RealmAdminRoleNotFound,
+    AdminRoleMissing,
     #[error("initial realm administrator has already been claimed")]
-    InitialAdministratorAlreadyClaimed,
+    AdministratorAlreadyClaimed,
     #[error("claiming initial realm admin did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -138,7 +138,7 @@ impl ClaimInitialOperation {
     }
 
     fn emit_auth_read(&mut self, txn_id: TxnId) -> Effects {
-        self.state = ClaimInitialState::ReadAuthDocAndAdminState { txn_id };
+        self.state = ClaimInitialState::ReadAdminState { txn_id };
         let target = AdminDocumentTarget::Realm {
             realm_id: self.input.actor.realm_id,
         };
@@ -147,7 +147,7 @@ impl ClaimInitialOperation {
             reads: vec![
                 (AUTH_KEYSPACE.to_string(), auth_key),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
             ],
@@ -162,14 +162,14 @@ impl ClaimInitialOperation {
         reducer_state_value: Option<ByteView>,
     ) -> Result<Effects, ClaimInitialError> {
         let mut auth_doc = RealmAuthorizationDocument::from_bytes(
-            &auth_doc.ok_or(ClaimInitialError::AuthDocNotFound)?,
+            &auth_doc.ok_or(ClaimInitialError::DocNotFound)?,
         )?;
         let role = auth_doc
             .roles
             .values()
             .find(|role| role.name == "realm_admin")
             .cloned()
-            .ok_or(ClaimInitialError::RealmAdminRoleNotFound)?;
+            .ok_or(ClaimInitialError::AdminRoleMissing)?;
 
         if !role.assigned_users.is_empty() {
             return Ok(self.abort_already_claimed(txn_id));
@@ -244,7 +244,7 @@ impl ClaimInitialOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = ClaimInitialState::WriteAuthDocAndAdminState {
+        self.state = ClaimInitialState::WriteAdminState {
             txn_id,
             auth_doc: auth_doc.clone(),
             admin_outbox_written: !admin_events.is_empty(),
@@ -340,7 +340,7 @@ impl Operation for ClaimInitialOperation {
                 };
                 self.emit_auth_read(txn_id)
             }
-            ClaimInitialState::ReadAuthDocAndAdminState { txn_id } => {
+            ClaimInitialState::ReadAdminState { txn_id } => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return self
@@ -362,7 +362,7 @@ impl Operation for ClaimInitialOperation {
                     Err(error) => self.fail(error),
                 }
             }
-            ClaimInitialState::WriteAuthDocAndAdminState {
+            ClaimInitialState::WriteAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
@@ -375,7 +375,7 @@ impl Operation for ClaimInitialOperation {
                 };
 
                 if !stale_conflict_deletes.is_empty() {
-                    self.state = ClaimInitialState::DeleteStaleAdminConflicts {
+                    self.state = ClaimInitialState::DeleteAdminConflicts {
                         txn_id,
                         auth_doc,
                         admin_outbox_written,
@@ -388,7 +388,7 @@ impl Operation for ClaimInitialOperation {
 
                 self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written)
             }
-            ClaimInitialState::DeleteStaleAdminConflicts {
+            ClaimInitialState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
@@ -415,13 +415,13 @@ impl Operation for ClaimInitialOperation {
                 };
 
                 if admin_outbox_written {
-                    self.state = ClaimInitialState::ScheduleAdminDocumentOutboxDrain { auth_doc };
+                    self.state = ClaimInitialState::ScheduleDocumentDrain { auth_doc };
                     return smallvec![schedule_drain_effect()];
                 }
 
                 self.emit_auth_announce(auth_doc)
             }
-            ClaimInitialState::ScheduleAdminDocumentOutboxDrain { auth_doc } => {
+            ClaimInitialState::ScheduleDocumentDrain { auth_doc } => {
                 self.handle_schedule(event, auth_doc)
             }
             ClaimInitialState::AbortTransaction => {
@@ -471,9 +471,9 @@ impl Operation for ClaimInitialOperation {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            ClaimInitialState::ReadAuthDocAndAdminState { txn_id }
-            | ClaimInitialState::WriteAuthDocAndAdminState { txn_id, .. }
-            | ClaimInitialState::DeleteStaleAdminConflicts { txn_id, .. }
+            ClaimInitialState::ReadAdminState { txn_id }
+            | ClaimInitialState::WriteAdminState { txn_id, .. }
+            | ClaimInitialState::DeleteAdminConflicts { txn_id, .. }
             | ClaimInitialState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
@@ -510,7 +510,7 @@ fn apply_reducer_updates(
     }
     let event = state.apply_operation(
         actor,
-        AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+        AdminDocumentOperation::RealmAssignmentAdded {
             role_id: role.role_id,
             user_id: actor.user_id,
         },
@@ -539,7 +539,7 @@ fn materialize_admin_assignment(
     let role = auth_doc
         .roles
         .get_mut(&role_id)
-        .ok_or(ClaimInitialError::RealmAdminRoleNotFound)?;
+        .ok_or(ClaimInitialError::AdminRoleMissing)?;
     if materialized_assignments
         .get(&role_id)
         .is_some_and(|users| users.contains(&actor.user_id))
@@ -569,7 +569,7 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE};
+    use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::auth::{Actor, Role};
@@ -694,11 +694,11 @@ mod tests {
                 assert!(
                     writes
                         .iter()
-                        .any(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_STATE_KEYSPACE)
+                        .any(|(keyspace, _, _)| keyspace == DOCUMENT_STATE_KEYSPACE)
                 );
                 writes
                     .iter()
-                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).unwrap())
                     .collect::<Vec<DocumentOutboxRecord>>()
             }
@@ -713,7 +713,7 @@ mod tests {
         assert!(outbox_records.iter().any(|record| matches!(
             &record.event,
             DocumentOutboxEvent::AdminOperation { event, .. }
-                if matches!(&event.op, AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
+                if matches!(&event.op, AdminDocumentOperation::RealmAssignmentAdded { role_id, user_id }
                     if *role_id == role.role_id && *user_id == actor.user_id)
         )));
     }
@@ -826,12 +826,12 @@ mod tests {
         let actor = actor(realm_id, 16, 17);
         let (auth_doc, _) = auth_and_role(realm_id);
         let mut operation = ClaimInitialOperation::new(ClaimInitialInput { actor });
-        operation.state = ClaimInitialState::ScheduleAdminDocumentOutboxDrain {
+        operation.state = ClaimInitialState::ScheduleDocumentDrain {
             auth_doc: auth_doc.clone(),
         };
 
         operation.step(Event::Task(TaskEvent::Error {
-            key: Some(TaskKey::DrainDocumentSyncOutbox),
+            key: Some(TaskKey::DrainSyncOutbox),
             message: "schedule failed".to_string(),
         }));
         assert_eq!(operation.state, ClaimInitialState::Finish);

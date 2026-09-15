@@ -104,7 +104,7 @@ fn conflict_is_expected() {
         &MutatePlacementError::StorageError(StorageError::TransactionConflict)
     ));
     assert!(!MutatePlacementOperation::expected_error(
-        &MutatePlacementError::RealmConfigNotFound
+        &MutatePlacementError::ConfigMissing
     ));
 }
 
@@ -481,7 +481,7 @@ fn family_strategy_frozen() {
     let realm_id = RealmId::from_bytes([16; 32]);
     let mut document = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     document.seed_default_placement();
-    let strategy_id = document.job_family_strategy_id;
+    let strategy_id = document.family_strategy_id;
     let mut reshaped = document.strategy(&strategy_id).unwrap().clone();
     reshaped.shard_count *= 2;
 
@@ -609,7 +609,7 @@ async fn missing_config_absent() {
             RealmPlacementMutation::RemoveOverride(Vec::new())
         )
         .await,
-        Err(MutatePlacementError::RealmConfigNotFound)
+        Err(MutatePlacementError::ConfigMissing)
     );
 }
 
@@ -621,10 +621,10 @@ fn mutation_schedules_revalidation() {
         actor: actor.clone(),
         mutation: RealmPlacementMutation::RemoveOverride(Vec::new()),
     });
-    operation.state = MutatePlacementState::ScheduleDocumentSyncOutboxDrain;
+    operation.state = MutatePlacementState::ScheduleSyncDrain;
 
     let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::DrainDocumentSyncOutbox,
+        key: TaskKey::DrainSyncOutbox,
         after: std::time::Duration::ZERO,
     }));
 
@@ -745,7 +745,7 @@ fn merges_node_attributes() {
     let mutation = set_attributes(node(1), Some(" us-east "), None);
     mutation.validate(&document).unwrap();
 
-    let Ok(AdminDocumentOperation::RealmConfigNodePlacementSet { entry }) =
+    let Ok(AdminDocumentOperation::NodePlacementSet { entry }) =
         mutation.admin_operation(&document)
     else {
         panic!("attribute edit reduces to a placement entry write");
@@ -767,7 +767,7 @@ fn advances_subject() {
     .unwrap();
 
     let entry_of = |mutation: RealmPlacementMutation| match mutation.admin_operation(&document) {
-        Ok(AdminDocumentOperation::RealmConfigNodePlacementSet { entry }) => entry,
+        Ok(AdminDocumentOperation::NodePlacementSet { entry }) => entry,
         other => panic!("unexpected reduction: {other:?}"),
     };
     let unchanged = entry_of(set_attributes(
@@ -1016,7 +1016,7 @@ fn preserves_affinity_data() {
     let document = RealmConfigDocument::new(RealmId::from_bytes([7; 32]), Vec::new(), 3);
     assert!(matches!(
         mutation.admin_operation(&document),
-        Ok(AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: stored })
+        Ok(AdminDocumentOperation::PlacementStrategyUpserted { strategy: stored })
             if stored == strategy
     ));
 }

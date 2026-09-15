@@ -5,8 +5,8 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    ADMIN_DOCUMENT_STATE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    METADATA_PENDING_PROJECTION_KEYSPACE,
+    DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -48,7 +48,7 @@ use crate::sync::shard_placement::schedule_revalidation;
 
 pub(crate) const CONFLICT_ATTEMPTS: usize = 10;
 
-const STRATEGY_REFERENCE_SCAN_PAGE_SIZE: usize = 8_192;
+const STRATEGY_PAGE_SIZE: usize = 8_192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RealmPlacementMutation {
@@ -115,74 +115,74 @@ impl RealmPlacementMutation {
         document: &RealmConfigDocument,
     ) -> Result<AdminDocumentOperation, MutatePlacementError> {
         Ok(match self {
-            Self::UpsertNode(entry) => AdminDocumentOperation::RealmConfigNodePlacementSet {
+            Self::UpsertNode(entry) => AdminDocumentOperation::NodePlacementSet {
                 entry: entry.clone(),
             },
             Self::SetNodeAttributes {
                 node_id,
                 location,
                 labels,
-            } => AdminDocumentOperation::RealmConfigNodePlacementSet {
+            } => AdminDocumentOperation::NodePlacementSet {
                 entry: attributes_entry(document, *node_id, location.as_ref(), labels.as_ref())?,
             },
             Self::RemoveNode(node_id) => {
-                AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id: *node_id }
+                AdminDocumentOperation::NodePlacementRemoved { node_id: *node_id }
             }
             Self::UpsertStrategy(strategy) => {
-                AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+                AdminDocumentOperation::PlacementStrategyUpserted {
                     strategy: strategy.clone(),
                 }
             }
             Self::RemoveStrategy(strategy_id) => {
-                AdminDocumentOperation::RealmConfigPlacementStrategyRemoved {
+                AdminDocumentOperation::PlacementStrategyRemoved {
                     strategy_id: *strategy_id,
                 }
             }
             Self::SetDefaultStrategy(strategy_id) => {
-                AdminDocumentOperation::RealmConfigDefaultStrategySet {
+                AdminDocumentOperation::ConfigStrategySet {
                     strategy_id: *strategy_id,
                 }
             }
-            Self::SetBinding(binding) => AdminDocumentOperation::RealmConfigStrategyBindingSet {
+            Self::SetBinding(binding) => AdminDocumentOperation::StrategyBindingSet {
                 binding: binding.clone(),
             },
             Self::RemoveBinding(scope) => {
-                AdminDocumentOperation::RealmConfigStrategyBindingRemoved {
+                AdminDocumentOperation::StrategyBindingRemoved {
                     scope: scope.clone(),
                 }
             }
-            Self::SetOverride(record) => AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+            Self::SetOverride(record) => AdminDocumentOperation::PlacementOverrideSet {
                 record: record.clone(),
             },
             Self::RemoveOverride(subject) => {
-                AdminDocumentOperation::RealmConfigPlacementOverrideRemoved {
+                AdminDocumentOperation::PlacementOverrideRemoved {
                     subject: subject.clone(),
                 }
             }
             Self::AppendPlacementBinding(binding) => {
-                AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+                AdminDocumentOperation::PlacementBindingAppended {
                     binding: binding.clone(),
                 }
             }
             Self::PublishCandidateMap(map) => {
-                AdminDocumentOperation::RealmConfigCandidateMapPublished { map: map.clone() }
+                AdminDocumentOperation::CandidateMapPublished { map: map.clone() }
             }
             Self::InitializeActivations {
                 strategy_id,
                 candidate_map_epoch,
-            } => AdminDocumentOperation::RealmConfigActivationsInitialized {
+            } => AdminDocumentOperation::ConfigActivationsInitialized {
                 strategy_id: *strategy_id,
                 candidate_map_epoch: *candidate_map_epoch,
             },
             Self::StartTransition(plan) => {
-                AdminDocumentOperation::RealmConfigTransitionStarted { plan: plan.clone() }
+                AdminDocumentOperation::ConfigTransitionStarted { plan: plan.clone() }
             }
             Self::ReportBarrier {
                 transition_id,
                 bucket,
                 reported_by,
                 frontier,
-            } => AdminDocumentOperation::RealmConfigTransitionBarrierReported {
+            } => AdminDocumentOperation::TransitionBarrierReported {
                 transition_id: *transition_id,
                 bucket: *bucket,
                 reported_by: *reported_by,
@@ -192,13 +192,13 @@ impl RealmPlacementMutation {
                 transition_id,
                 strategy_id,
                 proof,
-            } => AdminDocumentOperation::RealmConfigTransitionProofSubmitted {
+            } => AdminDocumentOperation::TransitionProofSubmitted {
                 transition_id: *transition_id,
                 strategy_id: *strategy_id,
                 proof: proof.clone(),
             },
             Self::AbortTransition(transition_id) => {
-                AdminDocumentOperation::RealmConfigTransitionAborted {
+                AdminDocumentOperation::ConfigTransitionAborted {
                     transition_id: *transition_id,
                 }
             }
@@ -206,7 +206,7 @@ impl RealmPlacementMutation {
                 transition_id,
                 bucket,
                 at_risk_report,
-            } => AdminDocumentOperation::RealmConfigTransitionBucketForced {
+            } => AdminDocumentOperation::TransitionBucketForced {
                 transition_id: *transition_id,
                 bucket: *bucket,
                 at_risk_report: at_risk_report.clone(),
@@ -216,7 +216,7 @@ impl RealmPlacementMutation {
                 bucket,
                 reported_by,
                 reason,
-            } => AdminDocumentOperation::RealmConfigTransitionStallReported {
+            } => AdminDocumentOperation::TransitionStallReported {
                 transition_id: *transition_id,
                 bucket: *bucket,
                 reported_by: *reported_by,
@@ -226,7 +226,7 @@ impl RealmPlacementMutation {
                 transition_id,
                 bucket,
                 reported_by,
-            } => AdminDocumentOperation::RealmConfigTransitionDrainReported {
+            } => AdminDocumentOperation::TransitionDrainReported {
                 transition_id: *transition_id,
                 bucket: *bucket,
                 reported_by: *reported_by,
@@ -368,7 +368,7 @@ impl RealmPlacementMutation {
             // Every node derives family shards from this count, so a reshape
             // would silently re-route retained v1 family records.
             Self::UpsertStrategy(strategy)
-                if document.job_family_strategy_id == strategy.strategy_id
+                if document.family_strategy_id == strategy.strategy_id
                     && document
                         .strategy(&strategy.strategy_id)
                         .is_some_and(|existing| existing.shard_count != strategy.shard_count) =>
@@ -565,7 +565,7 @@ impl RealmPlacementMutation {
                 Ok(())
             }
             Self::RemoveStrategy(strategy_id) => {
-                if document.job_family_strategy_id == *strategy_id {
+                if document.family_strategy_id == *strategy_id {
                     return Err(MutatePlacementError::JobFamilyImmutable {
                         strategy_id: *strategy_id,
                     });
@@ -759,17 +759,17 @@ enum MutatePlacementState {
         check: StrategyRemovalCheck,
         next_start_after: Option<Key>,
     },
-    WriteDocumentAndAdminState {
+    WriteDocumentState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         document: RealmConfigDocument,
     },
     CommitTransaction {
         document: RealmConfigDocument,
     },
-    ScheduleDocumentSyncOutboxDrain,
+    ScheduleSyncDrain,
     SchedulePlacementRevalidation,
     Finish,
     Error,
@@ -784,7 +784,7 @@ pub enum MutatePlacementError {
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
-    RealmConfigNotFound,
+    ConfigMissing,
     #[error("invalid placement mutation: {0}")]
     InvalidInput(String),
     #[error("node {node_id} may not originate this placement mutation")]
@@ -869,7 +869,7 @@ impl MutatePlacementOperation {
                     document.storage_key(),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
             ],
@@ -886,7 +886,7 @@ impl MutatePlacementOperation {
             return Err(MutatePlacementError::MissingTransaction);
         };
         let Some(document_value) = document_value else {
-            return Err(MutatePlacementError::RealmConfigNotFound);
+            return Err(MutatePlacementError::ConfigMissing);
         };
         if self.mutations.is_empty() {
             return Err(MutatePlacementError::InvalidInput(
@@ -966,7 +966,7 @@ impl MutatePlacementOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = MutatePlacementState::WriteDocumentAndAdminState {
+        self.state = MutatePlacementState::WriteDocumentState {
             document,
             stale_conflict_deletes,
         };
@@ -982,7 +982,7 @@ impl MutatePlacementOperation {
         reducer_state_value: Option<Value>,
     ) -> Result<Effects, MutatePlacementError> {
         let Some(document_value) = document_value else {
-            return Err(MutatePlacementError::RealmConfigNotFound);
+            return Err(MutatePlacementError::ConfigMissing);
         };
         // A caller's request is served by management nodes only; a node's own
         // mutations stay governed by the per-mutation node authorization.
@@ -1037,7 +1037,7 @@ impl MutatePlacementOperation {
             key_space: METADATA_INDEX_KEYSPACE.to_string(),
             prefix: None,
             start: start_after.map(IterStart::After),
-            limit: STRATEGY_REFERENCE_SCAN_PAGE_SIZE,
+            limit: STRATEGY_PAGE_SIZE,
             txn_id: Some(txn_id),
         })]
     }
@@ -1052,10 +1052,10 @@ impl MutatePlacementOperation {
         };
         self.state = MutatePlacementState::ReadPendingReferences { check };
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
             prefix: None,
             start: start_after.map(IterStart::After),
-            limit: STRATEGY_REFERENCE_SCAN_PAGE_SIZE,
+            limit: STRATEGY_PAGE_SIZE,
             txn_id: Some(txn_id),
         })]
     }
@@ -1235,7 +1235,7 @@ impl Operation for MutatePlacementOperation {
                     smallvec![Effect::Storage(StorageEffect::BatchRead {
                         reads: values
                             .into_iter()
-                            .map(|(key, _)| (METADATA_EVENT_LOG_KEYSPACE.to_string(), key))
+                            .map(|(key, _)| (EVENT_LOG_KEYSPACE.to_string(), key))
                             .collect(),
                         txn_id: Some(txn_id),
                     })]
@@ -1285,7 +1285,7 @@ impl Operation for MutatePlacementOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("pending create event reads", format!("{other:?}")),
             },
-            MutatePlacementState::WriteDocumentAndAdminState {
+            MutatePlacementState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
             } => match event {
@@ -1294,7 +1294,7 @@ impl Operation for MutatePlacementOperation {
                         return self.fail(MutatePlacementError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = MutatePlacementState::DeleteStaleAdminConflicts { document };
+                        self.state = MutatePlacementState::DeleteAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -1305,7 +1305,7 @@ impl Operation for MutatePlacementOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            MutatePlacementState::DeleteStaleAdminConflicts { document } => match event {
+            MutatePlacementState::DeleteAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
@@ -1315,7 +1315,7 @@ impl Operation for MutatePlacementOperation {
             MutatePlacementState::CommitTransaction { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = MutatePlacementState::ScheduleDocumentSyncOutboxDrain;
+                    self.state = MutatePlacementState::ScheduleSyncDrain;
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -1324,7 +1324,7 @@ impl Operation for MutatePlacementOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            MutatePlacementState::ScheduleDocumentSyncOutboxDrain => match event {
+            MutatePlacementState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = MutatePlacementState::SchedulePlacementRevalidation;
                     smallvec![schedule_revalidation(
