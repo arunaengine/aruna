@@ -15,7 +15,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DEVICE_MANAGEMENT_URL_KEYSPACE, DEVICE_REALM_MARKER_KEYSPACE, GROUP_KEYSPACE,
+    MANAGEMENT_URL_KEYSPACE, REALM_MARKER_KEYSPACE, GROUP_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -367,7 +367,7 @@ async fn install_documents(
         return false;
     };
     let mut writes = vec![(
-        DEVICE_REALM_MARKER_KEYSPACE.to_string(),
+        REALM_MARKER_KEYSPACE.to_string(),
         Key::from(plan.realm_id.as_bytes().to_vec()),
         Value::from(marker_bytes),
     )];
@@ -448,7 +448,7 @@ async fn install_documents(
         return false;
     };
     writes.push((
-        DEVICE_MANAGEMENT_URL_KEYSPACE.to_string(),
+        MANAGEMENT_URL_KEYSPACE.to_string(),
         Key::from(plan.realm_id.as_bytes().to_vec()),
         Value::from(url_bytes),
     ));
@@ -606,7 +606,7 @@ pub async fn installed_management_urls(
     }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: DEVICE_MANAGEMENT_URL_KEYSPACE.to_string(),
+            key_space: MANAGEMENT_URL_KEYSPACE.to_string(),
             key: realm_id.as_bytes().to_vec().into(),
             txn_id: None,
         })
@@ -625,7 +625,7 @@ async fn installed_marker(context: &Arc<DriverContext>, realm_id: RealmId) -> Re
     }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: DEVICE_REALM_MARKER_KEYSPACE.to_string(),
+            key_space: REALM_MARKER_KEYSPACE.to_string(),
             key: realm_id.as_bytes().to_vec().into(),
             txn_id: None,
         })
@@ -643,7 +643,7 @@ async fn store_marker(context: &Arc<DriverContext>, realm_id: RealmId, marker: &
     write_batch(
         context,
         vec![(
-            DEVICE_REALM_MARKER_KEYSPACE.to_string(),
+            REALM_MARKER_KEYSPACE.to_string(),
             Key::from(realm_id.as_bytes().to_vec()),
             Value::from(bytes),
         )],

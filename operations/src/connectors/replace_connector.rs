@@ -63,9 +63,9 @@ pub enum ReplaceSourceError {
     #[error("Connector not found")]
     NotFound,
     #[error("Connector credentials are referenced by object versions")]
-    ReferencedByObjectVersion,
+    ReferencedObjectVersion,
     #[error("ReplaceSourceConnector failed")]
-    ReplaceSourceConnectorFailed,
+    ReplaceConnectorFailed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
     InvalidStateEvent {
         state: ReplaceSourceState,
@@ -221,7 +221,7 @@ impl ReplaceSourceOperation {
     fn handle_scan_page(&mut self, event: Event) -> Effects {
         match parse_scan_page(event, self.input.connector_id) {
             Ok(ScanStep::Referenced) => {
-                self.abort_with_error(ReplaceSourceError::ReferencedByObjectVersion)
+                self.abort_with_error(ReplaceSourceError::ReferencedObjectVersion)
             }
             Ok(ScanStep::NextPage(start_after)) => self.scan_reference_versions(Some(start_after)),
             Ok(ScanStep::Complete) => self.write_records(),
@@ -264,7 +264,7 @@ impl ReplaceSourceOperation {
 
     fn write_records(&mut self) -> Effects {
         let Some(replacement) = self.replacement.clone() else {
-            return self.fail_or_abort(ReplaceSourceError::ReplaceSourceConnectorFailed);
+            return self.fail_or_abort(ReplaceSourceError::ReplaceConnectorFailed);
         };
 
         self.state = ReplaceSourceState::WriteRecords;
@@ -281,12 +281,12 @@ impl ReplaceSourceOperation {
             smallvec![Effect::Storage(StorageEffect::BatchWrite {
                 writes: vec![
                     (
-                        aruna_core::keyspaces::SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+                        aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
                         source_connector_key(replacement.group_id, replacement.connector_id),
                         connector_bytes.into(),
                     ),
                     (
-                        aruna_core::keyspaces::SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+                        aruna_core::keyspaces::SOURCE_SECRET_KEYSPACE.to_string(),
                         connector_secret_key(secret.connector_id),
                         secret_bytes.into(),
                     ),
@@ -299,7 +299,7 @@ impl ReplaceSourceOperation {
                 Err(error) => return self.fail_or_abort(error.into()),
             };
             smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: aruna_core::keyspaces::SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+                key_space: aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
                 key: source_connector_key(replacement.group_id, replacement.connector_id),
                 value: connector_bytes.into(),
                 txn_id: self.txn_id,
@@ -358,7 +358,7 @@ impl ReplaceSourceOperation {
 
     fn finish(&mut self) -> Effects {
         let Some(connector) = self.replacement.clone() else {
-            return self.emit_error(ReplaceSourceError::ReplaceSourceConnectorFailed);
+            return self.emit_error(ReplaceSourceError::ReplaceConnectorFailed);
         };
 
         self.state = ReplaceSourceState::Finish;
@@ -413,11 +413,11 @@ impl Operation for ReplaceSourceOperation {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(ReplaceSourceError::ReplaceSourceConnectorFailed);
+            return Err(ReplaceSourceError::ReplaceConnectorFailed);
         }
 
         self.output
-            .ok_or(ReplaceSourceError::ReplaceSourceConnectorFailed)?
+            .ok_or(ReplaceSourceError::ReplaceConnectorFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -668,7 +668,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(ReplaceSourceError::ReferencedByObjectVersion)
+            Err(ReplaceSourceError::ReferencedObjectVersion)
         );
     }
 
@@ -761,7 +761,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(ReplaceSourceError::ReferencedByObjectVersion)
+            Err(ReplaceSourceError::ReferencedObjectVersion)
         );
     }
 
@@ -960,7 +960,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Err(ReplaceSourceError::ReferencedByObjectVersion));
+        assert_eq!(result, Err(ReplaceSourceError::ReferencedObjectVersion));
     }
 
     #[tokio::test]

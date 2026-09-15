@@ -4,7 +4,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_SECRET_KEYSPACE;
+use aruna_core::keyspaces::BACKEND_SECRET_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{
@@ -157,7 +157,7 @@ impl CreateBackendOperation {
             Err(error) => return self.fail(error.into()),
         };
         writes.push((
-            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+            BACKEND_SECRET_KEYSPACE.to_string(),
             backend_key(record.backend_id),
             secret_bytes.into(),
         ));
@@ -226,8 +226,8 @@ mod pure_tests {
     use aruna_core::errors::BlobError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{
-        GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-        GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+        BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+        BACKEND_SECRET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
@@ -275,9 +275,9 @@ mod pure_tests {
                 .map(|(key_space, ..)| key_space.as_str())
                 .collect::<Vec<_>>(),
             [
-                GROUP_STORAGE_BACKEND_KEYSPACE,
-                GROUP_STORAGE_BACKEND_INDEX_KEYSPACE,
-                GROUP_STORAGE_BACKEND_SECRET_KEYSPACE
+                STORAGE_BACKEND_KEYSPACE,
+                BACKEND_INDEX_KEYSPACE,
+                BACKEND_SECRET_KEYSPACE
             ]
         );
         assert_eq!(writes[0].1, writes[2].1);

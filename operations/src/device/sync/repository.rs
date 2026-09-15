@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    SYNC_ACTION_LOG_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE,
+    SYNC_LOG_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::structs::{SyncActionRecord, SyncBase, SyncedFolder};
@@ -126,7 +126,7 @@ pub fn base_entry(
 
 pub fn upload_entry(upload: &SyncUpload) -> Result<(String, Key, Value), ConversionError> {
     Ok((
-        SYNC_UPLOAD_OUTBOX_KEYSPACE.to_string(),
+        SYNC_UPLOAD_KEYSPACE.to_string(),
         base_key(upload.folder_id, &upload.relative),
         ByteView::from(upload.to_bytes()?),
     ))
@@ -138,7 +138,7 @@ pub fn action_entry(record: &SyncActionRecord) -> Result<(String, Key, Value), C
     let mut key = record.folder_id.to_bytes().to_vec();
     key.extend_from_slice(&record.action_id.to_bytes());
     Ok((
-        SYNC_ACTION_LOG_KEYSPACE.to_string(),
+        SYNC_LOG_KEYSPACE.to_string(),
         ByteView::from(key),
         ByteView::from(record.to_bytes()?),
     ))

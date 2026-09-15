@@ -1,7 +1,7 @@
 use super::{RecordReadError, backend_key, index_prefix, parse_iter, parse_read};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE};
+use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, Key};
@@ -59,7 +59,7 @@ impl Operation for GetBackendOperation {
     fn start(&mut self) -> Effects {
         self.state = QueryState::Reading;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
             key: backend_key(self.backend_id),
             txn_id: None,
         })]
@@ -120,7 +120,7 @@ impl ListBackendsOperation {
 
     fn iter_effect(&self, start_after: Option<Key>) -> Effect {
         Effect::Storage(StorageEffect::Iter {
-            key_space: GROUP_STORAGE_BACKEND_INDEX_KEYSPACE.to_string(),
+            key_space: BACKEND_INDEX_KEYSPACE.to_string(),
             prefix: Some(index_prefix(self.group_id)),
             start: start_after.map(IterStart::After),
             limit: LIST_PAGE_SIZE,
@@ -191,7 +191,7 @@ mod pure_tests {
     use super::{GetBackendOperation, GroupQueryError, ListBackendsOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_INDEX_KEYSPACE;
+    use aruna_core::keyspaces::BACKEND_INDEX_KEYSPACE;
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use std::collections::HashMap;
@@ -244,7 +244,7 @@ mod pure_tests {
         else {
             panic!("expected a prefixed scan, got {effects:?}")
         };
-        assert_eq!(key_space, GROUP_STORAGE_BACKEND_INDEX_KEYSPACE);
+        assert_eq!(key_space, BACKEND_INDEX_KEYSPACE);
         assert_eq!(prefix, &index_prefix(group_id));
 
         operation.step(Event::Storage(StorageEvent::IterResult {

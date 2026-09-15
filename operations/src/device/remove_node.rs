@@ -8,7 +8,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -60,17 +60,17 @@ enum RemoveNodeState {
     Init,
     StartTransaction,
     ReadCurrent,
-    WriteDocumentAndAdminState {
+    WriteDocumentState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         document: RealmConfigDocument,
     },
     CommitTransaction {
         document: RealmConfigDocument,
     },
-    ScheduleDocumentSyncOutboxDrain {
+    ScheduleSyncDrain {
         document: RealmConfigDocument,
     },
     Finish,
@@ -86,7 +86,7 @@ pub enum RemoveNodeError {
     #[error(transparent)]
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
-    RealmConfigNotFound,
+    ConfigMissing,
     #[error("no device {node_id} belongs to this caller")]
     DeviceNotFound { node_id: NodeId },
     #[error("this node is not a realm management node")]
@@ -137,7 +137,7 @@ impl RemoveNodeOperation {
                     document.storage_key(),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
             ],
@@ -154,7 +154,7 @@ impl RemoveNodeOperation {
             return Err(RemoveNodeError::MissingTransaction);
         };
         let Some(document_value) = document_value else {
-            return Err(RemoveNodeError::RealmConfigNotFound);
+            return Err(RemoveNodeError::ConfigMissing);
         };
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         // Peers admit a realm-config event only from a management origin, so a
@@ -199,7 +199,7 @@ impl RemoveNodeOperation {
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let admin_event = reducer_state.apply_operation(
             &self.config.actor,
-            AdminDocumentOperation::RealmConfigNodeRemoved {
+            AdminDocumentOperation::ConfigNodeRemoved {
                 node_id: self.config.node_id,
             },
         )?;
@@ -232,7 +232,7 @@ impl RemoveNodeOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
-        self.state = RemoveNodeState::WriteDocumentAndAdminState {
+        self.state = RemoveNodeState::WriteDocumentState {
             document,
             stale_conflict_deletes,
         };
@@ -306,7 +306,7 @@ impl Operation for RemoveNodeOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            RemoveNodeState::WriteDocumentAndAdminState {
+            RemoveNodeState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
             } => match event {
@@ -315,7 +315,7 @@ impl Operation for RemoveNodeOperation {
                         return self.fail(RemoveNodeError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = RemoveNodeState::DeleteStaleAdminConflicts { document };
+                        self.state = RemoveNodeState::DeleteAdminConflicts { document };
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
@@ -326,7 +326,7 @@ impl Operation for RemoveNodeOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            RemoveNodeState::DeleteStaleAdminConflicts { document } => match event {
+            RemoveNodeState::DeleteAdminConflicts { document } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
@@ -336,7 +336,7 @@ impl Operation for RemoveNodeOperation {
             RemoveNodeState::CommitTransaction { document } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = RemoveNodeState::ScheduleDocumentSyncOutboxDrain { document };
+                    self.state = RemoveNodeState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -345,7 +345,7 @@ impl Operation for RemoveNodeOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            RemoveNodeState::ScheduleDocumentSyncOutboxDrain { .. } => match event {
+            RemoveNodeState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = RemoveNodeState::Finish;
                     smallvec![]

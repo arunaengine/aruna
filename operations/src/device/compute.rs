@@ -328,7 +328,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE, FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::identity::auth::Actor;
@@ -616,9 +616,9 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].owner_node_id, local);
         assert_eq!(records[0].created_by, caller);
-        assert_eq!(rows(&ctx, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await, 0);
-        assert_eq!(rows(&ctx, JOB_FAMILY_RECORD_KEYSPACE).await, 0);
-        assert_eq!(rows(&ctx, JOB_FAMILY_OUTBOX_KEYSPACE).await, 0);
+        assert_eq!(rows(&ctx, SYNC_OUTBOX_KEYSPACE).await, 0);
+        assert_eq!(rows(&ctx, FAMILY_RECORD_KEYSPACE).await, 0);
+        assert_eq!(rows(&ctx, FAMILY_OUTBOX_KEYSPACE).await, 0);
 
         let error = submit_local_execution(&ctx, run_config(local, caller))
             .await

@@ -96,10 +96,10 @@ pub(crate) async fn forward_to_holders(
             Ok(MetadataTransportMessage::ForwardedWriteDenied {
                 error: WriteAuthError::Forbidden,
             }) => return Err(MetadataWriteError::Forbidden),
-            Ok(MetadataTransportMessage::ForwardedWriteNotFound) if tracks_not_found => {
+            Ok(MetadataTransportMessage::WriteNotFound) if tracks_not_found => {
                 not_found += 1;
             }
-            Ok(MetadataTransportMessage::ForwardedWriteNotFound) => {
+            Ok(MetadataTransportMessage::WriteNotFound) => {
                 failures.push(format!(
                     "{holder}: holder returned not found for a forwarded create"
                 ));
@@ -107,7 +107,7 @@ pub(crate) async fn forward_to_holders(
             Ok(MetadataTransportMessage::ForwardedWriteUnavailable) => {
                 failures.push(format!("{holder}: holder placement view is unavailable"));
             }
-            Ok(MetadataTransportMessage::ForwardedMetadataHistoryCapacity)
+            Ok(MetadataTransportMessage::MetadataHistoryCapacity)
                 if matches!(
                     &message,
                     MetadataTransportMessage::ForwardUpdateDocument { .. }
@@ -115,7 +115,7 @@ pub(crate) async fn forward_to_holders(
             {
                 capacity += 1;
             }
-            Ok(MetadataTransportMessage::ForwardedMetadataHistoryCapacity) => {
+            Ok(MetadataTransportMessage::MetadataHistoryCapacity) => {
                 failures.push(format!(
                     "{holder}: holder returned metadata history capacity for a non-update"
                 ));
@@ -195,8 +195,8 @@ pub(crate) fn forwarded_unavailable(
                 result: Err(MetadataReadError::Unavailable),
             }
         }
-        MetadataTransportMessage::ForwardProfileValidationStatus { .. } => {
-            MetadataTransportMessage::ForwardedProfileValidationStatus {
+        MetadataTransportMessage::ForwardValidationStatus { .. } => {
+            MetadataTransportMessage::ForwardedValidationStatus {
                 result: Err(MetadataReadError::Unavailable),
             }
         }

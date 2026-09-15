@@ -21,8 +21,8 @@ use crate::connectors::repository::{
     read_secret_effect,
 };
 
-pub(crate) const ARUNA_NATIVE_RELATIONSHIP_ID: &str = "relationship_id";
-pub(crate) const ARUNA_NATIVE_ORIGIN_NODE_ID: &str = "origin_node_id";
+pub(crate) const NATIVE_RELATIONSHIP_ID: &str = "relationship_id";
+pub(crate) const ORIGIN_NODE_ID: &str = "origin_node_id";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolveConnectorInput {
@@ -317,7 +317,7 @@ pub fn resolve_connector_effect(input: ResolveConnectorInput) -> Effect {
 pub fn resolve_binding_effect(input: ResolveBindingInput) -> Effect {
     Effect::SubOperation(boxed_suboperation(
         ResolveBindingOperation::new(input),
-        |result| Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved { result }),
+        |result| Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }),
     ))
 }
 
@@ -421,7 +421,7 @@ fn build_native_access(
     let relationship_id = source
         .descriptor
         .public_config
-        .get(ARUNA_NATIVE_RELATIONSHIP_ID)
+        .get(NATIVE_RELATIONSHIP_ID)
         .and_then(|value| Ulid::from_string(value).ok())
         .ok_or(SourceResolutionError::ResolveFailed)?;
     let origin_node_id = source
@@ -438,11 +438,11 @@ fn build_native_access(
 
     let mut config = source.descriptor.public_config.clone();
     config.insert(
-        ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+        NATIVE_RELATIONSHIP_ID.to_string(),
         relationship_id.to_string(),
     );
     config.insert(
-        ARUNA_NATIVE_ORIGIN_NODE_ID.to_string(),
+        ORIGIN_NODE_ID.to_string(),
         origin_node_id.to_string(),
     );
     Ok(ResolvedSourceAccess::OpenDal {
@@ -888,7 +888,7 @@ mod tests {
             descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::ArunaNative,
                 public_config: HashMap::from([(
-                    ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+                    NATIVE_RELATIONSHIP_ID.to_string(),
                     relationship_id.to_string(),
                 )]),
                 source_path: "source-bucket/nested/data.txt".to_string(),
@@ -908,10 +908,10 @@ mod tests {
                 kind: SourceConnectorKind::ArunaNative,
                 config: HashMap::from([
                     (
-                        ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+                        NATIVE_RELATIONSHIP_ID.to_string(),
                         relationship_id.to_string(),
                     ),
-                    (ARUNA_NATIVE_ORIGIN_NODE_ID.to_string(), origin.to_string()),
+                    (ORIGIN_NODE_ID.to_string(), origin.to_string()),
                 ]),
                 path: "source-bucket/nested/data.txt".to_string(),
                 version: Some(version_id.to_string()),

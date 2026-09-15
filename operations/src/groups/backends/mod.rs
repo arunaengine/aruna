@@ -8,7 +8,7 @@ pub mod validation;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE};
+use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{GroupId, Key, TxnId};
@@ -42,12 +42,12 @@ pub fn record_writes(
     let value: ByteView = record.to_bytes()?.into();
     Ok(vec![
         (
-            GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+            STORAGE_BACKEND_KEYSPACE.to_string(),
             backend_key(record.backend_id),
             value.clone(),
         ),
         (
-            GROUP_STORAGE_BACKEND_INDEX_KEYSPACE.to_string(),
+            BACKEND_INDEX_KEYSPACE.to_string(),
             index_key(record.group_id, record.backend_id),
             value,
         ),
@@ -70,7 +70,7 @@ pub fn fence_backend(backend: &BackendRef, txn_id: Option<TxnId>) -> Option<Effe
         return None;
     };
     Some(Effect::Storage(StorageEffect::Read {
-        key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+        key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
         key: backend_key(*backend_id),
         txn_id,
     }))

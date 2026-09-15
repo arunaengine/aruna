@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
-use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
+use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
@@ -535,7 +535,7 @@ impl Operation for ReconcileFolderOperation {
             })
             .chain(paths.iter().map(|relative| {
                 (
-                    SYNC_UPLOAD_OUTBOX_KEYSPACE.to_string(),
+                    SYNC_UPLOAD_KEYSPACE.to_string(),
                     base_key(folder_id, relative),
                 )
             }))
@@ -799,7 +799,7 @@ mod pure_tests {
             created_at_ms: 1,
             last_reconcile_ms: None,
             last_error: None,
-            last_error_at_ms: None,
+            last_error_ms: None,
             observed_files: 0,
             list_cursor: None,
         }

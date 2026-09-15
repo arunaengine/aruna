@@ -6,7 +6,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -67,17 +67,17 @@ pub enum AddUserState {
     Init,
     Auth,
     StartTransaction,
-    ReadAuthDocAndAdminState {
+    ReadAdminState {
         txn_id: TxnId,
     },
-    WriteAuthDocAndAdminState {
+    WriteAdminState {
         txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
         newly_added: bool,
     },
-    DeleteStaleAdminConflicts {
+    DeleteAdminConflicts {
         txn_id: TxnId,
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
@@ -95,7 +95,7 @@ pub enum AddUserState {
         admin_outbox_written: bool,
         newly_added: bool,
     },
-    ScheduleAdminDocumentOutboxDrain {
+    ScheduleDocumentDrain {
         auth_doc: GroupAuthorizationDocument,
         newly_added: bool,
     },
@@ -131,7 +131,7 @@ pub enum AddUserError {
     #[error("Invalid user id")]
     InvalidUserId,
     #[error("Authorization document not found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error(transparent)]
     CheckPermissionsError(#[from] AuthorizationError),
     #[error("Adding user to group did not finish")]
@@ -209,7 +209,7 @@ impl AddUserOperation {
     }
 
     fn emit_auth_read(&mut self, txn_id: TxnId) -> Result<Effects, AddUserError> {
-        self.state = AddUserState::ReadAuthDocAndAdminState { txn_id };
+        self.state = AddUserState::ReadAdminState { txn_id };
         let target = AdminDocumentTarget::Group {
             group_id: self.input.group_id,
         };
@@ -220,7 +220,7 @@ impl AddUserOperation {
                     ByteView::from(self.input.group_id.to_bytes()),
                 ),
                 (
-                    ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
                 ),
                 (
@@ -273,7 +273,7 @@ impl AddUserOperation {
         realm_config_value: Option<ByteView>,
     ) -> Result<Effects, AddUserError> {
         let mut auth_doc =
-            super::parse_auth_record(auth_doc)?.ok_or(AddUserError::AuthDocNotFound)?;
+            super::parse_auth_record(auth_doc)?.ok_or(AddUserError::DocNotFound)?;
         let role_ids = sorted_role_ids(&self.input.role_ids);
         for role_id in &role_ids {
             if !auth_doc.roles.contains_key(role_id) {
@@ -368,7 +368,7 @@ impl AddUserOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = AddUserState::WriteAuthDocAndAdminState {
+        self.state = AddUserState::WriteAdminState {
             txn_id,
             auth_doc,
             admin_outbox_written: !admin_events.is_empty(),
@@ -401,7 +401,7 @@ impl AddUserOperation {
         };
 
         if !stale_conflict_deletes.is_empty() {
-            self.state = AddUserState::DeleteStaleAdminConflicts {
+            self.state = AddUserState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
@@ -514,7 +514,7 @@ impl AddUserOperation {
             );
         };
         if admin_outbox_written {
-            self.state = AddUserState::ScheduleAdminDocumentOutboxDrain {
+            self.state = AddUserState::ScheduleDocumentDrain {
                 auth_doc,
                 newly_added,
             };
@@ -691,10 +691,10 @@ impl Operation for AddUserOperation {
         match self.state.clone() {
             AddUserState::Auth => self.handle_authorization(event),
             AddUserState::StartTransaction => self.handle_start_transaction(event),
-            AddUserState::ReadAuthDocAndAdminState { txn_id } => {
+            AddUserState::ReadAdminState { txn_id } => {
                 self.handle_auth_read(event, txn_id)
             }
-            AddUserState::WriteAuthDocAndAdminState {
+            AddUserState::WriteAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
@@ -708,7 +708,7 @@ impl Operation for AddUserOperation {
                 stale_conflict_deletes,
                 newly_added,
             ),
-            AddUserState::DeleteStaleAdminConflicts {
+            AddUserState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
@@ -734,7 +734,7 @@ impl Operation for AddUserOperation {
                 newly_added,
                 ..
             } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written, newly_added),
-            AddUserState::ScheduleAdminDocumentOutboxDrain {
+            AddUserState::ScheduleDocumentDrain {
                 auth_doc,
                 newly_added,
             } => self.handle_drain_schedule(event, auth_doc, newly_added),
@@ -761,9 +761,9 @@ impl Operation for AddUserOperation {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            AddUserState::ReadAuthDocAndAdminState { txn_id }
-            | AddUserState::WriteAuthDocAndAdminState { txn_id, .. }
-            | AddUserState::DeleteStaleAdminConflicts { txn_id, .. }
+            AddUserState::ReadAdminState { txn_id }
+            | AddUserState::WriteAdminState { txn_id, .. }
+            | AddUserState::DeleteAdminConflicts { txn_id, .. }
             | AddUserState::ReadBucketFence { txn_id, .. }
             | AddUserState::CommitTransaction { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
@@ -796,7 +796,7 @@ fn apply_reducer_updates(
         }
         let event = state.apply_operation(
             &input.actor,
-            AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+            AdminDocumentOperation::GroupAssignmentAdded {
                 role_id: *role_id,
                 user_id: input.user_id,
             },
@@ -842,8 +842,8 @@ pub mod test {
     use aruna_core::task::TaskKey;
     use aruna_core::types::{RoleId, TxnId};
     use aruna_core::{
-        ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
-        DOCUMENT_SYNC_OUTBOX_KEYSPACE,
+        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
@@ -1032,7 +1032,7 @@ pub mod test {
         let outbox_records: Vec<DocumentOutboxRecord> = match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => writes
                 .iter()
-                .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
                 .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
                 .collect(),
             other => panic!("unexpected write effect: {other:?}"),
@@ -1062,7 +1062,7 @@ pub mod test {
         assert_eq!(events[1].observed.sequence_for(&actor.node_id), 1);
         assert!(matches!(
             &events[1].op,
-            AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+            AdminDocumentOperation::GroupAssignmentAdded {
                 role_id: event_role_id,
                 user_id: event_user_id,
             } if *event_role_id == role_id && *event_user_id == assigned_user_id
@@ -1154,16 +1154,16 @@ pub mod test {
                     .expect("auth doc write is included");
                 let reducer_state_write = writes
                     .iter()
-                    .find(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_STATE_KEYSPACE)
+                    .find(|(keyspace, _, _)| keyspace == DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state write is included");
                 let outbox_records: Vec<DocumentOutboxRecord> = writes
                     .iter()
-                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
                     .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
                     .collect();
                 let conflict_writes: Vec<_> = writes
                     .iter()
-                    .filter(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_CONFLICT_KEYSPACE)
+                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_CONFLICT_KEYSPACE)
                     .collect();
                 assert_eq!(conflict_writes.len(), 1);
                 let conflict: AdminConflict =
@@ -1191,7 +1191,7 @@ pub mod test {
                 if event.target == target
                     && matches!(
                         &event.op,
-                        AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+                        AdminDocumentOperation::GroupAssignmentAdded {
                             role_id: event_role_id,
                             user_id: event_user_id,
                         } if *event_role_id == role_id && *event_user_id == assigned_user_id
@@ -1228,7 +1228,7 @@ pub mod test {
                 assert_eq!(
                     deletes,
                     &vec![(
-                        ADMIN_DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+                        DOCUMENT_CONFLICT_KEYSPACE.to_string(),
                         reducer_conflict_key(&target, &assignment_path(role_id, assigned_user_id),),
                     )]
                 );
@@ -1248,7 +1248,7 @@ pub mod test {
         }));
         assert!(matches!(effects.first(), Some(Effect::Task(_))));
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
         assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
@@ -1289,7 +1289,7 @@ pub mod test {
             .unwrap();
         assert!(matches!(
             &operation.state,
-            AddUserState::WriteAuthDocAndAdminState {
+            AddUserState::WriteAdminState {
                 newly_added: false,
                 ..
             }
@@ -1307,7 +1307,7 @@ pub mod test {
         }));
         assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
 
@@ -1614,7 +1614,7 @@ pub mod test {
             txn_id,
         }));
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
         assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
@@ -1670,7 +1670,7 @@ pub mod test {
             txn_id,
         }));
         let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainDocumentSyncOutbox,
+            key: TaskKey::DrainSyncOutbox,
             after: std::time::Duration::ZERO,
         }));
         assert!(effects.is_empty());

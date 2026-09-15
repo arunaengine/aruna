@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
+use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
@@ -36,7 +36,7 @@ use super::repository::{
 };
 
 /// Delay before a deferred pass looks for the realm again.
-pub const UPLOAD_DEFER_RETRY_AFTER: Duration = Duration::from_secs(15);
+pub const UPLOAD_DEFER_AFTER: Duration = Duration::from_secs(15);
 
 /// Delay between passes while uploads are still due.
 pub const UPLOAD_CONTINUE_AFTER: Duration = Duration::from_millis(250);
@@ -164,7 +164,7 @@ async fn drop_upload(context: &Arc<DriverContext>, upload: &SyncUpload) {
     if !super::repository::delete_rows(
         context,
         vec![(
-            SYNC_UPLOAD_OUTBOX_KEYSPACE.to_string(),
+            SYNC_UPLOAD_KEYSPACE.to_string(),
             base_key(upload.folder_id, &upload.relative),
         )],
         None,
@@ -211,7 +211,7 @@ async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &
         && super::repository::delete_rows(
             context,
             vec![(
-                SYNC_UPLOAD_OUTBOX_KEYSPACE.to_string(),
+                SYNC_UPLOAD_KEYSPACE.to_string(),
                 base_key(upload.folder_id, &upload.relative),
             )],
             Some(txn_id),
@@ -348,7 +348,7 @@ async fn store_state(
 async fn holds_state(context: &Arc<DriverContext>, upload: &SyncUpload, txn_id: TxnId) -> bool {
     read_value(
         context,
-        SYNC_UPLOAD_OUTBOX_KEYSPACE,
+        SYNC_UPLOAD_KEYSPACE,
         base_key(upload.folder_id, &upload.relative),
         Some(txn_id),
     )
@@ -364,7 +364,7 @@ async fn read_page(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: SYNC_UPLOAD_OUTBOX_KEYSPACE.to_string(),
+            key_space: SYNC_UPLOAD_KEYSPACE.to_string(),
             prefix: None,
             start: cursor.map(IterStart::After),
             limit: SYNC_PAGE_SIZE,
@@ -405,12 +405,12 @@ pub(crate) async fn load_folder(
 
 /// Re-arms the drain when the outbox still holds rows.
 pub async fn restore_upload_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    if !has_rows(storage, SYNC_UPLOAD_OUTBOX_KEYSPACE).await {
+    if !has_rows(storage, SYNC_UPLOAD_KEYSPACE).await {
         return;
     }
     arm_timer(
         task_handle,
-        TaskKey::DrainSyncUploadOutbox,
+        TaskKey::DrainUploadOutbox,
         "Failed to restore the synced-folder upload timer",
     )
     .await;
@@ -448,7 +448,7 @@ mod tests {
     use crate::device::sync::repository::{base_key, read_value, upload_entry, write_rows};
     use crate::driver::DriverContext;
     use crate::tests::device::context;
-    use aruna_core::keyspaces::SYNC_UPLOAD_OUTBOX_KEYSPACE;
+    use aruna_core::keyspaces::SYNC_UPLOAD_KEYSPACE;
     use aruna_core::structs::{FolderState, SyncedFolder};
     use aruna_core::structs::identity::realm::RealmId;
 
@@ -474,7 +474,7 @@ mod tests {
             created_at_ms: 1,
             last_reconcile_ms: None,
             last_error: None,
-            last_error_at_ms: None,
+            last_error_ms: None,
             observed_files: 0,
             list_cursor: None,
         }
@@ -513,7 +513,7 @@ mod tests {
     async fn stored(context: &Arc<DriverContext>, upload: &SyncUpload) -> SyncUpload {
         let bytes = read_value(
             context,
-            SYNC_UPLOAD_OUTBOX_KEYSPACE,
+            SYNC_UPLOAD_KEYSPACE,
             base_key(upload.folder_id, &upload.relative),
             None,
         )
@@ -545,7 +545,7 @@ mod tests {
         assert!(
             read_value(
                 &context,
-                SYNC_UPLOAD_OUTBOX_KEYSPACE,
+                SYNC_UPLOAD_KEYSPACE,
                 base_key(entry.folder_id, &entry.relative),
                 None,
             )

@@ -19,7 +19,7 @@ pub enum ValidationError {
     #[error("connector kind `{kind}` is not supported")]
     UnsupportedConnectorKind { kind: SourceConnectorKind },
     #[error("missing required public config key `{key}` for connector kind `{kind}`")]
-    MissingRequiredPublicKey {
+    PublicKeyMissing {
         kind: SourceConnectorKind,
         key: String,
     },
@@ -44,7 +44,7 @@ pub enum ValidationError {
     #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
     UnsafeBucket(String),
     #[error("credentials must not be set when `skip_signature` is enabled")]
-    CredentialsWithSkipSignature,
+    CredentialsSkipSignature,
     #[error("signed s3 connectors require `{ACCESS_KEY_ID}` and `{SECRET_ACCESS_KEY}`")]
     MissingCredentials,
 }
@@ -110,7 +110,7 @@ pub fn validate_connector_input(
 
     for key in rules.required_public_keys {
         if !public_config.contains_key(*key) {
-            return Err(ValidationError::MissingRequiredPublicKey {
+            return Err(ValidationError::PublicKeyMissing {
                 kind,
                 key: (*key).to_string(),
             });
@@ -137,7 +137,7 @@ pub fn validate_connector_input(
         }
         anonymous = value == "true";
         if anonymous && !secret_config.is_empty() {
-            return Err(ValidationError::CredentialsWithSkipSignature);
+            return Err(ValidationError::CredentialsSkipSignature);
         }
     }
 
@@ -240,7 +240,7 @@ mod pure_tests {
 
         assert_eq!(
             err,
-            ValidationError::MissingRequiredPublicKey {
+            ValidationError::PublicKeyMissing {
                 kind: SourceConnectorKind::S3,
                 key: "endpoint".to_string(),
             }
@@ -331,7 +331,7 @@ mod pure_tests {
         )
         .unwrap_err();
 
-        assert_eq!(err, ValidationError::CredentialsWithSkipSignature);
+        assert_eq!(err, ValidationError::CredentialsSkipSignature);
     }
 
     #[test]

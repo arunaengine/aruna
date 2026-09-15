@@ -29,7 +29,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
-use aruna_core::keyspaces::ADMIN_DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::metadata::MetadataEffect;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataEvent;
@@ -58,7 +58,7 @@ use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::reject;
 use std::str::FromStr;
 
-pub(super) const DEVICE_GROUP_SCAN_PAGE: usize = 10_000;
+pub(super) const GROUP_SCAN_PAGE: usize = 10_000;
 
 /// Serves the realm-wide documents to one of the realm's devices.
 /// A device runs no document sync, so this is how it sees the realm config it is
@@ -186,7 +186,7 @@ pub(super) async fn device_group_documents(
     let mut offset = 0usize;
     loop {
         let groups = match drive(
-            ListGroupOperation::with_pagination(DEVICE_GROUP_SCAN_PAGE, offset),
+            ListGroupOperation::with_pagination(GROUP_SCAN_PAGE, offset),
             context.as_ref(),
         )
         .await
@@ -219,7 +219,7 @@ pub(super) async fn device_group_documents(
                 return documents;
             }
         }
-        if page_len < DEVICE_GROUP_SCAN_PAGE {
+        if page_len < GROUP_SCAN_PAGE {
             return documents;
         }
         offset = offset.saturating_add(page_len);
@@ -247,7 +247,7 @@ pub(super) async fn applied_clock(
     }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+            key_space: DOCUMENT_STATE_KEYSPACE.to_string(),
             key,
             txn_id: None,
         })
@@ -473,7 +473,7 @@ pub(super) async fn run_device_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::DEVICE_GROUP_SCAN_PAGE;
+    use super::GROUP_SCAN_PAGE;
     use super::device_group_documents;
     use crate::driver::DriverContext;
     use aruna_core::NodeId;
@@ -514,8 +514,8 @@ mod tests {
             user_id: member,
             realm_id,
         };
-        let mut writes = Vec::with_capacity((DEVICE_GROUP_SCAN_PAGE + 1) * 2);
-        for seed in 1..=DEVICE_GROUP_SCAN_PAGE + 1 {
+        let mut writes = Vec::with_capacity((GROUP_SCAN_PAGE + 1) * 2);
+        for seed in 1..=GROUP_SCAN_PAGE + 1 {
             let group_id = Ulid::from(seed as u128);
             let group = Group {
                 display_name: seed.to_string(),
@@ -525,7 +525,7 @@ mod tests {
                 owner: other,
             };
             let authorization = GroupAuthorizationDocument::default_group_doc(
-                if seed > DEVICE_GROUP_SCAN_PAGE {
+                if seed > GROUP_SCAN_PAGE {
                     member
                 } else {
                     other
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(documents.len(), 1);
         assert_eq!(
             documents[0].group.group_id,
-            Ulid::from((DEVICE_GROUP_SCAN_PAGE + 1) as u128)
+            Ulid::from((GROUP_SCAN_PAGE + 1) as u128)
         );
     }
 }

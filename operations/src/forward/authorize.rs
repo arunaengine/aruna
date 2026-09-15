@@ -89,7 +89,7 @@ pub(crate) async fn authorize_forwarded_caller(
         MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } => {
             Some(auth_token.clone())
         }
-        MetadataTransportMessage::ForwardCreatePlacementPolicy { auth_token, .. } => {
+        MetadataTransportMessage::ForwardCreatePolicy { auth_token, .. } => {
             auth_token.clone()
         }
         MetadataTransportMessage::ForwardGroupCreate { auth_token, .. } => auth_token.clone(),

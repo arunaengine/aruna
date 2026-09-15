@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DEVICE_SYNC_STATE_KEYSPACE, SYNC_BASE_KEYSPACE};
+use aruna_core::keyspaces::{SYNC_STATE_KEYSPACE, SYNC_BASE_KEYSPACE};
 use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
@@ -250,7 +250,7 @@ pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
     write_sync_state(context, &state).await;
     for key in [
         TaskKey::DrainDeviceIntake,
-        TaskKey::DrainSyncUploadOutbox,
+        TaskKey::DrainUploadOutbox,
         // The folder beat is also the beat the replicas refresh on.
         TaskKey::ReconcileSyncedFolders,
     ] {
@@ -302,7 +302,7 @@ pub async fn read_sync_state(context: &Arc<DriverContext>) -> DeviceSyncState {
     }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: DEVICE_SYNC_STATE_KEYSPACE.to_string(),
+            key_space: SYNC_STATE_KEYSPACE.to_string(),
             key: sync_state_key(),
             txn_id: None,
         })
@@ -320,7 +320,7 @@ async fn write_sync_state(context: &Arc<DriverContext>, state: &DeviceSyncState)
     if let Event::Storage(StorageEvent::Error { error }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: DEVICE_SYNC_STATE_KEYSPACE.to_string(),
+            key_space: SYNC_STATE_KEYSPACE.to_string(),
             key: sync_state_key(),
             value: ByteView::from(bytes),
             txn_id: None,
@@ -447,7 +447,7 @@ mod tests {
             created_at_ms: 1,
             last_reconcile_ms: None,
             last_error: None,
-            last_error_at_ms: None,
+            last_error_ms: None,
             observed_files: 0,
             list_cursor: None,
         }

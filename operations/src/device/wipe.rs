@@ -23,7 +23,7 @@ pub const WIPED_EXIT_CODE: i32 = 79;
 
 /// Exit status when the wipe left paths behind. Data may still be on disk, so
 /// this must never be reported as an erased device.
-pub const WIPE_INCOMPLETE_EXIT_CODE: i32 = 80;
+pub const INCOMPLETE_EXIT_CODE: i32 = 80;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WipeDeviceConfig {

@@ -248,7 +248,7 @@ mod tests {
     use super::*;
     use crate::tests::staging::setup_driver_context;
     use aruna_core::UserId;
-    use aruna_core::keyspaces::{GROUP_STORAGE_ROUTING_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+    use aruna_core::keyspaces::{STORAGE_ROUTING_KEYSPACE, NODE_SUBJECT_KEYSPACE};
     use aruna_core::structs::storage::blob::{BackendRef, ResolvedBackend};
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::routing::{
@@ -304,7 +304,7 @@ mod tests {
         };
         write_value(
             context,
-            GROUP_STORAGE_ROUTING_KEYSPACE,
+            STORAGE_ROUTING_KEYSPACE,
             group_id.to_bytes().to_vec(),
             record.to_bytes().unwrap(),
         )
@@ -425,7 +425,7 @@ mod tests {
         .await;
         write_value(
             &context,
-            GROUP_STORAGE_ROUTING_KEYSPACE,
+            STORAGE_ROUTING_KEYSPACE,
             group_id.to_bytes().to_vec(),
             record.to_bytes().unwrap(),
         )

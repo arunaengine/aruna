@@ -2,7 +2,7 @@ use super::{RecordReadError, backend_key, parse_read, record_writes};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_KEYSPACE;
+use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, TxnId};
@@ -84,7 +84,7 @@ impl SetDisabledOperation {
                 self.txn_id = Some(txn_id);
                 self.state = DisableState::ReadRecord;
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+                    key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
                     key: backend_key(self.backend_id),
                     txn_id: self.txn_id,
                 })]
@@ -240,7 +240,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
+        BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
@@ -329,8 +329,8 @@ mod pure_tests {
                 .map(|(key_space, ..)| key_space.as_str())
                 .collect::<Vec<_>>(),
             [
-                GROUP_STORAGE_BACKEND_KEYSPACE,
-                GROUP_STORAGE_BACKEND_INDEX_KEYSPACE
+                STORAGE_BACKEND_KEYSPACE,
+                BACKEND_INDEX_KEYSPACE
             ]
         );
         assert!(

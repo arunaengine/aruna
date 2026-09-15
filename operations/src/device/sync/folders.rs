@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    SYNC_ACTION_LOG_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE,
+    SYNC_LOG_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::AuthContext;
@@ -189,7 +189,7 @@ pub async fn bind_folder(
         created_at_ms: unix_timestamp_millis(),
         last_reconcile_ms: None,
         last_error: None,
-        last_error_at_ms: None,
+        last_error_ms: None,
         observed_files: sweep.files as u64,
         list_cursor: None,
     };
@@ -296,8 +296,8 @@ pub async fn unbind_folder(
     }
     for key_space in [
         SYNC_BASE_KEYSPACE,
-        SYNC_UPLOAD_OUTBOX_KEYSPACE,
-        SYNC_ACTION_LOG_KEYSPACE,
+        SYNC_UPLOAD_KEYSPACE,
+        SYNC_LOG_KEYSPACE,
     ] {
         clear_rows(context, key_space, folder_id).await?;
     }
@@ -433,7 +433,7 @@ pub async fn list_actions(
 ) -> Result<(Vec<SyncActionRecord>, Option<Key>), FolderError> {
     let (values, next) = scan_page(
         context,
-        scan_folder(SYNC_ACTION_LOG_KEYSPACE, folder_id, cursor, None),
+        scan_folder(SYNC_LOG_KEYSPACE, folder_id, cursor, None),
     )
     .await
     .ok_or(FolderError::Unavailable)?;
@@ -491,7 +491,7 @@ async fn count_uploads(
     loop {
         let (values, next) = scan_page(
             context,
-            scan_folder(SYNC_UPLOAD_OUTBOX_KEYSPACE, folder_id, cursor, None),
+            scan_folder(SYNC_UPLOAD_KEYSPACE, folder_id, cursor, None),
         )
         .await
         .ok_or(FolderError::Unavailable)?;
@@ -511,7 +511,7 @@ pub async fn list_transfers(context: &Arc<DriverContext>) -> Result<Vec<SyncUplo
         loop {
             let (values, next) = scan_page(
                 context,
-                scan_folder(SYNC_UPLOAD_OUTBOX_KEYSPACE, folder.folder_id, cursor, None),
+                scan_folder(SYNC_UPLOAD_KEYSPACE, folder.folder_id, cursor, None),
             )
             .await
             .ok_or(FolderError::Unavailable)?;
@@ -571,7 +571,7 @@ mod tests {
             created_at_ms: 1,
             last_reconcile_ms: None,
             last_error: None,
-            last_error_at_ms: None,
+            last_error_ms: None,
             observed_files: 0,
             list_cursor: None,
         }

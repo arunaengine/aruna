@@ -1,7 +1,7 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
@@ -13,8 +13,8 @@ use crate::storage_read::{parse_storage_iter, parse_storage_read};
 
 pub use crate::storage_read::StorageReadError;
 
-pub const LIST_SOURCE_CONNECTOR_PAGE_SIZE: usize = 128;
-pub const CONNECTOR_REFERENCE_SCAN_PAGE_SIZE: usize = 128;
+pub const LIST_CONNECTOR_SIZE: usize = 128;
+pub const REFERENCE_PAGE_SIZE: usize = 128;
 
 pub fn source_connector_key(group_id: GroupId, connector_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(32);
@@ -37,7 +37,7 @@ pub fn read_connector_effect(
     txn_id: Option<TxnId>,
 ) -> Effect {
     Effect::Storage(StorageEffect::Read {
-        key_space: SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+        key_space: SOURCE_INDEX_KEYSPACE.to_string(),
         key: source_connector_key(group_id, connector_id),
         txn_id,
     })
@@ -45,7 +45,7 @@ pub fn read_connector_effect(
 
 pub fn read_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
-        key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+        key_space: SOURCE_SECRET_KEYSPACE.to_string(),
         key: connector_secret_key(connector_id),
         txn_id,
     })
@@ -57,7 +57,7 @@ pub fn delete_connector_effect(
     txn_id: Option<TxnId>,
 ) -> Effect {
     Effect::Storage(StorageEffect::Delete {
-        key_space: SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+        key_space: SOURCE_INDEX_KEYSPACE.to_string(),
         key: source_connector_key(group_id, connector_id),
         txn_id,
     })
@@ -65,7 +65,7 @@ pub fn delete_connector_effect(
 
 pub fn delete_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Delete {
-        key_space: SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+        key_space: SOURCE_SECRET_KEYSPACE.to_string(),
         key: connector_secret_key(connector_id),
         txn_id,
     })
@@ -77,10 +77,10 @@ pub fn iter_connectors_effect(
     txn_id: Option<TxnId>,
 ) -> Effect {
     Effect::Storage(StorageEffect::Iter {
-        key_space: SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+        key_space: SOURCE_INDEX_KEYSPACE.to_string(),
         prefix: Some(source_connector_prefix(group_id)),
         start: start_after.map(IterStart::After),
-        limit: LIST_SOURCE_CONNECTOR_PAGE_SIZE,
+        limit: LIST_CONNECTOR_SIZE,
         txn_id,
     })
 }
@@ -90,7 +90,7 @@ pub fn reference_scan_effect(start_after: Option<Key>, txn_id: Option<TxnId>) ->
         key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
         prefix: None,
         start: start_after.map(IterStart::After),
-        limit: CONNECTOR_REFERENCE_SCAN_PAGE_SIZE,
+        limit: REFERENCE_PAGE_SIZE,
         txn_id,
     })
 }

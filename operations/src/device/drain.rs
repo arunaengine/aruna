@@ -37,7 +37,7 @@ use super::replica::{read_replica, store_replica};
 use super::selection::track_created;
 
 /// Delay before a deferred pass looks for the realm again.
-pub const PUBLISH_DEFER_RETRY_AFTER: Duration = Duration::from_secs(15);
+pub const PUBLISH_DEFER_AFTER: Duration = Duration::from_secs(15);
 
 /// Delay between passes while entries are still due.
 pub const PUBLISH_CONTINUE_AFTER: Duration = Duration::from_millis(250);

@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::driver::DriverContext;
 
-const REALM_PEER_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
+const PEER_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) async fn dispatch_storage(effect: StorageEffect, context: &DriverContext) -> Event {
     let realm_config_write = match &effect {
@@ -28,7 +28,7 @@ pub(super) async fn dispatch_storage(effect: StorageEffect, context: &DriverCont
         match (&event, realm_config_write) {
             (Event::Storage(StorageEvent::WriteResult { .. }), Some(bytes)) => {
                 match tokio::time::timeout(
-                    REALM_PEER_REFRESH_TIMEOUT,
+                    PEER_REFRESH_TIMEOUT,
                     net_handle.refresh_encoded_peers(&bytes),
                 )
                 .await
@@ -39,7 +39,7 @@ pub(super) async fn dispatch_storage(effect: StorageEffect, context: &DriverCont
                     }
                     Err(_) => {
                         warn!(
-                            timeout_ms = REALM_PEER_REFRESH_TIMEOUT.as_millis() as u64,
+                            timeout_ms = PEER_REFRESH_TIMEOUT.as_millis() as u64,
                             "Timed out refreshing realm peers from written realm config"
                         );
                     }
@@ -49,7 +49,7 @@ pub(super) async fn dispatch_storage(effect: StorageEffect, context: &DriverCont
                 if refresh_after_commit =>
             {
                 match tokio::time::timeout(
-                    REALM_PEER_REFRESH_TIMEOUT,
+                    PEER_REFRESH_TIMEOUT,
                     net_handle.reload_realm_peers(),
                 )
                 .await
@@ -60,7 +60,7 @@ pub(super) async fn dispatch_storage(effect: StorageEffect, context: &DriverCont
                     }
                     Err(_) => {
                         warn!(
-                            timeout_ms = REALM_PEER_REFRESH_TIMEOUT.as_millis() as u64,
+                            timeout_ms = PEER_REFRESH_TIMEOUT.as_millis() as u64,
                             "Timed out refreshing realm peers after storage commit"
                         );
                     }

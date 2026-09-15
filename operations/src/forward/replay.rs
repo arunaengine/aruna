@@ -10,8 +10,8 @@ use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
-use aruna_core::keyspaces::METADATA_CREATE_ACCEPTANCE_KEYSPACE;
-use aruna_core::keyspaces::METADATA_PENDING_PROJECTION_KEYSPACE;
+use aruna_core::keyspaces::CREATE_ACCEPTANCE_KEYSPACE;
+use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::create_acceptance_key;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -111,7 +111,7 @@ pub(crate) async fn accepted_create(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: METADATA_CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+            key_space: CREATE_ACCEPTANCE_KEYSPACE.to_string(),
             key: create_acceptance_key(document_id),
             txn_id: None,
         })
@@ -157,7 +157,7 @@ pub(crate) async fn projection_queued(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
             prefix: Some(byteview::ByteView::from(document_id.to_bytes().to_vec())),
             start: None,
             limit: 1,
