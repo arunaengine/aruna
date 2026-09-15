@@ -169,7 +169,7 @@ fn completion_events(plan: &TransitionPlan) -> Vec<AdminDocumentEvent> {
     vec![barrier(1, 50), barrier(2, 51), proof(3, 52), proof(4, 53)]
 }
 
-fn transition_config(state: &AdminDocumentReducerState) -> RealmConfigDocument {
+fn transition_config(state: &AdminDocumentState) -> RealmConfigDocument {
     let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
     overlay_placement(&mut config, state, 0);
     config
@@ -240,7 +240,7 @@ fn foreign_reports_dropped() {
     );
     assert!(matches!(
         state.apply(&oversized),
-        Err(AdminDocumentReducerError::TransitionReportOversized)
+        Err(AdminDocumentError::TransitionReportOversized)
     ));
 }
 
@@ -386,21 +386,21 @@ fn proof_admission_forgery() {
     // A proof relayed by anyone but its holder never enters the record.
     assert_eq!(
         state.apply(&submit(proof_for(&plan, 0, 3), node(1), 70)),
-        Err(AdminDocumentReducerError::TransitionOriginMismatch)
+        Err(AdminDocumentError::TransitionOriginMismatch)
     );
     // A tampered epoch invalidates the signature over the claim.
     let mut retargeted = proof_for(&plan, 0, 3);
     retargeted.target_map_epoch = 9;
     assert_eq!(
         state.apply(&submit(retargeted, node(3), 71)),
-        Err(AdminDocumentReducerError::InvalidTransitionProof)
+        Err(AdminDocumentError::InvalidTransitionProof)
     );
     // So does a signature made by another node key.
     let mut forged = proof_for(&plan, 0, 4);
     forged.holder = node(3);
     assert_eq!(
         state.apply(&submit(forged, node(3), 72)),
-        Err(AdminDocumentReducerError::InvalidTransitionProof)
+        Err(AdminDocumentError::InvalidTransitionProof)
     );
 
     let config = transition_config(&state);
@@ -430,7 +430,7 @@ fn duplicate_proof_idempotent() {
     resent.origin_seq = 2;
 
     state.apply(&first).unwrap();
-    assert_eq!(state.apply(&first), Ok(AdminDocumentApplyStatus::Duplicate));
+    assert_eq!(state.apply(&first), Ok(AdminApplyStatus::Duplicate));
     state.apply(&resent).unwrap();
 
     let config = transition_config(&state);

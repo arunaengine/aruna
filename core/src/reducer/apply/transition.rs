@@ -1,11 +1,11 @@
 use super::*;
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_transition(
         &mut self,
         event: &AdminDocumentEvent,
         realm_id: &RealmId,
-    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
             AdminDocumentOperation::RealmConfigTransitionStarted { plan } => {
                 let mut seen = BTreeSet::new();
@@ -16,7 +16,7 @@ impl AdminDocumentReducerState {
                         seen.insert(bucket.bucket) && !bucket.target_holders.is_empty()
                     });
                 if !well_formed {
-                    return Err(AdminDocumentReducerError::InvalidTransitionPlan);
+                    return Err(AdminDocumentError::InvalidTransitionPlan);
                 }
                 self.apply_immutable_value(
                     event,
@@ -31,10 +31,10 @@ impl AdminDocumentReducerState {
                 frontier,
             } => {
                 if *reported_by != event.origin_node_id {
-                    return Err(AdminDocumentReducerError::TransitionOriginMismatch);
+                    return Err(AdminDocumentError::TransitionOriginMismatch);
                 }
                 if frontier.len() > crate::structs::MAX_BARRIER_FRONTIER_BYTES {
-                    return Err(AdminDocumentReducerError::TransitionReportOversized);
+                    return Err(AdminDocumentError::TransitionReportOversized);
                 }
                 self.apply_transition_report(
                     event,
@@ -48,7 +48,7 @@ impl AdminDocumentReducerState {
                 proof,
             } => {
                 if proof.holder != event.origin_node_id {
-                    return Err(AdminDocumentReducerError::TransitionOriginMismatch);
+                    return Err(AdminDocumentError::TransitionOriginMismatch);
                 }
                 // A replicated plan wins; otherwise materialization rechecks the signed submitted
                 // strategy against the plan.
@@ -58,7 +58,7 @@ impl AdminDocumentReducerState {
                     .map(|plan| plan.strategy_id)
                     .unwrap_or(*strategy_id);
                 if !proof.verify(*realm_id, *transition_id, strategy_id) {
-                    return Err(AdminDocumentReducerError::InvalidTransitionProof);
+                    return Err(AdminDocumentError::InvalidTransitionProof);
                 }
                 self.apply_transition_report(
                     event,
@@ -79,7 +79,7 @@ impl AdminDocumentReducerState {
                 at_risk_report,
             } => {
                 if at_risk_report.len() > crate::structs::MAX_STALL_REASON_BYTES {
-                    return Err(AdminDocumentReducerError::TransitionReportOversized);
+                    return Err(AdminDocumentError::TransitionReportOversized);
                 }
                 self.apply_transition_report(
                     event,
@@ -94,10 +94,10 @@ impl AdminDocumentReducerState {
                 reason,
             } => {
                 if *reported_by != event.origin_node_id {
-                    return Err(AdminDocumentReducerError::TransitionOriginMismatch);
+                    return Err(AdminDocumentError::TransitionOriginMismatch);
                 }
                 if reason.len() > crate::structs::MAX_STALL_REASON_BYTES {
-                    return Err(AdminDocumentReducerError::TransitionReportOversized);
+                    return Err(AdminDocumentError::TransitionReportOversized);
                 }
                 self.apply_transition_report(
                     event,
@@ -111,7 +111,7 @@ impl AdminDocumentReducerState {
                 reported_by,
             } => {
                 if *reported_by != event.origin_node_id {
-                    return Err(AdminDocumentReducerError::TransitionOriginMismatch);
+                    return Err(AdminDocumentError::TransitionOriginMismatch);
                 }
                 self.apply_transition_report(
                     event,
@@ -121,18 +121,18 @@ impl AdminDocumentReducerState {
             }
             AdminDocumentOperation::RealmConfigHandleRangeGranted { range } => {
                 if !range.is_well_formed() {
-                    return Err(AdminDocumentReducerError::InvalidHandleRange);
+                    return Err(AdminDocumentError::InvalidHandleRange);
                 }
                 self.apply_handle_range(event, range);
             }
             AdminDocumentOperation::RealmConfigBandPoolAssigned { pool } => {
                 if !pool.is_well_formed() {
-                    return Err(AdminDocumentReducerError::InvalidHandleRange);
+                    return Err(AdminDocumentError::InvalidHandleRange);
                 }
                 self.apply_band_pool(event, pool);
             }
-            _ => return Err(AdminDocumentReducerError::UnsupportedTarget),
+            _ => return Err(AdminDocumentError::UnsupportedTarget),
         }
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     }
 }

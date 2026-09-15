@@ -4,7 +4,7 @@ use super::*;
 /// strategy. `now_ms` prunes expired terminal transitions but never changes activation routing.
 pub fn overlay_placement(
     config: &mut RealmConfigDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     now_ms: u64,
 ) {
     if reducer_state
@@ -212,7 +212,7 @@ pub fn overlay_placement(
 /// drops the record entirely, so the affected buckets resolve nothing.
 fn overlay_placement_transitions(
     config: &mut RealmConfigDocument,
-    reducer_state: &AdminDocumentReducerState,
+    reducer_state: &AdminDocumentState,
     now_ms: u64,
 ) {
     let materialized_maps = reducer_state.materialized_candidate_maps();
@@ -403,7 +403,7 @@ fn repair_placement_refs(config: &mut RealmConfigDocument) {
     }
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub fn materialized_config_nodes(&self) -> BTreeMap<NodeId, RealmNodeKind> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
@@ -566,7 +566,7 @@ impl AdminDocumentReducerState {
     }
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub fn materialized_candidate_maps(&self) -> BTreeMap<u64, CandidatePlacementMap> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return BTreeMap::new();
@@ -783,7 +783,7 @@ impl AdminDocumentReducerState {
     }
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_placement_field(
         &mut self,
         event: &AdminDocumentEvent,
@@ -844,7 +844,7 @@ impl AdminDocumentReducerState {
         }
         self.user_subject_ids.insert(
             path,
-            AdminDocumentAttributeVersion {
+            AdminAttributeVersion {
                 value: Some(value),
                 dot,
             },

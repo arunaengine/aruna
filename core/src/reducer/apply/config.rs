@@ -1,11 +1,11 @@
 use super::*;
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_config(
         &mut self,
         event: &AdminDocumentEvent,
         realm_id: &RealmId,
-    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
             AdminDocumentOperation::RealmConfigNodeEnsured { node_id, kind } => {
                 self.apply_config_node(event, node_id, Some(node_kind_value(kind)));
@@ -49,7 +49,7 @@ impl AdminDocumentReducerState {
                 token_owner,
             } => {
                 if !valid_token_hash(token_hash) {
-                    return Err(AdminDocumentReducerError::InvalidTokenHash);
+                    return Err(AdminDocumentError::InvalidTokenHash);
                 }
                 let status =
                     self.apply_revocation_full(event, token_hash, *expires_at, *token_owner);
@@ -58,6 +58,6 @@ impl AdminDocumentReducerState {
             }
             _ => return self.apply_placement(event, realm_id),
         }
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     }
 }

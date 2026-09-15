@@ -11,7 +11,7 @@ pub(super) fn candidate_cmp(left: &RevocationCandidate, right: &RevocationCandid
         .then_with(|| right.token_owner.cmp(&left.token_owner))
 }
 
-pub(super) fn value_matches(version: &AdminDocumentAttributeVersion, expires_at: u64) -> bool {
+pub(super) fn value_matches(version: &AdminAttributeVersion, expires_at: u64) -> bool {
     version
         .value
         .as_deref()
@@ -41,7 +41,7 @@ fn add_paths<T>(
     }
 }
 impl RevocationIndex {
-    pub(super) fn build(state: &AdminDocumentReducerState, now: u64) -> Self {
+    pub(super) fn build(state: &AdminDocumentState, now: u64) -> Self {
         if !matches!(&state.target, AdminDocumentTarget::RealmConfig { .. }) {
             return Self {
                 now,
@@ -255,12 +255,12 @@ impl RevocationIndex {
 
     pub(super) fn apply(
         &mut self,
-        state: &mut AdminDocumentReducerState,
+        state: &mut AdminDocumentState,
         event: &AdminDocumentEvent,
         token_hash: &str,
         expires_at: u64,
         token_owner: UserId,
-    ) -> AdminDocumentApplyStatus {
+    ) -> AdminApplyStatus {
         self.clear_hash(token_hash);
         let group = self.groups.remove(token_hash).unwrap_or_default();
         let winner = state.canonicalize_group(
@@ -271,9 +271,7 @@ impl RevocationIndex {
         let status = winner
             .as_ref()
             .filter(|winner| winner.dot == event.dot())
-            .map_or(AdminDocumentApplyStatus::Redundant, |_| {
-                AdminDocumentApplyStatus::Applied
-            });
+            .map_or(AdminApplyStatus::Redundant, |_| AdminApplyStatus::Applied);
         if let Some(winner) = winner {
             self.groups
                 .insert(token_hash.to_string(), Self::canonical_group(&winner));
@@ -282,13 +280,13 @@ impl RevocationIndex {
         self.refresh_expiry();
         state.revocation_next_expiry = self.next_expiry();
         state.clock.advance(event.origin_node_id, event.origin_seq);
-        if status != AdminDocumentApplyStatus::Redundant {
+        if status != AdminApplyStatus::Redundant {
             state.applied_event_ids.insert(event.event_id);
         }
         status
     }
 
-    pub fn compact(&mut self, state: &mut AdminDocumentReducerState) {
+    pub fn compact(&mut self, state: &mut AdminDocumentState) {
         let groups = std::mem::take(&mut self.groups);
         let retained = std::mem::take(&mut self.retained);
         self.live.clear();
@@ -314,7 +312,7 @@ impl RevocationIndex {
                 state.remove_revocation_group(&group);
                 state.user_subject_ids.insert(
                     winner.path.clone(),
-                    AdminDocumentAttributeVersion {
+                    AdminAttributeVersion {
                         value: Some(winner.expires_at.to_string()),
                         dot: winner.dot,
                     },
@@ -330,7 +328,7 @@ impl RevocationIndex {
     }
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub fn revocation_index(&self, now: u64) -> RevocationIndex {
         RevocationIndex::build(self, now)
     }
@@ -385,13 +383,13 @@ impl AdminDocumentReducerState {
         token_hash: &str,
         expires_at: u64,
         token_owner: UserId,
-    ) -> AdminDocumentApplyStatus {
+    ) -> AdminApplyStatus {
         let retained =
             self.canonicalize_revocation(token_hash, Some((expires_at, token_owner, event.dot())));
         if retained == Some(event.dot()) {
-            AdminDocumentApplyStatus::Applied
+            AdminApplyStatus::Applied
         } else {
-            AdminDocumentApplyStatus::Redundant
+            AdminApplyStatus::Redundant
         }
     }
 
@@ -453,7 +451,7 @@ impl AdminDocumentReducerState {
             self.remove_revocation_group(&group);
             self.user_subject_ids.insert(
                 winner.path.clone(),
-                AdminDocumentAttributeVersion {
+                AdminAttributeVersion {
                     value: Some(winner.expires_at.to_string()),
                     dot: winner.dot,
                 },

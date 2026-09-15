@@ -48,7 +48,7 @@ pub(super) fn set_placement_entry(
 }
 
 pub(super) fn upsert_placement_strategy(
-    state: &mut AdminDocumentReducerState,
+    state: &mut AdminDocumentState,
     event_seed: u8,
     origin_seed: u8,
     strategy_id: Ulid,
@@ -459,7 +459,7 @@ fn rejects_derived_labels() {
 
         assert_eq!(
             state.apply(&set_placement_entry(1, 1, entry)),
-            Err(AdminDocumentReducerError::ReservedPlacementLabel(key))
+            Err(AdminDocumentError::ReservedPlacementLabel(key))
         );
         assert_eq!(state, before);
     }
@@ -507,7 +507,7 @@ fn strategy_shards_immutable() {
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: initial },
         )),
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     );
     assert_eq!(
         state.apply(&realm_config_event(
@@ -519,7 +519,7 @@ fn strategy_shards_immutable() {
                 strategy: renamed.clone(),
             },
         )),
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     );
 
     let before = state.clone();
@@ -533,7 +533,7 @@ fn strategy_shards_immutable() {
             AdminDocumentClock::default().with_observed(origin, 2),
             AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy: changed },
         )),
-        Err(AdminDocumentReducerError::PlacementShardCountChanged)
+        Err(AdminDocumentError::PlacementShardCountChanged)
     );
     assert_eq!(state, before);
 }
@@ -553,7 +553,7 @@ fn realm_config_count() {
                 strategy: placement_strategy(Ulid::from_bytes([4; 16]), Some(0)),
             },
         )),
-        Err(AdminDocumentReducerError::ZeroPlacementReplicaCount)
+        Err(AdminDocumentError::ZeroPlacementReplicaCount)
     );
     assert_eq!(state, before);
 }
@@ -599,7 +599,7 @@ fn realm_config_max() {
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy },
         )),
-        Err(AdminDocumentReducerError::InvalidPlacementShardCount)
+        Err(AdminDocumentError::InvalidPlacementShardCount)
     );
     assert_eq!(state, before);
 }
@@ -620,7 +620,7 @@ fn realm_strategy_count() {
                 AdminDocumentClock::default(),
                 AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { strategy },
             )),
-            Err(AdminDocumentReducerError::InvalidPlacementShardCount),
+            Err(AdminDocumentError::InvalidPlacementShardCount),
             "shard_count {bad} must be rejected"
         );
         assert_eq!(state, before);
@@ -686,7 +686,7 @@ fn rejects_family_mutation() {
                 strategy_id: Ulid::nil()
             },
         )),
-        Err(AdminDocumentReducerError::NilJobFamily)
+        Err(AdminDocumentError::NilJobFamily)
     );
     state
         .apply(&realm_config_event(
@@ -709,7 +709,7 @@ fn rejects_family_mutation() {
                 strategy_id: Ulid::from_bytes([5; 16])
             },
         )),
-        Err(AdminDocumentReducerError::JobFamilyChanged)
+        Err(AdminDocumentError::JobFamilyChanged)
     );
     assert_eq!(
         state.apply(&realm_config_event(
@@ -719,7 +719,7 @@ fn rejects_family_mutation() {
             AdminDocumentClock::default(),
             AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { strategy_id },
         )),
-        Err(AdminDocumentReducerError::JobFamilyRemoved)
+        Err(AdminDocumentError::JobFamilyRemoved)
     );
     assert_eq!(state, stored);
 }
@@ -769,23 +769,20 @@ fn concurrent_realm_independent() {
         );
 
         let mut remove_first = initial.clone();
-        assert_eq!(
-            remove_first.apply(&removal),
-            Ok(AdminDocumentApplyStatus::Applied)
-        );
+        assert_eq!(remove_first.apply(&removal), Ok(AdminApplyStatus::Applied));
         assert_eq!(
             remove_first.apply(&reference),
-            Ok(AdminDocumentApplyStatus::Applied)
+            Ok(AdminApplyStatus::Applied)
         );
 
         let mut reference_first = initial;
         assert_eq!(
             reference_first.apply(&reference),
-            Ok(AdminDocumentApplyStatus::Applied)
+            Ok(AdminApplyStatus::Applied)
         );
         assert_eq!(
             reference_first.apply(&removal),
-            Ok(AdminDocumentApplyStatus::Applied)
+            Ok(AdminApplyStatus::Applied)
         );
 
         assert_eq!(remove_first, reference_first);
@@ -1020,7 +1017,7 @@ fn realm_override_materializes() {
     );
     assert_eq!(
         state.apply(&realm_config_removed(2, subject)),
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     );
 }
 
@@ -1050,7 +1047,7 @@ fn placement_op_target() {
 
     assert_eq!(
         state.apply(&event),
-        Err(AdminDocumentReducerError::UnsupportedTarget)
+        Err(AdminDocumentError::UnsupportedTarget)
     );
     assert_eq!(state, before);
 }
@@ -1133,7 +1130,7 @@ fn malformed_range_rejected() {
 
     assert_eq!(
         state.apply(&event),
-        Err(AdminDocumentReducerError::InvalidHandleRange)
+        Err(AdminDocumentError::InvalidHandleRange)
     );
 }
 
@@ -1213,7 +1210,7 @@ fn binding_conflicts_converge() {
     observed_reversed.apply(&observed_second).unwrap();
     assert_eq!(
         observed_reversed.apply(&first),
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     );
 
     assert_eq!(left.conflicts, right.conflicts);
@@ -1338,7 +1335,7 @@ fn overlay_retains_conflicts() {
 // The family strategy is append-once: a denied change must be an exact no-op,
 // never a partial write that a later overlay would materialize.
 #[test]
-fn family_mutation_denial_is_a_no_op() {
+fn denial_preserves_state() {
     let mut state = realm_config_state();
     let accepted = Ulid::from_bytes([0x5e; 16]);
     state
@@ -1365,7 +1362,7 @@ fn family_mutation_denial_is_a_no_op() {
     );
     assert_eq!(
         state.apply(&denied),
-        Err(AdminDocumentReducerError::JobFamilyChanged)
+        Err(AdminDocumentError::JobFamilyChanged)
     );
     assert_eq!(state, before);
 }
@@ -1378,7 +1375,7 @@ proptest::proptest! {
     })]
 
     #[test]
-    fn denied_family_mutation_never_changes_state(
+    fn denial_never_mutates(
         requests in proptest::collection::vec(any::<u128>(), 1..8),
     ) {
         let mut state = realm_config_state();

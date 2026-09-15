@@ -25,7 +25,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
     match op {
         AdminDocumentOperation::GroupRoleAdded { role_id }
         | AdminDocumentOperation::GroupRoleCreated {
-            role: AdminDocumentRoleDefinition { role_id, .. },
+            role: AdminRoleDefinition { role_id, .. },
         }
         | AdminDocumentOperation::GroupRoleRemoved { role_id } => vec![group_role_path(role_id)],
         AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id }
@@ -54,7 +54,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::RealmRoleAdded { role_id }
         | AdminDocumentOperation::RealmRoleCreated {
-            role: AdminDocumentRoleDefinition { role_id, .. },
+            role: AdminRoleDefinition { role_id, .. },
         } => vec![realm_role_path(role_id)],
         AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
         | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
@@ -199,7 +199,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
     }
 }
 
-pub(super) fn role_definition_value(role: &AdminDocumentRoleDefinition) -> String {
+pub(super) fn role_definition_value(role: &AdminRoleDefinition) -> String {
     serde_json::to_string(role).expect("admin document role definition serializes")
 }
 

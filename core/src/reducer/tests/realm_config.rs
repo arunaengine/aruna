@@ -428,11 +428,11 @@ fn realm_config_detection() {
         ],
         max_groups_per_user: Some(4),
         user_group_cap_overrides: vec![
-            UserGroupCapOverride {
+            UserCapOverride {
                 user_id: user_a,
                 max_groups: Some(2),
             },
-            UserGroupCapOverride {
+            UserCapOverride {
                 user_id: user_b,
                 max_groups: Some(3),
             },
@@ -605,7 +605,7 @@ fn user_operation_change() {
 
     assert_eq!(
         state.apply(&event),
-        Err(AdminDocumentReducerError::UnsupportedTarget)
+        Err(AdminDocumentError::UnsupportedTarget)
     );
     assert_eq!(state, before);
 }
@@ -626,7 +626,7 @@ fn oidc_provider_change() {
 
     assert_eq!(
         state.apply(&event),
-        Err(AdminDocumentReducerError::UnsupportedTarget)
+        Err(AdminDocumentError::UnsupportedTarget)
     );
     assert_eq!(state, before);
 }
@@ -650,7 +650,7 @@ fn realm_config_target() {
 
     assert_eq!(
         state.apply(&event),
-        Err(AdminDocumentReducerError::UnsupportedTarget)
+        Err(AdminDocumentError::UnsupportedTarget)
     );
     assert_eq!(state, before);
 }

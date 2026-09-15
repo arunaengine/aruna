@@ -182,7 +182,7 @@ fn group_created_change() {
 
     assert_eq!(
         state.apply(&event),
-        Err(AdminDocumentReducerError::UnsupportedTarget)
+        Err(AdminDocumentError::UnsupportedTarget)
     );
     assert_eq!(state, before);
 }

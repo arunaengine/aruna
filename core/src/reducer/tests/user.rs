@@ -112,11 +112,11 @@ fn user_disjoint_merge() {
 
     assert_eq!(
         state.apply(&set_attr(1, 1, "orcid", "0000-0002-1825-0097")),
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     );
     assert_eq!(
         state.apply(&set_attr(2, 2, "department", "biology")),
-        Ok(AdminDocumentApplyStatus::Applied)
+        Ok(AdminApplyStatus::Applied)
     );
 
     assert_eq!(
@@ -136,8 +136,8 @@ fn invalid_user_change() {
 
     assert_eq!(
         state.apply(&set_attr(1, 1, "display name", "biology")),
-        Err(AdminDocumentReducerError::InvalidUserAttribute(
-            UserAttributeValidationError::InvalidKey("display name".to_string())
+        Err(AdminDocumentError::InvalidUserAttribute(
+            UserAttributeError::InvalidKey("display name".to_string())
         ))
     );
     assert_eq!(state, before);
@@ -150,8 +150,8 @@ fn invalid_attribute_change() {
 
     assert_eq!(
         state.apply(&set_attr(1, 1, "department", "bio\nmedicine")),
-        Err(AdminDocumentReducerError::InvalidUserAttribute(
-            UserAttributeValidationError::InvalidValue("department".to_string())
+        Err(AdminDocumentError::InvalidUserAttribute(
+            UserAttributeError::InvalidValue("department".to_string())
         ))
     );
     assert_eq!(state, before);
@@ -233,10 +233,10 @@ fn duplicate_event_idempotent() {
     let mut state = user_state();
     let event = set_attr(1, 1, "department", "biology");
 
-    assert_eq!(state.apply(&event), Ok(AdminDocumentApplyStatus::Applied));
+    assert_eq!(state.apply(&event), Ok(AdminApplyStatus::Applied));
     let applied_once = state.clone();
 
-    assert_eq!(state.apply(&event), Ok(AdminDocumentApplyStatus::Duplicate));
+    assert_eq!(state.apply(&event), Ok(AdminApplyStatus::Duplicate));
     assert_eq!(state, applied_once);
 }
 
@@ -265,14 +265,8 @@ fn same_origin_converge() {
     );
 
     let mut newer_first = user_state();
-    assert_eq!(
-        newer_first.apply(&newer),
-        Ok(AdminDocumentApplyStatus::Applied)
-    );
-    assert_eq!(
-        newer_first.apply(&stale),
-        Ok(AdminDocumentApplyStatus::Applied)
-    );
+    assert_eq!(newer_first.apply(&newer), Ok(AdminApplyStatus::Applied));
+    assert_eq!(newer_first.apply(&stale), Ok(AdminApplyStatus::Applied));
 
     let mut older_first = user_state();
     older_first.apply(&stale).unwrap();
@@ -314,33 +308,24 @@ fn same_origin_idempotent() {
     );
 
     let mut newer_first = user_state();
-    assert_eq!(
-        newer_first.apply(&newer),
-        Ok(AdminDocumentApplyStatus::Applied)
-    );
+    assert_eq!(newer_first.apply(&newer), Ok(AdminApplyStatus::Applied));
     let before_stale = newer_first.clone();
     assert_eq!(
         newer_first.apply(&older),
-        Ok(AdminDocumentApplyStatus::StaleOriginSequence)
+        Ok(AdminApplyStatus::StaleOriginSequence)
     );
     assert_eq!(
         newer_first.materialized_user_attributes(),
         before_stale.materialized_user_attributes()
     );
     assert!(newer_first.applied_event_ids.contains(&older.event_id));
-    assert_eq!(
-        newer_first.apply(&newer),
-        Ok(AdminDocumentApplyStatus::Duplicate)
-    );
+    assert_eq!(newer_first.apply(&newer), Ok(AdminApplyStatus::Duplicate));
 
     let mut older_first = user_state();
     older_first.apply(&older).unwrap();
     older_first.apply(&newer).unwrap();
     assert_eq!(newer_first, older_first);
-    assert_eq!(
-        older_first.apply(&older),
-        Ok(AdminDocumentApplyStatus::Duplicate)
-    );
+    assert_eq!(older_first.apply(&older), Ok(AdminApplyStatus::Duplicate));
     assert_eq!(
         newer_first
             .materialized_user_attributes()
@@ -439,7 +424,7 @@ fn same_origin_stale() {
     newer_first.apply(&newer).unwrap();
     assert_eq!(
         newer_first.apply(&older),
-        Ok(AdminDocumentApplyStatus::StaleOriginSequence)
+        Ok(AdminApplyStatus::StaleOriginSequence)
     );
 
     let mut older_first = realm_config_state();

@@ -1,6 +1,6 @@
 use super::*;
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub fn materialized_user_name(&self) -> Option<String> {
         if !matches!(&self.target, AdminDocumentTarget::User { .. }) {
             return None;
@@ -39,7 +39,7 @@ impl AdminDocumentReducerState {
     }
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub fn materialized_group_name(&self) -> Option<String> {
         if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
             return None;
@@ -125,7 +125,7 @@ impl AdminDocumentReducerState {
     }
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub fn materialized_realm_roles(&self) -> BTreeSet<RoleId> {
         if !matches!(&self.target, AdminDocumentTarget::Realm { .. }) {
             return BTreeSet::new();
@@ -250,7 +250,7 @@ impl AdminDocumentReducerState {
     }
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
         self.user_name = self.reduce_value(
             event,
@@ -300,7 +300,7 @@ impl AdminDocumentReducerState {
     }
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_group_created(
         &mut self,
         event: &AdminDocumentEvent,
@@ -389,7 +389,7 @@ impl AdminDocumentReducerState {
     }
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub(super) fn apply_realm_role(
         &mut self,
         event: &AdminDocumentEvent,
