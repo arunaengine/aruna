@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE};
-use aruna_core::structs::{BackendRef, GroupStorageBackend};
+use aruna_core::structs::{BackendRef, GroupStorage};
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
 use thiserror::Error;
@@ -36,7 +36,7 @@ pub fn index_prefix(group_id: GroupId) -> Key {
 /// Both copies of one record. Callers must apply them in a single batch or
 /// transaction so the index can never disagree with the id-keyed record.
 pub fn record_writes(
-    record: &GroupStorageBackend,
+    record: &GroupStorage,
 ) -> Result<Vec<(String, Key, ByteView)>, ConversionError> {
     let value: ByteView = record.to_bytes()?.into();
     Ok(vec![
@@ -76,7 +76,7 @@ pub fn fence_backend(backend: &BackendRef, txn_id: Option<TxnId>) -> Option<Effe
 }
 
 pub fn check_fence(event: Event) -> Result<(), BackendFenceError> {
-    match parse_read(event, GroupStorageBackend::from_bytes)? {
+    match parse_read(event, GroupStorage::from_bytes)? {
         Some(record) if !record.disabled => Ok(()),
         _ => Err(BackendFenceError::Unavailable),
     }

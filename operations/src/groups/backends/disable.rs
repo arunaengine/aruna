@@ -4,7 +4,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::GROUP_STORAGE_BACKEND_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::GroupStorageBackend;
+use aruna_core::structs::GroupStorage;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -53,7 +53,7 @@ pub struct SetDisabledOperation {
     disabled: bool,
     state: DisableState,
     txn_id: Option<TxnId>,
-    output: Option<Result<GroupStorageBackend, SetDisabledError>>,
+    output: Option<Result<GroupStorage, SetDisabledError>>,
 }
 
 impl SetDisabledOperation {
@@ -101,7 +101,7 @@ impl SetDisabledOperation {
     /// The key carries no group, so the record's own group is the gate. An
     /// unchanged flag commits nothing, which makes repeating the call harmless.
     fn handle_record(&mut self, event: Event) -> Effects {
-        let record = match parse_read(event, GroupStorageBackend::from_bytes) {
+        let record = match parse_read(event, GroupStorage::from_bytes) {
             Ok(Some(record)) if record.group_id == self.group_id => record,
             Ok(_) => return self.fail(SetDisabledError::NotFound),
             Err(error) => return self.fail(error.into()),
@@ -113,7 +113,7 @@ impl SetDisabledOperation {
 
         // The stamp is what removal waits on: a writer that resolved the
         // backend just before this commit needs its credentials to survive.
-        let updated = GroupStorageBackend {
+        let updated = GroupStorage {
             disabled: self.disabled,
             updated_at: SystemTime::now(),
             ..record
@@ -183,7 +183,7 @@ impl SetDisabledOperation {
 }
 
 impl Operation for SetDisabledOperation {
-    type Output = GroupStorageBackend;
+    type Output = GroupStorage;
     type Error = SetDisabledError;
 
     fn start(&mut self) -> Effects {
@@ -243,7 +243,7 @@ mod pure_tests {
         GROUP_STORAGE_BACKEND_INDEX_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
     };
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{GroupBackendKind, GroupStorageBackend};
+    use aruna_core::structs::{GroupBackendKind, GroupStorage};
     use aruna_core::types::{Effects, TxnId};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -253,8 +253,8 @@ mod pure_tests {
         Ulid::from_bytes([9u8; 16])
     }
 
-    fn record(group_id: Ulid, disabled: bool) -> GroupStorageBackend {
-        GroupStorageBackend {
+    fn record(group_id: Ulid, disabled: bool) -> GroupStorage {
+        GroupStorage {
             backend_id: backend_id(),
             group_id,
             name: "tenant".to_string(),
@@ -276,7 +276,7 @@ mod pure_tests {
         }));
     }
 
-    fn read_result(stored: GroupStorageBackend) -> Event {
+    fn read_result(stored: GroupStorage) -> Event {
         Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
             value: Some(stored.to_bytes().unwrap().into()),
@@ -333,11 +333,11 @@ mod pure_tests {
                 GROUP_STORAGE_BACKEND_INDEX_KEYSPACE
             ]
         );
-        assert!(writes.iter().all(|(.., value)| {
-            GroupStorageBackend::from_bytes(value.as_ref())
-                .unwrap()
-                .disabled
-        }));
+        assert!(
+            writes
+                .iter()
+                .all(|(.., value)| { GroupStorage::from_bytes(value.as_ref()).unwrap().disabled })
+        );
 
         written(&mut operation);
         committed(&mut operation);
