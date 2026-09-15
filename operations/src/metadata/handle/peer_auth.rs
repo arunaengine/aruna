@@ -9,14 +9,13 @@ use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 
-use super::{MetadataHandle, MetadataWritePeerError, RevocationBlindValidation};
+use super::{MetadataHandle, RevocationBlindValidation, WritePeerError};
 use crate::auth::bearer_token::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_bearer_token,
-    validate_bearer_token,
+    ArunaBearerError, ArunaValidationState, decode_bearer_token, validate_bearer_token,
 };
 use crate::driver::DriverContext;
 use crate::metadata::contact::PeerContacts;
-use crate::metadata::protocol::{MetadataAuthToken, MetadataReadError};
+use crate::metadata::protocol::{AuthToken, MetadataReadError};
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
 
 impl MetadataHandle {
@@ -25,7 +24,7 @@ impl MetadataHandle {
     pub(crate) async fn authorize_remote_peer(
         &self,
         peer: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
     ) -> Result<Option<AuthContext>, MetadataError> {
         authorize_peer(
             &self.inner.auth_validation,
@@ -41,15 +40,15 @@ impl MetadataHandle {
     pub(crate) async fn authorize_read_peer(
         &self,
         peer: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         require_trusted: bool,
     ) -> Result<Option<AuthContext>, MetadataReadError> {
         let auth = match auth_token {
-            Some(token @ MetadataAuthToken::Bearer(_)) => {
+            Some(token @ AuthToken::Bearer(_)) => {
                 Some(self.authorize_write_peer(peer, Some(token)).await.map_err(
                     |error| match error {
-                        MetadataWritePeerError::Unauthorized => MetadataReadError::Unauthorized,
-                        MetadataWritePeerError::Unavailable(_) => MetadataReadError::Unavailable,
+                        WritePeerError::Unauthorized => MetadataReadError::Unauthorized,
+                        WritePeerError::Unavailable(_) => MetadataReadError::Unavailable,
                     },
                 )?)
             }
@@ -84,30 +83,30 @@ impl MetadataHandle {
     pub(crate) async fn authorize_write_peer(
         &self,
         peer: NodeId,
-        auth_token: Option<MetadataAuthToken>,
-    ) -> Result<AuthContext, MetadataWritePeerError> {
+        auth_token: Option<AuthToken>,
+    ) -> Result<AuthContext, WritePeerError> {
         let Some(auth_token) = auth_token else {
-            return Err(MetadataWritePeerError::Unauthorized);
+            return Err(WritePeerError::Unauthorized);
         };
-        let MetadataAuthToken::Bearer(token) = auth_token else {
+        let AuthToken::Bearer(token) = auth_token else {
             let auth = self
                 .authorize_remote_peer(peer, Some(auth_token))
                 .await
-                .map_err(MetadataWritePeerError::Unavailable)?
-                .ok_or(MetadataWritePeerError::Unauthorized)?;
+                .map_err(WritePeerError::Unavailable)?
+                .ok_or(WritePeerError::Unauthorized)?;
             self.note_peer_contact(peer);
             return Ok(auth);
         };
         let auth = validate_bearer_token(&self.inner.auth_validation, token.as_str())
             .await
-            .map_err(|_| MetadataWritePeerError::Unauthorized)?;
+            .map_err(|_| WritePeerError::Unauthorized)?;
         let local_realm_id = self
             .inner
             .net_handle
             .as_ref()
             .map(|net| *net.realm_id())
             .ok_or_else(|| {
-                MetadataWritePeerError::Unavailable(MetadataError::InvalidInput(
+                WritePeerError::Unavailable(MetadataError::InvalidInput(
                     "forwarded metadata auth requires a local serving realm".to_string(),
                 ))
             })?;
@@ -119,7 +118,7 @@ impl MetadataHandle {
                 PeerTrust::Member,
             )
             .await
-            .map_err(MetadataWritePeerError::Unavailable)?;
+            .map_err(WritePeerError::Unavailable)?;
         }
         self.note_peer_contact(peer);
         Ok(auth)
@@ -139,7 +138,7 @@ impl MetadataHandle {
     pub(crate) async fn claims_for_revocation(
         &self,
         token: &str,
-    ) -> Result<TokenClaims, ArunaBearerTokenError> {
+    ) -> Result<TokenClaims, ArunaBearerError> {
         decode_bearer_token(
             &RevocationBlindValidation(&self.inner.auth_validation),
             token,
@@ -150,15 +149,15 @@ impl MetadataHandle {
 
 pub(super) async fn remote_auth_context<S>(
     state: &S,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<Option<AuthContext>, MetadataError>
 where
-    S: ArunaBearerTokenValidationState + ?Sized,
+    S: ArunaValidationState + ?Sized,
 {
     let Some(auth_token) = auth_token else {
         return Ok(None);
     };
-    let MetadataAuthToken::Bearer(token) = auth_token else {
+    let AuthToken::Bearer(token) = auth_token else {
         return Err(MetadataError::Backend(
             "internal metadata auth requires the remote peer gate".to_string(),
         ));
@@ -174,12 +173,12 @@ pub(super) async fn bucket_search_auth<S>(
     storage_handle: &StorageHandle,
     peer: NodeId,
     local_realm_id: Option<RealmId>,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Result<AuthContext, MetadataReadError>
 where
-    S: ArunaBearerTokenValidationState + ?Sized,
+    S: ArunaValidationState + ?Sized,
 {
-    let Some(MetadataAuthToken::Bearer(token)) = auth_token else {
+    let Some(AuthToken::Bearer(token)) = auth_token else {
         return Err(MetadataReadError::Unauthorized);
     };
     let auth = validate_bearer_token(state, token.as_str())
@@ -202,15 +201,15 @@ pub(super) async fn authorize_peer<S>(
     storage_handle: &StorageHandle,
     peer: NodeId,
     local_realm_id: Option<RealmId>,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
     allow_internal: bool,
 ) -> Result<Option<AuthContext>, MetadataError>
 where
-    S: ArunaBearerTokenValidationState + ?Sized,
+    S: ArunaValidationState + ?Sized,
 {
-    let internal_auth = matches!(&auth_token, Some(MetadataAuthToken::Internal(_)));
+    let internal_auth = matches!(&auth_token, Some(AuthToken::Internal(_)));
     let auth_context = match auth_token {
-        Some(MetadataAuthToken::Internal(auth)) if allow_internal => {
+        Some(AuthToken::Internal(auth)) if allow_internal => {
             let local_realm_id = local_realm_id.ok_or_else(|| {
                 MetadataError::InvalidInput(
                     "internal metadata auth requires a local serving realm".to_string(),
@@ -230,7 +229,7 @@ where
             }
             Some(auth)
         }
-        Some(MetadataAuthToken::Internal(_)) => {
+        Some(AuthToken::Internal(_)) => {
             return Err(MetadataError::Backend(
                 "internal metadata auth is limited to forwarded requests".to_string(),
             ));

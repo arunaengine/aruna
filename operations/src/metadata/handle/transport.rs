@@ -21,12 +21,12 @@ use super::{
 };
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::protocol::{
-    MetadataAuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
+    AuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
     write_message,
 };
 use crate::s3::search_buckets::BucketSearchHit;
-use crate::s3::search_objects::{ObjectKeyMatch, ObjectSearchNodePage};
+use crate::s3::search_objects::{ObjectKeyMatch, SearchNodePage};
 
 #[tracing::instrument(
     name = "metadata.remote.request",
@@ -100,10 +100,8 @@ pub(super) async fn send_export_request(
     inner: &MetadataInner,
     node_id: NodeId,
     message: MetadataTransportMessage,
-) -> Result<
-    Result<super::super::api::ExportMetadataRoCrateResult, MetadataReadError>,
-    MetadataRequestError,
-> {
+) -> Result<Result<super::super::api::ExportMetadataResult, MetadataReadError>, MetadataRequestError>
+{
     let metadata_bytes = match &message {
         MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => *metadata_bytes,
         // The channel carries one Profile document; the holder caps the body.
@@ -493,7 +491,7 @@ impl MetadataHandle {
         node_id: NodeId,
         message: MetadataTransportMessage,
     ) -> Result<
-        Result<super::super::api::ExportMetadataRoCrateResult, MetadataReadError>,
+        Result<super::super::api::ExportMetadataResult, MetadataReadError>,
         MetadataRequestError,
     > {
         send_export_request(&self.inner, node_id, message).await
@@ -516,7 +514,7 @@ impl MetadataHandle {
     pub async fn query_remote_graphs(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         graph_iris: Option<Vec<String>>,
         sparql: String,
     ) -> Result<MetadataQueryResults, MetadataReadError> {
@@ -552,7 +550,7 @@ impl MetadataHandle {
     pub(crate) async fn request_document_query(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         config_digest: [u8; 32],
         document_id: Ulid,
         sparql: String,
@@ -594,7 +592,7 @@ impl MetadataHandle {
     pub async fn search_remote_graphs(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
@@ -622,7 +620,7 @@ impl MetadataHandle {
     pub async fn request_bucket_search(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         query: String,
         limit: usize,
     ) -> Result<Vec<BucketSearchHit>, MetadataReadError> {
@@ -672,14 +670,14 @@ impl MetadataHandle {
     pub async fn request_object_search(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         query: String,
         key_match: ObjectKeyMatch,
         bucket: Option<String>,
         limit: usize,
         start_after: Option<Vec<u8>>,
         as_of: SystemTime,
-    ) -> Result<ObjectSearchNodePage, MetadataReadError> {
+    ) -> Result<SearchNodePage, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
         let result = match send_remote_request(
@@ -716,7 +714,7 @@ impl MetadataHandle {
     pub async fn request_sync_create(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         source_group_id: GroupId,
         relationship: SyncRelationship,
         extras: PolicyRequestExtras,
@@ -745,7 +743,7 @@ impl MetadataHandle {
     pub async fn request_sync_delete(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         relationship: SyncRelationship,
         extras: PolicyRequestExtras,
     ) -> Result<(), MetadataError> {
@@ -773,7 +771,7 @@ impl MetadataHandle {
     pub async fn search_remote_filtered(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
@@ -797,7 +795,7 @@ impl MetadataHandle {
     async fn search_remote(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
+        auth_token: Option<AuthToken>,
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
@@ -845,9 +843,9 @@ impl MetadataHandle {
     pub async fn request_remote_preflight(
         &self,
         node_id: NodeId,
-        auth_token: Option<MetadataAuthToken>,
-        request: super::super::api::MetadataReferencePreflightNodeRequest,
-    ) -> Result<super::super::api::MetadataReferencePreflightNodeExecution, MetadataReadError> {
+        auth_token: Option<AuthToken>,
+        request: super::super::api::ReferenceNodeRequest,
+    ) -> Result<super::super::api::ReferenceNodeExecution, MetadataReadError> {
         match send_remote_request(
             &self.inner,
             &Span::current(),

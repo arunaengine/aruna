@@ -3,7 +3,7 @@ use super::*;
 use crate::metadata::protocol::MetadataReadError;
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::MetadataBatchSource;
-use aruna_core::metadata::MetadataCreateCrateRequest;
+use aruna_core::metadata::MetadataCrateRequest;
 use aruna_core::metadata::MetadataGraphPolicy;
 use aruna_core::metadata::MetadataRequestDurability;
 use craqle::CraqleError;
@@ -148,7 +148,7 @@ async fn merges_converge() {
     let (_left_dir, left) = memory_handle(left_storage);
     let (_right_storage_dir, right_storage) = auth_storage();
     let (_right_dir, right) = memory_handle(right_storage);
-    let request = MetadataCreateCrateRequest {
+    let request = MetadataCrateRequest {
         graph_iri: graph_iri.to_string(),
         name: "Converge".to_string(),
         description: "OR-Set convergence".to_string(),
@@ -211,7 +211,7 @@ async fn versions_roundtrip() {
 
     // One handle stores both versions, covering a mixed-version realm.
     for (version, graph_iri, jsonld) in cases {
-        let request = MetadataApplyRoCrateRequest {
+        let request = ApplyRoCrateRequest {
             graph_iri: graph_iri.to_string(),
             jsonld: jsonld.to_string(),
             policy: MetadataGraphPolicy {
@@ -282,7 +282,7 @@ async fn versions_roundtrip() {
     assert!(matches!(
         handle
             .send_metadata_effect(MetadataEffect::CreateCrate {
-                request: MetadataCreateCrateRequest {
+                request: MetadataCrateRequest {
                     graph_iri: graph_iri.to_string(),
                     name: "RO-Crate 1.3 scaffold".to_string(),
                     description: "Aruna scaffold version contract".to_string(),

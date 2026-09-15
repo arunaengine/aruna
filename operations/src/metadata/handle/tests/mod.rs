@@ -7,7 +7,7 @@ use super::search::{
 use super::*;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::metadata::MetadataApplyRoCrateRequest;
+use aruna_core::metadata::ApplyRoCrateRequest;
 use aruna_core::storage_entries::graph_lifecycle_key;
 use aruna_core::structs::{
     ArunaArn, PathRestriction, PlacementRef, RealmNodeKind, SyncMode, SyncState,
@@ -24,11 +24,11 @@ use tokio::io::AsyncWriteExt;
 
 const ROCRATE_12: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/data/rocrate/roundtrip-1.2.json"
+    "/tests/fixtures/roundtrip-1.2.json"
 ));
 const ROCRATE_13: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/data/rocrate/roundtrip-1.3.json"
+    "/tests/fixtures/roundtrip-1.3.json"
 ));
 
 mod auth;

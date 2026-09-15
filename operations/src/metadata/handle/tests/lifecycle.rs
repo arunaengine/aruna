@@ -5,8 +5,8 @@ use super::*;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
-use aruna_core::metadata::MetadataCreateCrateRequest;
-use aruna_core::metadata::MetadataGraphLifecycleRecord;
+use aruna_core::metadata::GraphLifecycleRecord;
+use aruna_core::metadata::MetadataCrateRequest;
 use aruna_core::metadata::MetadataGraphPolicy;
 use aruna_core::metadata::MetadataRequestDurability;
 use byteview::ByteView;
@@ -32,7 +32,7 @@ async fn group_records_live() {
     let group_id = Ulid::generate();
     let live = group_record(group_id, "datasets/live");
     let gone = group_record(group_id, "datasets/gone");
-    let tombstone = MetadataGraphLifecycleRecord::deleted(
+    let tombstone = GraphLifecycleRecord::deleted(
         gone.graph_iri.clone(),
         gone.realm_id,
         gone.group_id,
@@ -107,7 +107,7 @@ async fn tombstone_blocks_apply() {
     let task = tokio::spawn(async move {
         task_handle
             .send_metadata_effect(MetadataEffect::CreateCrate {
-                request: MetadataCreateCrateRequest {
+                request: MetadataCrateRequest {
                     graph_iri,
                     name: "fenced".to_string(),
                     description: "fenced".to_string(),
@@ -125,7 +125,7 @@ async fn tombstone_blocks_apply() {
     });
     tokio::task::yield_now().await;
 
-    let tombstone = MetadataGraphLifecycleRecord::deleted(
+    let tombstone = GraphLifecycleRecord::deleted(
         record.graph_iri.clone(),
         record.realm_id,
         record.group_id,
