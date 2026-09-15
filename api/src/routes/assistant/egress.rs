@@ -1,10 +1,6 @@
-//! Outbound egress policy for assistant provider connections.
-//!
-//! Only the assistant client accepts a caller-supplied origin, so only it
-//! resolves names and refuses non-public addresses. The OIDC validator and the
-//! management relay reach operator-configured or realm-resolved targets and
-//! keep their own clients without this resolver; sharing it would either weaken
-//! assistant egress or block those two, so the rules stay separate on purpose.
+//! Outbound egress policy for assistant provider connections. Only the assistant
+//! client accepts a caller-supplied origin and resolves names; the OIDC validator
+//! and management relay keep their own clients, so the rules stay separate.
 
 use aruna_core::structs::NodeCapabilities;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -15,8 +11,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The client the assistant proxy and the ChatGPT login flow share. A server
 /// node resolves through [`PublicDns`], so a stored base URL cannot reach a
-/// private address; a user node deliberately may, because it builds providers
-/// against a local model server.
+/// private address; a user node deliberately may build local providers.
 pub(crate) fn outbound_client(node_capabilities: &NodeCapabilities) -> Option<reqwest::Client> {
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)

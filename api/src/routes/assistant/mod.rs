@@ -301,7 +301,7 @@ pub(super) fn provider_summary(provider: &AssistantProvider) -> ProviderSummary 
             })
             .collect(),
         default_model: provider.default_model.clone(),
-        created_at: crate::routes::sessions::unix_rfc3339(provider.created_at),
+        created_at: crate::routes::access::sessions::unix_rfc3339(provider.created_at),
         status: provider.status.to_string(),
     }
 }
