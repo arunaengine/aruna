@@ -10,14 +10,12 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{AuthContext, OBJECT_CONTENT_TYPE_KEY};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::complete_upload::CompleteMultipartUploadResult;
-use aruna_operations::s3::delete_object::{DeleteObjectError, DeleteObjectResult};
-use aruna_operations::s3::delete_objects::DeleteObjectsEntryOutcome;
-use aruna_operations::s3::get_object::{GetObjectResult, ObjectInfo};
-use aruna_operations::s3::put_object::PutObjectResult;
-use aruna_operations::s3::refresh_metadata::{
-    QueueReferenceMetadataRefreshOperation, ReferenceMetadataRefresh,
-};
+use aruna_operations::s3::multipart::complete::CompleteUploadResult;
+use aruna_operations::s3::object::delete::{DeleteObjectError, DeleteObjectResult};
+use aruna_operations::s3::object::delete_bulk::BulkDeleteOutcome;
+use aruna_operations::s3::object::get::{GetObjectResult, ObjectInfo};
+use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use aruna_operations::s3::object::put::PutObjectResult;
 use s3s::dto::{
     CompleteMultipartUploadOutput, DeleteObjectOutput, DeleteObjectsOutput, DeletedObject, ETag,
     Error as S3DeleteError, LastModified, PutObjectOutput,
@@ -55,12 +53,12 @@ pub(super) fn reference_metadata_refresh(
     bucket: String,
     key: String,
     result: &GetObjectResult,
-) -> Option<ReferenceMetadataRefresh> {
+) -> Option<ReferenceRefresh> {
     if result.location.is_some() {
         return None;
     }
 
-    Some(ReferenceMetadataRefresh {
+    Some(ReferenceRefresh {
         bucket,
         key,
         version_id: result.resolved_version_id.or(result.version_id)?,
@@ -72,7 +70,7 @@ pub(super) fn reference_metadata_refresh(
 pub(super) fn attach_reference_refresh<T: 'static>(
     blob: BackendStream<Result<T, StreamError>>,
     context: Arc<DriverContext>,
-    refresh: ReferenceMetadataRefresh,
+    refresh: ReferenceRefresh,
 ) -> BackendStream<Result<T, StreamError>> {
     let refresh_bucket = refresh.bucket.clone();
     let refresh_key = refresh.key.clone();
@@ -80,7 +78,7 @@ pub(super) fn attach_reference_refresh<T: 'static>(
 
     blob.on_success_async(move || async move {
         match drive(
-            QueueReferenceMetadataRefreshOperation::new(refresh),
+            QueueRefreshOperation::new(refresh),
             context.as_ref(),
         )
         .await
@@ -118,7 +116,7 @@ impl ArunaS3Service {
         bucket: String,
         key: String,
         checksum_request: &UploadChecksumRequest,
-        result: CompleteMultipartUploadResult,
+        result: CompleteUploadResult,
     ) -> S3Response<CompleteMultipartUploadOutput> {
         let mut output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
@@ -207,17 +205,16 @@ impl ArunaS3Service {
         }))
     }
 
-    /// Maps one bulk delete's per-entry outcomes into the response. Policy
-    /// refusals collected before the operation keep their place and order, and
-    /// each outcome contributes either a deleted entry or a typed error. Quiet
-    /// mode suppresses only the deleted list; errors are always reported.
+    /// Maps one bulk delete's per-entry outcomes into the response: policy
+    /// refusals keep their place and order, quiet mode suppresses only deleted
+    /// entries, and errors are always reported.
     pub(super) async fn delete_objects_response(
         &self,
         quiet: bool,
         bucket: String,
         replication_auth: AuthContext,
         prior_errors: Vec<S3DeleteError>,
-        outcomes: Vec<DeleteObjectsEntryOutcome>,
+        outcomes: Vec<BulkDeleteOutcome>,
     ) -> S3Response<DeleteObjectsOutput> {
         let mut deleted = Vec::new();
         let mut errors = prior_errors;
@@ -240,7 +237,7 @@ impl ArunaS3Service {
                         &result,
                     ));
                 }
-                Err(DeleteObjectError::NoSuchVersion) => errors.push(no_such_version_error(
+                Err(DeleteObjectError::NoSuchVersion) => errors.push(missing_version_error(
                     outcome.key,
                     outcome.requested_version_id,
                 )),
@@ -351,10 +348,9 @@ impl ArunaS3Service {
     }
 }
 
-/// The deleted entry of one successful bulk delete. An unversioned delete
-/// reports the created delete marker and its marker version; a versioned delete
-/// reports the version and marks the version id as a delete marker only when
-/// the deleted version was one.
+/// The deleted entry of one successful bulk delete: an unversioned delete reports
+/// the created marker and its version, a versioned delete reports the version and
+/// marks the id as a delete marker only when that version was one.
 fn deleted_object(
     key: String,
     requested_version_id: Option<Ulid>,
@@ -377,7 +373,7 @@ fn deleted_object(
     }
 }
 
-fn no_such_version_error(key: String, requested_version_id: Option<Ulid>) -> S3DeleteError {
+fn missing_version_error(key: String, requested_version_id: Option<Ulid>) -> S3DeleteError {
     S3DeleteError {
         code: Some("NoSuchVersion".to_string()),
         key: Some(key),
@@ -418,9 +414,9 @@ mod tests {
         (dir, service)
     }
 
-    fn success(key: &str) -> DeleteObjectsEntryOutcome {
+    fn success(key: &str) -> BulkDeleteOutcome {
         let version_id = Ulid::generate();
-        DeleteObjectsEntryOutcome {
+        BulkDeleteOutcome {
             key: key.to_string(),
             requested_version_id: Some(version_id),
             result: Ok(DeleteObjectResult {
@@ -430,8 +426,8 @@ mod tests {
         }
     }
 
-    fn missing(key: &str) -> DeleteObjectsEntryOutcome {
-        DeleteObjectsEntryOutcome {
+    fn missing(key: &str) -> BulkDeleteOutcome {
+        BulkDeleteOutcome {
             key: key.to_string(),
             requested_version_id: Some(Ulid::generate()),
             result: Err(DeleteObjectError::NoSuchVersion),
@@ -439,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn unversioned_delete_reports_marker() {
+    fn delete_reports_marker() {
         let result = DeleteObjectResult {
             version_id: Ulid::generate(),
             delete_marker: true,
@@ -455,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn versioned_delete_reports_version() {
+    fn delete_reports_version() {
         let result = DeleteObjectResult {
             version_id: Ulid::generate(),
             delete_marker: false,
@@ -469,8 +465,8 @@ mod tests {
     }
 
     #[test]
-    fn bulk_errors_keep_their_shape() {
-        let missing = no_such_version_error("missing".to_string(), Some(Ulid::generate()));
+    fn delete_error_shapes() {
+        let missing = missing_version_error("missing".to_string(), Some(Ulid::generate()));
         assert_eq!(missing.code.as_deref(), Some("NoSuchVersion"));
         assert!(missing.version_id.is_some());
         let internal = internal_delete_error("broken".to_string(), None);
@@ -479,7 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quiet_bulk_delete_keeps_partial_errors() {
+    async fn quiet_delete_errors() {
         let (_dir, service) = test_service().await;
         let outcomes = vec![success("ok"), missing("missing")];
         let response = service
@@ -499,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_delete_preserves_result_order() {
+    async fn delete_preserves_order() {
         let (_dir, service) = test_service().await;
         let outcomes = vec![success("first"), missing("second"), success("third")];
         let response = service
@@ -525,7 +521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_delete_keeps_policy_errors_first() {
+    async fn policy_errors_first() {
         let (_dir, service) = test_service().await;
         let prior = vec![S3DeleteError {
             code: Some("AccessDenied".to_string()),

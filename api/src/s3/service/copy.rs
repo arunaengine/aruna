@@ -12,9 +12,9 @@ use aruna_core::structs::{
 use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
-use aruna_operations::s3::copy_object::{CopyObjectResultData, CopySourceConditions};
-use aruna_operations::s3::copy_part::UploadPartCopyResultData;
-use aruna_operations::s3::get_bucket::GetBucketInfoOperation;
+use aruna_operations::s3::bucket::get::GetBucketOperation;
+use aruna_operations::s3::multipart::part_copy::PartCopyResult;
+use aruna_operations::s3::object::copy::{CopyResultData, CopySourceConditions};
 use s3s::dto::{
     ChecksumType, CopyObjectOutput, CopyObjectResult, CopyPartResult, ETag, ETagCondition,
     Timestamp, TimestampFormat, UploadPartCopyOutput,
@@ -32,12 +32,9 @@ impl ArunaS3Service {
         source_key: &str,
         extras: PolicyRequestExtras,
     ) -> S3Result<(BucketInfo, AuthContext)> {
-        let source_bucket_info = drive(
-            GetBucketInfoOperation::new(source_bucket.clone()),
-            &self.state,
-        )
-        .await
-        .map_err(IntoS3Error::into_s3_error)?;
+        let source_bucket_info = drive(GetBucketOperation::new(source_bucket.clone()), &self.state)
+            .await
+            .map_err(IntoS3Error::into_s3_error)?;
 
         let source_auth_context = if source_bucket_info.group_id == user_access.group_id {
             AuthContext {
@@ -70,7 +67,7 @@ impl ArunaS3Service {
     }
 }
 
-pub(super) fn copy_object_response(result: CopyObjectResultData) -> S3Response<CopyObjectOutput> {
+pub(super) fn copy_object_response(result: CopyResultData) -> S3Response<CopyObjectOutput> {
     let e_tag = match &result.location {
         Some(location) => location
             .hashes
@@ -102,9 +99,7 @@ pub(super) fn copy_object_response(result: CopyObjectResultData) -> S3Response<C
     })
 }
 
-pub(super) fn copy_part_response(
-    result: UploadPartCopyResultData,
-) -> S3Response<UploadPartCopyOutput> {
+pub(super) fn copy_part_response(result: PartCopyResult) -> S3Response<UploadPartCopyOutput> {
     let mut copy_part_result = CopyPartResult {
         e_tag: result
             .part_location
