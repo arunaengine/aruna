@@ -24,13 +24,13 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::subscriptions::create_local_watch;
-use aruna_operations::replication::queue::{LiveReplicationObligationRecord, live_obligation_key};
-use aruna_operations::s3::get_object::ObjectInfo;
-use aruna_operations::s3::list_objects::ListObjectsV2ContinuationToken;
-use aruna_operations::s3::put_object::PutObjectResult;
-use aruna_operations::s3::refresh_metadata::{
-    QueueReferenceMetadataRefreshOperation, ReferenceMetadataRefresh, refresh_reference_metadata,
+use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
+use aruna_operations::s3::object::get::ObjectInfo;
+use aruna_operations::s3::object::list::ListContinuationToken;
+use aruna_operations::s3::object::metadata::{
+    QueueRefreshOperation, ReferenceRefresh, refresh_reference_metadata,
 };
+use aruna_operations::s3::object::put::PutObjectResult;
 use aruna_storage::storage;
 use futures_util::{StreamExt, stream};
 use http::Extensions;
@@ -151,7 +151,7 @@ fn info_prevents_fallbacks() {
 }
 
 #[test]
-fn reference_always_has_etag_and_date() {
+fn reference_fields_present() {
     // Mountpoint refuses a listing entry without ETag or LastModified, so a
     // reference whose source gave neither still answers both, and the same
     // way on every surface.
@@ -366,7 +366,7 @@ async fn put_survives_queue() {
         b"not a bucket replication config".to_vec(),
     )
     .await;
-    let obligation = LiveReplicationObligationRecord::new(
+    let obligation = LiveObligationRecord::new(
         node_id,
         auth.clone(),
         bucket.clone(),
@@ -694,7 +694,7 @@ async fn refresh_failure_hidden() {
         task_handle: None,
         compute_handle: None,
     });
-    let refresh = ReferenceMetadataRefresh {
+    let refresh = ReferenceRefresh {
         bucket: "bucket".to_string(),
         key: "reference".to_string(),
         version_id: Ulid::generate(),
@@ -703,7 +703,7 @@ async fn refresh_failure_hidden() {
     };
 
     let queue_result = drive(
-        QueueReferenceMetadataRefreshOperation::new(refresh.clone()),
+        QueueRefreshOperation::new(refresh.clone()),
         context.as_ref(),
     )
     .await;
@@ -942,8 +942,8 @@ fn refresh(
     test: &TestState,
     metadata: SourceMetadata,
     refreshed_at: SystemTime,
-) -> ReferenceMetadataRefresh {
-    ReferenceMetadataRefresh {
+) -> ReferenceRefresh {
+    ReferenceRefresh {
         bucket: test.bucket.clone(),
         key: test.key.clone(),
         version_id: test.version_id,
@@ -2504,13 +2504,13 @@ fn plain_marker_preserved() {
 
 #[test]
 fn next_marker_group() {
-    let token = ListObjectsV2ContinuationToken {
+    let token = ListContinuationToken {
         last_key: BlobHeadKey::object_prefix("bucket", "a/z.txt").unwrap(),
         last_common_prefix: Some("a/".to_string()),
     };
     assert_eq!(next_marker_of(&token).as_deref(), Some("a/"));
 
-    let token = ListObjectsV2ContinuationToken {
+    let token = ListContinuationToken {
         last_key: BlobHeadKey::object_prefix("bucket", "b.txt").unwrap(),
         last_common_prefix: None,
     };
@@ -2521,7 +2521,7 @@ fn next_marker_group() {
 fn marker_rescues_page() {
     // An undelimited page that filtered every key it scanned is truncated with
     // no `<Key>` to resume from, so it must carry the token-derived marker.
-    let token = ListObjectsV2ContinuationToken {
+    let token = ListContinuationToken {
         last_key: BlobHeadKey::object_prefix("bucket", "b.txt").unwrap(),
         last_common_prefix: None,
     };
