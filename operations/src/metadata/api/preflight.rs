@@ -1,19 +1,18 @@
 use super::{
-    ARUNA_DATA_PREFIX, Arc, AuthContext, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BTreeMap,
-    BTreeSet, BlobHeadKey, BlobVersion, BlobVersionState, ConversionError, CurrentVersionPointer,
-    Deserialize, DriverContext, Event, GetBucketInfoError, GetBucketInfoOperation,
-    GetRealmConfigOperation, GetRealmNodesOperation, HashMap, HashSet, IterStart, Key,
+    ARUNA_DATA_PREFIX, ApiQueryMode, Arc, AuthContext, AuthToken, BLOB_HEAD_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BTreeMap, BTreeSet, BlobHeadKey, BlobVersion, BlobVersionState,
+    ConversionError, CurrentVersionPointer, Deserialize, DriverContext, Event, GetBucketError,
+    GetBucketOperation, GetConfigOperation, GetNodesOperation, HashMap, HashSet, IterStart, Key,
     METADATA_DISTRIBUTED_QUERY_DEADLINE, METADATA_REFERENCES_DEFAULT_LIMIT,
     METADATA_REFERENCES_MAX_LIMIT, METADATA_REGISTRY_CANDIDATE_LIMIT,
-    METADATA_SEARCH_MAX_PAGINATION_DEPTH, MetadataApiError, MetadataApiQueryMode,
-    MetadataAuthToken, MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats,
-    MetadataNodeCall, MetadataRealmNodeDiscovery, MetadataReferenceEntry,
+    METADATA_SEARCH_MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation,
+    MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataReferenceEntry,
     MetadataReferencesRequest, MetadataRegistryRecord, MetadataSearchHit, NodeId, NodeSearchResult,
-    Permission, REALM_DISCOVERY_TIMEOUT, RealmConfigDocument, RealmId,
-    ResolveBlobPermissionPathsOperation, SearchCursor, SearchCursorError, SearchWatermark,
-    Serialize, StorageEffect, StorageEvent, Ulid, Value, VersionKey, W3idDataIdentifier,
-    bucket_permission_path, can_read_record, deduplicate_fanout_nodes, drive, filter_live_records,
-    forwarded_bearer, load_pending_records, map_internal_error, map_read_error, metadata_node_call,
+    Permission, REALM_DISCOVERY_TIMEOUT, RealmConfigDocument, RealmId, RealmNodeDiscovery,
+    ResolvePathsOperation, SearchCursor, SearchCursorError, SearchWatermark, Serialize,
+    StorageEffect, StorageEvent, Ulid, Value, VersionKey, W3idIdentifier, bucket_permission_path,
+    can_read_record, deduplicate_fanout_nodes, drive, filter_live_records, forwarded_bearer,
+    load_pending_records, map_internal_error, map_read_error, metadata_node_call,
     object_permission_path, paginate, record_preflight_node, resume_fetch_limit,
     run_metadata_fanout, select_fanout_nodes, warn,
 };
@@ -25,11 +24,11 @@ pub(super) async fn resolve_preflight_targets(
     realm_id: RealmId,
     local_node_id: NodeId,
     auth: &AuthContext,
-    target: MetadataReferencePreflightTarget,
+    target: ReferenceTarget,
     s3_endpoint: Option<&str>,
 ) -> Result<ResolvedPreflightTargets, MetadataApiError> {
     match target {
-        MetadataReferencePreflightTarget::ContentW3ids {
+        ReferenceTarget::ContentW3ids {
             content_w3ids,
             remove_all_resolvable_locations,
         } => {
@@ -40,15 +39,15 @@ pub(super) async fn resolve_preflight_targets(
             }
             let mut targets = BTreeMap::new();
             for content_w3id in content_w3ids {
-                let W3idDataIdentifier::ContentHash(content_hash) =
-                    W3idDataIdentifier::parse(&content_w3id)
+                let W3idIdentifier::ContentHash(content_hash) =
+                    W3idIdentifier::parse(&content_w3id)
                         .map_err(|_| MetadataApiError::BadRequest)?
                 else {
                     return Err(MetadataApiError::BadRequest);
                 };
                 targets
                     .entry(content_hash)
-                    .or_insert_with(|| MetadataPreflightResolvedTarget {
+                    .or_insert_with(|| MetadataResolvedTarget {
                         content_w3id: format!("{ARUNA_DATA_PREFIX}{}", hex::encode(content_hash)),
                         content_hash,
                         queried_iris: vec![content_w3id],
@@ -62,7 +61,7 @@ pub(super) async fn resolve_preflight_targets(
                 complete: true,
             })
         }
-        MetadataReferencePreflightTarget::BucketPrefix {
+        ReferenceTarget::BucketPrefix {
             bucket,
             prefix,
             operation,
@@ -70,16 +69,15 @@ pub(super) async fn resolve_preflight_targets(
             if bucket.trim().is_empty() {
                 return Err(MetadataApiError::BadRequest);
             }
-            let bucket_info =
-                match drive(GetBucketInfoOperation::new(bucket.clone()), context).await {
-                    Ok(info) => info,
-                    Err(GetBucketInfoError::NotFound) => {
-                        return Err(MetadataApiError::NotFound);
-                    }
-                    Err(_) => {
-                        return Err(MetadataApiError::ServiceUnavailable);
-                    }
-                };
+            let bucket_info = match drive(GetBucketOperation::new(bucket.clone()), context).await {
+                Ok(info) => info,
+                Err(GetBucketError::NotFound) => {
+                    return Err(MetadataApiError::NotFound);
+                }
+                Err(_) => {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+            };
             let prefix = prefix.filter(|prefix| !prefix.is_empty());
             let permission_path = match prefix.as_deref() {
                 Some(prefix) => object_permission_path(
@@ -105,10 +103,10 @@ pub(super) async fn resolve_preflight_targets(
             .await?;
 
             let versions = match operation {
-                MetadataPreflightStorageOperation::LatestVersionTombstone => {
+                MetadataStorageOperation::LatestVersionTombstone => {
                     resolve_preflight_versions(context, &bucket, prefix.as_deref()).await?
                 }
-                MetadataPreflightStorageOperation::AllVersionsPurge => {
+                MetadataStorageOperation::AllVersionsPurge => {
                     resolve_all_preflight(context, &bucket, prefix.as_deref()).await?
                 }
             };
@@ -134,7 +132,7 @@ pub(super) async fn resolve_preflight_targets(
                 }
             }
             let mut complete = true;
-            let mut targets = BTreeMap::<[u8; 32], MetadataPreflightResolvedTarget>::new();
+            let mut targets = BTreeMap::<[u8; 32], MetadataResolvedTarget>::new();
             for (version_key, version) in versions {
                 let content_hash = match version.state {
                     BlobVersionState::Materialized { blob_hash, .. } => blob_hash,
@@ -152,7 +150,7 @@ pub(super) async fn resolve_preflight_targets(
                 };
                 let target = targets.entry(content_hash).or_insert_with(|| {
                     let content_w3id = format!("{ARUNA_DATA_PREFIX}{}", hex::encode(content_hash));
-                    MetadataPreflightResolvedTarget {
+                    MetadataResolvedTarget {
                         queried_iris: vec![content_w3id.clone()],
                         content_w3id,
                         content_hash,
@@ -168,7 +166,7 @@ pub(super) async fn resolve_preflight_targets(
                     &location.key,
                 );
                 target.targeted_versions.push(location.clone());
-                if operation == MetadataPreflightStorageOperation::AllVersionsPurge {
+                if operation == MetadataStorageOperation::AllVersionsPurge {
                     target.removed_locations.push(location);
                 }
             }
@@ -342,9 +340,9 @@ pub(crate) async fn references_preflight_local(
     realm_id: RealmId,
     local_node_id: NodeId,
     auth: Option<AuthContext>,
-    mut request: MetadataReferencePreflightNodeRequest,
+    mut request: ReferenceNodeRequest,
     s3_endpoint: Option<String>,
-) -> Result<MetadataReferencePreflightNodeExecution, MetadataApiError> {
+) -> Result<ReferenceNodeExecution, MetadataApiError> {
     if request.targets.len() > METADATA_PREFLIGHT_MAX_TARGET_VERSIONS
         || request.limit == 0
         || request.limit > METADATA_SEARCH_MAX_PAGINATION_DEPTH
@@ -374,32 +372,27 @@ pub(crate) async fn references_preflight_local(
         .flatten()
         .any(|record| record.realm_id == realm_id);
     let index_state = match (freshness.state, pending_for_realm) {
-        (crate::metadata::iri_index::IriIndexFreshnessState::Current, false) => {
-            MetadataPreflightIndexState::Current
+        (crate::metadata::iri_index::IriFreshnessState::Current, false) => {
+            MetadataIndexState::Current
         }
-        (crate::metadata::iri_index::IriIndexFreshnessState::Current, true)
-        | (crate::metadata::iri_index::IriIndexFreshnessState::Pending, _) => {
-            MetadataPreflightIndexState::Pending
+        (crate::metadata::iri_index::IriFreshnessState::Current, true)
+        | (crate::metadata::iri_index::IriFreshnessState::Pending, _) => {
+            MetadataIndexState::Pending
         }
-        (crate::metadata::iri_index::IriIndexFreshnessState::Failed, false) => {
-            MetadataPreflightIndexState::Failed
+        (crate::metadata::iri_index::IriFreshnessState::Failed, false) => {
+            MetadataIndexState::Failed
         }
-        (crate::metadata::iri_index::IriIndexFreshnessState::Failed, true)
-        | (crate::metadata::iri_index::IriIndexFreshnessState::Mixed, _) => {
-            MetadataPreflightIndexState::Mixed
-        }
+        (crate::metadata::iri_index::IriFreshnessState::Failed, true)
+        | (crate::metadata::iri_index::IriFreshnessState::Mixed, _) => MetadataIndexState::Mixed,
     };
 
     let mut iri_targets = BTreeMap::<String, BTreeSet<String>>::new();
     let mut target_locations = BTreeMap::<String, (bool, bool)>::new();
     let mut aliases_seen = false;
     for target in request.targets.iter_mut() {
-        let mut local_aliases = drive(
-            ResolveBlobPermissionPathsOperation::new(target.content_hash),
-            context,
-        )
-        .await
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        let mut local_aliases = drive(ResolvePathsOperation::new(target.content_hash), context)
+            .await
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
         local_aliases.retain(|alias| alias.realm_id == realm_id && alias.node_id == local_node_id);
         aliases_seen |= !local_aliases.is_empty();
         let mut found = false;
@@ -447,7 +440,7 @@ pub(crate) async fn references_preflight_local(
     let mut readable = HashMap::<Ulid, bool>::new();
     let mut titles = HashMap::<Ulid, String>::new();
     let mut hidden = BTreeSet::<String>::new();
-    let mut visible = BTreeMap::<(String, Ulid), MetadataPreflightVisibleReference>::new();
+    let mut visible = BTreeMap::<(String, Ulid), MetadataVisibleReference>::new();
     for (iri, iri_backlinks) in backlinks {
         let Some(content_w3ids) = iri_targets.get(&iri) else {
             continue;
@@ -485,7 +478,7 @@ pub(crate) async fn references_preflight_local(
                 };
                 visible
                     .entry(visible_key)
-                    .or_insert(MetadataPreflightVisibleReference {
+                    .or_insert(MetadataVisibleReference {
                         content_w3id: content_w3id.clone(),
                         document_id: record.document_id.to_string(),
                         title,
@@ -502,7 +495,7 @@ pub(crate) async fn references_preflight_local(
             let (resolvable_location_found, resolvable_location_after_operation) = target_locations
                 .remove(&target.content_w3id)
                 .unwrap_or((false, false));
-            MetadataReferencePreflightNodeTarget {
+            ReferenceNodeTarget {
                 hidden_references_exist: hidden.contains(&target.content_w3id),
                 content_w3id: target.content_w3id,
                 resolvable_location_found,
@@ -510,10 +503,10 @@ pub(crate) async fn references_preflight_local(
             }
         })
         .collect();
-    Ok(MetadataReferencePreflightNodeExecution {
+    Ok(ReferenceNodeExecution {
         visible_references,
         targets,
-        freshness: MetadataPreflightNodeFreshness {
+        freshness: MetadataNodeFreshness {
             node_id: local_node_id,
             index_state,
             oldest_status_updated_at_ms: freshness.oldest_status_updated_at_ms,
@@ -524,15 +517,15 @@ pub(crate) async fn references_preflight_local(
 }
 
 pub(super) fn preflight_fingerprint(
-    targets: &[MetadataPreflightResolvedTarget],
-    mode: Option<MetadataApiQueryMode>,
+    targets: &[MetadataResolvedTarget],
+    mode: Option<ApiQueryMode>,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"metadata-reference-preflight\0");
     hasher.update(&[match mode {
         None => 0,
-        Some(MetadataApiQueryMode::Local) => 1,
-        Some(MetadataApiQueryMode::Distributed) => 2,
+        Some(ApiQueryMode::Local) => 1,
+        Some(ApiQueryMode::Distributed) => 2,
     }]);
     hasher.update(
         &postcard::to_allocvec(targets).expect("preflight cursor fingerprint payload serializes"),
@@ -585,7 +578,7 @@ pub async fn load_realm_config(
     context: &DriverContext,
     realm_id: RealmId,
 ) -> Option<RealmConfigDocument> {
-    match drive(GetRealmConfigOperation::new(realm_id), context).await {
+    match drive(GetConfigOperation::new(realm_id), context).await {
         Ok(config) => Some(config),
         Err(error) => {
             warn!(error = %error, "realm config unavailable; querying the local replica only");
@@ -608,9 +601,9 @@ pub(crate) async fn discover_realm_nodes(
     context: &DriverContext,
     realm_id: RealmId,
     local_node_id: NodeId,
-) -> MetadataRealmNodeDiscovery {
+) -> RealmNodeDiscovery {
     let Some(config) = load_realm_config(context, realm_id).await else {
-        return MetadataRealmNodeDiscovery {
+        return RealmNodeDiscovery {
             nodes: vec![local_node_id],
             failed: true,
         };
@@ -619,7 +612,7 @@ pub(crate) async fn discover_realm_nodes(
     // instead of stalling behind offline peers.
     let discovery = tokio::time::timeout(
         REALM_DISCOVERY_TIMEOUT,
-        drive(GetRealmNodesOperation::new(realm_id), context),
+        drive(GetNodesOperation::new(realm_id), context),
     )
     .await;
     let nodes = match discovery {
@@ -629,7 +622,7 @@ pub(crate) async fn discover_realm_nodes(
             Ok(nodes) => (nodes, false),
             Err(error) => {
                 warn!(error = %error, "realm config contains invalid node ids; using local-only metadata results");
-                return MetadataRealmNodeDiscovery {
+                return RealmNodeDiscovery {
                     nodes: vec![local_node_id],
                     failed: true,
                 };
@@ -653,7 +646,7 @@ pub(crate) async fn discover_realm_nodes(
         nodes.push(local_node_id);
     }
     nodes.sort_by_key(|node_id| node_id.to_string());
-    MetadataRealmNodeDiscovery { nodes, failed }
+    RealmNodeDiscovery { nodes, failed }
 }
 
 const METADATA_PREFLIGHT_MAX_TARGET_VERSIONS: usize = 128;
@@ -661,7 +654,7 @@ const METADATA_PREFLIGHT_MAX_TARGET_VERSIONS: usize = 128;
 const METADATA_PREFLIGHT_SCAN_PAGE_SIZE: usize = 128;
 
 #[derive(Debug, Clone)]
-pub enum MetadataReferencePreflightTarget {
+pub enum ReferenceTarget {
     ContentW3ids {
         content_w3ids: Vec<String>,
         remove_all_resolvable_locations: bool,
@@ -669,26 +662,26 @@ pub enum MetadataReferencePreflightTarget {
     BucketPrefix {
         bucket: String,
         prefix: Option<String>,
-        operation: MetadataPreflightStorageOperation,
+        operation: MetadataStorageOperation,
     },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataPreflightStorageOperation {
+pub enum MetadataStorageOperation {
     #[default]
     LatestVersionTombstone,
     AllVersionsPurge,
 }
 
 #[derive(Debug, Clone)]
-pub struct MetadataReferencePreflightRequest {
+pub struct ReferenceRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
-    pub target: MetadataReferencePreflightTarget,
+    pub target: ReferenceTarget,
     pub s3_endpoint: Option<String>,
     pub limit: Option<usize>,
     pub cursor: Option<String>,
-    pub mode: Option<MetadataApiQueryMode>,
+    pub mode: Option<ApiQueryMode>,
     pub target_nodes: Option<Vec<NodeId>>,
     pub allow_partial: bool,
 }
@@ -702,7 +695,7 @@ pub struct MetadataPreflightLocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataPreflightResolvedTarget {
+pub struct MetadataResolvedTarget {
     pub content_w3id: String,
     pub content_hash: [u8; 32],
     pub queried_iris: Vec<String>,
@@ -712,20 +705,20 @@ pub struct MetadataPreflightResolvedTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataReferencePreflightNodeRequest {
-    pub targets: Vec<MetadataPreflightResolvedTarget>,
+pub struct ReferenceNodeRequest {
+    pub targets: Vec<MetadataResolvedTarget>,
     pub limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataPreflightVisibleReference {
+pub struct MetadataVisibleReference {
     pub content_w3id: String,
     pub document_id: String,
     pub title: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataPreflightIndexState {
+pub enum MetadataIndexState {
     Current,
     Pending,
     Failed,
@@ -733,14 +726,14 @@ pub enum MetadataPreflightIndexState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataPreflightNodeFreshness {
+pub struct MetadataNodeFreshness {
     pub node_id: NodeId,
-    pub index_state: MetadataPreflightIndexState,
+    pub index_state: MetadataIndexState,
     pub oldest_status_updated_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataReferencePreflightNodeTarget {
+pub struct ReferenceNodeTarget {
     pub content_w3id: String,
     pub hidden_references_exist: bool,
     pub resolvable_location_found: bool,
@@ -748,55 +741,55 @@ pub struct MetadataReferencePreflightNodeTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataReferencePreflightNodeExecution {
-    pub visible_references: Vec<MetadataPreflightVisibleReference>,
-    pub targets: Vec<MetadataReferencePreflightNodeTarget>,
-    pub freshness: MetadataPreflightNodeFreshness,
+pub struct ReferenceNodeExecution {
+    pub visible_references: Vec<MetadataVisibleReference>,
+    pub targets: Vec<ReferenceNodeTarget>,
+    pub freshness: MetadataNodeFreshness,
     pub path_style_endpoint_available: bool,
     pub saturated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetadataReferencePreflightTargetExecution {
+pub struct ReferenceTargetExecution {
     pub content_w3id: String,
     pub targeted_versions: Vec<MetadataPreflightLocation>,
-    pub visible_references: Vec<MetadataPreflightVisibleReference>,
+    pub visible_references: Vec<MetadataVisibleReference>,
     pub hidden_references_exist: bool,
     pub would_remove_last_resolvable_aruna_location: bool,
     pub location_impact_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetadataPreflightExcludedForm {
+pub struct MetadataExcludedForm {
     pub form: &'static str,
     pub reason: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetadataReferencePreflightCoverage {
+pub struct ReferenceCoverage {
     pub queried_scope: &'static str,
     pub queried_forms: Vec<&'static str>,
-    pub excluded_forms: Vec<MetadataPreflightExcludedForm>,
-    pub node_freshness: Vec<MetadataPreflightNodeFreshness>,
+    pub excluded_forms: Vec<MetadataExcludedForm>,
+    pub node_freshness: Vec<MetadataNodeFreshness>,
     pub target_resolution_complete: bool,
     pub path_style_endpoint_coverage_complete: bool,
     pub realm_coverage_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetadataReferencePreflightExecution {
-    pub targets: Vec<MetadataReferencePreflightTargetExecution>,
+pub struct ReferenceExecution {
+    pub targets: Vec<ReferenceTargetExecution>,
     pub next_cursor: Option<String>,
     pub truncated: bool,
     pub nodes_queried: usize,
     pub nodes_failed: usize,
     pub complete: bool,
     pub failed_partitions: Vec<NodeId>,
-    pub coverage: MetadataReferencePreflightCoverage,
+    pub coverage: ReferenceCoverage,
 }
 
 pub(super) struct ResolvedPreflightTargets {
-    targets: Vec<MetadataPreflightResolvedTarget>,
+    targets: Vec<MetadataResolvedTarget>,
     complete: bool,
 }
 
@@ -806,7 +799,7 @@ pub(super) struct PreflightPlan {
     pub(super) s3_endpoint: Option<String>,
     pub(super) cursor: Option<String>,
     pub(super) page_size: usize,
-    pub(super) mode: Option<MetadataApiQueryMode>,
+    pub(super) mode: Option<ApiQueryMode>,
     pub(super) target_nodes: Option<Vec<NodeId>>,
     pub(super) allow_partial: bool,
 }
@@ -823,8 +816,8 @@ pub async fn references_preflight(
     context: &DriverContext,
     realm_id: RealmId,
     local_node_id: NodeId,
-    request: MetadataReferencePreflightRequest,
-) -> Result<MetadataReferencePreflightExecution, MetadataApiError> {
+    request: ReferenceRequest,
+) -> Result<ReferenceExecution, MetadataApiError> {
     let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     let (plan, target) = plan_preflight_request(realm_id, request)?;
     let resolved = resolve_preflight_targets(
@@ -854,9 +847,9 @@ pub async fn references_preflight(
 
 pub(super) fn plan_preflight_request(
     realm_id: RealmId,
-    request: MetadataReferencePreflightRequest,
-) -> Result<(PreflightPlan, MetadataReferencePreflightTarget), MetadataApiError> {
-    let MetadataReferencePreflightRequest {
+    request: ReferenceRequest,
+) -> Result<(PreflightPlan, ReferenceTarget), MetadataApiError> {
+    let ReferenceRequest {
         auth,
         bearer_token,
         target,
@@ -900,9 +893,9 @@ pub(super) async fn verify_preflight_cursor(
     let mut cursor_discovery = None;
     let (watermark, resume) = match plan.cursor.as_deref() {
         Some(raw) => {
-            let signer_nodes = match plan.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
-                MetadataApiQueryMode::Local => vec![local_node_id],
-                MetadataApiQueryMode::Distributed => match plan.target_nodes.as_ref() {
+            let signer_nodes = match plan.mode.unwrap_or(ApiQueryMode::Distributed) {
+                ApiQueryMode::Local => vec![local_node_id],
+                ApiQueryMode::Distributed => match plan.target_nodes.as_ref() {
                     Some(nodes) => {
                         let mut signers = nodes.clone();
                         signers.push(local_node_id);
@@ -914,7 +907,7 @@ pub(super) async fn verify_preflight_cursor(
                             discover_realm_nodes(context, realm_id, local_node_id),
                         )
                         .await
-                        .unwrap_or(MetadataRealmNodeDiscovery {
+                        .unwrap_or(RealmNodeDiscovery {
                             nodes: vec![local_node_id],
                             failed: true,
                         });
@@ -946,9 +939,9 @@ pub(super) async fn verify_preflight_cursor(
     let (target_nodes, discovery_failed) = if plan.cursor.is_some() {
         let mut nodes = match plan.target_nodes.as_ref() {
             Some(nodes) => select_fanout_nodes(nodes, local_node_id, &fingerprint),
-            None => match plan.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
-                MetadataApiQueryMode::Local => vec![local_node_id],
-                MetadataApiQueryMode::Distributed => cursor_discovery
+            None => match plan.mode.unwrap_or(ApiQueryMode::Distributed) {
+                ApiQueryMode::Local => vec![local_node_id],
+                ApiQueryMode::Distributed => cursor_discovery
                     .as_ref()
                     .map(|discovery| discovery.nodes.clone())
                     .unwrap_or_else(|| vec![local_node_id]),
@@ -985,21 +978,15 @@ pub(super) async fn run_preflight_fanout(
     resolved: &ResolvedPreflightTargets,
     cursor: &PreflightCursorPlan,
     deadline: tokio::time::Instant,
-) -> Result<
-    (
-        Vec<(NodeId, MetadataReferencePreflightNodeExecution)>,
-        MetadataFanoutStats,
-    ),
-    MetadataApiError,
-> {
+) -> Result<(Vec<(NodeId, ReferenceNodeExecution)>, MetadataFanoutStats), MetadataApiError> {
     let resume = Arc::new(cursor.resume.clone());
     let remote_auth = forwarded_bearer(plan.bearer_token.as_deref())?
-        .or_else(|| Some(MetadataAuthToken::internal(plan.auth.clone())));
+        .or_else(|| Some(AuthToken::internal(plan.auth.clone())));
     let handle = context
         .metadata_handle
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let local_call: MetadataNodeCall<MetadataReferencePreflightNodeExecution> = metadata_node_call(
+    let local_call: MetadataNodeCall<ReferenceNodeExecution> = metadata_node_call(
         (
             context.clone(),
             realm_id,
@@ -1021,14 +1008,14 @@ pub(super) async fn run_preflight_fanout(
                 realm_id,
                 node_id,
                 Some(auth),
-                MetadataReferencePreflightNodeRequest { targets, limit },
+                ReferenceNodeRequest { targets, limit },
                 endpoint,
             )
             .await
             .map_err(crate::forward::transport::read_error)
         },
     );
-    let remote_call: MetadataNodeCall<MetadataReferencePreflightNodeExecution> = metadata_node_call(
+    let remote_call: MetadataNodeCall<ReferenceNodeExecution> = metadata_node_call(
         (
             handle,
             remote_auth,
@@ -1047,7 +1034,7 @@ pub(super) async fn run_preflight_fanout(
                 .request_remote_preflight(
                     node_id,
                     auth_token,
-                    MetadataReferencePreflightNodeRequest { targets, limit },
+                    ReferenceNodeRequest { targets, limit },
                 )
                 .await
         },
@@ -1074,9 +1061,9 @@ pub(super) fn assemble_preflight_execution(
     resolved: ResolvedPreflightTargets,
     plan: &PreflightPlan,
     cursor: PreflightCursorPlan,
-    node_parts: Vec<(NodeId, MetadataReferencePreflightNodeExecution)>,
+    node_parts: Vec<(NodeId, ReferenceNodeExecution)>,
     fanout_stats: MetadataFanoutStats,
-) -> Result<MetadataReferencePreflightExecution, MetadataApiError> {
+) -> Result<ReferenceExecution, MetadataApiError> {
     let mut node_results = Vec::new();
     let mut node_freshness = Vec::new();
     let mut hidden = BTreeSet::new();
@@ -1121,12 +1108,12 @@ pub(super) fn assemble_preflight_execution(
         plan.page_size,
         METADATA_SEARCH_MAX_PAGINATION_DEPTH,
     );
-    let mut visible_by_target = BTreeMap::<String, Vec<MetadataPreflightVisibleReference>>::new();
+    let mut visible_by_target = BTreeMap::<String, Vec<MetadataVisibleReference>>::new();
     for hit in page.hits {
         visible_by_target
             .entry(hit.graph_iri.clone())
             .or_default()
-            .push(MetadataPreflightVisibleReference {
+            .push(MetadataVisibleReference {
                 content_w3id: hit.graph_iri,
                 document_id: hit.document_id,
                 title: hit.title,
@@ -1134,7 +1121,7 @@ pub(super) fn assemble_preflight_execution(
     }
     let index_current = node_freshness
         .iter()
-        .all(|freshness| freshness.index_state == MetadataPreflightIndexState::Current);
+        .all(|freshness| freshness.index_state == MetadataIndexState::Current);
     let complete = fanout_stats.nodes_failed == 0
         && resolved.complete
         && index_current
@@ -1152,7 +1139,7 @@ pub(super) fn assemble_preflight_execution(
                 .unwrap_or((false, false));
             let removes_location =
                 target.remove_all_resolvable_locations || !target.removed_locations.is_empty();
-            MetadataReferencePreflightTargetExecution {
+            ReferenceTargetExecution {
                 visible_references: visible_by_target
                     .remove(&target.content_w3id)
                     .unwrap_or_default(),
@@ -1189,9 +1176,8 @@ pub(super) fn assemble_preflight_execution(
         }
         None => None,
     };
-    let distributed =
-        plan.mode.unwrap_or(MetadataApiQueryMode::Distributed) == MetadataApiQueryMode::Distributed;
-    Ok(MetadataReferencePreflightExecution {
+    let distributed = plan.mode.unwrap_or(ApiQueryMode::Distributed) == ApiQueryMode::Distributed;
+    Ok(ReferenceExecution {
         targets,
         next_cursor,
         truncated: page.truncated,
@@ -1199,7 +1185,7 @@ pub(super) fn assemble_preflight_execution(
         nodes_failed: fanout_stats.nodes_failed,
         complete,
         failed_partitions: fanout_stats.failed_partitions,
-        coverage: MetadataReferencePreflightCoverage {
+        coverage: ReferenceCoverage {
             queried_scope: if distributed { "realm" } else { "local_node" },
             queried_forms: vec![
                 "canonical_content_w3id",
@@ -1207,15 +1193,15 @@ pub(super) fn assemble_preflight_execution(
                 "legacy_path_style_http_iri",
             ],
             excluded_forms: vec![
-                MetadataPreflightExcludedForm {
+                MetadataExcludedForm {
                     form: "literal_content_url",
                     reason: "literal objects are not materialized in the NamedNode IRI index",
                 },
-                MetadataPreflightExcludedForm {
+                MetadataExcludedForm {
                     form: "imported_relative_identity",
                     reason: "relative imported identities are outside exact absolute-IRI matching",
                 },
-                MetadataPreflightExcludedForm {
+                MetadataExcludedForm {
                     form: "imported_external_identity",
                     reason: "external identities without an Aruna content mapping are outside coverage",
                 },
