@@ -8,7 +8,7 @@ async fn filters_graph_delete() {
     let group_id = Ulid::generate();
     let live = public_record(group_id, Ulid::generate());
     let deleted = public_record(group_id, Ulid::generate());
-    let tombstone = MetadataGraphLifecycleRecord::deleted(
+    let tombstone = GraphLifecycleRecord::deleted(
         deleted.graph_iri.clone(),
         deleted.realm_id,
         deleted.group_id,
@@ -32,15 +32,15 @@ async fn filters_document_delete() {
     let test = metadata_test();
     let group_id = Ulid::generate();
     let deleted = public_record(group_id, Ulid::generate());
-    let tombstone = MetadataGraphLifecycleRecord::deleted(
+    let tombstone = GraphLifecycleRecord::deleted(
         deleted.graph_iri.clone(),
         deleted.realm_id,
         deleted.group_id,
         deleted.document_id,
         2,
     );
-    let lifecycle = aruna_core::metadata::MetadataDocumentLifecycleRecord::Delete {
-        event: aruna_core::metadata::MetadataDocumentDeleteRecord {
+    let lifecycle = aruna_core::metadata::MetadataLifecycleRecord::Delete {
+        event: aruna_core::metadata::MetadataDeleteRecord {
             event_id: Ulid::generate(),
             tombstone,
             deleted_after_event_id: deleted.last_event_id,
@@ -87,7 +87,7 @@ async fn foreign_lifecycle_rejected() {
     let graph_record = public_record(Ulid::generate(), Ulid::generate());
     let document_record = public_record(Ulid::generate(), Ulid::generate());
     let stranger = public_record(Ulid::generate(), Ulid::generate());
-    let tombstone = MetadataGraphLifecycleRecord::deleted(
+    let tombstone = GraphLifecycleRecord::deleted(
         stranger.graph_iri.clone(),
         stranger.realm_id,
         stranger.group_id,
@@ -103,8 +103,8 @@ async fn foreign_lifecycle_rejected() {
         ),
     )
     .await;
-    let lifecycle = MetadataDocumentLifecycleRecord::Delete {
-        event: aruna_core::metadata::MetadataDocumentDeleteRecord {
+    let lifecycle = MetadataLifecycleRecord::Delete {
+        event: aruna_core::metadata::MetadataDeleteRecord {
             event_id: Ulid::generate(),
             tombstone,
             deleted_after_event_id: stranger.last_event_id,
@@ -198,7 +198,7 @@ async fn estimate_beyond_page() {
     let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
             ..summary_request(group_id, false)
         },
@@ -212,7 +212,7 @@ async fn estimate_beyond_page() {
     let tail = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
             offset: Some(seeded - 1),
             ..summary_request(group_id, false)
@@ -237,7 +237,7 @@ async fn lookup_omits_estimate() {
     let lookup = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             limit: Some(METADATA_ESTIMATE_MIN_LIMIT - 1),
             ..summary_request(group_id, false)
         },
@@ -250,7 +250,7 @@ async fn lookup_omits_estimate() {
     let browse = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             limit: Some(METADATA_ESTIMATE_MIN_LIMIT),
             ..summary_request(group_id, false)
         },
@@ -480,7 +480,7 @@ async fn hidden_ids_match() {
         let result = get_visible_document(
             &test.context,
             TEST_REALM_ID,
-            GetVisibleMetadataDocumentRequest {
+            GetVisibleRequest {
                 document_id,
                 auth: Some(auth_for(stranger)),
             },
@@ -519,7 +519,7 @@ async fn policy_hides_record() {
     let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             auth: Some(auth_for(stranger)),
             ..summary_request(group_id, false)
         },
@@ -560,7 +560,7 @@ async fn stranger_sees_public() {
     let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             auth: Some(auth_for(stranger)),
             ..summary_request(group_id, false)
         },
@@ -574,7 +574,7 @@ async fn stranger_sees_public() {
     let beyond = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             offset: Some(1),
             auth: Some(auth_for(stranger)),
             ..summary_request(group_id, false)
@@ -624,7 +624,7 @@ async fn anonymous_sees_public() {
     let signed = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             auth: Some(auth_for(member)),
             ..summary_request(group_id, false)
         },
@@ -667,7 +667,7 @@ async fn foreign_policy_identity() {
     let listed = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             auth: Some(auth.clone()),
             ..summary_request(group_id, false)
         },
@@ -721,7 +721,7 @@ async fn estimate_counts_exact() {
     let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             auth: Some(auth_for(member)),
             ..summary_request(group_id, false)
         },
@@ -735,7 +735,7 @@ async fn estimate_counts_exact() {
     let lookup = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             limit: Some(METADATA_ESTIMATE_MIN_LIMIT - 1),
             auth: Some(auth_for(member)),
             ..summary_request(group_id, false)
@@ -762,7 +762,7 @@ async fn estimate_honours_prefix() {
     let result = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             path_prefix: Some("datasets".to_string()),
             ..summary_request(group_id, false)
         },
@@ -786,7 +786,7 @@ async fn seed_timed_records(test: &MetadataTest, group_id: GroupId) -> Vec<Metad
     records
 }
 
-fn listed_ids(result: &ListVisibleMetadataDocumentsResult) -> Vec<Ulid> {
+fn listed_ids(result: &ListVisibleResult) -> Vec<Ulid> {
     result
         .documents
         .iter()
@@ -804,7 +804,7 @@ async fn orders_recent_first() {
     let page = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             order: MetadataListOrder::Recent,
             ..summary_request(group_id, false)
         },
@@ -823,7 +823,7 @@ async fn orders_recent_first() {
     let second = list_visible_documents(
         &test.context,
         TEST_REALM_ID,
-        ListVisibleMetadataDocumentsRequest {
+        ListVisibleRequest {
             limit: Some(1),
             offset: Some(1),
             order: MetadataListOrder::Recent,
@@ -961,11 +961,8 @@ pub(super) async fn write_policy_docs(
     }
 }
 
-pub(super) fn summary_request(
-    group_id: GroupId,
-    include_summary: bool,
-) -> ListVisibleMetadataDocumentsRequest {
-    ListVisibleMetadataDocumentsRequest {
+pub(super) fn summary_request(group_id: GroupId, include_summary: bool) -> ListVisibleRequest {
+    ListVisibleRequest {
         group_id: Some(group_id),
         path_prefix: None,
         include_summary,

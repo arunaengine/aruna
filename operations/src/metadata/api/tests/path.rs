@@ -305,7 +305,7 @@ fn divergent_paths_fail() {
     // reduced to one of the two answers.
     let winner = sanitize_path_winner(public_record(Ulid::generate(), Ulid::generate()))
         .expect("valid path winner");
-    let result = MetadataPathLookupResult {
+    let result = MetadataLookupResult {
         winner,
         conflicts: Vec::new(),
     };
@@ -330,7 +330,7 @@ fn divergent_paths_fail() {
 #[test]
 fn path_denial_wins() {
     let record = public_record(Ulid::generate(), Ulid::generate());
-    let result = MetadataPathLookupResult {
+    let result = MetadataLookupResult {
         winner: sanitize_path_winner(record).expect("valid path winner"),
         conflicts: Vec::new(),
     };

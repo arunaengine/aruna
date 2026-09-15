@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use aruna_core::UserId;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
-use aruna_core::metadata::MetadataCreateEventPayload;
+use aruna_core::metadata::MetadataEventPayload;
 use aruna_core::storage_entries::{
     create_projection_entries, document_lifecycle_entry, graph_lifecycle_entry,
 };
@@ -31,4 +31,4 @@ mod preflight;
 mod query;
 mod search;
 
-use crate::tests::fixtures::metadata_api::*;
+use crate::tests::metadata_api::*;

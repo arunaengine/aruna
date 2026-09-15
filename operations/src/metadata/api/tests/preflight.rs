@@ -19,22 +19,22 @@ async fn preflight_fanout_reports() {
     let local = iroh::SecretKey::from_bytes(&[61u8; 32]).public();
     let healthy = iroh::SecretKey::from_bytes(&[62u8; 32]).public();
     let failed = iroh::SecretKey::from_bytes(&[63u8; 32]).public();
-    let result_for = |node_id| MetadataReferencePreflightNodeExecution {
+    let result_for = |node_id| ReferenceNodeExecution {
         visible_references: Vec::new(),
         targets: Vec::new(),
-        freshness: MetadataPreflightNodeFreshness {
+        freshness: MetadataNodeFreshness {
             node_id,
-            index_state: MetadataPreflightIndexState::Current,
+            index_state: MetadataIndexState::Current,
             oldest_status_updated_at_ms: None,
         },
         path_style_endpoint_available: true,
         saturated: false,
     };
-    let local_call: MetadataNodeCall<MetadataReferencePreflightNodeExecution> = metadata_node_call(
+    let local_call: MetadataNodeCall<ReferenceNodeExecution> = metadata_node_call(
         (),
         move |(), node_id| async move { Ok(result_for(node_id)) },
     );
-    let remote_call: MetadataNodeCall<MetadataReferencePreflightNodeExecution> =
+    let remote_call: MetadataNodeCall<ReferenceNodeExecution> =
         metadata_node_call(failed, move |failed, node_id| async move {
             if node_id == failed {
                 Err(MetadataReadError::Unavailable)
@@ -48,7 +48,7 @@ async fn preflight_fanout_reports() {
         RealmId::from_bytes([19u8; 32]),
         local,
         MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
+            Some(ApiQueryMode::Distributed),
             Some(vec![local, healthy, failed]),
             true,
         ),
@@ -71,7 +71,7 @@ async fn preflight_fanout_reports() {
         RealmId::from_bytes([19u8; 32]),
         local,
         MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
+            Some(ApiQueryMode::Distributed),
             Some(vec![local, healthy, failed]),
             false,
         ),
@@ -92,7 +92,7 @@ fn preflight_cursor_pagination() {
     let node_id = secret.public();
     let hash = [65u8; 32];
     let content_w3id = format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash));
-    let targets = vec![MetadataPreflightResolvedTarget {
+    let targets = vec![MetadataResolvedTarget {
         content_w3id: content_w3id.clone(),
         content_hash: hash,
         queried_iris: vec![content_w3id.clone()],
@@ -100,7 +100,7 @@ fn preflight_cursor_pagination() {
         removed_locations: Vec::new(),
         remove_all_resolvable_locations: false,
     }];
-    let fingerprint = preflight_fingerprint(&targets, Some(MetadataApiQueryMode::Local));
+    let fingerprint = preflight_fingerprint(&targets, Some(ApiQueryMode::Local));
     let hits = (0..3)
         .map(|index| MetadataSearchHit {
             document_id: format!("document-{index}"),
@@ -156,8 +156,8 @@ fn preflight_request(
     realm_id: RealmId,
     content_w3ids: Vec<String>,
     limit: Option<usize>,
-) -> MetadataReferencePreflightRequest {
-    MetadataReferencePreflightRequest {
+) -> ReferenceRequest {
+    ReferenceRequest {
         auth: AuthContext {
             user_id: UserId::nil(realm_id),
             realm_id,
@@ -165,7 +165,7 @@ fn preflight_request(
             session: None,
         },
         bearer_token: None,
-        target: MetadataReferencePreflightTarget::ContentW3ids {
+        target: ReferenceTarget::ContentW3ids {
             content_w3ids,
             remove_all_resolvable_locations: false,
         },
@@ -179,7 +179,7 @@ fn preflight_request(
 }
 
 #[test]
-fn preflight_plan_scopes_and_clamps_limit() {
+fn preflight_plan_limits() {
     let realm_id = RealmId::from_bytes([76u8; 32]);
     let target = || vec![content_w3id([1u8; 32])];
     assert!(matches!(
@@ -194,10 +194,7 @@ fn preflight_plan_scopes_and_clamps_limit() {
         plan_preflight_request(realm_id, preflight_request(realm_id, target(), None))
             .expect("default plan");
     assert_eq!(plan.page_size, METADATA_REFERENCES_DEFAULT_LIMIT);
-    assert!(matches!(
-        target_value,
-        MetadataReferencePreflightTarget::ContentW3ids { .. }
-    ));
+    assert!(matches!(target_value, ReferenceTarget::ContentW3ids { .. }));
     let (plan, _) =
         plan_preflight_request(realm_id, preflight_request(realm_id, target(), Some(0)))
             .expect("zero limit clamps");
@@ -211,7 +208,7 @@ fn preflight_plan_scopes_and_clamps_limit() {
 }
 
 #[tokio::test]
-async fn preflight_stages_reject_invalid_reference_cursor_and_partial_result() {
+async fn preflight_stage_failures() {
     let test = metadata_test();
     let realm_id = RealmId::from_bytes([78u8; 32]);
     let local_node_id = iroh::SecretKey::from_bytes(&[79u8; 32]).public();
@@ -250,7 +247,7 @@ async fn preflight_stages_reject_invalid_reference_cursor_and_partial_result() {
     .await
     .expect("content w3ids resolve without storage");
     plan.cursor = Some("not-a-cursor".to_string());
-    plan.mode = Some(MetadataApiQueryMode::Local);
+    plan.mode = Some(ApiQueryMode::Local);
     let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     assert!(matches!(
         verify_preflight_cursor(
@@ -290,12 +287,12 @@ async fn preflight_stages_reject_invalid_reference_cursor_and_partial_result() {
     )
     .await
     .expect("first page has no cursor");
-    let part = MetadataReferencePreflightNodeExecution {
+    let part = ReferenceNodeExecution {
         visible_references: Vec::new(),
         targets: Vec::new(),
-        freshness: MetadataPreflightNodeFreshness {
+        freshness: MetadataNodeFreshness {
             node_id: local_node_id,
-            index_state: MetadataPreflightIndexState::Current,
+            index_state: MetadataIndexState::Current,
             oldest_status_updated_at_ms: None,
         },
         path_style_endpoint_available: true,

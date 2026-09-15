@@ -1,14 +1,13 @@
 use super::{
-    AuthContext, BlobHeadKey, BucketSearchHit, CursorEnvelopeError, Deserialize, DriverContext,
-    GroupId, HashMap, HashSet, METADATA_DISTRIBUTED_QUERY_DEADLINE,
-    METADATA_DISTRIBUTED_QUERY_MAX_NODES, MetadataApiError, MetadataApiQueryMode,
-    MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall,
-    MetadataReadError, MetadataRealmNodeDiscovery, MetadataSearchHit, NodeId, ObjectInventoryHit,
-    ObjectKeyMatch, ObjectSearchNodePage, RealmId, SearchCursor, SearchCursorError,
-    SearchObjectsInput, Serialize, SignedCursor, SystemTime, deduplicate_fanout_nodes,
-    discover_realm_nodes, fanout_bearer, load_realm_config, map_read_error, metadata_node_call,
-    object_search_fingerprint, query_fingerprint, record_object_result, run_metadata_fanout,
-    search_local_objects, select_fanout_nodes,
+    ApiQueryMode, AuthContext, BlobHeadKey, BucketSearchHit, CursorEnvelopeError, Deserialize,
+    DriverContext, GroupId, HashMap, HashSet, METADATA_DISTRIBUTED_QUERY_DEADLINE,
+    METADATA_DISTRIBUTED_QUERY_MAX_NODES, MetadataApiError, MetadataFanoutOperation,
+    MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataReadError,
+    MetadataSearchHit, NodeId, ObjectInventoryHit, ObjectKeyMatch, RealmId, RealmNodeDiscovery,
+    SearchCursor, SearchCursorError, SearchNodePage, SearchObjectsInput, Serialize, SignedCursor,
+    SystemTime, deduplicate_fanout_nodes, discover_realm_nodes, fanout_bearer, load_realm_config,
+    map_read_error, metadata_node_call, object_search_fingerprint, query_fingerprint,
+    record_object_result, run_metadata_fanout, search_local_objects, select_fanout_nodes,
 };
 
 use super::distributed::run_search_distributed;
@@ -34,7 +33,7 @@ pub struct MetadataSearchRequest {
     pub group_id: Option<GroupId>,
     pub limit: Option<usize>,
     pub cursor: Option<String>,
-    pub mode: Option<MetadataApiQueryMode>,
+    pub mode: Option<ApiQueryMode>,
     pub target_nodes: Option<Vec<NodeId>>,
 }
 
@@ -62,19 +61,17 @@ pub struct BucketSearchExecution {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectSearchQueryMode {
+pub enum ObjectQueryMode {
     Local,
     DistributedBestEffort,
     DistributedStrict,
 }
 
-impl ObjectSearchQueryMode {
-    fn fanout_mode(self) -> MetadataApiQueryMode {
+impl ObjectQueryMode {
+    fn fanout_mode(self) -> ApiQueryMode {
         match self {
-            Self::Local => MetadataApiQueryMode::Local,
-            Self::DistributedBestEffort | Self::DistributedStrict => {
-                MetadataApiQueryMode::Distributed
-            }
+            Self::Local => ApiQueryMode::Local,
+            Self::DistributedBestEffort | Self::DistributedStrict => ApiQueryMode::Distributed,
         }
     }
 
@@ -84,7 +81,7 @@ impl ObjectSearchQueryMode {
 }
 
 #[derive(Debug, Clone)]
-pub struct ObjectSearchRequest {
+pub struct SearchQueryRequest {
     pub auth: AuthContext,
     pub bearer_token: Option<String>,
     pub query: String,
@@ -92,30 +89,30 @@ pub struct ObjectSearchRequest {
     pub bucket: Option<String>,
     pub limit: usize,
     pub cursor: Option<String>,
-    pub mode: ObjectSearchQueryMode,
+    pub mode: ObjectQueryMode,
     pub target_nodes: Option<Vec<NodeId>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ObjectSearchPartitionCoverage {
+pub struct ObjectPartitionCoverage {
     pub node_id: NodeId,
     pub observed_at: SystemTime,
     pub truncated: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct ObjectSearchExecution {
+pub struct ObjectExecution {
     pub hits: Vec<ObjectInventoryHit>,
     pub next_cursor: Option<String>,
     pub as_of: SystemTime,
-    pub partitions: Vec<ObjectSearchPartitionCoverage>,
+    pub partitions: Vec<ObjectPartitionCoverage>,
     pub fanout_stats: MetadataFanoutStats,
     pub omitted_partitions: usize,
     pub complete: bool,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ObjectSearchPartitionState {
+pub(super) struct ObjectPartitionState {
     pub(super) node_id: NodeId,
     pub(super) start_after: Option<Vec<u8>>,
     pub(super) exhausted: bool,
@@ -123,7 +120,7 @@ pub(super) struct ObjectSearchPartitionState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ObjectSearchCursorPartition {
+pub(super) struct ObjectCursorPartition {
     node_id: [u8; 32],
     start_after: Option<Vec<u8>>,
     exhausted: bool,
@@ -131,17 +128,17 @@ pub(super) struct ObjectSearchCursorPartition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ObjectSearchCursorPayload {
+pub(super) struct ObjectCursorPayload {
     pub(super) as_of: SystemTime,
-    pub(super) partitions: Vec<ObjectSearchCursorPartition>,
+    pub(super) partitions: Vec<ObjectCursorPartition>,
     pub(super) failed_partitions: Vec<[u8; 32]>,
     pub(super) discovery_failed: bool,
     pub(super) omitted_partitions: usize,
 }
 
-pub(super) type ObjectSearchCursor = SignedCursor<ObjectSearchCursorPayload>;
+pub(super) type ObjectCursor = SignedCursor<ObjectCursorPayload>;
 
-impl SignedCursor<ObjectSearchCursorPayload> {
+impl SignedCursor<ObjectCursorPayload> {
     pub(super) fn decode(
         raw: &str,
         fingerprint: [u8; 32],
@@ -220,14 +217,12 @@ impl SignedCursor<ObjectSearchCursorPayload> {
         Ok(cursor)
     }
 
-    pub(super) fn partition_states(
-        &self,
-    ) -> Result<Vec<ObjectSearchPartitionState>, MetadataApiError> {
+    pub(super) fn partition_states(&self) -> Result<Vec<ObjectPartitionState>, MetadataApiError> {
         self.payload
             .partitions
             .iter()
             .map(|partition| {
-                Ok(ObjectSearchPartitionState {
+                Ok(ObjectPartitionState {
                     node_id: NodeId::from_bytes(&partition.node_id).map_err(|_| {
                         MetadataApiError::InvalidCursor("invalid object search cursor".to_string())
                     })?,
@@ -255,16 +250,16 @@ impl SignedCursor<ObjectSearchCursorPayload> {
     pub(super) fn new_signed(
         fingerprint: [u8; 32],
         as_of: SystemTime,
-        partitions: &[ObjectSearchPartitionState],
+        partitions: &[ObjectPartitionState],
         failed_partitions: &[NodeId],
         discovery_failed: bool,
         omitted_partitions: usize,
         signer: NodeId,
         sign: impl FnOnce(&[u8]) -> iroh::Signature,
     ) -> Result<Self, postcard::Error> {
-        let partitions: Vec<ObjectSearchCursorPartition> = partitions
+        let partitions: Vec<ObjectCursorPartition> = partitions
             .iter()
-            .map(|partition| ObjectSearchCursorPartition {
+            .map(|partition| ObjectCursorPartition {
                 node_id: *partition.node_id.as_bytes(),
                 start_after: partition.start_after.clone(),
                 exhausted: partition.exhausted,
@@ -279,7 +274,7 @@ impl SignedCursor<ObjectSearchCursorPayload> {
             OBJECT_SEARCH_CURSOR_VERSION,
             OBJECT_SEARCH_CURSOR_SIGNATURE_CONTEXT,
             fingerprint,
-            ObjectSearchCursorPayload {
+            ObjectCursorPayload {
                 as_of,
                 partitions,
                 failed_partitions,
@@ -300,14 +295,14 @@ pub(super) struct ObjectSearchPlan {
     pub(super) bucket: Option<String>,
     pub(super) limit: usize,
     pub(super) cursor: Option<String>,
-    pub(super) mode: ObjectSearchQueryMode,
+    pub(super) mode: ObjectQueryMode,
     pub(super) target_nodes: Option<Vec<NodeId>>,
     pub(super) fingerprint: [u8; 32],
 }
 
 pub(super) struct ObjectSearchPartitions {
     pub(super) as_of: SystemTime,
-    pub(super) partitions: Vec<ObjectSearchPartitionState>,
+    pub(super) partitions: Vec<ObjectPartitionState>,
     pub(super) failed_partitions: Vec<NodeId>,
     pub(super) discovery_failed: bool,
     pub(super) omitted_partitions: usize,
@@ -317,8 +312,8 @@ pub async fn search_objects(
     context: &DriverContext,
     realm_id: RealmId,
     local_node_id: NodeId,
-    request: ObjectSearchRequest,
-) -> Result<ObjectSearchExecution, MetadataApiError> {
+    request: SearchQueryRequest,
+) -> Result<ObjectExecution, MetadataApiError> {
     let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     let plan = plan_object_search(realm_id, request)?;
     let partitions =
@@ -337,7 +332,7 @@ pub async fn search_objects(
 
 pub(super) fn plan_object_search(
     realm_id: RealmId,
-    request: ObjectSearchRequest,
+    request: SearchQueryRequest,
 ) -> Result<ObjectSearchPlan, MetadataApiError> {
     if request.query.is_empty() || request.auth.realm_id != realm_id {
         return Err(if request.query.is_empty() {
@@ -377,94 +372,94 @@ pub(super) async fn resolve_object_partitions(
     plan: &ObjectSearchPlan,
     deadline: tokio::time::Instant,
 ) -> Result<ObjectSearchPartitions, MetadataApiError> {
-    let (as_of, partitions, failed_partitions, discovery_failed, omitted_partitions) = match plan
-        .cursor
-        .as_deref()
-    {
-        Some(raw) => {
-            let authorized_signers = match plan.mode {
-                ObjectSearchQueryMode::Local => vec![local_node_id],
-                ObjectSearchQueryMode::DistributedBestEffort
-                | ObjectSearchQueryMode::DistributedStrict => load_realm_config(context, realm_id)
-                    .await
-                    .ok_or(MetadataApiError::ServiceUnavailable)?
-                    .node_ids()
-                    .map_err(|_| MetadataApiError::ServiceUnavailable)?,
-            };
-            let cursor = ObjectSearchCursor::decode(raw, plan.fingerprint, &authorized_signers)?;
-            let partitions = cursor.partition_states()?;
-            if plan.mode == ObjectSearchQueryMode::Local
-                && (partitions.len() != 1 || partitions[0].node_id != local_node_id)
-            {
-                return Err(MetadataApiError::InvalidCursor(
-                    "invalid local object search cursor".to_string(),
-                ));
-            }
-            (
-                cursor.payload.as_of,
-                partitions,
-                cursor.failed_nodes()?,
-                cursor.payload.discovery_failed,
-                cursor.payload.omitted_partitions,
-            )
-        }
-        None => {
-            let as_of = SystemTime::now();
-            let (mut nodes, discovery_failed) = match plan.mode {
-                ObjectSearchQueryMode::Local => (vec![local_node_id], false),
-                ObjectSearchQueryMode::DistributedBestEffort
-                | ObjectSearchQueryMode::DistributedStrict => match plan.target_nodes.clone() {
-                    Some(nodes) => (deduplicate_fanout_nodes(nodes), false),
-                    None => {
-                        let discovery = tokio::time::timeout_at(
-                            deadline,
-                            discover_realm_nodes(context, realm_id, local_node_id),
-                        )
-                        .await
-                        .unwrap_or(MetadataRealmNodeDiscovery {
-                            nodes: vec![local_node_id],
-                            failed: true,
-                        });
-                        (discovery.nodes, discovery.failed)
+    let (as_of, partitions, failed_partitions, discovery_failed, omitted_partitions) =
+        match plan.cursor.as_deref() {
+            Some(raw) => {
+                let authorized_signers = match plan.mode {
+                    ObjectQueryMode::Local => vec![local_node_id],
+                    ObjectQueryMode::DistributedBestEffort | ObjectQueryMode::DistributedStrict => {
+                        load_realm_config(context, realm_id)
+                            .await
+                            .ok_or(MetadataApiError::ServiceUnavailable)?
+                            .node_ids()
+                            .map_err(|_| MetadataApiError::ServiceUnavailable)?
                     }
-                },
-            };
-            if nodes.is_empty() {
-                return Err(MetadataApiError::ServiceUnavailable);
+                };
+                let cursor = ObjectCursor::decode(raw, plan.fingerprint, &authorized_signers)?;
+                let partitions = cursor.partition_states()?;
+                if plan.mode == ObjectQueryMode::Local
+                    && (partitions.len() != 1 || partitions[0].node_id != local_node_id)
+                {
+                    return Err(MetadataApiError::InvalidCursor(
+                        "invalid local object search cursor".to_string(),
+                    ));
+                }
+                (
+                    cursor.payload.as_of,
+                    partitions,
+                    cursor.failed_nodes()?,
+                    cursor.payload.discovery_failed,
+                    cursor.payload.omitted_partitions,
+                )
             }
-            let omitted_partitions = if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
-                let selected = select_fanout_nodes(&nodes, local_node_id, &plan.fingerprint);
-                let omitted = nodes.len().saturating_sub(selected.len());
-                nodes = selected;
-                omitted
-            } else {
-                0
-            };
-            if plan.mode == ObjectSearchQueryMode::DistributedStrict
-                && (discovery_failed || omitted_partitions > 0)
-            {
-                return Err(MetadataApiError::ServiceUnavailable);
+            None => {
+                let as_of = SystemTime::now();
+                let (mut nodes, discovery_failed) = match plan.mode {
+                    ObjectQueryMode::Local => (vec![local_node_id], false),
+                    ObjectQueryMode::DistributedBestEffort | ObjectQueryMode::DistributedStrict => {
+                        match plan.target_nodes.clone() {
+                            Some(nodes) => (deduplicate_fanout_nodes(nodes), false),
+                            None => {
+                                let discovery = tokio::time::timeout_at(
+                                    deadline,
+                                    discover_realm_nodes(context, realm_id, local_node_id),
+                                )
+                                .await
+                                .unwrap_or(RealmNodeDiscovery {
+                                    nodes: vec![local_node_id],
+                                    failed: true,
+                                });
+                                (discovery.nodes, discovery.failed)
+                            }
+                        }
+                    }
+                };
+                if nodes.is_empty() {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+                let omitted_partitions = if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+                    let selected = select_fanout_nodes(&nodes, local_node_id, &plan.fingerprint);
+                    let omitted = nodes.len().saturating_sub(selected.len());
+                    nodes = selected;
+                    omitted
+                } else {
+                    0
+                };
+                if plan.mode == ObjectQueryMode::DistributedStrict
+                    && (discovery_failed || omitted_partitions > 0)
+                {
+                    return Err(MetadataApiError::ServiceUnavailable);
+                }
+                nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+                (
+                    as_of,
+                    nodes
+                        .into_iter()
+                        .map(|node_id| ObjectPartitionState {
+                            node_id,
+                            start_after: None,
+                            exhausted: false,
+                            observed_at: None,
+                        })
+                        .collect(),
+                    Vec::new(),
+                    discovery_failed,
+                    omitted_partitions,
+                )
             }
-            nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-            (
-                as_of,
-                nodes
-                    .into_iter()
-                    .map(|node_id| ObjectSearchPartitionState {
-                        node_id,
-                        start_after: None,
-                        exhausted: false,
-                        observed_at: None,
-                    })
-                    .collect(),
-                Vec::new(),
-                discovery_failed,
-                omitted_partitions,
-            )
-        }
-    };
+        };
 
-    if plan.mode == ObjectSearchQueryMode::DistributedStrict
+    if plan.mode == ObjectQueryMode::DistributedStrict
         && (discovery_failed || omitted_partitions > 0 || !failed_partitions.is_empty())
     {
         return Err(MetadataApiError::ServiceUnavailable);
@@ -490,7 +485,7 @@ pub(super) async fn run_object_fanout(
     plan: &ObjectSearchPlan,
     partitions: &ObjectSearchPartitions,
     deadline: tokio::time::Instant,
-) -> Result<(Vec<(NodeId, ObjectSearchNodePage)>, MetadataFanoutStats), MetadataApiError> {
+) -> Result<(Vec<(NodeId, SearchNodePage)>, MetadataFanoutStats), MetadataApiError> {
     let active_nodes = partitions
         .partitions
         .iter()
@@ -505,7 +500,7 @@ pub(super) async fn run_object_fanout(
     let remote_auth_token = fanout_bearer(plan.bearer_token.as_deref());
     let handle = context.metadata_handle.clone();
 
-    let local_call: MetadataNodeCall<ObjectSearchNodePage> = metadata_node_call(
+    let local_call: MetadataNodeCall<SearchNodePage> = metadata_node_call(
         (
             context.clone(),
             plan.auth.clone(),
@@ -536,7 +531,7 @@ pub(super) async fn run_object_fanout(
             .map_err(|_| MetadataReadError::Unavailable)
         },
     );
-    let remote_call: MetadataNodeCall<ObjectSearchNodePage> = metadata_node_call(
+    let remote_call: MetadataNodeCall<SearchNodePage> = metadata_node_call(
         (
             handle,
             remote_auth_token,
@@ -590,9 +585,9 @@ pub(super) fn assemble_object_execution(
     context: &DriverContext,
     plan: &ObjectSearchPlan,
     partitions: ObjectSearchPartitions,
-    parts: Vec<(NodeId, ObjectSearchNodePage)>,
+    parts: Vec<(NodeId, SearchNodePage)>,
     mut fanout_stats: MetadataFanoutStats,
-) -> Result<ObjectSearchExecution, MetadataApiError> {
+) -> Result<ObjectExecution, MetadataApiError> {
     let ObjectSearchPartitions {
         as_of,
         mut partitions,
@@ -653,7 +648,7 @@ pub(super) fn assemble_object_execution(
             )
         })?;
         Some(
-            ObjectSearchCursor::new_signed(
+            ObjectCursor::new_signed(
                 plan.fingerprint,
                 as_of,
                 &partitions,
@@ -675,7 +670,7 @@ pub(super) fn assemble_object_execution(
         .filter_map(|partition| {
             partition
                 .observed_at
-                .map(|observed_at| ObjectSearchPartitionCoverage {
+                .map(|observed_at| ObjectPartitionCoverage {
                     node_id: partition.node_id,
                     observed_at,
                     truncated: !partition.exhausted,
@@ -687,7 +682,7 @@ pub(super) fn assemble_object_execution(
     fanout_stats.nodes_failed =
         fanout_stats.failed_partitions.len() + omitted_partitions + usize::from(discovery_failed);
     let complete = fanout_stats.nodes_failed == 0;
-    Ok(ObjectSearchExecution {
+    Ok(ObjectExecution {
         hits,
         next_cursor,
         as_of,
@@ -736,9 +731,9 @@ pub async fn search_metadata(
     let (watermark, resume) = match request.cursor.as_deref() {
         Some(raw) => {
             // Check the full realm because capped fan-out may omit the cursor's signer.
-            let signer_nodes = match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
-                MetadataApiQueryMode::Local => vec![local_node_id],
-                MetadataApiQueryMode::Distributed => match request.target_nodes.as_ref() {
+            let signer_nodes = match request.mode.unwrap_or(ApiQueryMode::Distributed) {
+                ApiQueryMode::Local => vec![local_node_id],
+                ApiQueryMode::Distributed => match request.target_nodes.as_ref() {
                     Some(nodes) => {
                         let mut signers = nodes.clone();
                         signers.push(local_node_id);
@@ -750,7 +745,7 @@ pub async fn search_metadata(
                             discover_realm_nodes(context, realm_id, local_node_id),
                         )
                         .await
-                        .unwrap_or(MetadataRealmNodeDiscovery {
+                        .unwrap_or(RealmNodeDiscovery {
                             nodes: vec![local_node_id],
                             failed: true,
                         });
@@ -785,9 +780,9 @@ pub async fn search_metadata(
     let (target_nodes, discovery_failed) = if request.cursor.is_some() {
         let mut nodes = match request.target_nodes.as_ref() {
             Some(nodes) => select_fanout_nodes(nodes, local_node_id, &fingerprint),
-            None => match request.mode.unwrap_or(MetadataApiQueryMode::Distributed) {
-                MetadataApiQueryMode::Local => vec![local_node_id],
-                MetadataApiQueryMode::Distributed => cursor_discovery
+            None => match request.mode.unwrap_or(ApiQueryMode::Distributed) {
+                ApiQueryMode::Local => vec![local_node_id],
+                ApiQueryMode::Distributed => cursor_discovery
                     .as_ref()
                     .map(|discovery| discovery.nodes.clone())
                     .unwrap_or_else(|| vec![local_node_id]),

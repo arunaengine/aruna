@@ -33,7 +33,7 @@ async fn bucket_fanout_partial() {
         RealmId::from_bytes([9u8; 32]),
         local,
         MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
+            Some(ApiQueryMode::Distributed),
             Some(vec![local, healthy, failed]),
             true,
         ),
@@ -81,9 +81,9 @@ async fn object_fanout_reports() {
         RealmId::from_bytes([19u8; 32]),
         local,
         MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
+            Some(ApiQueryMode::Distributed),
             Some(vec![local, healthy, failed]),
-            ObjectSearchQueryMode::DistributedBestEffort.allow_partial(),
+            ObjectQueryMode::DistributedBestEffort.allow_partial(),
         ),
         MetadataFanoutOperation::ObjectSearch,
         local_call,
@@ -125,9 +125,9 @@ async fn object_fanout_strict() {
         RealmId::from_bytes([20u8; 32]),
         local,
         MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
+            Some(ApiQueryMode::Distributed),
             Some(vec![local, failed]),
-            ObjectSearchQueryMode::DistributedStrict.allow_partial(),
+            ObjectQueryMode::DistributedStrict.allow_partial(),
         ),
         MetadataFanoutOperation::ObjectSearch,
         local_call,
@@ -169,7 +169,7 @@ async fn bucket_denial_wins() {
         RealmId::from_bytes([12u8; 32]),
         local,
         MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
+            Some(ApiQueryMode::Distributed),
             Some(vec![local, denied]),
             true,
         ),
@@ -212,7 +212,7 @@ async fn fanout_missing_fails() {
         RealmId::from_bytes([11u8; 32]),
         local,
         MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
+            Some(ApiQueryMode::Distributed),
             Some(vec![local, stale]),
             true,
         ),
@@ -258,7 +258,7 @@ async fn search_deadline_partial() {
         RealmId::from_bytes([10u8; 32]),
         local,
         MetadataFanoutScope::new(
-            Some(MetadataApiQueryMode::Distributed),
+            Some(ApiQueryMode::Distributed),
             Some(vec![local, healthy, hanging]),
             true,
         ),
@@ -301,7 +301,7 @@ async fn capped_fanout_incomplete() {
         &context,
         RealmId::from_bytes([13u8; 32]),
         local,
-        MetadataFanoutScope::new(Some(MetadataApiQueryMode::Distributed), Some(nodes), false),
+        MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), Some(nodes), false),
         MetadataFanoutOperation::Search,
         local_call,
         remote_call,
@@ -313,8 +313,8 @@ async fn capped_fanout_incomplete() {
     assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
 }
 
-fn object_search_request(realm_id: RealmId, query: &str, limit: usize) -> ObjectSearchRequest {
-    ObjectSearchRequest {
+fn object_search_request(realm_id: RealmId, query: &str, limit: usize) -> SearchQueryRequest {
+    SearchQueryRequest {
         auth: AuthContext {
             user_id: UserId::nil(realm_id),
             realm_id,
@@ -327,13 +327,13 @@ fn object_search_request(realm_id: RealmId, query: &str, limit: usize) -> Object
         bucket: None,
         limit,
         cursor: None,
-        mode: ObjectSearchQueryMode::Local,
+        mode: ObjectQueryMode::Local,
         target_nodes: None,
     }
 }
 
 #[test]
-fn object_search_plan_scopes_and_clamps_limit() {
+fn search_plan_limits() {
     let realm_id = RealmId::from_bytes([70u8; 32]);
     assert!(matches!(
         plan_object_search(realm_id, object_search_request(realm_id, "", 10)),
@@ -362,7 +362,7 @@ fn object_search_plan_scopes_and_clamps_limit() {
 }
 
 #[test]
-fn object_search_assembly_keeps_partition_order_and_empty_pages() {
+fn search_assembly_order() {
     let realm_id = RealmId::from_bytes([72u8; 32]);
     let test = metadata_test();
     let first = iroh::SecretKey::from_bytes(&[73u8; 32]).public();
@@ -380,20 +380,20 @@ fn object_search_assembly_keeps_partition_order_and_empty_pages() {
         bucket: None,
         limit: 10,
         cursor: None,
-        mode: ObjectSearchQueryMode::DistributedBestEffort,
+        mode: ObjectQueryMode::DistributedBestEffort,
         target_nodes: None,
         fingerprint: [7u8; 32],
     };
     let partitions = ObjectSearchPartitions {
         as_of: SystemTime::UNIX_EPOCH,
         partitions: vec![
-            ObjectSearchPartitionState {
+            ObjectPartitionState {
                 node_id: first,
                 start_after: None,
                 exhausted: false,
                 observed_at: None,
             },
-            ObjectSearchPartitionState {
+            ObjectPartitionState {
                 node_id: second,
                 start_after: None,
                 exhausted: false,
@@ -404,10 +404,10 @@ fn object_search_assembly_keeps_partition_order_and_empty_pages() {
         discovery_failed: false,
         omitted_partitions: 0,
     };
-    let page = |node_id, key: Option<&str>| ObjectSearchNodePage {
+    let page = |node_id, key: Option<&str>| SearchNodePage {
         hits: key
             .map(|key| {
-                vec![crate::s3::search_objects::ObjectSearchNodeHit {
+                vec![crate::s3::search_objects::SearchNodeHit {
                     hit: ObjectInventoryHit {
                         node_id,
                         group_id: Ulid::nil(),
