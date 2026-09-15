@@ -1,10 +1,6 @@
-//! Ordered shutdown for the storage handle: refuse new work, drain admitted
-//! work (including deferred cleanup and drop aborts), fence anything still
-//! queued, sync the backend, then join the worker.
-//!
-//! The application drives the order through these methods; each one stays
-//! independent so a caller can bound any phase without collapsing the rest.
-//! `close` is last because it releases the worker and the file lock.
+//! Ordered shutdown for the storage handle: refuse new work, drain admitted work
+//! (including deferred cleanup and drop aborts), fence what is still queued, sync
+//! the backend, then join the worker. `close` is last; it releases the file lock.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};

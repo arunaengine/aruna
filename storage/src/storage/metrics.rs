@@ -1,7 +1,6 @@
 //! Storage counters and in-flight accounting, including the close/drain
 //! guarantees they latch. The handle reads these atomics and the worker sets
-//! them, so the backlog, fence, and rejection decisions stay observable after
-//! the worker exits.
+//! them, so backlog and fence decisions stay observable after the worker exits.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};

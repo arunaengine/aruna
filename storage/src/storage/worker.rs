@@ -1,10 +1,6 @@
 //! The storage worker: the single write actor, grouped writes, per-lane read
-//! pools, and the worker-side transaction table.
-//!
-//! The handle owns admission and cleanup bookkeeping; this side executes
-//! effects in lane order (foreground, bulk, with abort priority contractual at
-//! the handle) and reports every outcome through the reply token. Lane choice
-//! stays in `LaneScheduler`; effects never share one queue.
+//! pools, and the worker-side transaction table. Lane choice stays in
+//! `LaneScheduler`; every outcome is reported through the reply token.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included, Unbounded};

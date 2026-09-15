@@ -1,7 +1,6 @@
-//! Persistence policy and the journal/commit durability points that carry
-//! each commit acknowledgement. The policy type stays with the code that
-//! applies it, and commit acknowledgement keeps reporting conflicts
-//! distinctly from unknown commit failures.
+//! Persistence policy and the journal/commit durability points that carry each
+//! commit acknowledgement, which keeps reporting conflicts distinctly from
+//! unknown commit failures.
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FjallPersistPolicy {

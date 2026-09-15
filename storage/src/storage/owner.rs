@@ -1,9 +1,6 @@
-//! Cancellation-safe ownership for manually driven storage transactions.
-//!
-//! `finish`, `unknown`, and `Drop` are the only ways ownership ends, and each
-//! maps to one cleanup-registry transition: terminal release, retained unknown
-//! commit, or abort-on-drop. Cleanup registration itself stays in the handle so
-//! every outcome keeps its existing meaning.
+//! Cancellation-safe ownership for manually driven storage transactions: `finish`,
+//! `unknown`, and `Drop` are the only ways ownership ends, each mapping to one
+//! cleanup-registry transition. Cleanup registration itself stays in the handle.
 
 use tracing::warn;
 use ulid::Ulid;

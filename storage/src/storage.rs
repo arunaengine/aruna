@@ -1,15 +1,6 @@
 //! The Fjall-backed storage handle, its worker, and transaction ownership.
-//!
-//! This file is the facade: the public surface is re-exported here while the
-//! behavior lives in focused modules:
-//!
-//! - `handle`: lane admission, close/drain fences, cleanup registry, replies
-//! - `owner`: cancellation-safe ownership of manually driven transactions
-//! - `worker`: the write actor, lane scheduling, grouped writes, read pools
-//! - `lifecycle`: open/close of the backend and its pools
-//! - `persistence`: persist policy and journal/commit durability
-//! - `metrics`: counters and the close/drain guarantees they latch
-//! - `telemetry`: effect/event spans and stable kind names
+//! This file is the facade: behavior lives in focused modules (`handle`, `owner`,
+//! `worker`, `lifecycle`, `persistence`, `metrics`, `telemetry`) re-exported here.
 
 mod handle;
 mod lifecycle;
