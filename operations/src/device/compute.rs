@@ -320,9 +320,9 @@ async fn resolve_local(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::records::payload;
+    use crate::tests::records::payload;
     use aruna_core::compute::{AttemptStatus, BackendError, FenceContext};
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::LaunchDecline;
     use aruna_core::events::{Event, StorageEvent};
@@ -374,7 +374,7 @@ mod tests {
             user_id: UserId::nil(REALM),
             realm_id: REALM,
         };
-        let target = DocumentSyncTarget::RealmConfig { realm_id: REALM };
+        let target = DocumentTarget::RealmConfig { realm_id: REALM };
         let event = ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -628,7 +628,7 @@ mod tests {
     async fn refuses_device_launch() {
         // The realm's own launch path declines a device whatever it advertises,
         // so local compute never becomes a dispatch target.
-        use crate::tests::fixtures::records::Family;
+        use crate::tests::records::Family;
         let dir = tempdir().unwrap();
         let ctx = test_ctx(dir.path().to_str().unwrap());
         let local = node(1);
