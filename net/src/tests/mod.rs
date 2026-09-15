@@ -918,7 +918,9 @@ async fn teardown_after_drain() -> Result<()> {
 
     let complete = handle.shutdown_with_drain(Duration::from_millis(100)).await;
 
-    assert!(!complete);
+    assert!(!complete.complete());
+    assert_eq!(complete.inbound_pending_at_deadline, 1);
+    assert_eq!(complete.inbound_pending, 1);
     assert!(handle.inner.shutdown.is_cancelled());
     assert!(handle.inner.accept_shutdown.is_cancelled());
     assert!(handle.inner.tasks.lock().await.is_empty());
@@ -976,7 +978,10 @@ async fn interrupted_shutdown_resumes_and_releases_children_once() -> Result<()>
     release.add_permits(1);
     let complete = handle.shutdown_with_drain(Duration::from_millis(10)).await;
 
-    assert!(complete, "the resumed shutdown joins the released child");
+    assert!(
+        complete.complete(),
+        "the resumed shutdown joins the released child"
+    );
     assert_eq!(completed.load(Ordering::SeqCst), 1);
     assert!(handle.inner.tasks.lock().await.is_empty());
     Ok(())
@@ -999,12 +1004,15 @@ async fn repeated_shutdown_joins_retained_children() -> Result<()> {
     });
 
     let first = handle.shutdown_with_drain(Duration::from_millis(10)).await;
-    assert!(!first, "the blocked child outlives the first forced drain");
+    assert!(
+        !first.complete(),
+        "the blocked child outlives the first forced drain"
+    );
     assert!(!stopped.load(Ordering::SeqCst));
 
     release_tx.send(()).expect("the child still waits");
     let second = handle.shutdown_with_drain(Duration::from_millis(100)).await;
-    assert!(second, "the later call joins the released child");
+    assert!(second.complete(), "the later call joins the released child");
     assert!(stopped.load(Ordering::SeqCst));
     Ok(())
 }

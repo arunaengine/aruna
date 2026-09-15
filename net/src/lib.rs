@@ -2,15 +2,9 @@
 #![deny(unsafe_code)]
 #![recursion_limit = "256"]
 
-//! The node networking layer: peer state, DHT, document sync, and the
-//! network handle the rest of the node drives through effects.
-//!
-//! The module map is short on purpose. `config` owns operator settings;
-//! `construction` binds the endpoint and starts services and background loops
-//! in order; `connectivity` maintains peer refresh; `discovery` resolves
-//! DHT-signed endpoints and persisted peers; `eviction` maintains the
-//! document-sync eviction journal; `tasks` owns every spawned loop; and the
-//! handle's public operations live in this file.
+//! The node networking layer: peer state, DHT, document sync, and the network
+//! handle the rest of the node drives through effects. Each subsystem lives in
+//! its own module; the handle's public operations live in this file.
 
 mod config;
 mod connection_pool;
@@ -156,6 +150,26 @@ impl std::fmt::Debug for NetHandle {
         f.debug_struct("NetHandle")
             .field("node_id", &self.inner.node_id)
             .finish()
+    }
+}
+
+/// What one attempt at the network shutdown boundary accomplished. The handle
+/// retains every unfinished owner, so an incomplete outcome can be resumed and
+/// is never proof that work admitted before closure ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetShutdownOutcome {
+    /// Inbound handlers still running when the soft drain deadline expired.
+    pub inbound_pending_at_deadline: usize,
+    /// Accepted effect futures that did not finish before the final join.
+    pub effects_pending: usize,
+    /// Inbound handlers that did not finish before the final join.
+    pub inbound_pending: usize,
+}
+
+impl NetShutdownOutcome {
+    /// True only when the endpoint closed and every tracked child joined.
+    pub fn complete(&self) -> bool {
+        self.effects_pending == 0 && self.inbound_pending == 0
     }
 }
 
@@ -758,28 +772,18 @@ impl NetHandle {
         self.shutdown_with_drain(DEFAULT_INBOUND_DRAIN).await;
     }
 
-    /// Stops accepting inbound streams and rejects further inbound handlers,
-    /// without waiting for the ones in flight or tearing the endpoint down.
-    /// This is the inbound boundary only: outgoing effects stay available so
-    /// earlier writer drains can still use the network, until
-    /// [`Self::shutdown_with_drain`] reaches final closure. Closing a tracker
-    /// only lets its wait finish; it does not reject insertions, so callers
-    /// must still join the dispatchers before trusting the tracker.
+    /// Stops accepting inbound streams and further handlers without waiting for
+    /// in-flight ones or tearing the endpoint down: outgoing effects stay until
+    /// final closure. A closed tracker only lets `wait` finish, never rejects.
     pub fn close_admission(&self) {
         self.inner.accept_shutdown.cancel();
         self.inner.inbound_tasks.close();
     }
 
-    /// Stops inbound admission, gives handlers that are already running up to
-    /// `drain` to finish while the endpoint is still usable, then closes the
-    /// outgoing-effect boundary, tears the transport down, and joins every
-    /// child, including accepted effect futures. Returns whether every tracked
-    /// child completed before its forced bound.
-    ///
-    /// The sequence is resumable: an interrupted call leaves every unfinished
-    /// owner retained, and a later call retries the joins. A cancelled token is
-    /// never treated as proof that a child finished.
-    pub async fn shutdown_with_drain(&self, drain: Duration) -> bool {
+    /// Stops inbound admission, gives running handlers up to `drain`, then
+    /// closes the effect boundary, tears down, and joins every child. A timed
+    /// out phase stays owned and is retried; cancellation never proves the end.
+    pub async fn shutdown_with_drain(&self, drain: Duration) -> NetShutdownOutcome {
         // The inbound boundary closes first, while outgoing effects stay
         // available for the writer drains ahead of the network phase.
         self.close_admission();
@@ -787,17 +791,18 @@ impl NetHandle {
             tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
                 .await
                 .is_ok();
+        let inbound_pending_at_deadline = self.inner.inbound_tasks.len();
         if !inbound_drained_before_teardown {
             warn!(
-                pending = self.inner.inbound_tasks.len(),
+                pending = inbound_pending_at_deadline,
                 drain_ms = drain.as_millis(),
                 "Inbound stream handlers outlived the drain deadline; closing the endpoint under them"
             );
         }
 
         // Final closure of the outgoing-effect boundary. The dispatcher settles
-        // every effect already buffered in the channel under the tracker before
-        // its receiver drops, and later submissions fail closed.
+        // every buffered effect and outstanding send reservation under the
+        // tracker before its receiver drops, and later submissions fail closed.
         self.inner.shutdown.cancel();
         self.inner.effect_tasks.close();
 
@@ -830,20 +835,25 @@ impl NetHandle {
             tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.effect_tasks.wait()),
             tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.inbound_tasks.wait()),
         );
+        let effects_pending = self.inner.effect_tasks.len();
         if effects_drained.is_err() {
             warn!(
-                pending = self.inner.effect_tasks.len(),
+                pending = effects_pending,
                 "Gave up joining accepted effect futures during shutdown"
             );
         }
-        let inbound_drained = inbound_drained.is_ok();
-        if !inbound_drained {
+        let inbound_pending = self.inner.inbound_tasks.len();
+        if inbound_drained.is_err() {
             warn!(
-                pending = self.inner.inbound_tasks.len(),
+                pending = inbound_pending,
                 "Gave up joining inbound stream handlers during shutdown"
             );
         }
-        effects_drained.is_ok() && inbound_drained
+        NetShutdownOutcome {
+            inbound_pending_at_deadline,
+            effects_pending,
+            inbound_pending,
+        }
     }
 
     pub async fn get_status(&self) -> NetState {
