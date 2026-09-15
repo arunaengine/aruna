@@ -1,7 +1,7 @@
 use crate::NodeId;
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::realm::RealmId;
+use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -9,14 +9,14 @@ use ulid::Ulid;
 /// What a node-local delete removed. Markers and version deletes name one
 /// object; a purge names the scope the job cleared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BlobDeleteAuditKind {
+pub enum BlobAuditKind {
     DeleteMarker,
     DeleteVersion,
-    Purge(BlobPurgeScopeKind),
+    Purge(BlobPurgeKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BlobPurgeScopeKind {
+pub enum BlobPurgeKind {
     File,
     Prefix,
     Bucket,
@@ -25,12 +25,12 @@ pub enum BlobPurgeScopeKind {
 /// One node-local S3 deletion, written in the same transaction as the delete it
 /// records. Deletes never propagate, so this trail is node-local as well.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlobDeleteAuditRecord {
+pub struct BlobAuditRecord {
     pub realm_id: RealmId,
     pub group_id: GroupId,
     pub node_id: NodeId,
     pub user_id: UserId,
-    pub kind: BlobDeleteAuditKind,
+    pub kind: BlobAuditKind,
     pub bucket: String,
     /// Object key for a marker or version delete, the purged prefix or key for a
     /// scoped purge, and empty when a whole bucket was purged.
@@ -41,7 +41,7 @@ pub struct BlobDeleteAuditRecord {
     pub occurred_at_ms: u64,
 }
 
-impl BlobDeleteAuditRecord {
+impl BlobAuditRecord {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }

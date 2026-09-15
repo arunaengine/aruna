@@ -1,7 +1,7 @@
 use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::blob::checked_refs;
 use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};
+use crate::structs::storage::blob::checked_refs;
 use crate::structs::{BackendLocation, BackendRef, PlacementPolicyError, PlacementPolicyRef};
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ impl MultipartChecksumType {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct MultipartUploadChecksumHint {
+pub struct MultipartChecksumHint {
     pub algorithm: Option<ChecksumAlgorithm>,
     pub checksum_type: MultipartChecksumType,
 }
@@ -60,7 +60,7 @@ pub struct MultipartUpload {
     pub created_by: UserId,
     pub created_at: SystemTime,
     pub status: MultipartUploadStatus,
-    pub checksum_hint: Option<MultipartUploadChecksumHint>,
+    pub checksum_hint: Option<MultipartChecksumHint>,
     pub metadata: HashMap<String, String>,
     /// Refs inherited from the sources parts were copied from, canonically
     /// sorted. The completed object unions them with the destination default,
@@ -122,12 +122,12 @@ impl MultipartUpload {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct MultipartUploadPartKey {
+pub struct MultipartPartKey {
     pub upload_id: Ulid,
     pub part_number: u16,
 }
 
-impl MultipartUploadPartKey {
+impl MultipartPartKey {
     pub fn new(upload_id: Ulid, part_number: u16) -> Self {
         Self {
             upload_id,
@@ -149,13 +149,13 @@ impl MultipartUploadPartKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct MultipartUploadPart {
+pub struct MultipartPart {
     pub part_number: u16,
     pub location: BackendLocation,
     pub created_at: SystemTime,
 }
 
-impl MultipartUploadPart {
+impl MultipartPart {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -170,12 +170,12 @@ impl MultipartUploadPart {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum MultipartObjectMetadataKey {
+pub enum MultipartObjectKey {
     Summary { version_id: Ulid },
     Part { version_id: Ulid, part_number: u16 },
 }
 
-impl MultipartObjectMetadataKey {
+impl MultipartObjectKey {
     pub fn summary(version_id: Ulid) -> Self {
         Self::Summary { version_id }
     }
@@ -269,7 +269,7 @@ impl MultipartObjectPart {
 
 #[cfg(test)]
 mod test {
-    use super::{MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectSummary};
+    use super::{MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use ulid::Ulid;
@@ -278,17 +278,15 @@ mod test {
     #[test]
     fn prefix_covers_version() {
         let version_id = Ulid::generate();
-        let prefix = MultipartObjectMetadataKey::part_prefix(version_id).unwrap();
+        let prefix = MultipartObjectKey::part_prefix(version_id).unwrap();
 
         // The prefix must be the part key with the fixed part-number suffix stripped.
-        let zero_part = MultipartObjectMetadataKey::part(version_id, 0)
-            .to_bytes()
-            .unwrap();
+        let zero_part = MultipartObjectKey::part(version_id, 0).to_bytes().unwrap();
         assert_eq!(prefix.as_slice(), &zero_part[..zero_part.len() - 1]);
 
         // Every part key for this version shares the prefix, across part numbers.
         for part_number in [0u16, 1, 127, 128, 255, 256, 65535] {
-            let part_key = MultipartObjectMetadataKey::part(version_id, part_number)
+            let part_key = MultipartObjectKey::part(version_id, part_number)
                 .to_bytes()
                 .unwrap();
             assert!(
@@ -298,13 +296,11 @@ mod test {
         }
 
         // The summary key must not be captured by the part prefix.
-        let summary_key = MultipartObjectMetadataKey::summary(version_id)
-            .to_bytes()
-            .unwrap();
+        let summary_key = MultipartObjectKey::summary(version_id).to_bytes().unwrap();
         assert!(!summary_key.starts_with(&prefix));
 
         // A different version must not be captured by this version's prefix.
-        let other_key = MultipartObjectMetadataKey::part(Ulid::generate(), 0)
+        let other_key = MultipartObjectKey::part(Ulid::generate(), 0)
             .to_bytes()
             .unwrap();
         assert!(!other_key.starts_with(&prefix));
@@ -320,26 +316,22 @@ mod test {
         let first = Ulid::from_bytes(first_bytes);
         let second = Ulid::from_bytes(second_bytes);
 
-        let first_prefix = MultipartObjectMetadataKey::part_prefix(first).unwrap();
-        let second_prefix = MultipartObjectMetadataKey::part_prefix(second).unwrap();
+        let first_prefix = MultipartObjectKey::part_prefix(first).unwrap();
+        let second_prefix = MultipartObjectKey::part_prefix(second).unwrap();
         assert_ne!(first_prefix, second_prefix);
 
-        let second_part = MultipartObjectMetadataKey::part(second, 1)
-            .to_bytes()
-            .unwrap();
+        let second_part = MultipartObjectKey::part(second, 1).to_bytes().unwrap();
         assert!(!second_part.starts_with(&first_prefix));
-        let second_summary = MultipartObjectMetadataKey::summary(second)
-            .to_bytes()
-            .unwrap();
+        let second_summary = MultipartObjectKey::summary(second).to_bytes().unwrap();
         assert!(!second_summary.starts_with(&first_prefix));
     }
 
     #[test]
     fn prefix_spans_parts() {
         let version_id = Ulid::from_bytes([3u8; 16]);
-        let prefix = MultipartObjectMetadataKey::part_prefix(version_id).unwrap();
+        let prefix = MultipartObjectKey::part_prefix(version_id).unwrap();
         for part_number in [0u16, 1, 127, 128, 255, 256, 65535] {
-            let key = MultipartObjectMetadataKey::part(version_id, part_number)
+            let key = MultipartObjectKey::part(version_id, part_number)
                 .to_bytes()
                 .unwrap();
             assert!(
@@ -347,44 +339,39 @@ mod test {
                 "part {part_number} missing prefix"
             );
         }
-        let summary = MultipartObjectMetadataKey::summary(version_id)
-            .to_bytes()
-            .unwrap();
+        let summary = MultipartObjectKey::summary(version_id).to_bytes().unwrap();
         assert!(!summary.starts_with(&prefix));
     }
 
     #[test]
     fn key_round_trips() {
         let version_id = Ulid::from_bytes([9u8; 16]);
-        let summary = MultipartObjectMetadataKey::summary(version_id);
+        let summary = MultipartObjectKey::summary(version_id);
         assert_eq!(
-            MultipartObjectMetadataKey::from_bytes(&summary.to_bytes().unwrap()).unwrap(),
+            MultipartObjectKey::from_bytes(&summary.to_bytes().unwrap()).unwrap(),
             summary
         );
         for part_number in [0u16, 1, 65535] {
-            let part = MultipartObjectMetadataKey::part(version_id, part_number);
+            let part = MultipartObjectKey::part(version_id, part_number);
             assert_eq!(
-                MultipartObjectMetadataKey::from_bytes(&part.to_bytes().unwrap()).unwrap(),
+                MultipartObjectKey::from_bytes(&part.to_bytes().unwrap()).unwrap(),
                 part
             );
         }
-        assert!(MultipartObjectMetadataKey::from_bytes(&[]).is_err());
-        assert!(MultipartObjectMetadataKey::from_bytes(&[9u8; 5]).is_err());
+        assert!(MultipartObjectKey::from_bytes(&[]).is_err());
+        assert!(MultipartObjectKey::from_bytes(&[9u8; 5]).is_err());
     }
 
     #[test]
     fn keys_keep_legacy() {
         let version_id = Ulid::from_bytes([9u8; 16]);
         for key in [
-            MultipartObjectMetadataKey::summary(version_id),
-            MultipartObjectMetadataKey::part(version_id, 256),
+            MultipartObjectKey::summary(version_id),
+            MultipartObjectKey::part(version_id, 256),
         ] {
             let legacy_bytes = postcard::to_allocvec(&key).unwrap();
             assert_eq!(key.to_bytes().unwrap(), legacy_bytes);
-            assert_eq!(
-                MultipartObjectMetadataKey::from_bytes(&legacy_bytes).unwrap(),
-                key
-            );
+            assert_eq!(MultipartObjectKey::from_bytes(&legacy_bytes).unwrap(), key);
         }
     }
 
