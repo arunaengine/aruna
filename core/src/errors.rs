@@ -121,7 +121,7 @@ pub enum StagingSourceError {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum SourceConnectorResolutionError {
+pub enum SourceResolutionError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]

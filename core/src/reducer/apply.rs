@@ -7,18 +7,18 @@ mod realm;
 mod transition;
 mod user;
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub fn apply(
         &mut self,
         event: &AdminDocumentEvent,
-    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
         if event.target != self.target {
-            return Err(AdminDocumentReducerError::TargetMismatch);
+            return Err(AdminDocumentError::TargetMismatch);
         }
         // Duplicate event IDs cannot overwrite the first event, so equivocation gains nothing.
         // Admission, rather than reduction, retains the evidence.
         if self.applied_event_ids.contains(&event.event_id) {
-            return Ok(AdminDocumentApplyStatus::Duplicate);
+            return Ok(AdminApplyStatus::Duplicate);
         }
         let stale_on_all_paths = !matches!(
             &event.op,
@@ -43,11 +43,11 @@ impl AdminDocumentReducerState {
         if stale_on_all_paths {
             self.applied_event_ids.insert(event.event_id);
             self.clock.advance(event.origin_node_id, event.origin_seq);
-            return Ok(AdminDocumentApplyStatus::StaleOriginSequence);
+            return Ok(AdminApplyStatus::StaleOriginSequence);
         }
 
         self.clock.advance(event.origin_node_id, event.origin_seq);
-        if apply_status != AdminDocumentApplyStatus::Redundant {
+        if apply_status != AdminApplyStatus::Redundant {
             self.applied_event_ids.insert(event.event_id);
         }
         Ok(apply_status)
@@ -56,7 +56,7 @@ impl AdminDocumentReducerState {
     fn apply_event(
         &mut self,
         event: &AdminDocumentEvent,
-    ) -> Result<AdminDocumentApplyStatus, AdminDocumentReducerError> {
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.target {
             AdminDocumentTarget::Group { group_id } => self.apply_group(event, group_id),
             AdminDocumentTarget::Realm { .. } => self.apply_realm(event),

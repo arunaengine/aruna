@@ -3,7 +3,7 @@ use crate::effects::{
     FetchCursor, FrameBoundsError, JobRecordFrame, MAX_JOB_RECORD_PAGE, MAX_JOB_RECORD_PAGE_BYTES,
     ReceiptFrame, encoded_len,
 };
-use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
+use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{
@@ -13,7 +13,7 @@ use crate::structs::{
     SourceMetadata,
 };
 use crate::{
-    document::DocumentSyncNetEvent,
+    document::DocumentNetEvent,
     errors::{AuthorizationError, DhtError, StorageError, StreamError},
     id::{DhtKeyId, NodeId},
     jobs::JobResponse,
@@ -53,10 +53,10 @@ pub enum SubOperationEvent {
         result: Result<(), String>,
     },
     SourceConnectorResolved {
-        result: Box<Result<ResolvedSourceConnector, SourceConnectorResolutionError>>,
+        result: Box<Result<ResolvedSourceConnector, SourceResolutionError>>,
     },
     VersionSourceAccessResolved {
-        result: Result<ResolvedSourceAccess, SourceConnectorResolutionError>,
+        result: Result<ResolvedSourceAccess, SourceResolutionError>,
     },
     ReplicationItemResult {
         result: Result<ReplicationSuboperationResult, ReplicationItemError>,
@@ -242,7 +242,7 @@ pub enum StorageEvent {
 #[derive(Debug, PartialEq)]
 pub enum NetEvent {
     Dht(DhtEvent),
-    DocumentSync(DocumentSyncNetEvent),
+    DocumentSync(DocumentNetEvent),
     Stream(StreamEvent),
     JobControl(JobControlEvent),
     AuditPages(AuditPageBatch),
@@ -493,7 +493,7 @@ pub enum NetError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::fixtures::effects::sized_envelope;
+    use crate::tests::effects::sized_envelope;
 
     fn frame(objects: usize, key_bytes: usize) -> JobRecordFrame {
         JobRecordFrame::new(sized_envelope(objects, key_bytes)).expect("bounded record")
