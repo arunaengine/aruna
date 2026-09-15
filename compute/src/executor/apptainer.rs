@@ -986,7 +986,7 @@ async fn read_log(path: &Path, limits: &LogLimits) -> Result<(Vec<u8>, u64, bool
         }
         Err(error) => return Err(io_error(error)),
     };
-    let mut tail = BoundedTail::new(limits.max_bytes_per_stream);
+    let mut tail = BoundedTail::new(limits.max_stream_bytes);
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let count = file.read(&mut buffer).await.map_err(io_error)?;

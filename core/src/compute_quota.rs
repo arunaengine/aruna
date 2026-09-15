@@ -259,12 +259,16 @@ pub struct ComputeQuota {
     pub max_cpu_cores: Option<u64>,
     pub max_ram_bytes: Option<u64>,
     pub max_disk_bytes: Option<u64>,
-    pub max_job_cpu_cores: Option<u32>,
-    pub max_job_ram_bytes: Option<u64>,
-    pub max_job_disk_bytes: Option<u64>,
+    #[serde(rename = "max_job_cpu_cores")]
+    pub job_cpu_cores: Option<u32>,
+    #[serde(rename = "max_job_ram_bytes")]
+    pub job_ram_bytes: Option<u64>,
+    #[serde(rename = "max_job_disk_bytes")]
+    pub job_disk_bytes: Option<u64>,
     /// Per-job walltime bound stored in the request, not an assertion about
     /// any clock: nothing is cancelled because this quota later changed.
-    pub max_job_walltime_ms: Option<u64>,
+    #[serde(rename = "max_job_walltime_ms")]
+    pub job_walltime_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,22 +311,22 @@ pub fn admits(
 ) -> Result<(), QuotaDenied> {
     let cpu = u64::from(request.cpu_cores);
     per_job(
-        quota.max_job_cpu_cores.map(u64::from),
+        quota.job_cpu_cores.map(u64::from),
         cpu,
         QuotaDimension::CpuCores,
     )?;
     per_job(
-        quota.max_job_ram_bytes,
+        quota.job_ram_bytes,
         request.ram_bytes,
         QuotaDimension::RamBytes,
     )?;
     per_job(
-        quota.max_job_disk_bytes,
+        quota.job_disk_bytes,
         request.disk_bytes,
         QuotaDimension::DiskBytes,
     )?;
     per_job(
-        quota.max_job_walltime_ms,
+        quota.job_walltime_ms,
         request.max_walltime_ms,
         QuotaDimension::WalltimeMs,
     )?;
@@ -588,7 +592,7 @@ mod tests {
         assert_eq!(denied.requested, 1);
 
         let per_job_only = ComputeQuota {
-            max_job_cpu_cores: Some(4),
+            job_cpu_cores: Some(4),
             ..Default::default()
         };
         assert_eq!(understated_denial(&per_job_only, &resources(2, 0)), None);
@@ -640,8 +644,8 @@ mod tests {
     fn denies_per_ceiling() {
         // A request above a per-job ceiling is refused on an empty view too.
         let quota = ComputeQuota {
-            max_job_cpu_cores: Some(4),
-            max_job_walltime_ms: Some(1_000),
+            job_cpu_cores: Some(4),
+            job_walltime_ms: Some(1_000),
             ..Default::default()
         };
         let denied = admits(&ResourceTotals::default(), &quota, &resources(8, 0))

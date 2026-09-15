@@ -16,7 +16,7 @@ use zeroize::Zeroize;
 use crate::NodeId;
 use crate::structs::execution::job::EffectiveResources;
 use crate::structs::placement::placement_policy::{
-    MAX_EXECUTOR_KIND_LEN, PlacementPolicyError, PlacementSubject,
+    MAX_KIND_LEN, PlacementPolicyError, PlacementSubject,
 };
 
 #[path = "compute_runtimes.rs"]
@@ -53,7 +53,7 @@ pub enum ExecutorKind {
 pub enum AdvertisementError {
     #[error("a node advertises at most {MAX_ADVERTISED_EXECUTORS} executors")]
     ExecutorCount,
-    #[error("executor kind must be 1..={MAX_EXECUTOR_KIND_LEN} bytes")]
+    #[error("executor kind must be 1..={MAX_KIND_LEN} bytes")]
     InvalidKind,
     #[error("executor kind {kind} is advertised twice")]
     DuplicateKind { kind: String },
@@ -141,7 +141,7 @@ impl ExecutorCapability {
     /// that published it.
     pub fn validate(&self, node_id: NodeId) -> Result<(), AdvertisementError> {
         let kind = self.kind.trim();
-        if kind.is_empty() || kind.len() > MAX_EXECUTOR_KIND_LEN {
+        if kind.is_empty() || kind.len() > MAX_KIND_LEN {
             return Err(AdvertisementError::InvalidKind);
         }
         if self.subject.node_id != node_id {
@@ -517,14 +517,15 @@ impl Drop for Secret {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogLimits {
-    pub max_bytes_per_stream: usize,
+    #[serde(rename = "max_bytes_per_stream")]
+    pub max_stream_bytes: usize,
     pub inline_tail_bytes: usize,
 }
 
 impl Default for LogLimits {
     fn default() -> Self {
         Self {
-            max_bytes_per_stream: 256 * 1024,
+            max_stream_bytes: 256 * 1024,
             inline_tail_bytes: 8 * 1024,
         }
     }

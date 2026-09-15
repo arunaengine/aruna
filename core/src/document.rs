@@ -7,11 +7,11 @@ use ulid::Ulid;
 use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    NODE_INFO_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-    NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE,
-    PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USER_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    NODE_INFO_KEYSPACE, WATCH_INTEREST_KEYSPACE,
+    WATCH_SUBSCRIPTIONS_KEYSPACE, ID_MAPPING_KEYSPACE,
+    PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, NODE_STATS_KEYSPACE, USER_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
@@ -394,13 +394,13 @@ impl DocumentTarget {
             Self::RealmConfig { .. } => REALM_CONFIG_KEYSPACE,
             Self::User { .. } => USER_KEYSPACE,
             Self::MetadataRegistry { .. } => METADATA_INDEX_KEYSPACE,
-            Self::MetadataCreateEvent { .. } => METADATA_EVENT_LOG_KEYSPACE,
-            Self::MetadataDocumentLifecycle { .. } => METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-            Self::MetadataGraphLifecycle { .. } => METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-            Self::PersistentIdMapping { .. } => PERSISTENT_ID_MAPPING_KEYSPACE,
-            Self::NodeUsage { .. } => USAGE_NODE_STATS_KEYSPACE,
-            Self::WatchInterest { .. } => NOTIFICATION_WATCH_INTEREST_KEYSPACE,
-            Self::WatchSubscription { .. } => NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+            Self::MetadataCreateEvent { .. } => EVENT_LOG_KEYSPACE,
+            Self::MetadataDocumentLifecycle { .. } => DOCUMENT_LIFECYCLE_KEYSPACE,
+            Self::MetadataGraphLifecycle { .. } => GRAPH_LIFECYCLE_KEYSPACE,
+            Self::PersistentIdMapping { .. } => ID_MAPPING_KEYSPACE,
+            Self::NodeUsage { .. } => NODE_STATS_KEYSPACE,
+            Self::WatchInterest { .. } => WATCH_INTEREST_KEYSPACE,
+            Self::WatchSubscription { .. } => WATCH_SUBSCRIPTIONS_KEYSPACE,
             Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
             Self::PlacementPolicy { .. } => PLACEMENT_POLICY_KEYSPACE,
         }

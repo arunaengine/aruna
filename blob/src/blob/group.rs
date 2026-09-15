@@ -4,7 +4,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
 use aruna_core::structs::storage::group_backend::{
@@ -260,8 +260,8 @@ impl BlobHandler {
             .storage
             .send_storage_effect(StorageEffect::BatchRead {
                 reads: vec![
-                    (GROUP_STORAGE_BACKEND_KEYSPACE.to_string(), key.clone()),
-                    (GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(), key),
+                    (STORAGE_BACKEND_KEYSPACE.to_string(), key.clone()),
+                    (BACKEND_SECRET_KEYSPACE.to_string(), key),
                 ],
                 txn_id: None,
             })

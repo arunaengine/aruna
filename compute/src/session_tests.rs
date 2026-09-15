@@ -10,7 +10,7 @@ fn config(idle_after_ms: u64) -> SessionConfig {
         workspace_bucket: "lab-data".to_string(),
         executor_node_id: "node-1".to_string(),
         idle_after_ms,
-        credential_expires_at_ms: 42,
+        credential_expires_ms: 42,
     }
 }
 
@@ -31,13 +31,13 @@ async fn reads_helper_lines() {
 
 #[tokio::test(start_paused = true)]
 async fn bounds_helper_lines() {
-    for bytes in [MAX_HELPER_LINE_BYTES, MAX_HELPER_LINE_BYTES + 1] {
+    for bytes in [MAX_HELPER_BYTES, MAX_HELPER_BYTES + 1] {
         let mut input = vec![b'x'; bytes];
         input.extend_from_slice(b"\nnext\n");
         let mut reader = BufReader::with_capacity(input.len(), input.as_slice());
         let mut line = Vec::new();
         let result = read_line(&mut reader, &mut line).await;
-        if bytes > MAX_HELPER_LINE_BYTES {
+        if bytes > MAX_HELPER_BYTES {
             assert!(result.is_err());
         } else {
             assert_eq!(result.unwrap(), bytes);
@@ -136,7 +136,7 @@ async fn refuses_bad_id() {
     assert_eq!(session.submit_cell("", "1"), Err(SessionError::CellId));
     assert_eq!(session.submit_cell("a b", "1"), Err(SessionError::CellId));
     assert_eq!(
-        session.submit_cell(&"c".repeat(MAX_CELL_ID_LEN + 1), "1"),
+        session.submit_cell(&"c".repeat(MAX_ID_LEN + 1), "1"),
         Err(SessionError::CellId)
     );
 }
@@ -144,7 +144,7 @@ async fn refuses_bad_id() {
 #[tokio::test(start_paused = true)]
 async fn refuses_large_code() {
     let (session, _channel) = ready(600_000);
-    let code = "x".repeat(MAX_CELL_CODE_BYTES + 1);
+    let code = "x".repeat(MAX_CELL_BYTES + 1);
     assert_eq!(
         session.submit_cell("c1", &code),
         Err(SessionError::CodeTooLarge)
@@ -317,7 +317,7 @@ async fn announces_credential_refresh() {
     // A refreshed credential expiry reaches the client as its own frame.
     let (session, _channel) = ready(600_000);
     session.credential_renewed(99);
-    assert_eq!(session.snapshot().credential_expires_at_ms, 99);
+    assert_eq!(session.snapshot().credential_expires_ms, 99);
     let (backlog, _receiver) = session.subscribe(0).expect("resume");
     assert!(
         backlog

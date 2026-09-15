@@ -15,8 +15,8 @@ use crate::types::GroupId;
 
 pub const AUDIT_KEY_BYTES: usize = 48;
 pub const MAX_AUDIT_RECORDS: usize = 200;
-pub const MAX_AUDIT_PAGE_BYTES: usize = 2 * 1024 * 1024;
-pub const MAX_AUDIT_BATCH_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_AUDIT_PEERS: usize = 64;
 
 /// A single realm node's local audit page request. Carries the caller's
@@ -202,7 +202,7 @@ impl AuditPageBatch {
             postcard::to_allocvec(&entry.record).map_err(|_| AuditPageError::TooLarge)?;
         let entry_bytes = entry.key.len() + record_bytes.len();
         let Some(current) = self.records.get(&entry.key) else {
-            if bytes.saturating_add(entry_bytes) > MAX_AUDIT_BATCH_BYTES {
+            if bytes.saturating_add(entry_bytes) > MAX_BATCH_BYTES {
                 return Err(AuditPageError::TooLarge);
             }
             return Ok(AuditEntryPlan {
@@ -236,7 +236,7 @@ impl AuditPageBatch {
         }
         let current_size = current.entry.key.len() + current_bytes.len();
         if entry_bytes > current_size
-            && bytes.saturating_add(entry_bytes - current_size) > MAX_AUDIT_BATCH_BYTES
+            && bytes.saturating_add(entry_bytes - current_size) > MAX_BATCH_BYTES
         {
             return Err(AuditPageError::TooLarge);
         }
@@ -421,7 +421,7 @@ pub fn validate_page(
     page: &AuditPageResponse,
 ) -> Result<(), AuditPageError> {
     validate_request(request)?;
-    if page.records.len() > request.limit || page_bytes(page)? > MAX_AUDIT_PAGE_BYTES {
+    if page.records.len() > request.limit || page_bytes(page)? > MAX_PAGE_BYTES {
         return Err(if page.records.len() > request.limit {
             AuditPageError::TooManyRecords
         } else {
@@ -577,7 +577,7 @@ mod tests {
         let mut batch = AuditPageBatch::new();
         let first_bytes = first.key.len() + postcard::to_allocvec(&first.record).unwrap().len();
         // Seed accounting just below the cap so the second entry would overflow.
-        batch.bytes = MAX_AUDIT_BATCH_BYTES - first_bytes;
+        batch.bytes = MAX_BATCH_BYTES - first_bytes;
         let bytes = batch.bytes;
 
         let error = batch.add_page(
@@ -621,7 +621,7 @@ mod tests {
         let first_bytes = first.key.len() + postcard::to_allocvec(&first.record).unwrap().len();
         let mut batch = AuditPageBatch::new();
         // Seed accounting just below the cap so the second chunk entry overflows.
-        batch.bytes = MAX_AUDIT_BATCH_BYTES - first_bytes;
+        batch.bytes = MAX_BATCH_BYTES - first_bytes;
         let bytes = batch.bytes;
         let existing = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
         batch.mark_missing(existing);
@@ -673,7 +673,7 @@ mod tests {
             )
             .unwrap();
         // A duplicate must not consume capacity when the aggregate is full.
-        batch.bytes = MAX_AUDIT_BATCH_BYTES;
+        batch.bytes = MAX_BATCH_BYTES;
 
         assert!(
             batch
@@ -688,7 +688,7 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(batch.records.len(), 1);
-        assert_eq!(batch.bytes, MAX_AUDIT_BATCH_BYTES);
+        assert_eq!(batch.bytes, MAX_BATCH_BYTES);
         assert!(batch.completed_nodes.contains(&node));
         assert!(batch.missing_nodes.is_empty());
     }

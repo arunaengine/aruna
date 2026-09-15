@@ -35,7 +35,7 @@ use tokio_util::io::{StreamReader, SyncIoBridge};
 use tokio_util::sync::CancellationToken;
 
 use super::channel::ChannelStream;
-use super::config::{KubernetesConfig, MAX_NODE_SELECTOR_ENTRIES};
+use super::config::{KubernetesConfig, MAX_SELECTOR_ENTRIES};
 use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
 use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned};
@@ -70,7 +70,7 @@ const EXEC_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Attach buffer for the helper standard streams, several times the archive read
 /// size. kube-rs otherwise defaults to 1 KiB, which throttles a transfer to a trickle
 /// and, on the read side, blocks the frame loop that drives its keepalive ping.
-const EXEC_STREAM_BUF_BYTES: usize = 512 * 1024;
+const STREAM_BUF_BYTES: usize = 512 * 1024;
 /// Bounds the termination evidence kept on a terminal status.
 const MAX_TERMINATION_DETAIL: usize = 2048;
 
@@ -573,7 +573,7 @@ impl KubernetesBackend {
             .stdin(true)
             .stdout(false)
             .stderr(false)
-            .max_stdin_buf_size(EXEC_STREAM_BUF_BYTES);
+            .max_stdin_buf_size(STREAM_BUF_BYTES);
         let mut attached = self
             .pods()
             .exec(
@@ -820,7 +820,7 @@ impl KubernetesBackend {
             .stdin(false)
             .stdout(true)
             .stderr(false)
-            .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
+            .max_stdout_buf_size(STREAM_BUF_BYTES);
         let listed = async {
             let mut attached = self
                 .pods()
@@ -873,7 +873,7 @@ impl KubernetesBackend {
             .stdin(false)
             .stdout(true)
             .stderr(false)
-            .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
+            .max_stdout_buf_size(STREAM_BUF_BYTES);
         let mut attached = self
             .pods()
             .exec(
@@ -1209,7 +1209,7 @@ impl ExecutorBackend for KubernetesBackend {
                     &pod.name_any(),
                     &LogParams {
                         container: Some("task".to_string()),
-                        limit_bytes: i64::try_from(limits.max_bytes_per_stream).ok(),
+                        limit_bytes: i64::try_from(limits.max_stream_bytes).ok(),
                         ..LogParams::default()
                     },
                 )
@@ -1217,7 +1217,7 @@ impl ExecutorBackend for KubernetesBackend {
                 .map_err(kube_error)?
                 .into_bytes()
         };
-        let mut tail = BoundedTail::new(limits.max_bytes_per_stream);
+        let mut tail = BoundedTail::new(limits.max_stream_bytes);
         tail.push(&bytes);
         Ok(LogTails {
             stdout_total: tail.total(),
@@ -1463,13 +1463,13 @@ fn validate_config(config: &KubernetesConfig) -> Result<(), BackendError> {
         ));
     }
     let bounded = |entries: &std::collections::BTreeMap<String, String>| {
-        entries.len() <= MAX_NODE_SELECTOR_ENTRIES
+        entries.len() <= MAX_SELECTOR_ENTRIES
             && entries.keys().all(|key| !key.trim().is_empty())
     };
     if !bounded(&config.node_selector) || !bounded(&config.execution_labels) {
         return Err(BackendError::InvalidSpec(format!(
             "Kubernetes selectors and worker labels are at most \
-             {MAX_NODE_SELECTOR_ENTRIES} named entries"
+             {MAX_SELECTOR_ENTRIES} named entries"
         )));
     }
     Ok(())

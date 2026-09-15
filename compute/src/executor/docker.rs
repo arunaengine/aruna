@@ -47,7 +47,7 @@ const NON_REGULAR_MODES: u32 =
 /// A wildcard listing streams the whole prefix archive to read its headers and
 /// uploads none of it, so the per-file transfer cap must not apply. This bound
 /// only stops an archive that never ends.
-const MAX_LISTING_SCAN_BYTES: u64 = 1024 * MAX_TRANSFER_BYTES;
+const MAX_SCAN_BYTES: u64 = 1024 * MAX_TRANSFER_BYTES;
 
 #[path = "docker_archive.rs"]
 mod archive;
@@ -955,8 +955,8 @@ impl ExecutorBackend for DockerBackend {
             .follow(false)
             .build();
         let mut stream = self.docker.logs(container_id, Some(opts));
-        let mut stdout = BoundedTail::new(limits.max_bytes_per_stream);
-        let mut stderr = BoundedTail::new(limits.max_bytes_per_stream);
+        let mut stdout = BoundedTail::new(limits.max_stream_bytes);
+        let mut stderr = BoundedTail::new(limits.max_stream_bytes);
         while let Some(item) = tokio::time::timeout(self.config.pull_deadline, stream.next())
             .await
             .map_err(|_| BackendError::Timeout("Docker log fetch timed out".to_string()))?
@@ -1064,7 +1064,7 @@ impl ExecutorBackend for DockerBackend {
             .docker
             .download_from_container(container_id, Some(options))
             .map(|chunk| chunk.map_err(|error| io::Error::other(classify_archive(&error))));
-        let counted = Box::pin(count_limited(raw, MAX_LISTING_SCAN_BYTES));
+        let counted = Box::pin(count_limited(raw, MAX_SCAN_BYTES));
         let reader = SyncIoBridge::new_with_handle(StreamReader::new(counted), Handle::current());
         let listed = tokio::task::spawn_blocking(move || list_archive(reader, &base, &glob))
             .await
@@ -2326,7 +2326,7 @@ mod tests {
         let matched = list_archive(io::Cursor::new(bytes), Path::new("/"), &glob).unwrap();
 
         assert_eq!(matched, vec!["/out/a.txt", "/out/b.txt"]);
-        const { assert!(MAX_LISTING_SCAN_BYTES > MAX_TRANSFER_BYTES) };
+        const { assert!(MAX_SCAN_BYTES > MAX_TRANSFER_BYTES) };
     }
 
     #[test]

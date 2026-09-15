@@ -22,13 +22,13 @@ use crate::executor::{ExecutorBackend, now_ms};
 use events::{BudgetVerdict, CellBudget, EventRing, SessionEvent};
 
 pub use aruna_core::compute::session::{
-    CellPhase, EndReason, EventKind, HelperEvent, HelperRequest, MAX_CELL_CODE_BYTES,
-    MAX_CELL_ID_LEN, MAX_QUEUED_CELLS, MAX_RING_EVENTS, MAX_SCRATCH_READ_BYTES, MAX_SUBMITS,
+    CellPhase, EndReason, EventKind, HelperEvent, HelperRequest, MAX_CELL_BYTES,
+    MAX_ID_LEN, MAX_QUEUED_CELLS, MAX_RING_EVENTS, MAX_SCRATCH_BYTES, MAX_SUBMITS,
     MAX_TRACKED_CELLS, SUBMIT_WINDOW, SessionError, SessionPhase,
 };
 
 /// Bytes one helper line may carry before the session is torn down.
-const MAX_HELPER_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HELPER_BYTES: usize = 16 * 1024 * 1024;
 /// How long the node waits for a helper reply to a scratch or status request.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the node keeps retrying to reach the helper of a starting attempt.
@@ -62,7 +62,8 @@ struct SessionFrame<'a> {
     started_at_ms: u64,
     idle_after_ms: u64,
     idle_deadline_ms: u64,
-    credential_expires_at_ms: u64,
+    #[serde(rename = "credential_expires_at_ms")]
+    credential_expires_ms: u64,
     last_event_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     ended: Option<EndedFrame>,
@@ -126,7 +127,7 @@ pub struct SessionSnapshot {
     pub started_at_ms: u64,
     pub idle_after_ms: u64,
     pub idle_deadline_ms: u64,
-    pub credential_expires_at_ms: u64,
+    pub credential_expires_ms: u64,
     pub last_event_id: u64,
     pub cells: Vec<CellSnapshot>,
     pub ended: Option<EndReason>,
@@ -141,7 +142,7 @@ pub struct SessionConfig {
     pub workspace_bucket: String,
     pub executor_node_id: String,
     pub idle_after_ms: u64,
-    pub credential_expires_at_ms: u64,
+    pub credential_expires_ms: u64,
 }
 
 struct CellRecord {
@@ -161,7 +162,7 @@ struct Inner {
     queue: VecDeque<String>,
     submits: VecDeque<Instant>,
     idle_deadline: Instant,
-    credential_expires_at_ms: u64,
+    credential_expires_ms: u64,
     next_request: u64,
     inventory: Vec<StagedInput>,
     pending: Vec<PendingInput>,
@@ -221,7 +222,7 @@ impl Session {
             started_at_ms: self.started_at_ms,
             idle_after_ms: self.config.idle_after_ms,
             idle_deadline_ms: deadline_ms(inner.idle_deadline),
-            credential_expires_at_ms: inner.credential_expires_at_ms,
+            credential_expires_ms: inner.credential_expires_ms,
             last_event_id: inner.ring.last_id(),
             cells,
             ended: inner.ended,
@@ -351,14 +352,14 @@ impl Session {
     /// Accepts one cell and returns its place in the queue, counted from one.
     pub fn submit_cell(&self, cell_id: &str, code: &str) -> Result<usize, SessionError> {
         if cell_id.is_empty()
-            || cell_id.len() > MAX_CELL_ID_LEN
+            || cell_id.len() > MAX_ID_LEN
             || !cell_id
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
         {
             return Err(SessionError::CellId);
         }
-        if code.len() > MAX_CELL_CODE_BYTES {
+        if code.len() > MAX_CELL_BYTES {
             return Err(SessionError::CodeTooLarge);
         }
         let position = {
@@ -489,7 +490,7 @@ impl Session {
     pub fn credential_renewed(&self, expires_at_ms: u64) {
         {
             let mut inner = self.lock();
-            inner.credential_expires_at_ms = expires_at_ms;
+            inner.credential_expires_ms = expires_at_ms;
             let event = inner.ring.push(
                 EventKind::Credential,
                 &json!({ "expires_at_ms": expires_at_ms }),
@@ -519,7 +520,7 @@ impl Session {
             id,
             path,
             offset,
-            limit: limit.min(MAX_SCRATCH_READ_BYTES),
+            limit: limit.min(MAX_SCRATCH_BYTES),
         })
         .await
     }
@@ -789,7 +790,7 @@ fn build_session(config: SessionConfig) -> (Arc<Session>, mpsc::Receiver<HelperR
     let (events, _) = broadcast::channel(BROADCAST_DEPTH);
     let (sender, receiver) = mpsc::channel(MAX_QUEUED_CELLS * 2);
     let idle_deadline = Instant::now() + Duration::from_millis(config.idle_after_ms);
-    let credential_expires_at_ms = config.credential_expires_at_ms;
+    let credential_expires_ms = config.credential_expires_ms;
     let session = Arc::new(Session {
         config,
         started_at_ms: now_ms(),
@@ -802,7 +803,7 @@ fn build_session(config: SessionConfig) -> (Arc<Session>, mpsc::Receiver<HelperR
             queue: VecDeque::new(),
             submits: VecDeque::new(),
             idle_deadline,
-            credential_expires_at_ms,
+            credential_expires_ms,
             next_request: 0,
             inventory: Vec::new(),
             pending: Vec::new(),
@@ -968,14 +969,14 @@ async fn read_line<R: AsyncBufRead + Unpin>(
 ) -> io::Result<usize> {
     line.clear();
     let read = reader
-        .take((MAX_HELPER_LINE_BYTES + 1) as u64)
+        .take((MAX_HELPER_BYTES + 1) as u64)
         .read_until(b'\n', line)
         .await?;
     if line.last() == Some(&b'\n') {
         line.pop();
         return Ok(line.len().max(1));
     }
-    if line.len() > MAX_HELPER_LINE_BYTES {
+    if line.len() > MAX_HELPER_BYTES {
         return Err(io::Error::other("session helper line is too long"));
     }
     Ok(read)
@@ -1010,7 +1011,7 @@ fn session_frame<'a>(
         started_at_ms,
         idle_after_ms: config.idle_after_ms,
         idle_deadline_ms: deadline_ms(inner.idle_deadline),
-        credential_expires_at_ms: inner.credential_expires_at_ms,
+        credential_expires_ms: inner.credential_expires_ms,
         last_event_id: inner.ring.last_id(),
         ended: inner.ended.map(|reason| EndedFrame {
             reason: reason.as_str(),

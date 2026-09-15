@@ -9,8 +9,8 @@ use crate::NodeId;
 use crate::TopicId;
 use crate::UserId;
 use crate::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
     REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
 use crate::structs::placement::placement_record::PlacementRef;
@@ -175,19 +175,19 @@ fn document_target_stable() {
                 document_id,
                 event_id,
             },
-            METADATA_EVENT_LOG_KEYSPACE,
+            EVENT_LOG_KEYSPACE,
             event_key,
         ),
         (
             DocumentTarget::MetadataDocumentLifecycle { document_id },
-            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+            DOCUMENT_LIFECYCLE_KEYSPACE,
             document_id.to_bytes().to_vec(),
         ),
         (
             DocumentTarget::MetadataGraphLifecycle {
                 graph_iri: graph_iri.to_string(),
             },
-            METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+            GRAPH_LIFECYCLE_KEYSPACE,
             graph_lifecycle_key(graph_iri),
         ),
     ];
@@ -318,7 +318,7 @@ fn shard_topic_identity() {
 
 #[test]
 fn node_usage_keys() {
-    use crate::keyspaces::USAGE_NODE_STATS_KEYSPACE;
+    use crate::keyspaces::NODE_STATS_KEYSPACE;
     use crate::structs::storage::usage::{usage_global_key, usage_snapshot_key};
 
     let realm_id = test_realm(2);
@@ -361,7 +361,7 @@ fn node_usage_keys() {
         DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &nil)
     );
 
-    assert_eq!(global.storage_keyspace(), USAGE_NODE_STATS_KEYSPACE);
+    assert_eq!(global.storage_keyspace(), NODE_STATS_KEYSPACE);
     assert_eq!(
         global.storage_key().as_ref(),
         usage_global_key(node_id).as_slice()
@@ -417,7 +417,7 @@ fn node_info_keys() {
 #[test]
 fn watch_interest_keys() {
     use crate::keyspaces::{
-        NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+        WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
     };
     use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 
@@ -458,7 +458,7 @@ fn watch_interest_keys() {
 
     assert_eq!(
         target.storage_keyspace(),
-        NOTIFICATION_WATCH_INTEREST_KEYSPACE
+        WATCH_INTEREST_KEYSPACE
     );
     assert_eq!(
         target.storage_key().as_ref(),
@@ -466,7 +466,7 @@ fn watch_interest_keys() {
     );
     assert_eq!(
         subscription.storage_keyspace(),
-        NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE
+        WATCH_SUBSCRIPTIONS_KEYSPACE
     );
     assert_eq!(
         subscription.storage_key().as_ref(),

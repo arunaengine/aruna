@@ -586,7 +586,7 @@ async fn log_bounds() {
     );
     let mut spec = spec;
     spec.log_limits = LogLimits {
-        max_bytes_per_stream: 4096,
+        max_stream_bytes: 4096,
         inline_tail_bytes: 1024,
     };
     let attempt = spec.attempt.clone();

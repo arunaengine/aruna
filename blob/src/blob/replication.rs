@@ -363,7 +363,7 @@ impl BlobHandler {
 
                     if let Err(event) = send_replication_message(
                         &mut stream.0,
-                        ReplicationMessage::new(replication_id, MessageType::BaoTreeInfoReceived),
+                        ReplicationMessage::new(replication_id, MessageType::BaoTreeReceived),
                         self.io_timeout(),
                         "sending replication tree info acknowledgement",
                     )

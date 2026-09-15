@@ -12,9 +12,9 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB,
-    GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE,
+    HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB,
+    STORAGE_BACKEND_KEYSPACE, BACKEND_SECRET_KEYSPACE,
+    PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
@@ -705,18 +705,18 @@ fn exposes_custom_timeouts() {
         max_bucket_size: Some(1),
         multipart_bucket: Some("multipart".to_string()),
         timeouts: BlobTimeoutConfig {
-            control_plane_connect_timeout: Duration::from_secs(11),
-            control_plane_io_timeout: Duration::from_secs(12),
+            control_connect_timeout: Duration::from_secs(11),
+            control_io_timeout: Duration::from_secs(12),
             transfer_idle_timeout: Duration::from_secs(13),
         },
     };
 
     assert_eq!(
-        config.timeouts.control_plane_connect_timeout,
+        config.timeouts.control_connect_timeout,
         Duration::from_secs(11)
     );
     assert_eq!(
-        config.timeouts.control_plane_io_timeout,
+        config.timeouts.control_io_timeout,
         Duration::from_secs(12)
     );
     assert_eq!(
@@ -728,7 +728,7 @@ fn exposes_custom_timeouts() {
 #[test]
 fn accepts_matching_ack() {
     let replication_id = Ulid::generate();
-    let ack = ReplicationMessage::new(replication_id, MessageType::BaoTreeInfoReceived);
+    let ack = ReplicationMessage::new(replication_id, MessageType::BaoTreeReceived);
 
     assert_eq!(validate_init_ack(ack, replication_id), Ok(()));
 }
@@ -756,7 +756,7 @@ fn rejects_unexpected_type() {
 fn rejects_wrong_replication() {
     let replication_id = Ulid::generate();
     let wrong_id = Ulid::generate();
-    let ack = ReplicationMessage::new(wrong_id, MessageType::BaoTreeInfoReceived);
+    let ack = ReplicationMessage::new(wrong_id, MessageType::BaoTreeReceived);
 
     assert_eq!(
         validate_init_ack(ack, replication_id),
@@ -1110,7 +1110,7 @@ async fn hidden_spool_roundtrip() {
         0
     );
     assert_eq!(
-        keyspace_count(&context.storage_handle, HASH_PATHS_INDEX_KEYSPACE).await,
+        keyspace_count(&context.storage_handle, PATHS_INDEX_KEYSPACE).await,
         0
     );
 
@@ -2085,13 +2085,13 @@ async fn cancelled_spool_releases() {
     .await
     .expect("spool must reach its second chunk");
     assert_eq!(
-        keyspace_count(&context.storage_handle, BLOB_HIDDEN_RESERVATION_KEYSPACE).await,
+        keyspace_count(&context.storage_handle, HIDDEN_RESERVATION_KEYSPACE).await,
         1
     );
 
     drop(spool);
     tokio::time::timeout(Duration::from_secs(30), async {
-        while keyspace_count(&context.storage_handle, BLOB_HIDDEN_RESERVATION_KEYSPACE).await > 0 {
+        while keyspace_count(&context.storage_handle, HIDDEN_RESERVATION_KEYSPACE).await > 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -2466,7 +2466,7 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
         cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
     };
     let mut writes = vec![(
-        GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+        STORAGE_BACKEND_KEYSPACE.to_string(),
         key.clone(),
         record.to_bytes().unwrap().into(),
     )];
@@ -2477,7 +2477,7 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
             updated_at: SystemTime::UNIX_EPOCH,
         };
         writes.push((
-            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+            BACKEND_SECRET_KEYSPACE.to_string(),
             key,
             secret.to_bytes().unwrap().into(),
         ));

@@ -14,11 +14,11 @@ pub const MAX_SUBMITS: usize = 30;
 /// Window the submit count is measured over.
 pub const SUBMIT_WINDOW: Duration = Duration::from_secs(10);
 /// Bytes of code one cell may carry.
-pub const MAX_CELL_CODE_BYTES: usize = 256 * 1024;
+pub const MAX_CELL_BYTES: usize = 256 * 1024;
 /// Characters a cell id may have.
-pub const MAX_CELL_ID_LEN: usize = 64;
+pub const MAX_ID_LEN: usize = 64;
 /// Bytes one scratch read may return.
-pub const MAX_SCRATCH_READ_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_SCRATCH_BYTES: u64 = 8 * 1024 * 1024;
 /// Cells one session reports in its state.
 pub const MAX_TRACKED_CELLS: usize = 512;
 /// Staged inputs one session records for its report.
@@ -32,7 +32,7 @@ pub const MAX_RING_BYTES: usize = 4 * 1024 * 1024;
 /// Outputs one cell may emit before the rest are dropped.
 pub const MAX_CELL_OUTPUTS: usize = 512;
 /// Output bytes one cell may emit before the rest are dropped.
-pub const MAX_CELL_OUTPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// What the client sees once a cell hit either output cap.
 pub const TRUNCATED_NOTICE: &str = "[output truncated by the node]";
 
@@ -157,7 +157,7 @@ pub enum SessionError {
     TooMany,
     #[error("a cell id is 1 to 64 characters of A-Z, a-z, 0-9, _ and -")]
     CellId,
-    #[error("cell code is larger than {MAX_CELL_CODE_BYTES} bytes")]
+    #[error("cell code is larger than {MAX_CELL_BYTES} bytes")]
     CodeTooLarge,
     #[error("a scratch path is relative to the working directory and carries no `..`")]
     Path,

@@ -12,7 +12,7 @@ use serde_json::json;
 use tokio::io::AsyncRead;
 
 use super::status::task_state;
-use super::{EXEC_STREAM_BUF_BYTES, KubernetesBackend, SessionChannel, kube_error};
+use super::{STREAM_BUF_BYTES, KubernetesBackend, SessionChannel, kube_error};
 
 /// Bridges standard input and output of one exec to the helper socket. The
 /// exec inherits the container's user and is never privileged.
@@ -35,8 +35,8 @@ pub(super) async fn open(
         .stdin(true)
         .stdout(true)
         .stderr(false)
-        .max_stdin_buf_size(EXEC_STREAM_BUF_BYTES)
-        .max_stdout_buf_size(EXEC_STREAM_BUF_BYTES);
+        .max_stdin_buf_size(STREAM_BUF_BYTES)
+        .max_stdout_buf_size(STREAM_BUF_BYTES);
     let mut attached = backend
         .pods()
         .exec(

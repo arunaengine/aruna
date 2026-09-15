@@ -21,7 +21,7 @@ use crate::structs::placement::compute_config::RealmComputeConfig;
 use crate::types::{GroupId, RoleId};
 
 /// Domain separator for the origin signature over an administrative event.
-pub const ADMIN_DOCUMENT_EVENT_DOMAIN: &str = "aruna-admin-document-event-v1";
+pub const DOCUMENT_EVENT_DOMAIN: &str = "aruna-admin-document-event-v1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminDocumentClock {
@@ -98,11 +98,13 @@ pub enum AdminDocumentOperation {
     GroupRoleAdded {
         role_id: RoleId,
     },
-    GroupRoleUserAssignmentAdded {
+    #[serde(rename = "GroupRoleUserAssignmentAdded")]
+    GroupAssignmentAdded {
         role_id: RoleId,
         user_id: UserId,
     },
-    GroupRoleUserAssignmentRemoved {
+    #[serde(rename = "GroupRoleUserAssignmentRemoved")]
+    GroupAssignmentRemoved {
         role_id: RoleId,
         user_id: UserId,
     },
@@ -116,20 +118,24 @@ pub enum AdminDocumentOperation {
     UserNameSet {
         name: String,
     },
-    UserSubjectIdAdded {
+    #[serde(rename = "UserSubjectIdAdded")]
+    SubjectIdAdded {
         subject_id: String,
     },
-    UserSubjectIdRemoved {
+    #[serde(rename = "UserSubjectIdRemoved")]
+    SubjectIdRemoved {
         subject_id: String,
     },
     RealmRoleAdded {
         role_id: RoleId,
     },
-    RealmRoleUserAssignmentAdded {
+    #[serde(rename = "RealmRoleUserAssignmentAdded")]
+    RealmAssignmentAdded {
         role_id: RoleId,
         user_id: UserId,
     },
-    RealmRoleUserAssignmentRemoved {
+    #[serde(rename = "RealmRoleUserAssignmentRemoved")]
+    RealmAssignmentRemoved {
         role_id: RoleId,
         user_id: UserId,
     },
@@ -142,17 +148,21 @@ pub enum AdminDocumentOperation {
     RealmRoleCreated {
         role: AdminRoleDefinition,
     },
-    RealmConfigNodeEnsured {
+    #[serde(rename = "RealmConfigNodeEnsured")]
+    ConfigNodeEnsured {
         node_id: NodeId,
         kind: RealmNodeKind,
     },
-    RealmConfigOidcProviderUpserted {
+    #[serde(rename = "RealmConfigOidcProviderUpserted")]
+    OidcProviderUpserted {
         provider: OidcProviderConfig,
     },
-    RealmConfigOidcProviderRemoved {
+    #[serde(rename = "RealmConfigOidcProviderRemoved")]
+    OidcProviderRemoved {
         provider_id: String,
     },
-    RealmConfigSettingsSet {
+    #[serde(rename = "RealmConfigSettingsSet")]
+    ConfigSettingsSet {
         metadata_replication: MetadataReplicationConfig,
         discovery: RealmDiscoveryConfig,
     },
@@ -161,72 +171,90 @@ pub enum AdminDocumentOperation {
         display_name: String,
         owner: UserId,
     },
-    RealmConfigDescriptionSet {
+    #[serde(rename = "RealmConfigDescriptionSet")]
+    ConfigDescriptionSet {
         description: String,
     },
-    RealmConfigQuotaSet {
+    #[serde(rename = "RealmConfigQuotaSet")]
+    ConfigQuotaSet {
         quota: QuotaConfig,
     },
-    RealmConfigNodePlacementSet {
+    #[serde(rename = "RealmConfigNodePlacementSet")]
+    NodePlacementSet {
         entry: NodePlacementEntry,
     },
-    RealmConfigNodePlacementRemoved {
+    #[serde(rename = "RealmConfigNodePlacementRemoved")]
+    NodePlacementRemoved {
         node_id: NodeId,
     },
-    RealmConfigPlacementStrategyUpserted {
+    #[serde(rename = "RealmConfigPlacementStrategyUpserted")]
+    PlacementStrategyUpserted {
         strategy: PlacementStrategy,
     },
-    RealmConfigPlacementStrategyRemoved {
+    #[serde(rename = "RealmConfigPlacementStrategyRemoved")]
+    PlacementStrategyRemoved {
         strategy_id: Ulid,
     },
-    RealmConfigDefaultStrategySet {
+    #[serde(rename = "RealmConfigDefaultStrategySet")]
+    ConfigStrategySet {
         strategy_id: Ulid,
     },
-    RealmConfigStrategyBindingSet {
+    #[serde(rename = "RealmConfigStrategyBindingSet")]
+    StrategyBindingSet {
         binding: StrategyBinding,
     },
-    RealmConfigStrategyBindingRemoved {
+    #[serde(rename = "RealmConfigStrategyBindingRemoved")]
+    StrategyBindingRemoved {
         scope: BindingScope,
     },
-    RealmConfigPlacementOverrideSet {
+    #[serde(rename = "RealmConfigPlacementOverrideSet")]
+    PlacementOverrideSet {
         record: PlacementOverride,
     },
-    RealmConfigPlacementOverrideRemoved {
+    #[serde(rename = "RealmConfigPlacementOverrideRemoved")]
+    PlacementOverrideRemoved {
         subject: Vec<u8>,
     },
     /// Appends an immutable placement binding (append-only, no remove twin). As
     /// an admin operation it can never be relayed (K1): only Management/Server
     /// origins may emit it, and receivers converge it through the reducer.
-    RealmConfigPlacementBindingAppended {
+    #[serde(rename = "RealmConfigPlacementBindingAppended")]
+    PlacementBindingAppended {
         binding: PlacementBinding,
     },
     /// Grants an append-only handle range. Only Management may emit it;
     /// overlapping grants fail closed in the derived directory.
-    RealmConfigHandleRangeGranted {
+    #[serde(rename = "RealmConfigHandleRangeGranted")]
+    HandleRangeGranted {
         range: HandleRange,
     },
     /// Assigns an append-only coordinator band pool. Pools form a causal
     /// delegation tree resolved by lineage, not by assignment order.
-    RealmConfigBandPoolAssigned {
+    #[serde(rename = "RealmConfigBandPoolAssigned")]
+    BandPoolAssigned {
         pool: BandPool,
     },
     /// Publishes an immutable candidate map. Two divergent maps at one epoch
     /// conflict and leave the epoch unusable.
-    RealmConfigCandidateMapPublished {
+    #[serde(rename = "RealmConfigCandidateMapPublished")]
+    CandidateMapPublished {
         map: CandidatePlacementMap,
     },
     /// Activates a published map for every bucket of a strategy that has no
     /// activation yet. Explicit, so nothing initializes as a create side effect.
-    RealmConfigActivationsInitialized {
+    #[serde(rename = "RealmConfigActivationsInitialized")]
+    ConfigActivationsInitialized {
         strategy_id: Ulid,
         candidate_map_epoch: u64,
     },
     /// Starts a proof-gated handoff of a strategy's buckets to a target map.
-    RealmConfigTransitionStarted {
+    #[serde(rename = "RealmConfigTransitionStarted")]
+    ConfigTransitionStarted {
         plan: TransitionPlan,
     },
     /// An old holder's frozen frontier for one bucket.
-    RealmConfigTransitionBarrierReported {
+    #[serde(rename = "RealmConfigTransitionBarrierReported")]
+    TransitionBarrierReported {
         transition_id: Ulid,
         bucket: u32,
         reported_by: NodeId,
@@ -234,34 +262,40 @@ pub enum AdminDocumentOperation {
     },
     /// A target holder's signed completion proof. Admitted only when the origin
     /// is the signing holder and the signature covers this exact tuple.
-    RealmConfigTransitionProofSubmitted {
+    #[serde(rename = "RealmConfigTransitionProofSubmitted")]
+    TransitionProofSubmitted {
         transition_id: Ulid,
         strategy_id: Ulid,
         proof: CompletionProof,
     },
-    RealmConfigTransitionAborted {
+    #[serde(rename = "RealmConfigTransitionAborted")]
+    ConfigTransitionAborted {
         transition_id: Ulid,
     },
     /// Cuts one bucket over without every proof; the reducer still requires at
     /// least one verified proof.
-    RealmConfigTransitionBucketForced {
+    #[serde(rename = "RealmConfigTransitionBucketForced")]
+    TransitionBucketForced {
         transition_id: Ulid,
         bucket: u32,
         at_risk_report: String,
     },
     /// Diagnostics only: a stall never moves authority.
-    RealmConfigTransitionStallReported {
+    #[serde(rename = "RealmConfigTransitionStallReported")]
+    TransitionStallReported {
         transition_id: Ulid,
         bucket: u32,
         reported_by: NodeId,
         reason: String,
     },
-    RealmConfigPoliciesSet {
+    #[serde(rename = "RealmConfigPoliciesSet")]
+    ConfigPoliciesSet {
         policies: Vec<crate::request_policy::RequestPolicy>,
     },
     /// Revokes one token hash until expiry. The trusted origin attests its owner;
     /// receivers recheck owner or admin authority without replicating the token.
-    RealmConfigTokenRevoked {
+    #[serde(rename = "RealmConfigTokenRevoked")]
+    ConfigTokenRevoked {
         token_hash: String,
         expires_at: u64,
         token_owner: UserId,
@@ -272,7 +306,8 @@ pub enum AdminDocumentOperation {
     /// A departing old holder's statement that its outbox holds nothing for
     /// the bucket any more, so its retention may end (postcard append-only:
     /// new variants only at the enum end).
-    RealmConfigTransitionDrainReported {
+    #[serde(rename = "RealmConfigTransitionDrainReported")]
+    TransitionDrainReported {
         transition_id: Ulid,
         bucket: u32,
         reported_by: NodeId,
@@ -280,25 +315,29 @@ pub enum AdminDocumentOperation {
     /// Stores the realm's submission-family placement strategy at creation. The
     /// reducer refuses a nil id and any later change, so family routing is
     /// immutable once one node has observed it.
-    RealmConfigJobFamilySet {
+    #[serde(rename = "RealmConfigJobFamilySet")]
+    JobFamilySet {
         strategy_id: Ulid,
     },
     /// Replaces the realm's compute configuration wholesale: the directed
     /// location links the planner estimates transfers with, and the standing
     /// group compute quotas new admissions are decided against.
-    RealmConfigComputeSet {
+    #[serde(rename = "RealmConfigComputeSet")]
+    ConfigComputeSet {
         compute: RealmComputeConfig,
     },
     /// Drops a node from realm membership. The node keeps its keys but stops
     /// being an admitted peer wherever the configuration replicates, so an
     /// evicted device loses its connections at the next membership refresh.
-    RealmConfigNodeRemoved {
+    #[serde(rename = "RealmConfigNodeRemoved")]
+    ConfigNodeRemoved {
         node_id: NodeId,
     },
     /// Renames a group after creation. Only the label changes; the group id and
     /// every permission path stay as they are (postcard append-only: new
     /// variants only at the enum end).
-    GroupDisplayNameSet {
+    #[serde(rename = "GroupDisplayNameSet")]
+    DisplayNameSet {
         display_name: String,
     },
     GroupJoinRequested {
@@ -389,11 +428,11 @@ mod tests {
         let realm_id = RealmId::from_bytes([9; 32]);
         let operations = vec![
             AdminDocumentOperation::GroupRoleAdded { role_id },
-            AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+            AdminDocumentOperation::GroupAssignmentAdded {
                 role_id,
                 user_id: assigned_user_id,
             },
-            AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
+            AdminDocumentOperation::GroupAssignmentRemoved {
                 role_id,
                 user_id: assigned_user_id,
             },
@@ -407,18 +446,18 @@ mod tests {
             AdminDocumentOperation::UserNameSet {
                 name: "Alice".to_string(),
             },
-            AdminDocumentOperation::UserSubjectIdAdded {
+            AdminDocumentOperation::SubjectIdAdded {
                 subject_id: "subject-1".to_string(),
             },
-            AdminDocumentOperation::UserSubjectIdRemoved {
+            AdminDocumentOperation::SubjectIdRemoved {
                 subject_id: "subject-1".to_string(),
             },
             AdminDocumentOperation::RealmRoleAdded { role_id },
-            AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+            AdminDocumentOperation::RealmAssignmentAdded {
                 role_id,
                 user_id: assigned_user_id,
             },
-            AdminDocumentOperation::RealmRoleUserAssignmentRemoved {
+            AdminDocumentOperation::RealmAssignmentRemoved {
                 role_id,
                 user_id: assigned_user_id,
             },
@@ -429,18 +468,18 @@ mod tests {
             AdminDocumentOperation::RealmRoleCreated {
                 role: role_definition(role_id),
             },
-            AdminDocumentOperation::RealmConfigNodeEnsured {
+            AdminDocumentOperation::ConfigNodeEnsured {
                 node_id: node(1),
                 kind: RealmNodeKind::Management,
             },
-            AdminDocumentOperation::RealmConfigNodeRemoved { node_id: node(1) },
-            AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+            AdminDocumentOperation::ConfigNodeRemoved { node_id: node(1) },
+            AdminDocumentOperation::OidcProviderUpserted {
                 provider: oidc_provider("default"),
             },
-            AdminDocumentOperation::RealmConfigOidcProviderRemoved {
+            AdminDocumentOperation::OidcProviderRemoved {
                 provider_id: "default".to_string(),
             },
-            AdminDocumentOperation::RealmConfigSettingsSet {
+            AdminDocumentOperation::ConfigSettingsSet {
                 metadata_replication: MetadataReplicationConfig::new(3),
                 discovery: RealmDiscoveryConfig::Static {
                     endpoints: Vec::new(),
@@ -451,44 +490,44 @@ mod tests {
                 display_name: "Engineering".to_string(),
                 owner: user_id(3),
             },
-            AdminDocumentOperation::RealmConfigDescriptionSet {
+            AdminDocumentOperation::ConfigDescriptionSet {
                 description: "Demo Realm".to_string(),
             },
-            AdminDocumentOperation::RealmConfigQuotaSet {
+            AdminDocumentOperation::ConfigQuotaSet {
                 quota: QuotaConfig::default(),
             },
-            AdminDocumentOperation::RealmConfigComputeSet {
+            AdminDocumentOperation::ConfigComputeSet {
                 compute: RealmComputeConfig::default(),
             },
-            AdminDocumentOperation::RealmConfigNodePlacementSet {
+            AdminDocumentOperation::NodePlacementSet {
                 entry: placement_entry(node(1)),
             },
-            AdminDocumentOperation::RealmConfigNodePlacementRemoved { node_id: node(1) },
-            AdminDocumentOperation::RealmConfigPlacementStrategyUpserted {
+            AdminDocumentOperation::NodePlacementRemoved { node_id: node(1) },
+            AdminDocumentOperation::PlacementStrategyUpserted {
                 strategy: placement_strategy(Ulid::from_bytes([4; 16])),
             },
-            AdminDocumentOperation::RealmConfigPlacementStrategyRemoved {
+            AdminDocumentOperation::PlacementStrategyRemoved {
                 strategy_id: Ulid::from_bytes([4; 16]),
             },
-            AdminDocumentOperation::RealmConfigDefaultStrategySet {
+            AdminDocumentOperation::ConfigStrategySet {
                 strategy_id: Ulid::from_bytes([4; 16]),
             },
-            AdminDocumentOperation::RealmConfigStrategyBindingSet {
+            AdminDocumentOperation::StrategyBindingSet {
                 binding: StrategyBinding {
                     scope: BindingScope::Class(DocumentClass::MetadataRegistry),
                     strategy_id: Ulid::from_bytes([4; 16]),
                 },
             },
-            AdminDocumentOperation::RealmConfigStrategyBindingRemoved {
+            AdminDocumentOperation::StrategyBindingRemoved {
                 scope: BindingScope::Class(DocumentClass::MetadataRegistry),
             },
-            AdminDocumentOperation::RealmConfigPlacementOverrideSet {
+            AdminDocumentOperation::PlacementOverrideSet {
                 record: placement_override(b"document-subject".to_vec()),
             },
-            AdminDocumentOperation::RealmConfigPlacementOverrideRemoved {
+            AdminDocumentOperation::PlacementOverrideRemoved {
                 subject: b"document-subject".to_vec(),
             },
-            AdminDocumentOperation::RealmConfigPlacementBindingAppended {
+            AdminDocumentOperation::PlacementBindingAppended {
                 binding: PlacementBinding {
                     handle: PlacementHandle::new(7).unwrap(),
                     scope: PlacementScope::Realm(realm_id),
@@ -499,7 +538,7 @@ mod tests {
                     allocated_at_ms: Some(1_700_000_000_000),
                 },
             },
-            AdminDocumentOperation::RealmConfigHandleRangeGranted {
+            AdminDocumentOperation::HandleRangeGranted {
                 range: HandleRange {
                     range_id: Ulid::from_bytes([6; 16]),
                     owner: node(1),
@@ -507,7 +546,7 @@ mod tests {
                     end: 1025,
                 },
             },
-            AdminDocumentOperation::RealmConfigBandPoolAssigned {
+            AdminDocumentOperation::BandPoolAssigned {
                 pool: BandPool {
                     pool_id: Ulid::from_bytes([7; 16]),
                     parent: None,
@@ -517,10 +556,10 @@ mod tests {
                     end: 1027,
                 },
             },
-            AdminDocumentOperation::RealmConfigPoliciesSet {
+            AdminDocumentOperation::ConfigPoliciesSet {
                 policies: vec![request_policy("permission == 'write'")],
             },
-            AdminDocumentOperation::RealmConfigTokenRevoked {
+            AdminDocumentOperation::ConfigTokenRevoked {
                 token_hash: blake3::hash(b"bearer-token").to_string(),
                 expires_at: 1_900_000_000,
                 token_owner: user_id(8),
@@ -644,7 +683,7 @@ mod tests {
 
     #[test]
     fn realm_config_roundtrips() {
-        let operation = AdminDocumentOperation::RealmConfigNodeEnsured {
+        let operation = AdminDocumentOperation::ConfigNodeEnsured {
             node_id: node(3),
             kind: RealmNodeKind::Server,
         };
@@ -655,10 +694,10 @@ mod tests {
     #[test]
     fn realm_config_roundtrip() {
         let operations = [
-            AdminDocumentOperation::RealmConfigOidcProviderUpserted {
+            AdminDocumentOperation::OidcProviderUpserted {
                 provider: oidc_provider("default"),
             },
-            AdminDocumentOperation::RealmConfigOidcProviderRemoved {
+            AdminDocumentOperation::OidcProviderRemoved {
                 provider_id: "default".to_string(),
             },
         ];
@@ -670,7 +709,7 @@ mod tests {
 
     #[test]
     fn realm_settings_roundtrips() {
-        let operation = AdminDocumentOperation::RealmConfigSettingsSet {
+        let operation = AdminDocumentOperation::ConfigSettingsSet {
             metadata_replication: MetadataReplicationConfig::new(3),
             discovery: RealmDiscoveryConfig::Static {
                 endpoints: Vec::new(),
@@ -693,7 +732,7 @@ mod tests {
 
     #[test]
     fn realm_description_roundtrips() {
-        let operation = AdminDocumentOperation::RealmConfigDescriptionSet {
+        let operation = AdminDocumentOperation::ConfigDescriptionSet {
             description: "Demo Realm".to_string(),
         };
 
@@ -725,7 +764,7 @@ impl AdminDocumentEvent {
     /// placement it rides, so a relay can forward but never re-target, re-actor,
     /// or re-shard another origin's event.
     pub fn signing_bytes(&self, placement: &PlacementRef) -> Result<Vec<u8>, postcard::Error> {
-        postcard::to_allocvec(&(ADMIN_DOCUMENT_EVENT_DOMAIN, self, placement))
+        postcard::to_allocvec(&(DOCUMENT_EVENT_DOMAIN, self, placement))
     }
 
     /// Whether `signature` is the origin node's signature over this envelope.

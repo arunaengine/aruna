@@ -1485,7 +1485,7 @@ impl BlobHandler {
             self.io_timeout(),
             self.storage
                 .send_effect(Effect::Storage(StorageEffect::Iter {
-                    key_space: aruna_core::keyspaces::BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                    key_space: aruna_core::keyspaces::HIDDEN_RESERVATION_KEYSPACE.to_string(),
                     prefix: None,
                     start: start_after.map(|key| IterStart::After(key.into())),
                     limit: HIDDEN_LIST_PAGE,

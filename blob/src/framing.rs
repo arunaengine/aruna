@@ -1,7 +1,7 @@
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const MAX_CONTROL_PLANE_FRAME: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_CONTROL_FRAME: usize = 128 * 1024 * 1024;
 
 pub(crate) fn checked_frame_len(len: u32, max_len: usize) -> io::Result<usize> {
     let len = len as usize;
@@ -60,7 +60,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CONTROL_PLANE_FRAME, checked_frame_len, checked_send_len, read_frame, write_frame,
+        MAX_CONTROL_FRAME, checked_frame_len, checked_send_len, read_frame, write_frame,
     };
     use std::io::ErrorKind;
     use tokio::io::AsyncWriteExt;
@@ -123,7 +123,7 @@ mod tests {
         );
         assert!(checked_frame_len(0, TEST_LIMIT).is_err());
         assert!(checked_frame_len(TEST_LIMIT as u32 + 1, TEST_LIMIT).is_err());
-        assert!(checked_frame_len(u32::MAX, MAX_CONTROL_PLANE_FRAME).is_err());
+        assert!(checked_frame_len(u32::MAX, MAX_CONTROL_FRAME).is_err());
     }
 
     #[test]

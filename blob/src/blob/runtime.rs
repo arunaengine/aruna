@@ -924,7 +924,7 @@ impl BlobHandler {
     fn handler_probe_timeout(&self) -> Duration {
         self.registry
             .timeouts()
-            .control_plane_io_timeout
+            .control_io_timeout
             .min(Duration::from_secs(5))
     }
 }
