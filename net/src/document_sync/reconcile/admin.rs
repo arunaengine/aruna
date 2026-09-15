@@ -481,6 +481,46 @@ pub(in crate::document_sync) fn coalescible_config_op(op: &AdminDocumentOperatio
     )
 }
 
+/// Realm-config operations this document applier owns; every other family has
+/// its own applier.
+fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
+    matches!(
+        op,
+        AdminDocumentOperation::RealmConfigNodeEnsured { .. }
+            | AdminDocumentOperation::RealmConfigNodeRemoved { .. }
+            | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
+            | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
+            | AdminDocumentOperation::RealmConfigSettingsSet { .. }
+            | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
+            | AdminDocumentOperation::RealmConfigQuotaSet { .. }
+            | AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
+            | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
+            | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
+            | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
+            | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
+            | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
+            | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
+            | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
+            | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
+            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
+            | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
+            | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
+            | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
+            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
+            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
+            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
+            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
+            | AdminDocumentOperation::RealmConfigComputeSet { .. }
+            | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+    )
+}
+
 /// Flushes a buffered run of coalescible realm-config events, if any, and
 /// drops the validation snapshot the applied events just outdated.
 pub(in crate::document_sync) async fn flush_config_run(
@@ -493,6 +533,50 @@ pub(in crate::document_sync) async fn flush_config_run(
         validation_cache.invalidate();
     }
     Ok(())
+}
+
+/// Plans the document a reduced realm config implies: the stored document is
+/// overlaid, or a new one materialized, and the bool reports an observable
+/// change. Revocation release and placement use the two supplied clocks.
+fn plan_realm_change(
+    previous_config: Option<RealmConfigDocument>,
+    realm_id: RealmId,
+    reducer_state: &AdminDocumentReducerState,
+    effective_now: u64,
+    now_ms: u64,
+    revocation_index: Option<&RevocationIndex>,
+) -> Result<(Option<RealmConfigDocument>, bool)> {
+    match previous_config {
+        Some(mut config) => {
+            if config.realm_id != realm_id {
+                return Err(NetError::Bootstrap(format!(
+                    "stored realm config document id {realm_id} does not match payload realm id {}",
+                    config.realm_id
+                )));
+            }
+            let before = config.clone();
+            overlay_realm_config(
+                &mut config,
+                reducer_state,
+                effective_now,
+                now_ms,
+                revocation_index,
+            );
+            let changed = config != before;
+            Ok((Some(config), changed))
+        }
+        None => {
+            let config = materialized_realm_config(
+                realm_id,
+                reducer_state,
+                effective_now,
+                now_ms,
+                revocation_index,
+            );
+            let changed = config.is_some();
+            Ok((config, changed))
+        }
+    }
 }
 
 /// Applies a run of coalescible realm-config events in one transaction. A
@@ -540,8 +624,6 @@ pub(in crate::document_sync) async fn apply_config_events(
         return Ok(());
     };
 
-    // A transient SSI conflict must never wedge the topic: retry with yields,
-    // bounded as a livelock safety valve.
     for _ in 0..APPLY_CONFLICT_ATTEMPTS {
         tokio::task::yield_now().await;
         let raw_now = unix_timestamp_secs();
@@ -609,43 +691,16 @@ pub(in crate::document_sync) async fn apply_config_events(
             index.compact(&mut reducer_state);
         }
 
-        let (config, config_changed) = match previous_config {
-            Some(mut config) => {
-                if config.realm_id != realm_id {
-                    return Err(
-                        abort_error(
-                            storage,
-                            txn_id,
-                            NetError::Bootstrap(format!(
-                                "stored realm config document id {realm_id} does not match payload realm id {}",
-                                config.realm_id
-                            )),
-                        )
-                        .await,
-                    );
-                }
-                let before = config.clone();
-                overlay_realm_config(
-                    &mut config,
-                    &reducer_state,
-                    effective_now,
-                    unix_timestamp_millis(),
-                    revocation_index.as_ref(),
-                );
-                let changed = config != before;
-                (Some(config), changed)
-            }
-            None => {
-                let config = materialized_realm_config(
-                    realm_id,
-                    &reducer_state,
-                    effective_now,
-                    unix_timestamp_millis(),
-                    revocation_index.as_ref(),
-                );
-                let changed = config.is_some();
-                (config, changed)
-            }
+        let (config, config_changed) = match plan_realm_change(
+            previous_config,
+            realm_id,
+            &reducer_state,
+            effective_now,
+            unix_timestamp_millis(),
+            revocation_index.as_ref(),
+        ) {
+            Ok(planned) => planned,
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
         };
         if previous_state
             .as_ref()
@@ -964,19 +1019,20 @@ pub(in crate::document_sync) fn materialize_user_operation(
 
 pub(in crate::document_sync) const APPLY_CONFLICT_ATTEMPTS: usize = 64;
 
-async fn apply_realm_config(
-    storage: &StorageHandle,
-    document_target: DocumentSyncTarget,
-    event: AdminDocumentEvent,
-) -> Result<()> {
-    let DocumentSyncTarget::RealmConfig { realm_id } = document_target.clone() else {
+/// The realm a realm-config operation addresses: the sync target, payload
+/// target, and document must all name the same realm.
+fn validate_config_target(
+    document_target: &DocumentSyncTarget,
+    event: &AdminDocumentEvent,
+) -> Result<RealmId> {
+    let DocumentSyncTarget::RealmConfig { realm_id } = document_target else {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports realm config targets".to_string(),
         ));
     };
     let AdminDocumentTarget::RealmConfig {
         realm_id: event_realm_id,
-    } = event.target.clone()
+    } = &event.target
     else {
         return Err(NetError::Bootstrap(
             "admin document operation payload target is not a realm config".to_string(),
@@ -987,51 +1043,12 @@ async fn apply_realm_config(
             "replicated realm config admin operation target {realm_id} does not match payload realm id {event_realm_id}"
         )));
     }
-    if !matches!(
-        &event.op,
-        AdminDocumentOperation::RealmConfigNodeEnsured { .. }
-            | AdminDocumentOperation::RealmConfigNodeRemoved { .. }
-            | AdminDocumentOperation::RealmConfigOidcProviderUpserted { .. }
-            | AdminDocumentOperation::RealmConfigOidcProviderRemoved { .. }
-            | AdminDocumentOperation::RealmConfigSettingsSet { .. }
-            | AdminDocumentOperation::RealmConfigDescriptionSet { .. }
-            | AdminDocumentOperation::RealmConfigQuotaSet { .. }
-            | AdminDocumentOperation::RealmConfigNodePlacementSet { .. }
-            | AdminDocumentOperation::RealmConfigNodePlacementRemoved { .. }
-            | AdminDocumentOperation::RealmConfigPlacementStrategyUpserted { .. }
-            | AdminDocumentOperation::RealmConfigPlacementStrategyRemoved { .. }
-            | AdminDocumentOperation::RealmConfigDefaultStrategySet { .. }
-            | AdminDocumentOperation::RealmConfigJobFamilySet { .. }
-            | AdminDocumentOperation::RealmConfigStrategyBindingSet { .. }
-            | AdminDocumentOperation::RealmConfigStrategyBindingRemoved { .. }
-            | AdminDocumentOperation::RealmConfigPlacementOverrideSet { .. }
-            | AdminDocumentOperation::RealmConfigPlacementOverrideRemoved { .. }
-            | AdminDocumentOperation::RealmConfigPlacementBindingAppended { .. }
-            | AdminDocumentOperation::RealmConfigHandleRangeGranted { .. }
-            | AdminDocumentOperation::RealmConfigBandPoolAssigned { .. }
-            | AdminDocumentOperation::RealmConfigPoliciesSet { .. }
-            | AdminDocumentOperation::RealmConfigCandidateMapPublished { .. }
-            | AdminDocumentOperation::RealmConfigActivationsInitialized { .. }
-            | AdminDocumentOperation::RealmConfigTransitionStarted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionBarrierReported { .. }
-            | AdminDocumentOperation::RealmConfigTransitionProofSubmitted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionAborted { .. }
-            | AdminDocumentOperation::RealmConfigTransitionBucketForced { .. }
-            | AdminDocumentOperation::RealmConfigTransitionStallReported { .. }
-            | AdminDocumentOperation::RealmConfigTransitionDrainReported { .. }
-            | AdminDocumentOperation::RealmConfigComputeSet { .. }
-            | AdminDocumentOperation::RealmConfigTokenRevoked { .. }
-    ) {
-        return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, and token revocations"
-                .to_string(),
-        ));
-    }
+    Ok(*realm_id)
+}
 
-    let is_revocation = matches!(
-        &event.op,
-        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
-    );
+/// Whether a realm-config event's origin node and actor belong to the target
+/// realm.
+fn validate_config_actor(realm_id: RealmId, event: &AdminDocumentEvent) -> Result<()> {
     if event.origin_node_id != event.actor.node_id
         || event.actor.realm_id != realm_id
         || event.actor.user_id.realm_id != realm_id
@@ -1040,9 +1057,61 @@ async fn apply_realm_config(
             "realm config event actor and origin do not match the target realm".to_string(),
         ));
     }
+    Ok(())
+}
 
-    // A transient SSI conflict must never wedge the topic: retry with yields,
-    // bounded as a livelock safety valve.
+/// Re-checks a revocation against the transaction snapshot: the origin must
+/// already be onboarded and the payload valid under the snapshot clock.
+fn validate_revocation_snapshot(
+    previous_config: Option<&RealmConfigDocument>,
+    previous_state: Option<&AdminDocumentReducerState>,
+    event: &AdminDocumentEvent,
+    realm_id: RealmId,
+    raw_now: u64,
+) -> Result<()> {
+    let valid = revocation_origin_known(previous_config, previous_state, event, realm_id);
+    if !valid {
+        return Err(NetError::Bootstrap(
+            "revocation origin is not an onboarded realm node in the transaction snapshot"
+                .to_string(),
+        ));
+    }
+    if let AdminDocumentOperation::RealmConfigTokenRevoked {
+        token_hash,
+        expires_at,
+        token_owner,
+    } = &event.op
+        && (!aruna_core::auth::valid_token_hash(token_hash)
+            || !valid_revocation_expiry(*expires_at, raw_now)
+            || token_owner.is_nil()
+            || token_owner.realm_id != realm_id)
+    {
+        return Err(NetError::Bootstrap(
+            "replicated revocation has invalid hash, expiry, or owner".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn apply_realm_config(
+    storage: &StorageHandle,
+    document_target: DocumentSyncTarget,
+    event: AdminDocumentEvent,
+) -> Result<()> {
+    let realm_id = validate_config_target(&document_target, &event)?;
+    if !config_mutation_allowed(&event.op) {
+        return Err(NetError::Bootstrap(
+            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, and token revocations"
+                .to_string(),
+        ));
+    }
+    validate_config_actor(realm_id, &event)?;
+
+    let is_revocation = matches!(
+        &event.op,
+        AdminDocumentOperation::RealmConfigTokenRevoked { .. }
+    );
+
     for _ in 0..APPLY_CONFLICT_ATTEMPTS {
         tokio::task::yield_now().await;
         let raw_now = unix_timestamp_secs();
@@ -1084,45 +1153,16 @@ async fn apply_realm_config(
             Err(error) => return Err(abort_error(storage, txn_id, error).await),
         };
 
-        if is_revocation {
-            let valid = revocation_origin_known(
+        if is_revocation
+            && let Err(error) = validate_revocation_snapshot(
                 previous_config.as_ref(),
                 previous_state.as_ref(),
                 &event,
                 realm_id,
-            );
-            if !valid {
-                return Err(
-                    abort_error(
-                        storage,
-                        txn_id,
-                        NetError::Bootstrap(
-                            "revocation origin is not an onboarded realm node in the transaction snapshot"
-                                .to_string(),
-                        ),
-                    )
-                    .await,
-                );
-            }
-            if let AdminDocumentOperation::RealmConfigTokenRevoked {
-                token_hash,
-                expires_at,
-                token_owner,
-            } = &event.op
-                && (!aruna_core::auth::valid_token_hash(token_hash)
-                    || !valid_revocation_expiry(*expires_at, raw_now)
-                    || token_owner.is_nil()
-                    || token_owner.realm_id != realm_id)
-            {
-                return Err(abort_error(
-                    storage,
-                    txn_id,
-                    NetError::Bootstrap(
-                        "replicated revocation has invalid hash, expiry, or owner".to_string(),
-                    ),
-                )
-                .await);
-            }
+                raw_now,
+            )
+        {
+            return Err(abort_error(storage, txn_id, error).await);
         }
 
         let effective_now = previous_state
@@ -1161,43 +1201,16 @@ async fn apply_realm_config(
             index.compact(&mut reducer_state);
         }
 
-        let (config, config_changed) = match previous_config {
-            Some(mut config) => {
-                if config.realm_id != realm_id {
-                    return Err(
-                        abort_error(
-                            storage,
-                            txn_id,
-                            NetError::Bootstrap(format!(
-                                "stored realm config document id {realm_id} does not match payload realm id {}",
-                                config.realm_id
-                            )),
-                        )
-                        .await,
-                    );
-                }
-                let before = config.clone();
-                overlay_realm_config(
-                    &mut config,
-                    &reducer_state,
-                    effective_now,
-                    unix_timestamp_millis(),
-                    revocation_index.as_ref(),
-                );
-                let changed = config != before;
-                (Some(config), changed)
-            }
-            None => {
-                let config = materialized_realm_config(
-                    realm_id,
-                    &reducer_state,
-                    effective_now,
-                    unix_timestamp_millis(),
-                    revocation_index.as_ref(),
-                );
-                let changed = config.is_some();
-                (config, changed)
-            }
+        let (config, config_changed) = match plan_realm_change(
+            previous_config,
+            realm_id,
+            &reducer_state,
+            effective_now,
+            unix_timestamp_millis(),
+            revocation_index.as_ref(),
+        ) {
+            Ok(planned) => planned,
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
         };
         if previous_state
             .as_ref()
