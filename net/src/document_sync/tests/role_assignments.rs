@@ -33,7 +33,7 @@ async fn subject_claims_promote() {
         for index in order {
             apply_user_operation(
                 storage,
-                DocumentSyncTarget::User {
+                DocumentTarget::User {
                     user_id: user_ids[index],
                 },
                 additions[index].clone(),
@@ -81,7 +81,7 @@ async fn subject_claims_promote() {
     for storage in [&left, &right] {
         apply_user_operation(
             storage,
-            DocumentSyncTarget::User {
+            DocumentTarget::User {
                 user_id: user_ids[0],
             },
             removal.clone(),
@@ -151,7 +151,7 @@ async fn seeded_group_materializes() {
     };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::GroupAuthorization { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
         seed_event,
     )
     .await
@@ -171,7 +171,7 @@ async fn seeded_group_materializes() {
     };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::GroupAuthorization { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
         add_event,
     )
     .await
@@ -194,7 +194,7 @@ async fn seeded_group_materializes() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert!(reducer_state.conflicts.is_empty());
     assert_eq!(
@@ -224,7 +224,7 @@ async fn seeded_group_materializes() {
     };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::GroupAuthorization { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
         remove_event,
     )
     .await
@@ -247,7 +247,7 @@ async fn seeded_group_materializes() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert_eq!(
         reducer_state
@@ -271,7 +271,7 @@ async fn new_role_materializes() {
         realm_id,
     );
     let target = AdminDocumentTarget::Group { group_id };
-    let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
 
     apply_admin_operation(
         &storage,
@@ -335,7 +335,7 @@ async fn new_role_materializes() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert!(reducer_state.conflicts.is_empty());
     assert_eq!(
@@ -406,7 +406,7 @@ async fn assignment_conflict_materializes() {
     };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::GroupAuthorization { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
         add_event,
     )
     .await
@@ -425,7 +425,7 @@ async fn assignment_conflict_materializes() {
     };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::GroupAuthorization { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
         conflicting_remove_event,
     )
     .await
@@ -462,7 +462,7 @@ async fn assignment_conflict_materializes() {
     };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::GroupAuthorization { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
         resolving_remove_event,
     )
     .await
@@ -489,7 +489,7 @@ async fn assignment_conflict_materializes() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert!(reducer_state.conflicts.is_empty());
 }
@@ -506,7 +506,7 @@ async fn conflicting_add_removes() {
         realm_id,
     };
     let target = AdminDocumentTarget::Realm { realm_id };
-    let document_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let document_target = DocumentTarget::RealmAuthorization { realm_id };
     let auth_doc = RealmAuthorizationDocument {
         realm_id,
         roles: HashMap::from([(role_id, test_role(role_id, [assigned_user_id]))]),
@@ -644,7 +644,7 @@ async fn seeded_realm_materializes() {
     };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::RealmAuthorization { realm_id },
+        DocumentTarget::RealmAuthorization { realm_id },
         seed_event,
     )
     .await
@@ -664,7 +664,7 @@ async fn seeded_realm_materializes() {
     };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::RealmAuthorization { realm_id },
+        DocumentTarget::RealmAuthorization { realm_id },
         add_event,
     )
     .await
@@ -688,7 +688,7 @@ async fn seeded_realm_materializes() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert!(reducer_state.conflicts.is_empty());
     assert_eq!(
@@ -718,7 +718,7 @@ async fn seeded_realm_materializes() {
     };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::RealmAuthorization { realm_id },
+        DocumentTarget::RealmAuthorization { realm_id },
         remove_event,
     )
     .await
@@ -742,7 +742,7 @@ async fn seeded_realm_materializes() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert_eq!(
         reducer_state
@@ -765,7 +765,7 @@ async fn new_realm_materializes() {
         realm_id,
     );
     let target = AdminDocumentTarget::Realm { realm_id };
-    let document_target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let document_target = DocumentTarget::RealmAuthorization { realm_id };
 
     apply_admin_operation(
         &storage,
@@ -829,7 +829,7 @@ async fn new_realm_materializes() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert!(reducer_state.conflicts.is_empty());
     assert_eq!(

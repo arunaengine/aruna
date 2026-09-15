@@ -52,7 +52,7 @@ async fn pid_placement_fence() {
     batch_write_to(
         &storage,
         vec![target_write_entry(
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             config
                 .to_bytes(&actor)
                 .expect("realm config serializes")
@@ -125,7 +125,7 @@ async fn pid_placement_fence() {
         )
         .await;
     assert!(
-        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published, DocumentNetEvent::DocumentsPublished { .. }),
         "mapping publish failed: {published:?}"
     );
 
@@ -227,7 +227,7 @@ async fn capacity_holds_cursor() {
     .expect("document sync service opens");
     let local_node = service.local_node_id().expect("local node id");
 
-    let target = DocumentSyncTarget::NodeInfo {
+    let target = DocumentTarget::NodeInfo {
         realm_id,
         node_id: local_node,
     };
@@ -238,7 +238,7 @@ async fn capacity_holds_cursor() {
                 event_id: Ulid::generate(),
                 target: target.clone(),
                 bytes: node_info_bytes(node(74), 5),
-                change: DocumentSyncChange {
+                change: DocumentChange {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: 1,
@@ -246,7 +246,7 @@ async fn capacity_holds_cursor() {
                         actor: local_node,
                         updated_at_ms: 1,
                     },
-                    kind: DocumentSyncChangeKind::Upsert,
+                    kind: DocumentChangeKind::Upsert,
                     placement: PlacementRef::NIL,
                 },
                 allow_genesis: true,
@@ -256,7 +256,7 @@ async fn capacity_holds_cursor() {
         .await;
     assert!(matches!(
         published,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     // A full store fails the write closed: no evidence, no cursor movement.
@@ -308,7 +308,7 @@ async fn shard_membership_exact() {
     let stale_node = node(82);
     let shard_topic = restart_topic();
     let shared_topic =
-        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+        DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
 
     service
         .ensure_sync_topics(&[shard_topic], vec![current_node, stale_node])
@@ -375,7 +375,7 @@ async fn covered_dependency_retained() {
     let remote_signer = Ed25519Signer::from_bytes(&[88; 32]);
     let remote_event_id = Ulid::from_parts(1_727_000_000_000, 43);
     let local_event_id = Ulid::from_parts(1_727_000_000_000, 44);
-    let change = |event_id, actor| DocumentSyncChange {
+    let change = |event_id, actor| DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -383,10 +383,10 @@ async fn covered_dependency_retained() {
             actor,
             updated_at_ms: 1_727_000_000_101,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement: restart_placement(),
     };
-    let publish = |event_id, actor| DocumentSyncEvent::Upsert {
+    let publish = |event_id, actor| DocumentEvent::Upsert {
         event_id,
         target: restart_target(),
         bytes: restart_payload(),
@@ -423,7 +423,7 @@ async fn covered_dependency_retained() {
     let event_ids = events
         .into_iter()
         .filter_map(|(event, _, _)| match event {
-            DocumentSyncEvent::Upsert { event_id, .. } => Some(event_id),
+            DocumentEvent::Upsert { event_id, .. } => Some(event_id),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -449,7 +449,7 @@ async fn replay_backlog() {
                 event_id,
                 target: target.clone(),
                 bytes: restart_payload(),
-                change: DocumentSyncChange {
+                change: DocumentChange {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: 1,
@@ -457,7 +457,7 @@ async fn replay_backlog() {
                         actor: service.local_node_id().expect("local node id"),
                         updated_at_ms: 1_800_000_000_000 + index as u64,
                     },
-                    kind: DocumentSyncChangeKind::Upsert,
+                    kind: DocumentChangeKind::Upsert,
                     placement: restart_placement(),
                 },
                 allow_genesis: false,
@@ -466,7 +466,7 @@ async fn replay_backlog() {
         .collect::<Vec<_>>();
     assert!(matches!(
         service.publish_documents(documents, Vec::new()).await,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     let cursor = ::irokle::ActorClock::default();
@@ -587,7 +587,7 @@ async fn stale_publisher_rejected() {
         .await;
     assert!(matches!(
         published,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
     let publisher_ops = ::irokle::oplog::topological(publisher.node().storage(), &topic_id)
         .expect("publisher history reads");

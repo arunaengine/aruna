@@ -31,7 +31,7 @@ fn empty_confirms_unknown() {
         // Typed summary: the peer holds a genesis.
         SyncMessage::Summary(summary_for(
             topic(2),
-            Some(DocumentSyncEvent::TYPE_ID.to_string()),
+            Some(DocumentEvent::TYPE_ID.to_string()),
             BTreeSet::new(),
         )),
         // topic(3) omitted entirely: refused (held, prober not a member).
@@ -88,7 +88,7 @@ fn buffered_publish_child() {
 
         assert_eq!(
             event,
-            DocumentSyncNetEvent::DocumentsPublished {
+            DocumentNetEvent::DocumentsPublished {
                 targets: vec![target]
             }
         );
@@ -100,7 +100,7 @@ fn buffered_publish_child() {
 
 #[test]
 fn event_envelope_roundtrip() {
-    let event = DocumentSyncEvent::Upsert {
+    let event = DocumentEvent::Upsert {
         event_id: restart_event_id(),
         target: restart_target(),
         bytes: restart_payload(),
@@ -108,7 +108,7 @@ fn event_envelope_roundtrip() {
     };
     let envelope = EventEnvelope::encode_event(&event).expect("event encodes");
     let decoded = envelope
-        .decode_event::<DocumentSyncEvent>()
+        .decode_event::<DocumentEvent>()
         .expect("event decodes");
 
     assert_eq!(decoded, event);
@@ -125,7 +125,7 @@ async fn buffered_publish_survives() {
     let service = open_restart_service(root, "parent-storage").await;
     let topic = service
         .node()
-        .open_topic::<DocumentSyncEvent>(restart_topic())
+        .open_topic::<DocumentEvent>(restart_topic())
         .expect("published topic reopens after restart");
     let history = topic
         .history(::irokle::history::HistoryOrder::OldestFirst)
@@ -134,7 +134,7 @@ async fn buffered_publish_survives() {
     assert_eq!(history.len(), 1);
     assert_eq!(
         history[0].event,
-        DocumentSyncEvent::Upsert {
+        DocumentEvent::Upsert {
             event_id: restart_event_id(),
             target,
             bytes: restart_payload(),
@@ -261,7 +261,7 @@ fn clean_batch_succeeds() {
 fn headless_summary_empty() {
     assert!(summary_is_empty(&sync_summary(None, BTreeSet::new())));
     assert!(!summary_is_empty(&sync_summary(
-        Some(DocumentSyncEvent::TYPE_ID.to_string()),
+        Some(DocumentEvent::TYPE_ID.to_string()),
         BTreeSet::new()
     )));
     assert!(!summary_is_empty(&sync_summary(

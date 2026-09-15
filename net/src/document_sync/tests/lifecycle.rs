@@ -104,10 +104,10 @@ async fn registry_replay_repairs() {
     batch_write_to(
         &storage,
         vec![(
-            DocumentSyncTarget::RealmConfig { realm_id }
+            DocumentTarget::RealmConfig { realm_id }
                 .storage_keyspace()
                 .to_string(),
-            DocumentSyncTarget::RealmConfig { realm_id }.storage_key(),
+            DocumentTarget::RealmConfig { realm_id }.storage_key(),
             config
                 .to_bytes(&actor)
                 .expect("realm config serializes")
@@ -214,7 +214,7 @@ async fn registry_strategy_fenced() {
     };
     let mut config = RealmConfigDocument::default_for_realm(record.realm_id, Vec::new());
     config.seed_default_placement();
-    let config_target = DocumentSyncTarget::RealmConfig {
+    let config_target = DocumentTarget::RealmConfig {
         realm_id: record.realm_id,
     };
     batch_write_to(
@@ -284,7 +284,7 @@ async fn upsert_keeps_config() {
         Ulid::from_parts(2_132, 1),
     );
     record.placement = placement;
-    let config_target = DocumentSyncTarget::RealmConfig {
+    let config_target = DocumentTarget::RealmConfig {
         realm_id: record.realm_id,
     };
     batch_write_to(
@@ -364,7 +364,7 @@ async fn capacity_retains_cursors() {
     batch_write_to(
         &storage,
         vec![target_write_entry(
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             config
                 .to_bytes(&actor)
                 .expect("realm config serializes")
@@ -401,7 +401,7 @@ async fn capacity_retains_cursors() {
         registry_event_id,
     );
     registry.placement = registry_placement;
-    let registry_target = DocumentSyncTarget::MetadataRegistry {
+    let registry_target = DocumentTarget::MetadataRegistry {
         group_id: registry_group_id,
         document_id: registry_document_id,
     };
@@ -424,7 +424,7 @@ async fn capacity_retains_cursors() {
         77,
     );
     create.record.placement = create_placement;
-    let create_target = DocumentSyncTarget::MetadataCreateEvent {
+    let create_target = DocumentTarget::MetadataCreateEvent {
         document_id: create_document_id,
         event_id: create_event_id,
     };
@@ -433,7 +433,7 @@ async fn capacity_retains_cursors() {
     service
         .ensure_sync_topics(&[registry_topic, create_topic], Vec::new())
         .expect("metadata shard topic genesis");
-    let change = |event_id, placement| DocumentSyncChange {
+    let change = |event_id, placement| DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -441,7 +441,7 @@ async fn capacity_retains_cursors() {
             actor: local_node,
             updated_at_ms: 100,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     };
     let published = service
@@ -466,7 +466,7 @@ async fn capacity_retains_cursors() {
         )
         .await;
     assert!(
-        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published, DocumentNetEvent::DocumentsPublished { .. }),
         "metadata publish failed: {published:?}"
     );
     for topic_id in [registry_topic, create_topic] {
@@ -497,7 +497,7 @@ async fn capacity_retains_cursors() {
         filler_realm[..8].copy_from_slice(&(index as u64).to_be_bytes());
         let filler_realm = RealmId::from_bytes(filler_realm);
         filler_topics.insert(
-            DocumentSyncTarget::RealmConfig {
+            DocumentTarget::RealmConfig {
                 realm_id: filler_realm,
             }
             .sync_topic_id(filler_realm, &PlacementRef::NIL),
@@ -514,11 +514,11 @@ async fn capacity_retains_cursors() {
         .expect("full dependency has a topic");
     assert_eq!(
         register_deferred_topic(&mut capacity_probe, dependency, existing_topic),
-        DeferredTopicRegistrationOutcome::AlreadyRegistered
+        DeferredRegistrationOutcome::AlreadyRegistered
     );
     assert_eq!(
         register_deferred_topic(&mut capacity_probe, dependency, registry_topic),
-        DeferredTopicRegistrationOutcome::CapacityExceeded
+        DeferredRegistrationOutcome::CapacityExceeded
     );
     service
         .storage_write(
@@ -619,7 +619,7 @@ async fn metadata_placement_defers() {
         allocated_by: None,
         allocated_at_ms: None,
     });
-    let config_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let config_target = DocumentTarget::RealmConfig { realm_id };
     batch_write_to(
         &storage,
         vec![target_write_entry(
@@ -665,11 +665,11 @@ async fn metadata_placement_defers() {
     record.placement = placement;
     let mut create = metadata_create_event(group_id, document_id, 100, create_event_id, 76);
     create.record = record.clone();
-    let registry_target = DocumentSyncTarget::MetadataRegistry {
+    let registry_target = DocumentTarget::MetadataRegistry {
         group_id,
         document_id,
     };
-    let create_target = DocumentSyncTarget::MetadataCreateEvent {
+    let create_target = DocumentTarget::MetadataCreateEvent {
         document_id,
         event_id: create_event_id,
     };
@@ -678,11 +678,11 @@ async fn metadata_placement_defers() {
     update.event_id = update_event_id;
     update.record.updated_at_ms = 200;
     update.record.last_event_id = update_event_id;
-    update.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+    update.payload = MetadataEventPayload::ReplaceRoCrate {
         jsonld: "{}".to_string(),
     };
     update.occurred_at_ms = 200;
-    let update_target = DocumentSyncTarget::MetadataCreateEvent {
+    let update_target = DocumentTarget::MetadataCreateEvent {
         document_id,
         event_id: update_event_id,
     };
@@ -690,7 +690,7 @@ async fn metadata_placement_defers() {
     service
         .ensure_sync_topics(&[metadata_topic], Vec::new())
         .expect("metadata shard topic genesis");
-    let change = |event_id| DocumentSyncChange {
+    let change = |event_id| DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -698,7 +698,7 @@ async fn metadata_placement_defers() {
             actor: local_node,
             updated_at_ms: 100,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     };
     let published = service
@@ -730,7 +730,7 @@ async fn metadata_placement_defers() {
         )
         .await;
     assert!(
-        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published, DocumentNetEvent::DocumentsPublished { .. }),
         "metadata publish failed: {published:?}"
     );
     reset_test_cursor(&service, metadata_topic).await;
@@ -811,7 +811,7 @@ async fn metadata_placement_defers() {
         )
         .await;
     assert!(
-        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published, DocumentNetEvent::DocumentsPublished { .. }),
         "strategy publish failed: {published:?}"
     );
     reset_test_cursor(&service, config_topic).await;
@@ -832,8 +832,7 @@ async fn metadata_placement_defers() {
     .await
     .expect("create event exists");
     assert_eq!(
-        postcard::from_bytes::<MetadataCreateEventRecord>(&stored_create)
-            .expect("create event decodes"),
+        postcard::from_bytes::<MetadataEventRecord>(&stored_create).expect("create event decodes"),
         create
     );
     let acceptance = read_storage_value(
@@ -844,7 +843,7 @@ async fn metadata_placement_defers() {
     .await
     .expect("create acceptance exists");
     assert_eq!(
-        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance)
+        postcard::from_bytes::<MetadataEventRecord>(&acceptance)
             .expect("create acceptance decodes"),
         create
     );
@@ -870,7 +869,7 @@ async fn metadata_placement_defers() {
     .await
     .expect("create acceptance remains");
     assert_eq!(
-        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+        postcard::from_bytes::<MetadataEventRecord>(&acceptance).unwrap(),
         create
     );
 
@@ -879,7 +878,7 @@ async fn metadata_placement_defers() {
     divergent.event_id = divergent_id;
     divergent.record.establishing_event_id = divergent_id;
     divergent.record.last_event_id = divergent_id;
-    let divergent_target = DocumentSyncTarget::MetadataCreateEvent {
+    let divergent_target = DocumentTarget::MetadataCreateEvent {
         document_id,
         event_id: divergent_id,
     };
@@ -908,7 +907,7 @@ async fn metadata_placement_defers() {
     .await
     .unwrap();
     assert_eq!(
-        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+        postcard::from_bytes::<MetadataEventRecord>(&acceptance).unwrap(),
         create
     );
     let cursor = read_test_cursor(&storage, metadata_topic).await.unwrap();
@@ -1015,7 +1014,7 @@ async fn tombstone_required() {
         Ulid::from_parts(52, 1),
     );
     write_registry_record(&storage, &record).await;
-    let graph = MetadataGraphLifecycleRecord::deleted(
+    let graph = GraphLifecycleRecord::deleted(
         record.graph_iri.clone(),
         record.realm_id,
         group_id,
@@ -1055,7 +1054,7 @@ async fn live_lifecycle_preserved() {
         live_event_id,
     );
     write_registry_record(&storage, &record).await;
-    let live_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+    let live_lifecycle = MetadataLifecycleRecord::Upsert {
         event: Box::new(metadata_create_event(
             group_id,
             document_id,
@@ -1065,7 +1064,7 @@ async fn live_lifecycle_preserved() {
         )),
     };
     write_document_lifecycle(&storage, &live_lifecycle).await;
-    let graph = MetadataGraphLifecycleRecord::deleted(
+    let graph = GraphLifecycleRecord::deleted(
         record.graph_iri.clone(),
         record.realm_id,
         group_id,
@@ -1113,7 +1112,7 @@ async fn newer_registry_preserved() {
         Ulid::from_parts(73, 1),
     );
     write_document_lifecycle(&storage, &delete_lifecycle).await;
-    let MetadataDocumentLifecycleRecord::Delete { event } = delete_lifecycle else {
+    let MetadataLifecycleRecord::Delete { event } = delete_lifecycle else {
         unreachable!("delete lifecycle helper returns delete records")
     };
     let graph = event.tombstone;
@@ -1157,7 +1156,7 @@ async fn matching_tombstone_deletes() {
         record.last_event_id,
     );
     write_document_lifecycle(&storage, &delete_lifecycle).await;
-    let MetadataDocumentLifecycleRecord::Delete { event } = delete_lifecycle else {
+    let MetadataLifecycleRecord::Delete { event } = delete_lifecycle else {
         unreachable!("delete lifecycle helper returns delete records")
     };
     let graph = event.tombstone;
@@ -1230,7 +1229,7 @@ async fn lifecycle_upsert_idempotent() {
     let document_id = Ulid::from_parts(2, 2);
     let event_id = Ulid::from_parts(3, 3);
     let event = metadata_create_event(group_id, document_id, 100, event_id, 7);
-    let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+    let lifecycle = MetadataLifecycleRecord::Upsert {
         event: Box::new(event.clone()),
     };
     let placement = aruna_core::structs::PlacementRef {
@@ -1259,7 +1258,7 @@ async fn lifecycle_upsert_idempotent() {
     .await
     .expect("event log record exists");
     assert_eq!(
-        postcard::from_bytes::<MetadataCreateEventRecord>(&stored_event)
+        postcard::from_bytes::<MetadataEventRecord>(&stored_event)
             .expect("event log record decodes"),
         event
     );
@@ -1273,7 +1272,7 @@ async fn lifecycle_upsert_idempotent() {
     .await
     .expect("create acceptance exists");
     assert_eq!(
-        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+        postcard::from_bytes::<MetadataEventRecord>(&acceptance).unwrap(),
         event
     );
 }
@@ -1285,7 +1284,7 @@ async fn lifecycle_acceptance_fence() {
     let document_id = Ulid::from_parts(12, 1);
     let event_id = Ulid::from_parts(13, 1);
     let accepted = metadata_create_event(group_id, document_id, 100, event_id, 7);
-    let accepted_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+    let accepted_lifecycle = MetadataLifecycleRecord::Upsert {
         event: Box::new(accepted.clone()),
     };
     assert!(
@@ -1302,7 +1301,7 @@ async fn lifecycle_acceptance_fence() {
     divergent.event_id = Ulid::from_parts(14, 1);
     divergent.record.establishing_event_id = divergent.event_id;
     divergent.record.last_event_id = divergent.event_id;
-    let divergent_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+    let divergent_lifecycle = MetadataLifecycleRecord::Upsert {
         event: Box::new(divergent),
     };
     assert!(
@@ -1322,16 +1321,16 @@ async fn lifecycle_acceptance_fence() {
     .await
     .expect("create acceptance remains");
     assert_eq!(
-        postcard::from_bytes::<MetadataCreateEventRecord>(&acceptance).unwrap(),
+        postcard::from_bytes::<MetadataEventRecord>(&acceptance).unwrap(),
         accepted
     );
 
     let orphan_id = Ulid::from_parts(15, 1);
     let mut orphan = metadata_create_event(group_id, orphan_id, 200, orphan_id, 7);
-    orphan.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+    orphan.payload = MetadataEventPayload::ReplaceRoCrate {
         jsonld: "{}".to_string(),
     };
-    let orphan_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+    let orphan_lifecycle = MetadataLifecycleRecord::Upsert {
         event: Box::new(orphan),
     };
     assert!(
@@ -1361,11 +1360,11 @@ async fn lifecycle_acceptance_fence() {
         strategy_id: Ulid::from_parts(17, 1),
         shard: 1,
     };
-    mismatched.payload = MetadataCreateEventPayload::ReplaceRoCrate {
+    mismatched.payload = MetadataEventPayload::ReplaceRoCrate {
         jsonld: "{}".to_string(),
     };
     mismatched.occurred_at_ms = 200;
-    let mismatched_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+    let mismatched_lifecycle = MetadataLifecycleRecord::Upsert {
         event: Box::new(mismatched),
     };
     assert!(
@@ -1399,7 +1398,7 @@ async fn newer_sidecar_blocks() {
     );
 
     let stale_event = metadata_create_event(group_id, document_id, 100, stale_event_id, 7);
-    let stale_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+    let stale_lifecycle = MetadataLifecycleRecord::Upsert {
         event: Box::new(stale_event),
     };
     assert!(
@@ -1427,7 +1426,7 @@ async fn newer_sidecar_blocks() {
     );
     let revision = read_lifecycle_revision(&storage, document_id).await;
     assert_eq!(revision.current.event_id, delete_event_id);
-    assert_eq!(revision.kind, DocumentSyncChangeKind::Delete);
+    assert_eq!(revision.kind, DocumentChangeKind::Delete);
 }
 
 #[tokio::test]
@@ -1487,14 +1486,14 @@ async fn stale_sidecars_block() {
 #[test]
 fn delete_entries_prune() {
     let document_id = Ulid::from_parts(10, 1);
-    let tombstone = MetadataGraphLifecycleRecord::deleted(
+    let tombstone = GraphLifecycleRecord::deleted(
         "urn:graph:deleted".to_string(),
         RealmId::from_bytes([1; 32]),
         Ulid::from_parts(11, 1),
         document_id,
         12,
     );
-    let record = MetadataDocumentDeleteRecord {
+    let record = MetadataDeleteRecord {
         event_id: Ulid::from_parts(13, 1),
         tombstone: tombstone.clone(),
         deleted_after_event_id: Ulid::from_parts(9, 1),
@@ -1506,8 +1505,7 @@ fn delete_entries_prune() {
         .iter()
         .filter(|(keyspace, _, _)| keyspace == METADATA_GRAPH_PRUNE_JOB_KEYSPACE)
         .map(|(_, _, value)| {
-            postcard::from_bytes::<MetadataGraphPruneJobRecord>(value.as_ref())
-                .expect("prune job decodes")
+            postcard::from_bytes::<GraphPruneRecord>(value.as_ref()).expect("prune job decodes")
         })
         .collect::<Vec<_>>();
     assert_eq!(prune_jobs.len(), 1);

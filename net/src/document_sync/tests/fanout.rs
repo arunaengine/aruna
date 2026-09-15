@@ -283,7 +283,7 @@ fn index_skip_expiry() {
         UserId::local(Ulid::from_parts(1_810, 1), realm_id),
         realm_id,
     );
-    let mut state = AdminDocumentReducerState::new(target.clone());
+    let mut state = AdminDocumentState::new(target.clone());
     state
         .apply(&test_admin_event(
             Ulid::from_parts(1_811, 1),
@@ -320,7 +320,7 @@ fn floor_stays_monotonic() {
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
     let token_hash = aruna_core::auth::bearer_token_hash("floor-token");
-    let mut state = AdminDocumentReducerState::new(target.clone());
+    let mut state = AdminDocumentState::new(target.clone());
     state
         .apply(&test_admin_event(
             Ulid::from_parts(1_801, 1),
@@ -357,7 +357,7 @@ async fn malformed_state_aborts() {
         realm_id,
     );
     let target = AdminDocumentTarget::RealmConfig { realm_id };
-    let document_target = DocumentSyncTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
     batch_write_to(
         &storage,
         vec![(

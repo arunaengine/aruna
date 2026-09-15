@@ -4,7 +4,7 @@ use super::*;
 fn visibility_conflicts_private() {
     let realm_id = RealmId::from_bytes([44; 32]);
     let user_id = UserId::local(Ulid::from_parts(210, 1), realm_id);
-    let mut reducer = AdminDocumentReducerState::new(AdminDocumentTarget::User { user_id });
+    let mut reducer = AdminDocumentState::new(AdminDocumentTarget::User { user_id });
     let mut event = test_admin_event(
         Ulid::from_parts(211, 1),
         reducer.target.clone(),
@@ -77,7 +77,7 @@ async fn created_group_bootstraps() {
 
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::GroupAuthorization { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
         test_admin_event(
             Ulid::from_parts(192, 1),
             AdminDocumentTarget::Group { group_id },
@@ -126,7 +126,7 @@ async fn rename_updates_row() {
         realm_id,
     );
     let target = AdminDocumentTarget::Group { group_id };
-    let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
 
     apply_admin_operation(
         &storage,
@@ -216,7 +216,7 @@ async fn seed_rename_group(
         storage,
         vec![
             target_write_entry(
-                DocumentSyncTarget::RealmConfig { realm_id },
+                DocumentTarget::RealmConfig { realm_id },
                 config.to_bytes(&actor).expect("config serializes").into(),
             ),
             (
@@ -237,7 +237,7 @@ async fn validate_rename(
     group_id: Ulid,
     actor: &Actor,
 ) -> AdminEventValidation {
-    let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
     let placement = admin_test_placement();
     let topic_id = document_target.sync_topic_id(realm_id, &placement);
     let event = test_admin_event(
@@ -276,7 +276,7 @@ async fn created_roles_update() {
         realm_id,
     );
     let target = AdminDocumentTarget::Group { group_id };
-    let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
 
     apply_admin_operation(
         &storage,
@@ -340,7 +340,7 @@ async fn replicated_role_confined() {
         UserId::local(Ulid::from_parts(212, 1), realm_id),
         realm_id,
     );
-    let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
     let placement = admin_test_placement();
     let topic_id = document_target.sync_topic_id(realm_id, &placement);
     let actor_id = ::irokle::actor_id_for(topic_id, node_to_peer(&actor.node_id));
@@ -403,7 +403,7 @@ async fn existing_roles_update() {
     .expect("group writes");
 
     let target = AdminDocumentTarget::Group { group_id };
-    let document_target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
     apply_admin_operation(
         &storage,
         document_target.clone(),
@@ -499,7 +499,7 @@ async fn missing_group_unchanged() {
 
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::GroupAuthorization { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
         test_admin_event(
             Ulid::from_parts(173, 1),
             AdminDocumentTarget::Group { group_id },
@@ -586,7 +586,7 @@ async fn role_removal_updates() {
     let target = AdminDocumentTarget::Group { group_id };
     apply_admin_operation(
         &storage,
-        DocumentSyncTarget::GroupAuthorization { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
         test_admin_event(
             Ulid::from_parts(202, 1),
             target.clone(),
@@ -617,7 +617,7 @@ async fn role_removal_updates() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert!(!reducer_state.materialized_group_roles().contains(&role_id));
 }
@@ -661,7 +661,7 @@ async fn user_operation_materializes() {
             name: "Alice Updated".to_string(),
         },
     };
-    apply_user_operation(&storage, DocumentSyncTarget::User { user_id }, event)
+    apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
         .await
         .expect("admin operation applies");
 
@@ -678,7 +678,7 @@ async fn user_operation_materializes() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert_eq!(
         reducer_state.materialized_user_name().as_deref(),
@@ -730,7 +730,7 @@ async fn stale_user_recorded() {
     };
 
     for event in [newer, older.clone(), older.clone()] {
-        apply_user_operation(&storage, DocumentSyncTarget::User { user_id }, event)
+        apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
             .await
             .expect("out-of-order admin operation applies");
     }
@@ -747,7 +747,7 @@ async fn stale_user_recorded() {
     )
     .await
     .expect("reducer state exists");
-    let reducer_state: AdminDocumentReducerState =
+    let reducer_state: AdminDocumentState =
         postcard::from_bytes(&reducer_state).expect("reducer state decodes");
     assert_eq!(reducer_state.applied_event_ids.len(), 2);
     assert!(reducer_state.applied_event_ids.contains(&older.event_id));
@@ -776,7 +776,7 @@ async fn subject_add_indexes() {
         },
     };
 
-    apply_user_operation(&storage, DocumentSyncTarget::User { user_id }, event)
+    apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
         .await
         .expect("subject add applies");
 
@@ -853,7 +853,7 @@ async fn subject_remove_cleans() {
             subject_id: "subject-removed".to_string(),
         },
     };
-    apply_user_operation(&storage, DocumentSyncTarget::User { user_id }, event)
+    apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
         .await
         .expect("subject remove applies");
 
