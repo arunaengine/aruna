@@ -10,13 +10,13 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::execution::notification_watch::{
-    MAX_PREFIX_LEN, WATCH_USER_CAP, WatchAuthorizationBinding,
-    WatchEventMask, WatchSubscription, parse_watch_key, watch_subscription_prefix,
+    MAX_PREFIX_LEN, WATCH_USER_CAP, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
+    parse_watch_key, watch_subscription_prefix,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
 use thiserror::Error;
@@ -656,9 +656,7 @@ pub async fn list_realm_subscriptions(
     let mut start = None;
     loop {
         let remaining = SUBSCRIPTION_SCAN_CAP - subscriptions.len();
-        let limit = remaining
-            .saturating_add(1)
-            .min(SUBSCRIPTION_PAGE_LIMIT);
+        let limit = remaining.saturating_add(1).min(SUBSCRIPTION_PAGE_LIMIT);
         let (values, next) = match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
@@ -782,12 +780,12 @@ mod tests {
     use crate::tests::notifications::{context, temp_storage, user};
     use aruna_core::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::structs::execution::notification_watch::{WatchEventKind, watch_resource_path};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
-    use aruna_core::structs::execution::notification_watch::{WatchEventKind, watch_resource_path};
 
     fn mask() -> WatchEventMask {
         WatchEventMask::from_kinds([
@@ -892,14 +890,7 @@ mod tests {
             Err(WatchSubscriptionError::LeadingSlash)
         );
         assert_eq!(
-            create_local_watch(
-                &storage,
-                owner,
-                "x".repeat(MAX_PREFIX_LEN + 1),
-                mask(),
-                1
-            )
-            .await,
+            create_local_watch(&storage, owner, "x".repeat(MAX_PREFIX_LEN + 1), mask(), 1).await,
             Err(WatchSubscriptionError::PrefixTooLong)
         );
         assert_eq!(
@@ -998,20 +989,28 @@ mod tests {
         let mut subscription = WatchSubscription::new(owner, "prefix".to_string(), mask(), 1);
         subscription.watch_id = watch_id;
         let bytes = subscription.to_bytes().expect("subscription encodes");
-        let key = aruna_core::structs::execution::notification_watch::watch_subscription_key(owner, watch_id);
+        let key = aruna_core::structs::execution::notification_watch::watch_subscription_key(
+            owner, watch_id,
+        );
         assert_eq!(
             decode_stored_subscription(&key, &bytes).expect("valid row"),
             subscription
         );
 
-        let wrong_key = aruna_core::structs::execution::notification_watch::watch_subscription_key(owner, Ulid::generate());
+        let wrong_key = aruna_core::structs::execution::notification_watch::watch_subscription_key(
+            owner,
+            Ulid::generate(),
+        );
         assert!(matches!(
             decode_stored_subscription(&wrong_key, &bytes),
             Err(WatchSubscriptionError::Storage(_))
         ));
 
         subscription.watch_id = Ulid::nil();
-        let nil_key = aruna_core::structs::execution::notification_watch::watch_subscription_key(owner, Ulid::nil());
+        let nil_key = aruna_core::structs::execution::notification_watch::watch_subscription_key(
+            owner,
+            Ulid::nil(),
+        );
         assert!(matches!(
             decode_stored_subscription(
                 &nil_key,

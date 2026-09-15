@@ -8,15 +8,15 @@ use aruna_core::events::{Event, NetEvent, PolicySignEvent, StorageEvent, SubOper
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::placement_policy::{
     PlacementPolicy, PlacementPolicyError, VerifiedPolicy,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::placement::policy_document::{
     PlacementPolicyDocument, PolicyAuthorityError, PolicyPublication, PolicyPublicationClaim,
     placement_policy_change, placement_policy_target, policy_authority_path,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, Value};
 use smallvec::smallvec;
@@ -475,9 +475,9 @@ mod tests {
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::handle::Handle;
-    use aruna_core::structs::placement::policy_document::verify_policy_authority;
-    use aruna_core::structs::placement::placement_policy::PlacementSelector;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::placement_policy::PlacementSelector;
+    use aruna_core::structs::placement::policy_document::verify_policy_authority;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -631,8 +631,10 @@ mod tests {
             verify_policy_authority(
                 &document,
                 &RealmConfigDocument::from_bytes(&realm_config).expect("config decodes"),
-                &aruna_core::structs::identity::realm::RealmAuthorizationDocument::from_bytes(&realm_auth)
-                    .expect("authorization decodes"),
+                &aruna_core::structs::identity::realm::RealmAuthorizationDocument::from_bytes(
+                    &realm_auth
+                )
+                .expect("authorization decodes"),
                 None,
             ),
             Ok(())
@@ -774,14 +776,19 @@ mod tests {
         .await;
         let group_auth =
             read_document(&context, DocumentTarget::GroupAuthorization { group_id }).await;
-        let group_auth = aruna_core::structs::identity::group::GroupAuthorizationDocument::from_bytes(&group_auth)
+        let group_auth =
+            aruna_core::structs::identity::group::GroupAuthorizationDocument::from_bytes(
+                &group_auth,
+            )
             .expect("group authorization decodes");
         assert_eq!(
             verify_policy_authority(
                 &document,
                 &RealmConfigDocument::from_bytes(&realm_config).expect("config decodes"),
-                &aruna_core::structs::identity::realm::RealmAuthorizationDocument::from_bytes(&realm_auth)
-                    .expect("authorization decodes"),
+                &aruna_core::structs::identity::realm::RealmAuthorizationDocument::from_bytes(
+                    &realm_auth
+                )
+                .expect("authorization decodes"),
                 Some(&group_auth),
             ),
             Ok(())

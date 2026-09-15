@@ -4,14 +4,12 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
+use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::{
-    METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind,
-};
+use aruna_core::structs::identity::realm::{METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::placement_record::{
     NodePlacementEntry, normalize_placement_input,
 };
-use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::storage::node_info::reserved_label;
 use aruna_core::time::unix_timestamp_millis;
 use ed25519_dalek::SigningKey;
@@ -388,11 +386,15 @@ mod tests {
         OnboardingMode, OnboardingPurpose, OnboardingSecretRecord, OnboardingSecretState,
         OnboardingStateRecord, OnboardingTicket,
     };
+    use aruna_core::structs::execution::notification::{
+        NotificationKind, NotificationOutboxRecord,
+    };
     use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmId, RealmNodeKind,
+    };
     use aruna_core::structs::placement::placement_record::{BindingScope, DocumentClass};
     use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
-    use aruna_core::structs::execution::notification::{NotificationKind, NotificationOutboxRecord};
-    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
@@ -727,11 +729,7 @@ mod tests {
 
         let (retry_context, net_handle) = context_with_net(&fixture).await;
         let retry = bootstrap_onboarding_finalize(
-            finalize_input(
-                &fixture,
-                fixture.joiner_node_id,
-                SECRET_EXPIRES_AT + 1,
-            ),
+            finalize_input(&fixture, fixture.joiner_node_id, SECRET_EXPIRES_AT + 1),
             retry_context,
         )
         .await
@@ -768,9 +766,10 @@ mod tests {
         let state = net_handle
             .document_sync_node()
             .storage()
-            .topic_state(
-                &target.sync_topic_id(fixture.realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL),
-            )
+            .topic_state(&target.sync_topic_id(
+                fixture.realm_id,
+                &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+            ))
             .unwrap()
             .expect("issuer node-info topic admitted during finalize");
         assert!(state.members.contains(&irokle::PeerId::from_bytes(
@@ -816,7 +815,10 @@ mod tests {
             realm_id: fixture.realm_id,
             node_id: fixture.local_node_id,
         }
-        .sync_topic_id(fixture.realm_id, &aruna_core::structs::placement::placement_record::PlacementRef::NIL);
+        .sync_topic_id(
+            fixture.realm_id,
+            &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        );
         let storage = net_handle.document_sync_node().storage().clone();
         assert!(storage.topic_state(&shared_topic).unwrap().is_none());
 
@@ -1028,11 +1030,7 @@ mod tests {
 
         let (retry_context, net_handle) = context_with_net(&fixture).await;
         let retry = bootstrap_onboarding_finalize(
-            finalize_input(
-                &fixture,
-                fixture.joiner_node_id,
-                SECRET_EXPIRES_AT + 1,
-            ),
+            finalize_input(&fixture, fixture.joiner_node_id, SECRET_EXPIRES_AT + 1),
             retry_context,
         )
         .await
@@ -1073,11 +1071,7 @@ mod tests {
         .await
         .unwrap();
         bootstrap_onboarding_finalize(
-            finalize_input(
-                &fixture,
-                fixture.joiner_node_id,
-                SECRET_EXPIRES_AT + 1,
-            ),
+            finalize_input(&fixture, fixture.joiner_node_id, SECRET_EXPIRES_AT + 1),
             context,
         )
         .await
@@ -1127,11 +1121,7 @@ mod tests {
 
         let (retry_context, net_handle) = context_with_net(&fixture).await;
         let retry = bootstrap_onboarding_finalize(
-            finalize_input(
-                &fixture,
-                fixture.joiner_node_id,
-                SECRET_EXPIRES_AT + 1,
-            ),
+            finalize_input(&fixture, fixture.joiner_node_id, SECRET_EXPIRES_AT + 1),
             retry_context,
         )
         .await

@@ -5,10 +5,10 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::placement_record::{
     AffinityEffect, AffinityRule, LabelMatch, PlacementStrategy,
 };
-use aruna_core::structs::identity::realm::RealmNodeKind;
 use ulid::Ulid;
 
 use crate::placement::{PlacementView, ResolvedNode, resolve_holders};

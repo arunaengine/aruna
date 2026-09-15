@@ -7,12 +7,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::blob::{BucketIdentity, BucketInfo};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::placement_policy::{
     PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, evaluate_placement,
 };
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{BucketIdentity, BucketInfo};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
@@ -670,8 +670,10 @@ mod pure_tests {
         // The subject that admitted the write must still be the one advertised
         // when the exposing transaction runs.
         let gated = GatedBucket::observe(None).stored_under(Some(&context("eu-west")), true);
-        let record =
-            aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(subject("eu-west")).expect("subject");
+        let record = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
+            subject("eu-west"),
+        )
+        .expect("subject");
         assert_eq!(gated.check_subject(Some(&record)), Ok(()));
         assert_eq!(gated.check_subject(None), Err(PolicyGateError::Drift));
 
@@ -714,7 +716,9 @@ mod pure_tests {
         assert_eq!(gated.check_subject(None), Ok(()));
     }
 
-    fn document(policy: &VerifiedPolicy) -> aruna_core::structs::placement::policy_document::PlacementPolicyDocument {
+    fn document(
+        policy: &VerifiedPolicy,
+    ) -> aruna_core::structs::placement::policy_document::PlacementPolicyDocument {
         crate::tests::policy::signed_document(realm(), policy, 1)
     }
 
@@ -724,10 +728,14 @@ mod pure_tests {
 
     /// The realm view and policy row the inner read starts with.
     fn opened(policy_row: Option<Value>) -> Event {
-        let mut config = aruna_core::structs::identity::realm::RealmConfigDocument::new(realm(), Vec::new(), 2);
+        let mut config =
+            aruna_core::structs::identity::realm::RealmConfigDocument::new(realm(), Vec::new(), 2);
         config.seed_default_placement();
         for seed in 1..=4u8 {
-            config.ensure_node(node(seed), aruna_core::structs::identity::realm::RealmNodeKind::Server);
+            config.ensure_node(
+                node(seed),
+                aruna_core::structs::identity::realm::RealmNodeKind::Server,
+            );
         }
         let (config_value, auth_value) =
             crate::tests::policy::realm_view(&config, crate::tests::policy::admin_user(realm()));

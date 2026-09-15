@@ -7,8 +7,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::WRITE_FENCE_KEYSPACE;
 use aruna_core::storage_entries::placement_fence_key;
-use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -254,16 +254,16 @@ mod tests {
         // admitted: the answer must line up with the reads it was asked for.
         let realm_id = RealmId::from_bytes([11; 32]);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        config
-            .strategies
-            .push(aruna_core::structs::placement::placement_record::PlacementStrategy {
+        config.strategies.push(
+            aruna_core::structs::placement::placement_record::PlacementStrategy {
                 strategy_id: placement().strategy_id,
                 name: "default".to_string(),
                 replica_count: Some(1),
                 distinct_locations: false,
                 affinity: Vec::new(),
                 shard_count: 16,
-            });
+            },
+        );
         config.snapshot_candidate_map();
 
         let mut fence = WriteFence::default();

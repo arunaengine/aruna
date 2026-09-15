@@ -5,15 +5,13 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{
-    MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE, POLICY_CACHE_KEYSPACE,
-};
+use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE, POLICY_CACHE_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{ManagedCopyRecord, ManagedCopyState, VersionKey};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
 use aruna_core::structs::placement::policy_document::policy_admin_path;
+use aruna_core::structs::storage::blob::{ManagedCopyRecord, ManagedCopyState, VersionKey};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -306,12 +304,12 @@ mod pure_tests {
     use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
         VersionKey,
     };
-    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
@@ -332,15 +330,18 @@ mod pure_tests {
         let policy = aruna_core::structs::placement::placement_policy::PlacementPolicy::new(
             Ulid::from_bytes([5u8; 16]),
             "residency".to_string(),
-            vec![aruna_core::structs::placement::placement_policy::PlacementSelector {
-                node_id: Some(node_id()),
-                location: None,
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
+            vec![
+                aruna_core::structs::placement::placement_policy::PlacementSelector {
+                    node_id: Some(node_id()),
+                    location: None,
+                    labels: Vec::new(),
+                    executor_kind: None,
+                },
+            ],
         )
         .expect("policy is valid");
-        aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(policy).expect("policy verifies")
+        aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(policy)
+            .expect("policy verifies")
     }
 
     fn copy(state: ManagedCopyState) -> ManagedCopyRecord {

@@ -7,14 +7,14 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::structs::execution::notification_watch::{
-    WATCH_DIRTY_PREFIX, WatchEventKind, WatchEventMask, WatchInterestDigest,
-    WatchInterestEntry, WatchInterestTable, dirty_interest_realm, interest_dirty_key,
-    interest_node_id, interest_node_key, interest_node_prefix, interest_pending_key,
-    interest_realm_id, interest_realm_prefix,
+    WATCH_DIRTY_PREFIX, WatchEventKind, WatchEventMask, WatchInterestDigest, WatchInterestEntry,
+    WatchInterestTable, dirty_interest_realm, interest_dirty_key, interest_node_id,
+    interest_node_key, interest_node_prefix, interest_pending_key, interest_realm_id,
+    interest_realm_prefix,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_storage::StorageHandle;
@@ -24,10 +24,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::notifications::protocol::{
-    DIRTY_REALM_CAP, INTEREST_BYTES_CAP,
-    INTEREST_ENTRY_CAP,
-};
+use crate::notifications::protocol::{DIRTY_REALM_CAP, INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP};
 use crate::notifications::watch::authorization::filter_authorized_subscriptions;
 use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::subscriptions::{
@@ -192,14 +189,8 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         let current = match storage
             .send_storage_effect(StorageEffect::BatchRead {
                 reads: vec![
-                    (
-                        WATCH_INTEREST_KEYSPACE.to_string(),
-                        digest_key.clone(),
-                    ),
-                    (
-                        WATCH_INTEREST_KEYSPACE.to_string(),
-                        pending_key.clone(),
-                    ),
+                    (WATCH_INTEREST_KEYSPACE.to_string(), digest_key.clone()),
+                    (WATCH_INTEREST_KEYSPACE.to_string(), pending_key.clone()),
                 ],
                 txn_id: None,
             })
@@ -315,13 +306,7 @@ async fn read_dirty_markers(storage: &StorageHandle) -> Result<(Vec<(Key, Value)
         }
     };
     let more = scan_more || values.len() > DIRTY_REALM_CAP;
-    Ok((
-        values
-            .into_iter()
-            .take(DIRTY_REALM_CAP)
-            .collect(),
-        more,
-    ))
+    Ok((values.into_iter().take(DIRTY_REALM_CAP).collect(), more))
 }
 
 /// Builds one bounded digest from subscriptions still held and authorized here.
@@ -361,8 +346,7 @@ fn digest_over(digest: &WatchInterestDigest) -> Result<bool, String> {
     if digest.entries.len() > INTEREST_ENTRY_CAP {
         return Ok(true);
     }
-    Ok(digest.to_bytes().map_err(|error| error.to_string())?.len()
-        > INTEREST_BYTES_CAP)
+    Ok(digest.to_bytes().map_err(|error| error.to_string())?.len() > INTEREST_BYTES_CAP)
 }
 
 fn catchall_digest(node_id: NodeId) -> WatchInterestDigest {
@@ -421,12 +405,7 @@ async fn clear_consumed_markers(
 
     let reads = observed
         .iter()
-        .map(|(key, _)| {
-            (
-                WATCH_INTEREST_KEYSPACE.to_string(),
-                key.clone(),
-            )
-        })
+        .map(|(key, _)| (WATCH_INTEREST_KEYSPACE.to_string(), key.clone()))
         .collect();
     let current = match storage
         .send_storage_effect(StorageEffect::BatchRead {
@@ -447,10 +426,7 @@ async fn clear_consumed_markers(
     let mut deletes: Vec<(KeySpace, Key)> = Vec::with_capacity(observed.len());
     for ((key, observed_generation), (_, current_value)) in observed.iter().zip(current) {
         if current_value.as_ref() == Some(observed_generation) {
-            deletes.push((
-                WATCH_INTEREST_KEYSPACE.to_string(),
-                key.clone(),
-            ));
+            deletes.push((WATCH_INTEREST_KEYSPACE.to_string(), key.clone()));
         }
     }
 
@@ -699,11 +675,13 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
-    use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
     use aruna_core::structs::execution::notification_watch::{
         WatchEventKind, WatchEventMask, WatchInterestEntry,
+    };
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;

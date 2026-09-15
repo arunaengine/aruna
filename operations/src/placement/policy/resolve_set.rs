@@ -5,8 +5,8 @@
 use aruna_core::NodeId;
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PolicyResolution};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PolicyResolution};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::collections::BTreeMap;
@@ -151,10 +151,10 @@ mod pure_tests {
     use super::{PolicySetResolver, ResolveMode, ResolveStep};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::placement_policy::{
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PolicyResolution, VerifiedPolicy,
     };
-    use aruna_core::structs::identity::realm::RealmId;
     use byteview::ByteView;
     use ulid::Ulid;
 

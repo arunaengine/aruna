@@ -3,13 +3,13 @@
 //! positive entry is bytes, never a trusted document, so it is re-verified.
 
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::placement::policy_document::{
-    PlacementPolicyDocument, PolicyAuthorityError,
-};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::placement_policy::{
     PlacementPolicyError, PlacementPolicyRef, VerifiedPolicy,
 };
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::policy_document::{
+    PlacementPolicyDocument, PolicyAuthorityError,
+};
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
