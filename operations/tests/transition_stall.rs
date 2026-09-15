@@ -12,7 +12,7 @@ use aruna_core::structs::{NodePlacementEntry, PlacementRef, RealmNodeKind, Trans
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::placement::transition::{preview_transition, transition_health};
 use aruna_operations::placement::{holds_placement, resolve_shard_holders};
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
@@ -187,7 +187,7 @@ async fn register_phantom(realm: &mut Topology) -> TestResult<NodeId> {
 
 async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
     drive(
-        GetMetadataDocumentOperation::new(group_id, document_id),
+        GetDocumentOperation::new(group_id, document_id),
         node.context.as_ref(),
     )
     .await
