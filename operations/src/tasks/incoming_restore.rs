@@ -63,7 +63,7 @@ async fn durable_rearm_loop(
 
 // A batch that processed nothing is blocked behind jobs that are not due yet, so
 // it backs off instead of rescanning the same head at batch pace.
-pub(super) fn drain_delay(result: &MetadataMaterializationDrainResult) -> Duration {
+pub(super) fn drain_delay(result: &MetadataDrainResult) -> Duration {
     if result.processed == 0 {
         METADATA_MATERIALIZATION_RETRY_AFTER
     } else {
@@ -81,7 +81,7 @@ async fn sweep_dead_letters(storage: &aruna_storage::StorageHandle) {
 
 /// Installs the inbound task handler without touching durable queues. Handler
 /// installation stays in the serving gate; the expensive durable-queue
-/// restoration behind it is [`TaskQueues::restore_timers_and_start`].
+/// restoration behind it is [`TaskQueues::restore_and_start`].
 pub async fn install_task_queues(
     context: Arc<DriverContext>,
     task_handle: TaskHandle,
@@ -93,9 +93,9 @@ pub async fn install_task_queues(
 
 /// Test convenience: installs the inbound handler, then restores and starts
 /// durable queues under the caller's shutdown owner. Production uses
-/// [`install_task_queues`] and [`TaskQueues::restore_timers_and_start`].
+/// [`install_task_queues`] and [`TaskQueues::restore_and_start`].
 #[doc(hidden)]
-pub async fn install_and_start_task_queues(
+pub async fn start_task_queues(
     context: Arc<DriverContext>,
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
@@ -103,7 +103,7 @@ pub async fn install_and_start_task_queues(
 ) {
     install_task_queues(context, task_handle, jobs_runtime, RoCrateLimits::default())
         .await
-        .restore_timers_and_start(shutdown)
+        .restore_and_start(shutdown)
         .await;
 }
 
@@ -143,16 +143,15 @@ async fn install_task_handler(
 impl TaskQueues {
     /// Restores persisted timers with their stored due time and starts the
     /// recurring re-arm loop, once the node is already serving.
-    pub async fn restore_timers_and_start(self, shutdown: &Shutdown) {
+    pub async fn restore_and_start(self, shutdown: &Shutdown) {
         let stop = shutdown.token();
-        self.restore_timers_and_start_until(shutdown, &stop, || false)
-            .await;
+        self.start_until_stopped(shutdown, &stop, || false).await;
     }
 
-    /// [`Self::restore_timers_and_start`] with an explicit startup stop and a
+    /// [`Self::restore_and_start`] with an explicit startup stop and a
     /// required-service failure probe, checked before every restore unit so an
     /// accepted stop finishes the current unit and admits no later one.
-    pub async fn restore_timers_and_start_until(
+    pub async fn start_until_stopped(
         self,
         shutdown: &Shutdown,
         stop: &CancellationToken,
@@ -1086,7 +1085,7 @@ mod stop_tests {
 
     // A stop accepted before restoration admits no restore unit.
     #[tokio::test]
-    async fn cancelled_restore_restores_no_timer() {
+    async fn cancel_skips_restore() {
         let (temp, task_handle, queues, shutdown) = restore_queues().await;
         persist_task_effect(
             &queues.context.storage_handle,
@@ -1100,9 +1099,7 @@ mod stop_tests {
         let stop = CancellationToken::new();
         stop.cancel();
 
-        queues
-            .restore_timers_and_start_until(&shutdown, &stop, || false)
-            .await;
+        queues.start_until_stopped(&shutdown, &stop, || false).await;
 
         let TaskEvent::TimerScheduled { after, .. } = task_handle
             .schedule_idle_timer(TaskKey::RefreshBlobHolders, Duration::from_secs(3600))
@@ -1121,7 +1118,7 @@ mod stop_tests {
     // A stop observed after the first unit finishes the current unit and skips
     // the next one instead of racing and dropping it mid-flight.
     #[tokio::test]
-    async fn stop_between_units_skips_the_next_restore() {
+    async fn stop_between_restores() {
         let (temp, task_handle, queues, shutdown) = restore_queues().await;
         persist_task_effect(
             &queues.context.storage_handle,
@@ -1134,11 +1131,11 @@ mod stop_tests {
         .expect("timer persists");
         let checks = std::cell::Cell::new(0u32);
         // The re-arm loop is not part of this unit sequence; stop it up front
-        // so only `restore_timers_and_start_until` can restore the timer.
+        // so only `start_until_stopped` can restore the timer.
         shutdown.trigger();
 
         queues
-            .restore_timers_and_start_until(&shutdown, &CancellationToken::new(), || {
+            .start_until_stopped(&shutdown, &CancellationToken::new(), || {
                 checks.set(checks.get() + 1);
                 checks.get() > 1
             })

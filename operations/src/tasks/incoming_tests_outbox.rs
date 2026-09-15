@@ -131,7 +131,7 @@ fn outbox_upsert_revision() {
     let publish = publish_from_outbox(
         event_id,
         target.clone(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: vec![1, 2, 3],
             change,
         },
@@ -152,7 +152,7 @@ fn outbox_upsert_revision() {
 #[test]
 fn partial_publish_records() {
     let duplicate_target = target();
-    let other_target = DocumentSyncTarget::Group {
+    let other_target = DocumentTarget::Group {
         group_id: Ulid::from_parts(7, 2),
     };
     let subbatch = DrainSubBatch {
@@ -202,10 +202,10 @@ async fn topic_page_blocks() {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
-    let blocked_target = DocumentSyncTarget::Group {
+    let blocked_target = DocumentTarget::Group {
         group_id: Ulid::from_parts(10, 1),
     };
-    let healthy_target = DocumentSyncTarget::Group {
+    let healthy_target = DocumentTarget::Group {
         group_id: Ulid::from_parts(10, 2),
     };
     // A shard topic keys on (strategy, shard) alone, so the two records need
@@ -221,7 +221,7 @@ async fn topic_page_blocks() {
         node(1),
         blocked_target,
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"blocked".to_vec(),
             change: blocked_change,
         },
@@ -233,7 +233,7 @@ async fn topic_page_blocks() {
         node(1),
         healthy_target,
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"healthy".to_vec(),
             change: healthy_change,
         },
@@ -300,10 +300,10 @@ async fn admin_page_blocks() {
     });
     // The local node is the origin: it can only publish envelopes it signs.
     let origin = net.node_id();
-    let blocked_target = DocumentSyncTarget::Group {
+    let blocked_target = DocumentTarget::Group {
         group_id: Ulid::from_parts(11, 1),
     };
-    let healthy_target = DocumentSyncTarget::Group {
+    let healthy_target = DocumentTarget::Group {
         group_id: Ulid::from_parts(11, 2),
     };
     // A shard topic keys on (strategy, shard) alone, so the two records need
@@ -743,7 +743,7 @@ async fn blocked_keeps_backoff() {
         node(1),
         target(),
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"blocked".to_vec(),
             change: blocked_change,
         },
@@ -802,7 +802,7 @@ async fn deferred_head_paginates() {
 
     // Every head-page record targets one shard topic with no local genesis,
     // so all of them defer.
-    let deferred_change = DocumentSyncChange {
+    let deferred_change = DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -810,13 +810,13 @@ async fn deferred_head_paginates() {
             actor: node(1),
             updated_at_ms: 9,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement: aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_parts(42, 1),
             shard: 3,
         },
     };
-    let deferred_target = DocumentSyncTarget::MetadataRegistry {
+    let deferred_target = DocumentTarget::MetadataRegistry {
         group_id: Ulid::from_parts(1, 1),
         document_id: Ulid::from_parts(2, 2),
     };
@@ -827,7 +827,7 @@ async fn deferred_head_paginates() {
             node(1),
             deferred_target.clone(),
             Vec::new(),
-            DocumentSyncOutboxEvent::Upsert {
+            DocumentOutboxEvent::Upsert {
                 bytes: Vec::new(),
                 change: deferred_change,
             },
@@ -843,9 +843,9 @@ async fn deferred_head_paginates() {
     let publish_record = crate::sync::document_outbox::new_identified_record(
         Ulid::from_parts(2, 0),
         node(1),
-        DocumentSyncTarget::RealmAuthorization { realm_id },
+        DocumentTarget::RealmAuthorization { realm_id },
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"realm-auth".to_vec(),
             change: change(),
         },
@@ -937,7 +937,7 @@ async fn rotation_streak() {
         FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
     let net = make_net_handle(realm_id, &storage, [51u8; 32]).await;
     tokio::time::pause();
-    let target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let target = DocumentTarget::RealmAuthorization { realm_id };
     let topic = target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
     net.ensure_sync_topics(&[topic], Vec::new())
         .expect("shared topic genesis");
@@ -962,7 +962,7 @@ async fn rotation_streak() {
             node(1),
             target.clone(),
             Vec::new(),
-            DocumentSyncOutboxEvent::Upsert {
+            DocumentOutboxEvent::Upsert {
                 bytes: index.to_be_bytes().to_vec(),
                 change: change(),
             },
@@ -1070,7 +1070,7 @@ async fn draining_a_topics() {
         .expect("refresh peers");
 
     let shutdown = Shutdown::new();
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle.clone(),
         JobsRuntime::new(),
@@ -1093,9 +1093,9 @@ async fn draining_a_topics() {
 
     let record = crate::sync::document_outbox::new_outbox_record(
         net.node_id(),
-        DocumentSyncTarget::RealmConfig { realm_id },
+        DocumentTarget::RealmConfig { realm_id },
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"config".to_vec(),
             change: change(),
         },
@@ -1130,7 +1130,7 @@ struct ConfigHarness {
     config: RealmConfigDocument,
     realm_id: RealmId,
     placement: aruna_core::structs::PlacementRef,
-    shard_target: DocumentSyncTarget,
+    shard_target: DocumentTarget,
 }
 
 async fn config_setup() -> ConfigHarness {
@@ -1146,8 +1146,8 @@ async fn config_setup() -> ConfigHarness {
         strategy_id: config.strategies[0].strategy_id,
         shard: 0,
     };
-    let shared_target = DocumentSyncTarget::RealmAuthorization { realm_id };
-    let shard_target = DocumentSyncTarget::MetadataRegistry {
+    let shared_target = DocumentTarget::RealmAuthorization { realm_id };
+    let shard_target = DocumentTarget::MetadataRegistry {
         group_id: Ulid::from_parts(7, 1),
         document_id: Ulid::from_parts(8, 1),
     };
@@ -1162,7 +1162,7 @@ async fn config_setup() -> ConfigHarness {
         node(1),
         shared_target,
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"shared".to_vec(),
             change: change(),
         },
@@ -1174,7 +1174,7 @@ async fn config_setup() -> ConfigHarness {
         node(1),
         shard_target.clone(),
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"shard".to_vec(),
             change: shard_change,
         },
@@ -1245,7 +1245,7 @@ async fn pull_reaches_holder() {
     ex_holder.add_peer_addr(net.endpoint_addr()).await;
     // The ex-holder must serve inbound sync streams for the pull to reach
     // its genesis.
-    crate::sync::incoming::initialize_net_incoming_for_tests(Arc::new(DriverContext {
+    crate::sync::incoming::initialize_incoming_fixture(Arc::new(DriverContext {
         storage_handle: ex_storage.clone(),
         net_handle: Some(ex_holder.clone()),
         blob_handle: None,
@@ -1288,7 +1288,7 @@ async fn pull_reaches_holder() {
         strategy_id,
         shard: 0,
     };
-    let target = DocumentSyncTarget::MetadataRegistry {
+    let target = DocumentTarget::MetadataRegistry {
         group_id: Ulid::from_parts(1, 1),
         document_id: Ulid::from_parts(2, 2),
     };
@@ -1307,7 +1307,7 @@ async fn pull_reaches_holder() {
         net.node_id(),
         target,
         vec![ex_holder.node_id()],
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: b"doc".to_vec(),
             change,
         },
@@ -1362,9 +1362,9 @@ fn admin_outbox(
     realm_id: RealmId,
     origin: aruna_core::NodeId,
     origin_seq: u64,
-    target: DocumentSyncTarget,
+    target: DocumentTarget,
     placement: aruna_core::structs::PlacementRef,
-) -> DocumentSyncOutboxRecord {
+) -> DocumentOutboxRecord {
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
@@ -1373,7 +1373,7 @@ fn admin_outbox(
         node(1),
         target,
         Vec::new(),
-        DocumentSyncOutboxEvent::admin(AdminDocumentEvent {
+        DocumentOutboxEvent::admin(AdminDocumentEvent {
             event_id: ulid::Ulid::from_parts(9, u128::from(origin_seq)),
             target: AdminDocumentTarget::User { user_id },
             origin_node_id: origin,
@@ -1393,7 +1393,7 @@ fn admin_outbox(
     )
 }
 
-fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentSyncOutboxRecord {
+fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentOutboxRecord {
     admin_outbox(
         RealmId([3; 32]),
         origin,
@@ -1403,7 +1403,7 @@ fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentSyncOutb
     )
 }
 
-fn shard_change(seed: u8) -> DocumentSyncChange {
+fn shard_change(seed: u8) -> DocumentChange {
     let mut value = change();
     value.placement = aruna_core::structs::PlacementRef {
         strategy_id: Ulid::from_bytes([seed; 16]),
@@ -1412,12 +1412,12 @@ fn shard_change(seed: u8) -> DocumentSyncChange {
     value
 }
 
-fn shard_topic_record(origin_seq: u64) -> DocumentSyncOutboxRecord {
+fn shard_topic_record(origin_seq: u64) -> DocumentOutboxRecord {
     crate::sync::document_outbox::new_outbox_record(
         node(1),
         target(),
         vec![node(2)],
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: vec![origin_seq as u8],
             change: change(),
         },
@@ -1433,7 +1433,7 @@ struct BoundaryHarness {
     task_handle: TaskHandle,
     handler: OperationsTaskHandler,
     realm_id: RealmId,
-    appended: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+    appended: Vec<(Vec<u8>, DocumentOutboxRecord)>,
 }
 
 impl BoundaryHarness {
@@ -1466,7 +1466,7 @@ impl BoundaryHarness {
         }
     }
 
-    fn placed_change(&self) -> DocumentSyncChange {
+    fn placed_change(&self) -> DocumentChange {
         let mut value = change();
         value.placement = aruna_core::structs::PlacementRef {
             strategy_id: Ulid::from_bytes([45; 16]),
@@ -1478,9 +1478,9 @@ impl BoundaryHarness {
     fn record(
         &self,
         id: u128,
-        target: DocumentSyncTarget,
-        event: DocumentSyncOutboxEvent,
-    ) -> DocumentSyncOutboxRecord {
+        target: DocumentTarget,
+        event: DocumentOutboxEvent,
+    ) -> DocumentOutboxRecord {
         crate::sync::document_outbox::new_identified_record(
             Ulid::from_parts(1, id),
             node(1),
@@ -1497,7 +1497,7 @@ impl BoundaryHarness {
             let record = self.record(
                 id,
                 target(),
-                DocumentSyncOutboxEvent::Upsert {
+                DocumentOutboxEvent::Upsert {
                     bytes: id.to_be_bytes().to_vec(),
                     change: self.placed_change(),
                 },
@@ -1506,16 +1506,16 @@ impl BoundaryHarness {
         }
         let initial = self.record(
             0,
-            DocumentSyncTarget::RealmAuthorization {
+            DocumentTarget::RealmAuthorization {
                 realm_id: self.realm_id,
             },
-            DocumentSyncOutboxEvent::Delete { change: change() },
+            DocumentOutboxEvent::Delete { change: change() },
         );
         write_outbox_record(&self.storage, &initial).await;
     }
 
     async fn append_records(&mut self) {
-        let shared = DocumentSyncTarget::RealmAuthorization {
+        let shared = DocumentTarget::RealmAuthorization {
             realm_id: self.realm_id,
         };
         let topic = shared.sync_topic_id(self.realm_id, &aruna_core::structs::PlacementRef::NIL);
@@ -1523,15 +1523,11 @@ impl BoundaryHarness {
             .ensure_sync_topics(&[topic], Vec::new())
             .expect("appended topic genesis");
         let records = [
-            self.record(
-                4,
-                shared,
-                DocumentSyncOutboxEvent::Delete { change: change() },
-            ),
+            self.record(4, shared, DocumentOutboxEvent::Delete { change: change() }),
             self.record(
                 5,
                 target(),
-                DocumentSyncOutboxEvent::Upsert {
+                DocumentOutboxEvent::Upsert {
                     bytes: b"appended-upsert".to_vec(),
                     change: self.placed_change(),
                 },
@@ -1548,7 +1544,7 @@ impl BoundaryHarness {
         let record = self.record(
             6,
             target(),
-            DocumentSyncOutboxEvent::Upsert {
+            DocumentOutboxEvent::Upsert {
                 bytes: b"appended-later".to_vec(),
                 change: self.placed_change(),
             },

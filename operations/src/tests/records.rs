@@ -13,7 +13,7 @@ use aruna_core::structs::{
 };
 use ulid::Ulid;
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -353,7 +353,7 @@ pub async fn context(config: &RealmConfigDocument, publisher: NodeId) -> (TempDi
     let dir = tempfile::tempdir().expect("temp dir");
     let storage: StorageHandle =
         FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
-    let target = DocumentSyncTarget::RealmConfig { realm_id: REALM };
+    let target = DocumentTarget::RealmConfig { realm_id: REALM };
     let event = storage
         .send_effect(Effect::Storage(StorageEffect::Write {
             key_space: target.storage_keyspace().to_string(),

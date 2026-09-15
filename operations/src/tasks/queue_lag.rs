@@ -36,7 +36,7 @@ pub struct QueueLagSnapshot {
 }
 
 /// One cadence's independently-fallible durable-queue probe results.
-pub struct DurableQueueLagSample {
+pub struct QueueLagSample {
     pub document_sync_outbox: Result<QueueLagSnapshot, String>,
     pub metadata_materialization: Result<QueueLagSnapshot, String>,
     /// Parked materialization jobs awaiting requeue; a depth that only grows
@@ -57,7 +57,7 @@ pub struct QueueLagReporter {
 impl QueueLagReporter {
     /// Probes every durable queue once, emits the tracing projection, and
     /// returns the same sample for the Prometheus projection.
-    pub async fn sample(&mut self, storage: &StorageHandle) -> DurableQueueLagSample {
+    pub async fn sample(&mut self, storage: &StorageHandle) -> QueueLagSample {
         let document_sync_outbox =
             probe_with_timeout(probe_outbox_lag(storage, self.outbox_active)).await;
         let metadata_materialization = probe_with_timeout(probe_materialization_lag(
@@ -86,7 +86,7 @@ impl QueueLagReporter {
             false,
         ))
         .await;
-        let sample = DurableQueueLagSample {
+        let sample = QueueLagSample {
             document_sync_outbox,
             metadata_materialization,
             materialization_dead_letters,

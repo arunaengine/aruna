@@ -3,14 +3,14 @@ use std::time::Duration;
 
 use aruna_core::UserId;
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncOutboxRecord,
-    DocumentSyncRevision, DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+    DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_GRAPH_PRUNE_JOB_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::metadata::MetadataGraphPruneJobRecord;
+use aruna_core::metadata::GraphPruneRecord;
 use aruna_core::structs::{Actor, FIRST_GRANTABLE_HANDLE, JobId, RealmConfigDocument, RealmId};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{TaskEvent, TaskKey};
@@ -142,7 +142,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
         FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
     let net = make_net_handle(realm_id, &storage, [46u8; 32]).await;
     tokio::time::pause();
-    let target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let target = DocumentTarget::RealmAuthorization { realm_id };
     let topic = target.sync_topic_id(realm_id, &aruna_core::structs::PlacementRef::NIL);
     net.ensure_sync_topics(&[topic], Vec::new())
         .expect("shared topic genesis");
@@ -152,7 +152,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
             node(1),
             target.clone(),
             Vec::new(),
-            DocumentSyncOutboxEvent::Upsert {
+            DocumentOutboxEvent::Upsert {
                 bytes: index.to_be_bytes().to_vec(),
                 change: change(),
             },
@@ -192,14 +192,14 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
     }
 }
 
-pub(crate) fn target() -> DocumentSyncTarget {
-    DocumentSyncTarget::Group {
+pub(crate) fn target() -> DocumentTarget {
+    DocumentTarget::Group {
         group_id: Ulid::from_parts(7, 1),
     }
 }
 
-pub(crate) fn change() -> DocumentSyncChange {
-    DocumentSyncChange {
+pub(crate) fn change() -> DocumentChange {
+    DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -207,14 +207,14 @@ pub(crate) fn change() -> DocumentSyncChange {
             actor: node(1),
             updated_at_ms: 9,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement: aruna_core::structs::PlacementRef::NIL,
     }
 }
 
 pub(crate) async fn read_graph_jobs(
     storage: &aruna_storage::StorageHandle,
-) -> Vec<MetadataGraphPruneJobRecord> {
+) -> Vec<GraphPruneRecord> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
@@ -235,7 +235,7 @@ pub(crate) async fn read_graph_jobs(
 
 pub(crate) async fn write_outbox_record(
     storage: &aruna_storage::StorageHandle,
-    record: &DocumentSyncOutboxRecord,
+    record: &DocumentOutboxRecord,
 ) {
     match storage
         .send_effect(write_outbox_effect(record).expect("outbox effect"))
