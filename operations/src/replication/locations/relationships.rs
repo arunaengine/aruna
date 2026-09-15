@@ -34,7 +34,7 @@ pub struct ReplicaTarget {
 /// version to, each carrying the path the copy is stored under. Between the
 /// local commit and the queue job that follows it, no other source names them.
 #[derive(Debug, PartialEq)]
-pub struct RelationshipReplicaNodesOperation {
+pub struct RelationshipNodesOperation {
     local_node: NodeId,
     bucket: String,
     key: String,
@@ -44,7 +44,7 @@ pub struct RelationshipReplicaNodesOperation {
     output: Option<Result<BTreeSet<ReplicaTarget>, LocationSummaryError>>,
 }
 
-impl RelationshipReplicaNodesOperation {
+impl RelationshipNodesOperation {
     pub fn new(local_node: NodeId, bucket: String, key: String, delete_marker: bool) -> Self {
         Self {
             local_node,
@@ -101,7 +101,7 @@ impl RelationshipReplicaNodesOperation {
     }
 }
 
-impl Operation for RelationshipReplicaNodesOperation {
+impl Operation for RelationshipNodesOperation {
     type Output = BTreeSet<ReplicaTarget>;
     type Error = LocationSummaryError;
 
@@ -166,8 +166,8 @@ impl Operation for RelationshipReplicaNodesOperation {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{RelationshipReplicaNodesOperation, ReplicaTarget};
-    use crate::tests::fixtures::locations::{node_id, realm_id};
+    use super::{RelationshipNodesOperation, ReplicaTarget};
+    use crate::tests::locations::{node_id, realm_id};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
@@ -201,8 +201,8 @@ mod pure_tests {
         })
     }
 
-    fn operation(delete_marker: bool) -> RelationshipReplicaNodesOperation {
-        RelationshipReplicaNodesOperation::new(
+    fn operation(delete_marker: bool) -> RelationshipNodesOperation {
+        RelationshipNodesOperation::new(
             node_id(4),
             "raw".to_string(),
             "run1.tar".to_string(),
@@ -233,7 +233,7 @@ mod pure_tests {
     fn maps_destination_key() {
         // A prefix rewrite stores the copy under the mapped key, so asking the
         // destination about the source key would miss it.
-        let mut op = RelationshipReplicaNodesOperation::new(
+        let mut op = RelationshipNodesOperation::new(
             node_id(4),
             "raw".to_string(),
             "photos/a.jpg".to_string(),
@@ -262,7 +262,7 @@ mod pure_tests {
     fn keeps_both_mappings() {
         // Two relationships to one node place two copies; collapsing them to
         // one destination loses whichever mapping came second.
-        let mut op = RelationshipReplicaNodesOperation::new(
+        let mut op = RelationshipNodesOperation::new(
             node_id(4),
             "raw".to_string(),
             "photos/a.jpg".to_string(),

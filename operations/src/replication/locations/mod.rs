@@ -10,9 +10,9 @@ use aruna_core::errors::{BlobError, ConversionError};
 use thiserror::Error;
 
 pub use local::{LocalSummary, LocationSummaryOperation};
-pub use queued::{QueuedReplicaNodesOperation, QueuedReplicas};
-pub use relationships::{RelationshipReplicaNodesOperation, ReplicaTarget};
-pub use remote::RemoteLocationSummaryOperation;
+pub use queued::{QueuedNodesOperation, QueuedReplicas};
+pub use relationships::{RelationshipNodesOperation, ReplicaTarget};
+pub use remote::RemoteLocationOperation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LocationSummaryError {

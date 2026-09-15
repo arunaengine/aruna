@@ -22,7 +22,7 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::structs::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-    CurrentVersionPointer, GroupAuthorizationDocument, GroupStorageBackend, ManagedCopyKey,
+    CurrentVersionPointer, GroupAuthorizationDocument, GroupStorage, ManagedCopyKey,
     NodeSubjectRecord, Permission, PlacementPolicyRef, RealmConfigDocument, VersionKey,
     bucket_permission_path, object_permission_path,
 };
@@ -677,7 +677,7 @@ impl LocationSummaryOperation {
             return self.unexpected(event);
         };
         if let Some(value) = value
-            && let Ok(record) = GroupStorageBackend::from_bytes(&value)
+            && let Ok(record) = GroupStorage::from_bytes(&value)
             && let Some(LocationCopyStorage::GroupBackend { name, .. }) =
                 self.summary.storage.as_mut()
         {
@@ -776,7 +776,7 @@ impl Operation for LocationSummaryOperation {
 mod pure_tests {
     use super::{LocationSummaryError, LocationSummaryOperation};
     use crate::replication::protocol::{CopyCompliance, LocationCopyStorage};
-    use crate::tests::fixtures::locations::{node_id, realm_id, request};
+    use crate::tests::locations::{node_id, realm_id, request};
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};

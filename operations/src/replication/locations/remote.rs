@@ -24,7 +24,7 @@ enum RemoteState {
 /// Asks one peer whether it holds a version and on what storage. Read-only: a
 /// summary never mutates the peer's state.
 #[derive(Debug, PartialEq)]
-pub struct RemoteLocationSummaryOperation {
+pub struct RemoteLocationOperation {
     node_id: NodeId,
     request: LocationSummaryRequest,
     stream_id: Option<Ulid>,
@@ -32,7 +32,7 @@ pub struct RemoteLocationSummaryOperation {
     output: Option<Result<LocationSummary, LocationSummaryError>>,
 }
 
-impl RemoteLocationSummaryOperation {
+impl RemoteLocationOperation {
     pub fn new(node_id: NodeId, request: LocationSummaryRequest) -> Self {
         Self {
             node_id,
@@ -60,7 +60,7 @@ impl RemoteLocationSummaryOperation {
     }
 }
 
-impl Operation for RemoteLocationSummaryOperation {
+impl Operation for RemoteLocationOperation {
     type Output = LocationSummary;
     type Error = LocationSummaryError;
 
@@ -160,7 +160,7 @@ impl Operation for RemoteLocationSummaryOperation {
 
 #[cfg(test)]
 mod pure_tests {
-    use crate::tests::fixtures::locations::{node_id, request};
+    use crate::tests::locations::{node_id, request};
     use aruna_core::effects::Effect;
     use aruna_core::events::Event;
     use aruna_core::operation::Operation;
@@ -171,7 +171,7 @@ mod pure_tests {
         // The asking side turns the denial back into a Denied error, never a
         // transport failure.
         let stream_id = Ulid::from_bytes([5u8; 16]);
-        let mut operation = super::RemoteLocationSummaryOperation::new(node_id(4), request(None));
+        let mut operation = super::RemoteLocationOperation::new(node_id(4), request(None));
         operation.start();
         operation.step(Event::Blob(
             aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
@@ -207,7 +207,7 @@ mod pure_tests {
             compliance: crate::replication::protocol::CopyCompliance::Quarantined,
             ..crate::replication::protocol::LocationSummary::absent()
         };
-        let mut operation = super::RemoteLocationSummaryOperation::new(node_id(4), request(None));
+        let mut operation = super::RemoteLocationOperation::new(node_id(4), request(None));
         operation.start();
         operation.step(Event::Blob(
             aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
@@ -234,7 +234,7 @@ mod pure_tests {
     #[test]
     fn remote_close_rejects() {
         let stream_id = Ulid::from_bytes([5u8; 16]);
-        let mut operation = super::RemoteLocationSummaryOperation::new(node_id(4), request(None));
+        let mut operation = super::RemoteLocationOperation::new(node_id(4), request(None));
         operation.start();
         operation.step(Event::Blob(
             aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
@@ -252,7 +252,7 @@ mod pure_tests {
     fn abort_closes_stream() {
         // A deadline must release the stream; only CloseConnection unregisters it.
         let stream_id = Ulid::from_bytes([5u8; 16]);
-        let mut operation = super::RemoteLocationSummaryOperation::new(node_id(4), request(None));
+        let mut operation = super::RemoteLocationOperation::new(node_id(4), request(None));
         operation.start();
         operation.step(Event::Blob(
             aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },

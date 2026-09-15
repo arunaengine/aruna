@@ -45,7 +45,7 @@ pub struct VersionReplicationManifest {
     pub auth_context: AuthContext,
     pub blob: Option<MaterializedBlobInfo>,
     pub source: Option<VersionSourceBinding>,
-    pub multipart: Option<MultipartObjectReplicationMetadata>,
+    pub multipart: Option<MultipartObjectMetadata>,
     pub reference_intent: bool,
     pub origin: Option<SyncOrigin>,
     pub upstream_sources: Vec<ArunaArn>,
@@ -260,13 +260,13 @@ pub enum BaoReadRefusal {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct MultipartObjectReplicationMetadata {
+pub struct MultipartObjectMetadata {
     pub summary: MultipartObjectSummary,
     pub parts: Vec<MultipartObjectPart>,
     pub checksum_type: MultipartChecksumType,
 }
 
-impl<'de> Deserialize<'de> for MultipartObjectReplicationMetadata {
+impl<'de> Deserialize<'de> for MultipartObjectMetadata {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -636,7 +636,7 @@ mod pure_tests {
     use super::{
         BaoReadRefusal, BaoReadRequest, BaoReadTarget, MAX_REPLICATION_HASH_BYTES,
         MAX_REPLICATION_HASHES, MAX_REPLICATION_PARTS, MAX_REPLICATION_SOURCES,
-        MAX_REPLICATION_VALUE_BYTES, MaterializedBlobInfo, MultipartObjectReplicationMetadata,
+        MAX_REPLICATION_VALUE_BYTES, MaterializedBlobInfo, MultipartObjectMetadata,
         ReferenceAdvance, SyncOrigin, VersionReplicationManifest, VersionReplicationMessage,
     };
     use aruna_blob::hash::Hasher;
@@ -924,7 +924,7 @@ mod pure_tests {
             |manifest| manifest.kind = ReplicationItemKind::DeleteMarker,
             |manifest| manifest.blob = Some(make_blob()),
             |manifest| {
-                manifest.multipart = Some(MultipartObjectReplicationMetadata {
+                manifest.multipart = Some(MultipartObjectMetadata {
                     summary: MultipartObjectSummary {
                         checksum_type: MultipartChecksumType::Composite,
                         part_count: 0,
@@ -1019,7 +1019,7 @@ mod pure_tests {
             hashes: HashMap::from([(HASH_SHA256.to_string(), vec![1u8; 32])]),
         };
         let mut manifest = make_manifest();
-        manifest.multipart = Some(MultipartObjectReplicationMetadata {
+        manifest.multipart = Some(MultipartObjectMetadata {
             summary: MultipartObjectSummary {
                 checksum_type: MultipartChecksumType::Composite,
                 part_count: MAX_REPLICATION_PARTS + 1,
@@ -1046,7 +1046,7 @@ mod pure_tests {
             )]),
         };
         let mut manifest = make_manifest();
-        manifest.multipart = Some(MultipartObjectReplicationMetadata {
+        manifest.multipart = Some(MultipartObjectMetadata {
             summary: MultipartObjectSummary {
                 checksum_type: MultipartChecksumType::Composite,
                 part_count: 1,
@@ -1077,7 +1077,7 @@ mod pure_tests {
         let combined = part_digests.concat();
         let composite_sha256 = Hasher::new_with_bytes(&combined).finalize().sha256.to_vec();
         let mut manifest = make_manifest();
-        manifest.multipart = Some(MultipartObjectReplicationMetadata {
+        manifest.multipart = Some(MultipartObjectMetadata {
             summary: MultipartObjectSummary {
                 checksum_type: MultipartChecksumType::Composite,
                 part_count: parts.len(),
