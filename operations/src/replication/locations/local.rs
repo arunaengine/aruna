@@ -20,12 +20,17 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
-    CurrentVersionPointer, GroupAuthorizationDocument, GroupStorage, ManagedCopyKey,
-    NodeSubjectRecord, Permission, PlacementPolicyRef, RealmConfigDocument, VersionKey,
-    bucket_permission_path, object_permission_path,
+    CurrentVersionPointer, ManagedCopyKey, VersionKey, bucket_permission_path,
+    object_permission_path,
 };
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -782,11 +787,10 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-    use aruna_core::structs::{
-        BackendLocation, BackendRef, BlobVersion, BucketInfo, GroupAuthorizationDocument,
-        RealmConfigDocument, RealmNodeKind,
-    };
-    use aruna_core::structs::{CopyOrigin, VersionKey};
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BlobVersion, BucketInfo};
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use aruna_core::structs::storage::blob::{CopyOrigin, VersionKey};
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -859,7 +863,7 @@ mod pure_tests {
                     b"group".to_vec().into(),
                     Some(
                         group
-                            .to_bytes(&aruna_core::structs::Actor {
+                            .to_bytes(&aruna_core::structs::identity::auth::Actor {
                                 node_id: node_id(5),
                                 user_id: UserId::nil(realm_id()),
                                 realm_id: realm_id(),
@@ -930,8 +934,8 @@ mod pure_tests {
         location
     }
 
-    fn policy_ref() -> aruna_core::structs::PlacementPolicyRef {
-        aruna_core::structs::PlacementPolicyRef {
+    fn policy_ref() -> aruna_core::structs::placement::placement_policy::PlacementPolicyRef {
+        aruna_core::structs::placement::placement_policy::PlacementPolicyRef {
             policy_id: Ulid::from_bytes([4u8; 16]),
             digest: [5u8; 32],
         }
@@ -939,15 +943,15 @@ mod pure_tests {
 
     fn copy_record(
         version_id: Ulid,
-        state: aruna_core::structs::ManagedCopyState,
+        state: aruna_core::structs::storage::blob::ManagedCopyState,
         origin: CopyOrigin,
         governed: bool,
-    ) -> aruna_core::structs::ManagedCopyRecord {
+    ) -> aruna_core::structs::storage::blob::ManagedCopyRecord {
         let refs = match governed {
             true => vec![policy_ref()],
             false => Vec::new(),
         };
-        aruna_core::structs::ManagedCopyRecord::new(
+        aruna_core::structs::storage::blob::ManagedCopyRecord::new(
             VersionKey::new("raw", "run1.tar", version_id),
             node_id(5),
             hashed_location(),
@@ -964,9 +968,9 @@ mod pure_tests {
     }
 
     /// Copy row plus subject row, the pair a governed answer reads at once.
-    fn serve_batch(record: &aruna_core::structs::ManagedCopyRecord, blocked: bool) -> Event {
+    fn serve_batch(record: &aruna_core::structs::storage::blob::ManagedCopyRecord, blocked: bool) -> Event {
         let mut subject =
-            aruna_core::structs::NodeSubjectRecord::seed(aruna_core::structs::PlacementSubject {
+            aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(aruna_core::structs::placement::placement_policy::PlacementSubject {
                 node_id: node_id(5),
                 generation: 1,
                 location: "eu-west".to_string(),
@@ -1001,7 +1005,7 @@ mod pure_tests {
         operation.step(read_result(Some(
             copy_record(
                 version_id,
-                aruna_core::structs::ManagedCopyState::Registered,
+                aruna_core::structs::storage::blob::ManagedCopyState::Registered,
                 CopyOrigin::Sync { relationship_id },
                 false,
             )
@@ -1033,8 +1037,8 @@ mod pure_tests {
         operation.step(serve_batch(
             &copy_record(
                 version_id,
-                aruna_core::structs::ManagedCopyState::Quarantined(
-                    aruna_core::structs::ManagedCopyQuarantine::PolicyViolation,
+                aruna_core::structs::storage::blob::ManagedCopyState::Quarantined(
+                    aruna_core::structs::storage::blob::ManagedCopyQuarantine::PolicyViolation,
                 ),
                 CopyOrigin::Replicate,
                 true,
@@ -1060,7 +1064,7 @@ mod pure_tests {
         operation.step(serve_batch(
             &copy_record(
                 version_id,
-                aruna_core::structs::ManagedCopyState::Registered,
+                aruna_core::structs::storage::blob::ManagedCopyState::Registered,
                 CopyOrigin::Replicate,
                 true,
             ),
@@ -1083,7 +1087,7 @@ mod pure_tests {
         operation.step(serve_batch(
             &copy_record(
                 version_id,
-                aruna_core::structs::ManagedCopyState::Registered,
+                aruna_core::structs::storage::blob::ManagedCopyState::Registered,
                 CopyOrigin::Write,
                 true,
             ),

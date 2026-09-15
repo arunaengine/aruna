@@ -203,7 +203,7 @@ mod pure_tests {
         let relationship_id = Ulid::from_bytes([6u8; 16]);
         let answer = crate::replication::protocol::LocationSummary {
             held: true,
-            origin: aruna_core::structs::CopyOrigin::Sync { relationship_id },
+            origin: aruna_core::structs::storage::blob::CopyOrigin::Sync { relationship_id },
             compliance: crate::replication::protocol::CopyCompliance::Quarantined,
             ..crate::replication::protocol::LocationSummary::absent()
         };

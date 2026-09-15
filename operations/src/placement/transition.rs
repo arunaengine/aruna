@@ -3,10 +3,11 @@
 //! plan every node can re-derive.
 
 use aruna_core::NodeId;
-use aruna_core::structs::{
-    BucketPlan, CandidatePlacementMap, PlacementRef, PlacementStrategy, RealmConfigDocument,
-    TRANSITION_OVERDUE_MS, TransitionLimits, TransitionPlan,
+use aruna_core::structs::placement::placement_transition::{
+    BucketPlan, CandidatePlacementMap, TRANSITION_OVERDUE_MS, TransitionLimits, TransitionPlan,
 };
+use aruna_core::structs::placement::placement_record::{PlacementRef, PlacementStrategy};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -285,9 +286,10 @@ fn locations_of(config: &RealmConfigDocument, holders: &[NodeId]) -> Vec<String>
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::{
-        PlacementTransition, RealmId, RealmNodeKind, StallReport, TransitionStatus,
+    use aruna_core::structs::placement::placement_transition::{
+        PlacementTransition, StallReport, TransitionStatus,
     };
+    use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

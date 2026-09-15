@@ -11,9 +11,8 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, Permission, RealmAuthorizationDocument, RealmId, Role,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use byteview::ByteView;
@@ -315,7 +314,7 @@ impl RealmRoleOperation {
                 DocumentOutboxEvent::admin(event.clone()),
                 // No realm config in reach here; the stage-2 topic flip resolves
                 // the real ref for this target.
-                aruna_core::structs::PlacementRef::NIL,
+                aruna_core::structs::placement::placement_record::PlacementRef::NIL,
                 false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
@@ -695,7 +694,8 @@ pub mod test {
     use aruna_core::operation::Operation;
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
-    use aruna_core::structs::{Actor, Permission, RealmAuthorizationDocument, Role};
+    use aruna_core::structs::identity::auth::{Actor, Permission, Role};
+    use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -706,7 +706,7 @@ pub mod test {
 
     #[test]
     fn rejects_reserved_names() {
-        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
@@ -736,7 +736,7 @@ pub mod test {
 
     #[test]
     fn rejects_public_permissions() {
-        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
@@ -763,8 +763,8 @@ pub mod test {
 
     #[test]
     fn rejects_foreign_nil() {
-        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
-        let other_realm_id = aruna_core::structs::RealmId([2u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([1u8; 32]);
+        let other_realm_id = aruna_core::structs::identity::realm::RealmId([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
@@ -791,7 +791,7 @@ pub mod test {
 
     #[test]
     pub fn writes_role_atomically() {
-        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
         let actor_user_id = UserId::local(Ulid::from_bytes([1u8; 16]), realm_id);
         let assigned_user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let retained_conflict_user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
@@ -1022,7 +1022,7 @@ pub mod test {
 
     #[test]
     pub fn outbox_error_finishes() {
-        let realm_id = aruna_core::structs::RealmId([6u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([6u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([7u8; 16]), realm_id);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
@@ -1094,7 +1094,7 @@ pub mod test {
             blob_handle: None,
         };
 
-        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let realm_config = CreateRealmConfig {

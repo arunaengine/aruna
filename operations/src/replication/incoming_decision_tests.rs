@@ -2,9 +2,10 @@ use super::pure_tests::{make_manifest, make_reference_manifest};
 use super::*;
 use crate::placement::policy::PolicyCacheEntry;
 use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
-use aruna_core::structs::{
-    PlacementPolicy, PlacementSelector, PlacementSubject, ReplicationItemKind, VerifiedPolicy,
+use aruna_core::structs::placement::placement_policy::{
+    PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
 };
+use aruna_core::structs::storage::replication::ReplicationItemKind;
 use std::collections::BTreeMap;
 
 fn realm() -> RealmId {

@@ -5,11 +5,13 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::events::StorageEvent;
 use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
 use aruna_core::storage_entries::{create_projection_entries, registry_write_entries};
-use aruna_core::structs::{
+use aruna_core::structs::placement::placement_record::{
     AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
-    FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, MetadataRegistryRecord, PlacementBinding,
-    PlacementRef, PlacementScope, RealmId, RealmNodeKind,
+    FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, PlacementBinding, PlacementRef,
+    PlacementScope,
 };
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::{TaskEffect, TaskKey};
 use tempfile::tempdir;
@@ -18,7 +20,9 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::placement::transition::{TransitionRequest, plan_transition};
 use crate::realm::get_config::GetConfigOperation;
-use aruna_core::structs::{PlacementTransition, ProofClaim, TransitionLimits};
+use aruna_core::structs::placement::placement_transition::{
+    PlacementTransition, ProofClaim, TransitionLimits,
+};
 
 fn node(seed: u8) -> aruna_core::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -391,7 +395,7 @@ async fn rejects_reserved_label() {
         full: false,
         draining: false,
         labels: BTreeMap::from([(
-            aruna_core::structs::KIND_LABEL_KEY.to_string(),
+            aruna_core::structs::storage::node_info::KIND_LABEL_KEY.to_string(),
             "Server".to_string(),
         )]),
     };
@@ -757,8 +761,8 @@ fn advances_subject() {
     // which is what makes it revalidate; the stored values leave it alone.
     let current = placed_entry(node(1));
     let document = placed_document(current.clone());
-    let record = aruna_core::structs::NodeSubjectRecord::seed(
-        aruna_core::structs::storage_subject(&current, 1),
+    let record = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
+        aruna_core::structs::placement::node_subject::storage_subject(&current, 1),
     )
     .unwrap();
 
@@ -773,14 +777,14 @@ fn advances_subject() {
     ));
     assert_eq!(
         record
-            .advance(aruna_core::structs::storage_subject(&unchanged, 1))
+            .advance(aruna_core::structs::placement::node_subject::storage_subject(&unchanged, 1))
             .unwrap(),
         None
     );
 
     let moved = entry_of(set_attributes(node(1), Some("us-east"), None));
     let advanced = record
-        .advance(aruna_core::structs::storage_subject(&moved, 1))
+        .advance(aruna_core::structs::placement::node_subject::storage_subject(&moved, 1))
         .unwrap()
         .expect("a moved node advertises a new subject");
     assert_eq!(advanced.subject.generation, 2);
@@ -1000,12 +1004,12 @@ fn preserves_affinity_data() {
         replica_count: None,
         distinct_locations: false,
         shard_count: 64,
-        affinity: vec![aruna_core::structs::AffinityRule {
-            matcher: aruna_core::structs::LabelMatch {
+        affinity: vec![aruna_core::structs::placement::placement_record::AffinityRule {
+            matcher: aruna_core::structs::placement::placement_record::LabelMatch {
                 key: "tier".to_string(),
                 value: "hot".to_string(),
             },
-            effect: aruna_core::structs::AffinityEffect::Multiply { permille: 1500 },
+            effect: aruna_core::structs::placement::placement_record::AffinityEffect::Multiply { permille: 1500 },
         }],
     };
     let mutation = RealmPlacementMutation::UpsertStrategy(strategy.clone());

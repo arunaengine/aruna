@@ -11,9 +11,9 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, REALM_CONFIG_Q
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, Permission, QuotaConfig, RealmConfigDocument, policy_admin_path,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument};
+use aruna_core::structs::placement::policy_document::policy_admin_path;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -480,7 +480,7 @@ mod tests {
     use aruna_core::document::DocumentTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
-    use aruna_core::structs::{
+    use aruna_core::structs::identity::realm::{
         GroupQuotaOverride, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
         RealmNodeKind, UserCapOverride,
     };

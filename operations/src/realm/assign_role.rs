@@ -12,7 +12,8 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{Actor, AuthContext, Permission, RealmAuthorizationDocument, RealmId};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Key, KeySpace, RoleId, TxnId};
 use byteview::ByteView;
@@ -296,7 +297,7 @@ impl AssignRolesOperation {
                 DocumentOutboxEvent::admin(event.clone()),
                 // No realm config in reach here; the stage-2 topic flip resolves
                 // the real ref for this target.
-                aruna_core::structs::PlacementRef::NIL,
+                aruna_core::structs::placement::placement_record::PlacementRef::NIL,
                 false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
@@ -658,7 +659,8 @@ pub mod test {
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
-    use aruna_core::structs::{Actor, Permission, RealmAuthorizationDocument, RealmId, Role};
+    use aruna_core::structs::identity::auth::{Actor, Permission, Role};
+    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{RoleId, TxnId};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -1082,7 +1084,7 @@ pub mod test {
             blob_handle: None,
         };
 
-        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
         let user_id = UserId::local(Ulid::generate(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let realm_config = CreateRealmConfig {

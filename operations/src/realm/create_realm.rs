@@ -9,11 +9,13 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::reducer_state_entry;
-use aruna_core::structs::{
-    Actor, BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
-    HandleRange, NodePlacementEntry, OidcProviderConfig, PlacementBinding, PlacementScope,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, band_start,
-    normalize_placement_input,
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::placement::placement_record::{
+    BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
+    NodePlacementEntry, PlacementBinding, PlacementScope, band_start, normalize_placement_input,
+};
+use aruna_core::structs::identity::realm::{
+    OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
 };
 use aruna_core::structured_id::{FieldError, PlacementHandle};
 use aruna_core::task::TaskEvent;
@@ -598,8 +600,11 @@ mod test {
     };
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
-    use aruna_core::structs::{
-        Actor, BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::placement::placement_record::{
+        BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
+    };
+    use aruna_core::structs::identity::realm::{
         OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
         RealmNodeKind,
     };
@@ -645,7 +650,7 @@ mod test {
         let entry = CreateRealmOperation::new(clamped)
             .creating_node_placement()
             .unwrap();
-        assert_eq!(entry.weight, aruna_core::structs::MAX_NODE_WEIGHT);
+        assert_eq!(entry.weight, aruna_core::structs::placement::placement_record::MAX_NODE_WEIGHT);
         assert_eq!(entry.location, "eu-west");
 
         let mut too_long = config(actor);

@@ -2,7 +2,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::TxnId;
 use smallvec::smallvec;
 use thiserror::Error;

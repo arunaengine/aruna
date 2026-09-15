@@ -12,7 +12,8 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{Actor, RealmAuthorizationDocument, Role};
+use aruna_core::structs::identity::auth::{Actor, Role};
+use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, RoleId, TxnId};
 use byteview::ByteView;
@@ -236,7 +237,7 @@ impl ClaimInitialOperation {
                 DocumentOutboxEvent::admin(event.clone()),
                 // No realm config in reach here; the stage-2 topic flip resolves
                 // the real ref for this target.
-                aruna_core::structs::PlacementRef::NIL,
+                aruna_core::structs::placement::placement_record::PlacementRef::NIL,
                 false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
@@ -571,7 +572,8 @@ mod tests {
     use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, DOCUMENT_SYNC_OUTBOX_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::reducer::AdminDocumentState;
-    use aruna_core::structs::{Actor, RealmAuthorizationDocument, RealmId, Role};
+    use aruna_core::structs::identity::auth::{Actor, Role};
+    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};

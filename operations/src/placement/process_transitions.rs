@@ -8,10 +8,12 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::document::shard_topic_id;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::{
-    Actor, PlacementRef, PlacementTransition, ProofClaim, RealmConfigDocument, RealmId,
-    TransitionStatus,
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::placement_transition::{
+    PlacementTransition, ProofClaim, TransitionStatus,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};
@@ -549,7 +551,7 @@ async fn ensure_expansions(
                 buckets,
                 target_map_epoch: epoch,
                 // Expansion moves nothing off a holder; every bucket may run.
-                limits: aruna_core::structs::TransitionLimits {
+                limits: aruna_core::structs::placement::placement_transition::TransitionLimits {
                     max_incomplete_buckets: u32::MAX,
                     ..Default::default()
                 },
@@ -682,7 +684,7 @@ fn map_publisher(config: &RealmConfigDocument) -> Option<&str> {
     config
         .nodes
         .iter()
-        .filter(|node| matches!(node.kind, aruna_core::structs::RealmNodeKind::Management))
+        .filter(|node| matches!(node.kind, aruna_core::structs::identity::realm::RealmNodeKind::Management))
         .map(|node| node.node_id.as_str())
         .min()
 }
@@ -735,7 +737,9 @@ mod tests {
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::structs::{BucketCompletion, PlacementStrategy, RealmNodeKind};
+    use aruna_core::structs::placement::placement_transition::BucketCompletion;
+    use aruna_core::structs::placement::placement_record::PlacementStrategy;
+    use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -1077,17 +1081,17 @@ mod tests {
             strategy_id,
             shard: 0,
         };
-        let mut transition = PlacementTransition::new(aruna_core::structs::TransitionPlan {
+        let mut transition = PlacementTransition::new(aruna_core::structs::placement::placement_transition::TransitionPlan {
             transition_id: Ulid::from_bytes([8; 16]),
             strategy_id,
-            buckets: vec![aruna_core::structs::BucketPlan {
+            buckets: vec![aruna_core::structs::placement::placement_transition::BucketPlan {
                 bucket: 0,
                 old_holders: vec![node(1)],
                 target_holders: vec![node(2)],
                 predecessor_epoch: 1,
             }],
             target_map_epoch: 1,
-            limits: aruna_core::structs::TransitionLimits {
+            limits: aruna_core::structs::placement::placement_transition::TransitionLimits {
                 max_incomplete_buckets: 1,
                 grace_ms: 0,
             },
@@ -1096,7 +1100,7 @@ mod tests {
         });
         transition
             .completed
-            .push(aruna_core::structs::BucketCompletion {
+            .push(aruna_core::structs::placement::placement_transition::BucketCompletion {
                 bucket: 0,
                 completed_at_ms: 1,
             });

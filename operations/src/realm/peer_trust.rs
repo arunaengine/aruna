@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -74,7 +74,7 @@ mod pure_tests {
     use super::{PeerTrust, RealmPeerError, ensure_peer_trust};
     use aruna_core::NodeId;
     use aruna_core::UserId;
-    use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

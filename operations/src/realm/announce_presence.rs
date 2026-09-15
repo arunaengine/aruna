@@ -7,7 +7,7 @@ use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keys::realm_presence_key;
 use aruna_core::operation::Operation;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Effects;
 use smallvec::smallvec;

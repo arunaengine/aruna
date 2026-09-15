@@ -7,10 +7,14 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState, NODE_SUBJECT_KEY,
-    NodeSubjectRecord, PlacementSubject, RealmConfigDocument, RealmId, storage_subject,
+use aruna_core::structs::storage::blob::{
+    ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
 };
+use aruna_core::structs::placement::node_subject::{
+    NODE_SUBJECT_KEY, NodeSubjectRecord, storage_subject,
+};
+use aruna_core::structs::placement::placement_policy::PlacementSubject;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -520,10 +524,13 @@ mod pure_tests {
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{
+    use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
-        NodeSubjectRecord, PlacementPolicyRef, PlacementSubject, RealmId, VersionKey,
+        VersionKey,
     };
+    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
+    use aruna_core::structs::identity::realm::RealmId;
     use std::collections::{BTreeMap, HashMap};
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;

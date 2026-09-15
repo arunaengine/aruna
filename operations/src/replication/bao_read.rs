@@ -13,12 +13,18 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{
-    BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
-    GroupAuthorizationDocument, HashIndex, ManagedCopyKey, NodePlacementEntry, Permission,
-    PlacementPolicyRef, PlacementSubject, RealmConfigDocument, RealmId, ResolvedSourceAccess,
-    VersionKey, VersionedObjectArn, object_permission_path, storage_subject,
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo, HashIndex,
+    ManagedCopyKey, VersionKey, object_permission_path,
 };
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::placement::placement_record::NodePlacementEntry;
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::structs::placement::node_subject::storage_subject;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use bytes::Bytes;
 use byteview::ByteView;
@@ -1467,10 +1473,11 @@ mod pure_tests {
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
-    use aruna_core::structs::{
-        AuthContext, BackendLocation, BackendRef, BlobVersion, BucketInfo, PlacementPolicyRef,
-        RealmConfigDocument, RealmId, RealmNodeKind, VersionedObjectArn,
-    };
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BlobVersion, BucketInfo};
+    use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
     use aruna_core::types::Effects;
     use ulid::Ulid;
 
@@ -1517,7 +1524,7 @@ mod pure_tests {
     }
 
     fn read_path(local_node: aruna_core::NodeId) -> String {
-        aruna_core::structs::object_permission_path(
+        aruna_core::structs::storage::blob::object_permission_path(
             test_realm(),
             Ulid::from(5u128),
             local_node,
@@ -1583,10 +1590,12 @@ mod pure_tests {
 
     /// One observation of a local directory, as a device records it.
     fn observation(size: u64, etag: Option<&str>) -> BlobVersion {
-        use aruna_core::structs::{
-            OFFERED_DIRECTORY_BUCKET, PortableSourceDescriptor, SourceConnectorKind,
-            SourceMetadata, StagingStrategy, VersionSourceBinding,
+        use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET;
+        use aruna_core::structs::execution::staging::{
+            PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
         };
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::execution::source_access::SourceMetadata;
         BlobVersion::reference(
             VersionSourceBinding {
                 strategy: StagingStrategy::Reference,
@@ -1871,9 +1880,11 @@ mod pure_tests {
     fn spoofed_subject_denied() {
         // The requester may assert any subject; only the realm's placement of
         // the authenticated peer decides where governed bytes may go.
-        use aruna_core::structs::{
-            DEFAULT_NODE_WEIGHT, NodePlacementEntry, PlacementSubject, storage_subject,
+        use aruna_core::structs::placement::placement_record::{
+            DEFAULT_NODE_WEIGHT, NodePlacementEntry,
         };
+        use aruna_core::structs::placement::placement_policy::PlacementSubject;
+        use aruna_core::structs::placement::node_subject::storage_subject;
 
         let local_node = node_from_seed(1);
         let peer = node_from_seed(2);

@@ -170,8 +170,9 @@ mod pure_tests {
     use crate::tests::locations::{node_id, realm_id};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
+    use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{
-        ArunaArn, ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
+        ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
     };
     use ulid::Ulid;
 

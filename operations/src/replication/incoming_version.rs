@@ -21,7 +21,7 @@ use crate::replication::protocol::{
 use crate::replication::queue::{
     LiveObligationRecord, live_obligation_effect, schedule_blob_drain,
 };
-use crate::s3::create_bucket::CreateBucketOperation;
+use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -33,14 +33,21 @@ use aruna_core::keyspaces::{
     HASH_PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    BucketInfo, CopyOrigin, CurrentVersionPointer, GroupRoutingInputs, MultipartObjectKey,
-    NodeRouting, PlacementPolicyRef, RealmConfigDocument, RealmId, ReclaimCandidate,
-    ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, ResolvedBackend,
-    RoCrateLimits, RoutingError, StorageRoutingRule, UsageDelta, VersionKey, WriteOwner,
-    bucket_permission_path, object_permission_path, resolve_backend,
+    BucketInfo, CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
+    bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::routing::{
+    GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
+};
+use aruna_core::structs::storage::multipart::MultipartObjectKey;
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::replication::{ReplicationItemKind, ReplicationNegotiationResult};
+use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
@@ -105,7 +112,7 @@ enum IncomingVersionState {
 #[derive(Debug, Error, PartialEq)]
 pub enum IncomingVersionError {
     #[error(transparent)]
-    Policy(#[from] aruna_core::structs::PlacementPolicyError),
+    Policy(#[from] aruna_core::structs::placement::placement_policy::PlacementPolicyError),
     #[error(transparent)]
     PolicyGate(#[from] PolicyGateError),
     #[error(transparent)]
@@ -760,12 +767,12 @@ impl IncomingVersionOperation {
     }
 
     fn binding_continues(
-        previous: &aruna_core::structs::VersionSourceBinding,
-        incoming: &aruna_core::structs::VersionSourceBinding,
+        previous: &aruna_core::structs::execution::staging::VersionSourceBinding,
+        incoming: &aruna_core::structs::execution::staging::VersionSourceBinding,
         advance: &ReferenceAdvance,
         version_id: Ulid,
     ) -> bool {
-        if previous.descriptor.kind != aruna_core::structs::SourceConnectorKind::ArunaNative {
+        if previous.descriptor.kind != aruna_core::structs::execution::source_connector::SourceConnectorKind::ArunaNative {
             return previous == incoming;
         }
         let previous_selector = format!("version:{}", advance.predecessor);
@@ -829,7 +836,7 @@ impl IncomingVersionOperation {
             .source
             .clone()
             .ok_or(IncomingVersionError::MissingReferenceSource)?;
-        if source.descriptor.kind == aruna_core::structs::SourceConnectorKind::LocalDirectory {
+        if source.descriptor.kind == aruna_core::structs::execution::source_connector::SourceConnectorKind::LocalDirectory {
             return Err(IncomingVersionError::LocalReferenceSource);
         }
         let metadata = self

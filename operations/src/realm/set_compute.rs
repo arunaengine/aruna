@@ -13,9 +13,10 @@ use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, REALM_CONFIG_C
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
-use aruna_core::structs::{
-    Actor, AuthContext, Permission, RealmComputeConfig, RealmConfigDocument, policy_admin_path,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::placement::compute_config::RealmComputeConfig;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::policy_document::policy_admin_path;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -418,9 +419,8 @@ mod tests {
     use aruna_core::document::DocumentTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
-    use aruna_core::structs::{
-        GroupComputeQuota, LocationLink, RealmAuthorizationDocument, RealmId, RealmNodeKind,
-    };
+    use aruna_core::structs::placement::compute_config::{GroupComputeQuota, LocationLink};
+    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
     use tempfile::tempdir;
     use ulid::Ulid;
 

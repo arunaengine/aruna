@@ -16,14 +16,24 @@ use aruna_core::keyspaces::{
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    AuthContext, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion,
-    BlobVersionState, BucketInfo, CurrentVersionPointer, GroupRoutingInputs, HashIndex, JobId,
-    MultipartObjectKey, NodeRouting, QuotaConfig, RealmConfigDocument, RealmId,
-    ReclaimCandidateKey, ReplicationItemKind, ReplicationNegotiationResult, RoutingTarget,
-    SourceConnectorKind, SourceMetadata, StagingStrategy, StoragePurgeFence, StoragePurgeScope,
-    StorageRoutingRule, UsageDelta, VersionSourceBinding, WriteOwner,
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, BlobVersionState,
+    BucketInfo, CurrentVersionPointer, HashIndex, WriteOwner,
 };
+use aruna_core::structs::storage::routing::{
+    GroupRoutingInputs, NodeRouting, RoutingTarget, StorageRoutingRule,
+};
+use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::storage::multipart::MultipartObjectKey;
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
+use aruna_core::structs::storage::replication::{ReplicationItemKind, ReplicationNegotiationResult};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::{NodeId, UserId};
 use std::cell::Cell;
@@ -172,7 +182,7 @@ pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationMani
 fn make_source_binding() -> VersionSourceBinding {
     VersionSourceBinding {
         strategy: StagingStrategy::Reference,
-        descriptor: aruna_core::structs::PortableSourceDescriptor {
+        descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
             kind: SourceConnectorKind::Http,
             public_config: HashMap::from([(
                 "endpoint".to_string(),
@@ -1207,7 +1217,7 @@ fn obligation_keeps_origin() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
     manifest.origin = Some(origin.clone());
     manifest.upstream_sources.push(
-        aruna_core::structs::ArunaArn::s3_bucket(
+        aruna_core::structs::storage::replication::ArunaArn::s3_bucket(
             test_realm_id(),
             iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
             "source",
@@ -1241,7 +1251,7 @@ fn obligation_keeps_lineage() {
         relationship_id: Ulid::from_bytes([44u8; 16]),
         hop_count: 2,
     };
-    let source = aruna_core::structs::ArunaArn::s3_bucket(
+    let source = aruna_core::structs::storage::replication::ArunaArn::s3_bucket(
         test_realm_id(),
         iroh::SecretKey::from_bytes(&[45u8; 32]).public(),
         "source",
@@ -1653,10 +1663,10 @@ fn indexes_noncurrent_version() {
     };
     assert_eq!(key_space, aruna_core::keyspaces::MANAGED_COPY_KEYSPACE);
     assert_eq!(
-        aruna_core::structs::ManagedCopyRecord::from_bytes(value.as_ref())
+        aruna_core::structs::storage::blob::ManagedCopyRecord::from_bytes(value.as_ref())
             .unwrap()
             .version,
-        aruna_core::structs::VersionKey::new(&manifest.bucket, &manifest.key, manifest.version_id)
+        aruna_core::structs::storage::blob::VersionKey::new(&manifest.bucket, &manifest.key, manifest.version_id)
     );
 
     let effects = op.step(Event::Storage(StorageEvent::WriteResult {
@@ -1877,7 +1887,7 @@ fn canonical_auth_path() {
 
     assert_eq!(
         op.target_authorization_path(group_id),
-        aruna_core::structs::object_permission_path(
+        aruna_core::structs::storage::blob::object_permission_path(
             local_realm_id,
             group_id,
             local_node_id,
@@ -1916,7 +1926,7 @@ fn mismatch_requests_transfer() {
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
-            aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion
+            aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobAndVersion
         )
     ));
 }
@@ -2376,7 +2386,7 @@ fn delete_marker_only() {
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
-            aruna_core::structs::ReplicationNegotiationResult::NeedVersionOnly
+            aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedVersionOnly
         )
     ));
 }
@@ -2407,7 +2417,7 @@ fn missing_blob_transfer() {
     assert!(matches!(
         message_from_effect(&effects[0]),
         VersionReplicationMessage::VersionNegotiationResponse(
-            aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion
+            aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobAndVersion
         )
     ));
 }
@@ -2463,7 +2473,7 @@ fn failure_deletes_blobs() {
         manifest,
     );
     op.negotiation_result =
-        Some(aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion);
+        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobAndVersion);
     op.state = IncomingVersionState::WriteBlobLocation;
     op.txn_id = Some(txn_id);
     op.received_blob = Some(ReceivedBlob::reserved(received.clone()));
@@ -2683,7 +2693,7 @@ fn failure_without_delete() {
         manifest,
     );
     op.negotiation_result =
-        Some(aruna_core::structs::ReplicationNegotiationResult::NeedVersionOnly);
+        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedVersionOnly);
     op.state = IncomingVersionState::ApplyHeadTransition;
     op.txn_id = Some(txn_id);
 
@@ -2721,7 +2731,7 @@ fn commit_preserves_blob() {
         manifest,
     );
     op.negotiation_result =
-        Some(aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion);
+        Some(aruna_core::structs::storage::replication::ReplicationNegotiationResult::NeedBlobAndVersion);
     op.state = IncomingVersionState::RegisterBlobInDht;
     op.received_blob = Some(ReceivedBlob::owned(received));
     op.apply_committed = true;
@@ -3169,7 +3179,7 @@ fn reclaim_uses_enqueue() {
         panic!("expected reclaim candidate write");
     };
     assert_eq!(key_space, BLOB_RECLAIM_KEYSPACE);
-    let candidate = aruna_core::structs::ReclaimCandidate::from_bytes(value.as_ref()).unwrap();
+    let candidate = aruna_core::structs::storage::cleanup::ReclaimCandidate::from_bytes(value.as_ref()).unwrap();
     assert_eq!(candidate.enqueued_at, enqueued_at);
     assert_ne!(candidate.enqueued_at, started_at);
 }
