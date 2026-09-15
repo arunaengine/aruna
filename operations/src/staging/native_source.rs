@@ -25,7 +25,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::connectors::resolver::{ARUNA_NATIVE_ORIGIN_NODE_ID, ARUNA_NATIVE_RELATIONSHIP_ID};
 use crate::driver::{DriverContext, drive};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::s3::get_object::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
 };
@@ -34,7 +34,7 @@ use crate::s3::head_object::{
 };
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::sync::sync_relationship::{
-    GetSyncRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
+    GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
 
 const NATIVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -315,25 +315,21 @@ async fn prepare_reference(
         NativeReferenceReject::Unavailable("network handle unavailable".to_string())
     })?;
     let relationship = drive(
-        GetSyncRelationshipOperation::new(
-            request.relationship_id,
-            SyncRelationshipDirection::Outgoing,
-        ),
+        GetRelationshipOperation::new(request.relationship_id, SyncRelationshipDirection::Outgoing),
         context,
     )
     .await
     .map_err(map_relationship_error)?;
     validate_relationship(net_handle, peer, &relationship, request)?;
-    let bucket_info =
-        match drive(GetBucketInfoOperation::new(request.bucket.clone()), context).await {
-            Ok(info) => info,
-            Err(GetBucketInfoError::NotFound) => {
-                return Err(NativeReferenceReject::NotFound);
-            }
-            Err(error) => {
-                return Err(NativeReferenceReject::Unavailable(error.to_string()));
-            }
-        };
+    let bucket_info = match drive(GetBucketOperation::new(request.bucket.clone()), context).await {
+        Ok(info) => info,
+        Err(GetBucketError::NotFound) => {
+            return Err(NativeReferenceReject::NotFound);
+        }
+        Err(error) => {
+            return Err(NativeReferenceReject::Unavailable(error.to_string()));
+        }
+    };
     let auth_context = AuthContext {
         user_id: relationship.created_by,
         realm_id: relationship.source.realm_id,

@@ -57,12 +57,12 @@ pub(crate) struct ManifestPagePlan {
 }
 
 #[derive(Serialize)]
-enum BorrowedShardTransportResponse<'a> {
-    ManifestPage(BorrowedShardManifestPage<'a>),
+enum BorrowedTransportResponse<'a> {
+    ManifestPage(BorrowedManifestPage<'a>),
 }
 
 #[derive(Serialize)]
-struct BorrowedShardManifestPage<'a> {
+struct BorrowedManifestPage<'a> {
     placement: PlacementRef,
     holder: NodeId,
     cursor: &'a [u8],
@@ -190,8 +190,8 @@ fn borrowed_page_response<'a>(
     page_index: u32,
     last: bool,
     entries: &'a [ShardManifestEntry],
-) -> BorrowedShardTransportResponse<'a> {
-    BorrowedShardTransportResponse::ManifestPage(BorrowedShardManifestPage {
+) -> BorrowedTransportResponse<'a> {
+    BorrowedTransportResponse::ManifestPage(BorrowedManifestPage {
         placement: manifest.placement,
         holder: manifest.holder,
         cursor: &manifest.cursor,
@@ -447,7 +447,7 @@ async fn read_frame<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use aruna_core::document::{
-        DocumentSyncRevision, DocumentSyncTarget, ShardManifest, ShardManifestEntry,
+        DocumentSyncRevision, DocumentTarget, ShardManifest, ShardManifestEntry,
     };
     use aruna_core::{NodeId, alpn::Alpn};
     use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
@@ -498,7 +498,7 @@ mod tests {
             placement: placement(),
             holder,
             entries: vec![ShardManifestEntry {
-                target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                target: DocumentTarget::MetadataDocumentLifecycle {
                     document_id: Ulid::from_bytes([4; 16]),
                 },
                 revision: DocumentSyncRevision {
@@ -537,7 +537,7 @@ mod tests {
         let holder = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let entries = (1..=4)
             .map(|seed| ShardManifestEntry {
-                target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                target: DocumentTarget::MetadataDocumentLifecycle {
                     document_id: Ulid::from_bytes([seed; 16]),
                 },
                 revision: DocumentSyncRevision {
@@ -612,7 +612,7 @@ mod tests {
         let other_holder = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let entries = (1..=2)
             .map(|seed| ShardManifestEntry {
-                target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                target: DocumentTarget::MetadataDocumentLifecycle {
                     document_id: Ulid::from_bytes([seed; 16]),
                 },
                 revision: DocumentSyncRevision {

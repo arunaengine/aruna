@@ -9,7 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CheckStagingSourceState {
+pub enum CheckSourceState {
     Init,
     Check,
     Finish,
@@ -17,12 +17,12 @@ pub enum CheckStagingSourceState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum CheckStagingSourceError {
+pub enum CheckSourceError {
     #[error(transparent)]
     Staging(#[from] StagingSourceError),
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: CheckStagingSourceState,
+        state: CheckSourceState,
         expected: &'static str,
         got: String,
     },
@@ -31,34 +31,34 @@ pub enum CheckStagingSourceError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CheckStagingSourceOperation {
+pub struct CheckSourceOperation {
     access: ResolvedSourceAccess,
-    state: CheckStagingSourceState,
-    output: Option<Result<(), CheckStagingSourceError>>,
+    state: CheckSourceState,
+    output: Option<Result<(), CheckSourceError>>,
 }
 
-impl CheckStagingSourceOperation {
+impl CheckSourceOperation {
     pub fn new(access: ResolvedSourceAccess) -> Self {
         Self {
             access,
-            state: CheckStagingSourceState::Init,
+            state: CheckSourceState::Init,
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: CheckStagingSourceError) -> Effects {
-        self.state = CheckStagingSourceState::Error;
+    fn emit_error(&mut self, error: CheckSourceError) -> Effects {
+        self.state = CheckSourceState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 }
 
-impl Operation for CheckStagingSourceOperation {
+impl Operation for CheckSourceOperation {
     type Output = ();
-    type Error = CheckStagingSourceError;
+    type Error = CheckSourceError;
 
     fn start(&mut self) -> Effects {
-        self.state = CheckStagingSourceState::Check;
+        self.state = CheckSourceState::Check;
         smallvec![Effect::StagingSource(StagingSourceEffect::Check {
             access: self.access.clone(),
         })]
@@ -66,21 +66,18 @@ impl Operation for CheckStagingSourceOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match (&self.state, event) {
-            (
-                CheckStagingSourceState::Check,
-                Event::StagingSource(StagingSourceEvent::CheckResult),
-            ) => {
-                self.state = CheckStagingSourceState::Finish;
+            (CheckSourceState::Check, Event::StagingSource(StagingSourceEvent::CheckResult)) => {
+                self.state = CheckSourceState::Finish;
                 self.output = Some(Ok(()));
                 smallvec![]
             }
             (
-                CheckStagingSourceState::Check,
+                CheckSourceState::Check,
                 Event::StagingSource(StagingSourceEvent::Error { error }),
             ) => self.emit_error(error.into()),
-            (CheckStagingSourceState::Finish, _) => smallvec![],
-            (CheckStagingSourceState::Error, _) => self.abort(),
-            (_, event) => self.emit_error(CheckStagingSourceError::UnexpectedEvent {
+            (CheckSourceState::Finish, _) => smallvec![],
+            (CheckSourceState::Error, _) => self.abort(),
+            (_, event) => self.emit_error(CheckSourceError::UnexpectedEvent {
                 state: self.state.clone(),
                 expected: "Event::StagingSource(StagingSourceEvent::CheckResult)",
                 got: describe_event(&event),
@@ -91,12 +88,12 @@ impl Operation for CheckStagingSourceOperation {
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            CheckStagingSourceState::Finish | CheckStagingSourceState::Error
+            CheckSourceState::Finish | CheckSourceState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(CheckStagingSourceError::CheckFailed)?
+        self.output.ok_or(CheckSourceError::CheckFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -121,7 +118,7 @@ mod pure_tests {
 
     #[test]
     fn check_emits_effect() {
-        let mut operation = CheckStagingSourceOperation::new(sample_access());
+        let mut operation = CheckSourceOperation::new(sample_access());
 
         let effects = operation.start();
 
@@ -133,7 +130,7 @@ mod pure_tests {
 
     #[test]
     fn check_finishes() {
-        let mut operation = CheckStagingSourceOperation::new(sample_access());
+        let mut operation = CheckSourceOperation::new(sample_access());
         operation.start();
 
         let effects = operation.step(Event::StagingSource(StagingSourceEvent::CheckResult));
@@ -144,7 +141,7 @@ mod pure_tests {
 
     #[test]
     fn check_rejects_event() {
-        let mut operation = CheckStagingSourceOperation::new(sample_access());
+        let mut operation = CheckSourceOperation::new(sample_access());
         operation.start();
 
         let effects = operation.step(Event::Search());
@@ -153,13 +150,13 @@ mod pure_tests {
         assert!(operation.is_complete());
         assert!(matches!(
             operation.finalize(),
-            Err(CheckStagingSourceError::UnexpectedEvent { .. })
+            Err(CheckSourceError::UnexpectedEvent { .. })
         ));
     }
 
     #[test]
     fn check_exposes_error() {
-        let mut operation = CheckStagingSourceOperation::new(sample_access());
+        let mut operation = CheckSourceOperation::new(sample_access());
         operation.start();
 
         operation.step(Event::StagingSource(StagingSourceEvent::Error {
@@ -168,9 +165,9 @@ mod pure_tests {
 
         assert_eq!(
             operation.finalize(),
-            Err(CheckStagingSourceError::Staging(
-                StagingSourceError::CheckError("unreachable".to_string())
-            ))
+            Err(CheckSourceError::Staging(StagingSourceError::CheckError(
+                "unreachable".to_string()
+            )))
         );
     }
 }

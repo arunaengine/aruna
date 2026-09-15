@@ -824,7 +824,7 @@ async fn commit(context: &DriverContext, txn_id: TxnId) -> Result<(), OfferedDir
 mod tests {
     use super::*;
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
-    use crate::tests::fixtures::staging::setup_driver_context;
+    use crate::tests::staging::setup_driver_context;
     use aruna_core::structs::{UsageCounters, usage_group_key};
     use futures_util::StreamExt;
 
@@ -902,13 +902,8 @@ mod tests {
         let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         let offer = input("taken", root.path().to_str().expect("utf-8 root"));
-        crate::tests::fixtures::staging::create_test_bucket(
-            context,
-            offer.group_id,
-            offer.user_id,
-            "taken",
-        )
-        .await;
+        crate::tests::staging::create_test_bucket(context, offer.group_id, offer.user_id, "taken")
+            .await;
 
         assert_eq!(
             offer_directory(context, offer).await,
