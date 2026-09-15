@@ -46,9 +46,8 @@ pub mod user_validation;
 mod tests;
 
 pub use document::{
-    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEffect,
-    DocumentSyncEvent, DocumentSyncEvictedDocument, DocumentSyncNetEvent, DocumentSyncRevision,
-    DocumentSyncTarget,
+    DocumentApplyDecision, DocumentChange, DocumentChangeKind, DocumentEffect, DocumentEvent,
+    DocumentEvictedDocument, DocumentNetEvent, DocumentSyncRevision, DocumentTarget,
 };
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;

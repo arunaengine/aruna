@@ -4,16 +4,16 @@ use crate::UserId;
 use crate::alpn::Alpn;
 use crate::audit::AuditPageRequest;
 use crate::compute::ExecutionTargetId;
-use crate::document::DocumentSyncEffect;
+use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::{
-    BackendLocation, GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey,
-    JobRecordEnvelope, JobRecordKind, PlacementPolicyRef, PlacementRef, PolicyPublicationClaim,
-    RealmId, ResolvedBackend, ResolvedSourceAccess, SubmissionId, WriteGuard,
+    BackendLocation, GroupStorage, GroupStorageSecret, HiddenBlobKey, JobRecordEnvelope,
+    JobRecordKind, PlacementPolicyRef, PlacementRef, PolicyPublicationClaim, RealmId,
+    ResolvedBackend, ResolvedSourceAccess, SubmissionId, WriteGuard,
 };
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
@@ -148,8 +148,8 @@ pub enum BlobEffect {
     /// Create-time reachability proof for a tenant backend: build the guarded
     /// operator and round-trip a sentinel object.
     CheckGroupBackend {
-        record: GroupStorageBackend,
-        secret: GroupStorageBackendSecret,
+        record: GroupStorage,
+        secret: GroupStorageSecret,
     },
 }
 
@@ -349,7 +349,7 @@ impl IterStart {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
     Dht(DhtEffect),
-    DocumentSync(DocumentSyncEffect),
+    DocumentSync(DocumentEffect),
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
     AuditPage(Box<AuditPageEffect>),
@@ -749,7 +749,7 @@ pub enum StreamEffect {
 pub(crate) mod tests {
     use super::*;
 
-    use crate::tests::fixtures::effects::*;
+    use crate::tests::effects::*;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

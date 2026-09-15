@@ -199,7 +199,6 @@ pub const JOB_ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
 pub const JOB_OUTPUT_RECORD_KEYSPACE: &str = "job_output_records";
 pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
 
-// Append-only distributed job-record store.
 /// Immutable authentic record envelopes, keyed by `JobRecordKey`. A key is
 /// written once: the same digest replays as a no-op and a different digest is
 /// retained in the conflict keyspace instead of overwriting it.

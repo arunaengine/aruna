@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
 
 use super::{
-    DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent,
-    DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncRevision, DocumentSyncTarget,
-    compare_sync_revisions, shard_topic_id, sync_apply_decision,
+    DocumentApplyDecision, DocumentChange, DocumentChangeKind, DocumentEvent, DocumentOutboxEvent,
+    DocumentSyncPublish, DocumentSyncRevision, DocumentTarget, compare_sync_revisions,
+    shard_topic_id, sync_apply_decision,
 };
 use crate::NodeId;
 use crate::TopicId;
@@ -35,13 +35,13 @@ fn revision(generation: u64, event_seed: u8, actor_seed: u8) -> DocumentSyncRevi
 }
 
 fn change(
-    kind: DocumentSyncChangeKind,
+    kind: DocumentChangeKind,
     base: Option<DocumentSyncRevision>,
     generation: u64,
     event_seed: u8,
     actor_seed: u8,
-) -> DocumentSyncChange {
-    DocumentSyncChange {
+) -> DocumentChange {
+    DocumentChange {
         base,
         current: revision(generation, event_seed, actor_seed),
         kind,
@@ -74,46 +74,40 @@ fn document_sync_stable() {
     let graph_iri = "https://example.com/graphs/stable";
 
     let cases = [
+        (DocumentTarget::Group { group_id }, TopicId::group(group_id)),
         (
-            DocumentSyncTarget::Group { group_id },
+            DocumentTarget::GroupAuthorization { group_id },
             TopicId::group(group_id),
         ),
         (
-            DocumentSyncTarget::GroupAuthorization { group_id },
-            TopicId::group(group_id),
-        ),
-        (
-            DocumentSyncTarget::RealmAuthorization { realm_id },
+            DocumentTarget::RealmAuthorization { realm_id },
             TopicId::realm(realm_id),
         ),
         (
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             TopicId::realm(realm_id),
         ),
+        (DocumentTarget::User { user_id }, TopicId::users(realm_id)),
         (
-            DocumentSyncTarget::User { user_id },
-            TopicId::users(realm_id),
-        ),
-        (
-            DocumentSyncTarget::MetadataRegistry {
+            DocumentTarget::MetadataRegistry {
                 group_id,
                 document_id,
             },
             TopicId::metadata(document_id),
         ),
         (
-            DocumentSyncTarget::MetadataCreateEvent {
+            DocumentTarget::MetadataCreateEvent {
                 document_id,
                 event_id,
             },
             TopicId::metadata(document_id),
         ),
         (
-            DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+            DocumentTarget::MetadataDocumentLifecycle { document_id },
             TopicId::metadata(document_id),
         ),
         (
-            DocumentSyncTarget::MetadataGraphLifecycle {
+            DocumentTarget::MetadataGraphLifecycle {
                 graph_iri: graph_iri.to_string(),
             },
             TopicId::metadata(graph_topic_ulid(graph_iri)),
@@ -148,32 +142,28 @@ fn document_target_stable() {
 
     let cases = [
         (
-            DocumentSyncTarget::Group { group_id },
+            DocumentTarget::Group { group_id },
             GROUP_KEYSPACE,
             group_id.to_bytes().to_vec(),
         ),
         (
-            DocumentSyncTarget::GroupAuthorization { group_id },
+            DocumentTarget::GroupAuthorization { group_id },
             AUTH_KEYSPACE,
             group_id.to_bytes().to_vec(),
         ),
         (
-            DocumentSyncTarget::RealmAuthorization { realm_id },
+            DocumentTarget::RealmAuthorization { realm_id },
             AUTH_KEYSPACE,
             realm_id.as_bytes().to_vec(),
         ),
         (
-            DocumentSyncTarget::RealmConfig { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
             REALM_CONFIG_KEYSPACE,
             realm_id.as_bytes().to_vec(),
         ),
+        (DocumentTarget::User { user_id }, USER_KEYSPACE, user_key),
         (
-            DocumentSyncTarget::User { user_id },
-            USER_KEYSPACE,
-            user_key,
-        ),
-        (
-            DocumentSyncTarget::MetadataRegistry {
+            DocumentTarget::MetadataRegistry {
                 group_id,
                 document_id,
             },
@@ -181,7 +171,7 @@ fn document_target_stable() {
             registry_key,
         ),
         (
-            DocumentSyncTarget::MetadataCreateEvent {
+            DocumentTarget::MetadataCreateEvent {
                 document_id,
                 event_id,
             },
@@ -189,12 +179,12 @@ fn document_target_stable() {
             event_key,
         ),
         (
-            DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+            DocumentTarget::MetadataDocumentLifecycle { document_id },
             METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
             document_id.to_bytes().to_vec(),
         ),
         (
-            DocumentSyncTarget::MetadataGraphLifecycle {
+            DocumentTarget::MetadataGraphLifecycle {
                 graph_iri: graph_iri.to_string(),
             },
             METADATA_GRAPH_LIFECYCLE_KEYSPACE,
@@ -229,8 +219,8 @@ fn shard_classed_topics() {
 
     // Group and its authorization are one logical subject: with the same
     // placement they ride a single shard topic, derived purely from it.
-    let group = DocumentSyncTarget::Group { group_id };
-    let group_auth = DocumentSyncTarget::GroupAuthorization { group_id };
+    let group = DocumentTarget::Group { group_id };
+    let group_auth = DocumentTarget::GroupAuthorization { group_id };
     assert_eq!(
         group.sync_topic_id(realm_id, &placement_a),
         group_auth.sync_topic_id(realm_id, &placement_a)
@@ -245,15 +235,15 @@ fn shard_classed_topics() {
     );
 
     // The three metadata variants of one document collapse onto its shard.
-    let registry = DocumentSyncTarget::MetadataRegistry {
+    let registry = DocumentTarget::MetadataRegistry {
         group_id,
         document_id,
     };
-    let create = DocumentSyncTarget::MetadataCreateEvent {
+    let create = DocumentTarget::MetadataCreateEvent {
         document_id,
         event_id,
     };
-    let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    let lifecycle = DocumentTarget::MetadataDocumentLifecycle { document_id };
     assert_eq!(
         registry.sync_topic_id(realm_id, &placement_a),
         create.sync_topic_id(realm_id, &placement_a)
@@ -265,8 +255,8 @@ fn shard_classed_topics() {
 
     // Shared realm-scoped targets keep their per-domain topics and ignore
     // the placement entirely.
-    let realm_auth = DocumentSyncTarget::RealmAuthorization { realm_id };
-    let realm_config = DocumentSyncTarget::RealmConfig { realm_id };
+    let realm_auth = DocumentTarget::RealmAuthorization { realm_id };
+    let realm_config = DocumentTarget::RealmConfig { realm_id };
     assert_eq!(realm_auth.topic_id(), realm_config.topic_id());
     assert_ne!(
         realm_auth.sync_topic_id(realm_id, &placement_a),
@@ -335,12 +325,12 @@ fn node_usage_keys() {
     let node_id = test_node(1);
     let group_id = test_ulid(4);
 
-    let global = DocumentSyncTarget::NodeUsage {
+    let global = DocumentTarget::NodeUsage {
         realm_id,
         node_id,
         group_id: None,
     };
-    let group = DocumentSyncTarget::NodeUsage {
+    let group = DocumentTarget::NodeUsage {
         realm_id,
         node_id,
         group_id: Some(group_id),
@@ -356,7 +346,7 @@ fn node_usage_keys() {
     );
 
     // A different node's usage rides the very same shared topic.
-    let other = DocumentSyncTarget::NodeUsage {
+    let other = DocumentTarget::NodeUsage {
         realm_id,
         node_id: test_node(9),
         group_id: None,
@@ -368,7 +358,7 @@ fn node_usage_keys() {
     // But is distinct from the realm-config topic on the same domain.
     assert_ne!(
         global.sync_topic_id(realm_id, &nil),
-        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &nil)
+        DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &nil)
     );
 
     assert_eq!(global.storage_keyspace(), USAGE_NODE_STATS_KEYSPACE);
@@ -389,12 +379,12 @@ fn node_info_keys() {
 
     let realm_id = test_realm(2);
     let node_id = test_node(1);
-    let target = DocumentSyncTarget::NodeInfo { realm_id, node_id };
+    let target = DocumentTarget::NodeInfo { realm_id, node_id };
 
     // Rides the realm domain topic and one shared sync topic across nodes.
     let nil = PlacementRef::NIL;
     assert_eq!(target.topic_id(), TopicId::realm(realm_id));
-    let other = DocumentSyncTarget::NodeInfo {
+    let other = DocumentTarget::NodeInfo {
         realm_id,
         node_id: test_node(9),
     };
@@ -405,7 +395,7 @@ fn node_info_keys() {
     // Distinct from the node-usage and watch-interest topics on the same realm.
     assert_ne!(
         target.sync_topic_id(realm_id, &nil),
-        DocumentSyncTarget::NodeUsage {
+        DocumentTarget::NodeUsage {
             realm_id,
             node_id,
             group_id: None,
@@ -414,7 +404,7 @@ fn node_info_keys() {
     );
     assert_ne!(
         target.sync_topic_id(realm_id, &nil),
-        DocumentSyncTarget::WatchInterest { realm_id, node_id }.sync_topic_id(realm_id, &nil)
+        DocumentTarget::WatchInterest { realm_id, node_id }.sync_topic_id(realm_id, &nil)
     );
 
     assert_eq!(target.storage_keyspace(), NODE_INFO_KEYSPACE);
@@ -433,13 +423,13 @@ fn watch_interest_keys() {
 
     let realm_id = test_realm(2);
     let node_id = test_node(1);
-    let other = DocumentSyncTarget::WatchInterest {
+    let other = DocumentTarget::WatchInterest {
         realm_id,
         node_id: test_node(9),
     };
-    let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let target = DocumentTarget::WatchInterest { realm_id, node_id };
     let owner = UserId::new(test_ulid(10), realm_id);
-    let subscription = DocumentSyncTarget::WatchSubscription {
+    let subscription = DocumentTarget::WatchSubscription {
         owner,
         watch_id: test_ulid(11),
     };
@@ -458,7 +448,7 @@ fn watch_interest_keys() {
     // Distinct from the node-usage topic that shares the same realm domain.
     assert_ne!(
         target.sync_topic_id(realm_id, &nil),
-        DocumentSyncTarget::NodeUsage {
+        DocumentTarget::NodeUsage {
             realm_id,
             node_id,
             group_id: None,
@@ -487,11 +477,11 @@ fn watch_interest_keys() {
 #[test]
 fn upsert_uses_helpers() {
     let event_id = test_ulid(10);
-    let target = DocumentSyncTarget::RealmConfig {
+    let target = DocumentTarget::RealmConfig {
         realm_id: test_realm(11),
     };
-    let change = change(DocumentSyncChangeKind::Upsert, None, 1, 12, 1);
-    let outbox = DocumentSyncOutboxEvent::Upsert {
+    let change = change(DocumentChangeKind::Upsert, None, 1, 12, 1);
+    let outbox = DocumentOutboxEvent::Upsert {
         bytes: vec![1, 2],
         change,
     };
@@ -502,7 +492,7 @@ fn upsert_uses_helpers() {
         change,
         allow_genesis: true,
     };
-    let event = DocumentSyncEvent::Upsert {
+    let event = DocumentEvent::Upsert {
         event_id,
         target: target.clone(),
         bytes: vec![1, 2],
@@ -520,18 +510,18 @@ fn upsert_uses_helpers() {
 #[test]
 fn delete_uses_helpers() {
     let event_id = test_ulid(13);
-    let target = DocumentSyncTarget::RealmConfig {
+    let target = DocumentTarget::RealmConfig {
         realm_id: test_realm(14),
     };
-    let change = change(DocumentSyncChangeKind::Delete, None, 2, 15, 1);
-    let outbox = DocumentSyncOutboxEvent::Delete { change };
+    let change = change(DocumentChangeKind::Delete, None, 2, 15, 1);
+    let outbox = DocumentOutboxEvent::Delete { change };
     let publish = DocumentSyncPublish::Delete {
         event_id,
         target: target.clone(),
         change,
         allow_genesis: false,
     };
-    let event = DocumentSyncEvent::Delete {
+    let event = DocumentEvent::Delete {
         event_id,
         target: target.clone(),
         change,
@@ -566,60 +556,60 @@ fn document_revision_stable() {
 
 #[test]
 fn document_sync_changes() {
-    let local = change(DocumentSyncChangeKind::Upsert, None, 1, 1, 1);
-    let incoming = change(DocumentSyncChangeKind::Upsert, Some(local.current), 2, 2, 1);
+    let local = change(DocumentChangeKind::Upsert, None, 1, 1, 1);
+    let incoming = change(DocumentChangeKind::Upsert, Some(local.current), 2, 2, 1);
 
     assert_eq!(
         sync_apply_decision(None, &local),
-        DocumentSyncApplyDecision::Apply
+        DocumentApplyDecision::Apply
     );
     assert_eq!(
         sync_apply_decision(Some(&local), &incoming),
-        DocumentSyncApplyDecision::Apply
+        DocumentApplyDecision::Apply
     );
     assert_eq!(
         sync_apply_decision(Some(&local), &local),
-        DocumentSyncApplyDecision::Apply
+        DocumentApplyDecision::Apply
     );
 }
 
 #[test]
 fn document_apply_changes() {
-    let stale = change(DocumentSyncChangeKind::Upsert, None, 1, 1, 1);
-    let newer = change(DocumentSyncChangeKind::Upsert, Some(stale.current), 2, 2, 1);
-    let tombstone = change(DocumentSyncChangeKind::Delete, Some(stale.current), 2, 3, 1);
+    let stale = change(DocumentChangeKind::Upsert, None, 1, 1, 1);
+    let newer = change(DocumentChangeKind::Upsert, Some(stale.current), 2, 2, 1);
+    let tombstone = change(DocumentChangeKind::Delete, Some(stale.current), 2, 3, 1);
 
     assert_eq!(
         sync_apply_decision(Some(&newer), &stale),
-        DocumentSyncApplyDecision::SkipStale
+        DocumentApplyDecision::SkipStale
     );
     assert_eq!(
         sync_apply_decision(Some(&tombstone), &stale),
-        DocumentSyncApplyDecision::SkipTombstoned
+        DocumentApplyDecision::SkipTombstoned
     );
 }
 
 #[test]
 fn document_decision_changes() {
-    let local = change(DocumentSyncChangeKind::Upsert, None, 1, 1, 1);
-    let same_generation = change(DocumentSyncChangeKind::Upsert, None, 1, 2, 2);
-    let unobserved_newer = change(DocumentSyncChangeKind::Delete, None, 2, 3, 2);
+    let local = change(DocumentChangeKind::Upsert, None, 1, 1, 1);
+    let same_generation = change(DocumentChangeKind::Upsert, None, 1, 2, 2);
+    let unobserved_newer = change(DocumentChangeKind::Delete, None, 2, 3, 2);
 
     assert_eq!(
         sync_apply_decision(Some(&local), &same_generation),
-        DocumentSyncApplyDecision::Conflict
+        DocumentApplyDecision::Conflict
     );
     assert_eq!(
         sync_apply_decision(Some(&local), &unobserved_newer),
-        DocumentSyncApplyDecision::Conflict
+        DocumentApplyDecision::Conflict
     );
 }
 
 #[test]
 fn metadata_document_scoped() {
     let document_id = test_ulid(4);
-    let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    let create = DocumentSyncTarget::MetadataCreateEvent {
+    let lifecycle = DocumentTarget::MetadataDocumentLifecycle { document_id };
+    let create = DocumentTarget::MetadataCreateEvent {
         document_id,
         event_id: test_ulid(5),
     };
@@ -636,8 +626,8 @@ fn metadata_document_delete() {
         strategy_id: test_ulid(9),
         shard: 2,
     };
-    let upsert_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
-    let delete_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    let upsert_target = DocumentTarget::MetadataDocumentLifecycle { document_id };
+    let delete_target = DocumentTarget::MetadataDocumentLifecycle { document_id };
 
     assert_eq!(upsert_target.topic_id(), delete_target.topic_id());
     assert_eq!(

@@ -52,7 +52,7 @@ pub struct RouteLabels {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WatchAuthorizationMetricReason {
+pub enum WatchMetricReason {
     InvalidResource,
     InvalidOwner,
     TokenRestricted,
@@ -63,7 +63,7 @@ pub enum WatchAuthorizationMetricReason {
     InvalidState,
 }
 
-impl WatchAuthorizationMetricReason {
+impl WatchMetricReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidResource => "invalid_resource",
@@ -104,7 +104,7 @@ pub struct NotificationWatchMetrics {
 }
 
 impl NotificationWatchMetrics {
-    pub fn record_creation_denial(&self, reason: WatchAuthorizationMetricReason) {
+    pub fn record_creation_denial(&self, reason: WatchMetricReason) {
         self.creation_denials
             .get_or_create(&WatchAuthorizationLabels {
                 reason: reason.as_str(),
@@ -112,7 +112,7 @@ impl NotificationWatchMetrics {
             .inc();
     }
 
-    pub fn record_delivery_suppression(&self, reason: WatchAuthorizationMetricReason) {
+    pub fn record_delivery_suppression(&self, reason: WatchMetricReason) {
         self.delivery_suppressions
             .get_or_create(&WatchAuthorizationLabels {
                 reason: reason.as_str(),
@@ -323,14 +323,14 @@ mod tests {
     #[tokio::test]
     async fn notification_watch_labels() {
         assert_eq!(
-            WatchAuthorizationMetricReason::parse("token_revoked"),
-            Some(WatchAuthorizationMetricReason::TokenRevoked)
+            WatchMetricReason::parse("token_revoked"),
+            Some(WatchMetricReason::TokenRevoked)
         );
         let metrics = NodeMetrics::new();
         let watch_metrics = NotificationWatchMetrics::default();
         watch_metrics.register(&metrics).await;
-        watch_metrics.record_creation_denial(WatchAuthorizationMetricReason::PermissionDenied);
-        watch_metrics.record_delivery_suppression(WatchAuthorizationMetricReason::TokenRestricted);
+        watch_metrics.record_creation_denial(WatchMetricReason::PermissionDenied);
+        watch_metrics.record_delivery_suppression(WatchMetricReason::TokenRestricted);
 
         let body = metrics.render().await;
         assert!(body.contains(

@@ -1,7 +1,7 @@
 use crate::NodeId;
 use crate::UserId;
 use crate::auth::credential_hash;
-use crate::document::DocumentSyncTarget;
+use crate::document::DocumentTarget;
 use crate::structs::{RealmId, StaticRealmEndpoint};
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -62,7 +62,7 @@ pub struct OnboardingSecretRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OnboardingSecretStateRecord {
+pub struct OnboardingStateRecord {
     pub enrollment_id: Ulid,
     pub state: OnboardingSecretState,
 }
@@ -125,16 +125,16 @@ pub enum OnboardingPhase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OnboardingSyncTicketPayload {
+pub struct OnboardingTicketPayload {
     pub realm_id: String,
     pub node_id: String,
     pub expires_at: u64,
-    pub documents: Vec<DocumentSyncTarget>,
+    pub documents: Vec<DocumentTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OnboardingSyncTicket {
-    pub payload: OnboardingSyncTicketPayload,
+pub struct OnboardingTicket {
+    pub payload: OnboardingTicketPayload,
     pub signature: String,
 }
 
@@ -158,14 +158,14 @@ impl From<OnboardingMode> for RequestedOnboardingMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateOnboardingSecretRequest {
+pub struct CreateSecretRequest {
     pub seed_url: String,
     pub mode: RequestedOnboardingMode,
     pub expires_in_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateOnboardingSecretResponse {
+pub struct CreateSecretResponse {
     pub onboarding_secret: String,
     /// Identifier of the minted enrollment, the handle the status and revoke
     /// routes take. Not secret: the admin listing exposes the same value.
@@ -211,15 +211,15 @@ impl BootstrapOnboardingResponse {
     }
 }
 
-impl OnboardingSyncTicket {
+impl OnboardingTicket {
     pub fn issue(
         signing_key: &SigningKey,
         realm_id: &RealmId,
         node_id: NodeId,
         expires_at: u64,
-        documents: Vec<DocumentSyncTarget>,
+        documents: Vec<DocumentTarget>,
     ) -> Result<Self, OnboardingSecretError> {
-        let payload = OnboardingSyncTicketPayload {
+        let payload = OnboardingTicketPayload {
             realm_id: realm_id.to_string(),
             node_id: node_id.to_string(),
             expires_at,
@@ -243,7 +243,7 @@ impl OnboardingSyncTicket {
     pub fn verify(
         &self,
         expected_node_id: NodeId,
-        expected_document: &DocumentSyncTarget,
+        expected_document: &DocumentTarget,
         now: u64,
     ) -> Result<(), OnboardingSecretError> {
         if self.payload.node_id != expected_node_id.to_string() {
@@ -297,9 +297,9 @@ pub fn issuer_proof_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSyncTicket, credential_hash,
+        OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingTicket, credential_hash,
     };
-    use crate::document::DocumentSyncTarget;
+    use crate::document::DocumentTarget;
     use crate::structs::RealmId;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;
@@ -340,9 +340,9 @@ mod tests {
         let node_signing_key = SigningKey::from_bytes(&[4u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&node_signing_key.to_bytes()).public();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let document = DocumentSyncTarget::RealmAuthorization { realm_id };
+        let document = DocumentTarget::RealmAuthorization { realm_id };
 
-        let ticket = OnboardingSyncTicket::issue(
+        let ticket = OnboardingTicket::issue(
             &realm_signing_key,
             &realm_id,
             node_id,
@@ -352,7 +352,7 @@ mod tests {
         .unwrap();
 
         let encoded = ticket.encode().unwrap();
-        let decoded = OnboardingSyncTicket::decode(&encoded).unwrap();
+        let decoded = OnboardingTicket::decode(&encoded).unwrap();
         decoded.verify(node_id, &document, 0).unwrap();
     }
 }

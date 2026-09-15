@@ -1,6 +1,6 @@
 use crate::UserId;
 use crate::admin_documents::AdminDocumentTarget;
-use crate::reducer::AdminDocumentReducerState;
+use crate::reducer::AdminDocumentState;
 use crate::types::{GroupId, RoleId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -59,7 +59,7 @@ pub fn valid_message(message: &Option<String>) -> bool {
     })
 }
 
-impl AdminDocumentReducerState {
+impl AdminDocumentState {
     pub fn join_requests(&self) -> Vec<JoinRequestState> {
         let AdminDocumentTarget::Group { group_id } = self.target else {
             return Vec::new();
@@ -114,7 +114,7 @@ impl AdminDocumentReducerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin_documents::{AdminDocumentOperation, AdminDocumentRoleDefinition};
+    use crate::admin_documents::{AdminDocumentOperation, AdminRoleDefinition};
     use crate::structs::{Actor, RealmId};
     use std::collections::BTreeMap;
 
@@ -127,17 +127,17 @@ mod tests {
         }
     }
 
-    fn pending() -> (AdminDocumentReducerState, JoinRequest, Ulid) {
+    fn pending() -> (AdminDocumentState, JoinRequest, Ulid) {
         let admin = actor(1);
         let member = actor(2);
         let group_id = Ulid::from_bytes([3; 16]);
         let role_id = Ulid::from_bytes([4; 16]);
-        let mut state = AdminDocumentReducerState::new(AdminDocumentTarget::Group { group_id });
+        let mut state = AdminDocumentState::new(AdminDocumentTarget::Group { group_id });
         state
             .apply_operation(
                 &admin,
                 AdminDocumentOperation::GroupRoleCreated {
-                    role: AdminDocumentRoleDefinition {
+                    role: AdminRoleDefinition {
                         role_id,
                         name: "user".into(),
                         permissions: BTreeMap::new(),
