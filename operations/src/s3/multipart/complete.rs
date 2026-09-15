@@ -14,8 +14,8 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::queue::build_live_obligation;
+use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::upload_target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
 use aruna_blob::hash::Hasher;
 use aruna_core::UserId;
@@ -32,11 +32,10 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BucketInfo, CopyOrigin, CurrentVersionPointer, MultipartChecksumType,
-    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
-    MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, PathRestriction,
-    PlacementPolicyError, PlacementPolicyRef, RealmId, ResolvedBackend, RoCrateLimits, UsageDelta,
-    VersionKey, WriteOwner,
+    BucketInfo, CopyOrigin, CurrentVersionPointer, MultipartChecksumType, MultipartObjectKey,
+    MultipartObjectPart, MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
+    MultipartUploadStatus, PathRestriction, PlacementPolicyError, PlacementPolicyRef, RealmId,
+    ResolvedBackend, RoCrateLimits, UsageDelta, VersionKey, WriteOwner,
 };
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -47,7 +46,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum CompleteMultipartUploadState {
+pub enum CompleteUploadState {
     Init,
     StartMarkTransaction,
     CheckPurgeFenceForMark,
@@ -90,7 +89,7 @@ pub enum CompleteMultipartUploadState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum CompleteMultipartUploadError {
+pub enum CompleteUploadError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -151,7 +150,7 @@ pub enum CompleteMultipartUploadError {
     NotFinished,
 }
 
-impl From<UploadTargetError> for CompleteMultipartUploadError {
+impl From<UploadTargetError> for CompleteUploadError {
     fn from(error: UploadTargetError) -> Self {
         match error {
             UploadTargetError::TargetMismatch => Self::UploadTargetMismatch,
@@ -169,7 +168,7 @@ pub struct CompleteMultipartPart {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CompleteMultipartUploadInput {
+pub struct CompleteUploadInput {
     pub bucket: String,
     pub key: String,
     pub upload_id: Ulid,
@@ -191,7 +190,7 @@ pub struct CompleteMultipartUploadInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct CompleteMultipartUploadResult {
+pub struct CompleteUploadResult {
     pub location: BackendLocation,
     pub version_id: Ulid,
     pub checksum_type: MultipartChecksumType,
@@ -200,13 +199,13 @@ pub struct CompleteMultipartUploadResult {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CompleteMultipartUploadOperation {
-    state: CompleteMultipartUploadState,
-    input: CompleteMultipartUploadInput,
+pub struct CompleteUploadOperation {
+    state: CompleteUploadState,
+    input: CompleteUploadInput,
     txn_id: Option<TxnId>,
     upload_record: Option<MultipartUpload>,
-    upload_parts: Vec<MultipartUploadPart>,
-    resolved_parts: Vec<MultipartUploadPart>,
+    upload_parts: Vec<MultipartPart>,
+    resolved_parts: Vec<MultipartPart>,
     composed_location: Option<BackendLocation>,
     /// The composed object after a commit whose outcome is unknown. Held apart
     /// from `composed_location` so `abort` cannot delete bytes a commit owns.
@@ -214,7 +213,7 @@ pub struct CompleteMultipartUploadOperation {
     /// A pre-finalize write has no committed owner, even when its hash is absent.
     delete_location: Option<BackendLocation>,
     rollback_location: Option<BackendLocation>,
-    cleanup: WriteCleanup<CompleteMultipartUploadError>,
+    cleanup: WriteCleanup<CompleteUploadError>,
     cleanup_closed: bool,
     final_location: Option<BackendLocation>,
     composite_hashes: HashMap<String, Vec<u8>>,
@@ -225,7 +224,7 @@ pub struct CompleteMultipartUploadOperation {
     was_live: bool,
     usage_update: Option<UsageCounterUpdate>,
     quota_gate: Option<QuotaGate>,
-    output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
+    output: Option<Result<CompleteUploadResult, CompleteUploadError>>,
     rocrate_limits: RoCrateLimits,
     restrictions: Option<Vec<PathRestriction>>,
     /// Refs stored on the version record, reused verbatim by its registration.
@@ -243,10 +242,10 @@ pub struct CompleteMultipartUploadOperation {
     reset_done: bool,
 }
 
-impl CompleteMultipartUploadOperation {
-    pub fn new(input: CompleteMultipartUploadInput) -> Self {
+impl CompleteUploadOperation {
+    pub fn new(input: CompleteUploadInput) -> Self {
         Self {
-            state: CompleteMultipartUploadState::Init,
+            state: CompleteUploadState::Init,
             input,
             txn_id: None,
             upload_record: None,
@@ -309,18 +308,18 @@ impl CompleteMultipartUploadOperation {
     /// The terminal state is complete, so the driver never calls `abort` for us;
     /// releasing the transaction here is what keeps it from outliving the
     /// operation. `abort` takes the id, so it cannot run twice.
-    fn emit_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
-        self.state = CompleteMultipartUploadState::Error;
+    fn emit_error(&mut self, error: CompleteUploadError) -> Effects {
+        self.state = CompleteUploadState::Error;
         self.output = Some(Err(error));
         self.abort()
     }
 
-    fn schedule_error(&mut self, error: CompleteMultipartUploadError) -> Effects {
+    fn schedule_error(&mut self, error: CompleteUploadError) -> Effects {
         self.cleanup.set_error(error);
         // Abort the open finalize transaction before the reset one or the
         // orphaned txn pins an LSM snapshot; the error stays pending.
         if let Some(txn_id) = self.txn_id.take() {
-            self.state = CompleteMultipartUploadState::AbortFinalizeTransaction;
+            self.state = CompleteUploadState::AbortFinalizeTransaction;
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
         self.continue_error_cleanup()
@@ -334,7 +333,7 @@ impl CompleteMultipartUploadOperation {
     fn continue_error_cleanup(&mut self) -> Effects {
         if self.needs_reset() {
             self.reset_done = true;
-            self.state = CompleteMultipartUploadState::ResetUploadTransaction;
+            self.state = CompleteUploadState::ResetUploadTransaction;
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false,
             })]
@@ -356,7 +355,7 @@ impl CompleteMultipartUploadOperation {
         if let Some(location) = self.rollback_location.take() {
             return self.queue_cleanup_work(BlobCleanupWork::DeleteBlob { location });
         }
-        self.state = CompleteMultipartUploadState::CleanupFailedCompose;
+        self.state = CompleteUploadState::CleanupFailedCompose;
         match self.composed_location.take() {
             Some(location) => {
                 self.rollback_location = Some(location.clone());
@@ -400,7 +399,7 @@ impl CompleteMultipartUploadOperation {
         let Some(effect) = self.cleanup.queue(work) else {
             return self.release_or_error();
         };
-        self.state = CompleteMultipartUploadState::QueueCleanupRow;
+        self.state = CompleteUploadState::QueueCleanupRow;
         smallvec![effect]
     }
 
@@ -412,19 +411,17 @@ impl CompleteMultipartUploadOperation {
                 self.cleanup_closed = true;
                 self.fail_node()
             }
-            CleanupStep::Invalid => {
-                self.emit_error(CompleteMultipartUploadError::InvalidOperationState)
-            }
+            CleanupStep::Invalid => self.emit_error(CompleteUploadError::InvalidOperationState),
         }
     }
 
     fn fail_node(&mut self) -> Effects {
-        self.state = CompleteMultipartUploadState::Error;
+        self.state = CompleteUploadState::Error;
         if !matches!(self.output.as_ref(), Some(Err(_))) {
             self.output = Some(Err(self
                 .cleanup
                 .take_error()
-                .unwrap_or(CompleteMultipartUploadError::CompleteMultipartUploadFailed)));
+                .unwrap_or(CompleteUploadError::CompleteMultipartUploadFailed)));
         }
         smallvec![]
     }
@@ -436,16 +433,16 @@ impl CompleteMultipartUploadOperation {
         let Some(effect) = self.cleanup.release_effect() else {
             return self.emit_pending_error();
         };
-        self.state = CompleteMultipartUploadState::ReleaseReservation;
+        self.state = CompleteUploadState::ReleaseReservation;
         smallvec![effect]
     }
 
     fn handle_release(&mut self, event: Event) -> Effects {
         let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
-            return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.emit_error(CompleteUploadError::InvalidOperationState);
         };
         if self.cleanup.release_id() != Some(id) {
-            return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.emit_error(CompleteUploadError::InvalidOperationState);
         }
         self.cleanup.clear_release();
         if self.cleanup.error_pending() {
@@ -456,7 +453,7 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn finish_commit(&mut self) -> Effects {
-        self.state = CompleteMultipartUploadState::Finish;
+        self.state = CompleteUploadState::Finish;
         smallvec![schedule_snapshot_publish(), schedule_cleanup_effect()]
     }
 
@@ -466,7 +463,7 @@ impl CompleteMultipartUploadOperation {
                 self.continue_error_cleanup()
             }
             Event::Storage(StorageEvent::Error { error }) => self.abort_uncertain(&error),
-            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
+            _ => self.emit_error(CompleteUploadError::InvalidOperationState),
         }
     }
 
@@ -505,7 +502,7 @@ impl CompleteMultipartUploadOperation {
     fn emit_pending_error(&mut self) -> Effects {
         let error = match (self.cleanup.take_error(), self.output.take()) {
             (Some(error), _) | (None, Some(Err(error))) => error,
-            _ => CompleteMultipartUploadError::CompleteMultipartUploadFailed,
+            _ => CompleteUploadError::CompleteMultipartUploadFailed,
         };
         self.emit_error(error)
     }
@@ -513,7 +510,7 @@ impl CompleteMultipartUploadOperation {
     fn validate_checksum_contract(
         &mut self,
         record: &MultipartUpload,
-    ) -> Result<(), CompleteMultipartUploadError> {
+    ) -> Result<(), CompleteUploadError> {
         let Some(hint) = record.checksum_hint.as_ref() else {
             return Ok(());
         };
@@ -522,7 +519,7 @@ impl CompleteMultipartUploadOperation {
             self.input.checksum_type = hint.checksum_type;
         }
         if self.input.checksum_type_explicit && hint.checksum_type != self.input.checksum_type {
-            return Err(CompleteMultipartUploadError::ChecksumContractMismatch);
+            return Err(CompleteUploadError::ChecksumContractMismatch);
         }
 
         if let Some(algorithm) = hint.algorithm
@@ -535,16 +532,16 @@ impl CompleteMultipartUploadOperation {
                 .iter()
                 .any(|checksum| checksum.algorithm == algorithm);
             if self.input.checksum_algorithm != Some(algorithm) || !matching_expected {
-                return Err(CompleteMultipartUploadError::ChecksumContractMismatch);
+                return Err(CompleteUploadError::ChecksumContractMismatch);
             }
         }
 
         Ok(())
     }
 
-    fn alias_context(&self) -> Result<HeadAliasContext, CompleteMultipartUploadError> {
+    fn alias_context(&self) -> Result<HeadAliasContext, CompleteUploadError> {
         let Some(upload_record) = self.upload_record.as_ref() else {
-            return Err(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return Err(CompleteUploadError::CompleteMultipartUploadFailed);
         };
 
         Ok(HeadAliasContext::new(
@@ -557,7 +554,7 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = CompleteMultipartUploadState::StartMarkTransaction;
+        self.state = CompleteUploadState::StartMarkTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -565,10 +562,10 @@ impl CompleteMultipartUploadOperation {
 
     fn mark_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.emit_error(CompleteUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
-        self.state = CompleteMultipartUploadState::CheckPurgeFenceForMark;
+        self.state = CompleteUploadState::CheckPurgeFenceForMark;
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
 
@@ -576,7 +573,7 @@ impl CompleteMultipartUploadOperation {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.emit_error(error.into());
         }
-        self.state = CompleteMultipartUploadState::ReadUploadForMark;
+        self.state = CompleteUploadState::ReadUploadForMark;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
@@ -586,10 +583,10 @@ impl CompleteMultipartUploadOperation {
 
     fn mark_upload_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.emit_error(CompleteUploadError::InvalidOperationState);
         };
         let Some(value) = value else {
-            return self.emit_error(CompleteMultipartUploadError::NoSuchUpload);
+            return self.emit_error(CompleteUploadError::NoSuchUpload);
         };
         let mut record = match MultipartUpload::from_bytes(value.as_ref()) {
             Ok(record) => record,
@@ -622,7 +619,7 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.emit_error(err.into()),
         };
         self.upload_record = Some(record);
-        self.state = CompleteMultipartUploadState::WriteUploadCompleting;
+        self.state = CompleteUploadState::WriteUploadCompleting;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
@@ -633,13 +630,13 @@ impl CompleteMultipartUploadOperation {
 
     fn handle_upload_marked(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.emit_error(CompleteUploadError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {
-            return self.emit_error(CompleteMultipartUploadError::NoTransactionFound);
+            return self.emit_error(CompleteUploadError::NoTransactionFound);
         };
 
-        self.state = CompleteMultipartUploadState::CommitMarkTransaction;
+        self.state = CompleteUploadState::CommitMarkTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -647,8 +644,8 @@ impl CompleteMultipartUploadOperation {
         match event {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                 self.txn_id = None;
-                self.state = CompleteMultipartUploadState::ReadUploadParts;
-                let prefix = match MultipartUploadPartKey::prefix(self.input.upload_id) {
+                self.state = CompleteUploadState::ReadUploadParts;
+                let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
                     Ok(prefix) => prefix,
                     Err(err) => return self.schedule_error(err.into()),
                 };
@@ -667,24 +664,23 @@ impl CompleteMultipartUploadOperation {
                 self.txn_id = None;
                 self.schedule_error(error.into())
             }
-            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
+            _ => self.emit_error(CompleteUploadError::InvalidOperationState),
         }
     }
 
     fn extract_requested_parts(
         &self,
         values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
-    ) -> Result<(Vec<MultipartUploadPart>, Vec<MultipartUploadPart>), CompleteMultipartUploadError>
-    {
+    ) -> Result<(Vec<MultipartPart>, Vec<MultipartPart>), CompleteUploadError> {
         if self.input.completed_parts.is_empty() {
-            return Err(CompleteMultipartUploadError::MissingParts);
+            return Err(CompleteUploadError::MissingParts);
         }
 
         let mut all_parts = HashMap::new();
         let mut upload_parts = Vec::new();
         for (key, value) in values {
-            let part_key = MultipartUploadPartKey::from_bytes(key.as_ref())?;
-            let part_record = MultipartUploadPart::from_bytes(value.as_ref())?;
+            let part_key = MultipartPartKey::from_bytes(key.as_ref())?;
+            let part_record = MultipartPart::from_bytes(value.as_ref())?;
             upload_parts.push(part_record.clone());
             all_parts.insert(part_key.part_number, part_record);
         }
@@ -699,18 +695,18 @@ impl CompleteMultipartUploadOperation {
             .and_then(|hint| hint.algorithm);
         for requested in &self.input.completed_parts {
             if previous.is_some_and(|prev| requested.part_number <= prev) {
-                return Err(CompleteMultipartUploadError::InvalidPartOrder);
+                return Err(CompleteUploadError::InvalidPartOrder);
             }
             previous = Some(requested.part_number);
 
             let Some(record) = all_parts.get(&requested.part_number).cloned() else {
-                return Err(CompleteMultipartUploadError::InvalidPart);
+                return Err(CompleteUploadError::InvalidPart);
             };
             // Compose stays same-backend: a part elsewhere means a routing bug.
             if let Some(upload) = self.upload_record.as_ref()
                 && record.location.backend != upload.backend
             {
-                return Err(CompleteMultipartUploadError::BackendMismatch);
+                return Err(CompleteUploadError::BackendMismatch);
             }
             validate_requested_part(requested, &record, required_checksum_algorithm)?;
             resolved.push(record);
@@ -721,7 +717,7 @@ impl CompleteMultipartUploadOperation {
             .take(resolved.len().saturating_sub(1))
             .any(|part| part.location.blob_size < 5 * 1024 * 1024)
         {
-            return Err(CompleteMultipartUploadError::EntityTooSmall);
+            return Err(CompleteUploadError::EntityTooSmall);
         }
 
         if self.input.object_size.is_some_and(|size| {
@@ -730,7 +726,7 @@ impl CompleteMultipartUploadOperation {
                 .map(|part| part.location.blob_size)
                 .sum::<u64>()
         }) {
-            return Err(CompleteMultipartUploadError::InvalidObjectSize);
+            return Err(CompleteUploadError::InvalidObjectSize);
         }
 
         Ok((resolved, upload_parts))
@@ -738,7 +734,7 @@ impl CompleteMultipartUploadOperation {
 
     fn upload_parts_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
 
         let (resolved, upload_parts) = match self.extract_requested_parts(values) {
@@ -754,7 +750,7 @@ impl CompleteMultipartUploadOperation {
 
         // The destination default is read before the compose, so the gate that
         // admits the object sees the refs the version would actually carry.
-        self.state = CompleteMultipartUploadState::ReadGateBucket;
+        self.state = CompleteUploadState::ReadGateBucket;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
             key: self.input.bucket.as_bytes().into(),
@@ -764,7 +760,7 @@ impl CompleteMultipartUploadOperation {
 
     fn handle_gate_bucket(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         let bucket = match value
             .as_ref()
@@ -797,7 +793,7 @@ impl CompleteMultipartUploadOperation {
                 let effects = gate.start();
                 let complete = gate.is_complete();
                 self.gate = Some(gate);
-                self.state = CompleteMultipartUploadState::PolicyGate;
+                self.state = CompleteUploadState::PolicyGate;
                 match complete {
                     true => self.finish_gate(),
                     false => effects,
@@ -809,7 +805,7 @@ impl CompleteMultipartUploadOperation {
 
     fn handle_policy_gate(&mut self, event: Event) -> Effects {
         let Some(gate) = self.gate.as_mut() else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         let effects = gate.step(event);
         match gate.is_complete() {
@@ -820,7 +816,7 @@ impl CompleteMultipartUploadOperation {
 
     fn finish_gate(&mut self) -> Effects {
         let Some(gate) = self.gate.take() else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         let outcome = match gate.finalize() {
             Ok(outcome) => outcome,
@@ -834,7 +830,7 @@ impl CompleteMultipartUploadOperation {
 
     fn compose_blob(&mut self) -> Effects {
         let Some(upload) = self.upload_record.as_ref() else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone());
         let parts = self
@@ -842,7 +838,7 @@ impl CompleteMultipartUploadOperation {
             .iter()
             .map(|part| part.location.clone())
             .collect();
-        self.state = CompleteMultipartUploadState::ComposeBlob;
+        self.state = CompleteUploadState::ComposeBlob;
         smallvec![Effect::Blob(BlobEffect::Compose {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
@@ -858,10 +854,9 @@ impl CompleteMultipartUploadOperation {
             Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
                 self.cleanup.set_release(location.ulid);
                 self.delete_location = Some(location);
-                return self
-                    .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+                return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
             }
-            _ => return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState),
+            _ => return self.schedule_error(CompleteUploadError::InvalidOperationState),
         };
         self.composed_location = Some(location.clone());
         self.final_location = None;
@@ -873,18 +868,18 @@ impl CompleteMultipartUploadOperation {
 
         for expected in &self.input.expected_checksums {
             let Some(actual) = hashes.get(expected.algorithm.hash_key()) else {
-                return self.schedule_error(CompleteMultipartUploadError::MissingExpectedChecksum(
+                return self.schedule_error(CompleteUploadError::MissingExpectedChecksum(
                     expected.algorithm.s3_name(),
                 ));
             };
             if actual != &expected.digest {
-                return self.schedule_error(CompleteMultipartUploadError::ChecksumMismatch(
+                return self.schedule_error(CompleteUploadError::ChecksumMismatch(
                     expected.algorithm.s3_name(),
                 ));
             }
         }
 
-        self.state = CompleteMultipartUploadState::StartFinalizeTransaction;
+        self.state = CompleteUploadState::StartFinalizeTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
         })]
@@ -892,10 +887,10 @@ impl CompleteMultipartUploadOperation {
 
     fn finalize_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         self.txn_id = Some(txn_id);
-        self.state = CompleteMultipartUploadState::CheckPurgeFenceForFinalize;
+        self.state = CompleteUploadState::CheckPurgeFenceForFinalize;
         smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
     }
 
@@ -905,13 +900,13 @@ impl CompleteMultipartUploadOperation {
         }
         // The version snapshots the default this transaction observes, not one
         // read while the parts were still being uploaded.
-        self.state = CompleteMultipartUploadState::ReadBucketDefault;
+        self.state = CompleteUploadState::ReadBucketDefault;
         smallvec![drift_reads(&self.input.bucket, self.txn_id)]
     }
 
     fn handle_default_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         let (bucket, subject) = match split_drift_reads(values) {
             Ok(split) => split,
@@ -931,14 +926,13 @@ impl CompleteMultipartUploadOperation {
         self.bucket_policies = observed.policies;
 
         let Some(location) = self.composed_location.clone() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         // The compose already ran on the pinned backend, so the finalize must
         // prove it is still enabled or roll the composed object back.
         match fence_backend(&location.backend, self.txn_id) {
             Some(effect) => {
-                self.state = CompleteMultipartUploadState::FenceBackend;
+                self.state = CompleteUploadState::FenceBackend;
                 smallvec![effect]
             }
             None => self.check_hash_lookup(),
@@ -954,38 +948,34 @@ impl CompleteMultipartUploadOperation {
 
     fn check_hash_lookup(&mut self) -> Effects {
         let Some(location) = self.composed_location.clone() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteMultipartUploadError::MissingExpectedChecksum(
-                "blake3",
-            ));
+            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
         };
         // Only the copy on the upload's pinned backend may be deduplicated.
         let key = match BlobLocationKey::from_blake3(blake3_hash, location.backend.clone()) {
             Ok(key) => key,
             Err(error) => return self.schedule_error(error.into()),
         };
-        self.state = CompleteMultipartUploadState::CheckHashLookup;
+        self.state = CompleteUploadState::CheckHashLookup;
         smallvec![blob_location_read(&key, self.txn_id)]
     }
 
     fn hash_checked(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
 
         let Some(composed_location) = self.composed_location.clone() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
 
         self.final_location = match value {
             Some(value) => match BackendLocation::from_bytes(value.as_ref()) {
                 Ok(location) => Some(location),
                 Err(err) => {
-                    return self.schedule_error(CompleteMultipartUploadError::ConversionError(err));
+                    return self.schedule_error(CompleteUploadError::ConversionError(err));
                 }
             },
             None => {
@@ -999,20 +989,16 @@ impl CompleteMultipartUploadOperation {
 
     fn write_blob_location(&mut self) -> Effects {
         let Some(location) = self.final_location.clone() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteMultipartUploadError::MissingExpectedChecksum(
-                "blake3",
-            ));
+            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
         };
         let effect = match write_location_effect(
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
                 Err(err) => {
-                    return self
-                        .schedule_error(CompleteMultipartUploadError::ConversionError(err.into()));
+                    return self.schedule_error(CompleteUploadError::ConversionError(err.into()));
                 }
             },
             location,
@@ -1022,13 +1008,13 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
 
-        self.state = CompleteMultipartUploadState::WriteBlobLocation;
+        self.state = CompleteUploadState::WriteBlobLocation;
         smallvec![effect]
     }
 
     fn location_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
 
         let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
@@ -1036,7 +1022,7 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
 
-        self.state = CompleteMultipartUploadState::ReadObjectLookup;
+        self.state = CompleteUploadState::ReadObjectLookup;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             key: key.into(),
@@ -1046,7 +1032,7 @@ impl CompleteMultipartUploadOperation {
 
     fn object_lookup_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         let existing = match value
             .as_ref()
@@ -1065,7 +1051,7 @@ impl CompleteMultipartUploadOperation {
                 Ok(key) => key.into(),
                 Err(err) => return self.schedule_error(err.into()),
             };
-            self.state = CompleteMultipartUploadState::ReadLivenessVersion;
+            self.state = CompleteUploadState::ReadLivenessVersion;
             return smallvec![Effect::Storage(StorageEffect::Read {
                 key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                 key,
@@ -1077,7 +1063,7 @@ impl CompleteMultipartUploadOperation {
 
     fn liveness_read(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
 
         self.was_live = value
@@ -1103,13 +1089,13 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
 
-        self.state = CompleteMultipartUploadState::WriteBlobHead;
+        self.state = CompleteUploadState::WriteBlobHead;
         smallvec![effect]
     }
 
     fn head_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
 
         self.write_path_index()
@@ -1117,13 +1103,10 @@ impl CompleteMultipartUploadOperation {
 
     fn write_path_index(&mut self) -> Effects {
         let Some(location) = self.final_location.clone() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteMultipartUploadError::MissingExpectedChecksum(
-                "blake3",
-            ));
+            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
         };
         let alias_context = match self.alias_context() {
             Ok(context) => context,
@@ -1134,16 +1117,13 @@ impl CompleteMultipartUploadOperation {
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
                 Err(err) => {
-                    return self
-                        .schedule_error(CompleteMultipartUploadError::ConversionError(err.into()));
+                    return self.schedule_error(CompleteUploadError::ConversionError(err.into()));
                 }
             },
             match self.version_id {
                 Some(version_id) => version_id,
                 None => {
-                    return self.schedule_error(
-                        CompleteMultipartUploadError::CompleteMultipartUploadFailed,
-                    );
+                    return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
                 }
             },
             self.txn_id,
@@ -1152,42 +1132,36 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
 
-        self.state = CompleteMultipartUploadState::WriteHashPathIndex;
+        self.state = CompleteUploadState::WriteHashPathIndex;
         smallvec![effect]
     }
 
     fn path_index_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
 
         let Some(location) = self.final_location.clone() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let Some(version_id) = self.version_id else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let Some(blake3_hash) = location.get_blake3() else {
-            return self.schedule_error(CompleteMultipartUploadError::MissingExpectedChecksum(
-                "blake3",
-            ));
+            return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
         };
         let created_at = self
             .version_created_at
             .get_or_insert_with(SystemTime::now)
             .to_owned();
         let Some(upload_record) = self.upload_record.as_ref() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let version = BlobVersion::materialized(
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
                 Err(err) => {
-                    return self
-                        .schedule_error(CompleteMultipartUploadError::ConversionError(err.into()));
+                    return self.schedule_error(CompleteUploadError::ConversionError(err.into()));
                 }
             },
             location.backend.clone(),
@@ -1211,13 +1185,13 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
 
-        self.state = CompleteMultipartUploadState::WriteBlobVersionRecord;
+        self.state = CompleteUploadState::WriteBlobVersionRecord;
         smallvec![effect]
     }
 
     fn version_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
 
         self.register_managed_copy()
@@ -1228,8 +1202,7 @@ impl CompleteMultipartUploadOperation {
     fn register_managed_copy(&mut self) -> Effects {
         let (Some(version_id), Some(location)) = (self.version_id, self.final_location.clone())
         else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let effect = match register_effect(
             CopyRegistration {
@@ -1246,18 +1219,17 @@ impl CompleteMultipartUploadOperation {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
         };
-        self.state = CompleteMultipartUploadState::RegisterManagedCopy;
+        self.state = CompleteUploadState::RegisterManagedCopy;
         smallvec![effect]
     }
 
     fn handle_copy_registered(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
 
         let Some(version_id) = self.version_id else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let mut writes = Vec::with_capacity(self.resolved_parts.len() + 1);
 
@@ -1266,7 +1238,7 @@ impl CompleteMultipartUploadOperation {
             part_count: self.resolved_parts.len(),
             composite_hashes: self.composite_hashes.clone(),
         };
-        let summary_key = match MultipartObjectMetadataKey::summary(version_id).to_bytes() {
+        let summary_key = match MultipartObjectKey::summary(version_id).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.schedule_error(err.into()),
         };
@@ -1286,11 +1258,10 @@ impl CompleteMultipartUploadOperation {
                 size: record.location.blob_size,
                 hashes: record.location.hashes.clone(),
             };
-            let key =
-                match MultipartObjectMetadataKey::part(version_id, record.part_number).to_bytes() {
-                    Ok(key) => key,
-                    Err(err) => return self.schedule_error(err.into()),
-                };
+            let key = match MultipartObjectKey::part(version_id, record.part_number).to_bytes() {
+                Ok(key) => key,
+                Err(err) => return self.schedule_error(err.into()),
+            };
             let value = match object_part.to_bytes() {
                 Ok(value) => value,
                 Err(err) => return self.schedule_error(err.into()),
@@ -1302,7 +1273,7 @@ impl CompleteMultipartUploadOperation {
             ));
         }
 
-        self.state = CompleteMultipartUploadState::WriteObjectMetadata;
+        self.state = CompleteUploadState::WriteObjectMetadata;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: self.txn_id,
@@ -1311,7 +1282,7 @@ impl CompleteMultipartUploadOperation {
 
     fn metadata_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         self.delete_upload_records()
     }
@@ -1322,13 +1293,13 @@ impl CompleteMultipartUploadOperation {
                 Ok(effect) => effect,
                 Err(err) => return self.schedule_error(err.into()),
             };
-        self.state = CompleteMultipartUploadState::DeleteUploadRecords;
+        self.state = CompleteUploadState::DeleteUploadRecords;
         smallvec![effect]
     }
 
     fn records_deleted(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         self.write_cleanup_records()
     }
@@ -1398,7 +1369,7 @@ impl CompleteMultipartUploadOperation {
             writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
         }
 
-        self.state = CompleteMultipartUploadState::WriteCleanupRecords;
+        self.state = CompleteUploadState::WriteCleanupRecords;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
             txn_id: self.txn_id,
@@ -1407,15 +1378,14 @@ impl CompleteMultipartUploadOperation {
 
     fn handle_cleanup_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         self.write_obligation()
     }
 
     fn write_obligation(&mut self) -> Effects {
         let Some(version_id) = self.version_id else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let effect = match build_live_obligation(
             self.input.node_id,
@@ -1434,28 +1404,26 @@ impl CompleteMultipartUploadOperation {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
         };
-        self.state = CompleteMultipartUploadState::WriteLiveReplicationObligation;
+        self.state = CompleteUploadState::WriteLiveReplicationObligation;
         smallvec![effect]
     }
 
     fn obligation_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         let Some(txn_id) = self.txn_id else {
-            return self.schedule_error(CompleteMultipartUploadError::NoTransactionFound);
+            return self.schedule_error(CompleteUploadError::NoTransactionFound);
         };
         let Some(group_id) = self.upload_record.as_ref().map(|record| record.group_id) else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let Some(size) = self
             .final_location
             .as_ref()
             .map(|location| i128::from(location.blob_size))
         else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
 
         let group_delta = UsageDelta {
@@ -1468,8 +1436,7 @@ impl CompleteMultipartUploadOperation {
             .as_ref()
             .and_then(|location| StoredDelta::for_location(location, self.new_blob));
         let Some(stored) = stored else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         self.usage_update = Some(UsageCounterUpdate::with_stored(
             group_id,
@@ -1494,7 +1461,7 @@ impl CompleteMultipartUploadOperation {
                 self.input.node_id,
                 self.input.realm_id,
             );
-            self.state = CompleteMultipartUploadState::EnforceQuota;
+            self.state = CompleteUploadState::EnforceQuota;
             let effects = gate.start(txn_id);
             self.quota_gate = Some(gate);
             effects
@@ -1504,22 +1471,19 @@ impl CompleteMultipartUploadOperation {
     }
 
     fn start_usage_update(&mut self, txn_id: TxnId) -> Effects {
-        self.state = CompleteMultipartUploadState::UpdateUsage;
+        self.state = CompleteUploadState::UpdateUsage;
         match self.usage_update.as_mut() {
             Some(update) => update.start(txn_id),
-            None => {
-                self.schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed)
-            }
+            None => self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed),
         }
     }
 
     fn handle_enforce_quota(&mut self, event: Event) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.schedule_error(CompleteMultipartUploadError::NoTransactionFound);
+            return self.schedule_error(CompleteUploadError::NoTransactionFound);
         };
         let Some(gate) = self.quota_gate.as_mut() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         match gate.step(event, txn_id) {
             Ok(Some(effects)) => effects,
@@ -1529,10 +1493,7 @@ impl CompleteMultipartUploadOperation {
                     let usage = gate.projected_usage();
                     // schedule_error resets the upload back to Open and cleans up
                     // the composed blob, mirroring every other finalize-phase error.
-                    self.schedule_error(CompleteMultipartUploadError::QuotaExceeded {
-                        limit,
-                        usage,
-                    })
+                    self.schedule_error(CompleteUploadError::QuotaExceeded { limit, usage })
                 } else {
                     self.start_usage_update(txn_id)
                 }
@@ -1543,16 +1504,15 @@ impl CompleteMultipartUploadOperation {
 
     fn handle_usage_update(&mut self, event: Event) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.schedule_error(CompleteMultipartUploadError::NoTransactionFound);
+            return self.schedule_error(CompleteUploadError::NoTransactionFound);
         };
         let Some(update) = self.usage_update.as_mut() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.schedule_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         match update.step(event, txn_id) {
             Ok(Some(effects)) => effects,
             Ok(None) => {
-                self.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+                self.state = CompleteUploadState::CommitFinalizeTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             Err(err) => self.schedule_error(err.into()),
@@ -1564,7 +1524,7 @@ impl CompleteMultipartUploadOperation {
     /// out of reach of `abort`, where the committed location row decides its fate.
     fn handle_finalize_failure(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::Error { error }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         if matches!(error, StorageError::TransactionConflict) {
             self.txn_id = None;
@@ -1594,16 +1554,16 @@ impl CompleteMultipartUploadOperation {
         self.reset_done = true;
         let release_id = self.composed_location.take().map(|location| location.ulid);
         let Some(location) = self.final_location.clone() else {
-            return self.emit_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.emit_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let Some(version_id) = self.version_id else {
-            return self.emit_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+            return self.emit_error(CompleteUploadError::CompleteMultipartUploadFailed);
         };
         let response_hashes = match self.input.checksum_type {
             MultipartChecksumType::FullObject => location.hashes.clone(),
             MultipartChecksumType::Composite => self.composite_hashes.clone(),
         };
-        self.output = Some(Ok(CompleteMultipartUploadResult {
+        self.output = Some(Ok(CompleteUploadResult {
             location,
             version_id,
             checksum_type: self.input.checksum_type,
@@ -1612,7 +1572,7 @@ impl CompleteMultipartUploadOperation {
         }));
         if let Some(id) = release_id {
             self.cleanup.set_release(id);
-            self.state = CompleteMultipartUploadState::ReleaseReservation;
+            self.state = CompleteUploadState::ReleaseReservation;
             smallvec![Effect::Blob(BlobEffect::ReleaseReservation { id })]
         } else {
             self.finish_commit()
@@ -1624,12 +1584,11 @@ impl CompleteMultipartUploadOperation {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
             Event::Storage(StorageEvent::Error { .. }) => return self.reset_failed(None),
             _ => {
-                return self
-                    .reset_failed(Some(CompleteMultipartUploadError::InvalidOperationState));
+                return self.reset_failed(Some(CompleteUploadError::InvalidOperationState));
             }
         };
         self.txn_id = Some(txn_id);
-        self.state = CompleteMultipartUploadState::ReadUploadForReset;
+        self.state = CompleteUploadState::ReadUploadForReset;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             key: self.input.upload_id.to_bytes().to_vec().into(),
@@ -1642,8 +1601,7 @@ impl CompleteMultipartUploadOperation {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
             Event::Storage(StorageEvent::Error { .. }) => return self.reset_failed(None),
             _ => {
-                return self
-                    .reset_failed(Some(CompleteMultipartUploadError::InvalidOperationState));
+                return self.reset_failed(Some(CompleteUploadError::InvalidOperationState));
             }
         };
         if let Some(value) = value {
@@ -1663,7 +1621,7 @@ impl CompleteMultipartUploadOperation {
                 Ok(bytes) => bytes,
                 Err(err) => return self.reset_failed(Some(err.into())),
             };
-            self.state = CompleteMultipartUploadState::WriteUploadReset;
+            self.state = CompleteUploadState::WriteUploadReset;
             return smallvec![Effect::Storage(StorageEffect::Write {
                 key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
                 key: self.input.upload_id.to_bytes().to_vec().into(),
@@ -1680,14 +1638,13 @@ impl CompleteMultipartUploadOperation {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             Event::Storage(StorageEvent::Error { .. }) => return self.reset_failed(None),
             _ => {
-                return self
-                    .reset_failed(Some(CompleteMultipartUploadError::InvalidOperationState));
+                return self.reset_failed(Some(CompleteUploadError::InvalidOperationState));
             }
         };
         let Some(txn_id) = self.txn_id else {
-            return self.reset_failed(Some(CompleteMultipartUploadError::NoTransactionFound));
+            return self.reset_failed(Some(CompleteUploadError::NoTransactionFound));
         };
-        self.state = CompleteMultipartUploadState::CommitResetTransaction;
+        self.state = CompleteUploadState::CommitResetTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -1707,19 +1664,18 @@ impl CompleteMultipartUploadOperation {
                 return self.reset_failed(None);
             }
             _ => {
-                return self
-                    .reset_failed(Some(CompleteMultipartUploadError::InvalidOperationState));
+                return self.reset_failed(Some(CompleteUploadError::InvalidOperationState));
             }
         };
         self.txn_id = None;
         self.rollback_composed_blob()
     }
 
-    fn reset_failed(&mut self, error: Option<CompleteMultipartUploadError>) -> Effects {
+    fn reset_failed(&mut self, error: Option<CompleteUploadError>) -> Effects {
         if let Some(error) = error {
             self.cleanup.set_error(error);
         }
-        self.state = CompleteMultipartUploadState::CleanupFailedCompose;
+        self.state = CompleteUploadState::CleanupFailedCompose;
         if let Some(txn_id) = self.txn_id.take() {
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
@@ -1743,7 +1699,7 @@ impl CompleteMultipartUploadOperation {
             // The composed object is still on the backend and this operation is
             // over; only a queued delete can still reach it.
             Event::Blob(BlobEvent::Error(_)) => self.queue_rollback_delete(),
-            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
+            _ => self.emit_error(CompleteUploadError::InvalidOperationState),
         }
     }
 
@@ -1755,9 +1711,9 @@ impl CompleteMultipartUploadOperation {
     }
 }
 
-impl Operation for CompleteMultipartUploadOperation {
-    type Output = CompleteMultipartUploadResult;
-    type Error = CompleteMultipartUploadError;
+impl Operation for CompleteUploadOperation {
+    type Output = CompleteUploadResult;
+    type Error = CompleteUploadError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -1765,72 +1721,62 @@ impl Operation for CompleteMultipartUploadOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            CompleteMultipartUploadState::Init => self.handle_init(),
-            CompleteMultipartUploadState::StartMarkTransaction => self.mark_started(event),
-            CompleteMultipartUploadState::CheckPurgeFenceForMark => self.mark_fence_checked(event),
-            CompleteMultipartUploadState::ReadUploadForMark => self.mark_upload_read(event),
-            CompleteMultipartUploadState::WriteUploadCompleting => self.handle_upload_marked(event),
-            CompleteMultipartUploadState::CommitMarkTransaction => {
-                self.handle_mark_committed(event)
-            }
-            CompleteMultipartUploadState::ReadUploadParts => self.upload_parts_read(event),
-            CompleteMultipartUploadState::ReadGateBucket => self.handle_gate_bucket(event),
-            CompleteMultipartUploadState::PolicyGate => self.handle_policy_gate(event),
-            CompleteMultipartUploadState::ComposeBlob => self.handle_blob_composed(event),
-            CompleteMultipartUploadState::StartFinalizeTransaction => self.finalize_started(event),
-            CompleteMultipartUploadState::CheckPurgeFenceForFinalize => {
-                self.finalize_fence_checked(event)
-            }
-            CompleteMultipartUploadState::ReadBucketDefault => self.handle_default_read(event),
-            CompleteMultipartUploadState::FenceBackend => self.handle_backend_fenced(event),
-            CompleteMultipartUploadState::CheckHashLookup => self.hash_checked(event),
-            CompleteMultipartUploadState::WriteBlobLocation => self.location_written(event),
-            CompleteMultipartUploadState::ReadObjectLookup => self.object_lookup_read(event),
-            CompleteMultipartUploadState::ReadLivenessVersion => self.liveness_read(event),
-            CompleteMultipartUploadState::WriteBlobHead => self.head_written(event),
-            CompleteMultipartUploadState::WriteHashPathIndex => self.path_index_written(event),
-            CompleteMultipartUploadState::WriteBlobVersionRecord => self.version_written(event),
-            CompleteMultipartUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
-            CompleteMultipartUploadState::WriteObjectMetadata => self.metadata_written(event),
-            CompleteMultipartUploadState::DeleteUploadRecords => self.records_deleted(event),
-            CompleteMultipartUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
-            CompleteMultipartUploadState::WriteLiveReplicationObligation => {
-                self.obligation_written(event)
-            }
-            CompleteMultipartUploadState::EnforceQuota => self.handle_enforce_quota(event),
-            CompleteMultipartUploadState::UpdateUsage => self.handle_usage_update(event),
-            CompleteMultipartUploadState::CommitFinalizeTransaction => {
-                self.handle_finalize_committed(event)
-            }
-            CompleteMultipartUploadState::AbortFinalizeTransaction => self.abort_finalize(event),
-            CompleteMultipartUploadState::ResetUploadTransaction => self.reset_started(event),
-            CompleteMultipartUploadState::ReadUploadForReset => self.reset_upload_read(event),
-            CompleteMultipartUploadState::WriteUploadReset => self.upload_reset(event),
-            CompleteMultipartUploadState::CommitResetTransaction => {
-                self.handle_reset_committed(event)
-            }
-            CompleteMultipartUploadState::CleanupFailedCompose => self.compose_cleanup(event),
-            CompleteMultipartUploadState::QueueCleanupRow => self.handle_cleanup_queued(event),
-            CompleteMultipartUploadState::ReleaseReservation => self.handle_release(event),
-            CompleteMultipartUploadState::Finish => smallvec![],
-            CompleteMultipartUploadState::Error => self.abort(),
+            CompleteUploadState::Init => self.handle_init(),
+            CompleteUploadState::StartMarkTransaction => self.mark_started(event),
+            CompleteUploadState::CheckPurgeFenceForMark => self.mark_fence_checked(event),
+            CompleteUploadState::ReadUploadForMark => self.mark_upload_read(event),
+            CompleteUploadState::WriteUploadCompleting => self.handle_upload_marked(event),
+            CompleteUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
+            CompleteUploadState::ReadUploadParts => self.upload_parts_read(event),
+            CompleteUploadState::ReadGateBucket => self.handle_gate_bucket(event),
+            CompleteUploadState::PolicyGate => self.handle_policy_gate(event),
+            CompleteUploadState::ComposeBlob => self.handle_blob_composed(event),
+            CompleteUploadState::StartFinalizeTransaction => self.finalize_started(event),
+            CompleteUploadState::CheckPurgeFenceForFinalize => self.finalize_fence_checked(event),
+            CompleteUploadState::ReadBucketDefault => self.handle_default_read(event),
+            CompleteUploadState::FenceBackend => self.handle_backend_fenced(event),
+            CompleteUploadState::CheckHashLookup => self.hash_checked(event),
+            CompleteUploadState::WriteBlobLocation => self.location_written(event),
+            CompleteUploadState::ReadObjectLookup => self.object_lookup_read(event),
+            CompleteUploadState::ReadLivenessVersion => self.liveness_read(event),
+            CompleteUploadState::WriteBlobHead => self.head_written(event),
+            CompleteUploadState::WriteHashPathIndex => self.path_index_written(event),
+            CompleteUploadState::WriteBlobVersionRecord => self.version_written(event),
+            CompleteUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
+            CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
+            CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
+            CompleteUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
+            CompleteUploadState::WriteLiveReplicationObligation => self.obligation_written(event),
+            CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),
+            CompleteUploadState::UpdateUsage => self.handle_usage_update(event),
+            CompleteUploadState::CommitFinalizeTransaction => self.handle_finalize_committed(event),
+            CompleteUploadState::AbortFinalizeTransaction => self.abort_finalize(event),
+            CompleteUploadState::ResetUploadTransaction => self.reset_started(event),
+            CompleteUploadState::ReadUploadForReset => self.reset_upload_read(event),
+            CompleteUploadState::WriteUploadReset => self.upload_reset(event),
+            CompleteUploadState::CommitResetTransaction => self.handle_reset_committed(event),
+            CompleteUploadState::CleanupFailedCompose => self.compose_cleanup(event),
+            CompleteUploadState::QueueCleanupRow => self.handle_cleanup_queued(event),
+            CompleteUploadState::ReleaseReservation => self.handle_release(event),
+            CompleteUploadState::Finish => smallvec![],
+            CompleteUploadState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            CompleteMultipartUploadState::Finish | CompleteMultipartUploadState::Error
+            CompleteUploadState::Finish | CompleteUploadState::Error
         )
     }
 
     fn expected_error(error: &Self::Error) -> bool {
         matches!(
             error,
-            CompleteMultipartUploadError::NoSuchUpload
-                | CompleteMultipartUploadError::UploadTargetMismatch
-                | CompleteMultipartUploadError::UploadNotOpen
-                | CompleteMultipartUploadError::CompletionInProgress
+            CompleteUploadError::NoSuchUpload
+                | CompleteUploadError::UploadTargetMismatch
+                | CompleteUploadError::UploadNotOpen
+                | CompleteUploadError::CompletionInProgress
         )
     }
 
@@ -1844,7 +1790,7 @@ impl Operation for CompleteMultipartUploadOperation {
         match self.output {
             Some(Ok(value)) => Ok(value),
             Some(Err(error)) => Err(error),
-            None => Err(CompleteMultipartUploadError::NotFinished),
+            None => Err(CompleteUploadError::NotFinished),
         }
     }
 
@@ -1855,21 +1801,21 @@ impl Operation for CompleteMultipartUploadOperation {
         if let Some(txn_id) = self.txn_id.take() {
             if matches!(
                 self.state,
-                CompleteMultipartUploadState::CommitFinalizeTransaction
-                    | CompleteMultipartUploadState::CommitResetTransaction
+                CompleteUploadState::CommitFinalizeTransaction
+                    | CompleteUploadState::CommitResetTransaction
             ) {
                 self.preserve_blob();
             }
-            if self.state != CompleteMultipartUploadState::Error
+            if self.state != CompleteUploadState::Error
                 || self.has_cleanup()
                 || self.cleanup.release_id().is_some()
             {
-                self.state = CompleteMultipartUploadState::CleanupFailedCompose;
+                self.state = CompleteUploadState::CleanupFailedCompose;
             }
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
         if let Some(effect) = self.cleanup.retry(&StorageError::Timeout) {
-            self.state = CompleteMultipartUploadState::QueueCleanupRow;
+            self.state = CompleteUploadState::QueueCleanupRow;
             return smallvec![effect];
         }
         // A deadline that fires between the mark and the finalize leaves the
@@ -1878,14 +1824,12 @@ impl Operation for CompleteMultipartUploadOperation {
             return self.continue_error_cleanup();
         }
         if let Some(effect) = self.cleanup.release_effect() {
-            self.state = CompleteMultipartUploadState::ReleaseReservation;
+            self.state = CompleteUploadState::ReleaseReservation;
             return smallvec![effect];
         }
-        self.state = CompleteMultipartUploadState::Error;
+        self.state = CompleteUploadState::Error;
         if !matches!(self.output.as_ref(), Some(Err(_))) {
-            self.output = Some(Err(
-                CompleteMultipartUploadError::CompleteMultipartUploadFailed,
-            ));
+            self.output = Some(Err(CompleteUploadError::CompleteMultipartUploadFailed));
         }
         smallvec![]
     }
@@ -1893,15 +1837,15 @@ impl Operation for CompleteMultipartUploadOperation {
 
 fn validate_requested_part(
     requested: &CompleteMultipartPart,
-    record: &MultipartUploadPart,
+    record: &MultipartPart,
     required_checksum_algorithm: Option<ChecksumAlgorithm>,
-) -> Result<(), CompleteMultipartUploadError> {
+) -> Result<(), CompleteUploadError> {
     if let Some(etag) = &requested.etag {
         let Some(md5) = record.location.hashes.get(HASH_MD5) else {
-            return Err(CompleteMultipartUploadError::MissingPartEtag);
+            return Err(CompleteUploadError::MissingPartEtag);
         };
         if hex::encode(md5) != *etag {
-            return Err(CompleteMultipartUploadError::PartEtagMismatch);
+            return Err(CompleteUploadError::PartEtagMismatch);
         }
     }
 
@@ -1911,17 +1855,17 @@ fn validate_requested_part(
             .iter()
             .any(|expected| expected.algorithm == algorithm)
     {
-        return Err(CompleteMultipartUploadError::ChecksumContractMismatch);
+        return Err(CompleteUploadError::ChecksumContractMismatch);
     }
 
     for expected in &requested.expected_checksums {
         let Some(actual) = record.location.hashes.get(expected.algorithm.hash_key()) else {
-            return Err(CompleteMultipartUploadError::MissingExpectedChecksum(
+            return Err(CompleteUploadError::MissingExpectedChecksum(
                 expected.algorithm.s3_name(),
             ));
         };
         if actual != &expected.digest {
-            return Err(CompleteMultipartUploadError::ChecksumMismatch(
+            return Err(CompleteUploadError::ChecksumMismatch(
                 expected.algorithm.s3_name(),
             ));
         }
@@ -1931,8 +1875,8 @@ fn validate_requested_part(
 }
 
 fn compute_composite_hashes(
-    parts: &[MultipartUploadPart],
-) -> Result<HashMap<String, Vec<u8>>, CompleteMultipartUploadError> {
+    parts: &[MultipartPart],
+) -> Result<HashMap<String, Vec<u8>>, CompleteUploadError> {
     let mut hashes = HashMap::new();
     for algorithm in [
         ChecksumAlgorithm::Md5,
@@ -1945,7 +1889,7 @@ fn compute_composite_hashes(
         let mut combined = Vec::new();
         for part in parts {
             let Some(digest) = part.location.hashes.get(algorithm.hash_key()) else {
-                return Err(CompleteMultipartUploadError::MissingExpectedChecksum(
+                return Err(CompleteUploadError::MissingExpectedChecksum(
                     algorithm.s3_name(),
                 ));
             };
@@ -1971,6 +1915,7 @@ fn composite_digest(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[path = "complete_tests.rs"]
 mod pure_tests;
 
 #[cfg(test)]
@@ -1979,8 +1924,8 @@ mod decision_tests {
     use super::*;
     use crate::placement::policy::PolicyCacheEntry;
     use aruna_core::structs::{
-        BackendRef, MultipartUploadChecksumHint, PlacementPolicy, PlacementSelector,
-        PlacementSubject, VerifiedPolicy,
+        BackendRef, MultipartChecksumHint, PlacementPolicy, PlacementSelector, PlacementSubject,
+        VerifiedPolicy,
     };
     use aruna_core::types::Value;
     use std::collections::BTreeMap;
@@ -2024,9 +1969,9 @@ mod decision_tests {
         }
     }
 
-    fn input() -> CompleteMultipartUploadInput {
+    fn input() -> CompleteUploadInput {
         let realm_id = realm();
-        CompleteMultipartUploadInput {
+        CompleteUploadInput {
             bucket: "bucket".to_string(),
             key: "object".to_string(),
             upload_id: Ulid::from_parts(1, 1),
@@ -2044,7 +1989,7 @@ mod decision_tests {
         }
     }
 
-    fn upload(input: &CompleteMultipartUploadInput) -> MultipartUpload {
+    fn upload(input: &CompleteUploadInput) -> MultipartUpload {
         MultipartUpload {
             upload_id: input.upload_id,
             backend: BackendRef::node_default(),
@@ -2055,7 +2000,7 @@ mod decision_tests {
             created_by: input.created_by,
             created_at: std::time::SystemTime::UNIX_EPOCH,
             status: MultipartUploadStatus::Open,
-            checksum_hint: None::<MultipartUploadChecksumHint>,
+            checksum_hint: None::<MultipartChecksumHint>,
             metadata: HashMap::new(),
             placement_policies: Vec::new(),
             subject_generation: 0,
@@ -2085,15 +2030,15 @@ mod decision_tests {
 
     /// `location` of `None` leaves the node without a subject, which fails
     /// every governed completion closed.
-    fn at_gate(location: Option<&str>) -> CompleteMultipartUploadOperation {
+    fn at_gate(location: Option<&str>) -> CompleteUploadOperation {
         let input = input();
         let record = upload(&input);
-        let mut operation = CompleteMultipartUploadOperation::new(input);
+        let mut operation = CompleteUploadOperation::new(input);
         if let Some(location) = location {
             operation = operation.with_gate(gate(location));
         }
         operation.upload_record = Some(record);
-        operation.state = CompleteMultipartUploadState::ReadGateBucket;
+        operation.state = CompleteUploadState::ReadGateBucket;
         operation
     }
 
@@ -2111,21 +2056,19 @@ mod decision_tests {
         let effects = operation.step(read(Some(bucket(vec![rule.policy_ref()], 1))));
         assert!(!composes(&effects));
 
-        let document = crate::tests::fixtures::policy::signed_document(realm(), &rule, 9);
+        let document = crate::tests::policy::signed_document(realm(), &rule, 9);
         let cached = PolicyCacheEntry::verified(&document, 10)
             .to_bytes()
             .expect("entry encodes");
         operation.step(read(Some(cached.into())));
-        let effects = operation.step(crate::tests::fixtures::policy::authority(realm()));
+        let effects = operation.step(crate::tests::policy::authority(realm()));
 
         assert!(!composes(&effects));
         assert_eq!(
             operation.cleanup.take_error(),
-            Some(CompleteMultipartUploadError::PolicyGate(
-                PolicyGateError::Denied {
-                    policy_ids: vec![rule.policy().policy_id]
-                }
-            ))
+            Some(CompleteUploadError::PolicyGate(PolicyGateError::Denied {
+                policy_ids: vec![rule.policy().policy_id]
+            }))
         );
     }
 
@@ -2143,7 +2086,7 @@ mod decision_tests {
         assert!(!composes(&effects));
         assert!(matches!(
             operation.cleanup.take_error(),
-            Some(CompleteMultipartUploadError::PolicyGate(
+            Some(CompleteUploadError::PolicyGate(
                 PolicyGateError::Unavailable { .. }
             ))
         ));
@@ -2163,9 +2106,7 @@ mod decision_tests {
         assert!(!composes(&effects));
         assert_eq!(
             operation.cleanup.take_error(),
-            Some(CompleteMultipartUploadError::PolicyGate(
-                PolicyGateError::NoSubject
-            ))
+            Some(CompleteUploadError::PolicyGate(PolicyGateError::NoSubject))
         );
     }
 
@@ -2185,7 +2126,7 @@ mod decision_tests {
         operation.step(read(Some(bucket(Vec::new(), 0))));
         operation.composed_location = Some(composed());
         operation.txn_id = Some(Ulid::from_bytes([7u8; 16]));
-        operation.state = CompleteMultipartUploadState::ReadBucketDefault;
+        operation.state = CompleteUploadState::ReadBucketDefault;
 
         operation.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![
@@ -2199,9 +2140,7 @@ mod decision_tests {
 
         assert_eq!(
             operation.cleanup.take_error(),
-            Some(CompleteMultipartUploadError::PolicyGate(
-                PolicyGateError::Drift
-            ))
+            Some(CompleteUploadError::PolicyGate(PolicyGateError::Drift))
         );
     }
 
