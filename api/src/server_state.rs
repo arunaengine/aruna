@@ -11,25 +11,23 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::API_STATE_KEYSPACE;
 use aruna_core::metrics::NodeMetrics;
-use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
+use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::structs::{
     Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId, RoCrateLimits,
 };
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, IssuerKeyCache, realm_token_revoked,
+    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_token_revoked,
 };
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::onboarding::issue_ticket::{
-    IssueOnboardingSyncTicketInput, IssueOnboardingSyncTicketOperation,
-    ONBOARDING_SYNC_TICKET_TTL_SECS,
+    IssueSyncInput, IssueSyncOperation, ONBOARDING_SYNC_TICKET_TTL_SECS,
 };
 use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    ClaimInitialRealmAdminResult,
+    ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use async_trait::async_trait;
 use byteview::ByteView;
 use ed25519_dalek::Signer;
@@ -96,7 +94,7 @@ impl IdentityState {
         &self,
         driver_ctx: &DriverContext,
         auth: &AuthContext,
-    ) -> Result<(), ClaimInitialRealmAdminError> {
+    ) -> Result<(), ClaimInitialError> {
         let Some(initial_admin_claim) = &self.initial_admin_claim else {
             return Ok(());
         };
@@ -111,7 +109,7 @@ impl IdentityState {
 
         for _ in 0..3 {
             let result = drive(
-                ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                ClaimInitialOperation::new(ClaimInitialInput {
                     actor: Actor {
                         node_id: self.node_id,
                         user_id: auth.user_id,
@@ -123,15 +121,12 @@ impl IdentityState {
             .await;
 
             match result {
-                Ok(ClaimInitialRealmAdminResult::Claimed(_))
-                | Ok(ClaimInitialRealmAdminResult::AlreadyClaimed) => {
+                Ok(ClaimInitialResult::Claimed(_)) | Ok(ClaimInitialResult::AlreadyClaimed) => {
                     initial_admin_claim.store(true, Ordering::Release);
                     self.persist_admin_claim(driver_ctx).await;
                     return Ok(());
                 }
-                Err(ClaimInitialRealmAdminError::StorageError(
-                    StorageError::TransactionConflict,
-                )) => {
+                Err(ClaimInitialError::StorageError(StorageError::TransactionConflict)) => {
                     if initial_admin_claim.load(Ordering::Acquire) {
                         return Ok(());
                     }
@@ -141,7 +136,7 @@ impl IdentityState {
             }
         }
 
-        Err(ClaimInitialRealmAdminError::StorageError(
+        Err(ClaimInitialError::StorageError(
             StorageError::TransactionConflict,
         ))
     }
@@ -564,7 +559,7 @@ impl ServerState {
         selector: &OidcTokenSelector,
     ) -> Result<OidcProviderConfig, OidcError> {
         let config = drive(
-            GetRealmConfigOperation::new(self.identity.realm_id),
+            GetConfigOperation::new(self.identity.realm_id),
             &self.driver_ctx,
         )
         .await
@@ -640,12 +635,12 @@ impl ServerState {
     pub async fn issue_sync_ticket(
         &self,
         node_id: NodeId,
-    ) -> Result<OnboardingSyncTicket, OnboardingSecretError> {
+    ) -> Result<OnboardingTicket, OnboardingSecretError> {
         match &self.identity.node_capabilities {
             NodeCapabilities::Management {
                 realm_signing_key, ..
             } => drive(
-                IssueOnboardingSyncTicketOperation::new(IssueOnboardingSyncTicketInput {
+                IssueSyncOperation::new(IssueSyncInput {
                     realm_signing_key: realm_signing_key.clone(),
                     realm_id: self.identity.realm_id,
                     node_id,
@@ -680,10 +675,7 @@ impl ServerState {
             .is_some()
     }
 
-    pub async fn claim_initial_admin(
-        &self,
-        auth: &AuthContext,
-    ) -> Result<(), ClaimInitialRealmAdminError> {
+    pub async fn claim_initial_admin(&self, auth: &AuthContext) -> Result<(), ClaimInitialError> {
         self.identity
             .claim_initial_admin(self.driver_ctx.as_ref(), auth)
             .await
@@ -691,12 +683,12 @@ impl ServerState {
 }
 
 #[async_trait]
-impl ArunaBearerTokenValidationState for ServerState {
+impl ArunaValidationState for ServerState {
     async fn is_token_revoked(
         &self,
         realm_id: &RealmId,
         token_hash: &str,
-    ) -> Result<bool, ArunaBearerTokenError> {
+    ) -> Result<bool, ArunaBearerError> {
         // The issuing realm's replicated config is the only revocation
         // authority; it is expiry-bounded, so the durable set stays limited.
         realm_token_revoked(&self.driver_ctx.storage_handle, *realm_id, token_hash).await
@@ -713,7 +705,7 @@ impl ArunaBearerTokenValidationState for ServerState {
     async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+    ) -> Result<DecodingKey, ArunaBearerError> {
         self.identity.issuer_keys.get_or_insert(issuer_pubkey).await
     }
 }
@@ -835,4 +827,5 @@ fn host_for_ip(ip: std::net::IpAddr) -> String {
 }
 
 #[cfg(test)]
+#[path = "server_state_tests.rs"]
 mod pure_tests;
