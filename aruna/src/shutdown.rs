@@ -10,7 +10,7 @@ use aruna_api::error::ServerSetupError;
 use aruna_api::monitoring::{MonitoringState, Readiness};
 use aruna_blob::blob::BlobHandle;
 use aruna_core::shutdown::Shutdown;
-use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle};
+use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle, NetShutdownOutcome};
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
@@ -125,8 +125,58 @@ pub struct NodeShutdown {
     pub grace: Duration,
 }
 
+/// What the ordered sequence accomplished. A `false` phase flag or a retained
+/// persistence failure means an owner or an uncertain commit remains: the
+/// process result must not report a clean stop, and no wipe may claim success.
+#[derive(Debug, Default)]
+pub struct ShutdownOutcome {
+    /// Ingress had to be aborted instead of finishing within its slice; every
+    /// server and connection child was still released before the sequence
+    /// continued.
+    pub ingress_forced: bool,
+    /// Timer handlers finished without a forced stop or lost acknowledgement.
+    pub tasks_drained: bool,
+    /// Every job attempt wound down on its own; no lease was handed back.
+    pub jobs_drained: bool,
+    /// Tracked background children completed before their drain deadline.
+    pub background_drained: bool,
+    /// The last network attempt's details, when the phase returned a result.
+    pub net: Option<NetShutdownOutcome>,
+    /// The network phase returned within its slice and joined every child; a
+    /// phase dropped by its budget leaves this false without a result.
+    pub net_complete: bool,
+    /// Metadata persistence flushed successfully.
+    pub metadata_flushed: bool,
+    /// Blob writes drained before their deadline.
+    pub blob_drained: bool,
+    /// Accepted storage mutations drained; `false` means they were fenced
+    /// before the final sync, so their commit is uncertain.
+    pub storage_drained: bool,
+    /// The final storage sync succeeded.
+    pub storage_synced: bool,
+    /// Writes rejected after the storage close.
+    pub rejected_writes: u64,
+    /// Blob writes rejected after the blob close.
+    pub blob_rejected_writes: u64,
+}
+
+impl ShutdownOutcome {
+    /// True only when every phase released its owners and every persistence
+    /// step reported success. This is the admission gate for a wipe.
+    pub fn complete(&self) -> bool {
+        self.tasks_drained
+            && self.jobs_drained
+            && self.background_drained
+            && self.net_complete
+            && self.metadata_flushed
+            && self.blob_drained
+            && self.storage_drained
+            && self.storage_synced
+    }
+}
+
 impl NodeShutdown {
-    pub async fn run(self) {
+    pub async fn run(self) -> ShutdownOutcome {
         let started = Instant::now();
         let watchdog = ForceExitWatchdog::arm(self.grace + WATCHDOG_MARGIN);
         let budget = Budget::new(started, self.grace);
@@ -148,15 +198,15 @@ impl NodeShutdown {
                 let _ = rest.await;
             }
             rest = None;
-            if let Some(s3) = s3.take() {
-                s3.wait().await;
+            if let Some(s3) = s3.as_mut() {
+                s3.wait_until_released().await;
             }
             if let Some(portal) = portal.as_mut() {
                 let _ = portal.await;
             }
             portal = None;
-            if let Some(session_s3) = session_s3.take() {
-                session_s3.wait().await;
+            if let Some(session_s3) = session_s3.as_mut() {
+                session_s3.wait_until_released().await;
             }
             ingress_complete = true;
         })
@@ -179,14 +229,14 @@ impl NodeShutdown {
             }
             // The S3 abort already cancelled its connections; waiting proves
             // every connection child released before the sequence continues.
-            if let Some(s3) = s3 {
-                s3.wait().await;
+            if let Some(s3) = s3.as_mut() {
+                s3.wait_until_released().await;
             }
             if let Some(portal) = portal {
                 let _ = portal.await;
             }
-            if let Some(session_s3) = session_s3 {
-                session_s3.wait().await;
+            if let Some(session_s3) = session_s3.as_mut() {
+                session_s3.wait_until_released().await;
             }
         }
 
@@ -208,12 +258,21 @@ impl NodeShutdown {
             task_report = Some(self.task_handle.shutdown(task_drain).await);
         })
         .await;
+        let tasks_drained = task_report.as_ref().is_some_and(|report| report.drained());
         if let Some(report) = task_report {
-            info!(
-                in_flight = report.in_flight,
-                aborted = report.aborted,
-                "Shutdown: task scheduler drained"
-            );
+            if report.drained() {
+                info!(
+                    in_flight = report.in_flight,
+                    "Shutdown: task scheduler drained"
+                );
+            } else {
+                warn!(
+                    in_flight = report.in_flight,
+                    aborted = report.aborted,
+                    scheduler_unavailable = report.scheduler_unavailable,
+                    "Shutdown: task scheduler drain incomplete"
+                );
+            }
         }
 
         // 5. Job workers write storage: drain them before the close.
@@ -228,6 +287,9 @@ impl NodeShutdown {
             );
         })
         .await;
+        let jobs_drained = job_report
+            .as_ref()
+            .is_some_and(|report| report.released == 0 && report.skipped == 0);
         if let Some(job_report) = job_report {
             info!(?job_report, "Shutdown: job runtime drained");
         }
@@ -255,20 +317,29 @@ impl NodeShutdown {
 
         // 7. Network last among the writers: its eviction path re-emits
         //    documents through the inbound handler.
+        let mut net_outcome = None;
+        let mut net_complete = self.net_handle.is_none();
         if let Some(net_handle) = self.net_handle.as_ref() {
             let phase_budget = phase_slice(
                 budget.remaining(),
                 METADATA_SLICE + BLOB_SLICE + STORAGE_SLICE,
                 NET_SLICE,
             );
-            let mut net_shutdown_complete = false;
+            net_complete = false;
+            let mut attempt = None;
             phase("net", phase_budget, async {
-                net_shutdown_complete = net_handle
-                    .shutdown_with_drain(net_drain_budget(phase_budget))
-                    .await;
+                attempt = Some(
+                    net_handle
+                        .shutdown_with_drain(net_drain_budget(phase_budget))
+                        .await,
+                );
             })
             .await;
-            if net_shutdown_complete {
+            if let Some(attempt) = attempt {
+                net_complete = attempt.complete();
+                net_outcome = Some(attempt);
+            }
+            if net_complete {
                 net_handle.clear_inbound_handler();
             } else {
                 warn!(
@@ -278,6 +349,7 @@ impl NodeShutdown {
         }
 
         // 8. Flush the metadata store.
+        let mut metadata_flushed = self.metadata_handle.is_none();
         if let Some(metadata_handle) = self.metadata_handle.as_ref() {
             phase(
                 "metadata",
@@ -289,6 +361,8 @@ impl NodeShutdown {
                 async {
                     if let Err(error) = metadata_handle.flush_persistence().await {
                         error!(error = %error, "Failed to flush metadata persistence during shutdown");
+                    } else {
+                        metadata_flushed = true;
                     }
                 },
             )
@@ -297,10 +371,12 @@ impl NodeShutdown {
 
         // 9. Close blob writes, then drain the ones registered before the close so
         //    their storage locations land before storage closes.
+        let mut blob_drained = self.blob_handle.is_none();
         let blob_rejected = if let Some(blob_handle) = self.blob_handle.as_ref() {
             blob_handle.close_writes();
             let blob_drain = phase_slice(budget.remaining(), STORAGE_SLICE, BLOB_SLICE);
-            if !blob_handle.drain_writes(blob_drain).await {
+            blob_drained = blob_handle.drain_writes(blob_drain).await;
+            if !blob_drained {
                 warn!("Blob writes outlived the shutdown drain");
             }
             blob_handle.rejected_writes()
@@ -312,14 +388,18 @@ impl NodeShutdown {
         //     close so they commit ahead of the fsync.
         self.storage_handle.close_writes();
         let storage_drain = phase_slice(budget.remaining(), Duration::ZERO, STORAGE_SLICE);
-        if !self.storage_handle.drain_accepted(storage_drain).await {
+        let storage_drained = self.storage_handle.drain_accepted(storage_drain).await;
+        if !storage_drained {
             // Undrained work must not commit behind the final fsync.
             self.storage_handle.fence_mutations();
             warn!("Accepted storage mutations outlived the shutdown drain; mutations fenced");
         }
-        if let Err(error) = self.storage_handle.sync_all().await {
+        let storage_synced = if let Err(error) = self.storage_handle.sync_all().await {
             error!(error = %error, "Failed to sync storage during shutdown");
-        }
+            false
+        } else {
+            true
+        };
         let rejected = self.storage_handle.rejected_writes();
         if rejected > 0 || blob_rejected > 0 {
             warn!(
@@ -328,12 +408,34 @@ impl NodeShutdown {
             );
         }
 
-        info!(
-            elapsed_ms = started.elapsed().as_millis(),
-            rejected_writes = rejected,
-            blob_rejected_writes = blob_rejected,
-            "Shutdown complete"
-        );
+        let outcome = ShutdownOutcome {
+            ingress_forced: !ingress_complete,
+            tasks_drained,
+            jobs_drained,
+            background_drained,
+            net: net_outcome,
+            net_complete,
+            metadata_flushed,
+            blob_drained,
+            storage_drained,
+            storage_synced,
+            rejected_writes: rejected,
+            blob_rejected_writes: blob_rejected,
+        };
+        if outcome.complete() {
+            info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                rejected_writes = rejected,
+                blob_rejected_writes = blob_rejected,
+                "Shutdown complete"
+            );
+        } else {
+            warn!(
+                ?outcome,
+                elapsed_ms = started.elapsed().as_millis(),
+                "Shutdown incomplete; an owner or persistence step remains unresolved"
+            );
+        }
         if let Some(ops) = self.ops {
             ops.abort();
             // Awaiting the aborted task proves its resources released instead
@@ -341,6 +443,7 @@ impl NodeShutdown {
             let _ = ops.await;
         }
         drop(watchdog);
+        outcome
     }
 }
 
@@ -409,17 +512,15 @@ where
     );
 }
 
-/// Arms the conventional fast exit: once the drain is already running, a
-/// second SIGTERM or SIGINT means "stop now", not "wait out the grace". Exits
-/// with 128 + the signal number, like a process without handlers would.
-pub fn arm_signal_exit() -> JoinHandle<()> {
-    tokio::spawn(async {
-        let Some(code) = second_signal_code().await else {
-            return;
-        };
-        eprintln!("received a second termination signal during shutdown; exiting immediately");
-        std::process::exit(code);
-    })
+/// The conventional fast exit: once the drain is already running, a second
+/// SIGTERM or SIGINT means "stop now", not "wait out the grace". Exits with
+/// 128 + the signal number; the caller owns the returned future.
+pub async fn arm_signal_exit() {
+    let Some(code) = second_signal_code().await else {
+        return;
+    };
+    eprintln!("received a second termination signal during shutdown; exiting immediately");
+    std::process::exit(code);
 }
 
 #[cfg(unix)]
@@ -645,8 +746,9 @@ mod tests {
         let readiness = sequence.readiness.clone();
         readiness.set_ready();
 
-        sequence.run().await;
+        let outcome = sequence.run().await;
 
+        assert!(outcome.complete());
         assert!(!readiness.is_ready());
         assert!(readiness.is_draining());
         let event = storage_handle
@@ -783,9 +885,195 @@ mod tests {
         let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
         sequence.grace = Duration::from_millis(200);
 
-        sequence.run().await;
+        let outcome = sequence.run().await;
 
         assert!(shutdown.is_triggered());
         assert!(storage_handle.writes_closed());
+        assert!(!outcome.background_drained);
+        assert!(!outcome.complete());
+    }
+
+    async fn bound_s3_server(
+        storage_handle: StorageHandle,
+        shutdown: &Shutdown,
+    ) -> (std::net::SocketAddr, aruna_api::s3::server::S3ServerHandle) {
+        use aruna_api::cors::CorsConfig;
+        use aruna_api::s3::server::{S3Server, S3ServerTimeouts};
+        use aruna_core::metrics::NodeMetrics;
+        use aruna_core::structs::{RealmId, RoCrateLimits};
+        use aruna_operations::driver::DriverContext;
+        use std::sync::Arc;
+
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let secret = iroh::SecretKey::from_bytes(&[0x58; 32]);
+        let server = S3Server::new(
+            "127.0.0.1:0",
+            "localhost",
+            driver_ctx,
+            RealmId::from_bytes([0x58; 32]),
+            secret.public(),
+            aruna_core::credential_encryption::CredentialEncryptionKey::derive(&secret.to_bytes()),
+            RoCrateLimits::default(),
+            CorsConfig::default(),
+            Arc::new(NodeMetrics::new()),
+        )
+        .await
+        .expect("s3 server builds")
+        .with_timeouts(S3ServerTimeouts::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("s3 listener binds");
+        let address = listener.local_addr().expect("s3 address");
+        let (_bound, handle) = server
+            .run_with_listener(listener, shutdown.token())
+            .expect("s3 server runs");
+        (address, handle)
+    }
+
+    // The real ingress deadline must not lose either S3 owner: both listeners
+    // drain active connection work past their slice, so only the retained
+    // forced cleanup can release them before storage closes.
+    #[tokio::test(start_paused = true)]
+    async fn ingress_timeout_retains_s3_owners() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempdir().expect("temp dir");
+        let storage_handle = open_storage(&dir);
+        let shutdown = Shutdown::new();
+        let (main_addr, main_s3) = bound_s3_server(storage_handle.clone(), &shutdown).await;
+        let (session_addr, session_s3) = bound_s3_server(storage_handle.clone(), &shutdown).await;
+
+        // A request with an unfinished body keeps one connection child busy per
+        // listener, so the graceful wait cannot finish inside its slice.
+        let mut main_client = tokio::net::TcpStream::connect(main_addr)
+            .await
+            .expect("main S3 connect");
+        main_client
+            .write_all(
+                b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab",
+            )
+            .await
+            .expect("main partial body");
+        let mut session_client = tokio::net::TcpStream::connect(session_addr)
+            .await
+            .expect("session S3 connect");
+        session_client
+            .write_all(
+                b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab",
+            )
+            .await
+            .expect("session partial body");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
+        sequence.s3 = Some(main_s3);
+        sequence.session_s3 = Some(session_s3);
+        // The ingress slice is a quarter of this grace: the busy connections
+        // outlive it and only the forced cleanup can stop them.
+        sequence.grace = Duration::from_millis(200);
+        let started = tokio::time::Instant::now();
+
+        sequence.run().await;
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(5),
+            "the ingress phase must expire on its slice, not on the connection, took {elapsed:?}"
+        );
+        assert!(storage_handle.writes_closed());
+        for (label, client) in [("main", &mut main_client), ("session", &mut session_client)] {
+            let mut buf = [0u8; 1];
+            let released =
+                tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf)).await;
+            assert!(
+                matches!(released, Ok(Ok(0)) | Ok(Err(_))),
+                "{label} S3 connection must be released before shutdown returns, got {released:?}"
+            );
+        }
+    }
+
+    // A handler that signals its start and then never completes on its own, so
+    // only a forced abort can end the run.
+    struct PendingTaskHandler {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl aruna_tasks::InboundTaskHandler for PendingTaskHandler {
+        #[allow(clippy::type_complexity)]
+        fn handle_timer<'life0, 'async_trait>(
+            &'life0 self,
+            _key: aruna_core::task::TaskKey,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: Sync + 'async_trait,
+        {
+            let started = self.started.clone();
+            Box::pin(async move {
+                started.notify_one();
+                std::future::pending::<()>().await
+            })
+        }
+    }
+
+    // The tasks phase is timeout-wrapped. When its budget expires, the drain
+    // future is dropped and the scheduler must still own the running handler,
+    // so a resumed drain sees it instead of reporting a clean shutdown.
+    #[tokio::test]
+    async fn interrupted_task_phase_keeps_handler_owned() {
+        use aruna_core::effects::Effect;
+        use aruna_core::handle::Handle;
+        use aruna_core::task::{TaskEffect, TaskKey};
+
+        let dir = tempdir().expect("temp dir");
+        let storage_handle = open_storage(&dir);
+        let sequence = node_shutdown(Shutdown::new(), storage_handle);
+        let task_handle = sequence.task_handle.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        task_handle
+            .set_inbound_handler(Arc::new(PendingTaskHandler {
+                started: started.clone(),
+            }))
+            .await;
+        let _ = task_handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::DrainDocumentSyncOutbox,
+                after: Duration::ZERO,
+            }))
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("handler should start");
+
+        let mut task_report = None;
+        phase("tasks", Duration::from_millis(20), async {
+            task_report = Some(task_handle.shutdown(Duration::from_secs(30)).await);
+        })
+        .await;
+        assert!(
+            task_report.is_none(),
+            "the phase budget must interrupt the task drain"
+        );
+
+        let resumed = task_handle.shutdown(Duration::ZERO).await;
+        assert_eq!(
+            resumed.in_flight, 1,
+            "the interrupted drain must keep the handler owned"
+        );
+        assert_eq!(resumed.aborted, 1);
+        assert!(!resumed.drained());
+
+        let settled = task_handle.shutdown(Duration::from_secs(1)).await;
+        assert!(
+            settled.drained(),
+            "the forced stop must release the handler"
+        );
     }
 }
