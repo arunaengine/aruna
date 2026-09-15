@@ -3,8 +3,8 @@ use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{
-    BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
-    CreateOnboardingSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
+    BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateSecretRequest,
+    CreateSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
     OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode, issuer_proof_message,
     node_proof_message,
 };
@@ -17,24 +17,23 @@ use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::onboarding::consume_secret::ConsumeOnboardingSecretError;
+use aruna_operations::onboarding::consume_secret::ConsumeSecretError;
 use aruna_operations::onboarding::create_secret::{
-    CreateOnboardingSecretError, CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
+    CreateSecretError, CreateSecretInput, CreateSecretOperation,
 };
 use aruna_operations::onboarding::delete_secret::{
-    DeleteOnboardingSecretError, DeleteOnboardingSecretInput, DeleteOnboardingSecretOperation,
+    DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
 use aruna_operations::onboarding::finalize_bootstrap::{
-    BootstrapOnboardingFinalizeError, BootstrapOnboardingFinalizeInput,
-    bootstrap_onboarding_finalize,
+    BootstrapFinalizeError, BootstrapFinalizeInput, bootstrap_onboarding_finalize,
 };
 use aruna_operations::onboarding::inspect_secret::{
-    InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
+    InspectSecretError, InspectSecretInput, InspectSecretOperation,
 };
-use aruna_operations::onboarding::list_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::onboarding::reserve_secret::ReserveOnboardingSecretError;
-use aruna_operations::realm::ensure_config::EnsureRealmConfigError;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
+use aruna_operations::onboarding::reserve_secret::ReserveSecretError;
+use aruna_operations::realm::ensure_config::EnsureConfigError;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -84,14 +83,16 @@ pub enum TransportAddressDoc {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
-pub struct CreateOnboardingSecretRequestDoc {
+#[schema(as = CreateOnboardingSecretRequestDoc)]
+pub struct CreateRequestDoc {
     pub seed_url: String,
     pub mode: String,
     pub expires_in_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
-pub struct CreateOnboardingSecretResponseDoc {
+#[schema(as = CreateOnboardingSecretResponseDoc)]
+pub struct CreateResponseDoc {
     pub onboarding_secret: String,
     pub enrollment_id: String,
     pub mode: String,
@@ -100,7 +101,8 @@ pub struct CreateOnboardingSecretResponseDoc {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
-pub struct BootstrapOnboardingRequestDoc {
+#[schema(as = BootstrapOnboardingRequestDoc)]
+pub struct BootstrapRequestDoc {
     pub onboarding_secret: String,
     pub node_id: String,
     pub node_proof: String,
@@ -113,7 +115,8 @@ pub struct BootstrapOnboardingRequestDoc {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
-pub struct BootstrapOnboardingResponseDoc {
+#[schema(as = BootstrapOnboardingResponseDoc)]
+pub struct BootstrapResponseDoc {
     pub realm_id: String,
     /// `"Management"`, `"Server"`, or the device form that carries its owner.
     pub mode: serde_json::Value,
@@ -133,12 +136,14 @@ pub struct RealmEndpointDoc {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
-pub struct ListOnboardingSecretsResponse {
+#[schema(as = ListOnboardingSecretsResponse)]
+pub struct ListSecretsResponse {
     pub secrets: Vec<OnboardingSecretSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
-pub struct OnboardingSecretStatusResponse {
+#[schema(as = OnboardingSecretStatusResponse)]
+pub struct OnboardingSecretResponse {
     pub enrollment_id: String,
     pub mode: String,
     /// Owner a `User` secret is bound to; null for infrastructure modes.
@@ -235,7 +240,7 @@ async fn enforce_enrollment_policies(
 
 async fn prune_stale_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
     let now = now_timestamp();
-    let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+    let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
@@ -244,7 +249,7 @@ async fn prune_stale_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
             && !matches!(&secret.state, OnboardingSecretState::Finalizing { .. })
         {
             drive(
-                DeleteOnboardingSecretOperation::new(DeleteOnboardingSecretInput {
+                DeleteSecretOperation::new(DeleteSecretInput {
                     enrollment_id: secret.record.enrollment_id,
                 }),
                 &state.get_ctx(),
@@ -296,7 +301,7 @@ unrestricted token. A management node serves the route, and every other node rel
 - The count is transactional per node and checked again at redemption, so two management nodes
   minting at the same time each see only their own outstanding secrets and stay best effort."#,
     request_body(
-        content = CreateOnboardingSecretRequestDoc,
+        content = CreateRequestDoc,
         description = "Seed URL the joiner calls back, the mode it is enrolled as, and an optional lifetime",
         example = json!({
             "seed_url": "https://node.example.test",
@@ -308,7 +313,7 @@ unrestricted token. A management node serves the route, and every other node rel
         (
             status = 201,
             description = "Secret created; `onboarding_secret` is shown here and never again",
-            body = CreateOnboardingSecretResponseDoc,
+            body = CreateResponseDoc,
             example = json!({
                 "onboarding_secret": "<enrollment-secret-shown-once>",
                 "enrollment_id": "01JABCDEF0123456789ABCDEFG",
@@ -329,8 +334,8 @@ unrestricted token. A management node serves the route, and every other node rel
 pub async fn create_onboarding_secret(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Json(request): Json<CreateOnboardingSecretRequest>,
-) -> ServerResult<(StatusCode, Json<CreateOnboardingSecretResponse>)> {
+    Json(request): Json<CreateSecretRequest>,
+) -> ServerResult<(StatusCode, Json<CreateSecretResponse>)> {
     let auth = match request.mode {
         RequestedOnboardingMode::User => {
             let auth = authorize_device_enrollment(&state, auth)?;
@@ -382,7 +387,7 @@ pub async fn create_onboarding_secret(
     };
 
     drive(
-        CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput { record }),
+        CreateSecretOperation::new(CreateSecretInput { record }),
         &state.get_ctx(),
     )
     .await
@@ -399,7 +404,7 @@ pub async fn create_onboarding_secret(
 
     Ok((
         StatusCode::CREATED,
-        Json(CreateOnboardingSecretResponse {
+        Json(CreateSecretResponse {
             onboarding_secret: encoded_secret,
             enrollment_id: onboarding_secret.enrollment_id.to_string(),
             mode: request.mode,
@@ -459,7 +464,7 @@ node serves it, and every other node relays the call to one.
         (
             status = 200,
             description = "Live and in-flight onboarding secrets, soonest expiry first",
-            body = ListOnboardingSecretsResponse,
+            body = ListSecretsResponse,
             example = json!({
                 "secrets": [
                     {
@@ -488,17 +493,17 @@ node serves it, and every other node relays the call to one.
 pub async fn list_onboarding_secrets(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-) -> ServerResult<(StatusCode, Json<ListOnboardingSecretsResponse>)> {
+) -> ServerResult<(StatusCode, Json<ListSecretsResponse>)> {
     let _auth = authorize_onboarding_admin(&state, auth).await?;
     prune_stale_secrets(&state).await?;
-    let mut secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+    let mut secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
     secrets.sort_by_key(|entry| entry.record.expires_at);
 
     Ok((
         StatusCode::OK,
-        Json(ListOnboardingSecretsResponse {
+        Json(ListSecretsResponse {
             secrets: secrets
                 .into_iter()
                 .map(|entry| OnboardingSecretSummary::from(entry.record))
@@ -542,7 +547,7 @@ pub async fn revoke_onboarding_secret(
     let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::BadRequest)?;
 
     drive(
-        DeleteOnboardingSecretOperation::new(DeleteOnboardingSecretInput { enrollment_id }),
+        DeleteSecretOperation::new(DeleteSecretInput { enrollment_id }),
         &state.get_ctx(),
     )
     .await
@@ -575,7 +580,7 @@ serves the route, and every other node relays the call to one.
         (
             status = 200,
             description = "The claim state this node recorded for the secret",
-            body = OnboardingSecretStatusResponse,
+            body = OnboardingSecretResponse,
             example = json!({
                 "enrollment_id": "01JABCDEF0123456789ABCDEFG",
                 "mode": "User",
@@ -596,10 +601,10 @@ pub async fn get_secret_status(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(enrollment_id): Path<String>,
-) -> ServerResult<(StatusCode, Json<OnboardingSecretStatusResponse>)> {
+) -> ServerResult<(StatusCode, Json<OnboardingSecretResponse>)> {
     let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::BadRequest)?;
     let caller = auth.clone().ok_or(ServerError::Unauthorized)?;
-    let entry = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+    let entry = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?
         .into_iter()
@@ -625,7 +630,7 @@ pub async fn get_secret_status(
 
     Ok((
         StatusCode::OK,
-        Json(OnboardingSecretStatusResponse {
+        Json(OnboardingSecretResponse {
             enrollment_id: entry.record.enrollment_id.to_string(),
             mode: format!("{:?}", RequestedOnboardingMode::from(entry.record.mode)),
             owner: entry.record.mode.owner().map(|owner| owner.to_string()),
@@ -667,7 +672,7 @@ node serves this route, and every other node relays the call to one.
   discovery declares none.
 - Everything returned here is one-time joining material and must never be logged or reused."#,
     request_body(
-        content = BootstrapOnboardingRequestDoc,
+        content = BootstrapRequestDoc,
         description = "The onboarding secret, the joiner's node id, its proof of possession of the node key, and any mode-specific key material",
         example = json!({
             "onboarding_secret": "<onboarding-secret-shown-once>",
@@ -686,7 +691,7 @@ node serves this route, and every other node relays the call to one.
         (
             status = 200,
             description = "Enrollment finalized; one-time joining material for the mode the secret was minted for. `addrs` entries are tagged transport addresses, either `Ip` or `Relay`",
-            body = BootstrapOnboardingResponseDoc,
+            body = BootstrapResponseDoc,
             example = json!({
                 "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 "mode": "Server",
@@ -736,7 +741,7 @@ pub async fn bootstrap_onboarding(
     verify_node_proof(&request, node_id)?;
 
     let record = drive(
-        InspectOnboardingSecretOperation::new(InspectOnboardingSecretInput {
+        InspectSecretOperation::new(InspectSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),
             node_id: request.node_id.clone(),
@@ -800,7 +805,7 @@ pub async fn bootstrap_onboarding(
     };
 
     let finalized = bootstrap_onboarding_finalize(
-        BootstrapOnboardingFinalizeInput {
+        BootstrapFinalizeInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),
             node_id,
@@ -868,7 +873,7 @@ async fn realm_endpoints(
     joiner: NodeId,
 ) -> ServerResult<Vec<StaticRealmEndpoint>> {
     let config = drive(
-        GetRealmConfigOperation::new(state.get_realm_id()),
+        GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
@@ -896,71 +901,67 @@ fn declared_endpoints(config: &RealmConfigDocument, joiner: &str) -> Vec<StaticR
         .collect()
 }
 
-fn map_consume_error(error: ConsumeOnboardingSecretError) -> ServerError {
+fn map_consume_error(error: ConsumeSecretError) -> ServerError {
     match error {
-        ConsumeOnboardingSecretError::NotFound
-        | ConsumeOnboardingSecretError::Expired
-        | ConsumeOnboardingSecretError::AlreadyClaimed
-        | ConsumeOnboardingSecretError::InvalidSecret => ServerError::Unauthorized,
+        ConsumeSecretError::NotFound
+        | ConsumeSecretError::Expired
+        | ConsumeSecretError::AlreadyClaimed
+        | ConsumeSecretError::InvalidSecret => ServerError::Unauthorized,
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
-fn map_finalize_error(error: BootstrapOnboardingFinalizeError) -> ServerError {
+fn map_finalize_error(error: BootstrapFinalizeError) -> ServerError {
     match error {
-        BootstrapOnboardingFinalizeError::Reserve(
-            ReserveOnboardingSecretError::NotFound
-            | ReserveOnboardingSecretError::Expired
-            | ReserveOnboardingSecretError::AlreadyClaimed
-            | ReserveOnboardingSecretError::InvalidSecret,
+        BootstrapFinalizeError::Reserve(
+            ReserveSecretError::NotFound
+            | ReserveSecretError::Expired
+            | ReserveSecretError::AlreadyClaimed
+            | ReserveSecretError::InvalidSecret,
         ) => ServerError::Unauthorized,
-        BootstrapOnboardingFinalizeError::Reserve(
-            ReserveOnboardingSecretError::DeviceCapExceeded { .. },
-        ) => ServerError::Conflict(error.to_string()),
+        BootstrapFinalizeError::Reserve(ReserveSecretError::DeviceCapExceeded { .. }) => {
+            ServerError::Conflict(error.to_string())
+        }
         // The cap re-check reads a range, so a concurrent mint or redemption on
         // this node can lose the transaction; the joiner may simply retry.
-        BootstrapOnboardingFinalizeError::Reserve(ReserveOnboardingSecretError::StorageError(
+        BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(
             StorageError::TransactionConflict,
         )) => ServerError::Conflict("concurrent enrollment conflict; retry".to_string()),
-        BootstrapOnboardingFinalizeError::Reserve(ReserveOnboardingSecretError::StorageError(
+        BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(
             StorageError::CleanupCapacity,
         )) => ServerError::ServiceUnavailableReason(
             "storage cleanup capacity exhausted; retry".to_string(),
         ),
-        BootstrapOnboardingFinalizeError::Consume(error) => map_consume_error(error),
-        BootstrapOnboardingFinalizeError::EnsureRealmConfig(
-            EnsureRealmConfigError::NodeKindMismatch { .. },
-        ) => ServerError::BadRequest,
-        BootstrapOnboardingFinalizeError::EnsureRealmConfig(
-            EnsureRealmConfigError::HandleSpaceExhausted,
-        ) => ServerError::Conflict("realm handle space is exhausted".to_string()),
-        BootstrapOnboardingFinalizeError::ReservedNodeLabel(label) => {
-            ServerError::ReservedLabel(label)
+        BootstrapFinalizeError::Consume(error) => map_consume_error(error),
+        BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::NodeKindMismatch {
+            ..
+        }) => ServerError::BadRequest,
+        BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::HandleSpaceExhausted) => {
+            ServerError::Conflict("realm handle space is exhausted".to_string())
         }
-        BootstrapOnboardingFinalizeError::NodeLocationTooLong => ServerError::BadRequest,
+        BootstrapFinalizeError::ReservedNodeLabel(label) => ServerError::ReservedLabel(label),
+        BootstrapFinalizeError::NodeLocationTooLong => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
-fn map_inspect_error(error: InspectOnboardingSecretError) -> ServerError {
+fn map_inspect_error(error: InspectSecretError) -> ServerError {
     match error {
-        InspectOnboardingSecretError::NotFound
-        | InspectOnboardingSecretError::Expired
-        | InspectOnboardingSecretError::AlreadyClaimed
-        | InspectOnboardingSecretError::InvalidSecret => ServerError::Unauthorized,
+        InspectSecretError::NotFound
+        | InspectSecretError::Expired
+        | InspectSecretError::AlreadyClaimed
+        | InspectSecretError::InvalidSecret => ServerError::Unauthorized,
         other => ServerError::InternalError(other.to_string()),
     }
 }
 
-fn map_create_error(error: CreateOnboardingSecretError) -> ServerError {
+fn map_create_error(error: CreateSecretError) -> ServerError {
     match error {
-        CreateOnboardingSecretError::DeviceCapExceeded { .. } => {
-            ServerError::Conflict(error.to_string())
-        }
-        CreateOnboardingSecretError::StorageError(StorageError::TransactionConflict) => {
+        CreateSecretError::DeviceCapExceeded { .. } => ServerError::Conflict(error.to_string()),
+        CreateSecretError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent enrollment secret conflict; retry".to_string())
         }
-        CreateOnboardingSecretError::StorageError(StorageError::CleanupCapacity) => {
+        CreateSecretError::StorageError(StorageError::CleanupCapacity) => {
             ServerError::ServiceUnavailableReason(
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
@@ -969,9 +970,9 @@ fn map_create_error(error: CreateOnboardingSecretError) -> ServerError {
     }
 }
 
-fn map_delete_error(error: DeleteOnboardingSecretError) -> ServerError {
+fn map_delete_error(error: DeleteSecretError) -> ServerError {
     match error {
-        DeleteOnboardingSecretError::NotFound => ServerError::NotFound,
+        DeleteSecretError::NotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -1056,4 +1057,5 @@ fn wrap_realm_key(
 }
 
 #[cfg(test)]
+#[path = "onboarding_tests.rs"]
 mod tests;

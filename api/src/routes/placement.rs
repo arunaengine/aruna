@@ -2,14 +2,14 @@
 //! Operations own authorization, reference authentication, and transactional rules.
 //! Realm bearer authentication prevents policy identifiers from reaching public S3 callers.
 
-use crate::auth::{ValidatedArunaBearerTokenCarrier, require_realm_auth};
+use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     Actor, AuthContext, CurrentVersionPointer, LabelMatch, PlacementPolicy,
     PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef, PlacementSelector,
-    PolicyBlockedReason, PolicyBulkStatus, VersionKey,
+    PolicyBlockedReason, PolicyStatus, VersionKey,
 };
 use aruna_operations::driver::{drive, gate_context, now_ms};
 use aruna_operations::forward::transport::MetadataWriteError;
@@ -29,9 +29,9 @@ use aruna_operations::placement::policy::{
     ResolveQuarantineOperation, create_policy_routed,
 };
 use aruna_operations::s3::bucket_placement::{
-    PutBucketPlacementError, PutBucketPlacementInput, PutBucketPlacementOperation,
+    PutPlacementError, PutPlacementInput, PutPlacementOperation,
 };
-use aruna_operations::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object_placement::{
     ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation,
 };
@@ -498,19 +498,18 @@ fn map_read_error(error: ReadPolicyError) -> ServerError {
     }
 }
 
-fn map_default_error(error: PutBucketPlacementError) -> ServerError {
+fn map_default_error(error: PutPlacementError) -> ServerError {
     match error {
-        PutBucketPlacementError::Unauthorized => ServerError::Forbidden,
-        PutBucketPlacementError::NoSuchBucket | PutBucketPlacementError::GroupMismatch => {
-            ServerError::NotFound
+        PutPlacementError::Unauthorized => ServerError::Forbidden,
+        PutPlacementError::NoSuchBucket | PutPlacementError::GroupMismatch => ServerError::NotFound,
+        PutPlacementError::GenerationConflict { .. } | PutPlacementError::GenerationExhausted => {
+            ServerError::Conflict(error.to_string())
         }
-        PutBucketPlacementError::GenerationConflict { .. }
-        | PutBucketPlacementError::GenerationExhausted => ServerError::Conflict(error.to_string()),
-        PutBucketPlacementError::PolicyUnavailable { .. } => {
+        PutPlacementError::PolicyUnavailable { .. } => {
             ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
         }
-        PutBucketPlacementError::Policy(_) => policy_denied(),
-        PutBucketPlacementError::ForeignPolicy { .. } => foreign_policy(),
+        PutPlacementError::Policy(_) => policy_denied(),
+        PutPlacementError::ForeignPolicy { .. } => foreign_policy(),
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -626,11 +625,11 @@ fn blocked_reason(reason: PolicyBlockedReason) -> String {
     .to_string()
 }
 
-fn bulk_status(status: PolicyBulkStatus) -> String {
+fn bulk_status(status: PolicyStatus) -> String {
     match status {
-        PolicyBulkStatus::Active => "active",
-        PolicyBulkStatus::Completed => "completed",
-        PolicyBulkStatus::Superseded => "superseded",
+        PolicyStatus::Active => "active",
+        PolicyStatus::Completed => "completed",
+        PolicyStatus::Superseded => "superseded",
     }
     .to_string()
 }
@@ -654,7 +653,7 @@ async fn ensure_placement_writer(
     {
         return Ok(());
     }
-    let path = match crate::routes::groups::get_bucket_group(state, bucket).await? {
+    let path = match crate::routes::access::groups::get_bucket_group(state, bucket).await? {
         Some(group_id) => aruna_core::structs::group_admin_path(realm_id, group_id),
         None => config_admin,
     };
@@ -682,13 +681,13 @@ async fn bucket_info(
     bucket: &str,
 ) -> ServerResult<aruna_core::structs::BucketInfo> {
     match drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
+        GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(info) => Ok(info),
-        Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
@@ -747,7 +746,7 @@ read, and every verifier re-runs the same check against its own replicated view.
 pub async fn create_placement_policy(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreatePolicyRequest>,
 ) -> ServerResult<Json<PolicyResponse>> {
     let auth = require_realm_auth(&state, auth)?;
@@ -1061,7 +1060,7 @@ pub async fn put_bucket_placement(
     let info = bucket_info(&state, &bucket).await?;
     let policies = refs_from(request.policies)?;
     let stored = drive(
-        PutBucketPlacementOperation::new(PutBucketPlacementInput {
+        PutPlacementOperation::new(PutPlacementInput {
             bucket: bucket.clone(),
             group_id: info.group_id,
             policies,
@@ -1827,7 +1826,9 @@ fn quarantine_release(request: &QuarantineResolveRequest) -> ServerResult<Option
 }
 
 #[cfg(test)]
+#[path = "placement_tests.rs"]
 mod tests;
 
 #[cfg(test)]
+#[path = "placement_routes_tests.rs"]
 mod test_routes;

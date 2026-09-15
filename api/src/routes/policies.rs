@@ -1,6 +1,6 @@
 use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::groups::refuse_group_edit;
+use crate::routes::access::groups::refuse_group_edit;
 use crate::server_state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::request_policy::{
@@ -10,12 +10,10 @@ use aruna_core::request_policy::{
 use aruna_core::structs::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::groups::set_policies::{
-    SetGroupPoliciesConfig, SetGroupPoliciesError, SetGroupPoliciesOperation,
-};
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::groups::set_policies::{SetGroupConfig, SetGroupError, SetGroupOperation};
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::set_policies::{
-    SetRealmPoliciesConfig, SetRealmPoliciesError, SetRealmPoliciesOperation,
+    SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -295,13 +293,13 @@ async fn realm_policies(
 ) -> ServerResult<Vec<RequestPolicy>> {
     require_config_read(state, auth).await?;
     match drive(
-        GetRealmConfigOperation::new(state.get_realm_id()),
+        GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
     {
         Ok(config) => Ok(config.request_policies),
-        Err(aruna_operations::realm::get_config::GetRealmConfigError::DocumentNotFound) => {
+        Err(aruna_operations::realm::get_config::GetConfigError::DocumentNotFound) => {
             Ok(Vec::new())
         }
         Err(error) => Err(ServerError::InternalError(error.to_string())),
@@ -512,7 +510,7 @@ pub async fn set_realm_policies(
         .transpose()?;
 
     let document = drive(
-        SetRealmPoliciesOperation::new(SetRealmPoliciesConfig {
+        SetPoliciesOperation::new(SetPoliciesConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
@@ -526,15 +524,15 @@ pub async fn set_realm_policies(
     )
     .await
     .map_err(|error| match error {
-        SetRealmPoliciesError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
-        SetRealmPoliciesError::Unauthorized | SetRealmPoliciesError::NotManagementNode => {
+        SetPoliciesError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
+        SetPoliciesError::Unauthorized | SetPoliciesError::NotManagementNode => {
             ServerError::Forbidden
         }
-        SetRealmPoliciesError::RealmConfigNotFound => ServerError::NotFound,
-        SetRealmPoliciesError::StaleHash => {
+        SetPoliciesError::RealmConfigNotFound => ServerError::NotFound,
+        SetPoliciesError::StaleHash => {
             ServerError::Conflict("stored realm policy set changed".to_string())
         }
-        SetRealmPoliciesError::StorageError(StorageError::CleanupCapacity) => {
+        SetPoliciesError::StorageError(StorageError::CleanupCapacity) => {
             ServerError::ServiceUnavailableReason(
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
@@ -691,7 +689,7 @@ pub async fn set_group_policies(
         .transpose()?;
 
     let document = drive(
-        SetGroupPoliciesOperation::new(SetGroupPoliciesConfig {
+        SetGroupOperation::new(SetGroupConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
@@ -706,13 +704,13 @@ pub async fn set_group_policies(
     )
     .await
     .map_err(|error| match error {
-        SetGroupPoliciesError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
-        SetGroupPoliciesError::Unauthorized => ServerError::Forbidden,
-        SetGroupPoliciesError::GroupAuthDocNotFound => ServerError::NotFound,
-        SetGroupPoliciesError::StaleHash => {
+        SetGroupError::InvalidPolicies { reason } => ServerError::BadRequestMessage(reason),
+        SetGroupError::Unauthorized => ServerError::Forbidden,
+        SetGroupError::GroupAuthDocNotFound => ServerError::NotFound,
+        SetGroupError::StaleHash => {
             ServerError::Conflict("stored group policy set changed".to_string())
         }
-        SetGroupPoliciesError::StorageError(StorageError::CleanupCapacity) => {
+        SetGroupError::StorageError(StorageError::CleanupCapacity) => {
             ServerError::ServiceUnavailableReason(
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
@@ -1060,4 +1058,5 @@ async fn dry_run_scopes(
 }
 
 #[cfg(test)]
+#[path = "policies_tests.rs"]
 mod tests;
