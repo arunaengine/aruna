@@ -1,4 +1,3 @@
-/// Get current unix timestamp in seconds.
 /// Returns 0 if system time is before UNIX epoch (should never happen in practice).
 #[inline]
 pub fn unix_timestamp_secs() -> u64 {
@@ -8,7 +7,6 @@ pub fn unix_timestamp_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Get current unix timestamp in milliseconds.
 #[inline]
 pub fn unix_timestamp_millis() -> u64 {
     std::time::SystemTime::now()

@@ -1,4 +1,3 @@
-// net/src/dht/kbucket.rs
 use aruna_core::id::xor_distance_32;
 use aruna_core::id::{NodeId, NodeIdExt};
 use std::collections::VecDeque;
@@ -89,17 +88,14 @@ impl KBucket {
         self.peers.pop_front()
     }
 
-    /// Get all peers in this bucket
     pub fn peers(&self) -> impl Iterator<Item = &PeerInfo> {
         self.peers.iter()
     }
 
-    /// Check if a peer exists in this bucket
     pub fn contains(&self, node_id: &NodeId) -> bool {
         self.peers.iter().any(|p| &p.node_id == node_id)
     }
 
-    /// Remove a specific peer
     pub fn remove(&mut self, node_id: &NodeId) -> Option<PeerInfo> {
         if let Some(pos) = self.peers.iter().position(|p| &p.node_id == node_id) {
             self.peers.remove(pos)
@@ -149,7 +145,6 @@ impl RoutingTable {
         &self.local_id
     }
 
-    /// Get the bucket index for a given node
     fn bucket_index(&self, node_id: &NodeId) -> Option<usize> {
         let idx = self.local_id.bucket_index(node_id);
         if idx >= NUM_BUCKETS {
@@ -159,7 +154,6 @@ impl RoutingTable {
         }
     }
 
-    /// Try to insert or update a peer in the routing table
     pub fn insert(&mut self, peer: PeerInfo) -> InsertResult {
         if peer.node_id == self.local_id {
             return InsertResult::Updated; // Ignore self
@@ -172,7 +166,6 @@ impl RoutingTable {
         self.buckets[idx].insert(peer)
     }
 
-    /// Remove a peer from the routing table
     pub fn remove(&mut self, node_id: &NodeId) -> Option<PeerInfo> {
         let idx = self.bucket_index(node_id)?;
         self.buckets[idx].remove(node_id)
@@ -183,7 +176,6 @@ impl RoutingTable {
         self.buckets[idx].remove_seen(node_id, last_seen)
     }
 
-    /// Evict the oldest peer from a specific bucket
     pub fn evict_oldest(&mut self, bucket_idx: usize) -> Option<PeerInfo> {
         self.buckets
             .get_mut(bucket_idx)

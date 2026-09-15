@@ -86,7 +86,6 @@ pub enum ErrorCode {
     InvalidSignature,
 }
 
-/// A stored DHT value
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredValue {
     pub publisher: NodeId,
@@ -145,7 +144,6 @@ pub fn verify_record(
     publisher.verify(&signed_data, signature).is_ok()
 }
 
-/// Serialize a request to bytes
 pub fn encode_request(req: &DhtRequest) -> Result<Vec<u8>, postcard::Error> {
     encode_traced_request(req, None)
 }
@@ -160,7 +158,6 @@ pub fn encode_traced_request(
     })
 }
 
-/// Deserialize a request from bytes
 pub fn decode_request(bytes: &[u8]) -> Result<DhtRequest, postcard::Error> {
     decode_traced_request(bytes).map(|(_, request)| request)
 }
@@ -172,12 +169,10 @@ pub fn decode_traced_request(
         .map(|envelope| (envelope.trace_context, envelope.request))
 }
 
-/// Serialize a response to bytes
 pub fn encode_response(resp: &DhtResponse) -> Result<Vec<u8>, postcard::Error> {
     postcard::to_allocvec(resp)
 }
 
-/// Deserialize a response from bytes
 pub fn decode_response(bytes: &[u8]) -> Result<DhtResponse, postcard::Error> {
     decode_exact(bytes)
 }

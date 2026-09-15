@@ -32,7 +32,6 @@ pub trait SettingsEnv {
     fn var(&self, key: &str) -> Option<String>;
 }
 
-/// The process environment.
 pub struct ProcessEnv;
 
 impl SettingsEnv for ProcessEnv {

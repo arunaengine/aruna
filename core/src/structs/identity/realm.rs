@@ -283,7 +283,7 @@ impl QuotaConfig {
 
     /// Resolves the effective pre-grace quota (in bytes) for a group: the group override's `quota_bytes`
     /// when an override exists (an override with `quota_bytes: None` makes the group explicitly unlimited),
-    /// else the realm `default_group_quota_bytes`. `None` means unlimited.
+    /// else the realm `default_quota_bytes`. `None` means unlimited.
     pub fn group_quota_bytes(&self, group_id: &GroupId) -> Option<u64> {
         match self
             .group_overrides

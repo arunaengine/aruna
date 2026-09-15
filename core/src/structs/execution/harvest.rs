@@ -414,7 +414,6 @@ mod tests {
         );
     }
 
-    // an empty secret config is None
     #[test]
     fn empty_secret_none() {
         assert!(

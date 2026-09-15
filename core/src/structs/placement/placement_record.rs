@@ -28,7 +28,7 @@ pub enum NodeInputError {
 }
 
 /// Normalizes onboarding/config-sourced placement inputs: trims the location (empty-after-trim ⇒
-/// unset), rejects locations longer than [`MAX_NODE_LOCATION_LEN`], clamps a present weight into
+/// unset), rejects locations longer than [`MAX_LOCATION_LEN`], clamps a present weight into
 /// `1..=MAX_NODE_WEIGHT`, and defaults an absent weight to [`DEFAULT_NODE_WEIGHT`].
 pub fn normalize_placement_input(
     location: Option<&str>,

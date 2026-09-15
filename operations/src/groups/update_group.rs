@@ -29,7 +29,7 @@ use crate::sync::document_outbox::{
 pub const MAX_NAME_LEN: usize = 256;
 
 /// The one group-name rule: trimmed, non-empty and at most
-/// `MAX_GROUP_NAME_LEN` bytes. `None` means the name is refused.
+/// `MAX_NAME_LEN` bytes. `None` means the name is refused.
 pub fn normalize_group_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     (!trimmed.is_empty() && trimmed.len() <= MAX_NAME_LEN).then(|| trimmed.to_string())

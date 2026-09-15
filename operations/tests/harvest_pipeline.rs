@@ -58,8 +58,6 @@ const BETA: &str = "oai:ex:beta";
 
 type BoxError = Box<dyn std::error::Error>;
 
-// ---------------------------------------------------------------- fixture
-
 struct Fixture {
     _root: tempfile::TempDir,
     actor: Actor,

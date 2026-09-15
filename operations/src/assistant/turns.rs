@@ -132,8 +132,8 @@ enum WriteTurnState {
 }
 
 /// Appends one turn to a chat or rewrites its tail turn. The chat keeps its
-/// newest `MAX_ASSISTANT_CHAT_TURNS` turns, and all chats of the user stay
-/// within `MAX_ASSISTANT_CHAT_BYTES` together.
+/// newest `MAX_ASSISTANT_TURNS` turns, and all chats of the user stay
+/// within `MAX_ASSISTANT_BYTES` together.
 #[derive(Debug, PartialEq)]
 pub struct WriteTurnOperation {
     user_id: UserId,

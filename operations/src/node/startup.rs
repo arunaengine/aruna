@@ -806,7 +806,7 @@ pub struct RestoreShardSummary {
     pub held_shards: usize,
     /// Shard sync topics ensured (rank-0) or joined that this pass touched.
     pub shard_topics: usize,
-    /// Fixed shared realm topics restored ([`SHARED_RESTORE_TOPIC_COUNT`]).
+    /// Fixed shared realm topics restored ([`RESTORE_TOPIC_COUNT`]).
     pub shared_topics: usize,
     /// Held topics this pass could not finish because a co-holder was absent or
     /// refused a genesis probe. Retryable background state, never a start error.
@@ -856,7 +856,7 @@ pub struct ShardRestoreCursor {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardRestorePass {
     pub summary: RestoreShardSummary,
-    /// Never more than [`SHARD_RESTORE_UNIT_BUDGET`].
+    /// Never more than [`RESTORE_UNIT_BUDGET`].
     pub units_processed: usize,
     pub topics_completed: usize,
     pub units_total: usize,
@@ -871,7 +871,7 @@ pub struct ShardRestorePass {
     pub enumerated: bool,
 }
 
-/// Runs at most [`SHARD_RESTORE_UNIT_BUDGET`] restore work units from `cursor`,
+/// Runs at most [`RESTORE_UNIT_BUDGET`] restore work units from `cursor`,
 /// advances it past them, and wraps at the end, so an unavailable first group
 /// cannot starve a later healthy one.
 pub async fn restore_shard_pass(

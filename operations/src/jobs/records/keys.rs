@@ -17,7 +17,6 @@ pub fn record_key(key: &JobRecordKey) -> Key {
     Key::from(key.to_bytes().as_slice())
 }
 
-/// Prefix of every record of one request family.
 pub fn family_prefix(family: &JobFamilyId) -> Key {
     Key::from(family.to_bytes().as_slice())
 }

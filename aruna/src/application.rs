@@ -20,14 +20,12 @@ pub enum ProcessOutcome {
     /// The node drained and stopped normally.
     Stopped,
     /// The node stopped, but the shutdown sequence left an owner or a
-    /// persistence step unresolved; the stores were not verified clean. Also
-    /// the outcome of an accepted startup cancellation whose cleanup was
-    /// incomplete.
+    /// persistence step unresolved, so the stores were not verified clean; also
+    /// an accepted startup cancellation whose cleanup was incomplete.
     StoppedIncomplete,
-    /// The operator asked to stop before startup completed; no later phase
-    /// was admitted and the ordered cleanup released every acquired owner. A
-    /// stop whose cleanup left an owner unresolved maps to
-    /// [`ProcessOutcome::StoppedIncomplete`] instead.
+    /// The operator asked to stop before startup completed; no later phase was
+    /// admitted and the ordered cleanup released every acquired owner. An
+    /// incomplete cleanup maps to [`ProcessOutcome::StoppedIncomplete`] instead.
     StartupCancelled,
     /// Ingress failed before any signal; the node shut down because of it.
     ServerFailure(String),
@@ -485,10 +483,8 @@ fn cancellation_outcome(cleanup: &ShutdownOutcome) -> ProcessOutcome {
 }
 
 /// Runs the ordered teardown for everything acquired before background work,
-/// including bound listeners. The caller decides whether the stop is a
-/// cancellation or a failure; every early drain keeps the second-signal policy.
-/// Returns what the sequence accomplished so a cancellation site can report a
-/// complete release and an incomplete one distinctly.
+/// including bound listeners, and arms escalation before the drain. The returned
+/// outcome distinguishes a complete release from an incomplete one.
 async fn release_unready(
     signals: &mut SignalTasks,
     resources: NodeResources,
@@ -1125,11 +1121,9 @@ mod tests {
         }
     }
 
-    // The acquisition, realm-preparation, listener-binding, and
-    // background-start cancellations all map through `cancellation_outcome`; a
-    // real complete sequence is the clean cancellation and a real incomplete
-    // one is the nonzero incomplete stop, so no accepted stop can report
-    // success after a cleanup that left an owner unresolved.
+    // Every accepted-stop path maps through `cancellation_outcome`: a complete
+    // sequence is a clean cancellation, an incomplete one the nonzero stop, so
+    // an unresolved owner can never report success.
     #[tokio::test]
     async fn cancellation_requires_cleanup() {
         let dir = tempfile::tempdir().expect("temp dir");

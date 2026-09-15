@@ -21,7 +21,7 @@ pub const PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const DEFER_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// Retry interval for a held shard topic the local node could not pull yet (no
-/// genesis or co-holder served it). The base matches `QUEUE_RETRY_BASE_MS` because
+/// genesis or co-holder served it). The base matches `RETRY_BASE_MS` because
 /// admission is a gossip round away; the pull is join-only, so it cannot fork.
 pub const PULL_RETRY_AFTER: Duration = Duration::from_millis(250);
 

@@ -92,9 +92,7 @@ impl Acquired {
 
     /// Runs the ordered teardown for the acquired subset: admissions, tasks,
     /// jobs, background, network, metadata, blob, storage. The ops task and
-    /// driver context join after it; the sampler stops before storage closes.
-    /// Returns what the ordered sequence accomplished, so only a complete
-    /// outcome reports a clean release.
+    /// driver context follow it; only a complete outcome reports a clean release.
     pub(crate) async fn cleanup(self, grace: Duration) -> ShutdownOutcome {
         info!("Startup stopped early; releasing the acquired resources");
         let ops = self.ops_handle;
@@ -242,12 +240,8 @@ pub(crate) async fn acquire(
 }
 
 /// Acquires the node resources from parsed settings and an already-open store,
-/// so identity loading, enrollment, and later stages run inside the explicit
-/// cleanup boundary. `Ok(None)` means a stop released exactly the acquired set
-/// and every ordered teardown step completed; an incomplete release is a typed
-/// error instead. `on_drain` runs before every cleanup this acquisition enters,
-/// so the caller arms its escalation policy for every drain, not only the
-/// normal shutdown.
+/// so later stages share one cleanup boundary. `Ok(None)` is a complete release,
+/// a partial one is a typed error; `on_drain` arms escalation before each drain.
 pub(crate) async fn acquire_with_storage(
     settings: Settings,
     storage_handle: aruna_storage::StorageHandle,

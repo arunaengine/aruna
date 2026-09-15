@@ -105,11 +105,9 @@ pub struct MonitoringState {
     metrics: Arc<NodeMetrics>,
     readiness: Readiness,
     recovery: RecoveryStatus,
-    /// The queue-lag sampler owner: cancel and completion are held together, so
-    /// stopping it always releases its driver context. [`Self::stop_queue_refresher`]
-    /// keeps the owner in place while awaiting, so a caller cancelled mid-wait
-    /// releases the lock and a later call resumes on the same owner. The ops
-    /// HTTP task drains separately.
+    /// The queue-lag sampler owner. It stays in place while a stop awaits, so a
+    /// caller cancelled mid-wait releases the lock and a later call resumes on
+    /// the same owner. The ops HTTP task drains separately.
     queue_refresher: tokio::sync::Mutex<Option<QueueRefresher>>,
 }
 
@@ -154,12 +152,9 @@ impl MonitoringState {
         })
     }
 
-    /// Cancels the queue-lag sampler and awaits its completion before returning.
-    /// Call before the storage close on any teardown path; a later call sees the
-    /// remembered completion. The owner stays in place across the await, so if
-    /// this caller is dropped mid-wait the lock is released and a later or
-    /// concurrent caller resumes waiting on the same owner. The ops HTTP endpoint
-    /// is owned by its own task and untouched.
+    /// Cancels the queue-lag sampler and awaits its completion; call before the
+    /// storage close on any teardown path. The owner stays in place across the
+    /// await, so a caller dropped mid-wait cannot lose it.
     pub async fn stop_queue_refresher(&self) {
         let mut guard = self.queue_refresher.lock().await;
         let Some(refresher) = guard.as_mut() else {
