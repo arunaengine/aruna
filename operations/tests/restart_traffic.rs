@@ -16,19 +16,18 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
+use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::projector::project_logged_events;
 use aruna_operations::node::startup::{SHARED_RESTORE_TOPIC_COUNT, restore_shard_subscriptions};
 use aruna_operations::realm::announce_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
-use aruna_operations::realm::get_nodes::GetRealmNodesOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::incoming::install_and_start_task_queues;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -55,7 +54,7 @@ struct IncidentFixture {
     nodes: Vec<TestNode>,
     secrets: [iroh::SecretKey; 3],
     config: RealmConfigDocument,
-    target: aruna_core::document::DocumentSyncTarget,
+    target: aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::PlacementRef,
 }
 
@@ -65,7 +64,7 @@ struct OutageFixture {
     dir_two: TempDir,
     secrets: [iroh::SecretKey; 3],
     config: RealmConfigDocument,
-    target: aruna_core::document::DocumentSyncTarget,
+    target: aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::PlacementRef,
     group_id: GroupId,
     document_id: Ulid,
@@ -182,7 +181,7 @@ async fn announce_restart_nodes(
     aux: &AuxRuntime,
 ) -> Result<(), BoxError> {
     for (index, node) in nodes.iter().enumerate() {
-        let op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        let op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id: node.net.node_id(),
             schedule_refresh: true,
@@ -251,7 +250,7 @@ async fn restart_node(
         other.net.add_peer_addr(node2.net.endpoint_addr()).await;
     }
     drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id: node2.net.node_id(),
             schedule_refresh: true,
@@ -324,12 +323,9 @@ async fn run_writer(
 
     // Mint from the replicated realm config; the id is no longer in the path,
     // since the path now feeds the bucket the id embeds.
-    let config = drive(
-        GetRealmConfigOperation::new(realm_id),
-        targets[0].1.as_ref(),
-    )
-    .await
-    .map_err(|error| format!("realm config load failed: {error:?}"))?;
+    let config = drive(GetConfigOperation::new(realm_id), targets[0].1.as_ref())
+        .await
+        .map_err(|error| format!("realm config load failed: {error:?}"))?;
 
     for index in 0..count {
         let slot = index % targets.len();
@@ -344,13 +340,13 @@ async fn run_writer(
             .map_err(|error| format!("mint failed index={index}: {error:?}"))?
             .as_ulid();
         let result = drive(
-            CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
                 actor,
                 group_id,
                 document_id,
                 document_path,
                 public: true,
-                payload: CreateMetadataDocumentPayload::Scaffold {
+                payload: CreateDocumentPayload::Scaffold {
                     name: format!("Restart Dataset {index}"),
                     description: "Restart traffic document".to_string(),
                     date_published: "2026-07-07".to_string(),
@@ -407,7 +403,7 @@ async fn wait_for_visibility(
             let mut still_missing = Vec::new();
             for &(group_id, document_id) in missing.iter() {
                 if drive(
-                    GetMetadataDocumentOperation::new(group_id, document_id),
+                    GetDocumentOperation::new(group_id, document_id),
                     context.as_ref(),
                 )
                 .await
@@ -444,7 +440,7 @@ async fn wait_sample_visible(
         let mut pending = 0;
         for &(group_id, document_id) in pairs {
             if drive(
-                GetMetadataDocumentOperation::new(group_id, document_id),
+                GetDocumentOperation::new(group_id, document_id),
                 context.as_ref(),
             )
             .await
@@ -512,7 +508,7 @@ async fn spawn_node_with(
         aruna_operations::jobs::runtime::JobsRuntime::new(),
         &shutdown,
     );
-    install_and_start_task_queues(
+    start_task_queues(
         context.clone(),
         task_handle.clone(),
         aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -620,12 +616,7 @@ async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Result
     wait_for_convergence("realm nodes did not converge", || async {
         let mut pending = 0;
         for node in nodes {
-            match drive(
-                GetRealmNodesOperation::new(*realm_id),
-                node.context.as_ref(),
-            )
-            .await
-            {
+            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
                 Ok(realm_nodes) if realm_nodes == expected => {}
                 _ => pending += 1,
             }
@@ -752,7 +743,7 @@ fn spawn_recovery(
 }
 
 async fn prepare_outage(realm_id: RealmId, record_count: usize) -> Result<OutageFixture, BoxError> {
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
 
     let IncidentFixture {
         nodes,
@@ -762,7 +753,7 @@ async fn prepare_outage(realm_id: RealmId, record_count: usize) -> Result<Outage
         placement,
     } = incident_fixture(realm_id).await?;
     let (group_id, document_id) = match &target {
-        DocumentSyncTarget::MetadataRegistry {
+        DocumentTarget::MetadataRegistry {
             group_id,
             document_id,
         } => (*group_id, *document_id),
@@ -971,13 +962,13 @@ fn incident_target(
     strategy: &aruna_core::structs::PlacementStrategy,
 ) -> Result<
     (
-        aruna_core::document::DocumentSyncTarget,
+        aruna_core::document::DocumentTarget,
         aruna_core::structs::PlacementRef,
     ),
     BoxError,
 > {
     use aruna_core::MetaResourceId;
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
 
     let placement = aruna_core::structs::PlacementRef {
@@ -992,7 +983,7 @@ fn incident_target(
     )?
     .into();
     Ok((
-        DocumentSyncTarget::MetadataRegistry {
+        DocumentTarget::MetadataRegistry {
             group_id: Ulid::from_parts(1, 1),
             document_id,
         },
@@ -1004,7 +995,7 @@ fn ensure_incident_topics(
     realm_id: RealmId,
     nodes: &[TestNode],
     strategy: &aruna_core::structs::PlacementStrategy,
-    target: &aruna_core::document::DocumentSyncTarget,
+    target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::PlacementRef,
 ) -> Result<(), BoxError> {
     let local = nodes[0].net.node_id();
@@ -1068,7 +1059,7 @@ async fn seed_outbox(
     node: &TestNode,
     realm_id: RealmId,
     local: aruna_core::NodeId,
-    target: &aruna_core::document::DocumentSyncTarget,
+    target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::PlacementRef,
     holders: &[aruna_core::NodeId],
     record_count: usize,
@@ -1108,13 +1099,13 @@ async fn seed_outbox(
 fn incident_record(
     realm_id: RealmId,
     local: aruna_core::NodeId,
-    target: &aruna_core::document::DocumentSyncTarget,
+    target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::PlacementRef,
     holders: &[aruna_core::NodeId],
     index: usize,
-) -> Result<aruna_core::document::DocumentSyncOutboxRecord, BoxError> {
+) -> Result<aruna_core::document::DocumentOutboxRecord, BoxError> {
     use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
+        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision,
     };
     if index >= INCIDENT_METADATA_RECORDS {
         return incident_delete(local, placement, holders, index);
@@ -1126,7 +1117,7 @@ fn incident_record(
         actor: local,
         updated_at_ms: index as u64,
     });
-    let change = DocumentSyncChange {
+    let change = DocumentChange {
         base,
         current: DocumentSyncRevision {
             generation: (index + 1) as u64,
@@ -1134,7 +1125,7 @@ fn incident_record(
             actor: local,
             updated_at_ms: (index + 1) as u64,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement,
     };
     let registry = incident_registry(realm_id, target, placement, holders, index)?;
@@ -1144,7 +1135,7 @@ fn incident_record(
             local,
             target.clone(),
             holders.to_vec(),
-            DocumentSyncOutboxEvent::Upsert {
+            DocumentOutboxEvent::Upsert {
                 bytes: postcard::to_allocvec(&registry)?,
                 change,
             },
@@ -1159,13 +1150,13 @@ fn incident_delete(
     placement: aruna_core::structs::PlacementRef,
     holders: &[aruna_core::NodeId],
     index: usize,
-) -> Result<aruna_core::document::DocumentSyncOutboxRecord, BoxError> {
+) -> Result<aruna_core::document::DocumentOutboxRecord, BoxError> {
     use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
-        DocumentSyncTarget,
+        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision,
+        DocumentTarget,
     };
     let event_id = Ulid::from_parts(3, (index + 1) as u128);
-    let change = DocumentSyncChange {
+    let change = DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -1173,10 +1164,10 @@ fn incident_delete(
             actor: local,
             updated_at_ms: (index + 1) as u64,
         },
-        kind: DocumentSyncChangeKind::Delete,
+        kind: DocumentChangeKind::Delete,
         placement,
     };
-    let target = DocumentSyncTarget::MetadataGraphLifecycle {
+    let target = DocumentTarget::MetadataGraphLifecycle {
         graph_iri: format!("https://aruna.example/incident/graph/{index}"),
     };
     Ok(
@@ -1185,7 +1176,7 @@ fn incident_delete(
             local,
             target,
             holders.to_vec(),
-            DocumentSyncOutboxEvent::Delete { change },
+            DocumentOutboxEvent::Delete { change },
             aruna_core::structs::PlacementRef::NIL,
             false,
         ),
@@ -1194,16 +1185,16 @@ fn incident_delete(
 
 fn incident_registry(
     realm_id: RealmId,
-    target: &aruna_core::document::DocumentSyncTarget,
+    target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::PlacementRef,
     holders: &[aruna_core::NodeId],
     index: usize,
 ) -> Result<aruna_core::structs::MetadataRegistryRecord, BoxError> {
-    use aruna_core::document::DocumentSyncTarget;
+    use aruna_core::document::DocumentTarget;
     use aruna_core::structs::MetadataRegistryRecord;
 
     let (group_id, document_id) = match target {
-        DocumentSyncTarget::MetadataRegistry {
+        DocumentTarget::MetadataRegistry {
             group_id,
             document_id,
         } => (*group_id, *document_id),

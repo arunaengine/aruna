@@ -3,8 +3,8 @@
 
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent, DocumentSyncNetEvent,
-    DocumentSyncPublish, DocumentSyncRevision, DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentEvent, DocumentNetEvent, DocumentSyncPublish,
+    DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -67,14 +67,14 @@ async fn reset_cursor(storage: &StorageHandle, topic: &[u8]) {
     .await;
 }
 
-fn seed_event(index: u64) -> DocumentSyncEvent {
-    DocumentSyncEvent::Upsert {
+fn seed_event(index: u64) -> DocumentEvent {
+    DocumentEvent::Upsert {
         event_id: Ulid::from_parts(index, 1),
-        target: DocumentSyncTarget::RealmConfig {
+        target: DocumentTarget::RealmConfig {
             realm_id: RealmId::from_bytes([9; 32]),
         },
         bytes: vec![7; 16],
-        change: DocumentSyncChange {
+        change: DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
@@ -82,7 +82,7 @@ fn seed_event(index: u64) -> DocumentSyncEvent {
                 actor: iroh::SecretKey::from_bytes(&[1; 32]).public(),
                 updated_at_ms: 1,
             },
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement: PlacementRef::NIL,
         },
     }
@@ -181,7 +181,7 @@ async fn capacity_blocks_releases() {
     assert_eq!(read_quarantine_usage(&ctx).await.unwrap(), seeded);
 
     // A node info document that claims another node is a permanent reject.
-    let target = DocumentSyncTarget::NodeInfo {
+    let target = DocumentTarget::NodeInfo {
         realm_id,
         node_id: local_node,
     };
@@ -193,7 +193,7 @@ async fn capacity_blocks_releases() {
                 event_id,
                 target: target.clone(),
                 bytes: node_info_bytes(iroh::SecretKey::from_bytes(&[5; 32]).public()),
-                change: DocumentSyncChange {
+                change: DocumentChange {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: 1,
@@ -201,7 +201,7 @@ async fn capacity_blocks_releases() {
                         actor: local_node,
                         updated_at_ms: 1,
                     },
-                    kind: DocumentSyncChangeKind::Upsert,
+                    kind: DocumentChangeKind::Upsert,
                     placement: PlacementRef::NIL,
                 },
                 allow_genesis: true,
@@ -210,7 +210,7 @@ async fn capacity_blocks_releases() {
         )
         .await;
     assert!(
-        matches!(published, DocumentSyncNetEvent::DocumentsPublished { .. }),
+        matches!(published, DocumentNetEvent::DocumentsPublished { .. }),
         "publish failed: {published:?}"
     );
 

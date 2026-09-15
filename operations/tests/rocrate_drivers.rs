@@ -32,7 +32,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::connectors::create_connector::{
-    CreateSourceConnectorInput, CreateSourceConnectorOperation,
+    SourceConnectorInput, SourceConnectorOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
@@ -87,7 +87,7 @@ fn job_id() -> JobId {
 
 const ELABFTW: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/data/eln/elabftw.eln"
+    "/tests/fixtures/elabftw.eln"
 ));
 const BUCKET: &str = "rocrate-target";
 const TARGET_KEY: &str = "imported/data.txt";
@@ -1754,7 +1754,7 @@ async fn create_connector(
     endpoint: &str,
 ) -> Result<Ulid, Box<dyn std::error::Error>> {
     let result = drive(
-        CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+        SourceConnectorOperation::new(SourceConnectorInput {
             group_id: fixture.group_id,
             created_by: fixture.actor.user_id,
             name: "driver-http".to_string(),

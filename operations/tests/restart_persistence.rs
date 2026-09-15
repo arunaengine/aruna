@@ -14,11 +14,10 @@ use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::structs::{Actor, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::get_document::GetMetadataDocumentOperation;
-use aruna_operations::metadata::list_documents::ListMetadataDocumentsOperation;
+use aruna_operations::metadata::get_document::GetDocumentOperation;
+use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
@@ -59,11 +58,7 @@ async fn restart_persists_flush() -> Result<(), Box<dyn std::error::Error>> {
 
     // The child mints a structured document id at create time, so the parent
     // rediscovers it from the persisted registry rather than assuming a fixed id.
-    let documents = drive(
-        ListMetadataDocumentsOperation::new(group_id()),
-        context.as_ref(),
-    )
-    .await?;
+    let documents = drive(ListDocumentsOperation::new(group_id()), context.as_ref()).await?;
     let record = documents
         .first()
         .ok_or("no metadata document survived the restart")?;
@@ -72,7 +67,7 @@ async fn restart_persists_flush() -> Result<(), Box<dyn std::error::Error>> {
     assert_graph_exists(&context, &graph_iri).await?;
 
     let document = drive(
-        GetMetadataDocumentOperation::new(group_id(), document_id),
+        GetDocumentOperation::new(group_id(), document_id),
         context.as_ref(),
     )
     .await?;
@@ -115,13 +110,13 @@ async fn create_materialized_document(
     let document_id =
         mint_local_document(config, &actor, group_id(), "datasets/restart-persistence")?.as_ulid();
     let created = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor,
             group_id: group_id(),
             document_id,
             document_path: "datasets/restart-persistence".to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::Scaffold {
+            payload: CreateDocumentPayload::Scaffold {
                 name: document_name().to_string(),
                 description: "Restart persistence contract".to_string(),
                 date_published: "2026-01-01".to_string(),

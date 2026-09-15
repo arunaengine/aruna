@@ -31,22 +31,20 @@ use aruna_operations::jobs::store::{
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::complete_upload::{
-    CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOperation,
+    CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
 use aruna_operations::s3::copy_object::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
-use aruna_operations::s3::copy_part::{UploadPartCopyError, UploadPartCopyInput, upload_part_copy};
+use aruna_operations::s3::copy_part::{PartCopyError, PartCopyInput, upload_part_copy};
 use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::create_upload::{
-    CreateMultipartUploadError, CreateMultipartUploadInput, CreateMultipartUploadOperation,
+    CreateMultipartError, CreateMultipartInput, CreateMultipartOperation,
 };
 use aruna_operations::s3::delete_object::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
 };
-use aruna_operations::s3::delete_objects::{
-    DeleteObjectsEntry, DeleteObjectsInput, delete_objects,
-};
+use aruna_operations::s3::delete_objects::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
 use aruna_operations::s3::purge_fence::{PurgeFenceError, acquire_purge_fence, fence_key};
 use aruna_operations::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
@@ -255,7 +253,7 @@ async fn scoped_fence_isolates() {
     assert!(matches!(
         upload_part_copy(
             &context.driver,
-            UploadPartCopyInput {
+            PartCopyInput {
                 source_bucket: "bucket".to_string(),
                 source_key: "source.txt".to_string(),
                 source_version_id: None,
@@ -272,14 +270,14 @@ async fn scoped_fence_isolates() {
             },
         )
         .await,
-        Err(UploadPartCopyError::UploadPart(
-            UploadPartError::PurgeFence(PurgeFenceError::Suspended)
-        ))
+        Err(PartCopyError::UploadPart(UploadPartError::PurgeFence(
+            PurgeFenceError::Suspended
+        )))
     ));
 
     assert!(matches!(
         drive(
-            CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+            CreateMultipartOperation::new(CreateMultipartInput {
                 bucket: "bucket".to_string(),
                 key: "blocked/new-upload.bin".to_string(),
                 group_id: context.group_id,
@@ -290,9 +288,7 @@ async fn scoped_fence_isolates() {
             &context.driver,
         )
         .await,
-        Err(CreateMultipartUploadError::PurgeFence(
-            PurgeFenceError::Suspended
-        ))
+        Err(CreateMultipartError::PurgeFence(PurgeFenceError::Suspended))
     ));
 
     assert!(matches!(
@@ -317,7 +313,7 @@ async fn scoped_fence_isolates() {
 
     assert!(matches!(
         drive(
-            CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+            CompleteUploadOperation::new(CompleteUploadInput {
                 bucket: upload.bucket.clone(),
                 key: upload.key.clone(),
                 upload_id: upload.upload_id,
@@ -336,9 +332,7 @@ async fn scoped_fence_isolates() {
             &context.driver,
         )
         .await,
-        Err(CompleteMultipartUploadError::PurgeFence(
-            PurgeFenceError::Suspended
-        ))
+        Err(CompleteUploadError::PurgeFence(PurgeFenceError::Suspended))
     ));
 
     assert!(matches!(
@@ -359,9 +353,9 @@ async fn scoped_fence_isolates() {
     ));
     let batch = delete_objects(
         &context.driver,
-        DeleteObjectsInput {
+        BulkDeleteInput {
             bucket: "bucket".to_string(),
-            entries: vec![DeleteObjectsEntry {
+            entries: vec![BulkDeleteEntry {
                 key: "blocked/batch-delete.txt".to_string(),
                 version_id: None,
             }],
@@ -379,7 +373,7 @@ async fn scoped_fence_isolates() {
     ));
 
     let outside_upload = drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: "bucket".to_string(),
             key: "allowed/outside.bin".to_string(),
             group_id: context.group_id,

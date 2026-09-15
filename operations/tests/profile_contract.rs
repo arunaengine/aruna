@@ -10,8 +10,8 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataEffect, MetadataError, MetadataEvent, MetadataProfileValidationSeverity,
-    MetadataProfileValidationState, PROCESS_RUN_CRATE_PROFILE_IRI,
+    MetadataEffect, MetadataError, MetadataEvent, PROCESS_RUN_CRATE_PROFILE_IRI,
+    ProfileValidationSeverity, ProfileValidationState,
 };
 use aruna_core::storage_entries::event_log_prefix;
 use aruna_core::structs::{
@@ -22,8 +22,8 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
+    mint_local_document,
 };
 use aruna_operations::metadata::forward::{
     admits_profile_peer, export_profile_local, route_metadata_create,
@@ -33,8 +33,8 @@ use aruna_operations::metadata::profile_validation::{
     revalidate_current,
 };
 use aruna_operations::metadata::update_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
-    UpdateMetadataDocumentOperation, update_metadata_document,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    update_metadata_document,
 };
 use aruna_operations::metadata::{
     MetadataHandle, MetadataHandleOptions, materialization_queue::process_materialization_batch,
@@ -76,8 +76,7 @@ async fn tagged_create_retryable() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await
     .expect_err("missing identifier must be rejected");
-    let CreateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings)) =
-        error
+    let CreateDocumentError::MetadataError(MetadataError::ProfileValidation(findings)) = error
     else {
         panic!("expected a structured Profile rejection");
     };
@@ -99,7 +98,7 @@ async fn tagged_create_retryable() -> Result<(), Box<dyn std::error::Error>> {
     let status = load_validation_status(test.context.as_ref(), document_id, None)
         .await?
         .expect("create commits status atomically");
-    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.state, ProfileValidationState::Valid);
     assert_eq!(status.dataset_revision, created.event_id);
     assert_eq!(status.profile_id, Some(profile_id));
     assert_eq!(status.profile_revision, Some(profile_revision.to_string()));
@@ -204,8 +203,7 @@ async fn constraint_rejects_atomically() -> Result<(), Box<dyn std::error::Error
     )
     .await
     .expect_err("unsupported registered constraint must fail closed");
-    let CreateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings)) =
-        error
+    let CreateDocumentError::MetadataError(MetadataError::ProfileValidation(findings)) = error
     else {
         panic!("expected structured Profile validation findings");
     };
@@ -257,8 +255,7 @@ async fn enforces_core_constraints() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await
     .expect_err("a short identifier and a missing alternative must be rejected");
-    let CreateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings)) =
-        error
+    let CreateDocumentError::MetadataError(MetadataError::ProfileValidation(findings)) = error
     else {
         panic!("expected structured Profile validation findings");
     };
@@ -315,11 +312,11 @@ async fn warning_severity_accepts() -> Result<(), Box<dyn std::error::Error>> {
     let status = load_validation_status(test.context.as_ref(), document_id, None)
         .await?
         .expect("status is durable");
-    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.state, ProfileValidationState::Valid);
     assert_eq!(status.findings.len(), 1, "{:#?}", status.findings);
     assert_eq!(
         status.findings[0].severity,
-        MetadataProfileValidationSeverity::Warning
+        ProfileValidationSeverity::Warning
     );
     Ok(())
 }
@@ -355,7 +352,7 @@ async fn spans_crate_versions() -> Result<(), Box<dyn std::error::Error>> {
         let status = load_validation_status(test.context.as_ref(), document_id, None)
             .await?
             .expect("status is durable");
-        assert_eq!(status.state, MetadataProfileValidationState::Valid);
+        assert_eq!(status.state, ProfileValidationState::Valid);
     }
     Ok(())
 }
@@ -375,10 +372,7 @@ async fn preview_stores_nothing() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert!(!rejected.accepted());
-    assert_eq!(
-        rejected.status.state,
-        MetadataProfileValidationState::Invalid
-    );
+    assert_eq!(rejected.status.state, ProfileValidationState::Invalid);
     assert!(rejected.structural_violations.is_empty());
     assert!(
         rejected.status.findings.iter().any(|finding| {
@@ -397,7 +391,7 @@ async fn preview_stores_nothing() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert!(accepted.accepted());
-    assert_eq!(accepted.status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(accepted.status.state, ProfileValidationState::Valid);
 
     assert!(!graph_exists(&test, draft_id).await?);
     assert_eq!(event_count(&test, draft_id).await?, 0);
@@ -418,10 +412,7 @@ async fn builtin_profile_enforced() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert!(!rejected.accepted());
-    assert_eq!(
-        rejected.status.state,
-        MetadataProfileValidationState::Invalid
-    );
+    assert_eq!(rejected.status.state, ProfileValidationState::Invalid);
     assert_eq!(rejected.status.profile_id, None);
     assert_eq!(
         rejected.status.profile_iri.as_deref(),
@@ -431,7 +422,7 @@ async fn builtin_profile_enforced() -> Result<(), Box<dyn std::error::Error>> {
     assert!(
         rejected.status.findings.iter().any(|finding| {
             finding.path.as_deref() == Some("http://schema.org/instrument")
-                && finding.severity == MetadataProfileValidationSeverity::Violation
+                && finding.severity == ProfileValidationSeverity::Violation
         }),
         "{:#?}",
         rejected.status.findings
@@ -459,7 +450,7 @@ async fn builtin_profile_enforced() -> Result<(), Box<dyn std::error::Error>> {
     assert!(
         accepted.status.findings.iter().any(|finding| {
             finding.path.as_deref() == Some("http://schema.org/softwareVersion")
-                && finding.severity == MetadataProfileValidationSeverity::Warning
+                && finding.severity == ProfileValidationSeverity::Warning
         }),
         "{:#?}",
         accepted.status.findings
@@ -476,7 +467,7 @@ async fn builtin_profile_enforced() -> Result<(), Box<dyn std::error::Error>> {
     let status = load_validation_status(test.context.as_ref(), document_id, None)
         .await?
         .expect("a built-in verdict is durable");
-    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.state, ProfileValidationState::Valid);
     assert_eq!(status.profile_revision.as_deref(), Some("builtin"));
     Ok(())
 }
@@ -502,10 +493,7 @@ async fn preview_reports_structural() -> Result<(), Box<dyn std::error::Error>> 
     .to_string();
     let preview = preview_submission(test.context.as_ref(), Some(group_id), &jsonld).await?;
     assert!(!preview.accepted());
-    assert_eq!(
-        preview.status.state,
-        MetadataProfileValidationState::NotProfiled
-    );
+    assert_eq!(preview.status.state, ProfileValidationState::NotProfiled);
     assert!(
         !preview.structural_violations.is_empty(),
         "an incomplete root data entity must be reported"
@@ -542,8 +530,7 @@ async fn create_refuses_structural() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await
     .expect_err("an incomplete root data entity must be rejected");
-    let CreateMetadataDocumentError::MetadataError(MetadataError::Validation(violations)) = error
-    else {
+    let CreateDocumentError::MetadataError(MetadataError::Validation(violations)) = error else {
         panic!("expected structural violations");
     };
     assert!(!violations.is_empty());
@@ -643,12 +630,12 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
     let tag = profile_public_iri(profile_id);
 
     let error = update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: test.actor.clone(),
             group_id,
             document_id,
             public: true,
-            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: crate_json(document_id, Some(&tag), false, true),
             },
         }),
@@ -658,7 +645,7 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
     .expect_err("invalid replacement must fail before commit");
     assert!(matches!(
         error,
-        UpdateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(_))
+        UpdateDocumentError::MetadataError(MetadataError::ProfileValidation(_))
     ));
     assert_eq!(event_count(&test, document_id).await?, 1);
     let status = load_validation_status(test.context.as_ref(), document_id, None)
@@ -667,12 +654,12 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(status.dataset_revision, created.event_id);
 
     let updated = update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: test.actor.clone(),
             group_id,
             document_id,
             public: true,
-            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: crate_json(document_id, Some(&tag), true, true),
             },
         }),
@@ -767,7 +754,7 @@ async fn accepts_group_profile() -> Result<(), Box<dyn std::error::Error>> {
     let status = load_validation_status(test.context.as_ref(), document_id, None)
         .await?
         .expect("an accepted create commits its status");
-    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.state, ProfileValidationState::Valid);
     assert_eq!(status.profile_id, Some(profile_id));
     assert_eq!(status.profile_revision, Some(revision.to_string()));
     assert_eq!(status.dataset_revision, created.event_id);
@@ -830,7 +817,7 @@ async fn public_crosses_groups() -> Result<(), Box<dyn std::error::Error>> {
     let status = load_validation_status(test.context.as_ref(), document_id, None)
         .await?
         .expect("an accepted create commits its status");
-    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.state, ProfileValidationState::Valid);
     assert_eq!(status.profile_revision, Some(revision.to_string()));
     Ok(())
 }
@@ -890,7 +877,7 @@ async fn render_resolves_group() -> Result<(), Box<dyn std::error::Error>> {
     let status = load_validation_status(test.context.as_ref(), document_id, None)
         .await?
         .expect("materialization writes a status");
-    assert_eq!(status.state, MetadataProfileValidationState::Valid);
+    assert_eq!(status.state, ProfileValidationState::Valid);
     assert_eq!(status.profile_id, Some(profile_id));
     Ok(())
 }
@@ -1004,12 +991,12 @@ async fn make_private(
     profile_id: Ulid,
 ) -> Result<Ulid, Box<dyn std::error::Error>> {
     let updated = update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: test.actor.clone(),
             group_id,
             document_id: profile_id,
             public: false,
-            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: profile_json(profile_id, minimum_shape()),
             },
         }),
@@ -1042,12 +1029,12 @@ async fn revision_change_repins() -> Result<(), Box<dyn std::error::Error>> {
     drain_projection_queue(test.context.as_ref()).await?;
 
     let updated_profile = update_metadata_document(
-        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+        UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: test.actor.clone(),
             group_id,
             document_id: profile_id,
             public: true,
-            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+            mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: profile_json(profile_id, minimum_shape()),
             },
         }),
@@ -1057,7 +1044,7 @@ async fn revision_change_repins() -> Result<(), Box<dyn std::error::Error>> {
     assert_ne!(updated_profile.last_event_id, original_revision);
 
     let stale = current_validation_status(test.context.as_ref(), &created.record).await?;
-    assert_eq!(stale.state, MetadataProfileValidationState::Stale);
+    assert_eq!(stale.state, ProfileValidationState::Stale);
     assert_eq!(
         stale.stale_reason.as_deref(),
         Some("profile_revision_changed")
@@ -1065,7 +1052,7 @@ async fn revision_change_repins() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(stale.profile_revision, Some(original_revision.to_string()));
 
     let refreshed = revalidate_current(test.context.as_ref(), &created.record).await?;
-    assert_eq!(refreshed.state, MetadataProfileValidationState::Valid);
+    assert_eq!(refreshed.state, ProfileValidationState::Valid);
     assert_eq!(
         refreshed.profile_revision,
         Some(updated_profile.last_event_id.to_string())
@@ -1074,9 +1061,8 @@ async fn revision_change_repins() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn assert_profile_code(error: CreateMetadataDocumentError, code: &str) {
-    let CreateMetadataDocumentError::MetadataError(MetadataError::ProfileValidation(findings)) =
-        error
+fn assert_profile_code(error: CreateDocumentError, code: &str) {
+    let CreateDocumentError::MetadataError(MetadataError::ProfileValidation(findings)) = error
     else {
         panic!("expected structured Profile validation findings");
     };
@@ -1377,18 +1363,16 @@ async fn create_crate(
     document_id: Ulid,
     path: &str,
     jsonld: String,
-) -> Result<
-    aruna_operations::metadata::create_document::CreateMetadataDocumentResult,
-    CreateMetadataDocumentError,
-> {
+) -> Result<aruna_operations::metadata::create_document::CreateDocumentResult, CreateDocumentError>
+{
     match route_metadata_create(
-        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor: test.actor.clone(),
             group_id,
             document_id,
             document_path: path.to_string(),
             public: true,
-            payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
+            payload: CreateDocumentPayload::RoCrate { jsonld },
         }),
         test.context.clone(),
         None,
@@ -1397,17 +1381,13 @@ async fn create_crate(
     {
         Ok(created) => Ok(created),
         Err(MetadataWriteError::Create(error)) => Err(error),
-        Err(error) => Err(CreateMetadataDocumentError::MetadataError(
-            MetadataError::Backend(error.to_string()),
-        )),
+        Err(error) => Err(CreateDocumentError::MetadataError(MetadataError::Backend(
+            error.to_string(),
+        ))),
     }
 }
 
-fn mint(
-    test: &TestContext,
-    group_id: Ulid,
-    path: &str,
-) -> Result<Ulid, CreateMetadataDocumentError> {
+fn mint(test: &TestContext, group_id: Ulid, path: &str) -> Result<Ulid, CreateDocumentError> {
     Ok(mint_local_document(&test.config, &test.actor, group_id, path)?.as_ulid())
 }
 

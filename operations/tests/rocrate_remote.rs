@@ -38,12 +38,11 @@ use aruna_operations::jobs::store::{
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::sync::incoming::initialize_net_incoming_for_tests;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use bytes::Bytes;
@@ -229,7 +228,7 @@ async fn setup_remote(
         &location,
     )
     .await?;
-    initialize_net_incoming_for_tests(holder.context.clone());
+    initialize_incoming_fixture(holder.context.clone());
 
     let config = seed_exporter(&exporter, holder.net.node_id(), owner, group_id, realm_id).await?;
     // Minted on the exporter so the document lands in a bucket it leads.
@@ -520,7 +519,7 @@ async fn create_document(
     jsonld: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: node.net.node_id(),
                 user_id: owner,
@@ -530,7 +529,7 @@ async fn create_document(
             document_id,
             document_path: DOC_PATH.to_string(),
             public: false,
-            payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
+            payload: CreateDocumentPayload::RoCrate { jsonld },
         }),
         node.context.as_ref(),
     )
