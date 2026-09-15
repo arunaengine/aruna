@@ -104,12 +104,12 @@ fn batch_deleted() -> Event {
     })
 }
 
-fn read_op(after: Option<u32>) -> ReadChatTurnsOperation {
-    ReadChatTurnsOperation::new(user(), CHAT.to_string(), after)
+fn read_op(after: Option<u32>) -> ReadChatOperation {
+    ReadChatOperation::new(user(), CHAT.to_string(), after)
 }
 
-fn head_op(expected: Option<u64>) -> WriteChatHeadOperation {
-    WriteChatHeadOperation::new(
+fn head_op(expected: Option<u64>) -> WriteChatOperation {
+    WriteChatOperation::new(
         user(),
         CHAT.to_string(),
         "Run QC".to_string(),
@@ -119,12 +119,12 @@ fn head_op(expected: Option<u64>) -> WriteChatHeadOperation {
     )
 }
 
-fn turn_op(seq: u32, payload: &str) -> WriteChatTurnOperation {
-    WriteChatTurnOperation::new(user(), CHAT.to_string(), seq, payload.to_string(), None, 50)
+fn turn_op(seq: u32, payload: &str) -> WriteTurnOperation {
+    WriteTurnOperation::new(user(), CHAT.to_string(), seq, payload.to_string(), None, 50)
 }
 
-fn turn_op_at(seq: u32, revision: u64) -> WriteChatTurnOperation {
-    WriteChatTurnOperation::new(
+fn turn_op_at(seq: u32, revision: u64) -> WriteTurnOperation {
+    WriteTurnOperation::new(
         user(),
         CHAT.to_string(),
         seq,
@@ -186,7 +186,7 @@ fn lists_live_heads() {
     new.updated_at = 9;
     let mut gone = head("c", 1, 5);
     gone.deleted_at = Some(11);
-    let mut operation = ListChatHeadsOperation::new(user());
+    let mut operation = ListChatOperation::new(user());
     assert!(is_iter(&operation.start(), ASSISTANT_CHAT_HEAD_KEYSPACE));
     assert!(!operation.is_complete());
     operation.step(heads_iter(&[old.clone(), gone, new.clone()]));
@@ -490,7 +490,7 @@ fn refuses_stale_revision() {
 #[test]
 fn refuses_large_turn() {
     let payload = "x".repeat(MAX_ASSISTANT_TURN_BYTES + 1);
-    let mut operation = WriteChatTurnOperation::new(user(), CHAT.to_string(), 0, payload, None, 50);
+    let mut operation = WriteTurnOperation::new(user(), CHAT.to_string(), 0, payload, None, 50);
 
     assert!(operation.start().is_empty());
     assert_eq!(
@@ -614,7 +614,7 @@ fn rejects_unexpected_events() {
     full.first_seq = 10;
     let live = || head_read(Some(&stored));
 
-    expect_unexpected(ListChatHeadsOperation::new(user()), vec![], started(), 0);
+    expect_unexpected(ListChatOperation::new(user()), vec![], started(), 0);
     expect_unexpected(read_op(None), vec![], started(), 0);
     expect_unexpected(read_op(None), vec![live()], head_read(None), 0);
 
@@ -714,7 +714,7 @@ fn aborts_on_error() {
     assert_eq!(delete.step(error()).len(), 1);
     assert!(delete.finalize().is_err());
 
-    let mut list = ListChatHeadsOperation::new(user());
+    let mut list = ListChatOperation::new(user());
     list.start();
     assert!(list.step(error()).is_empty());
     assert!(list.finalize().is_err());
@@ -753,7 +753,7 @@ fn rejects_corrupt_records() {
         ChatStoreError::Conversion(_)
     ));
 
-    let mut list = ListChatHeadsOperation::new(user());
+    let mut list = ListChatOperation::new(user());
     list.start();
     list.step(Event::Storage(StorageEvent::IterResult {
         values: vec![(head_key(user(), CHAT), vec![0xff; 3].into())],
@@ -777,7 +777,7 @@ fn finalize_needs_completion() {
         ChatStoreError::NotFinished
     );
     assert_eq!(
-        ListChatHeadsOperation::new(user()).finalize().unwrap_err(),
+        ListChatOperation::new(user()).finalize().unwrap_err(),
         ChatStoreError::NotFinished
     );
     assert_eq!(

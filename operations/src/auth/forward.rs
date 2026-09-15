@@ -10,9 +10,9 @@ use crate::forward::authorize::forward_auth_error;
 use crate::forward::transport::reject;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::handle::MetadataRequestError;
-use crate::metadata::protocol::MetadataAuthToken;
+use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::MetadataWriteAuthError;
+use crate::metadata::protocol::WriteAuthError;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::selector::select_top_peers;
 use aruna_core::NodeId;
@@ -40,7 +40,7 @@ pub(super) const TOKEN_REVOKE_DEADLINE: Duration = Duration::from_secs(15);
 pub async fn forward_token_revoke(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
-    auth_token: MetadataAuthToken,
+    auth_token: AuthToken,
     token: String,
 ) -> Result<(), MetadataApiError> {
     let Some(config) = load_realm_config(context, realm_id).await else {
@@ -106,10 +106,10 @@ where
             }
             Ok(Ok(MetadataTransportMessage::ForwardedTokenRevoked)) => return Ok(()),
             Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
-                error: MetadataWriteAuthError::Unauthorized,
+                error: WriteAuthError::Unauthorized,
             })) => return Err(MetadataApiError::Unauthorized),
             Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
-                error: MetadataWriteAuthError::Forbidden,
+                error: WriteAuthError::Forbidden,
             })) => return Err(MetadataApiError::Forbidden),
             Ok(Ok(MetadataTransportMessage::ForwardedWriteUnavailable))
             | Ok(Ok(MetadataTransportMessage::ForwardedTokenRevocationCapacity)) => continue,
@@ -162,9 +162,9 @@ pub(crate) async fn apply_token_revoke(
     let MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } = &message else {
         return reject("unexpected token revocation message");
     };
-    if !matches!(auth_token, MetadataAuthToken::Bearer(_)) {
+    if !matches!(auth_token, AuthToken::Bearer(_)) {
         return MetadataTransportMessage::ForwardedWriteDenied {
-            error: MetadataWriteAuthError::Unauthorized,
+            error: WriteAuthError::Unauthorized,
         };
     }
     let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
@@ -189,7 +189,7 @@ pub(crate) async fn apply_token_revoke(
     };
     if subject.realm_id != realm_id {
         return MetadataTransportMessage::ForwardedWriteDenied {
-            error: MetadataWriteAuthError::Forbidden,
+            error: WriteAuthError::Forbidden,
         };
     }
     if auth.user_id != subject.user_id
@@ -239,7 +239,7 @@ mod tests {
     use super::run_revoke;
     use crate::metadata::api::MetadataApiError;
     use crate::metadata::handle::MetadataRequestError;
-    use crate::metadata::protocol::MetadataAuthToken;
+    use crate::metadata::protocol::AuthToken;
     use crate::metadata::protocol::MetadataTransportMessage;
     use aruna_core::NodeId;
     use aruna_core::auth::bearer_token_hash;
@@ -252,7 +252,7 @@ mod tests {
 
     fn revoke_message() -> MetadataTransportMessage {
         MetadataTransportMessage::ForwardTokenRevocation {
-            auth_token: MetadataAuthToken::bearer("caller-token").unwrap(),
+            auth_token: AuthToken::bearer("caller-token").unwrap(),
             token: "target-token".to_string(),
         }
     }

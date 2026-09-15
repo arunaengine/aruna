@@ -1,8 +1,6 @@
 //! Task adapter: persist the task effect first, then hand it to the handle.
-//!
-//! Persistence happens even when this node has no task handle, so a restart
-//! still sees the requested control; the missing handle is reported as an
-//! explicit task error keyed like the effect.
+//! Persistence happens even without a task handle, so a restart still sees the
+//! requested control; the missing handle is reported as an explicit task error.
 
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -47,7 +45,7 @@ mod pure_tests {
     use aruna_core::task::TaskEffect;
 
     #[test]
-    fn control_effects_name_their_timer() {
+    fn control_effects_key() {
         let key = aruna_core::task::TaskKey::RealmPresence {
             realm_id: RealmId::from_bytes([4u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[6u8; 32]).public(),

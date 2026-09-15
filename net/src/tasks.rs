@@ -116,7 +116,7 @@ pub(crate) fn spawn_effect_dispatch<E: EffectExecutor>(
 }
 
 /// Forwards inbound DHT streams into the DHT driver's bounded inbox.
-pub(crate) fn spawn_dht_inbound_forwarder(
+pub(crate) fn spawn_dht_forwarder(
     mut dht_rx: mpsc::Receiver<(SendStream, RecvStream, NodeId)>,
     dht_inbound_tx: InboundSender,
 ) -> JoinHandle<()> {
@@ -136,7 +136,7 @@ pub(crate) fn spawn_dht_inbound_forwarder(
 /// Applies admission to inbound app streams and hands them to the registered
 /// handler. The handler limit and per-device limit are both checked before any
 /// task is spawned.
-pub(crate) fn spawn_inbound_stream_dispatch(
+pub(crate) fn spawn_stream_dispatch(
     mut stream_rx: mpsc::Receiver<(Alpn, streams::BiStream, NodeId)>,
     dht: Arc<DhtHandle>,
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
@@ -275,7 +275,7 @@ mod tests {
     // dispatcher joins, the tracker still owns the running child and waits for
     // it and its response before shutdown returns.
     #[tokio::test]
-    async fn accepted_effect_cannot_escape_the_completion_boundary() {
+    async fn accepted_stays_tracked() {
         let (executor, mut started, release, completed) = controlled_executor();
         let effect_tasks = TaskTracker::new();
         let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(8);
@@ -314,7 +314,7 @@ mod tests {
     // Effects already buffered when the dispatcher is cancelled are settled by
     // being spawned under the tracker, not dropped with the receiver.
     #[tokio::test]
-    async fn queued_effects_are_settled_before_the_receiver_drops() {
+    async fn queued_effects_settled() {
         let (executor, mut started, release, completed) = controlled_executor();
         let effect_tasks = TaskTracker::new();
         let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(2);
@@ -427,7 +427,7 @@ mod tests {
     // After the dispatcher stops, the effect channel is closed: a later send is
     // rejected instead of being accepted into an unowned task.
     #[tokio::test]
-    async fn new_effects_are_rejected_after_the_dispatcher_stops() {
+    async fn late_effects_rejected() {
         let (executor, _started, _release, _completed) = controlled_executor();
         let (effect_tx, effect_rx) = mpsc::channel::<EffectHandle>(1);
         let shutdown = CancellationToken::new();

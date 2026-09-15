@@ -5,12 +5,12 @@ use crate::document_sync::{DocumentSyncService, node_to_peer};
 use crate::test_support::test_endpoint;
 use ::irokle::Storage as _;
 use aruna_core::admin_documents::{
-    AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition,
-    AdminDocumentTarget,
+    AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+    AdminRoleDefinition,
 };
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{
-    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+    DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -21,8 +21,8 @@ use aruna_core::keyspaces::{
     SYNC_QUARANTINE_KEYSPACE, SYNC_QUARANTINE_USAGE_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentDeleteRecord,
-    MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
+    GraphLifecycleRecord, MetadataDeleteRecord, MetadataEventPayload, MetadataEventRecord,
+    MetadataLifecycleRecord,
 };
 use aruna_core::storage_entries::{
     document_lifecycle_entry, document_lifecycle_key, graph_lifecycle_key, metadata_document_key,
@@ -54,7 +54,7 @@ pub(crate) const DOCUMENT_SYNC_RESTART_CHILD_TEST: &str =
     "document_sync::tests::restart::buffered_publish_child";
 
 pub(crate) fn topic(seed: u8) -> ::irokle::TopicId {
-    DocumentSyncTarget::RealmConfig {
+    DocumentTarget::RealmConfig {
         realm_id: RealmId::from_bytes([seed; 32]),
     }
     .sync_topic_id(RealmId::from_bytes([seed; 32]), &PlacementRef::NIL)
@@ -80,8 +80,8 @@ pub(crate) fn storage_at(path: &Path) -> StorageHandle {
         .expect("storage opens")
 }
 
-pub(crate) fn restart_target() -> DocumentSyncTarget {
-    DocumentSyncTarget::MetadataGraphLifecycle {
+pub(crate) fn restart_target() -> DocumentTarget {
+    DocumentTarget::MetadataGraphLifecycle {
         graph_iri: "urn:aruna:restart-contract".to_string(),
     }
 }
@@ -106,7 +106,7 @@ pub(crate) fn restart_event_id() -> Ulid {
 }
 
 pub(crate) fn restart_payload() -> Vec<u8> {
-    postcard::to_allocvec(&MetadataGraphLifecycleRecord::deleted(
+    postcard::to_allocvec(&GraphLifecycleRecord::deleted(
         "urn:aruna:restart-contract".to_string(),
         RealmId::from_bytes([99; 32]),
         Ulid::from_parts(99, 1),
@@ -116,8 +116,8 @@ pub(crate) fn restart_payload() -> Vec<u8> {
     .expect("restart payload serializes")
 }
 
-pub(crate) fn revision_change() -> DocumentSyncChange {
-    DocumentSyncChange {
+pub(crate) fn revision_change() -> DocumentChange {
+    DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -125,7 +125,7 @@ pub(crate) fn revision_change() -> DocumentSyncChange {
             actor: node(43),
             updated_at_ms: 1_727_000_000_101,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement: restart_placement(),
     }
 }
@@ -250,8 +250,8 @@ pub(crate) fn admin_role(
     name: &str,
     path: &str,
     permission: Permission,
-) -> AdminDocumentRoleDefinition {
-    AdminDocumentRoleDefinition {
+) -> AdminRoleDefinition {
+    AdminRoleDefinition {
         role_id,
         name: name.to_string(),
         permissions: BTreeMap::from([(path.to_string(), permission)]),
@@ -297,7 +297,7 @@ pub(crate) fn test_admin_event(
 }
 
 pub(crate) async fn read_user_doc(storage: &StorageHandle, user_id: UserId) -> User {
-    let target = DocumentSyncTarget::User { user_id };
+    let target = DocumentTarget::User { user_id };
     let value = read_storage_value(storage, target.storage_keyspace(), target.storage_key())
         .await
         .expect("user exists");
@@ -305,7 +305,7 @@ pub(crate) async fn read_user_doc(storage: &StorageHandle, user_id: UserId) -> U
 }
 
 pub(crate) async fn read_group_doc(storage: &StorageHandle, group_id: Ulid) -> Group {
-    let target = DocumentSyncTarget::Group { group_id };
+    let target = DocumentTarget::Group { group_id };
     let value = read_storage_value(storage, target.storage_keyspace(), target.storage_key())
         .await
         .expect("group exists");
@@ -316,7 +316,7 @@ pub(crate) async fn read_group_auth(
     storage: &StorageHandle,
     group_id: Ulid,
 ) -> GroupAuthorizationDocument {
-    let target = DocumentSyncTarget::GroupAuthorization { group_id };
+    let target = DocumentTarget::GroupAuthorization { group_id };
     let value = read_storage_value(storage, target.storage_keyspace(), target.storage_key())
         .await
         .expect("group auth doc exists");
@@ -327,7 +327,7 @@ pub(crate) async fn read_realm_auth(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> RealmAuthorizationDocument {
-    let target = DocumentSyncTarget::RealmAuthorization { realm_id };
+    let target = DocumentTarget::RealmAuthorization { realm_id };
     let value = read_storage_value(storage, target.storage_keyspace(), target.storage_key())
         .await
         .expect("realm auth doc exists");
@@ -338,7 +338,7 @@ pub(crate) async fn stored_realm_config(
     storage: &StorageHandle,
     realm_id: RealmId,
 ) -> RealmConfigDocument {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let value = read_storage_value(storage, target.storage_keyspace(), target.storage_key())
         .await
         .expect("realm config doc exists");
@@ -397,7 +397,7 @@ pub(crate) async fn read_registry_record(
 pub(crate) async fn read_graph_lifecycle(
     storage: &StorageHandle,
     graph_iri: &str,
-) -> Option<MetadataGraphLifecycleRecord> {
+) -> Option<GraphLifecycleRecord> {
     read_storage_value(
         storage,
         METADATA_GRAPH_LIFECYCLE_KEYSPACE,
@@ -409,7 +409,7 @@ pub(crate) async fn read_graph_lifecycle(
 
 pub(crate) async fn write_document_lifecycle(
     storage: &StorageHandle,
-    lifecycle: &MetadataDocumentLifecycleRecord,
+    lifecycle: &MetadataLifecycleRecord,
 ) {
     batch_write_to(
         storage,
@@ -489,9 +489,9 @@ pub(crate) fn metadata_create_event(
     updated_at_ms: u64,
     event_id: Ulid,
     actor_seed: u8,
-) -> MetadataCreateEventRecord {
+) -> MetadataEventRecord {
     let realm_id = RealmId::from_bytes([42; 32]);
-    MetadataCreateEventRecord {
+    MetadataEventRecord {
         event_id,
         record: registry_record(
             group_id,
@@ -502,7 +502,7 @@ pub(crate) fn metadata_create_event(
         ),
         user_id: UserId::local(Ulid::from_parts(90, 1), realm_id),
         node_id: node(actor_seed),
-        payload: MetadataCreateEventPayload::Scaffold {
+        payload: MetadataEventPayload::Scaffold {
             name: "Lifecycle".to_string(),
             description: "Lifecycle event".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -518,12 +518,12 @@ pub(crate) fn metadata_delete_lifecycle(
     updated_at_ms: u64,
     event_id: Ulid,
     deleted_after_event_id: Ulid,
-) -> MetadataDocumentLifecycleRecord {
+) -> MetadataLifecycleRecord {
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
-    MetadataDocumentLifecycleRecord::Delete {
-        event: MetadataDocumentDeleteRecord {
+    MetadataLifecycleRecord::Delete {
+        event: MetadataDeleteRecord {
             event_id,
-            tombstone: MetadataGraphLifecycleRecord::deleted(
+            tombstone: GraphLifecycleRecord::deleted(
                 graph_iri,
                 RealmId::from_bytes([42; 32]),
                 group_id,
@@ -536,9 +536,9 @@ pub(crate) fn metadata_delete_lifecycle(
 }
 
 pub(crate) fn metadata_lifecycle_change(
-    lifecycle: &MetadataDocumentLifecycleRecord,
+    lifecycle: &MetadataLifecycleRecord,
     actor: NodeId,
-) -> DocumentSyncChange {
+) -> DocumentChange {
     aruna_core::storage_entries::lifecycle_revision_change(
         lifecycle,
         actor,
@@ -626,7 +626,7 @@ pub(crate) async fn apply_user_conflict(
     ] {
         apply_admin_operation(
             storage,
-            DocumentSyncTarget::User { user_id },
+            DocumentTarget::User { user_id },
             test_admin_event(
                 Ulid::from_parts(2_500 + seq, 1),
                 target.clone(),
@@ -644,7 +644,7 @@ pub(crate) async fn apply_user_conflict(
 pub(crate) async fn read_document_lifecycle(
     storage: &StorageHandle,
     document_id: Ulid,
-) -> MetadataDocumentLifecycleRecord {
+) -> MetadataLifecycleRecord {
     let value = read_storage_value(
         storage,
         METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
@@ -658,8 +658,8 @@ pub(crate) async fn read_document_lifecycle(
 pub(crate) async fn read_lifecycle_revision(
     storage: &StorageHandle,
     document_id: Ulid,
-) -> DocumentSyncChange {
-    let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+) -> DocumentChange {
+    let target = DocumentTarget::MetadataDocumentLifecycle { document_id };
     let value = read_storage_value(
         storage,
         DOCUMENT_SYNC_REVISION_KEYSPACE,
@@ -732,10 +732,10 @@ pub(crate) async fn write_realm_view(
         user_id: policy_admin(config.realm_id),
         realm_id: config.realm_id,
     };
-    let config_target = DocumentSyncTarget::RealmConfig {
+    let config_target = DocumentTarget::RealmConfig {
         realm_id: config.realm_id,
     };
-    let auth_target = DocumentSyncTarget::RealmAuthorization {
+    let auth_target = DocumentTarget::RealmAuthorization {
         realm_id: config.realm_id,
     };
     let writes = vec![

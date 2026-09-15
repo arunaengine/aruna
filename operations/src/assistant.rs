@@ -9,14 +9,18 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
+#[path = "assistant_heads.rs"]
 mod heads;
+#[path = "assistant_provider.rs"]
 pub mod provider;
 #[cfg(test)]
+#[path = "assistant_tests.rs"]
 mod tests;
+#[path = "assistant_turns.rs"]
 mod turns;
 
-pub use heads::{DeleteChatOperation, ListChatHeadsOperation, WriteChatHeadOperation};
-pub use turns::{ReadChatTurnsOperation, WriteChatTurnOperation};
+pub use heads::{DeleteChatOperation, ListChatOperation, WriteChatOperation};
+pub use turns::{ReadChatOperation, WriteTurnOperation};
 
 pub const CHAT_CAP: &str = "a user may keep at most 20 chats";
 pub const TURN_CAP: &str = "a turn payload may hold at most 256 KiB";

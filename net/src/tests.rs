@@ -1,6 +1,8 @@
 use super::*;
 
-pub(crate) mod fixtures;
+#[path = "tests_document_sync.rs"]
+pub(crate) mod document_sync_support;
+
 use crate::discovery::{
     DHT_SIGNED_MAX_CLOCK_SKEW_SECS, select_signed_endpoint, validate_endpoint_announcement,
 };
@@ -49,9 +51,9 @@ fn make_announcement(
     }
 }
 
-fn test_evicted_document(seed: u8) -> DocumentSyncEvictedDocument {
+fn test_evicted_document(seed: u8) -> DocumentEvictedDocument {
     let event_id = ulid::Ulid::from_parts(seed as u64, seed as u128);
-    let change = aruna_core::document::DocumentSyncChange {
+    let change = aruna_core::document::DocumentChange {
         base: None,
         current: aruna_core::document::DocumentSyncRevision {
             generation: 1,
@@ -59,16 +61,16 @@ fn test_evicted_document(seed: u8) -> DocumentSyncEvictedDocument {
             actor: make_secret(seed).public(),
             updated_at_ms: seed as u64,
         },
-        kind: aruna_core::document::DocumentSyncChangeKind::Delete,
+        kind: aruna_core::document::DocumentChangeKind::Delete,
         placement: aruna_core::structs::PlacementRef::NIL,
     };
 
-    DocumentSyncEvictedDocument {
+    DocumentEvictedDocument {
         event_id,
-        target: DocumentSyncTarget::RealmConfig {
+        target: DocumentTarget::RealmConfig {
             realm_id: RealmId::from_bytes([seed; 32]),
         },
-        event: aruna_core::document::DocumentSyncOutboxEvent::Delete { change },
+        event: aruna_core::document::DocumentOutboxEvent::Delete { change },
         placement: aruna_core::structs::PlacementRef::NIL,
         allow_genesis: false,
     }
@@ -76,7 +78,7 @@ fn test_evicted_document(seed: u8) -> DocumentSyncEvictedDocument {
 
 #[derive(Debug)]
 struct RecordingEvictedHandler {
-    documents: tokio::sync::Mutex<Vec<DocumentSyncEvictedDocument>>,
+    documents: tokio::sync::Mutex<Vec<DocumentEvictedDocument>>,
     accepts: bool,
 }
 
@@ -99,7 +101,7 @@ impl InboundEventHandler for RecordingEvictedHandler {
     ) {
     }
 
-    async fn handle_evicted_documents(&self, documents: Vec<DocumentSyncEvictedDocument>) -> bool {
+    async fn handle_evicted_documents(&self, documents: Vec<DocumentEvictedDocument>) -> bool {
         self.documents.lock().await.extend(documents);
         self.accepts
     }
@@ -181,12 +183,12 @@ fn local_eviction(
     evicted: bool,
 ) -> ::irokle::TopicEviction {
     let event_id = ulid::Ulid::from_bytes([31; 16]);
-    let event = aruna_core::document::DocumentSyncEvent::Delete {
+    let event = aruna_core::document::DocumentEvent::Delete {
         event_id,
-        target: DocumentSyncTarget::MetadataDocumentLifecycle {
+        target: DocumentTarget::MetadataDocumentLifecycle {
             document_id: event_id,
         },
-        change: aruna_core::document::DocumentSyncChange {
+        change: aruna_core::document::DocumentChange {
             base: None,
             current: aruna_core::document::DocumentSyncRevision {
                 generation: 0,
@@ -194,7 +196,7 @@ fn local_eviction(
                 actor: make_secret(31).public(),
                 updated_at_ms: 1,
             },
-            kind: aruna_core::document::DocumentSyncChangeKind::Delete,
+            kind: aruna_core::document::DocumentChangeKind::Delete,
             placement,
         },
     };
@@ -1005,7 +1007,7 @@ async fn close_stops_accept() -> Result<()> {
 // An interrupted shutdown must not detach the child it was joining: the owner
 // keeps the handle, a resumed call joins it, and its completion runs once.
 #[tokio::test]
-async fn interrupted_shutdown_resumes_and_releases_children_once() -> Result<()> {
+async fn shutdown_resumes_children() -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
@@ -1050,7 +1052,7 @@ async fn interrupted_shutdown_resumes_and_releases_children_once() -> Result<()>
 // Repeated shutdown after the first returned incomplete still makes progress:
 // the retained owners are joined by the later call instead of being abandoned.
 #[tokio::test]
-async fn repeated_shutdown_joins_retained_children() -> Result<()> {
+async fn repeat_shutdown_joins() -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::oneshot;
 

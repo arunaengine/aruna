@@ -27,7 +27,7 @@ enum ReadTurnsState {
 /// Reads the live turns of one chat in seq order, optionally only those after
 /// a seq the caller already holds.
 #[derive(Debug, PartialEq)]
-pub struct ReadChatTurnsOperation {
+pub struct ReadChatOperation {
     user_id: UserId,
     chat_id: String,
     after: Option<u32>,
@@ -35,7 +35,7 @@ pub struct ReadChatTurnsOperation {
     output: Option<Result<Vec<AssistantChatTurn>, ChatStoreError>>,
 }
 
-impl ReadChatTurnsOperation {
+impl ReadChatOperation {
     pub fn new(user_id: UserId, chat_id: String, after: Option<u32>) -> Self {
         Self {
             user_id,
@@ -53,7 +53,7 @@ impl ReadChatTurnsOperation {
     }
 }
 
-impl Operation for ReadChatTurnsOperation {
+impl Operation for ReadChatOperation {
     type Output = Vec<AssistantChatTurn>;
     type Error = ChatStoreError;
 
@@ -135,7 +135,7 @@ enum WriteTurnState {
 /// newest `MAX_ASSISTANT_CHAT_TURNS` turns, and all chats of the user stay
 /// within `MAX_ASSISTANT_CHAT_BYTES` together.
 #[derive(Debug, PartialEq)]
-pub struct WriteChatTurnOperation {
+pub struct WriteTurnOperation {
     user_id: UserId,
     chat_id: String,
     seq: u32,
@@ -151,7 +151,7 @@ pub struct WriteChatTurnOperation {
     output: Option<Result<AssistantChatHead, ChatStoreError>>,
 }
 
-impl WriteChatTurnOperation {
+impl WriteTurnOperation {
     pub fn new(
         user_id: UserId,
         chat_id: String,
@@ -368,7 +368,7 @@ impl WriteChatTurnOperation {
     }
 }
 
-impl Operation for WriteChatTurnOperation {
+impl Operation for WriteTurnOperation {
     type Output = AssistantChatHead;
     type Error = ChatStoreError;
 

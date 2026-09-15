@@ -1,5 +1,5 @@
 use aruna_core::auth::{REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime};
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -23,14 +23,14 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 #[async_trait]
-pub trait ArunaBearerTokenValidationState: Sync {
+pub trait ArunaValidationState: Sync {
     /// Revocation is owned by the realm that issued the token, never by the
     /// serving node's realm, so `realm_id` comes from the verified claims.
     async fn is_token_revoked(
         &self,
         realm_id: &RealmId,
         token_hash: &str,
-    ) -> Result<bool, ArunaBearerTokenError>;
+    ) -> Result<bool, ArunaBearerError>;
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool;
 
     /// The wall clock claim validation judges against, injectable so a test can
@@ -42,13 +42,13 @@ pub trait ArunaBearerTokenValidationState: Sync {
     async fn issuer_decoding_key(
         &self,
         issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+    ) -> Result<DecodingKey, ArunaBearerError> {
         bearer_decoding_key(issuer_pubkey)
     }
 }
 
 #[derive(Debug, Error)]
-pub enum ArunaBearerTokenError {
+pub enum ArunaBearerError {
     #[error("Realm is not trusted")]
     RealmNotTrusted,
     #[error("Token is revoked")]
@@ -84,8 +84,8 @@ pub async fn realm_token_revoked(
     storage: &StorageHandle,
     realm_id: RealmId,
     token_hash: &str,
-) -> Result<bool, ArunaBearerTokenError> {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+) -> Result<bool, ArunaBearerError> {
+    let target = DocumentTarget::RealmConfig { realm_id };
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: target.storage_keyspace().to_string(),
@@ -100,13 +100,13 @@ pub async fn realm_token_revoked(
             Ok(config) => Ok(config.token_revoked(token_hash, unix_timestamp_secs())),
             Err(error) => {
                 warn!(error = %error, "Failed to decode realm config for token revocation");
-                Err(ArunaBearerTokenError::RevocationUnavailable)
+                Err(ArunaBearerError::RevocationUnavailable)
             }
         },
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(true),
         other => {
             warn!(event = ?other, "Failed to read realm config for token revocation");
-            Err(ArunaBearerTokenError::RevocationUnavailable)
+            Err(ArunaBearerError::RevocationUnavailable)
         }
     }
 }
@@ -114,20 +114,17 @@ pub async fn realm_token_revoked(
 pub async fn validate_bearer_token<S>(
     state: &S,
     token: &str,
-) -> Result<AuthContext, ArunaBearerTokenError>
+) -> Result<AuthContext, ArunaBearerError>
 where
-    S: ArunaBearerTokenValidationState + ?Sized,
+    S: ArunaValidationState + ?Sized,
 {
     let claims = decode_bearer_token(state, token).await?;
     Ok(claims.try_into()?)
 }
 
-pub async fn decode_bearer_token<S>(
-    state: &S,
-    token: &str,
-) -> Result<TokenClaims, ArunaBearerTokenError>
+pub async fn decode_bearer_token<S>(state: &S, token: &str) -> Result<TokenClaims, ArunaBearerError>
 where
-    S: ArunaBearerTokenValidationState + ?Sized,
+    S: ArunaValidationState + ?Sized,
 {
     let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
 
@@ -154,53 +151,50 @@ where
 
     // The issuing realm from the verified claims, so a foreign token is judged
     // by its origin realm's revocation set and not by the serving node's.
-    let issuer_realm = RealmId::from_base64(&claims.claims.iss)
-        .map_err(|_| ArunaBearerTokenError::InvalidIssuerKey)?;
+    let issuer_realm =
+        RealmId::from_base64(&claims.claims.iss).map_err(|_| ArunaBearerError::InvalidIssuerKey)?;
     let token_hash = bearer_token_hash(token);
     if state.is_token_revoked(&issuer_realm, &token_hash).await? {
-        return Err(ArunaBearerTokenError::TokenRevoked);
+        return Err(ArunaBearerError::TokenRevoked);
     }
 
     Ok(claims.claims)
 }
 
-async fn validate_issuer_trust<S>(
-    state: &S,
-    claims: &TokenClaims,
-) -> Result<(), ArunaBearerTokenError>
+async fn validate_issuer_trust<S>(state: &S, claims: &TokenClaims) -> Result<(), ArunaBearerError>
 where
-    S: ArunaBearerTokenValidationState + ?Sized,
+    S: ArunaValidationState + ?Sized,
 {
     let realm_id =
-        RealmId::from_base64(&claims.iss).map_err(|_| ArunaBearerTokenError::InvalidIssuerKey)?;
+        RealmId::from_base64(&claims.iss).map_err(|_| ArunaBearerError::InvalidIssuerKey)?;
     if !state.is_trusted_realm(&realm_id).await {
-        return Err(ArunaBearerTokenError::RealmNotTrusted);
+        return Err(ArunaBearerError::RealmNotTrusted);
     }
     match (&claims.delegation_signature, &claims.issuer_pubkey) {
         (Some(delegation_signature), Some(issuer_pubkey)) => {
             verify_realm_delegation(&claims.iss, issuer_pubkey, delegation_signature)
         }
         (None, None) => Ok(()),
-        (_, _) => Err(ArunaBearerTokenError::InvalidServerToken),
+        (_, _) => Err(ArunaBearerError::InvalidServerToken),
     }
 }
 
 pub async fn validate_bearer_claims<S>(
     state: &S,
     claims: &TokenClaims,
-) -> Result<(), ArunaBearerTokenError>
+) -> Result<(), ArunaBearerError>
 where
-    S: ArunaBearerTokenValidationState + ?Sized,
+    S: ArunaValidationState + ?Sized,
 {
     let now = state.now_secs();
     if now > claims.exp {
-        return Err(ArunaBearerTokenError::Expired);
+        return Err(ArunaBearerError::Expired);
     }
     // Judge the signed lifetime so ageing and a future `iat` cannot evade the revocation bound.
     if !valid_token_lifetime(claims.iat, claims.exp)
         || claims.iat.saturating_sub(now) > REVOCATION_GRACE_SECS
     {
-        return Err(ArunaBearerTokenError::LifetimeTooLong);
+        return Err(ArunaBearerError::LifetimeTooLong);
     }
 
     validate_issuer_trust(state, claims).await
@@ -210,7 +204,7 @@ fn verify_realm_delegation(
     realm_iss: &str,
     issuer_pubkey: &str,
     delegation_signature: &str,
-) -> Result<(), ArunaBearerTokenError> {
+) -> Result<(), ArunaBearerError> {
     let realm_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(realm_iss)?;
     let realm_verifying_key = VerifyingKey::from_bytes(realm_key.as_slice().try_into()?)?;
     let signature = Signature::from_str(delegation_signature)?;
@@ -218,11 +212,11 @@ fn verify_realm_delegation(
     Ok(())
 }
 
-pub fn bearer_decoding_key(issuer_pubkey: &str) -> Result<DecodingKey, ArunaBearerTokenError> {
+pub fn bearer_decoding_key(issuer_pubkey: &str) -> Result<DecodingKey, ArunaBearerError> {
     let issuer_pubkey: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(issuer_pubkey)?
         .try_into()
-        .map_err(|_| ArunaBearerTokenError::InvalidIssuerKey)?;
+        .map_err(|_| ArunaBearerError::InvalidIssuerKey)?;
     let public_key = VerifyingKey::from_bytes(&issuer_pubkey)?;
     let public_key_pem = public_key.to_public_key_pem(LineEnding::default())?;
     Ok(DecodingKey::from_ed_pem(public_key_pem.as_bytes())?)
@@ -273,7 +267,7 @@ impl IssuerKeyCache {
     pub async fn get_or_insert(
         &self,
         issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+    ) -> Result<DecodingKey, ArunaBearerError> {
         let mut entries = self.entries.lock().await;
         if let Some(entry) = entries.get(issuer_pubkey).cloned() {
             if entry.inserted_at.elapsed() < self.ttl {
@@ -393,7 +387,7 @@ mod tests {
         )
         .unwrap();
         let realm_id = RealmId::from_bytes([11; 32]);
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let target = DocumentTarget::RealmConfig { realm_id };
         storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: target.storage_keyspace().to_string(),
@@ -405,7 +399,7 @@ mod tests {
 
         assert!(matches!(
             realm_token_revoked(&storage, realm_id, "token-hash").await,
-            Err(ArunaBearerTokenError::RevocationUnavailable)
+            Err(ArunaBearerError::RevocationUnavailable)
         ));
     }
 
@@ -418,12 +412,12 @@ mod tests {
     const FIXED_NOW: u64 = 1_800_000_000;
 
     #[async_trait]
-    impl ArunaBearerTokenValidationState for SkewState {
+    impl ArunaValidationState for SkewState {
         async fn is_token_revoked(
             &self,
             _realm_id: &RealmId,
             _token_hash: &str,
-        ) -> Result<bool, ArunaBearerTokenError> {
+        ) -> Result<bool, ArunaBearerError> {
             Ok(false)
         }
 
@@ -461,7 +455,7 @@ mod tests {
 
         assert!(matches!(
             validate_bearer_claims(&state, &claims).await,
-            Err(ArunaBearerTokenError::LifetimeTooLong)
+            Err(ArunaBearerError::LifetimeTooLong)
         ));
         // A token signed within the bound still validates.
         validate_bearer_claims(&state, &lifetime_claims(FIXED_NOW, FIXED_NOW + 600))
@@ -476,7 +470,7 @@ mod tests {
 
         assert!(matches!(
             validate_bearer_claims(&state, &lifetime_claims(skewed, skewed + 600)).await,
-            Err(ArunaBearerTokenError::LifetimeTooLong)
+            Err(ArunaBearerError::LifetimeTooLong)
         ));
     }
 
@@ -488,7 +482,7 @@ mod tests {
 
         assert!(matches!(
             validate_bearer_claims(&state, &claims).await,
-            Err(ArunaBearerTokenError::Expired)
+            Err(ArunaBearerError::Expired)
         ));
     }
 
@@ -506,7 +500,7 @@ mod tests {
                 .unwrap()
         );
 
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let target = DocumentTarget::RealmConfig { realm_id };
         let signing_key = SigningKey::from_bytes(&[9; 32]);
         let actor = Actor {
             node_id: iroh::PublicKey::from_bytes(signing_key.verifying_key().as_bytes()).unwrap(),

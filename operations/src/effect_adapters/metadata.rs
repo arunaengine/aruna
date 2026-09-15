@@ -1,7 +1,5 @@
-//! Metadata handle adapter.
-//!
-//! A node without a metadata plane keeps the explicit `HandleMissing` outcome
-//! instead of dropping the effect.
+//! Metadata handle adapter: a node without a metadata plane keeps the explicit
+//! `HandleMissing` outcome instead of dropping the effect.
 
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;

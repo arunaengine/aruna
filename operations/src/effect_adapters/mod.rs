@@ -1,26 +1,12 @@
-//! Effect adapters: one visible dispatch outline, one cohesive module per
-//! effect family.
-//!
-//! The runner (`crate::driver`) owns operation execution and transaction
-//! ownership; this module only routes one effect to the adapter that can
-//! perform it. Substantial adapter bodies live beside their siblings:
-//!
-//! - [`blob`]: blob, staging-source, and local-file handle effects;
-//! - [`storage`]: storage effects plus the peer refresh a realm-config write or
-//!   transaction commit triggers;
-//! - [`net`]: handle-backed network effects, job-control frame I/O, and the
-//!   no-handle document-publication fallback;
-//! - [`audit`]: the bounded audit-page fan-out;
-//! - [`metadata`]: metadata handle effects;
-//! - [`task`]: task persistence and task handle effects;
-//! - [`routing`]: routing-input assembly for operation configs (not dispatched
-//!   here; re-exported by the `driver` facade).
+//! Effect adapters: one visible dispatch outline, one module per effect family.
+//! The runner owns execution and transaction ownership; this module only routes
+//! each effect to the adapter that performs it.
 
 mod audit;
 mod blob;
 mod metadata;
 mod net;
-pub(super) mod routing;
+pub mod routing;
 mod storage;
 mod task;
 
@@ -36,7 +22,7 @@ use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
     skip(effect, context),
     fields(depth, effect = effect_kind(&effect))
 )]
-pub(in crate::driver) async fn dispatch_effect(
+pub(crate) async fn dispatch_effect(
     effect: Effect,
     context: &DriverContext,
     depth: usize,
@@ -44,7 +30,7 @@ pub(in crate::driver) async fn dispatch_effect(
     dispatch_effect_until(effect, context, depth, None).await
 }
 
-pub(in crate::driver) async fn dispatch_effect_until(
+pub(crate) async fn dispatch_effect_until(
     effect: Effect,
     context: &DriverContext,
     depth: usize,
