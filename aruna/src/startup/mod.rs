@@ -1,8 +1,6 @@
-//! Node startup phases and the resources they own.
-//!
-//! The ordered flow lives in [`crate::application`]. Modules here own the
-//! acquired resources, realm preparation, listener binding, background work,
-//! and the startup instrumentation that retained binary tests need.
+//! Node startup phases and the resources they own. The ordered flow lives in
+//! [`crate::application`]; modules here own acquired resources, realm
+//! preparation, listener binding, background work, and test instrumentation.
 
 pub mod background;
 pub mod listeners;

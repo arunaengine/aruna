@@ -1,34 +1,28 @@
-//! Realm bootstrap duties after identity resolution: core-document
-//! preparation, publication, and fetch, placement waits, and the local
-//! onboarding secret.
-//!
-//! Persisted identity and the enrollment decision live in `crate::identity`;
-//! operator settings parsing lives in `crate::settings`. This module holds no
-//! second identity or enrollment path.
+//! Realm bootstrap duties after identity resolution: core-document preparation,
+//! publication, and fetch, placement waits, and the local onboarding secret.
+//! Persisted identity and enrollment live in `crate::identity`.
 
 use crate::identity::PersistedNodeState;
 use aruna_api::server_state::{
     INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_state,
 };
-use aruna_core::document::{DocumentSyncNetEvent, DocumentSyncTarget};
+use aruna_core::document::{DocumentNetEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{
-    OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSyncTicket,
+    OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingTicket,
 };
-use aruna_core::{DocumentSyncEffect, NodeId, UserId};
+use aruna_core::{DocumentEffect, NodeId, UserId};
 use aruna_operations::device::realm_documents::fetch_from_peers;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::interest::{
     ensure_interest_digest, mark_interest_dirty,
 };
-use aruna_operations::onboarding::create_secret::{
-    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-};
+use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::placement::target_placement_ref;
-use aruna_operations::realm::get_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -91,7 +85,7 @@ pub async fn publish_core_documents(
     node_id: NodeId,
     realm_id: aruna_core::structs::RealmId,
     allow_genesis: bool,
-    documents: Vec<DocumentSyncTarget>,
+    documents: Vec<DocumentTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if documents.is_empty() {
         return Ok(());
@@ -124,7 +118,7 @@ pub async fn prepare_core_documents(
     realm_id: aruna_core::structs::RealmId,
     allow_genesis: bool,
     include_node_info: bool,
-) -> Result<Vec<DocumentSyncTarget>, Box<dyn std::error::Error>> {
+) -> Result<Vec<DocumentTarget>, Box<dyn std::error::Error>> {
     let digest_created = ensure_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
         .await
         .map_err(|error| format!("failed to initialize local watch interest digest: {error}"))?;
@@ -135,20 +129,20 @@ pub async fn prepare_core_documents(
     }
 
     let mut documents = vec![
-        DocumentSyncTarget::RealmAuthorization { realm_id },
-        DocumentSyncTarget::RealmConfig { realm_id },
+        DocumentTarget::RealmAuthorization { realm_id },
+        DocumentTarget::RealmConfig { realm_id },
     ];
     if include_node_info {
         // Initial and joining nodes publish before timers run. Provisioned restarts restore
         // shared topics and leave publication to the timers.
-        documents.push(DocumentSyncTarget::NodeUsage {
+        documents.push(DocumentTarget::NodeUsage {
             realm_id,
             node_id,
             group_id: None,
         });
-        documents.push(DocumentSyncTarget::NodeInfo { realm_id, node_id });
+        documents.push(DocumentTarget::NodeInfo { realm_id, node_id });
     }
-    let watch_target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let watch_target = DocumentTarget::WatchInterest { realm_id, node_id };
     let topic_exists = if allow_genesis {
         let net_handle = driver_ctx
             .net_handle
@@ -184,7 +178,7 @@ pub async fn prepare_core_documents(
                 UserId::from_storage_key(&key)
                     .ok()
                     .filter(|user_id| user_id.realm_id == realm_id)
-                    .map(|user_id| DocumentSyncTarget::User { user_id })
+                    .map(|user_id| DocumentTarget::User { user_id })
             }));
             Ok(documents)
         }
@@ -213,7 +207,7 @@ pub async fn fetch_core_documents(
         .onboarding_sync_ticket
         .as_deref()
         .ok_or("missing onboarding sync ticket")?;
-    let onboarding_sync_ticket = OnboardingSyncTicket::decode(onboarding_sync_ticket)?;
+    let onboarding_sync_ticket = OnboardingTicket::decode(onboarding_sync_ticket)?;
     let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
         return Err("net handle unavailable".into());
     };
@@ -222,7 +216,7 @@ pub async fn fetch_core_documents(
     // Shared documents include the config needed to route user documents to shard topics.
     let mut user_documents = Vec::new();
     for document in onboarding_sync_ticket.payload.documents.clone() {
-        if matches!(document, DocumentSyncTarget::User { .. }) {
+        if matches!(document, DocumentTarget::User { .. }) {
             user_documents.push(document);
             continue;
         }
@@ -300,12 +294,12 @@ pub async fn wait_for_placement(
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
 
     tokio::time::timeout(timeout, async {
         let mut attempt = 0;
         loop {
-            let config = drive(GetRealmConfigOperation::new(realm_id), driver_ctx).await?;
+            let config = drive(GetConfigOperation::new(realm_id), driver_ctx).await?;
             if node_is_ready(&config, node_id) {
                 info!(
                     realm_id = %realm_id,
@@ -403,7 +397,7 @@ fn unique_user_topic(
     synced_topics: &mut HashSet<::irokle::TopicId>,
     realm_id: aruna_core::structs::RealmId,
     placement: &aruna_core::structs::PlacementRef,
-    document: &DocumentSyncTarget,
+    document: &DocumentTarget,
 ) -> Option<::irokle::TopicId> {
     let topic = document.sync_topic_id(realm_id, placement);
     synced_topics.insert(topic).then_some(topic)
@@ -413,12 +407,12 @@ async fn sync_peer_topic(
     net_handle: &aruna_net::NetHandle,
     topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
-    document_for_error: &DocumentSyncTarget,
+    document_for_error: &DocumentTarget,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let document_for_error = document_for_error.clone();
     let sync = net_handle.send_effect(Effect::Net(NetEffect::DocumentSync(
-        DocumentSyncEffect::SyncDocument {
+        DocumentEffect::SyncDocument {
             topic,
             peers: vec![bootstrap_peer],
         },
@@ -432,10 +426,8 @@ async fn sync_peer_topic(
         })?;
 
     match event {
-        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
-            ..
-        })) => Ok(()),
-        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::Error { error, .. })) => {
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled { .. })) => Ok(()),
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
             Err(error.into())
         }
         Event::Net(NetEvent::Error(error)) => Err(format!("{error:?}").into()),
@@ -449,7 +441,7 @@ async fn sync_with_retry(
     net_handle: &aruna_net::NetHandle,
     topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
-    document: &DocumentSyncTarget,
+    document: &DocumentTarget,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -519,7 +511,7 @@ pub async fn ensure_onboarding_secret(
     };
 
     drive(
-        CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput { record }),
+        CreateSecretOperation::new(CreateSecretInput { record }),
         driver_ctx,
     )
     .await?;
@@ -544,4 +536,5 @@ pub async fn ensure_onboarding_secret(
 }
 
 #[cfg(test)]
+#[path = "bootstrap_tests.rs"]
 mod tests;

@@ -119,9 +119,8 @@ struct SessionS3 {
 }
 
 /// Serves the node's S3 plane on the session bridge gateway too. A bind failure
-/// is not fatal: only sessions lose their endpoint, the node keeps serving. The
-/// returned handle is retained by the caller's ingress owner, which joins it on
-/// shutdown; the cancellation token only asks it to stop.
+/// is not fatal (only sessions lose their endpoint); the returned handle is
+/// joined by the caller's ingress owner, which the token only asks to stop.
 async fn bind_session_s3(
     session: Option<SessionS3>,
     s3_host: &str,
@@ -459,7 +458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_s3_exit_reports() {
+    async fn session_exit_reports() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
         use aruna_core::structs::{RealmId, RoCrateLimits};
@@ -510,7 +509,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn session_s3_exit_pends() {
+    async fn session_exit_pends() {
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(60), session_s3_exit(None))
                 .await
@@ -529,7 +528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_bind_aborts_and_awaits_started_listeners() {
+    async fn partial_bind_cleanup() {
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut started = StartedListeners::default();
         let counter = DropCounter(dropped.clone());
@@ -553,7 +552,7 @@ mod tests {
     // A failure after the S3 listener started but before the REST listener did
     // must release the S3 port instead of leaving a half-bound server behind.
     #[tokio::test]
-    async fn later_bind_failure_releases_the_started_s3_listener() {
+    async fn bind_failure_releases() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
         use aruna_operations::jobs::runtime::JobsRuntime;
@@ -620,7 +619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absent_session_listener_binds_nothing() {
+    async fn absent_session_unbound() {
         let started = bind_session_s3(
             None,
             "127.0.0.1",
@@ -645,7 +644,7 @@ mod tests {
     // A successful optional bind returns a retained owner whose task completes
     // once the shutdown token fires, so a later drain can await it.
     #[tokio::test]
-    async fn session_listener_binds_and_completes_on_shutdown() {
+    async fn session_listener_completes() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
         use aruna_core::structs::{RealmId, RoCrateLimits};
@@ -693,7 +692,7 @@ mod tests {
     // A forced abort of the session listener still awaits its children; the
     // port releases only once `wait` returned.
     #[tokio::test]
-    async fn forced_session_listener_abort_waits_for_children() {
+    async fn abort_awaits_children() {
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::shutdown::Shutdown;
         use aruna_core::structs::{RealmId, RoCrateLimits};

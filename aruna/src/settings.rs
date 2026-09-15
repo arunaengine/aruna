@@ -1,9 +1,6 @@
-//! Operator settings parsing.
-//!
-//! [`read_settings_from`] is the only parser. It consumes an explicit
-//! [`SettingsEnv`] so tests provide maps instead of mutating the process
-//! environment, and it performs no filesystem, network, or storage I/O.
-//! Persisted identity, enrollment, and storage opening live in `config.rs`.
+//! Operator settings parsing. [`read_settings_from`] is the only parser: it
+//! consumes an explicit [`SettingsEnv`] so tests pass maps, and it performs no
+//! filesystem, network, or storage I/O.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -911,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_storage_path_is_named() {
+    fn missing_path_named() {
         let mut raw = env(&[]);
         raw.remove("STORAGE_PATH");
         assert!(matches!(
@@ -921,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn rocrate_defaults_and_overrides() {
+    fn rocrate_limits_parse() {
         let settings = parse(&[]).unwrap();
         assert_eq!(settings.rocrate_limits, RoCrateLimits::default());
 
@@ -969,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn rocrate_rejects_zero_and_refresh_without_headroom() {
+    fn rocrate_limits_rejected() {
         assert_eq!(
             invalid_key(parse(&[("ROCRATE_MAX_ENTRIES", "0")]).unwrap_err()),
             "ROCRATE_MAX_ENTRIES"
@@ -983,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn timeouts_override_and_default() {
+    fn timeout_overrides() {
         let settings = parse(&[
             ("ONBOARDING_BOOTSTRAP_TIMEOUT_SECS", "240"),
             ("ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS", "300"),
@@ -1017,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_listener_is_all_or_nothing() {
+    fn listener_pair_required() {
         let settings = parse(&[("S3_HOST", ""), ("S3_ADDRESS", "")]).unwrap();
         assert!(settings.s3_host.is_none());
         assert!(settings.s3_address.is_none());
@@ -1037,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn public_urls_accept_schemes_and_reject_others() {
+    fn public_url_schemes() {
         for value in ["http://localhost:1337", "https://s3.example.test/base/"] {
             assert!(parse(&[("API_PUBLIC_URL", value)]).is_ok());
         }
@@ -1054,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_policy_defaults_and_rejects_invalid() {
+    fn persist_policy_validation() {
         assert_eq!(
             parse(&[]).unwrap().fjall_persist_policy,
             FjallPersistPolicy::default()
@@ -1084,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn node_labels_parse_and_reserve_derived_keys() {
+    fn node_labels_validation() {
         assert!(parse(&[]).unwrap().node_labels.is_empty());
         let settings = parse(&[("ARUNA_NODE_LABELS", "a=1, b = two")]).unwrap();
         assert_eq!(
@@ -1110,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn oidc_providers_parse_or_name_the_missing_field() {
+    fn oidc_providers_parse() {
         assert!(parse(&[]).unwrap().oidc_providers.is_empty());
         let settings = parse(&[
             ("OIDC_PROVIDER_IDS", "keycloak"),
@@ -1136,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn portal_modes_and_artifact_requirements() {
+    fn portal_artifact_requirements() {
         assert!(matches!(parse(&[]).unwrap().portal, PortalConfig::Disabled));
         assert_eq!(
             invalid_key(parse(&[("PORTAL_MODE", "carrier-pigeon")]).unwrap_err()),
@@ -1202,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_credential_tokens_are_rejected_before_lookup() {
+    fn duplicate_tokens_rejected() {
         assert!(reject_token_clashes(["hot", "cold"].into_iter().map(str::to_string)).is_ok());
         let error =
             reject_token_clashes(["hot-store", "hot_store"].into_iter().map(str::to_string))
@@ -1211,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_node_labels_keeps_label_order() {
+    fn node_labels_order() {
         let labels = super::parse_node_labels(&env(&[("ARUNA_NODE_LABELS", "b=2,a=1")])).unwrap();
         assert_eq!(
             labels.keys().cloned().collect::<Vec<_>>(),

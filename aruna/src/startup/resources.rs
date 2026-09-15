@@ -405,7 +405,7 @@ async fn ensure_usage_counters(
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::global_shard_keys;
     use aruna_operations::driver::drive;
-    use aruna_operations::node::usage_stats::RebuildUsageStatsOperation;
+    use aruna_operations::node::usage_stats::RebuildStatsOperation;
 
     let shard_keys = global_shard_keys();
     let event = driver_ctx
@@ -430,7 +430,7 @@ async fn ensure_usage_counters(
                 .into());
             }
             if values.iter().any(|(_, value)| value.is_none()) {
-                drive(RebuildUsageStatsOperation::new(), driver_ctx).await?;
+                drive(RebuildStatsOperation::new(), driver_ctx).await?;
                 return Ok(true);
             }
         }
@@ -558,7 +558,7 @@ mod tests {
     // A failure with no fallible resource acquired yet still releases storage,
     // and later acquisitions are absent rather than faked.
     #[tokio::test]
-    async fn cleanup_releases_the_acquired_subset() {
+    async fn cleanup_releases_subset() {
         let temp = tempdir().expect("temp dir");
         let storage_handle = open_storage(&temp);
         let task_handle = TaskHandle::new();
@@ -587,7 +587,7 @@ mod tests {
     // A failure after any acquisition stage must release exactly the acquired
     // subset: every later stage is absent and the store lock is given back.
     #[tokio::test]
-    async fn stops_after_each_stage_and_releases_acquired_resources() {
+    async fn stage_failure_releases() {
         use crate::config::resolve_settings;
         use crate::settings::read_settings_from;
 
@@ -649,7 +649,7 @@ mod tests {
     // A pre-cancelled startup must release the store without loading,
     // generating, or persisting an identity or sending enrollment traffic.
     #[tokio::test]
-    async fn pre_cancelled_startup_skips_identity_and_enrollment() {
+    async fn cancelled_startup_skips() {
         use crate::settings::read_settings_from;
 
         let temp = tempdir().expect("temp dir");

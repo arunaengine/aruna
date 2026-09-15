@@ -2,24 +2,23 @@
 //! decision, and [`IdentityError`]. Enrollment transport and response
 //! validation live in the `enrollment` submodule.
 
+#[path = "identity_enrollment.rs"]
 mod enrollment;
-mod error;
 
 pub(crate) use enrollment::{
     bootstrap_node_state, onboarding_realm_endpoints, refresh_onboarding_bootstrap,
 };
 
 pub use enrollment::{EnrollmentPlan, plan_enrollment};
-pub use error::IdentityError;
 
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::ConversionError;
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
-use aruna_core::onboarding::OnboardingPhase;
+use aruna_core::onboarding::{OnboardingMode, OnboardingPhase, OnboardingSecretError};
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -27,6 +26,40 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
+use std::array::TryFromSliceError;
+use std::string::FromUtf8Error;
+use thiserror::Error;
+
+/// A failure while reading, persisting, or enrolling a node identity.
+#[derive(Error, Debug)]
+pub enum IdentityError {
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    FromSliceError(#[from] TryFromSliceError),
+    #[error(transparent)]
+    Base64Error(#[from] base64::DecodeError),
+    #[error(transparent)]
+    SPKIError(#[from] ed25519_dalek::pkcs8::spki::Error),
+    #[error(transparent)]
+    PKCSError(#[from] ed25519_dalek::pkcs8::Error),
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    OnboardingSecretError(#[from] OnboardingSecretError),
+    #[error(transparent)]
+    ReqwestError(#[from] reqwest::Error),
+    #[error(transparent)]
+    Utf8Error(#[from] FromUtf8Error),
+    #[error("onboarding bootstrap failed: {0}")]
+    OnboardingBootstrapFailed(String),
+    #[error("missing onboarding bootstrap material for {0:?} node")]
+    MissingOnboardingMaterial(OnboardingMode),
+    #[error("onboarding mode mismatch between secret and bootstrap response")]
+    OnboardingModeMismatch,
+    #[error("unexpected storage event while loading node state: {0}")]
+    UnexpectedStorageEvent(String),
+}
 
 const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
 
@@ -289,7 +322,7 @@ mod tests {
     /// The persisted record keeps its byte layout across the ownership move:
     /// the stored encoding is part of the deployed compatibility surface.
     #[test]
-    fn persisted_state_bytes_are_stable() {
+    fn persisted_state_stable() {
         let state = PersistedNodeState {
             boot_origin: BootOrigin::InitializedRealm,
             status: PersistedNodeStatus::PendingInitialization,
@@ -312,7 +345,7 @@ mod tests {
     /// onboarding state. Never regenerate them by the current encoder: a layout
     /// change must fail decode, not just a malformed-bytes check.
     #[test]
-    fn persisted_state_historical_fixtures_decode_exactly() {
+    fn historical_fixtures_decode() {
         let fixtures: &[(&str, &str, PersistedNodeState)] = &[
             (
                 "management pending initialization",
@@ -376,7 +409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_boot_generates_and_repeat_boot_reuses() {
+    async fn boot_reuses_identity() {
         let dir = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let store = IdentityStore::from_storage(storage.clone());
@@ -406,7 +439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_identity_is_an_error() {
+    async fn corrupt_identity_rejected() {
         use aruna_core::effects::Effect;
         use aruna_core::handle::Handle;
         use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
@@ -427,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_realm_must_match_the_persisted_realm() {
+    fn realm_mismatch_detected() {
         // Only a management identity derives its realm from key material; a
         // corrupted realm field must be detectable against the derived one.
         let (storage, _receivers) = aruna_storage::StorageHandle::new();

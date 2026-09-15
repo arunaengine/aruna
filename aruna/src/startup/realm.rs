@@ -4,16 +4,16 @@
 use std::sync::Arc;
 
 use aruna_core::UserId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::{Actor, NodeCapabilities, NodeUrls, RealmNodeKind};
 use aruna_net::NetHandle;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::projector::replay_event_log_until;
+use aruna_operations::metadata::projector::replay_until_stopped;
 use aruna_operations::node::startup::prepare_shard_policy;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::realm::ensure_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
+use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
 use tracing::{info, warn};
 
 use crate::bootstrap::{
@@ -24,7 +24,7 @@ use crate::config::{Config, StartupMode};
 use crate::identity::{mark_onboarding_phase, mark_state_complete};
 
 pub(crate) struct CoreAnnouncement {
-    pub(crate) documents: Vec<DocumentSyncTarget>,
+    pub(crate) documents: Vec<DocumentTarget>,
     pub(crate) allow_genesis: bool,
 }
 
@@ -41,7 +41,7 @@ pub(crate) async fn prepare(
         return Ok(None);
     }
     let replayed_metadata_events =
-        replay_event_log_until(driver_ctx.as_ref(), || !stop.is_cancelled()).await?;
+        replay_until_stopped(driver_ctx.as_ref(), || !stop.is_cancelled()).await?;
     if replayed_metadata_events > 0 {
         info!(
             replayed_metadata_events,
@@ -260,7 +260,7 @@ async fn provision_realm(
         NodeCapabilities::Management { .. }
     ) {
         drive(
-            EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+            EnsureConfigOperation::new(EnsureConfigParams {
                 actor: Actor {
                     node_id: config.node_id,
                     user_id: UserId::nil(config.realm_id),
@@ -343,7 +343,7 @@ mod tests {
     // touching storage or the network, so the caller can release the acquired
     // resources and report a startup cancellation.
     #[tokio::test]
-    async fn cancelled_preparation_stops_at_the_boundary() {
+    async fn cancel_stops_preparation() {
         let temp = tempfile::tempdir().expect("temp dir");
         let map: std::collections::BTreeMap<String, String> = [
             (

@@ -1,8 +1,6 @@
-//! Compute settings read from an explicit operator-input source.
-//!
-//! [`collect`] consumes one [`crate::settings::SettingsEnv`] and returns typed
-//! values the backend builders consume, so a builder never reads the process
-//! environment and validation can be tested from supplied maps.
+//! Compute settings read from an explicit operator-input source: [`collect`]
+//! consumes one [`crate::settings::SettingsEnv`] and returns typed values, so a
+//! builder never reads the process environment.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -502,7 +500,7 @@ mod pure_tests {
     // The whole collection runs from a supplied map: no process environment is
     // read or mutated, and only the selected backend's values are parsed.
     #[test]
-    fn collects_from_a_supplied_map() {
+    fn collects_from_map() {
         let env = BTreeMap::from([
             ("ARUNA_COMPUTE_EXECUTOR".to_string(), "none".to_string()),
             ("ARUNA_COMPUTE_OPTIONAL".to_string(), "true".to_string()),
@@ -553,7 +551,7 @@ mod pure_tests {
 
     #[cfg(feature = "docker")]
     #[test]
-    fn session_gateway_comes_from_typed_settings() {
+    fn session_gateway_derived() {
         let address = session_s3_address(Some("127.0.0.1:9000"), "172.30.255.0/24")
             .expect("a docker subnet yields a gateway on the S3 port");
         assert_eq!(address.port(), 9000);
