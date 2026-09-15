@@ -1,16 +1,15 @@
 use super::{
-    InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, PeerContacts,
-    RealmNodeConnectionStatus, RealmNodeKindInfo, RealmPlacementBinding,
-    RealmPlacementBindingScope, RealmPlacementMutationRequest, RealmPlacementOverride,
-    RealmPlacementStrategy, RealmQuotaConfig, RealmUserGroupCapOverride, ServiceStatus,
-    UsageResponse, get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
+    GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
+    PeerContacts, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,
+    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, ServiceStatus, UsageResponse,
+    get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
     map_placement_error, map_quota_error, map_realm_nodes, mutate_realm_placement, presence_nodes,
     set_realm_quota,
 };
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
 use crate::server_state::ServerState;
-use crate::tests::fixtures::routes::{test_context, test_state, test_storage};
+use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -25,13 +24,11 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, allocate_placement_binding,
 };
-use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::RealmPresence;
-use aruna_operations::realm::mutate_placement::MutateRealmPlacementError;
-use aruna_operations::realm::set_quota::SetRealmQuotaError;
+use aruna_operations::realm::mutate_placement::MutatePlacementError;
+use aruna_operations::realm::set_quota::SetQuotaError;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::body::Body;
@@ -532,7 +529,7 @@ fn openapi_includes_quota() {
 
 #[test]
 fn quota_conflict_maps() {
-    let error = map_quota_error(SetRealmQuotaError::StorageError(
+    let error = map_quota_error(SetQuotaError::StorageError(
         StorageError::TransactionConflict,
     ));
 
@@ -545,9 +542,7 @@ fn quota_conflict_maps() {
 #[test]
 fn quota_capacity_unavailable() {
     // Cleanup capacity is transient, so it must not read as an internal error.
-    let error = map_quota_error(SetRealmQuotaError::StorageError(
-        StorageError::CleanupCapacity,
-    ));
+    let error = map_quota_error(SetQuotaError::StorageError(StorageError::CleanupCapacity));
 
     assert!(matches!(error, ServerError::ServiceUnavailableReason(_)));
 }
@@ -587,7 +582,7 @@ async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir
     .await
     .unwrap();
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: Actor {
                 node_id,
                 user_id,
@@ -628,7 +623,7 @@ fn admin_auth(realm_id: RealmId, user_id: UserId) -> AuthContext {
 async fn deny_path(state: &ServerState, path: &str) {
     let realm_id = state.get_realm_id();
     let mut config = drive(
-        aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
+        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -721,7 +716,7 @@ async fn placement_admin_gated() {
         Err(ServerError::Forbidden)
     ));
 
-    let request = RealmPlacementMutationRequest::RemoveOverride {
+    let request = RealmPlacementRequest::RemoveOverride {
         subject: "00".to_string(),
     };
     assert!(matches!(
@@ -746,7 +741,7 @@ async fn placement_binding_lifecycle() {
     let (state, realm_id, admin, _tempdir) = setup_management_state().await;
     let auth = admin_auth(realm_id, admin);
     let job_family_strategy_id = drive(
-        aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
+        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -763,13 +758,13 @@ async fn placement_binding_lifecycle() {
     );
     let initial_default = initial.default_strategy_id.unwrap();
     let strategy_id = Ulid::from_bytes([21; 16]);
-    let scope = RealmPlacementBindingScope::Realm;
+    let scope = RealmBindingScope::Realm;
     let node_id = state.get_node_id().to_string();
 
     let (_status, Json(after_upsert)) = mutate_realm_placement(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
+        Ok(Json(RealmPlacementRequest::UpsertStrategy {
             strategy: placement_strategy(strategy_id),
         })),
     )
@@ -782,27 +777,25 @@ async fn placement_binding_lifecycle() {
     let _ = mutate_realm_placement(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Ok(Json(
-            RealmPlacementMutationRequest::ProvisionMetadataBinding {
-                strategy_id: strategy_id.to_string(),
-                group_id: None,
-            },
-        )),
+        Ok(Json(RealmPlacementRequest::ProvisionMetadataBinding {
+            strategy_id: strategy_id.to_string(),
+            group_id: None,
+        })),
     )
     .await
     .unwrap();
 
     for request in [
-        RealmPlacementMutationRequest::SetDefaultStrategy {
+        RealmPlacementRequest::SetDefaultStrategy {
             strategy_id: strategy_id.to_string(),
         },
-        RealmPlacementMutationRequest::SetBinding {
-            binding: RealmPlacementBinding {
+        RealmPlacementRequest::SetBinding {
+            binding: RealmBinding {
                 scope: scope.clone(),
                 strategy_id: strategy_id.to_string(),
             },
         },
-        RealmPlacementMutationRequest::SetOverride {
+        RealmPlacementRequest::SetOverride {
             placement_override: RealmPlacementOverride {
                 subject: "abcd".to_string(),
                 pinned: vec![node_id],
@@ -839,7 +832,7 @@ async fn placement_binding_lifecycle() {
     let error = mutate_realm_placement(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Ok(Json(RealmPlacementMutationRequest::RemoveStrategy {
+        Ok(Json(RealmPlacementRequest::RemoveStrategy {
             strategy_id: strategy_id.to_string(),
         })),
     )
@@ -848,13 +841,13 @@ async fn placement_binding_lifecycle() {
     assert!(matches!(error, ServerError::Conflict(message) if message.contains("referenced")));
 
     for request in [
-        RealmPlacementMutationRequest::RemoveOverride {
+        RealmPlacementRequest::RemoveOverride {
             subject: "abcd".to_string(),
         },
-        RealmPlacementMutationRequest::RemoveBinding {
+        RealmPlacementRequest::RemoveBinding {
             scope: scope.clone(),
         },
-        RealmPlacementMutationRequest::SetDefaultStrategy {
+        RealmPlacementRequest::SetDefaultStrategy {
             strategy_id: initial_default,
         },
     ] {
@@ -870,7 +863,7 @@ async fn placement_binding_lifecycle() {
     let error = mutate_realm_placement(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Ok(Json(RealmPlacementMutationRequest::RemoveStrategy {
+        Ok(Json(RealmPlacementRequest::RemoveStrategy {
             strategy_id: strategy_id.to_string(),
         })),
     )
@@ -905,7 +898,7 @@ async fn replication_factor_defaults() {
     let (_status, _body) = mutate_realm_placement(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
+        Ok(Json(RealmPlacementRequest::UpsertStrategy {
             strategy: placement_strategy(strategy_id),
         })),
     )
@@ -924,7 +917,7 @@ async fn replication_factor_defaults() {
     let (_status, _body) = mutate_realm_placement(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Ok(Json(RealmPlacementMutationRequest::SetDefaultStrategy {
+        Ok(Json(RealmPlacementRequest::SetDefaultStrategy {
             strategy_id: strategy_id.to_string(),
         })),
     )
@@ -944,7 +937,7 @@ async fn replication_factor_defaults() {
     let _ = mutate_realm_placement(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Ok(Json(RealmPlacementMutationRequest::UpsertStrategy {
+        Ok(Json(RealmPlacementRequest::UpsertStrategy {
             strategy: unbounded,
         })),
     )
@@ -982,17 +975,17 @@ async fn placement_rejects_invalid() {
     zero.replica_count = Some(0);
 
     for request in [
-        RealmPlacementMutationRequest::UpsertStrategy { strategy: zero },
-        RealmPlacementMutationRequest::SetDefaultStrategy {
+        RealmPlacementRequest::UpsertStrategy { strategy: zero },
+        RealmPlacementRequest::SetDefaultStrategy {
             strategy_id: missing.to_string(),
         },
-        RealmPlacementMutationRequest::SetBinding {
-            binding: RealmPlacementBinding {
-                scope: RealmPlacementBindingScope::Realm,
+        RealmPlacementRequest::SetBinding {
+            binding: RealmBinding {
+                scope: RealmBindingScope::Realm,
                 strategy_id: missing.to_string(),
             },
         },
-        RealmPlacementMutationRequest::SetOverride {
+        RealmPlacementRequest::SetOverride {
             placement_override: RealmPlacementOverride {
                 subject: "00".to_string(),
                 pinned: Vec::new(),
@@ -1000,7 +993,7 @@ async fn placement_rejects_invalid() {
                 strategy_id: Some(missing.to_string()),
             },
         },
-        RealmPlacementMutationRequest::ProvisionMetadataBinding {
+        RealmPlacementRequest::ProvisionMetadataBinding {
             strategy_id: missing.to_string(),
             group_id: None,
         },
@@ -1017,13 +1010,13 @@ async fn placement_rejects_invalid() {
     }
 
     for request in [
-        RealmPlacementMutationRequest::RemoveStrategy {
+        RealmPlacementRequest::RemoveStrategy {
             strategy_id: "not-a-ulid".to_string(),
         },
-        RealmPlacementMutationRequest::RemoveOverride {
+        RealmPlacementRequest::RemoveOverride {
             subject: "not-hex".to_string(),
         },
-        RealmPlacementMutationRequest::SetOverride {
+        RealmPlacementRequest::SetOverride {
             placement_override: RealmPlacementOverride {
                 subject: "00".to_string(),
                 pinned: vec!["not-a-node".to_string()],
@@ -1049,7 +1042,7 @@ async fn placement_rejects_invalid() {
             r#"{"mutation":"remove_override","subject":"00","extra":true}"#,
         ))
         .unwrap();
-    let rejection = Json::<RealmPlacementMutationRequest>::from_request(request, &())
+    let rejection = Json::<RealmPlacementRequest>::from_request(request, &())
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1093,7 +1086,7 @@ fn openapi_registers_placement() {
 
 #[test]
 fn placement_conflict_maps() {
-    let error = map_placement_error(MutateRealmPlacementError::StorageError(
+    let error = map_placement_error(MutatePlacementError::StorageError(
         StorageError::TransactionConflict,
     ));
     assert!(matches!(
@@ -1105,7 +1098,7 @@ fn placement_conflict_maps() {
 #[test]
 fn placement_missing_config() {
     assert!(matches!(
-        map_placement_error(MutateRealmPlacementError::RealmConfigNotFound),
+        map_placement_error(MutatePlacementError::RealmConfigNotFound),
         ServerError::NotFound
     ));
 }
@@ -1114,7 +1107,7 @@ fn placement_missing_config() {
 fn placement_capacity_unavailable() {
     // Cleanup capacity is transient on both placement paths.
     assert!(matches!(
-        map_placement_error(MutateRealmPlacementError::StorageError(
+        map_placement_error(MutatePlacementError::StorageError(
             StorageError::CleanupCapacity
         )),
         ServerError::ServiceUnavailableReason(_)
@@ -1204,7 +1197,7 @@ async fn realm_gates_detail() {
         .await;
     let auth = admin_auth(realm_id, admin);
     let mut body = RealmQuotaConfig::from(QuotaConfig::default());
-    body.user_group_cap_overrides = vec![RealmUserGroupCapOverride {
+    body.user_group_cap_overrides = vec![GroupCapOverride {
         user_id: admin.to_string(),
         max_groups: Some(1),
     }];
@@ -1599,7 +1592,7 @@ async fn device_never_connected() {
     // this node answering about itself, may still not connect it.
     let (state, realm_id, owner, _tempdir) = setup_management_state().await;
     let mut config = drive(
-        aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
+        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -1624,22 +1617,19 @@ async fn device_never_connected() {
 
     let devices: Vec<_> = nodes
         .iter()
-        .filter(|node| node.kind == RealmNodeKindInfo::User)
+        .filter(|node| node.kind == NodeKindInfo::User)
         .collect();
     assert_eq!(devices.len(), 2);
     for node in devices {
         assert!(!node.present, "a device is never presence-confirmed");
-        assert_ne!(node.connection_status, RealmNodeConnectionStatus::Connected);
+        assert_ne!(node.connection_status, RealmConnectionStatus::Connected);
     }
     let infra = nodes
         .iter()
-        .find(|node| node.kind != RealmNodeKindInfo::User)
+        .find(|node| node.kind != NodeKindInfo::User)
         .unwrap();
     assert!(infra.present);
-    assert_eq!(
-        infra.connection_status,
-        RealmNodeConnectionStatus::Connected
-    );
+    assert_eq!(infra.connection_status, RealmConnectionStatus::Connected);
 }
 
 #[tokio::test]
@@ -1648,7 +1638,7 @@ async fn reports_device_seen() {
     // device's own node is serving the request, so it saw itself now.
     let (state, realm_id, owner, _tempdir) = setup_management_state().await;
     let mut config = drive(
-        aruna_operations::realm::get_config::GetRealmConfigOperation::new(realm_id),
+        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -1678,28 +1668,26 @@ async fn reports_device_seen() {
     let device = |node_id: aruna_core::NodeId| {
         nodes
             .iter()
-            .find(|node| {
-                node.node_id == node_id.to_string() && node.kind == RealmNodeKindInfo::User
-            })
+            .find(|node| node.node_id == node_id.to_string() && node.kind == NodeKindInfo::User)
             .unwrap()
     };
 
     assert_eq!(
         device(recent).connection_status,
-        RealmNodeConnectionStatus::Seen
+        RealmConnectionStatus::Seen
     );
     assert_eq!(device(recent).last_seen_ms, Some(now_ms - window));
     assert_eq!(
         device(stale).connection_status,
-        RealmNodeConnectionStatus::Unknown
+        RealmConnectionStatus::Unknown
     );
     assert_eq!(device(stale).last_seen_ms, Some(now_ms - window - 1));
     let current = device(state.get_node_id());
-    assert_eq!(current.connection_status, RealmNodeConnectionStatus::Seen);
+    assert_eq!(current.connection_status, RealmConnectionStatus::Seen);
     assert_eq!(current.last_seen_ms, Some(now_ms));
     let infra = nodes
         .iter()
-        .find(|node| node.kind != RealmNodeKindInfo::User)
+        .find(|node| node.kind != NodeKindInfo::User)
         .unwrap();
     assert_eq!(infra.last_seen_ms, None, "only devices report contact");
 }

@@ -3,9 +3,7 @@ use aruna_core::UserId;
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_storage::storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -56,7 +54,7 @@ async fn setup() -> Fixture {
     .await
     .unwrap();
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: actor.clone(),
         }),
         context.as_ref(),

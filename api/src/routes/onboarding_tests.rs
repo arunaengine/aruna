@@ -11,11 +11,11 @@ use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{ADMIN_DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{
-    BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode, OnboardingPurpose,
+    BootstrapOnboardingRequest, CreateSecretRequest, OnboardingMode, OnboardingPurpose,
     OnboardingSecret, OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode,
     issuer_proof_message, node_proof_message,
 };
-use aruna_core::reducer::AdminDocumentReducerState;
+use aruna_core::reducer::AdminDocumentState;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::{
@@ -24,17 +24,11 @@ use aruna_core::structs::{
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::onboarding::create_secret::{
-    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
-};
-use aruna_operations::onboarding::finalize_bootstrap::BootstrapOnboardingFinalizeError;
-use aruna_operations::onboarding::list_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::onboarding::reserve_secret::{
-    ReserveOnboardingSecretInput, ReserveOnboardingSecretOperation,
-};
-use aruna_operations::realm::claim_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
+use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+use aruna_operations::onboarding::finalize_bootstrap::BootstrapFinalizeError;
+use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
+use aruna_operations::onboarding::reserve_secret::{ReserveSecretInput, ReserveSecretOperation};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
@@ -105,7 +99,7 @@ async fn setup_management_state() -> (
     .unwrap();
 
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: Actor {
                 node_id,
                 user_id,
@@ -167,13 +161,11 @@ fn declares_dialable_members() {
 #[test]
 fn placement_errors_badrequest() {
     assert!(matches!(
-        map_finalize_error(BootstrapOnboardingFinalizeError::ReservedNodeLabel(
-            String::new()
-        )),
+        map_finalize_error(BootstrapFinalizeError::ReservedNodeLabel(String::new())),
         ServerError::ReservedLabel(_)
     ));
     assert!(matches!(
-        map_finalize_error(BootstrapOnboardingFinalizeError::NodeLocationTooLong),
+        map_finalize_error(BootstrapFinalizeError::NodeLocationTooLong),
         ServerError::BadRequest
     ));
 }
@@ -192,7 +184,7 @@ async fn server_secret_consumed() {
     let (_, Json(created)) = create_onboarding_secret(
         State(state.clone()),
         Extension(Some(auth)),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: "http://127.0.0.1:3000".to_string(),
             mode: RequestedOnboardingMode::Server,
             expires_in_seconds: Some(600),
@@ -272,7 +264,7 @@ async fn server_secret_consumed() {
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
-        }) => postcard::from_bytes::<AdminDocumentReducerState>(&bytes).unwrap(),
+        }) => postcard::from_bytes::<AdminDocumentState>(&bytes).unwrap(),
         other => panic!("unexpected realm config reducer state read result: {other:?}"),
     };
     assert_eq!(
@@ -297,7 +289,7 @@ async fn mint_binds_owner() {
     let (_, Json(created)) = create_onboarding_secret(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: "http://127.0.0.1:3000".to_string(),
             mode: RequestedOnboardingMode::User,
             expires_in_seconds: Some(600),
@@ -345,7 +337,7 @@ async fn policy_denies_enrollment() {
     config.request_policies.push(deny);
     write_realm_config(&state, realm_id, &config).await;
 
-    let request = |mode| CreateOnboardingSecretRequest {
+    let request = |mode| CreateSecretRequest {
         seed_url: "http://127.0.0.1:3000".to_string(),
         mode,
         expires_in_seconds: Some(600),
@@ -429,7 +421,7 @@ async fn builds_enroll_url() {
     let (_, Json(created)) = create_onboarding_secret(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: String::new(),
             mode: RequestedOnboardingMode::User,
             expires_in_seconds: Some(600),
@@ -459,7 +451,7 @@ async fn builds_enroll_url() {
     let (_, Json(server)) = create_onboarding_secret(
         State(state),
         Extension(Some(auth)),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: "http://127.0.0.1:3000".to_string(),
             mode: RequestedOnboardingMode::Server,
             expires_in_seconds: Some(600),
@@ -486,7 +478,7 @@ async fn polls_secret_status() {
     let (_, Json(created)) = create_onboarding_secret(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: "http://127.0.0.1:3000".to_string(),
             mode: RequestedOnboardingMode::User,
             expires_in_seconds: Some(600),
@@ -526,7 +518,7 @@ async fn polls_secret_status() {
     assert!(matches!(stranger, Err(ServerError::NotFound)));
 
     drive(
-        ReserveOnboardingSecretOperation::new(ReserveOnboardingSecretInput {
+        ReserveSecretOperation::new(ReserveSecretInput {
             enrollment_id: secret.enrollment_id,
             secret_hash: secret.secret_hash(),
             node_id: "device-a".to_string(),
@@ -579,7 +571,7 @@ async fn enrolls_user_device() {
     let (_, Json(created)) = create_onboarding_secret(
         State(state.clone()),
         Extension(Some(auth)),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: "http://127.0.0.1:3000".to_string(),
             mode: RequestedOnboardingMode::User,
             expires_in_seconds: Some(600),
@@ -651,7 +643,7 @@ async fn mint_rejects_stranger() {
     // Self-service enrollment is still realm-scoped and never anonymous.
     let (state, _realm_id, _node_id, user_id, net_handle, _tempdir) =
         setup_management_state().await;
-    let request = || CreateOnboardingSecretRequest {
+    let request = || CreateSecretRequest {
         seed_url: "http://127.0.0.1:3000".to_string(),
         mode: RequestedOnboardingMode::User,
         expires_in_seconds: Some(600),
@@ -691,7 +683,7 @@ async fn mint_rejects_restricted() {
             path_restrictions: Some(Vec::new()),
             session: None,
         })),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: "http://127.0.0.1:3000".to_string(),
             mode: RequestedOnboardingMode::User,
             expires_in_seconds: Some(600),
@@ -718,7 +710,7 @@ async fn bootstrap_rejects_secret() {
         purpose: OnboardingPurpose::InitialAdministrator,
     };
     drive(
-        CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+        CreateSecretOperation::new(CreateSecretInput {
             record: OnboardingSecretRecord {
                 enrollment_id,
                 secret_hash: secret.secret_hash(),
@@ -758,7 +750,7 @@ async fn bootstrap_rejects_secret() {
     .await;
     assert!(matches!(result, Err(ServerError::Forbidden)));
 
-    let entries = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+    let entries = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
         .unwrap();
     let entry = entries
@@ -783,7 +775,7 @@ async fn secrets_list_revoke() {
     let (_, Json(created)) = create_onboarding_secret(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: "http://127.0.0.1:3000".to_string(),
             mode: RequestedOnboardingMode::Server,
             expires_in_seconds: Some(600),
@@ -836,7 +828,7 @@ async fn secret_pruning_correct() {
 
     let finalizing_id = Ulid::generate();
     drive(
-        CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+        CreateSecretOperation::new(CreateSecretInput {
             record: OnboardingSecretRecord {
                 enrollment_id: finalizing_id,
                 secret_hash: "finalizing".to_string(),
@@ -851,7 +843,7 @@ async fn secret_pruning_correct() {
     .await
     .unwrap();
     drive(
-        ReserveOnboardingSecretOperation::new(ReserveOnboardingSecretInput {
+        ReserveSecretOperation::new(ReserveSecretInput {
             enrollment_id: finalizing_id,
             secret_hash: "finalizing".to_string(),
             node_id: "node-a".to_string(),
@@ -866,7 +858,7 @@ async fn secret_pruning_correct() {
 
     let stale_id = Ulid::generate();
     drive(
-        CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput {
+        CreateSecretOperation::new(CreateSecretInput {
             record: OnboardingSecretRecord {
                 enrollment_id: stale_id,
                 secret_hash: "stale".to_string(),
@@ -888,7 +880,7 @@ async fn secret_pruning_correct() {
     assert_eq!(listed.secrets[0].enrollment_id, finalizing_id.to_string());
     assert_eq!(listed.secrets[0].claimed_node_id.as_deref(), Some("node-a"));
 
-    let entries = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+    let entries = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
         .unwrap();
     assert_eq!(entries.len(), 1);
@@ -911,7 +903,7 @@ async fn invalid_proof_preserves() {
     let (_, Json(created)) = create_onboarding_secret(
         State(state.clone()),
         Extension(Some(auth.clone())),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: "http://127.0.0.1:3000".to_string(),
             mode: RequestedOnboardingMode::Server,
             expires_in_seconds: Some(600),
@@ -999,7 +991,7 @@ async fn bootstrap_wraps_key() {
     let (_, Json(created)) = create_onboarding_secret(
         State(state.clone()),
         Extension(Some(auth)),
-        Json(CreateOnboardingSecretRequest {
+        Json(CreateSecretRequest {
             seed_url: "http://127.0.0.1:3000".to_string(),
             mode: RequestedOnboardingMode::Management,
             expires_in_seconds: Some(600),

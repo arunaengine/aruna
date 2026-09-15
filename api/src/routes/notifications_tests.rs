@@ -250,8 +250,8 @@ fn auth_for(user_id: UserId, realm_id: RealmId) -> AuthContext {
     }
 }
 
-fn bearer() -> Extension<Option<ValidatedArunaBearerTokenCarrier>> {
-    Extension(Some(ValidatedArunaBearerTokenCarrier::new_for_test(
+fn bearer() -> Extension<Option<ValidatedBearer>> {
+    Extension(Some(ValidatedBearer::new_for_test(
         "notification-watch-test-token",
     )))
 }
@@ -298,7 +298,7 @@ async fn restricted_token_rejected() {
     let mark_err = mark_read(
         State(state),
         Extension(Some(auth)),
-        Json(MarkReadApiRequest {
+        Json(MarkReadRequest {
             ids: Vec::new(),
             up_to_ms: None,
         }),
@@ -328,7 +328,7 @@ fn cursor_rejects_garbage() {
 
 #[test]
 fn missing_ids_default() {
-    let request: MarkReadApiRequest =
+    let request: MarkReadRequest =
         serde_json::from_str(r#"{"up_to_ms":123}"#).expect("request deserializes");
 
     assert!(request.ids.is_empty());
@@ -343,7 +343,7 @@ async fn bad_ids_rejected() {
     let error = mark_read(
         State(state),
         Extension(Some(auth_for(user_id, realm_id))),
-        Json(MarkReadApiRequest {
+        Json(MarkReadRequest {
             ids: vec!["not-a-ulid".to_string()],
             up_to_ms: None,
         }),
@@ -361,7 +361,7 @@ async fn excess_ids_rejected() {
     let error = mark_read(
         State(state),
         Extension(Some(auth_for(user_id, realm_id))),
-        Json(MarkReadApiRequest {
+        Json(MarkReadRequest {
             ids: (0..=MARK_READ_MAX_IDS)
                 .map(|_| Ulid::generate().to_string())
                 .collect(),
@@ -418,7 +418,7 @@ async fn local_path_serves() {
     let (_, marked) = mark_read(
         State(state.clone()),
         Extension(Some(auth_for(user_id, realm_id))),
-        Json(MarkReadApiRequest {
+        Json(MarkReadRequest {
             ids,
             up_to_ms: None,
         }),
@@ -488,10 +488,10 @@ async fn state_stream_initial() {
 
     assert_eq!(
         states.next().await,
-        Some(NotificationStreamStateResponse {
+        Some(NotificationStreamResponse {
             epoch: "test-epoch".to_string(),
             revision: 3,
-            unread: UnreadCountApiResponse {
+            unread: UnreadCountResponse {
                 count: 4,
                 capped: false,
             },
@@ -513,7 +513,7 @@ async fn state_stream_updates() {
     assert_eq!(states.next().await.expect("initial state").revision, 3);
     assert_eq!(
         states.next().await.expect("unread state").unread,
-        UnreadCountApiResponse {
+        UnreadCountResponse {
             count: 5,
             capped: true,
         }
@@ -549,7 +549,7 @@ async fn wake_emits_unchanged() {
         Duration::from_secs(20),
     ));
 
-    let capped = UnreadCountApiResponse {
+    let capped = UnreadCountResponse {
         count: 100,
         capped: true,
     };
@@ -579,10 +579,10 @@ async fn state_stream_periodic() {
 async fn state_event_shape() {
     use axum::response::IntoResponse;
 
-    let event = state_event(NotificationStreamStateResponse {
+    let event = state_event(NotificationStreamResponse {
         epoch: "test-epoch".to_string(),
         revision: 3,
-        unread: UnreadCountApiResponse {
+        unread: UnreadCountResponse {
             count: 4,
             capped: false,
         },
