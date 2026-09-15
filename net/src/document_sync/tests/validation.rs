@@ -7,12 +7,12 @@ fn usage_owner_validation() {
     let node_id = node(7);
     let realm_id = RealmId::from_bytes([2u8; 32]);
     let group_id = Ulid::from_bytes([4u8; 16]);
-    let global = DocumentSyncTarget::NodeUsage {
+    let global = DocumentTarget::NodeUsage {
         realm_id,
         node_id,
         group_id: None,
     };
-    let group = DocumentSyncTarget::NodeUsage {
+    let group = DocumentTarget::NodeUsage {
         realm_id,
         node_id,
         group_id: Some(group_id),
@@ -50,7 +50,7 @@ fn usage_owner_validation() {
     // Undecodable payloads and non node-usage targets are rejected.
     assert!(validate_usage_upsert(&global, b"not-a-snapshot").is_err());
     assert!(
-        validate_usage_upsert(&DocumentSyncTarget::RealmConfig { realm_id }, &owned_bytes).is_err()
+        validate_usage_upsert(&DocumentTarget::RealmConfig { realm_id }, &owned_bytes).is_err()
     );
 }
 
@@ -60,7 +60,7 @@ fn watch_interest_validation() {
 
     let node_id = node(7);
     let realm_id = RealmId::from_bytes([12u8; 32]);
-    let target = DocumentSyncTarget::WatchInterest { realm_id, node_id };
+    let target = DocumentTarget::WatchInterest { realm_id, node_id };
 
     // The owning node's own digest validates.
     let owned = WatchInterestDigest::from_subscriptions(
@@ -108,8 +108,7 @@ fn watch_interest_validation() {
     // Undecodable payloads and non watch-interest targets are rejected.
     assert!(validate_watch_interest(&target, b"not-a-digest").is_err());
     assert!(
-        validate_watch_interest(&DocumentSyncTarget::RealmConfig { realm_id }, &owned_bytes,)
-            .is_err()
+        validate_watch_interest(&DocumentTarget::RealmConfig { realm_id }, &owned_bytes,).is_err()
     );
 }
 
@@ -127,7 +126,7 @@ async fn watch_origins_converge() {
         let mut subscription =
             WatchSubscription::new(owner, format!("watch/{seed}"), event_mask, 1);
         subscription.watch_id = watch_id;
-        let change = DocumentSyncChange {
+        let change = DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: 1,
@@ -135,11 +134,11 @@ async fn watch_origins_converge() {
                 actor: node(seed),
                 updated_at_ms: 1,
             },
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement: PlacementRef::NIL,
         };
         (
-            DocumentSyncTarget::WatchSubscription { owner, watch_id },
+            DocumentTarget::WatchSubscription { owner, watch_id },
             subscription.to_bytes().expect("subscription serializes"),
             change,
         )
@@ -235,7 +234,7 @@ fn stale_advertisement_skipped() {
 
     // An unbounded or self-contradicting snapshot never reaches storage.
     let realm_id = RealmId::from_bytes([9u8; 32]);
-    let target = DocumentSyncTarget::NodeInfo {
+    let target = DocumentTarget::NodeInfo {
         realm_id,
         node_id: node(7),
     };
@@ -339,7 +338,7 @@ async fn defers_unknown_authority() {
         user_id: policy_admin(realm_id),
         realm_id,
     };
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     batch_write_to(
         &storage,
         vec![(
@@ -439,11 +438,11 @@ async fn forged_upsert_skipped() {
     let local_node = service.local_node_id().expect("local node id");
     let forged_node = node(88);
     assert_ne!(local_node, forged_node);
-    let target = DocumentSyncTarget::WatchInterest {
+    let target = DocumentTarget::WatchInterest {
         realm_id,
         node_id: local_node,
     };
-    let forged_target = DocumentSyncTarget::WatchInterest {
+    let forged_target = DocumentTarget::WatchInterest {
         realm_id,
         node_id: forged_node,
     };
@@ -453,7 +452,7 @@ async fn forged_upsert_skipped() {
         forged_target.sync_topic_id(realm_id, &PlacementRef::NIL)
     );
 
-    let change = || DocumentSyncChange {
+    let change = || DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -461,7 +460,7 @@ async fn forged_upsert_skipped() {
             actor: local_node,
             updated_at_ms: 1,
         },
-        kind: DocumentSyncChangeKind::Upsert,
+        kind: DocumentChangeKind::Upsert,
         placement: aruna_core::structs::PlacementRef::NIL,
     };
     let forged_digest = WatchInterestDigest::from_subscriptions(
@@ -505,7 +504,7 @@ async fn forged_upsert_skipped() {
         .await;
     assert!(matches!(
         published,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     reset_test_cursor(&service, topic_id).await;
@@ -580,11 +579,11 @@ async fn forged_watch_skipped() {
     let local_node = service.local_node_id().expect("local node id");
     let forged_node = node(89);
     assert_ne!(local_node, forged_node);
-    let target = DocumentSyncTarget::WatchInterest {
+    let target = DocumentTarget::WatchInterest {
         realm_id,
         node_id: local_node,
     };
-    let forged_target = DocumentSyncTarget::WatchInterest {
+    let forged_target = DocumentTarget::WatchInterest {
         realm_id,
         node_id: forged_node,
     };
@@ -594,7 +593,7 @@ async fn forged_watch_skipped() {
         forged_target.sync_topic_id(realm_id, &PlacementRef::NIL)
     );
 
-    let change = |kind| DocumentSyncChange {
+    let change = |kind| DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -638,7 +637,7 @@ async fn forged_watch_skipped() {
                 DocumentSyncPublish::Delete {
                     event_id: Ulid::generate(),
                     target: forged_target.clone(),
-                    change: change(DocumentSyncChangeKind::Delete),
+                    change: change(DocumentChangeKind::Delete),
                     allow_genesis: true,
                 },
                 DocumentSyncPublish::AdminOperation {
@@ -652,7 +651,7 @@ async fn forged_watch_skipped() {
                     event_id: Ulid::generate(),
                     target: target.clone(),
                     bytes: digest_bytes.clone(),
-                    change: change(DocumentSyncChangeKind::Upsert),
+                    change: change(DocumentChangeKind::Upsert),
                     allow_genesis: true,
                 },
             ],
@@ -661,7 +660,7 @@ async fn forged_watch_skipped() {
         .await;
     assert!(matches!(
         published,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     reset_test_cursor(&service, topic_id).await;
@@ -737,14 +736,14 @@ async fn forged_usage_skipped() {
 
     let local_node = service.local_node_id().expect("local node id");
     let realm_id = RealmId::from_bytes([53u8; 32]);
-    let target = DocumentSyncTarget::NodeUsage {
+    let target = DocumentTarget::NodeUsage {
         realm_id,
         node_id: local_node,
         group_id: None,
     };
     let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
 
-    let change = |kind| DocumentSyncChange {
+    let change = |kind| DocumentChange {
         base: None,
         current: DocumentSyncRevision {
             generation: 1,
@@ -773,14 +772,14 @@ async fn forged_usage_skipped() {
                 DocumentSyncPublish::Delete {
                     event_id: Ulid::generate(),
                     target: target.clone(),
-                    change: change(DocumentSyncChangeKind::Delete),
+                    change: change(DocumentChangeKind::Delete),
                     allow_genesis: true,
                 },
                 DocumentSyncPublish::Upsert {
                     event_id: Ulid::generate(),
                     target: target.clone(),
                     bytes: snapshot_bytes.clone(),
-                    change: change(DocumentSyncChangeKind::Upsert),
+                    change: change(DocumentChangeKind::Upsert),
                     allow_genesis: true,
                 },
             ],
@@ -789,7 +788,7 @@ async fn forged_usage_skipped() {
         .await;
     assert!(matches!(
         published,
-        DocumentSyncNetEvent::DocumentsPublished { .. }
+        DocumentNetEvent::DocumentsPublished { .. }
     ));
 
     // Reset the cursor so reconcile reprocesses both ops exactly as a fresh
@@ -843,7 +842,7 @@ fn node_owner_validation() {
 
     let node_id = node(7);
     let realm_id = RealmId::from_bytes([2u8; 32]);
-    let target = DocumentSyncTarget::NodeInfo { realm_id, node_id };
+    let target = DocumentTarget::NodeInfo { realm_id, node_id };
 
     let owned = NodeInfoDocument {
         node_id,
@@ -883,7 +882,7 @@ fn node_owner_validation() {
     assert!(validate_node_upsert(&target, b"not-a-document").is_err());
     assert!(
         validate_node_upsert(
-            &DocumentSyncTarget::RealmConfig { realm_id },
+            &DocumentTarget::RealmConfig { realm_id },
             &owned.to_bytes().unwrap()
         )
         .is_err()
