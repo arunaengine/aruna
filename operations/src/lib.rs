@@ -1,5 +1,4 @@
-//! Domain state machines and their adapters: metadata, sync, jobs, S3,
-//! placement, and the effect-driven operation runner.
+//! Domain state machines and their adapters over the operation runner.
 // Fresh (non-incremental) builds overflow the default query depth in the
 // deeply nested async state machines; incremental builds mask it.
 #![recursion_limit = "512"]
@@ -13,6 +12,7 @@ pub mod device;
 pub mod document_repository;
 pub mod driver;
 pub(crate) mod endpoint_screening;
+pub mod forward;
 pub mod groups;
 pub mod harvest;
 pub mod jobs;

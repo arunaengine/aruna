@@ -2,6 +2,8 @@
 //! through `Processing` to `Active`; each step is a compare-and-set txn that
 //! also enqueues its sync publish, so replay cannot mint twice.
 
+pub mod forward;
+
 use aruna_core::UserId;
 use aruna_core::document::DocumentSyncOutboxEvent;
 use aruna_core::effects::{Effect, StorageEffect};

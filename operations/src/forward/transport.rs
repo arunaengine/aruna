@@ -35,7 +35,7 @@ pub enum MetadataWriteError {
     Undeliverable(String),
 }
 
-pub(super) fn write_error(error: MetadataWriteError) -> MetadataApiError {
+pub(crate) fn write_error(error: MetadataWriteError) -> MetadataApiError {
     match error {
         MetadataWriteError::Unauthorized => MetadataApiError::Unauthorized,
         MetadataWriteError::Forbidden => MetadataApiError::Forbidden,
@@ -163,30 +163,30 @@ pub(crate) async fn forward_to_holders(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RetryDisposition {
+pub(crate) enum RetryDisposition {
     TryNext,
     Stop,
 }
 
-pub(super) fn retry_disposition(delivery: MetadataRequestDelivery) -> RetryDisposition {
+pub(crate) fn retry_disposition(delivery: MetadataRequestDelivery) -> RetryDisposition {
     match delivery {
         MetadataRequestDelivery::DefinitelyNotSent => RetryDisposition::TryNext,
         MetadataRequestDelivery::PossiblySent => RetryDisposition::Stop,
     }
 }
 
-pub(super) fn unexpected_response(response: MetadataTransportMessage) -> MetadataWriteError {
+pub(crate) fn unexpected_response(response: MetadataTransportMessage) -> MetadataWriteError {
     MetadataWriteError::Undeliverable(format!(
         "unexpected forwarded metadata response: {}",
         crate::metadata::handle::transport_message_kind(&response)
     ))
 }
 
-pub(super) fn reject(error: impl Into<String>) -> MetadataTransportMessage {
+pub(crate) fn reject(error: impl Into<String>) -> MetadataTransportMessage {
     MetadataTransportMessage::Reject(error.into())
 }
 
-pub(super) fn forwarded_unavailable(
+pub(crate) fn forwarded_unavailable(
     message: &MetadataTransportMessage,
 ) -> MetadataTransportMessage {
     match message {

@@ -21,7 +21,7 @@ use aruna_core::structs::RealmId;
 use std::sync::Arc;
 use ulid::Ulid;
 
-pub(super) fn routed_record_matches(
+pub(crate) fn routed_record_matches(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     document_id: Ulid,
@@ -43,7 +43,7 @@ pub(super) fn routed_record_matches(
             .is_ok_and(|resolved| resolved == *placement)
 }
 
-pub(super) fn create_record_matches(
+pub(crate) fn create_record_matches(
     config: &CreateMetadataDocumentConfig,
     document_id: Ulid,
     placement: &PlacementRef,
@@ -66,7 +66,7 @@ pub(super) fn create_record_matches(
         && record.public == config.public
 }
 
-pub(super) fn update_record_matches(
+pub(crate) fn update_record_matches(
     expected: &MetadataRegistryRecord,
     actual: &MetadataRegistryRecord,
 ) -> bool {
@@ -81,7 +81,7 @@ pub(super) fn update_record_matches(
         && expected.establishing_event_id == actual.establishing_event_id
 }
 
-pub(super) async fn forwarded_create_replay(
+pub(crate) async fn forwarded_create_replay(
     context: &Arc<DriverContext>,
     config: &CreateMetadataDocumentConfig,
 ) -> Result<Option<MetadataTransportMessage>, String> {
@@ -104,7 +104,7 @@ pub(super) async fn forwarded_create_replay(
     }))
 }
 
-pub(super) async fn accepted_create(
+pub(crate) async fn accepted_create(
     context: &Arc<DriverContext>,
     document_id: Ulid,
 ) -> Result<Option<MetadataCreateEventRecord>, String> {
@@ -135,7 +135,7 @@ pub(super) async fn accepted_create(
 /// Whether this node has evidence that the document was created here and is now
 /// gone, rather than a create whose projection has not landed: the create
 /// acceptance survives the delete, while a queued projection means "not yet".
-pub(super) async fn document_deleted_here(
+pub(crate) async fn document_deleted_here(
     context: &Arc<DriverContext>,
     document_id: Ulid,
 ) -> Result<bool, MetadataApiError> {
@@ -171,7 +171,7 @@ pub(crate) async fn projection_queued(
 }
 
 /// The document's registry record, whatever this node's holdership of it.
-pub(super) async fn existing_record(
+pub(crate) async fn existing_record(
     context: &Arc<DriverContext>,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, String> {
@@ -180,13 +180,13 @@ pub(super) async fn existing_record(
         .map_err(|error| format!("metadata registry read failed: {error:?}"))
 }
 
-pub(super) enum HeldRecordError {
+pub(crate) enum HeldRecordError {
     NotFound,
     Unavailable(String),
 }
 
 /// Loads a document only when this node holds its current structured placement.
-pub(super) async fn held_record(
+pub(crate) async fn held_record(
     context: &Arc<DriverContext>,
     config: &RealmConfigDocument,
     local_node_id: NodeId,

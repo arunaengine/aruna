@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::warn;
 
-use super::authorize::is_sync_eligible;
-use super::transport::reject;
+use crate::forward::authorize::is_sync_eligible;
+use crate::forward::transport::reject;
 
 pub(crate) async fn apply_bucket_create(
     context: &Arc<DriverContext>,

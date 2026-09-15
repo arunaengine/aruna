@@ -22,7 +22,7 @@ use ulid::Ulid;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::{DriverContext, drive, routing_snapshot};
-use crate::metadata::forward::peer_acts_for;
+use crate::forward::authorize::peer_acts_for;
 use crate::metadata::handle::MetadataWritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;

@@ -387,7 +387,7 @@ impl MetadataHandle {
                                 )
                                 .await
                                 .map(Box::new)
-                                .map_err(super::super::forward::read_error)
+                                .map_err(crate::forward::transport::read_error)
                             }
                             None => Err(MetadataReadError::Unavailable),
                         },
@@ -606,7 +606,7 @@ impl MetadataHandle {
                                         auth.as_ref(),
                                     )
                                     .await
-                                    .map_err(super::super::forward::read_error);
+                                    .map_err(crate::forward::transport::read_error);
                                     if !config_digest_matches(
                                         context.as_ref(),
                                         realm_id,
@@ -664,7 +664,7 @@ impl MetadataHandle {
                                             conflicts: result.conflicts,
                                         })
                                     })
-                                    .map_err(super::super::forward::read_error);
+                                    .map_err(crate::forward::transport::read_error);
                                     if !config_digest_matches(
                                         context.as_ref(),
                                         realm_id,
@@ -797,13 +797,16 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
                 Box::pin(async {
-                    super::super::forward::apply_token_revoke(context, peer, forward).await
+                    crate::auth::forward::apply_token_revoke(context, peer, forward).await
                 })
                 .await
             }
             forward @ MetadataTransportMessage::ForwardPersistentId { .. } => {
                 Box::pin(async {
-                    super::super::forward::apply_forwarded_pid(context, peer, forward).await
+                    crate::metadata::persistent_id::forward::apply_forwarded_pid(
+                        context, peer, forward,
+                    )
+                    .await
                 })
                 .await
             }
@@ -863,37 +866,37 @@ impl MetadataHandle {
             }
             create @ MetadataTransportMessage::ForwardCreateBucket { .. } => {
                 Box::pin(async {
-                    super::super::forward::apply_bucket_create(context, peer, create).await
+                    crate::s3::forward::apply_bucket_create(context, peer, create).await
                 })
                 .await
             }
             fetch @ MetadataTransportMessage::FetchRealmDocuments { .. } => {
                 Box::pin(async {
-                    super::super::forward::serve_realm_documents(context, peer, fetch).await
+                    crate::device::forward::serve_realm_documents(context, peer, fetch).await
                 })
                 .await
             }
             fetch @ MetadataTransportMessage::FetchGraphState { .. } => {
                 Box::pin(async {
-                    super::super::forward::serve_graph_state(context, peer, fetch).await
+                    crate::device::forward::serve_graph_state(context, peer, fetch).await
                 })
                 .await
             }
             forward @ MetadataTransportMessage::ForwardApplyBatch { .. } => {
                 Box::pin(async {
-                    super::super::forward::apply_device_batch(context, peer, forward).await
+                    crate::device::forward::apply_device_batch(context, peer, forward).await
                 })
                 .await
             }
             forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
                 Box::pin(async {
-                    super::super::forward::apply_admin_relay(context, peer, forward).await
+                    crate::realm::forward::apply_admin_relay(context, peer, forward).await
                 })
                 .await
             }
             forward @ MetadataTransportMessage::ForwardGroupCreate { .. } => {
                 Box::pin(async {
-                    super::super::forward::apply_group_create(context, peer, forward).await
+                    crate::groups::forward::apply_group_create(context, peer, forward).await
                 })
                 .await
             }
