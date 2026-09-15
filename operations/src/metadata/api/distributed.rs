@@ -1,10 +1,10 @@
 use super::{
-    Arc, AuthContext, BucketSearchHit, DriverContext, GroupId, HashMap, HashSet, Instant,
-    METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS, METADATA_SEARCH_MAX_PAGINATION_DEPTH,
-    MetadataApiError, MetadataApiQueryMode, MetadataFanoutOperation, MetadataFanoutScope,
-    MetadataFanoutStats, MetadataNodeCall, MetadataQueryResults, MetadataReadError,
-    MetadataReferencePreflightNodeExecution, MetadataSearchHit, NodeId, NodeSearchResult,
-    ObjectKeyMatch, ObjectSearchNodePage, ObjectSearchQueryMode, RealmId, SearchPageCursor,
+    ApiQueryMode, Arc, AuthContext, BucketSearchHit, DriverContext, GroupId, HashMap, HashSet,
+    Instant, METADATA_QUERY_MAX_RESULT_BYTES, METADATA_QUERY_MAX_ROWS,
+    METADATA_SEARCH_MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation,
+    MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataQueryResults,
+    MetadataReadError, MetadataSearchHit, NodeId, NodeSearchResult, ObjectKeyMatch,
+    ObjectQueryMode, RealmId, ReferenceNodeExecution, SearchNodePage, SearchPageCursor,
     SearchWatermark, Span, fanout_bearer, field, map_read_error, merge_search_hits,
     metadata_node_call, paginate, query_union_safe, record_elapsed_ms, resume_fetch_limit,
     run_metadata_fanout,
@@ -15,7 +15,7 @@ pub(super) fn object_search_fingerprint(
     query: &str,
     key_match: ObjectKeyMatch,
     bucket: Option<&str>,
-    mode: ObjectSearchQueryMode,
+    mode: ObjectQueryMode,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"aruna.object.search.v1\0");
@@ -36,16 +36,16 @@ pub(super) fn object_search_fingerprint(
         }
     }
     hasher.update(&[match mode {
-        ObjectSearchQueryMode::Local => 1,
-        ObjectSearchQueryMode::DistributedBestEffort => 2,
-        ObjectSearchQueryMode::DistributedStrict => 3,
+        ObjectQueryMode::Local => 1,
+        ObjectQueryMode::DistributedBestEffort => 2,
+        ObjectQueryMode::DistributedStrict => 3,
     }]);
     *hasher.finalize().as_bytes()
 }
 
 pub(super) fn record_object_result(
     span: &Span,
-    result: &Result<ObjectSearchNodePage, MetadataReadError>,
+    result: &Result<SearchNodePage, MetadataReadError>,
 ) {
     match result {
         Ok(page) => {
@@ -104,7 +104,7 @@ pub(super) fn record_search_node(
 
 pub(super) fn record_preflight_node(
     span: &Span,
-    result: &Result<MetadataReferencePreflightNodeExecution, MetadataReadError>,
+    result: &Result<ReferenceNodeExecution, MetadataReadError>,
 ) {
     match result {
         Ok(result) => {
@@ -145,12 +145,9 @@ pub(super) async fn run_query_distributed(
 ) -> Result<(MetadataQueryResults, MetadataFanoutStats), MetadataApiError> {
     let span = Span::current();
     let total_started = Instant::now();
-    let mode = scope.mode.unwrap_or(MetadataApiQueryMode::Distributed);
-    let single_dataset_result = mode == MetadataApiQueryMode::Local || graph_iris.is_some();
-    if mode == MetadataApiQueryMode::Distributed
-        && graph_iris.is_none()
-        && !query_union_safe(&query)
-    {
+    let mode = scope.mode.unwrap_or(ApiQueryMode::Distributed);
+    let single_dataset_result = mode == ApiQueryMode::Local || graph_iris.is_some();
+    if mode == ApiQueryMode::Distributed && graph_iris.is_none() && !query_union_safe(&query) {
         return Err(MetadataApiError::BadRequest);
     }
     let handle = context
@@ -172,7 +169,7 @@ pub(super) async fn run_query_distributed(
             .map(|credential| {
                 crate::metadata::query_cache::remote_key(
                     &crate::metadata::query_cache::RemoteKeyInput {
-                        distributed: mode == MetadataApiQueryMode::Distributed,
+                        distributed: mode == ApiQueryMode::Distributed,
                         realm_id,
                         credential: &credential,
                         graph_iris: graph_iris.as_deref(),

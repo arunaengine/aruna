@@ -12,11 +12,11 @@ use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
     AttemptControl, AuthContext, BackendLocation, BucketInfo, CapturedInput, ExecutionSpec,
-    HashPathIndexKey, InputMode, InputSelection, InputSource, JobError, JobRecord,
-    MAX_EXECUTION_OUTPUTS, OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject,
-    OutputSelection, PathRestriction, Permission, PlacementPolicyRef, RealmId, ReplicationFailure,
-    UserAccess, VersionedObjectArn, bucket_permission_path, ensure_confined_path,
-    group_permission_path, key_content_type, object_permission_path, workspace_credential_id,
+    HashIndex, InputMode, InputSelection, InputSource, JobError, JobRecord, MAX_EXECUTION_OUTPUTS,
+    OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject, OutputSelection, PathRestriction,
+    Permission, PlacementPolicyRef, RealmId, ReplicationFailure, UserAccess, VersionedObjectArn,
+    bucket_permission_path, ensure_confined_path, group_permission_path, key_content_type,
+    object_permission_path, workspace_credential_id,
 };
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -24,14 +24,14 @@ use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::blob::permission_paths::ResolveBlobPermissionPathsOperation;
+use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     quota_marked_routing, routing_snapshot,
 };
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::store::reserve_output_commits;
-use crate::realm::get_config::GetRealmConfigOperation;
+use crate::realm::get_config::GetConfigOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,
@@ -40,15 +40,15 @@ use crate::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
     SourceAuthorizationError,
 };
-use crate::s3::create_access::{CreateUserAccessConfig, CreateUserAccessOperation};
+use crate::s3::create_access::{CreateUserConfig, CreateUserOperation};
 use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::delete_object::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
-use crate::s3::get_access::{GetUserAccessError, GetUserAccessOperation};
-use crate::s3::get_bucket::{GetBucketInfoError, GetBucketInfoOperation};
+use crate::s3::get_access::{GetAccessError, GetAccessOperation};
+use crate::s3::get_bucket::{GetBucketError, GetBucketOperation};
 use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use crate::s3::list_objects::{ListObjectsV2Input, ListObjectsV2Operation};
+use crate::s3::list_objects::{ListBucketInput, ListBucketOperation};
 use crate::s3::put_object::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
@@ -109,12 +109,9 @@ pub async fn check_workspace_bucket(
     node_id: NodeId,
     bucket: &str,
 ) -> Result<(), JobError> {
-    let info = Box::pin(drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
-        context,
-    ))
-    .await
-    .map_err(|error| bucket_lookup_error("workspace", error))?;
+    let info = Box::pin(drive(GetBucketOperation::new(bucket.to_string()), context))
+        .await
+        .map_err(|error| bucket_lookup_error("workspace", error))?;
     if info.group_id != spec.group_id {
         return Err(JobError::permanent(
             "existing workspace bucket is outside the execution group",
@@ -226,12 +223,7 @@ async fn mint_credential(
         .as_ref()
         .map(|net| net.credential_encryption_key())
         .ok_or_else(|| JobError::permanent("workspace credential needs a net handle"))?;
-    match Box::pin(drive(
-        GetUserAccessOperation::new(access_key.clone()),
-        context,
-    ))
-    .await
-    {
+    match Box::pin(drive(GetAccessOperation::new(access_key.clone()), context)).await {
         Ok(access) => {
             let matches_job = access.access_key == access_key
                 && access.user_identity == record.created_by
@@ -256,7 +248,7 @@ async fn mint_credential(
                 return Err(JobError::permanent("workspace credential expired"));
             }
         }
-        Err(GetUserAccessError::NotFound) => {}
+        Err(GetAccessError::NotFound) => {}
         Err(error) => {
             return Err(JobError::retryable(format!(
                 "workspace credential lookup failed: {error}"
@@ -281,8 +273,8 @@ async fn mint_credential(
         None => SystemTime::now() + walltime + CREDENTIAL_SLACK,
     };
     let (_, secret, access) = Box::pin(drive(
-        CreateUserAccessOperation::new_with_key(
-            CreateUserAccessConfig {
+        CreateUserOperation::new_with_key(
+            CreateUserConfig {
                 user_identity: record.created_by,
                 group_id: spec.group_id,
                 expiry,
@@ -369,7 +361,7 @@ async fn authorize_source(
     source: &SourceObject,
 ) -> Result<(), JobError> {
     let bucket_info = Box::pin(drive(
-        GetBucketInfoOperation::new(source.bucket.clone()),
+        GetBucketOperation::new(source.bucket.clone()),
         context,
     ))
     .await
@@ -567,11 +559,7 @@ async fn input_bytes(
 /// Registered copies of the same bytes this node holds itself, deduplicated by
 /// the object they name. Only copies of this realm on this node can be read
 /// locally, so everything else is dropped.
-fn local_copies(
-    candidates: Vec<HashPathIndexKey>,
-    realm_id: RealmId,
-    node_id: NodeId,
-) -> Vec<HashPathIndexKey> {
+fn local_copies(candidates: Vec<HashIndex>, realm_id: RealmId, node_id: NodeId) -> Vec<HashIndex> {
     let mut unique = BTreeMap::new();
     for candidate in candidates {
         if candidate.realm_id != realm_id || candidate.node_id != node_id {
@@ -598,12 +586,9 @@ async fn local_copy_source(
     source: &SourceObject,
     captured: &CapturedInput,
 ) -> Option<StagedSource> {
-    let candidates = Box::pin(drive(
-        ResolveBlobPermissionPathsOperation::new(captured.blake3),
-        context,
-    ))
-    .await
-    .ok()?;
+    let candidates = Box::pin(drive(ResolvePathsOperation::new(captured.blake3), context))
+        .await
+        .ok()?;
     for candidate in local_copies(candidates, record.created_by.realm_id, node_id) {
         let copy = SourceObject {
             path: source.path.clone(),
@@ -838,7 +823,7 @@ async fn put_file_output(
         Box::pin(ensure_output_stage(context, spec, record, &stage_bucket)).await?;
         (stage_bucket, version_id.to_string())
     } else {
-        let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
+        let bucket_info = Box::pin(drive(GetBucketOperation::new(bucket.clone()), context))
             .await
             .map_err(|error| bucket_lookup_error("output", error))?;
         if bucket_info.group_id != spec.group_id {
@@ -876,7 +861,7 @@ async fn put_file_output(
     };
 
     let realm_config = Box::pin(drive(
-        GetRealmConfigOperation::new(record.created_by.realm_id),
+        GetConfigOperation::new(record.created_by.realm_id),
         context,
     ))
     .await
@@ -1291,9 +1276,9 @@ fn device_read_error(bucket: &str, key: &str, error: BaoReadError) -> JobError {
     }
 }
 
-fn bucket_lookup_error(scope: &str, error: GetBucketInfoError) -> JobError {
+fn bucket_lookup_error(scope: &str, error: GetBucketError) -> JobError {
     let message = format!("{scope} bucket lookup failed: {error}");
-    if matches!(&error, GetBucketInfoError::StorageError(error) if storage_retryable(error)) {
+    if matches!(&error, GetBucketError::StorageError(error) if storage_retryable(error)) {
         JobError::retryable(message)
     } else {
         JobError::permanent(message)
@@ -1404,7 +1389,7 @@ pub async fn collect_outputs(
         let mut continuation = None;
         loop {
             let result = Box::pin(drive(
-                ListObjectsV2Operation::new(ListObjectsV2Input {
+                ListBucketOperation::new(ListBucketInput {
                     bucket: bucket.to_string(),
                     group_id: spec.group_id,
                     continuation_token: continuation.clone(),
@@ -1671,7 +1656,7 @@ mod tests {
         let group = Ulid::from_bytes([5; 16]);
         let version = Ulid::from_bytes([6; 16]);
         let alias = |realm_id, node_id, bucket: &str, key: &str| {
-            HashPathIndexKey::new(hash, version, realm_id, group, node_id, bucket, key)
+            HashIndex::new(hash, version, realm_id, group, node_id, bucket, key)
         };
         let candidates = vec![
             alias(realm, node, "shared", "reads.fastq"),
@@ -2029,7 +2014,7 @@ mod tests {
         assert_eq!(second.secret, first.secret);
 
         let access = Box::pin(drive(
-            GetUserAccessOperation::new(first.access_key.clone()),
+            GetAccessOperation::new(first.access_key.clone()),
             &context,
         ))
         .await
@@ -2050,7 +2035,7 @@ mod tests {
             .unwrap();
         assert_eq!(renewed.access_key, first.access_key);
         let renewed_access = Box::pin(drive(
-            GetUserAccessOperation::new(first.access_key.clone()),
+            GetAccessOperation::new(first.access_key.clone()),
             &context,
         ))
         .await
@@ -2090,7 +2075,7 @@ mod tests {
             .await
             .unwrap();
         let mut access = Box::pin(drive(
-            GetUserAccessOperation::new(minted.access_key.clone()),
+            GetAccessOperation::new(minted.access_key.clone()),
             &context,
         ))
         .await

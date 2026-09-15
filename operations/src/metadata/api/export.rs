@@ -10,7 +10,7 @@ use super::read::{is_deleted, load_record_txn};
 pub async fn get_visible_document(
     context: &DriverContext,
     realm_id: RealmId,
-    request: GetVisibleMetadataDocumentRequest,
+    request: GetVisibleRequest,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
     let record = load_live_record(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
@@ -21,33 +21,33 @@ pub async fn get_visible_document(
 pub async fn export_metadata_rocrate(
     context: &DriverContext,
     realm_id: RealmId,
-    request: ExportMetadataRoCrateRequest,
-) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
-    if request.view == MetadataRoCrateExportView::Raw {
+    request: ExportMetadataRequest,
+) -> Result<ExportMetadataResult, MetadataApiError> {
+    if request.view == RoCrateExportView::Raw {
         return export_raw(context, realm_id, request).await;
     }
     let record = load_live_record(context, request.document_id).await?;
     ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
 
     match request.view {
-        MetadataRoCrateExportView::Full => {
+        RoCrateExportView::Full => {
             ensure_record_materialized(context, &record).await?;
-            Ok(ExportMetadataRoCrateResult::Full {
+            Ok(ExportMetadataResult::Full {
                 jsonld: export_rocrate_jsonld(context, &record.graph_iri).await?,
                 record,
             })
         }
-        MetadataRoCrateExportView::Summary => {
+        RoCrateExportView::Summary => {
             ensure_record_materialized(context, &record).await?;
-            Ok(ExportMetadataRoCrateResult::Summary {
+            Ok(ExportMetadataResult::Summary {
                 jsonld: export_summary_jsonld(context, &record.graph_iri, record.last_event_id)
                     .await?,
                 record,
             })
         }
-        MetadataRoCrateExportView::Page => {
+        RoCrateExportView::Page => {
             ensure_record_materialized(context, &record).await?;
-            Ok(ExportMetadataRoCrateResult::Page {
+            Ok(ExportMetadataResult::Page {
                 page: export_rocrate_page(
                     context,
                     &record.graph_iri,
@@ -59,7 +59,7 @@ pub async fn export_metadata_rocrate(
                 record,
             })
         }
-        MetadataRoCrateExportView::Raw => Err(MetadataApiError::Internal(
+        RoCrateExportView::Raw => Err(MetadataApiError::Internal(
             "raw export snapshot dispatch mismatch".to_string(),
         )),
     }
@@ -68,8 +68,8 @@ pub async fn export_metadata_rocrate(
 pub(super) async fn export_raw(
     context: &DriverContext,
     realm_id: RealmId,
-    request: ExportMetadataRoCrateRequest,
-) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+    request: ExportMetadataRequest,
+) -> Result<ExportMetadataResult, MetadataApiError> {
     let mut owner = context
         .storage_handle
         .start_transaction(true)
@@ -127,9 +127,9 @@ pub(super) fn raw_identity_matches(
 pub(super) async fn export_raw_txn(
     context: &DriverContext,
     realm_id: RealmId,
-    request: &ExportMetadataRoCrateRequest,
+    request: &ExportMetadataRequest,
     txn_id: TxnId,
-) -> Result<ExportMetadataRoCrateResult, MetadataApiError> {
+) -> Result<ExportMetadataResult, MetadataApiError> {
     let record = load_record_txn(context, request.document_id, txn_id).await?;
     if !raw_identity_matches(&record, realm_id, request.document_id) {
         return Err(MetadataApiError::NotFound);
@@ -146,14 +146,14 @@ pub(super) async fn export_raw_txn(
         crate::metadata::raw_revision::load_raw_view(context, record.document_id, Some(txn_id))
             .await
             .map_err(|error| match error {
-                crate::metadata::raw_revision::MetadataRawReadError::LimitExceeded(_) => {
+                crate::metadata::raw_revision::RawReadError::LimitExceeded(_) => {
                     MetadataApiError::ServiceUnavailable
                 }
                 error => MetadataApiError::Internal(error.to_string()),
             })?
             .ok_or(MetadataApiError::NotFound)?;
     let dataset_digest = raw.revision.dataset_digest;
-    Ok(ExportMetadataRoCrateResult::Raw {
+    Ok(ExportMetadataResult::Raw {
         record,
         raw,
         dataset_digest,
@@ -225,13 +225,13 @@ async fn export_rocrate_page(
 }
 
 #[derive(Debug, Clone)]
-pub struct GetVisibleMetadataDocumentRequest {
+pub struct GetVisibleRequest {
     pub document_id: Ulid,
     pub auth: Option<AuthContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataRoCrateExportView {
+pub enum RoCrateExportView {
     Full,
     Summary,
     Page,
@@ -239,17 +239,17 @@ pub enum MetadataRoCrateExportView {
 }
 
 #[derive(Debug, Clone)]
-pub struct ExportMetadataRoCrateRequest {
+pub struct ExportMetadataRequest {
     pub document_id: Ulid,
     pub auth: Option<AuthContext>,
-    pub view: MetadataRoCrateExportView,
+    pub view: RoCrateExportView,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ExportMetadataRoCrateResult {
+pub enum ExportMetadataResult {
     Full {
         record: MetadataRegistryRecord,
         jsonld: String,

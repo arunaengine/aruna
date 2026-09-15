@@ -2,10 +2,10 @@ use super::{
     AuthContext, Deserialize, DriverContext, Event, GroupId, GroupPermissionRules, HashMap,
     IterStart, LIST_METADATA_PAGE_SIZE, ListGroupOperation, METADATA_EVENT_LOG_KEYSPACE,
     METADATA_PENDING_PROJECTION_KEYSPACE, METADATA_REGISTRY_CANDIDATE_LIMIT, MetadataApiError,
-    MetadataCreateEventRecord, MetadataRegistryRecord, RealmId, Serialize, StorageEffect,
-    StorageEvent, drive, ensure_record_materialized, event_log_key, export_summary_jsonld,
-    filter_live_records, iter_registry_effect, metadata_read_request, parse_registry_iter,
-    pending_projection_target, stream,
+    MetadataEventRecord, MetadataRegistryRecord, RealmId, Serialize, StorageEffect, StorageEvent,
+    drive, ensure_record_materialized, event_log_key, export_summary_jsonld, filter_live_records,
+    iter_registry_effect, metadata_read_request, parse_registry_iter, pending_projection_target,
+    stream,
 };
 use aruna_core::handle::Handle;
 use futures_util::StreamExt;
@@ -37,7 +37,7 @@ pub enum MetadataListOrder {
 }
 
 #[derive(Debug, Clone)]
-pub struct ListVisibleMetadataDocumentsRequest {
+pub struct ListVisibleRequest {
     pub group_id: Option<GroupId>,
     pub path_prefix: Option<String>,
     pub include_summary: bool,
@@ -54,7 +54,7 @@ pub struct ListedMetadataDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListVisibleMetadataDocumentsResult {
+pub struct ListVisibleResult {
     pub documents: Vec<ListedMetadataDocument>,
     pub limit: usize,
     pub offset: usize,
@@ -68,8 +68,8 @@ pub struct ListVisibleMetadataDocumentsResult {
 pub async fn list_visible_documents(
     context: &DriverContext,
     realm_id: RealmId,
-    request: ListVisibleMetadataDocumentsRequest,
-) -> Result<ListVisibleMetadataDocumentsResult, MetadataApiError> {
+    request: ListVisibleRequest,
+) -> Result<ListVisibleResult, MetadataApiError> {
     let limit = effective_list_limit(request.limit, request.auth.is_none());
     let offset = request.offset.unwrap_or(0);
 
@@ -217,7 +217,7 @@ pub async fn list_visible_documents(
     }
 
     let total_returned = documents.len();
-    Ok(ListVisibleMetadataDocumentsResult {
+    Ok(ListVisibleResult {
         documents,
         limit,
         offset,
@@ -382,7 +382,7 @@ pub(super) async fn load_pending_records(
         let Some(value) = value else {
             continue;
         };
-        let event: MetadataCreateEventRecord = postcard::from_bytes(&value)
+        let event: MetadataEventRecord = postcard::from_bytes(&value)
             .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
         if event.record.document_id != document_id || event.event_id != event_id {
             return Err(MetadataApiError::Internal(format!(

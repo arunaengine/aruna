@@ -530,7 +530,7 @@ mod tests {
     use super::*;
     use crate::jobs::JOB_MAX_ATTEMPTS;
     use crate::jobs::store::{insert_job, record_attempt_intent};
-    use crate::tests::fixtures::workflow::{execution_spec, node_id};
+    use crate::tests::workflow::{execution_spec, node_id};
     use aruna_compute::ExecutorRegistry;
     use aruna_core::UserId;
     use aruna_core::structs::{AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobId, RealmId};

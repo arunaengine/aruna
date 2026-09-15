@@ -20,10 +20,9 @@ use super::super::store::{put_crate_status, read_crate_status, read_job_record};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
 use crate::forward::transport::MetadataWriteError;
-use crate::metadata::MetadataAuthToken;
+use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_job_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_job_document,
 };
 use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
@@ -155,16 +154,16 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
     let jsonld = build_crate_jsonld(&parent, spec, document_id);
 
     let (status, resource) = match route_metadata_create(
-        CreateMetadataDocumentOperation::new_generated_id(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor,
             group_id: spec.group_id,
             document_id,
             document_path,
             public: false,
-            payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
+            payload: CreateDocumentPayload::RoCrate { jsonld },
         }),
         ctx.driver.clone(),
-        Some(MetadataAuthToken::internal(AuthContext {
+        Some(AuthToken::internal(AuthContext {
             user_id: parent.created_by,
             realm_id: parent.created_by.realm_id,
             path_restrictions: None,
@@ -511,23 +510,23 @@ fn rfc3339(ms: u64) -> String {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::metadata::create_document::CreateMetadataDocumentError;
+    use crate::metadata::create_document::CreateDocumentError;
     use aruna_core::metadata::{
-        MetadataError, MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
-        MetadataProfileValidationSeverity,
+        MetadataError, ProfileValidationCompleteness, ProfileValidationFinding,
+        ProfileValidationSeverity,
     };
 
     fn profile_rejection(code: &str) -> MetadataWriteError {
-        MetadataWriteError::Create(CreateMetadataDocumentError::MetadataError(
-            MetadataError::ProfileValidation(vec![MetadataProfileValidationFinding {
+        MetadataWriteError::Create(CreateDocumentError::MetadataError(
+            MetadataError::ProfileValidation(vec![ProfileValidationFinding {
                 code: code.to_string(),
-                severity: MetadataProfileValidationSeverity::Violation,
+                severity: ProfileValidationSeverity::Violation,
                 focus_node: None,
                 path: None,
                 rule: "http://purl.org/dc/terms/conformsTo".to_string(),
                 message: String::new(),
                 profile_revision: None,
-                completeness: MetadataProfileValidationCompleteness::Complete,
+                completeness: ProfileValidationCompleteness::Complete,
             }]),
         ))
     }
