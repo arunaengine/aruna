@@ -46,7 +46,7 @@ pub use subject::{
 };
 pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 
-use aruna_core::structs::PolicyResolution;
+use aruna_core::structs::placement::placement_policy::PolicyResolution;
 use aruna_core::types::GroupId;
 use std::collections::BTreeMap;
 use ulid::Ulid;
@@ -74,10 +74,14 @@ pub fn foreign_owner(
 pub(crate) mod tests {
     use aruna_core::NodeId;
     use aruna_core::UserId;
-    use aruna_core::structs::{
-        DEFAULT_NODE_WEIGHT, NodePlacementEntry, Permission, PlacementDecision, PlacementPolicy,
-        PlacementSelector, PlacementSubject, PolicyResolution, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, RealmNodeKind, Role, VerifiedPolicy, evaluate_placement,
+    use aruna_core::structs::placement::placement_record::{DEFAULT_NODE_WEIGHT, NodePlacementEntry};
+    use aruna_core::structs::identity::auth::{Permission, Role};
+    use aruna_core::structs::placement::placement_policy::{
+        PlacementDecision, PlacementPolicy, PlacementSelector, PlacementSubject, PolicyResolution,
+        VerifiedPolicy, evaluate_placement,
+    };
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use std::collections::{BTreeMap, HashMap, HashSet};
     use ulid::Ulid;

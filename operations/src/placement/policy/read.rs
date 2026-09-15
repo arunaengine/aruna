@@ -9,10 +9,16 @@ use aruna_core::effects::{
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicyFetchEvent, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    GroupAuthorizationDocument, PlacementPolicyDocument, PlacementPolicyError, PlacementPolicyRef,
-    PolicyAuthorityError, RealmAuthorizationDocument, RealmConfigDocument, RealmId, VerifiedPolicy,
-    placement_policy_target, verify_policy_authority,
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::placement::policy_document::{
+    PlacementPolicyDocument, PolicyAuthorityError, placement_policy_target,
+    verify_policy_authority,
+};
+use aruna_core::structs::placement::placement_policy::{
+    PlacementPolicyError, PlacementPolicyRef, VerifiedPolicy,
+};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_core::types::{Effects, Value};
 use smallvec::smallvec;
@@ -153,7 +159,7 @@ impl ReadPolicyOperation {
     /// ref, so neither a stale local row nor a peer can substitute a rule.
     fn accept(
         &self,
-        policy: aruna_core::structs::PlacementPolicy,
+        policy: aruna_core::structs::placement::placement_policy::PlacementPolicy,
     ) -> Result<VerifiedPolicy, ReadPolicyError> {
         let verified = VerifiedPolicy::verify(policy)?;
         if verified.policy_ref() != self.config.policy_ref {
@@ -465,9 +471,10 @@ mod pure_tests {
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::effects::NetEffect;
-    use aruna_core::structs::{
-        LabelMatch, PlacementPolicy, PlacementSelector, PolicyPublicationClaim, RealmNodeKind,
-    };
+    use aruna_core::structs::placement::placement_record::LabelMatch;
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementSelector};
+    use aruna_core::structs::placement::policy_document::PolicyPublicationClaim;
+    use aruna_core::structs::identity::realm::RealmNodeKind;
     use byteview::ByteView;
     use ulid::Ulid;
 

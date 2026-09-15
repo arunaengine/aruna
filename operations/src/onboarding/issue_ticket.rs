@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::operation::Operation;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Key};
 use ed25519_dalek::SigningKey;
 use smallvec::smallvec;
@@ -198,7 +198,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USER_KEYSPACE;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;

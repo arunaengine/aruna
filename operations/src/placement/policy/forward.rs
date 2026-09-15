@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::{Actor, AuthContext, PlacementPolicyDocument};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
 use thiserror::Error;
 use tracing::warn;
 

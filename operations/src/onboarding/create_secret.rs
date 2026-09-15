@@ -5,7 +5,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::Operation;
-use aruna_core::structs::RealmConfigDocument;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -368,7 +368,9 @@ mod tests {
     use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::identity::realm::{
+        QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
     use aruna_storage::storage;
     use byteview::ByteView;
     use tempfile::tempdir;

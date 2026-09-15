@@ -6,10 +6,11 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{
-    AuthContext, ManagedCopyQuarantine, NODE_SUBJECT_KEY, NodeSubjectRecord, Permission, RealmId,
-    VersionKey, policy_admin_path,
-};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{ManagedCopyQuarantine, VersionKey};
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::policy_document::policy_admin_path;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -271,7 +272,8 @@ mod pure_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::id::NodeId;
-    use aruna_core::structs::{PlacementSubject, VersionKey};
+    use aruna_core::structs::placement::placement_policy::PlacementSubject;
+    use aruna_core::structs::storage::blob::VersionKey;
     use std::collections::BTreeMap;
     use ulid::Ulid;
 

@@ -7,12 +7,16 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicySignEvent, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
-use aruna_core::structs::{
-    Actor, AuthContext, Permission, PlacementPolicy, PlacementPolicyDocument, PlacementPolicyError,
-    PlacementRef, PolicyAuthorityError, PolicyPublication, PolicyPublicationClaim,
-    RealmConfigDocument, VerifiedPolicy, placement_policy_change, placement_policy_target,
-    policy_authority_path,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::placement::placement_policy::{
+    PlacementPolicy, PlacementPolicyError, VerifiedPolicy,
 };
+use aruna_core::structs::placement::policy_document::{
+    PlacementPolicyDocument, PolicyAuthorityError, PolicyPublication, PolicyPublicationClaim,
+    placement_policy_change, placement_policy_target, policy_authority_path,
+};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, Value};
 use smallvec::smallvec;
@@ -471,8 +475,9 @@ mod tests {
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_core::UserId;
     use aruna_core::handle::Handle;
-    use aruna_core::structs::verify_policy_authority;
-    use aruna_core::structs::{PlacementSelector, RealmId};
+    use aruna_core::structs::placement::policy_document::verify_policy_authority;
+    use aruna_core::structs::placement::placement_policy::PlacementSelector;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
@@ -626,7 +631,7 @@ mod tests {
             verify_policy_authority(
                 &document,
                 &RealmConfigDocument::from_bytes(&realm_config).expect("config decodes"),
-                &aruna_core::structs::RealmAuthorizationDocument::from_bytes(&realm_auth)
+                &aruna_core::structs::identity::realm::RealmAuthorizationDocument::from_bytes(&realm_auth)
                     .expect("authorization decodes"),
                 None,
             ),
@@ -710,11 +715,11 @@ mod tests {
     /// so a group-owned publication has an authority to check against.
     async fn seed_group_admin(context: &DriverContext, actor: &Actor, group_id: Ulid) {
         let target = DocumentTarget::GroupAuthorization { group_id };
-        let document = aruna_core::structs::GroupAuthorizationDocument {
+        let document = aruna_core::structs::identity::group::GroupAuthorizationDocument {
             group_id,
             roles: std::collections::HashMap::from([(
                 Ulid::from_bytes([4u8; 16]),
-                aruna_core::structs::Role {
+                aruna_core::structs::identity::auth::Role {
                     role_id: Ulid::from_bytes([4u8; 16]),
                     name: "group_admin".to_string(),
                     permissions: std::collections::HashMap::from([(
@@ -769,13 +774,13 @@ mod tests {
         .await;
         let group_auth =
             read_document(&context, DocumentTarget::GroupAuthorization { group_id }).await;
-        let group_auth = aruna_core::structs::GroupAuthorizationDocument::from_bytes(&group_auth)
+        let group_auth = aruna_core::structs::identity::group::GroupAuthorizationDocument::from_bytes(&group_auth)
             .expect("group authorization decodes");
         assert_eq!(
             verify_policy_authority(
                 &document,
                 &RealmConfigDocument::from_bytes(&realm_config).expect("config decodes"),
-                &aruna_core::structs::RealmAuthorizationDocument::from_bytes(&realm_auth)
+                &aruna_core::structs::identity::realm::RealmAuthorizationDocument::from_bytes(&realm_auth)
                     .expect("authorization decodes"),
                 Some(&group_auth),
             ),

@@ -4,7 +4,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE};
-use aruna_core::structs::{
+use aruna_core::structs::execution::notification::{
     NOTIFICATION_DIRECT_TTL_MS, NOTIFICATION_TRANSIENT_PER_USER_CAP, NOTIFICATION_TRANSIENT_TTL_MS,
     NotificationClass, NotificationRecord, notification_inbox_key, notification_prune_key,
     parse_prune_key,

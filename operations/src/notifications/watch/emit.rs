@@ -1,6 +1,7 @@
 use aruna_core::UserId;
-use aruna_core::structs::{
-    RealmId, WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
 };
 use aruna_core::types::GroupId;
 use tracing::warn;
@@ -120,7 +121,7 @@ async fn include_local_holder(
     event: &WatchEvent,
     local_node_id: aruna_core::NodeId,
     holders: &mut Vec<aruna_core::NodeId>,
-) -> Result<aruna_core::structs::RealmConfigDocument, String> {
+) -> Result<aruna_core::structs::identity::realm::RealmConfigDocument, String> {
     let realm_config = drive(GetConfigOperation::new(event.realm_id), context)
         .await
         .map_err(|error| error.to_string())?;
@@ -162,11 +163,15 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
     use aruna_core::metrics::NodeMetrics;
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, NotificationRecord, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmId, RealmNodeKind, WatchEventDetail, WatchEventKind,
-        WatchEventMask, WatchInterestEntry, WatchInterestTable, parse_watch_path,
-        watch_resource_path,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::execution::notification::NotificationRecord;
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
+    use aruna_core::structs::execution::notification_watch::{
+        WatchEventDetail, WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable,
+        parse_watch_path, watch_resource_path,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;

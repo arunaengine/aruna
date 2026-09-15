@@ -8,10 +8,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLACEMENT_POLICY_CACHE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    GroupAuthorizationDocument, PlacementPolicyRef, RealmAuthorizationDocument,
-    RealmConfigDocument, RealmId, VerifiedPolicy, verify_policy_authority,
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, VerifiedPolicy};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
+use aruna_core::structs::placement::policy_document::verify_policy_authority;
 use aruna_core::types::{Effects, Key};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -409,10 +411,9 @@ mod pure_tests {
     use super::*;
     use aruna_core::effects::NetEffect;
     use aruna_core::events::{NetEvent, PolicyFetchEvent};
-    use aruna_core::structs::{
-        PlacementPolicy, PlacementPolicyDocument, PlacementSelector, RealmConfigDocument,
-        RealmNodeKind,
-    };
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementSelector};
+    use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::types::Value;
     use ulid::Ulid;
 

@@ -8,11 +8,12 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{NOTIFICATION_WATCH_INTEREST_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::structs::{
-    RealmConfigDocument, RealmId, WATCH_INTEREST_DIRTY_PREFIX, WatchEventKind, WatchEventMask,
-    WatchInterestDigest, WatchInterestEntry, WatchInterestTable, dirty_interest_realm,
-    interest_dirty_key, interest_node_id, interest_node_key, interest_node_prefix,
-    interest_pending_key, interest_realm_id, interest_realm_prefix,
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::execution::notification_watch::{
+    WATCH_INTEREST_DIRTY_PREFIX, WatchEventKind, WatchEventMask, WatchInterestDigest,
+    WatchInterestEntry, WatchInterestTable, dirty_interest_realm, interest_dirty_key,
+    interest_node_id, interest_node_key, interest_node_prefix, interest_pending_key,
+    interest_realm_id, interest_realm_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -698,9 +699,11 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmId,
-        RealmNodeKind, WatchEventKind, WatchEventMask, WatchInterestEntry,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::execution::notification_watch::{
+        WatchEventKind, WatchEventMask, WatchInterestEntry,
     };
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;

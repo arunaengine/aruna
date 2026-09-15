@@ -1,9 +1,10 @@
 use aruna_core::UserId;
-pub use aruna_core::structs::{
+pub use aruna_core::structs::execution::notification_watch::{
     NOTIFICATION_WATCH_INTEREST_BYTES_CAP, NOTIFICATION_WATCH_INTEREST_ENTRY_CAP,
 };
-use aruna_core::structs::{
-    NotificationRecord, WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
+use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::execution::notification_watch::{
+    WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};

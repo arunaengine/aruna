@@ -4,7 +4,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{NotificationRecord, notification_inbox_prefix};
+use aruna_core::structs::execution::notification::{NotificationRecord, notification_inbox_prefix};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -185,7 +185,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::tests::notifications::{context_with_storage, seed, user};
-    use aruna_core::structs::NotificationClass;
+    use aruna_core::structs::execution::notification::NotificationClass;
     use std::collections::VecDeque;
 
     fn record(recipient: UserId, created_at_ms: u64, read: bool) -> NotificationRecord {

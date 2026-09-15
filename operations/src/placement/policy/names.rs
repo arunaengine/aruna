@@ -7,7 +7,9 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{PlacementPolicyDocument, PlacementPolicyRef, RealmId};
+use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
@@ -152,14 +154,15 @@ mod pure_tests {
     use super::{PolicyName, PolicyNamesOperation};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{PlacementPolicy, PlacementSelector, RealmId};
+    use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementSelector};
+    use aruna_core::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     fn realm() -> RealmId {
         RealmId::from_bytes([3u8; 32])
     }
 
-    fn policy(seed: u8, owner: Option<Ulid>) -> aruna_core::structs::VerifiedPolicy {
+    fn policy(seed: u8, owner: Option<Ulid>) -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
         let policy = PlacementPolicy::new(
             Ulid::from_bytes([seed; 16]),
             "eu-residency".to_string(),
@@ -175,7 +178,7 @@ mod pure_tests {
             Some(owner) => policy.owned_by(owner).expect("owner is valid"),
             None => policy,
         };
-        aruna_core::structs::VerifiedPolicy::verify(policy).expect("policy verifies")
+        aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(policy).expect("policy verifies")
     }
 
     #[test]

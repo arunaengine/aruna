@@ -6,9 +6,11 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::structs::{
-    NotificationRecord, RealmId, WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription,
-    watch_retry_key, watch_retry_prefix, watch_subscription_key,
+use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, watch_retry_key,
+    watch_retry_prefix, watch_subscription_key,
 };
 use aruna_core::types::{Key, KeySpace, TxnId};
 use tracing::warn;
@@ -36,7 +38,7 @@ use crate::notifications::watch::subscriptions::list_watch_page;
 pub async fn expand_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
-    realm_config: &aruna_core::structs::RealmConfigDocument,
+    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     local_node_id: aruna_core::NodeId,
     events: &[WatchEvent],
 ) -> Result<(InboxWriteOutcome, bool), String> {
@@ -84,7 +86,7 @@ const WATCH_PAGE_LIMIT: usize = 256;
 async fn expand_events_once(
     context: &DriverContext,
     realm_id: RealmId,
-    realm_config: &aruna_core::structs::RealmConfigDocument,
+    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     local_node_id: aruna_core::NodeId,
     events: &[WatchEvent],
     start: Option<Vec<u8>>,
@@ -260,7 +262,7 @@ async fn stage_retry_change(
 pub async fn drain_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
-    realm_config: &aruna_core::structs::RealmConfigDocument,
+    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     local_node_id: aruna_core::NodeId,
 ) -> Result<(), String> {
     let values = match context
@@ -728,11 +730,16 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmNodeKind, WatchAuthorizationBinding, WatchEventDetail,
-        WatchEventKind, WatchEventMask, object_permission_path, watch_resource_path,
+    use aruna_core::structs::identity::auth::{Actor, Permission};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
     };
+    use aruna_core::structs::execution::notification_watch::{
+        WatchAuthorizationBinding, WatchEventDetail, WatchEventKind, WatchEventMask,
+        watch_resource_path,
+    };
+    use aruna_core::structs::storage::blob::object_permission_path;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use ulid::Ulid;

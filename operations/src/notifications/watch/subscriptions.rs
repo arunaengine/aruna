@@ -10,11 +10,13 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
-use aruna_core::structs::{
-    AuthContext, NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, PlacementRef,
-    RealmId, WatchAuthorizationBinding, WatchEventMask, WatchSubscription, parse_watch_key,
-    watch_subscription_prefix,
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::execution::notification_watch::{
+    NOTIFICATION_WATCH_MAX_PREFIX_LEN, NOTIFICATION_WATCH_PER_USER_CAP, WatchAuthorizationBinding,
+    WatchEventMask, WatchSubscription, parse_watch_key, watch_subscription_prefix,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
 use thiserror::Error;
@@ -780,10 +782,12 @@ mod tests {
     use crate::tests::notifications::{context, temp_storage, user};
     use aruna_core::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
-        RealmId, WatchEventKind, watch_resource_path,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
+    use aruna_core::structs::execution::notification_watch::{WatchEventKind, watch_resource_path};
 
     fn mask() -> WatchEventMask {
         WatchEventMask::from_kinds([
@@ -994,20 +998,20 @@ mod tests {
         let mut subscription = WatchSubscription::new(owner, "prefix".to_string(), mask(), 1);
         subscription.watch_id = watch_id;
         let bytes = subscription.to_bytes().expect("subscription encodes");
-        let key = aruna_core::structs::watch_subscription_key(owner, watch_id);
+        let key = aruna_core::structs::execution::notification_watch::watch_subscription_key(owner, watch_id);
         assert_eq!(
             decode_stored_subscription(&key, &bytes).expect("valid row"),
             subscription
         );
 
-        let wrong_key = aruna_core::structs::watch_subscription_key(owner, Ulid::generate());
+        let wrong_key = aruna_core::structs::execution::notification_watch::watch_subscription_key(owner, Ulid::generate());
         assert!(matches!(
             decode_stored_subscription(&wrong_key, &bytes),
             Err(WatchSubscriptionError::Storage(_))
         ));
 
         subscription.watch_id = Ulid::nil();
-        let nil_key = aruna_core::structs::watch_subscription_key(owner, Ulid::nil());
+        let nil_key = aruna_core::structs::execution::notification_watch::watch_subscription_key(owner, Ulid::nil());
         assert!(matches!(
             decode_stored_subscription(
                 &nil_key,

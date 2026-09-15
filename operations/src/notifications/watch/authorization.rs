@@ -4,12 +4,15 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, NotificationKind, Permission, RealmId,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::execution::notification::NotificationKind;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
-    WatchSubscription, bucket_permission_path, object_permission_path, parse_watch_path,
-    watch_path_matches, watch_resource_path,
+    WatchSubscription, parse_watch_path, watch_path_matches, watch_resource_path,
 };
+use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -653,7 +656,7 @@ pub async fn list_authorized_subscriptions(
 pub async fn filter_authorized_subscriptions(
     context: &DriverContext,
     realm_id: RealmId,
-    realm_config: &aruna_core::structs::RealmConfigDocument,
+    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     local_node_id: NodeId,
     subscriptions: Vec<WatchSubscription>,
 ) -> Result<AuthorizedWatchSubscriptions, String> {
@@ -702,10 +705,13 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, PathRestriction, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmNodeKind, WatchEvent, WatchEventDetail, WatchEventKind,
-        watch_resource_path,
+    use aruna_core::structs::identity::auth::{Actor, PathRestriction};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+    };
+    use aruna_core::structs::execution::notification_watch::{
+        WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
     };
     use aruna_storage::{FjallStorage, StorageHandle};
 

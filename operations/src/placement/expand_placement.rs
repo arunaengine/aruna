@@ -2,7 +2,9 @@
 //! siphon buckets by existing. Only buckets whose target set contains their
 //! current set get a transition; weight changes, removals and drains never do.
 
-use aruna_core::structs::{Actor, CandidatePlacementMap, RealmConfigDocument, TransitionLimits};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::placement::placement_transition::{CandidatePlacementMap, TransitionLimits};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
