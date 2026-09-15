@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_net::streams::BiStream;
@@ -140,7 +140,7 @@ async fn sync_skips_devices() -> Result<(), Box<dyn std::error::Error>> {
     realm.refresh_document_peers(&view).await?;
 
     let topic =
-        DocumentSyncTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+        DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
     realm.ensure_sync_topics(&[topic], vec![device, server])?;
     realm.allow_topic_peers(&[topic], vec![device])?;
 
