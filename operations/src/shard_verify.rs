@@ -435,7 +435,7 @@ async fn load_realm_config(
 mod pure_tests {
     use super::*;
     use aruna_core::document::{
-        DocumentSyncRevision, DocumentSyncTarget, ShardManifest, ShardManifestEntry,
+        DocumentSyncRevision, DocumentTarget, ShardManifest, ShardManifestEntry,
     };
     use ulid::Ulid;
 
@@ -452,7 +452,7 @@ mod pure_tests {
 
     fn entry(document: u8, generation: u64) -> ShardManifestEntry {
         ShardManifestEntry {
-            target: DocumentSyncTarget::MetadataDocumentLifecycle {
+            target: DocumentTarget::MetadataDocumentLifecycle {
                 document_id: Ulid::from_bytes([document; 16]),
             },
             revision: DocumentSyncRevision {

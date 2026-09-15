@@ -5,9 +5,7 @@ use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::build_source_binding;
-use crate::staging::head_source::{
-    HeadStagingSourceError, HeadStagingSourceInput, HeadStagingSourceOperation,
-};
+use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -56,7 +54,7 @@ pub struct MaterializeReferenceResult {
 #[derive(Debug, Error, PartialEq)]
 pub enum MaterializeReferenceError {
     #[error(transparent)]
-    Head(#[from] HeadStagingSourceError),
+    Head(#[from] HeadSourceError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -74,7 +72,7 @@ pub async fn stage_reference_blob(
     input: MaterializeReferenceInput,
 ) -> Result<MaterializeReferenceResult, MaterializeReferenceError> {
     let head_result = drive(
-        HeadStagingSourceOperation::new(HeadStagingSourceInput {
+        HeadSourceOperation::new(HeadSourceInput {
             group_id: input.group_id,
             connector_id: input.connector_id,
             source_path: input.source_path.clone(),
@@ -546,9 +544,7 @@ mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-    use crate::tests::fixtures::staging::{
-        create_http_connector, create_test_bucket, setup_driver_context,
-    };
+    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
@@ -557,7 +553,7 @@ mod tests {
     };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey, JobId, RoutingSnapshot,
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex, JobId, RoutingSnapshot,
         SourceConnectorKind, SourceConnectorSecret, StoragePurgeFence, StoragePurgeScope,
         UsageCounters, global_group_key, usage_group_key,
     };
@@ -945,7 +941,7 @@ mod tests {
         let historical_hash_path = read_value(
             context,
             HASH_PATHS_INDEX_KEYSPACE,
-            HashPathIndexKey::new(
+            HashIndex::new(
                 initial_hash,
                 initial.version_id,
                 realm_id,

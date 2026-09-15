@@ -1,6 +1,10 @@
+#[path = "shard_client.rs"]
 pub mod client;
+#[path = "shard_incoming.rs"]
 pub mod incoming;
+#[path = "shard_protocol.rs"]
 pub mod protocol;
+#[path = "shard_verify.rs"]
 pub mod verify;
 
 use aruna_core::document::{ShardManifest, ShardManifestEntry, shard_topic_id};
@@ -168,7 +172,7 @@ pub(crate) fn frontier_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
+    use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use aruna_core::storage_entries::shard_manifest_entry;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -183,8 +187,8 @@ mod tests {
         }
     }
 
-    fn lifecycle_change(placement: PlacementRef, seed: u8) -> DocumentSyncChange {
-        DocumentSyncChange {
+    fn lifecycle_change(placement: PlacementRef, seed: u8) -> DocumentChange {
+        DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: u64::from(seed),
@@ -192,13 +196,13 @@ mod tests {
                 actor: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
                 updated_at_ms: u64::from(seed),
             },
-            kind: DocumentSyncChangeKind::Upsert,
+            kind: DocumentChangeKind::Upsert,
             placement,
         }
     }
 
     async fn write_manifest_row(storage: &aruna_storage::StorageHandle, shard: u32, doc: u8) {
-        let target = aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
+        let target = aruna_core::document::DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([doc; 16]),
         };
         let (key_space, key, value) =
@@ -263,7 +267,7 @@ mod tests {
         assert_eq!(shard3.len(), 2);
         assert_eq!(shard4.len(), 1);
         assert!(shard3.iter().all(|entry| entry.target
-            != aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
+            != aruna_core::document::DocumentTarget::MetadataDocumentLifecycle {
                 document_id: Ulid::from_bytes([3; 16])
             }));
     }
@@ -351,7 +355,7 @@ mod tests {
     fn digest_order_independent() {
         let actor = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let first = ShardManifestEntry {
-            target: aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
+            target: aruna_core::document::DocumentTarget::MetadataDocumentLifecycle {
                 document_id: Ulid::from_bytes([1; 16]),
             },
             revision: DocumentSyncRevision {
@@ -362,7 +366,7 @@ mod tests {
             },
         };
         let mut second = first.clone();
-        second.target = aruna_core::document::DocumentSyncTarget::MetadataDocumentLifecycle {
+        second.target = aruna_core::document::DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([4; 16]),
         };
         let mut changed = second.clone();
