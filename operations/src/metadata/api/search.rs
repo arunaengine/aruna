@@ -292,12 +292,53 @@ impl SignedCursor<ObjectSearchCursorPayload> {
     }
 }
 
+pub(super) struct ObjectSearchPlan {
+    pub(super) auth: AuthContext,
+    pub(super) bearer_token: Option<String>,
+    pub(super) query: String,
+    pub(super) key_match: ObjectKeyMatch,
+    pub(super) bucket: Option<String>,
+    pub(super) limit: usize,
+    pub(super) cursor: Option<String>,
+    pub(super) mode: ObjectSearchQueryMode,
+    pub(super) target_nodes: Option<Vec<NodeId>>,
+    pub(super) fingerprint: [u8; 32],
+}
+
+pub(super) struct ObjectSearchPartitions {
+    pub(super) as_of: SystemTime,
+    pub(super) partitions: Vec<ObjectSearchPartitionState>,
+    pub(super) failed_partitions: Vec<NodeId>,
+    pub(super) discovery_failed: bool,
+    pub(super) omitted_partitions: usize,
+}
+
 pub async fn search_objects(
     context: &DriverContext,
     realm_id: RealmId,
     local_node_id: NodeId,
     request: ObjectSearchRequest,
 ) -> Result<ObjectSearchExecution, MetadataApiError> {
+    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
+    let plan = plan_object_search(realm_id, request)?;
+    let partitions =
+        resolve_object_partitions(context, realm_id, local_node_id, &plan, deadline).await?;
+    let (parts, fanout_stats) = run_object_fanout(
+        context,
+        realm_id,
+        local_node_id,
+        &plan,
+        &partitions,
+        deadline,
+    )
+    .await?;
+    assemble_object_execution(context, &plan, partitions, parts, fanout_stats)
+}
+
+pub(super) fn plan_object_search(
+    realm_id: RealmId,
+    request: ObjectSearchRequest,
+) -> Result<ObjectSearchPlan, MetadataApiError> {
     if request.query.is_empty() || request.auth.realm_id != realm_id {
         return Err(if request.query.is_empty() {
             MetadataApiError::BadRequest
@@ -305,7 +346,6 @@ pub async fn search_objects(
             MetadataApiError::Forbidden
         });
     }
-    let deadline = tokio::time::Instant::now() + METADATA_DISTRIBUTED_QUERY_DEADLINE;
     let limit = request
         .limit
         .clamp(1, crate::s3::search_objects::OBJECT_SEARCH_MAX_LIMIT);
@@ -316,130 +356,165 @@ pub async fn search_objects(
         request.bucket.as_deref(),
         request.mode,
     );
+    Ok(ObjectSearchPlan {
+        auth: request.auth,
+        bearer_token: request.bearer_token,
+        query: request.query,
+        key_match: request.key_match,
+        bucket: request.bucket,
+        limit,
+        cursor: request.cursor,
+        mode: request.mode,
+        target_nodes: request.target_nodes,
+        fingerprint,
+    })
+}
 
-    let (as_of, mut partitions, mut failed_partitions, discovery_failed, omitted_partitions) =
-        match request.cursor.as_deref() {
-            Some(raw) => {
-                let authorized_signers = match request.mode {
-                    ObjectSearchQueryMode::Local => vec![local_node_id],
-                    ObjectSearchQueryMode::DistributedBestEffort
-                    | ObjectSearchQueryMode::DistributedStrict => {
-                        load_realm_config(context, realm_id)
-                            .await
-                            .ok_or(MetadataApiError::ServiceUnavailable)?
-                            .node_ids()
-                            .map_err(|_| MetadataApiError::ServiceUnavailable)?
+pub(super) async fn resolve_object_partitions(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    plan: &ObjectSearchPlan,
+    deadline: tokio::time::Instant,
+) -> Result<ObjectSearchPartitions, MetadataApiError> {
+    let (as_of, partitions, failed_partitions, discovery_failed, omitted_partitions) = match plan
+        .cursor
+        .as_deref()
+    {
+        Some(raw) => {
+            let authorized_signers = match plan.mode {
+                ObjectSearchQueryMode::Local => vec![local_node_id],
+                ObjectSearchQueryMode::DistributedBestEffort
+                | ObjectSearchQueryMode::DistributedStrict => load_realm_config(context, realm_id)
+                    .await
+                    .ok_or(MetadataApiError::ServiceUnavailable)?
+                    .node_ids()
+                    .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+            };
+            let cursor = ObjectSearchCursor::decode(raw, plan.fingerprint, &authorized_signers)?;
+            let partitions = cursor.partition_states()?;
+            if plan.mode == ObjectSearchQueryMode::Local
+                && (partitions.len() != 1 || partitions[0].node_id != local_node_id)
+            {
+                return Err(MetadataApiError::InvalidCursor(
+                    "invalid local object search cursor".to_string(),
+                ));
+            }
+            (
+                cursor.payload.as_of,
+                partitions,
+                cursor.failed_nodes()?,
+                cursor.payload.discovery_failed,
+                cursor.payload.omitted_partitions,
+            )
+        }
+        None => {
+            let as_of = SystemTime::now();
+            let (mut nodes, discovery_failed) = match plan.mode {
+                ObjectSearchQueryMode::Local => (vec![local_node_id], false),
+                ObjectSearchQueryMode::DistributedBestEffort
+                | ObjectSearchQueryMode::DistributedStrict => match plan.target_nodes.clone() {
+                    Some(nodes) => (deduplicate_fanout_nodes(nodes), false),
+                    None => {
+                        let discovery = tokio::time::timeout_at(
+                            deadline,
+                            discover_realm_nodes(context, realm_id, local_node_id),
+                        )
+                        .await
+                        .unwrap_or(MetadataRealmNodeDiscovery {
+                            nodes: vec![local_node_id],
+                            failed: true,
+                        });
+                        (discovery.nodes, discovery.failed)
                     }
-                };
-                let cursor = ObjectSearchCursor::decode(raw, fingerprint, &authorized_signers)?;
-                let partitions = cursor.partition_states()?;
-                if request.mode == ObjectSearchQueryMode::Local
-                    && (partitions.len() != 1 || partitions[0].node_id != local_node_id)
-                {
-                    return Err(MetadataApiError::InvalidCursor(
-                        "invalid local object search cursor".to_string(),
-                    ));
-                }
-                (
-                    cursor.payload.as_of,
-                    partitions,
-                    cursor.failed_nodes()?,
-                    cursor.payload.discovery_failed,
-                    cursor.payload.omitted_partitions,
-                )
+                },
+            };
+            if nodes.is_empty() {
+                return Err(MetadataApiError::ServiceUnavailable);
             }
-            None => {
-                let as_of = SystemTime::now();
-                let (mut nodes, discovery_failed) =
-                    match request.mode {
-                        ObjectSearchQueryMode::Local => (vec![local_node_id], false),
-                        ObjectSearchQueryMode::DistributedBestEffort
-                        | ObjectSearchQueryMode::DistributedStrict => {
-                            match request.target_nodes.clone() {
-                                Some(nodes) => (deduplicate_fanout_nodes(nodes), false),
-                                None => {
-                                    let discovery = tokio::time::timeout_at(
-                                        deadline,
-                                        discover_realm_nodes(context, realm_id, local_node_id),
-                                    )
-                                    .await
-                                    .unwrap_or(MetadataRealmNodeDiscovery {
-                                        nodes: vec![local_node_id],
-                                        failed: true,
-                                    });
-                                    (discovery.nodes, discovery.failed)
-                                }
-                            }
-                        }
-                    };
-                if nodes.is_empty() {
-                    return Err(MetadataApiError::ServiceUnavailable);
-                }
-                let omitted_partitions = if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
-                    let selected = select_fanout_nodes(&nodes, local_node_id, &fingerprint);
-                    let omitted = nodes.len().saturating_sub(selected.len());
-                    nodes = selected;
-                    omitted
-                } else {
-                    0
-                };
-                if request.mode == ObjectSearchQueryMode::DistributedStrict
-                    && (discovery_failed || omitted_partitions > 0)
-                {
-                    return Err(MetadataApiError::ServiceUnavailable);
-                }
-                nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-                (
-                    as_of,
-                    nodes
-                        .into_iter()
-                        .map(|node_id| ObjectSearchPartitionState {
-                            node_id,
-                            start_after: None,
-                            exhausted: false,
-                            observed_at: None,
-                        })
-                        .collect(),
-                    Vec::new(),
-                    discovery_failed,
-                    omitted_partitions,
-                )
+            let omitted_partitions = if nodes.len() > METADATA_DISTRIBUTED_QUERY_MAX_NODES {
+                let selected = select_fanout_nodes(&nodes, local_node_id, &plan.fingerprint);
+                let omitted = nodes.len().saturating_sub(selected.len());
+                nodes = selected;
+                omitted
+            } else {
+                0
+            };
+            if plan.mode == ObjectSearchQueryMode::DistributedStrict
+                && (discovery_failed || omitted_partitions > 0)
+            {
+                return Err(MetadataApiError::ServiceUnavailable);
             }
-        };
+            nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            (
+                as_of,
+                nodes
+                    .into_iter()
+                    .map(|node_id| ObjectSearchPartitionState {
+                        node_id,
+                        start_after: None,
+                        exhausted: false,
+                        observed_at: None,
+                    })
+                    .collect(),
+                Vec::new(),
+                discovery_failed,
+                omitted_partitions,
+            )
+        }
+    };
 
-    if request.mode == ObjectSearchQueryMode::DistributedStrict
+    if plan.mode == ObjectSearchQueryMode::DistributedStrict
         && (discovery_failed || omitted_partitions > 0 || !failed_partitions.is_empty())
     {
         return Err(MetadataApiError::ServiceUnavailable);
     }
-
-    let active_nodes = partitions
-        .iter()
-        .filter(|partition| !partition.exhausted)
-        .map(|partition| partition.node_id)
-        .collect::<Vec<_>>();
-    if active_nodes.is_empty() {
+    if !partitions.iter().any(|partition| !partition.exhausted) {
         return Err(MetadataApiError::InvalidCursor(
             "exhausted object search cursor".to_string(),
         ));
     }
+    Ok(ObjectSearchPartitions {
+        as_of,
+        partitions,
+        failed_partitions,
+        discovery_failed,
+        omitted_partitions,
+    })
+}
+
+pub(super) async fn run_object_fanout(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    plan: &ObjectSearchPlan,
+    partitions: &ObjectSearchPartitions,
+    deadline: tokio::time::Instant,
+) -> Result<(Vec<(NodeId, ObjectSearchNodePage)>, MetadataFanoutStats), MetadataApiError> {
+    let active_nodes = partitions
+        .partitions
+        .iter()
+        .filter(|partition| !partition.exhausted)
+        .map(|partition| partition.node_id)
+        .collect::<Vec<_>>();
     let start_positions = partitions
+        .partitions
         .iter()
         .map(|partition| (partition.node_id, partition.start_after.clone()))
         .collect::<HashMap<_, _>>();
-    let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
+    let remote_auth_token = fanout_bearer(plan.bearer_token.as_deref());
     let handle = context.metadata_handle.clone();
 
     let local_call: MetadataNodeCall<ObjectSearchNodePage> = metadata_node_call(
         (
             context.clone(),
-            request.auth,
+            plan.auth.clone(),
             realm_id,
-            request.query.clone(),
-            request.key_match,
-            request.bucket.clone(),
-            limit,
-            as_of,
+            plan.query.clone(),
+            plan.key_match,
+            plan.bucket.clone(),
+            plan.limit,
+            partitions.as_of,
             start_positions.clone(),
         ),
         |(context, auth, realm_id, query, key_match, bucket, limit, as_of, starts), node_id| async move {
@@ -465,11 +540,11 @@ pub async fn search_objects(
         (
             handle,
             remote_auth_token,
-            request.query,
-            request.key_match,
-            request.bucket,
-            limit,
-            as_of,
+            plan.query.clone(),
+            plan.key_match,
+            plan.bucket.clone(),
+            plan.limit,
+            partitions.as_of,
             start_positions,
         ),
         |(handle, auth_token, query, key_match, bucket, limit, as_of, starts), node_id| async move {
@@ -490,17 +565,17 @@ pub async fn search_objects(
                 .await
         },
     );
-    let (parts, mut fanout_stats) = run_metadata_fanout(
+    run_metadata_fanout(
         context,
         realm_id,
         local_node_id,
         MetadataFanoutScope::new(
-            Some(request.mode.fanout_mode()),
+            Some(plan.mode.fanout_mode()),
             Some(active_nodes),
-            request.mode.allow_partial(),
+            plan.mode.allow_partial(),
         )
-        .with_subject(fingerprint)
-        .with_discovery_failed(discovery_failed)
+        .with_subject(plan.fingerprint)
+        .with_discovery_failed(partitions.discovery_failed)
         .with_deadline(deadline),
         MetadataFanoutOperation::ObjectSearch,
         local_call,
@@ -508,8 +583,23 @@ pub async fn search_objects(
         record_object_result,
         map_read_error,
     )
-    .await?;
+    .await
+}
 
+pub(super) fn assemble_object_execution(
+    context: &DriverContext,
+    plan: &ObjectSearchPlan,
+    partitions: ObjectSearchPartitions,
+    parts: Vec<(NodeId, ObjectSearchNodePage)>,
+    mut fanout_stats: MetadataFanoutStats,
+) -> Result<ObjectSearchExecution, MetadataApiError> {
+    let ObjectSearchPartitions {
+        as_of,
+        mut partitions,
+        mut failed_partitions,
+        discovery_failed,
+        omitted_partitions,
+    } = partitions;
     let newly_failed = fanout_stats.failed_partitions.clone();
     failed_partitions.extend(newly_failed.iter().copied());
     failed_partitions.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
@@ -519,8 +609,8 @@ pub async fn search_objects(
         .sort_unstable_by(|left, right| left.node_id.as_bytes().cmp(right.node_id.as_bytes()));
 
     let mut pages = parts.into_iter().collect::<HashMap<_, _>>();
-    let mut hits = Vec::with_capacity(limit);
-    let mut remaining = limit;
+    let mut hits = Vec::with_capacity(plan.limit);
+    let mut remaining = plan.limit;
     for partition in &mut partitions {
         if partition.exhausted {
             continue;
@@ -564,7 +654,7 @@ pub async fn search_objects(
         })?;
         Some(
             ObjectSearchCursor::new_signed(
-                fingerprint,
+                plan.fingerprint,
                 as_of,
                 &partitions,
                 &failed_partitions,
