@@ -13,6 +13,25 @@ change.
 - `aruna`: the node binary: settings, startup, shutdown, process entry.
 - `aruna-doctor`: operator diagnostics.
 
+## Where new files live
+
+Add behavior to the family that already owns it:
+
+- bucket, object, multipart, and access operations:
+  `operations/src/s3/{bucket,object,multipart,access}/`;
+- routes: `api/src/routes/{execution,access,storage}/`; other route domains
+  stay flat under `api/src/routes/`;
+- persisted records: `core/src/structs/{placement,identity,storage,execution}/`;
+- effect adapters: `operations/src/effect_adapters/`;
+- test helpers and hoisted tests: beside their subject, following the
+  `aruna/src/bootstrap_tests.rs` pattern;
+- raw fixture assets: the owning crate's `tests/fixtures/`
+  (`operations/tests/fixtures/`, `blob/tests/fixtures/`), with fixture helper
+  code in `src/tests/` beside its domain (`api/src/tests/assistant.rs`).
+
+A new subfolder needs at least five real cohesive files besides `mod.rs`;
+`CONTRIBUTING.md` owns the threshold, hoisting, and naming rules.
+
 ## One request, end to end
 
 1. A transport accepts bytes and authenticates the caller:
@@ -20,12 +39,12 @@ change.
    `api/src/mcp/mod.rs` (MCP).
 2. The transport handler builds a request value and calls one named operation
    through `aruna_operations::driver::drive`, for example
-   `api/src/s3/auth.rs` calling `GetBucketInfoOperation`
-   (`operations/src/s3/get_bucket.rs`).
+   `api/src/s3/auth.rs` calling `GetBucketOperation`
+   (`operations/src/s3/bucket/get.rs`).
 3. `drive` calls `start`/`step` on the operation. The operation returns
    `Effect` values (`core/src/effects.rs`) and consumes `Event` values
    (`core/src/events.rs`). It never performs I/O itself.
-4. The effect adapters in `operations/src/driver/effect_adapters/` execute storage, blob,
+4. The effect adapters in `operations/src/effect_adapters/` execute storage, blob,
    net, metadata, and task effects and feed the results back as events.
 5. `finalize` maps the completed state to `Result<Output, Error>`; the
    transport maps that to a response.
@@ -50,8 +69,10 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 
 ## Add a REST route
 
-1. Put the handler in `api/src/routes/<feature>.rs` and register it in that
-   module's `router()` with a `#[utoipa::path]` attribute.
+1. Put the handler in `api/src/routes/<domain>/<feature>.rs` for the
+   execution, access, and storage domains (other domains stay flat as
+   `api/src/routes/<feature>.rs`) and register it in that module's `router()`
+   with a `#[utoipa::path]` attribute.
 2. `api/src/routes/mod.rs::rest_api` merges the module routers; the runtime
    router and the OpenAPI document come from that one assembly, so they cannot
    diverge.
@@ -72,12 +93,12 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 ## Add a background queue or timer
 
 1. Add the `TaskKey` variant in `core/src/task.rs`.
-2. Handle `TaskEvent` for it in `operations/src/tasks/incoming/` and register
-   the handler/queue with the shared `TaskHandle` lifecycle owner:
+2. Handle `TaskEvent` for it in `operations/src/tasks/incoming.rs` and
+   register the handler/queue with the shared `TaskHandle` lifecycle owner:
    `install_task_queues` installs the handler, and
-   `TaskQueues::restore_timers_and_start` restores durable timers and starts
-   the re-arm loop under the caller's `Shutdown`
-   (`operations/src/tasks/incoming/restore.rs`).
+   `TaskQueues::restore_and_start` restores durable timers and starts the
+   re-arm loop under the caller's `Shutdown`
+   (`operations/src/tasks/incoming_restore.rs`).
 3. Production startup starts queues in `aruna/src/startup/background.rs`
    (`STARTUP_PHASES`); put restore/install work there, not in the task crate
    root.
@@ -86,12 +107,12 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 
 ## Add a compute backend
 
-1. Implement `ExecutorBackend` in `compute/src/executor/<backend>/`.
-2. Add the backend's typed settings to `aruna/src/compute_setup/mod.rs` and
-   read them once in `compute_setup/settings.rs::collect`.
+1. Implement `ExecutorBackend` in `compute/src/executor/<backend>.rs`.
+2. Add the backend's typed settings to `aruna/src/compute_setup.rs` and read
+   them once in `aruna/src/compute_setup_settings.rs::collect`.
 3. Add the feature to `compute/Cargo.toml` and `aruna/Cargo.toml`, gate the
    module at the backend boundary, build the registry in
-   `compute_setup/<backend>.rs`.
+   `aruna/src/compute_setup_<backend>.rs`.
 4. Check every selection locally, feature-explicit and per package, as
    `just check` and CI do:
    `cargo check -p aruna-compute --all-targets --no-default-features --features <backend>`
@@ -102,7 +123,8 @@ assert effects, `step` explicit events, assert effects, `finalize`.
 ## Add a persisted record
 
 1. Add the keyspace constant in `core/src/keyspaces.rs` and the record type
-   with `to_bytes`/`from_bytes` in `core/src/structs/`.
+   with `to_bytes`/`from_bytes` in the matching family under
+   `core/src/structs/{placement,identity,storage,execution}/`.
 2. Never change an existing encoding silently; add a field with a default or a
    versioned record and keep old fixtures decoding.
 3. Test round-trips and malformed bytes at the record boundary, and one real
@@ -126,21 +148,23 @@ assert effects, `step` explicit events, assert effects, `finalize`.
    then runs `shutdown::NodeShutdown::run` (ingress, admissions, tasks, jobs,
    background, network, metadata, blob, storage) before the owner wipe path.
 
-Startup instrumentation lives in `startup/test_hooks.rs`; each hook must name
-its consumer in `aruna/tests/observability.rs`.
+Startup instrumentation lives in `aruna/src/startup/test_hooks.rs`; each hook
+must name its consumer in `aruna/tests/observability.rs`.
 
 ## Tests and commands
 
-- `just test-fast` runs the audited no-I/O selection across `aruna-core` and
-  `aruna-operations`: the `state_machine_tests`, `pure_tests`, and
-  `decision_tests` modules plus the pure `reducer::tests` family. These tests
-  use no runtime, storage, network, process, or environment mutation. A module
-  with that name must keep the guarantee: filesystem, database, or discovery
-  coverage belongs in an ordinary `tests` module beside it. The selection is
-  a name filter over two crates' `--lib` targets only: it compiles no other
-  crate or target and is not evidence for transport, runtime, storage,
-  process, or environment changes, which need focused module runs recorded
-  against the exact revision.
+- `just test-fast` selects the `--lib` targets of `aruna-core` and
+  `aruna-operations` and executes the `state_machine_tests`, `pure_tests`,
+  and `decision_tests` modules plus the pure `reducer::tests` family. Cargo
+  still compiles both selected packages and their transitive dependencies,
+  and the selected targets run only those name-filtered tests; a narrow
+  selection is not a narrow build. `just test-fast-workspace` widens the
+  target set under the same names. These tests use no runtime, storage,
+  network, process, or environment mutation, and a module with one of those
+  names must keep the guarantee: filesystem, database, or discovery coverage
+  belongs in an ordinary `tests` module beside it. The selection is not
+  evidence for transport, runtime, storage, process, or environment changes,
+  which need focused module runs recorded against the exact revision.
 - Runtime, storage, and multi-node behavior lives in the ordinary test modules
   and `aruna/tests`.
 - Focused loop: `cargo nextest run -p <crate> --lib --locked --profile fast`.
