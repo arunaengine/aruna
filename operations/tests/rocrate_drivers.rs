@@ -19,15 +19,21 @@ use aruna_core::keyspaces::{
     ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    Actor, AuthContext, Backend, BackendConfig, BucketInfo, ExportRoCrateSpec,
-    FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, ImportMetadataTarget,
-    ImportReportRow, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId,
-    JobPayload, JobRecord, JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
-    RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord, RoutingSnapshot, SourceConnectorKind,
-    VersionKey,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo, VersionKey};
+use aruna_core::structs::execution::job::{
+    ExportRoCrateSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
+    ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord, JobResultPayload,
+    ReasonCode, RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord,
 };
+use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+};
+use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -46,8 +52,8 @@ use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::put_object::{
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -1979,7 +1985,7 @@ async fn pair_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 async fn artifact_bytes(
     fixture: &Fixture,
-    artifact: &aruna_core::structs::ArtifactRef,
+    artifact: &aruna_core::structs::execution::job::ArtifactRef,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut read =
         read_artifact_range(fixture.context.as_ref(), artifact, 0..artifact.size).await?;

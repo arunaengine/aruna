@@ -12,9 +12,11 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    ActionKind, ActionOutcome, ActionScope, BucketInfo, EntryState, FolderMode, RemoteBinding,
-    RoutingSnapshot, SyncBase, SyncRefusal,
+    ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, RemoteBinding, SyncBase,
+    SyncRefusal,
 };
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
@@ -25,12 +27,12 @@ use aruna_operations::device::sync::outbox::drain_sync_outbox;
 use aruna_operations::device::sync::reconcile_folder;
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
-use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_operations::s3::get_bucket::GetBucketOperation;
-use aruna_operations::s3::get_object::{GetObjectInput, GetObjectOperation};
-use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
+use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+use aruna_operations::s3::bucket::get::GetBucketOperation;
+use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, wait_for_convergence};

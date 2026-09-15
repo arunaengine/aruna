@@ -23,10 +23,10 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{
     create_event_entry, event_log_key, lifecycle_revision_change, metadata_registry_key,
 };
-use aruna_core::structs::{
-    Actor, MetadataRegistryRecord, NodePlacementEntry, PlacementRef, RealmConfigDocument, RealmId,
-    RealmNodeKind,
-};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -1119,7 +1119,7 @@ async fn spawn_node_configured(
     let shutdown = aruna_core::shutdown::Shutdown::new();
     initialize_net_holder(
         context.clone(),
-        aruna_core::structs::RoCrateLimits::default(),
+        aruna_core::structs::execution::job::RoCrateLimits::default(),
         jobs_runtime.clone(),
         &shutdown,
     );
@@ -1205,7 +1205,7 @@ async fn publish_to_peer(
     target: DocumentTarget,
     bytes: Vec<u8>,
     peer: aruna_core::NodeId,
-    placement: aruna_core::structs::PlacementRef,
+    placement: aruna_core::structs::placement::placement_record::PlacementRef,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match node
         .net
@@ -1235,7 +1235,7 @@ fn publish_change(
     node_id: aruna_core::NodeId,
     target: &DocumentTarget,
     bytes: &[u8],
-    placement: aruna_core::structs::PlacementRef,
+    placement: aruna_core::structs::placement::placement_record::PlacementRef,
 ) -> Result<DocumentChange, Box<dyn std::error::Error>> {
     match target {
         DocumentTarget::MetadataDocumentLifecycle { document_id } => {

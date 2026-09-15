@@ -10,11 +10,12 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::storage_entries::registry_delete_entries;
-use aruna_core::structs::{
-    AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
-    ImportRoCrateSpec, ImportRoCrateTarget, JobState, RoCrateLimits, WorkspaceMode, band_start,
-    user_dedup_key,
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::execution::job::{
+    ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
+    ImportRoCrateTarget, JobState, RoCrateLimits, WorkspaceMode, user_dedup_key,
 };
+use aruna_core::structs::placement::placement_record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
@@ -84,7 +85,7 @@ const JOB_BUDGET: JobClassBudget = JobClassBudget {
 /// Owner derivation as every node performs it: pure, from the replicated config.
 fn derived_owner(
     realm: &Topology,
-    job_id: aruna_core::structs::JobId,
+    job_id: aruna_core::structs::execution::job::JobId,
 ) -> TestResult<aruna_core::NodeId> {
     Ok(realm.config.job_owner(job_id)?)
 }
@@ -419,7 +420,7 @@ async fn swap_keeps_owner() -> TestResult<()> {
     }
     config
         .placement_overrides
-        .push(aruna_core::structs::PlacementOverride {
+        .push(aruna_core::structs::placement::placement_record::PlacementOverride {
             subject: b"any-shard-subject".to_vec(),
             pinned: Vec::new(),
             excluded: vec![owner_id],
@@ -1179,7 +1180,7 @@ async fn create_document(
     group_id: Ulid,
     document_id: Ulid,
     document_path: &str,
-) -> TestResult<aruna_core::structs::PlacementRef> {
+) -> TestResult<aruna_core::structs::placement::placement_record::PlacementRef> {
     let created = drive(
         CreateDocumentOperation::new(document_config(
             realm,

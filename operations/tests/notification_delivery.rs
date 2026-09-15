@@ -6,10 +6,11 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::structs::{
-    Actor, NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
-    RealmConfigDocument, RealmId, RealmNodeKind,
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -530,7 +531,7 @@ async fn build_node(
     let shutdown = aruna_core::shutdown::Shutdown::new();
     initialize_net_holder(
         context.clone(),
-        aruna_core::structs::RoCrateLimits::default(),
+        aruna_core::structs::execution::job::RoCrateLimits::default(),
         jobs_runtime.clone(),
         &shutdown,
     );

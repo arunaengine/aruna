@@ -10,10 +10,13 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::reducer::AdminDocumentState;
-use aruna_core::structs::{
-    Actor, AffinityEffect, AffinityRule, LabelMatch, MetadataRegistryRecord, NodePlacementEntry,
-    NodeUrls, RealmConfigDocument, RealmId, RealmNodeKind,
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::placement::placement_record::{
+    AffinityEffect, AffinityRule, LabelMatch, NodePlacementEntry,
 };
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::{DocumentEffect, DocumentNetEvent, StructuredId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
@@ -490,7 +493,7 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
     let shutdown = aruna_core::shutdown::Shutdown::new();
     initialize_net_holder(
         context.clone(),
-        aruna_core::structs::RoCrateLimits::default(),
+        aruna_core::structs::execution::job::RoCrateLimits::default(),
         jobs_runtime.clone(),
         &shutdown,
     );

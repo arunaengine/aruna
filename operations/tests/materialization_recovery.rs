@@ -17,7 +17,10 @@ use aruna_core::storage_entries::{
     create_event_entry, document_job_entry, materialization_job_entry,
     materialization_status_entry, materialization_status_key,
 };
-use aruna_core::structs::{Actor, MetadataRegistryRecord, PlacementRef, RealmId};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::{

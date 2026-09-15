@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
-use aruna_core::structs::{JobId, JobPayload, JobRecord, JobState, RealmId};
+use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobState};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
 use aruna_operations::jobs::runtime::JobsRuntime;

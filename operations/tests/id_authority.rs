@@ -10,10 +10,13 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{METADATA_PENDING_PROJECTION_KEYSPACE, PERSISTENT_ID_MAPPING_KEYSPACE};
 use aruna_core::storage_entries::pending_projection_key;
+use aruna_core::structs::execution::job::{JobId, pid_dedup_key};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{
-    JobId, MetadataRegistryRecord, MintPersistentSpec, PersistentIdMapping, PersistentIdRevision,
-    PersistentIdStatus, PlacementRef, persistent_id_key, pid_dedup_key,
+    MintPersistentSpec, PersistentIdMapping, PersistentIdRevision, PersistentIdStatus,
+    persistent_id_key,
 };
+use aruna_core::structs::placement::placement_record::PlacementRef;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::service::{read_job_routed, submit_mint_pid};
@@ -601,7 +604,7 @@ async fn routed_delete(
 async fn delete_until_applied(
     realm: &Topology,
     node: &TestNode,
-    record: &aruna_core::structs::MetadataRegistryRecord,
+    record: &aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord,
     document_id: Ulid,
 ) -> TestResult<()> {
     let attempted = std::cell::Cell::new(false);
@@ -940,7 +943,7 @@ async fn registry_present(context: &DriverContext, document_id: Ulid) -> bool {
 async fn registry_record(
     node: &TestNode,
     document_id: Ulid,
-) -> Option<aruna_core::structs::MetadataRegistryRecord> {
+) -> Option<aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord> {
     load_document_record(node.context.as_ref(), document_id)
         .await
         .ok()

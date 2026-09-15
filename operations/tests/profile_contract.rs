@@ -14,9 +14,10 @@ use aruna_core::metadata::{
     ProfileValidationSeverity, ProfileValidationState,
 };
 use aruna_core::storage_entries::event_log_prefix;
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, RealmAuthorizationDocument, RealmConfigDocument,
-    RealmId, RealmNodeKind,
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_operations::driver::DriverContext;
 use aruna_operations::forward::transport::MetadataWriteError;
@@ -477,7 +478,7 @@ async fn preview_reports_structural() -> Result<(), Box<dyn std::error::Error>> 
     let test = build_context(false).await?;
     let group_id = Ulid::generate();
     let draft_id = mint(&test, group_id, "datasets/structural")?;
-    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(draft_id);
+    let graph_iri = aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(draft_id);
     let jsonld = json!({
         "@context": "https://w3id.org/ro/crate/1.2/context",
         "@graph": [
@@ -507,7 +508,7 @@ async fn create_refuses_structural() -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context(false).await?;
     let group_id = Ulid::generate();
     let document_id = mint(&test, group_id, "datasets/structural-write")?;
-    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let graph_iri = aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(document_id);
     let jsonld = json!({
         "@context": "https://w3id.org/ro/crate/1.2/context",
         "@graph": [
@@ -680,7 +681,7 @@ async fn rejects_graph_alias() -> Result<(), Box<dyn std::error::Error>> {
     let group_id = Ulid::generate();
     let (profile_id, _) = register_profile(&test, group_id, minimum_shape()).await?;
     let document_id = mint(&test, group_id, "datasets/graph-alias")?;
-    let tag = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(profile_id);
+    let tag = aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(profile_id);
     let error = create_crate(
         &test,
         group_id,
@@ -1087,7 +1088,7 @@ fn portal_shape(with_base: bool) -> String {
 }
 
 fn portal_crate(document_id: Ulid, tag: &str, complete: bool) -> String {
-    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let graph_iri = aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(document_id);
     let mut root = json!({
         "@id": graph_iri,
         "@type": "Dataset",
@@ -1115,7 +1116,7 @@ fn portal_crate(document_id: Ulid, tag: &str, complete: bool) -> String {
 }
 
 fn versioned_crate(document_id: Ulid, tag: &str, version: &str, valid: bool) -> String {
-    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let graph_iri = aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(document_id);
     let specification = format!("https://w3id.org/ro/crate/{version}");
     let mut root = json!({
         "@id": graph_iri,
@@ -1153,7 +1154,7 @@ async fn graph_exists(
         .metadata_handle
         .as_ref()
         .ok_or("metadata handle is configured")?;
-    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let graph_iri = aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(document_id);
     match metadata
         .send_metadata_effect(MetadataEffect::ContainsGraph { graph_iri })
         .await
@@ -1230,7 +1231,7 @@ async fn seed_group(test: &TestContext, group_id: Ulid) -> Result<(), Box<dyn st
 }
 
 fn profile_json(profile_id: Ulid, shapes: &str) -> String {
-    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(profile_id);
+    let graph_iri = aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(profile_id);
     json!({
         "@context": "https://w3id.org/ro/crate/1.2/context",
         "@graph": [
@@ -1272,7 +1273,7 @@ fn minimum_shape() -> &'static str {
 }
 
 fn crate_json(document_id: Ulid, tag: Option<&str>, valid: bool, extra: bool) -> String {
-    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let graph_iri = aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(document_id);
     let mut root = json!({
         "@id": graph_iri,
         "@type": "Dataset",
@@ -1308,7 +1309,7 @@ fn crate_json(document_id: Ulid, tag: Option<&str>, valid: bool, extra: bool) ->
 /// A Process Run Crate the built-in Profile is meant to accept. `complete`
 /// adds the instrument the profile requires.
 fn run_crate_json(document_id: Ulid, complete: bool) -> String {
-    let graph_iri = aruna_core::structs::MetadataRegistryRecord::graph_iri_for(document_id);
+    let graph_iri = aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(document_id);
     let mut action = json!({
         "@id": "#run-1",
         "@type": "CreateAction",

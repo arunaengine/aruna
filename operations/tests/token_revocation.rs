@@ -13,9 +13,9 @@ use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::reducer::AdminDocumentState;
-use aruna_core::structs::{
-    Actor, NodePlacementEntry, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
-};
+use aruna_core::structs::identity::auth::{Actor, TokenClaims};
+use aruna_core::structs::placement::placement_record::NodePlacementEntry;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::bearer_token::{
@@ -223,7 +223,7 @@ async fn spawn_node(realm_id: RealmId) -> TestResult<TestNode> {
     let shutdown = aruna_core::shutdown::Shutdown::new();
     initialize_net_holder(
         context.clone(),
-        aruna_core::structs::RoCrateLimits::default(),
+        aruna_core::structs::execution::job::RoCrateLimits::default(),
         jobs_runtime.clone(),
         &shutdown,
     );

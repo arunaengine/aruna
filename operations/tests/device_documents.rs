@@ -8,9 +8,11 @@ use std::collections::{HashMap, HashSet};
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::structs::{
-    Actor, Group, GroupAuthorizationDocument, NodeUrls, RealmNodeKind, User,
-};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::bearer_token::realm_token_revoked;
 use aruna_operations::auth::revoke_token::{

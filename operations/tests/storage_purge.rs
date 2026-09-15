@@ -14,13 +14,22 @@ use aruna_core::keyspaces::{
     S3_PURGE_CHECKPOINT_KEYSPACE, S3_PURGE_FENCE_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{
-    Actor, AuthContext, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-    Group, GroupAuthorizationDocument, JobId, JobPayload, JobRecord, JobResultPayload,
-    MultipartChecksumType, MultipartUpload, MultipartUploadStatus, PathRestriction, Permission,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, RoutingSnapshot,
-    StoragePurgeCheckpoint, StoragePurgeScope, StoragePurgeSpec, VersionKey,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
     bucket_permission_path,
+};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobResultPayload};
+use aruna_core::structs::storage::multipart::{
+    MultipartChecksumType, MultipartUpload, MultipartUploadStatus,
+};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+};
+use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::structs::storage::storage_purge::{
+    StoragePurgeCheckpoint, StoragePurgeScope, StoragePurgeSpec,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
@@ -30,26 +39,28 @@ use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, complete_job, insert_job, put_purge_checkpoint, transition_to_running,
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
-use aruna_operations::s3::complete_upload::{
+use aruna_operations::s3::multipart::complete::{
     CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
-use aruna_operations::s3::copy_object::{
+use aruna_operations::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
-use aruna_operations::s3::copy_part::{PartCopyError, PartCopyInput, upload_part_copy};
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::create_upload::{
+use aruna_operations::s3::multipart::part_copy::{PartCopyError, PartCopyInput, upload_part_copy};
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::multipart::create::{
     CreateMultipartError, CreateMultipartInput, CreateMultipartOperation,
 };
-use aruna_operations::s3::delete_object::{
+use aruna_operations::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
 };
-use aruna_operations::s3::delete_objects::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use aruna_operations::s3::object::delete_bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
 use aruna_operations::s3::purge_fence::{PurgeFenceError, acquire_purge_fence, fence_key};
-use aruna_operations::s3::put_object::{
+use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
-use aruna_operations::s3::upload_part::{UploadPartError, UploadPartInput, UploadPartOperation};
+use aruna_operations::s3::multipart::part_upload::{
+    UploadPartError, UploadPartInput, UploadPartOperation,
+};
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -704,7 +715,7 @@ async fn claimed_job(
     }
 }
 
-fn purge_result(outcome: JobRunOutcome) -> aruna_core::structs::StoragePurgeResult {
+fn purge_result(outcome: JobRunOutcome) -> aruna_core::structs::storage::storage_purge::StoragePurgeResult {
     match outcome {
         JobRunOutcome::Succeeded(JobResultPayload::StoragePurge(result)) => result,
         JobRunOutcome::Succeeded(_) => panic!("purge returned the wrong result kind"),

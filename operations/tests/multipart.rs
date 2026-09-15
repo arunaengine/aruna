@@ -12,24 +12,29 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    COMPLETION_LEASE_MS, CurrentVersionPointer, HashIndex, MultipartChecksumHint,
-    MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
-    MultipartPartKey, MultipartUpload, MultipartUploadStatus, RealmId, RoutingSnapshot, VersionKey,
+    CurrentVersionPointer, HashIndex, VersionKey,
 };
+use aruna_core::structs::storage::multipart::{
+    COMPLETION_LEASE_MS, MultipartChecksumHint, MultipartChecksumType, MultipartObjectKey,
+    MultipartObjectPart, MultipartObjectSummary, MultipartPartKey, MultipartUpload,
+    MultipartUploadStatus,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
 use aruna_operations::driver::{DriverContext, drive, now_ms};
-use aruna_operations::s3::abort_upload::{AbortUploadInput, AbortUploadOperation};
-use aruna_operations::s3::complete_upload::{
+use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
+use aruna_operations::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
-use aruna_operations::s3::create_upload::{CreateMultipartInput, CreateMultipartOperation};
-use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation};
+use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
 use aruna_storage::storage;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{create_dir_all, exists, read_dir};
@@ -139,7 +144,7 @@ async fn create_upload(
     key: &str,
     group_id: Ulid,
     created_by: UserId,
-) -> aruna_core::structs::MultipartUpload {
+) -> aruna_core::structs::storage::multipart::MultipartUpload {
     drive(
         CreateMultipartOperation::new(CreateMultipartInput {
             bucket: bucket.to_string(),
@@ -164,7 +169,7 @@ async fn upload_part_bytes(
     part_number: u16,
     bytes: &[u8],
     created_by: UserId,
-) -> aruna_operations::s3::upload_part::UploadPartResult {
+) -> aruna_operations::s3::multipart::part_upload::UploadPartResult {
     drive(
         UploadPartOperation::new(UploadPartInput {
             bucket: bucket.to_string(),
@@ -192,11 +197,11 @@ async fn complete_upload(
     upload_id: Ulid,
     realm_id: RealmId,
     node_id: aruna_core::id::NodeId,
-    uploaded_parts: &[aruna_operations::s3::upload_part::UploadPartResult],
+    uploaded_parts: &[aruna_operations::s3::multipart::part_upload::UploadPartResult],
     checksum_type: MultipartChecksumType,
     object_size: Option<u64>,
     created_by: UserId,
-) -> aruna_operations::s3::complete_upload::CompleteUploadResult {
+) -> aruna_operations::s3::multipart::complete::CompleteUploadResult {
     drive(
         CompleteUploadOperation::new(CompleteUploadInput {
             bucket: bucket.to_string(),
@@ -359,7 +364,7 @@ async fn completion_persists_parts() {
         .await
         .expect("missing blob location entry");
     assert_eq!(
-        aruna_core::structs::BackendLocation::from_bytes(blob_location.as_ref()).unwrap(),
+        aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref()).unwrap(),
         complete.location.clone()
     );
 
@@ -924,7 +929,7 @@ async fn completion_deduplicates_multipart() {
         .await
         .expect("missing blob location entry");
     assert_eq!(
-        aruna_core::structs::BackendLocation::from_bytes(blob_location.as_ref()).unwrap(),
+        aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref()).unwrap(),
         first_complete.location
     );
 }
@@ -1264,7 +1269,7 @@ async fn checksum_mismatch_cleans() {
 
     assert!(matches!(
         err,
-        aruna_operations::s3::upload_part::UploadPartError::ChecksumMismatch("SHA256")
+        aruna_operations::s3::multipart::part_upload::UploadPartError::ChecksumMismatch("SHA256")
     ));
 
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
@@ -1490,7 +1495,7 @@ async fn read_upload(context: &TestContext, upload_id: Ulid) -> Option<Multipart
 
 fn completion_input(
     upload_id: Ulid,
-    part: &aruna_operations::s3::upload_part::UploadPartResult,
+    part: &aruna_operations::s3::multipart::part_upload::UploadPartResult,
     realm_id: RealmId,
     node_id: aruna_core::id::NodeId,
     created_by: UserId,
@@ -1645,7 +1650,7 @@ async fn abort_refuses_lease() {
 
     assert!(matches!(
         refused,
-        Err(aruna_operations::s3::abort_upload::AbortUploadError::CompletionInProgress)
+        Err(aruna_operations::s3::multipart::abort::AbortUploadError::CompletionInProgress)
     ));
 
     // Once the lease lapses the same abort reclaims the record and its part.

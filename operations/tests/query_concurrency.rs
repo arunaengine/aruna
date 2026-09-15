@@ -15,8 +15,11 @@ use aruna_core::metadata::{
     MetadataQueryResults, MetadataRequestDurability, UpsertEntityRequest,
 };
 use aruna_core::storage_entries::{graph_lifecycle_entry, metadata_registry_key};
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, MetadataRegistryRecord, PlacementRef,
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_core::types::{GroupId, Key, Value};

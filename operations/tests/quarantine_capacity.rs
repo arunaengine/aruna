@@ -9,8 +9,10 @@ use aruna_core::document::{
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_SYNC_APPLIED_OPS_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
+use aruna_core::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
-    NodeInfoDocument, NodeUrls, NodeUtilization, PlacementRef, RealmId,
     SYNC_QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity,
     SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
@@ -128,7 +130,7 @@ fn node_info_bytes(node_id: aruna_core::NodeId) -> Vec<u8> {
             heartbeat_at_ms: 5,
         },
         updated_at_ms: 5,
-        epoch: aruna_core::structs::AdvertisementEpoch {
+        epoch: aruna_core::structs::storage::node_info::AdvertisementEpoch {
             membership_generation: 1,
             publisher_generation: 1,
             observed_at_ms: 5,

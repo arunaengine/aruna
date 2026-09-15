@@ -21,9 +21,11 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::MetadataError;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::{
-    Actor, AuthContext, MetadataRegistryRecord, Permission, PlacementRef,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::time::unix_timestamp_secs;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -1100,7 +1102,7 @@ async fn spawn_node(
     let shutdown = aruna_core::shutdown::Shutdown::new();
     initialize_net_holder(
         context.clone(),
-        aruna_core::structs::RoCrateLimits::default(),
+        aruna_core::structs::execution::job::RoCrateLimits::default(),
         jobs_runtime.clone(),
         &shutdown,
     );

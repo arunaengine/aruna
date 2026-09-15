@@ -17,13 +17,21 @@ use aruna_core::keyspaces::{
     HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    ARUNA_DATA_PREFIX, Actor, ArtifactRef, AuthContext, Backend, BackendConfig, BackendLocation,
-    BackendRef, BlobLocationKey, BlobVersion, BucketInfo, ExportReportRow, ExportReportSource,
-    ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, JobId,
-    JobPayload, JobRecord, JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
-    RoCrateLimits, VersionKey, VersionedObjectArn,
+use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
+use aruna_core::structs::execution::job::{
+    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobId, JobPayload,
+    JobRecord, JobResultPayload, ReasonCode, RoCrateLimits,
+};
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo,
+    VersionKey,
+};
+use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
@@ -326,7 +334,7 @@ async fn write_payload(
         .as_ref()
         .ok_or("holder blob handle is missing")?
         .send_blob_effect(BlobEffect::Write {
-            resolved: aruna_core::structs::ResolvedBackend::node_default(),
+            resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
             bucket: BUCKET.to_string(),
             key: KEY.to_string(),
             created_by: owner,
