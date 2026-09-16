@@ -569,11 +569,11 @@ async fn setup_state() -> TestState {
         realm_signing_key.verifying_key().to_bytes(),
     );
     let node_id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
-    let user_with_source_read = UserId::local(Ulid::generate(), realm_id);
-    let user_without_source_read = UserId::local(Ulid::generate(), realm_id);
+    let with_source_read = UserId::local(Ulid::generate(), realm_id);
+    let without_source_read = UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
         node_id,
-        user_id: user_with_source_read,
+        user_id: with_source_read,
         realm_id,
     };
     let driver_ctx = Arc::new(test_context(storage_handle));
@@ -581,34 +581,34 @@ async fn setup_state() -> TestState {
     let bucket_group_id = Ulid::generate();
     let source_group_id = Ulid::generate();
     let mut bucket_auth = GroupAuthorizationDocument::default_group_doc(
-        user_with_source_read,
+        with_source_read,
         realm_id,
         bucket_group_id,
     );
     for role in bucket_auth.roles.values_mut() {
-        role.assigned_users.insert(user_without_source_read);
+        role.assigned_users.insert(without_source_read);
     }
     let mut source_auth = GroupAuthorizationDocument::default_group_doc(
-        user_with_source_read,
+        with_source_read,
         realm_id,
         source_group_id,
     );
     for role in source_auth.roles.values_mut() {
-        role.assigned_users.remove(&user_without_source_read);
+        role.assigned_users.remove(&without_source_read);
     }
 
     let bucket_group = Group {
         display_name: "bucket-group".to_string(),
         group_id: bucket_group_id,
         realm_id,
-        owner: user_with_source_read,
+        owner: with_source_read,
         roles: bucket_auth.roles.keys().copied().collect(),
     };
     let source_group = Group {
         display_name: "source-group".to_string(),
         group_id: source_group_id,
         realm_id,
-        owner: user_with_source_read,
+        owner: with_source_read,
         roles: source_auth.roles.keys().copied().collect(),
     };
     seed_realm_auth(&driver_ctx, realm_id, &actor).await;
@@ -649,7 +649,7 @@ async fn setup_state() -> TestState {
     let bucket_info = BucketInfo {
         group_id: bucket_group_id,
         created_at: std::time::SystemTime::UNIX_EPOCH,
-        created_by: user_with_source_read,
+        created_by: with_source_read,
         cors_configuration: None,
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
@@ -688,7 +688,7 @@ async fn setup_state() -> TestState {
         bucket,
         key,
         auth_bucket_read: AuthContext {
-            user_id: user_with_source_read,
+            user_id: with_source_read,
             realm_id,
             path_restrictions: Some(vec![PathRestriction {
                 pattern: bucket_path,
@@ -697,7 +697,7 @@ async fn setup_state() -> TestState {
             session: None,
         },
         auth_source_read: AuthContext {
-            user_id: user_with_source_read,
+            user_id: with_source_read,
             realm_id,
             path_restrictions: Some(vec![
                 PathRestriction {
@@ -712,7 +712,7 @@ async fn setup_state() -> TestState {
             session: None,
         },
         without_source_read: AuthContext {
-            user_id: user_without_source_read,
+            user_id: without_source_read,
             realm_id,
             path_restrictions: Some(vec![PathRestriction {
                 pattern: target_path,

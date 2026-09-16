@@ -266,7 +266,7 @@ impl SubmitExecutionCommand {
     /// become engine tags the executing node reads back.
     pub fn resolve_session(
         &mut self,
-        bearer_expires_at_ms: Option<u64>,
+        bearer_expires_ms: Option<u64>,
     ) -> Result<(), SessionCommandError> {
         let Some(value) = self.tags.get(SESSION_TAG) else {
             if self.runtime.is_some()
@@ -353,7 +353,7 @@ impl SubmitExecutionCommand {
         }
         self.tags
             .insert(SESSION_RUNTIME_TAG.to_string(), runtime.id.to_string());
-        if let Some(expires_at_ms) = bearer_expires_at_ms {
+        if let Some(expires_at_ms) = bearer_expires_ms {
             self.tags
                 .insert(SESSION_EXPIRY_TAG.to_string(), expires_at_ms.to_string());
         }

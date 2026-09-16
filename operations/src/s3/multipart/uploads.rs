@@ -649,12 +649,12 @@ mod test {
                 (second, first)
             }
         };
-        let newer_lower_upload_id = versions.0;
-        let older_higher_upload_id = versions.1;
+        let newer_lower_ulid = versions.0;
+        let older_higher_ulid = versions.1;
         seed_upload(
             &storage_handle,
             &upload_record_at(
-                newer_lower_upload_id,
+                newer_lower_ulid,
                 "bucket",
                 "same-key",
                 SystemTime::UNIX_EPOCH + Duration::from_secs(2),
@@ -664,7 +664,7 @@ mod test {
         seed_upload(
             &storage_handle,
             &upload_record_at(
-                older_higher_upload_id,
+                older_higher_ulid,
                 "bucket",
                 "same-key",
                 SystemTime::UNIX_EPOCH + Duration::from_secs(1),
@@ -684,7 +684,7 @@ mod test {
             .iter()
             .map(|upload| upload.upload_id)
             .collect();
-        assert_eq!(ordered, vec![newer_lower_upload_id, older_higher_upload_id]);
+        assert_eq!(ordered, vec![newer_lower_ulid, older_higher_ulid]);
     }
 
     #[tokio::test]

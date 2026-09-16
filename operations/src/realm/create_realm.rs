@@ -13,7 +13,7 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
     OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
 };
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
     NodePlacementEntry, PlacementBinding, PlacementScope, band_start, normalize_placement_input,
 };
@@ -604,7 +604,7 @@ mod test {
     use aruna_core::structs::identity::realm::{
         OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
-    use aruna_core::structs::placement::placement_record::{
+    use aruna_core::structs::placement::record::{
         BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
     };
     use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -651,7 +651,7 @@ mod test {
             .unwrap();
         assert_eq!(
             entry.weight,
-            aruna_core::structs::placement::placement_record::MAX_NODE_WEIGHT
+            aruna_core::structs::placement::record::MAX_NODE_WEIGHT
         );
         assert_eq!(entry.location, "eu-west");
 
@@ -782,8 +782,8 @@ mod test {
         );
 
         let seeded_strategies = config_doc.strategies.clone();
-        let seeded_default_strategy_id = config_doc.default_strategy_id.unwrap();
-        let seeded_family_strategy_id = config_doc.family_strategy_id;
+        let default_strategy_id = config_doc.default_strategy_id.unwrap();
+        let family_strategy_id = config_doc.family_strategy_id;
         let seeded_bindings = config_doc.strategy_bindings.clone();
         let seeded_placements = config_doc.placement_bindings.clone();
         assert_eq!(seeded_strategies.len(), 3);
@@ -796,17 +796,17 @@ mod test {
             config_doc.default_strategy_id,
             Some(seeded_strategies[0].strategy_id)
         );
-        assert_eq!(seeded_family_strategy_id, seeded_strategies[2].strategy_id);
+        assert_eq!(family_strategy_id, seeded_strategies[2].strategy_id);
         assert_eq!(seeded_bindings.len(), 5);
         assert_eq!(seeded_placements.len(), 2);
         assert_eq!(
             config_state.materialized_default_strategy(),
-            Some(seeded_default_strategy_id)
+            Some(default_strategy_id)
         );
         assert_eq!(config_state.materialized_strategies().len(), 3);
         assert_eq!(
             config_state.materialized_family_strategy(),
-            Some(seeded_family_strategy_id)
+            Some(family_strategy_id)
         );
         assert_eq!(config_state.materialized_strategy_bindings().len(), 5);
         assert_eq!(config_state.materialized_placement_bindings().len(), 2);
@@ -927,13 +927,13 @@ mod test {
                 (
                     13,
                     AdminDocumentOperation::ConfigStrategySet {
-                        strategy_id: seeded_default_strategy_id,
+                        strategy_id: default_strategy_id,
                     },
                 ),
                 (
                     14,
                     AdminDocumentOperation::JobFamilySet {
-                        strategy_id: seeded_family_strategy_id,
+                        strategy_id: family_strategy_id,
                     },
                 ),
                 (

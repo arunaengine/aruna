@@ -297,7 +297,7 @@ impl AssignRolesOperation {
                 DocumentOutboxEvent::admin(event.clone()),
                 // No realm config in reach here; the stage-2 topic flip resolves
                 // the real ref for this target.
-                aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+                aruna_core::structs::placement::record::PlacementRef::NIL,
                 false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
@@ -707,7 +707,7 @@ pub mod test {
         realm_id: RealmId,
         role_id: RoleId,
         assigned_user_id: UserId,
-        remaining_conflict_user_id: UserId,
+        conflict_user_id: UserId,
     ) -> AdminDocumentState {
         let role_dot = dot(3);
         let mut clock = AdminDocumentClock::default();
@@ -726,8 +726,8 @@ pub mod test {
                     assignment_conflict(role_id, assigned_user_id, 11, 12),
                 ),
                 (
-                    assignment_path(role_id, remaining_conflict_user_id),
-                    assignment_conflict(role_id, remaining_conflict_user_id, 13, 14),
+                    assignment_path(role_id, conflict_user_id),
+                    assignment_conflict(role_id, conflict_user_id, 13, 14),
                 ),
             ]),
             user_name: None,
@@ -850,7 +850,7 @@ pub mod test {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let owner_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let assigned_user_id = UserId::local(Ulid::from_bytes([4u8; 16]), realm_id);
-        let remaining_conflict_user_id = UserId::local(Ulid::from_bytes([5u8; 16]), realm_id);
+        let conflict_user_id = UserId::local(Ulid::from_bytes([5u8; 16]), realm_id);
         let role_id = Ulid::from_bytes([6u8; 16]);
         let second_role_id = Ulid::from_bytes([7u8; 16]);
         let actor = Actor {
@@ -886,7 +886,7 @@ pub mod test {
             realm_id,
             role_id,
             assigned_user_id,
-            remaining_conflict_user_id,
+            conflict_user_id,
         );
         let input = AssignRolesInput {
             actor: actor.clone(),
@@ -941,7 +941,7 @@ pub mod test {
                     postcard::from_bytes(conflict_writes[0].2.as_ref()).unwrap();
                 assert_eq!(
                     conflict.path,
-                    assignment_path(role_id, remaining_conflict_user_id)
+                    assignment_path(role_id, conflict_user_id)
                 );
 
                 (
@@ -1016,7 +1016,7 @@ pub mod test {
         assert!(
             reducer_state
                 .conflicts
-                .contains_key(&assignment_path(role_id, remaining_conflict_user_id))
+                .contains_key(&assignment_path(role_id, conflict_user_id))
         );
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {

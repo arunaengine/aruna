@@ -58,7 +58,7 @@ fn test_evicted_document(seed: u8) -> DocumentEvictedDocument {
             updated_at_ms: seed as u64,
         },
         kind: aruna_core::document::DocumentChangeKind::Delete,
-        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
     };
 
     DocumentEvictedDocument {
@@ -67,7 +67,7 @@ fn test_evicted_document(seed: u8) -> DocumentEvictedDocument {
             realm_id: RealmId::from_bytes([seed; 32]),
         },
         event: aruna_core::document::DocumentOutboxEvent::Delete { change },
-        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
         allow_genesis: false,
     }
 }
@@ -175,7 +175,7 @@ async fn eviction_waits_handler() {
 /// A tie-break eviction of one locally authored delete on `placement`.
 fn local_eviction(
     service: &DocumentSyncService,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
     evicted: bool,
 ) -> ::irokle::TopicEviction {
     let event_id = ulid::Ulid::from_bytes([31; 16]);
@@ -222,11 +222,11 @@ async fn eviction_registers_buckets() {
     // The entry outlives the hand-off: it is released only once the
     // replacement rows are durable, and it never stalls another bucket.
     let (_dir, service) = eviction_test_service().await;
-    let placement = aruna_core::structs::placement::placement_record::PlacementRef {
+    let placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: ulid::Ulid::from_bytes([31; 16]),
         shard: 1,
     };
-    let elsewhere = aruna_core::structs::placement::placement_record::PlacementRef {
+    let elsewhere = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: placement.strategy_id,
         shard: 2,
     };
@@ -262,7 +262,7 @@ async fn empty_eviction_unpending() {
     // Irokle writes no record for an eviction with no payloads, so treating
     // one as pending would arm the retry timer against a phantom forever.
     let (_dir, service) = eviction_test_service().await;
-    let placement = aruna_core::structs::placement::placement_record::PlacementRef::NIL;
+    let placement = aruna_core::structs::placement::record::PlacementRef::NIL;
     assert!(
         service
             .consume_eviction(local_eviction(&service, placement, false))
@@ -831,7 +831,7 @@ async fn refuses_predecessor_alpn() -> Result<()> {
 }
 
 #[tokio::test]
-async fn loopback_stream_reaches_handler() -> Result<()> {
+async fn loopback_reaches_handler() -> Result<()> {
     let (handle, _dir) = test_net_handle().await?;
     let holding = Arc::new(HoldingInboundHandler {
         streams: tokio::sync::Mutex::new(Vec::new()),

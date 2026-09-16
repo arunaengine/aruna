@@ -16,7 +16,7 @@ use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, RoleId, TxnId};
@@ -834,7 +834,7 @@ pub mod test {
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::task::TaskEvent;
     use aruna_core::task::TaskKey;
     use aruna_core::types::{RoleId, TxnId};
@@ -893,7 +893,7 @@ pub mod test {
         group_id: Ulid,
         role_id: RoleId,
         assigned_user_id: UserId,
-        remaining_conflict_user_id: UserId,
+        conflict_user_id: UserId,
     ) -> AdminDocumentState {
         let role_dot = dot(3);
         let mut clock = AdminDocumentClock::default();
@@ -912,8 +912,8 @@ pub mod test {
                     assignment_conflict(role_id, assigned_user_id, 11, 12),
                 ),
                 (
-                    assignment_path(role_id, remaining_conflict_user_id),
-                    assignment_conflict(role_id, remaining_conflict_user_id, 13, 14),
+                    assignment_path(role_id, conflict_user_id),
+                    assignment_conflict(role_id, conflict_user_id, 13, 14),
                 ),
             ]),
             user_name: None,
@@ -1070,7 +1070,7 @@ pub mod test {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let owner_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let assigned_user_id = UserId::local(Ulid::from_bytes([4u8; 16]), realm_id);
-        let remaining_conflict_user_id = UserId::local(Ulid::from_bytes([5u8; 16]), realm_id);
+        let conflict_user_id = UserId::local(Ulid::from_bytes([5u8; 16]), realm_id);
         let group_id = Ulid::from_bytes([6u8; 16]);
         let role_id = Ulid::from_bytes([7u8; 16]);
         let actor = Actor {
@@ -1095,7 +1095,7 @@ pub mod test {
             group_id,
             role_id,
             assigned_user_id,
-            remaining_conflict_user_id,
+            conflict_user_id,
         );
         let input = AddUserInput {
             actor: actor.clone(),
@@ -1166,7 +1166,7 @@ pub mod test {
                     postcard::from_bytes(conflict_writes[0].2.as_ref()).unwrap();
                 assert_eq!(
                     conflict.path,
-                    assignment_path(role_id, remaining_conflict_user_id)
+                    assignment_path(role_id, conflict_user_id)
                 );
 
                 (
@@ -1213,7 +1213,7 @@ pub mod test {
         assert!(
             reducer_state
                 .conflicts
-                .contains_key(&assignment_path(role_id, remaining_conflict_user_id))
+                .contains_key(&assignment_path(role_id, conflict_user_id))
         );
 
         let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {

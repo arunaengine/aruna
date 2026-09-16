@@ -314,7 +314,7 @@ impl RealmRoleOperation {
                 DocumentOutboxEvent::admin(event.clone()),
                 // No realm config in reach here; the stage-2 topic flip resolves
                 // the real ref for this target.
-                aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+                aruna_core::structs::placement::record::PlacementRef::NIL,
                 false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
@@ -791,7 +791,7 @@ pub mod test {
         let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
         let actor_user_id = UserId::local(Ulid::from_bytes([1u8; 16]), realm_id);
         let assigned_user_id = UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
-        let retained_conflict_user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let conflict_user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let actor = Actor {
             node_id,
@@ -799,7 +799,7 @@ pub mod test {
             realm_id,
         };
         let role_id = Ulid::from_bytes([4u8; 16]);
-        let retained_conflict_role_id = Ulid::from_bytes([5u8; 16]);
+        let conflict_role_id = Ulid::from_bytes([5u8; 16]);
         let input = RealmRoleConfig {
             actor: actor.clone(),
             realm_id,
@@ -817,7 +817,7 @@ pub mod test {
         let stale_conflict_path =
             format!("realm.roles.{role_id}.assigned_users.{assigned_user_id}");
         let retained_conflict_path = format!(
-            "realm.roles.{retained_conflict_role_id}.assigned_users.{retained_conflict_user_id}"
+            "realm.roles.{conflict_role_id}.assigned_users.{conflict_user_id}"
         );
         let stale_add_dot = conflict_dot(2, 1);
         let stale_remove_dot = conflict_dot(3, 1);
@@ -856,7 +856,7 @@ pub mod test {
                 path: retained_conflict_path.clone(),
                 values: vec![
                     AdminConflictValue {
-                        value: Some(retained_conflict_user_id.to_string()),
+                        value: Some(conflict_user_id.to_string()),
                         dot: retained_add_dot,
                     },
                     AdminConflictValue {

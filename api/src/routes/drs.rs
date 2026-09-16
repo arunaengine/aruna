@@ -4,7 +4,7 @@ use crate::download::{self, AdmissionError};
 use crate::error::ServerError;
 use crate::forwarded::{client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
@@ -979,7 +979,7 @@ async fn resolve_content_hash(
         .map_err(|error| DrsError::internal(error.to_string()))?;
     debug!(?mappings);
 
-    let mut any_mapping_on_this_node = false;
+    let mut any_local_mapping = false;
     let mut last_permission_check: Option<(String, bool)> = None;
 
     for mapping in mappings {
@@ -987,7 +987,7 @@ async fn resolve_content_hash(
             debug!("Realm id or node id mismatch");
             continue;
         }
-        any_mapping_on_this_node = true;
+        any_local_mapping = true;
         let path = mapping.permission_path();
         let allowed = match &last_permission_check {
             Some((cached_path, allowed)) if cached_path == &path => *allowed,
@@ -1044,7 +1044,7 @@ async fn resolve_content_hash(
         }));
     }
 
-    if any_mapping_on_this_node {
+    if any_local_mapping {
         Ok(ResolveOutcome::Denied)
     } else {
         Ok(ResolveOutcome::NotFound)

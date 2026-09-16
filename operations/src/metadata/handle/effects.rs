@@ -1054,8 +1054,8 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             | MetadataEffect::ExportRoCratePage { .. }
             | MetadataEffect::PlanBatch { .. }
     );
-    let persist_document_sync_after_success = effect_persists_sync(&effect);
-    let deferred_persist_after_success = effect_defers_persist(&effect);
+    let persist_sync_success = effect_persists_sync(&effect);
+    let deferred_persist_success = effect_defers_persist(&effect);
     let node = inner.node.clone();
     let effect_span = debug_span!(
         "metadata.backend.effect",
@@ -1092,12 +1092,12 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         | MetadataEffect::MergeBatch { .. }) => sync_effect(&node, &auth, effect),
     });
 
-    let persist_error = if persist_document_sync_after_success && result.is_ok() {
+    let persist_error = if persist_sync_success && result.is_ok() {
         flush_sync_journal(&inner, effect_name, graph_iri.as_deref()).err()
     } else {
         None
     };
-    if result.is_ok() && persist_error.is_none() && deferred_persist_after_success {
+    if result.is_ok() && persist_error.is_none() && deferred_persist_success {
         schedule_deferred_persist(inner.clone(), effect_name, graph_iri.clone());
     }
     record_elapsed_ms(&effect_span, "elapsed_ms", effect_started);

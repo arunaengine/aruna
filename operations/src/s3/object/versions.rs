@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
@@ -971,8 +971,8 @@ mod test {
         let driver_ctx = driver_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
-        let (newer_head, older_with_larger_ulid) = (versions[0], versions[1]);
-        seed_materialized(&storage_handle, "obj", older_with_larger_ulid, [1u8; 32]).await;
+        let (newer_head, older_larger_ulid) = (versions[0], versions[1]);
+        seed_materialized(&storage_handle, "obj", older_larger_ulid, [1u8; 32]).await;
         seed_materialized(&storage_handle, "obj", newer_head, [2u8; 32]).await;
         seed_head(&storage_handle, "obj", newer_head).await;
 
@@ -998,7 +998,7 @@ mod test {
                 version_id,
                 is_latest: false,
                 ..
-            } if *version_id == older_with_larger_ulid
+            } if *version_id == older_larger_ulid
         ));
     }
 
@@ -1359,7 +1359,7 @@ mod pure_tests {
     use super::served_copy;
     use crate::blob::managed_copy::register_entry;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
+    use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyKey, VersionKey,
     };

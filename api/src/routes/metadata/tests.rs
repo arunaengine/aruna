@@ -6,7 +6,7 @@ use super::validation::*;
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::metadata::*;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, test_context, test_state, test_storage,
 };
@@ -44,7 +44,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
-use aruna_core::structs::placement::placement_record::METADATA_HANDLE;
+use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, HashIndex, VersionKey,
 };
@@ -1728,31 +1728,31 @@ async fn query_forwards_token() {
     assert_contains_name(&anonymous.names, "Remote Public Dataset");
     assert_excludes_name(&anonymous.names, "Remote Private Dataset");
 
-    let authenticated_without_forwardable_token =
+    let no_forwardable_token =
         query_remote_names(&test, Some(token_auth.clone()), None).await;
-    assert_eq!(authenticated_without_forwardable_token.nodes_failed, 0);
+    assert_eq!(no_forwardable_token.nodes_failed, 0);
     assert_contains_name(
-        &authenticated_without_forwardable_token.names,
+        &no_forwardable_token.names,
         "Remote Public Dataset",
     );
     assert_excludes_name(
-        &authenticated_without_forwardable_token.names,
+        &no_forwardable_token.names,
         "Remote Private Dataset",
     );
 
-    let oversized_non_forwardable_token = query_remote_names(
+    let oversized_token = query_remote_names(
         &test,
         Some(token_auth.clone()),
         Some(ValidatedBearer::new_for_test("x".repeat(4097))),
     )
     .await;
-    assert_eq!(oversized_non_forwardable_token.nodes_failed, 0);
+    assert_eq!(oversized_token.nodes_failed, 0);
     assert_contains_name(
-        &oversized_non_forwardable_token.names,
+        &oversized_token.names,
         "Remote Public Dataset",
     );
     assert_excludes_name(
-        &oversized_non_forwardable_token.names,
+        &oversized_token.names,
         "Remote Private Dataset",
     );
 

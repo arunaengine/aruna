@@ -17,7 +17,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId};
@@ -1427,9 +1427,9 @@ pub mod test {
                 value: Some(group.to_bytes(&actor).unwrap().into()),
             },
         ));
-        let get_auth_doc_and_admin_state_effect = effects.first().unwrap();
+        let auth_state_read = effects.first().unwrap();
         assert_eq!(
-            get_auth_doc_and_admin_state_effect,
+            auth_state_read,
             &Effect::Storage(aruna_core::effects::StorageEffect::BatchRead {
                 reads: vec![
                     (AUTH_KEYSPACE.to_string(), group_id.to_bytes().into()),
@@ -1468,14 +1468,14 @@ pub mod test {
                 ],
             },
         ));
-        let write_group_auth_doc_and_admin_state_effect = effects.first().unwrap();
+        let group_batch_effect = effects.first().unwrap();
         let mut mutated_group = group.clone();
         mutated_group.roles.insert(add_role_input.role.role_id);
         let mut mutated_auth_doc = auth_doc.clone();
         mutated_auth_doc
             .roles
             .insert(add_role_input.role.role_id, add_role_input.role.clone());
-        match write_group_auth_doc_and_admin_state_effect {
+        match group_batch_effect {
             Effect::Storage(aruna_core::effects::StorageEffect::BatchWrite {
                 writes,
                 txn_id: effect_txn_id,
@@ -1713,7 +1713,7 @@ pub mod test {
             aruna_core::structs::identity::realm::RealmNodeKind::Server,
         );
         config.strategies.push(
-            aruna_core::structs::placement::placement_record::PlacementStrategy {
+            aruna_core::structs::placement::record::PlacementStrategy {
                 strategy_id: Ulid::from_bytes([5; 16]),
                 name: "default".to_string(),
                 replica_count: Some(1),

@@ -223,11 +223,11 @@ pub(crate) async fn bootstrap_node_state(
                 let transport_secret_key = transport_secret_key.ok_or(
                     IdentityError::MissingOnboardingMaterial(OnboardingMode::Management),
                 )?;
-                let wrapping_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                let wrapping_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(wrapping_public_key)
                     .map_err(IdentityError::Base64Error)?;
                 let wrapping_public_key = TransportPublicKey::from(
-                    <[u8; 32]>::try_from(wrapping_public_key_bytes.as_slice())
+                    <[u8; 32]>::try_from(wrapping_key_bytes.as_slice())
                         .map_err(IdentityError::FromSliceError)?,
                 );
                 let cipher = SalsaBox::new(&wrapping_public_key, &transport_secret_key);

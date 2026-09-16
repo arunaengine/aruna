@@ -7,7 +7,7 @@ use aruna_api::cors::CorsConfig;
 use aruna_api::csp::PortalCspConfig;
 use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::{Server, ServerConfig};
-use aruna_api::server_state::ServerState;
+use aruna_api::server::state::ServerState;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -288,7 +288,7 @@ async fn bind_all(
 
     // A device serves S3 only where S3_HOST and S3_ADDRESS are configured; the
     // desktop shell sets both to loopback by default, and the pair stays whole.
-    let driver_ctx_for_sessions = driver_ctx.clone();
+    let session_driver_ctx = driver_ctx.clone();
     let cors_for_sessions = cors.clone();
     let metrics_for_sessions = metrics.clone();
     if let (Some(s3_address), Some(s3_host)) =
@@ -334,7 +334,7 @@ async fn bind_all(
         started.session_s3 = bind_session_s3(
             session_s3,
             s3_host,
-            driver_ctx_for_sessions,
+            session_driver_ctx,
             cors_for_sessions,
             metrics_for_sessions,
             s3_timeouts,

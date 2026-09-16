@@ -40,7 +40,7 @@ use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::execution::notification_watch::{WatchInterestEntry, WatchInterestTable};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::{NetState, NetworkDiagnosticsState};
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
@@ -803,12 +803,12 @@ impl NetHandle {
         // The inbound boundary closes first, while outgoing effects stay
         // available for the writer drains ahead of the network phase.
         self.close_admission();
-        let inbound_drained_before_teardown =
+        let drained_before_teardown =
             tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
                 .await
                 .is_ok();
         let inbound_pending_deadline = self.inner.inbound_tasks.len();
-        if !inbound_drained_before_teardown {
+        if !drained_before_teardown {
             warn!(
                 pending = inbound_pending_deadline,
                 drain_ms = drain.as_millis(),

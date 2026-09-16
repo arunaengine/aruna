@@ -2,7 +2,7 @@ use super::{
     ServerError, bootstrap_onboarding, create_onboarding_secret, get_secret_status,
     list_onboarding_secrets, map_finalize_error, revoke_onboarding_secret,
 };
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -914,11 +914,11 @@ async fn invalid_proof_preserves() {
 
     let node_proof = SigningKey::from_bytes(&[5u8; 32]);
     let joiner_node_id = iroh::SecretKey::from_bytes(&node_proof.to_bytes()).public();
-    let joiner_node_id_string = joiner_node_id.to_string();
+    let joiner_node_string = joiner_node_id.to_string();
     let node_signature = node_proof
         .sign(&node_proof_message(
             &created.onboarding_secret,
-            &joiner_node_id_string,
+            &joiner_node_string,
             None,
         ))
         .to_string();
@@ -932,7 +932,7 @@ async fn invalid_proof_preserves() {
         State(state.clone()),
         Json(BootstrapOnboardingRequest {
             onboarding_secret: onboarding_secret.clone(),
-            node_id: joiner_node_id_string.clone(),
+            node_id: joiner_node_string.clone(),
             node_proof: node_signature.clone(),
             transport_public_key: None,
             issuer_public_key: Some(issuer_public_key.clone()),
@@ -953,7 +953,7 @@ async fn invalid_proof_preserves() {
     let issuer_signature = issuer_key
         .sign(&issuer_proof_message(
             &onboarding_secret,
-            &joiner_node_id_string,
+            &joiner_node_string,
             &issuer_public_key,
         ))
         .to_string();
@@ -961,7 +961,7 @@ async fn invalid_proof_preserves() {
         State(state),
         Json(BootstrapOnboardingRequest {
             onboarding_secret,
-            node_id: joiner_node_id_string,
+            node_id: joiner_node_string,
             node_proof: node_signature,
             transport_public_key: None,
             issuer_public_key: Some(issuer_public_key),
@@ -1002,14 +1002,14 @@ async fn bootstrap_wraps_key() {
 
     let joiner_node_key = SigningKey::from_bytes(&[11u8; 32]);
     let joiner_node_id = iroh::SecretKey::from_bytes(&joiner_node_key.to_bytes()).public();
-    let joiner_node_id_string = joiner_node_id.to_string();
+    let joiner_node_string = joiner_node_id.to_string();
     let transport_secret_key = TransportSecretKey::generate(&mut crypto_box::aead::OsRng);
     let transport_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(transport_secret_key.public_key().as_bytes());
     let node_signature = joiner_node_key
         .sign(&node_proof_message(
             &created.onboarding_secret,
-            &joiner_node_id_string,
+            &joiner_node_string,
             Some(&transport_public_key),
         ))
         .to_string();
@@ -1018,7 +1018,7 @@ async fn bootstrap_wraps_key() {
         State(state),
         Json(BootstrapOnboardingRequest {
             onboarding_secret: created.onboarding_secret,
-            node_id: joiner_node_id_string,
+            node_id: joiner_node_string,
             node_proof: node_signature,
             transport_public_key: Some(transport_public_key),
             issuer_public_key: None,

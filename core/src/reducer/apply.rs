@@ -20,7 +20,7 @@ impl AdminDocumentState {
         if self.applied_event_ids.contains(&event.event_id) {
             return Ok(AdminApplyStatus::Duplicate);
         }
-        let stale_on_all_paths = !matches!(
+        let all_paths_stale = !matches!(
             &event.op,
             AdminDocumentOperation::PlacementBindingAppended { .. }
                 | AdminDocumentOperation::HandleRangeGranted { .. }
@@ -40,7 +40,7 @@ impl AdminDocumentState {
             .all(|path| self.event_path_stale(event, path));
         let apply_status = self.apply_event(event)?;
 
-        if stale_on_all_paths {
+        if all_paths_stale {
             self.applied_event_ids.insert(event.event_id);
             self.clock.advance(event.origin_node_id, event.origin_seq);
             return Ok(AdminApplyStatus::StaleOriginSequence);

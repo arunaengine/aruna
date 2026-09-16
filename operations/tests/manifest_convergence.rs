@@ -9,7 +9,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_core::{NodeId, UserId};
@@ -89,7 +89,7 @@ async fn interleaved_writes_converge() -> Result<(), Box<dyn std::error::Error>>
 
     // The mint job rewrites each mapping once it activates the id, so the
     // manifests can only settle after every mapping is active on both holders.
-    wait_for_active_ids(&nodes, &document_ids).await?;
+    wait_active_ids(&nodes, &document_ids).await?;
     // Every create lands two rows in the shard: the document and its
     // persistent-id mapping. Both holders must converge on set and digest.
     let manifest_rows = document_ids.len() * 2;
@@ -232,7 +232,7 @@ async fn create_document(
     Ok(())
 }
 
-async fn wait_for_active_ids(
+async fn wait_active_ids(
     nodes: &[TestNode],
     document_ids: &[Ulid],
 ) -> Result<(), Box<dyn std::error::Error>> {

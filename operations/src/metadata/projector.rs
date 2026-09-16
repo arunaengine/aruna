@@ -23,7 +23,7 @@ use aruna_core::storage_entries::{
     registry_delete_entries,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
 };
@@ -401,8 +401,8 @@ pub async fn project_create_events(
     let mut repair_deletes = Vec::new();
     let mut repaired_records = Vec::new();
     let mut outboxes = Vec::new();
-    let mut pending_projection_delete_targets = BTreeSet::new();
-    let mut pending_projection_retry_targets = BTreeSet::new();
+    let mut pending_delete_targets = BTreeSet::new();
+    let mut pending_retry_targets = BTreeSet::new();
     let mut mint_retry_targets = BTreeSet::new();
     let mut needs_materialization_drain = false;
     let mut projected = 0usize;
@@ -426,10 +426,10 @@ pub async fn project_create_events(
                 rejected_total,
                 "Deferring metadata event stamped too far in the future; check NTP on the emitting node"
             );
-            pending_projection_retry_targets.insert((document_id, event.event_id));
+            pending_retry_targets.insert((document_id, event.event_id));
             continue;
         }
-        pending_projection_delete_targets.insert((document_id, event.event_id));
+        pending_delete_targets.insert((document_id, event.event_id));
         if graph_deleted_cached(context, &event.record.graph_iri, &mut lifecycle_cache).await? {
             let existing_registry = match registry_cache.get(&document_id) {
                 Some(record) => record.clone(),
@@ -531,7 +531,7 @@ pub async fn project_create_events(
                 // No live holder can accept the genesis yet; keep the marker so
                 // a later placement change retries the lifecycle mint.
                 mint_retry_targets.insert((document_id, event.event_id));
-                pending_projection_delete_targets.remove(&(document_id, event.event_id));
+                pending_delete_targets.remove(&(document_id, event.event_id));
             }
             None
         };
@@ -634,16 +634,16 @@ pub async fn project_create_events(
     if needs_materialization_drain {
         schedule_materialization_drain(context).await?;
     }
-    write_pending_markers(context, &pending_projection_retry_targets).await?;
+    write_pending_markers(context, &pending_retry_targets).await?;
     write_pending_markers(context, &mint_retry_targets).await?;
-    delete_pending_markers(context, pending_projection_delete_targets).await?;
+    delete_pending_markers(context, pending_delete_targets).await?;
     if !mint_retry_targets.is_empty() {
         schedule_projection_drain(context, PROJECTION_RETRY_AFTER).await?;
     }
 
-    if !pending_projection_retry_targets.is_empty() {
+    if !pending_retry_targets.is_empty() {
         return Err(MetadataProjectionError::ClockSkewDeferred {
-            deferred: pending_projection_retry_targets.len(),
+            deferred: pending_retry_targets.len(),
         });
     }
 
@@ -1157,7 +1157,7 @@ mod tests {
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use aruna_core::structs::placement::placement_record::{PlacementRef, PlacementStrategy};
+    use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
@@ -1951,7 +1951,7 @@ mod tests {
         let create_ref = placement_of(&create);
         assert_ne!(
             create_ref,
-            aruna_core::structs::placement::placement_record::PlacementRef::NIL
+            aruna_core::structs::placement::record::PlacementRef::NIL
         );
         assert_eq!(create_ref, placement_of(&update));
     }

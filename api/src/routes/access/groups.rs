@@ -1,7 +1,7 @@
 use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
@@ -1010,7 +1010,7 @@ pub(crate) async fn run_group_usage(
 
     // The QuotaGate enforces against the group's realm-wide logical_bytes, so the
     // warning threshold is evaluated against the same counter.
-    let realm_group_logical_bytes = realm.logical_bytes;
+    let group_logical_bytes = realm.logical_bytes;
     let mut response = crate::routes::info::UsageResponse::for_group(local, realm);
     match count_group_purpose(&state.get_ctx(), state.get_realm_id(), group_id).await {
         Ok(Some(counts)) => {
@@ -1034,7 +1034,7 @@ pub(crate) async fn run_group_usage(
         response.quota = Some(crate::routes::info::GroupQuotaStatus::resolve(
             &config.quota,
             &group_id,
-            realm_group_logical_bytes,
+            group_logical_bytes,
         ));
     }
     Ok(response)

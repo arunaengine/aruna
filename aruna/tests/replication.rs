@@ -1489,7 +1489,7 @@ async fn delete_marker_replicates() -> TestResult<()> {
             .send()
             .await?;
         assert_eq!(delete_output.delete_marker(), Some(true));
-        let delete_marker_version_id = delete_output
+        let marker_version_id = delete_output
             .version_id()
             .ok_or_else(|| {
                 std::io::Error::other("delete object did not return delete-marker version id")
@@ -1533,16 +1533,16 @@ async fn delete_marker_replicates() -> TestResult<()> {
             .await;
         assert!(current_get_error.is_err());
 
-        let delete_marker_get_error = harness
+        let marker_get_error = harness
             .joiner_client
             .get_object()
             .bucket(bucket)
             .key(key)
-            .version_id(delete_marker_version_id)
+            .version_id(marker_version_id)
             .send()
             .await;
         assert_eq!(
-            error_code(&delete_marker_get_error).as_deref(),
+            error_code(&marker_get_error).as_deref(),
             Some("MethodNotAllowed")
         );
 

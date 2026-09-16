@@ -502,7 +502,7 @@ mod tests {
     };
     use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::config::load;
-    use aruna_api::server_state::ServerState;
+    use aruna_api::server::state::ServerState;
     use aruna_blob::blob::BlobHandler;
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_STATE_KEYSPACE,
@@ -535,7 +535,7 @@ mod tests {
         let _guard = env_lock().lock().await;
         let temp = tempdir().unwrap();
         let source_db_path = temp.path().join("source-db");
-        let snapshot_source_db_path = temp.path().join("snapshot-source-db");
+        let snapshot_db_path = temp.path().join("snapshot-source-db");
         let snapshot_path = temp.path().join("backup.aruna");
         let restored_db_path = temp.path().join("restored-db");
         let blob_root = temp.path().join("blob-root");
@@ -738,9 +738,9 @@ mod tests {
             drop(config);
         }
 
-        copy_dir_all(&source_db_path, &snapshot_source_db_path).unwrap();
+        copy_dir_all(&source_db_path, &snapshot_db_path).unwrap();
 
-        let before = read_database_contents(&snapshot_source_db_path).unwrap();
+        let before = read_database_contents(&snapshot_db_path).unwrap();
         assert!(before.contains_key(NODE_STATE_KEYSPACE));
         assert!(before.contains_key(API_STATE_KEYSPACE));
         assert!(before.contains_key(REALM_CONFIG_KEYSPACE));
@@ -749,7 +749,7 @@ mod tests {
         assert!(before.contains_key(USER_ACCESS_KEYSPACE));
         assert!(before.contains_key(S3_BUCKET_KEYSPACE));
 
-        let snapshot_stats = snapshot_database(&snapshot_source_db_path, &snapshot_path).unwrap();
+        let snapshot_stats = snapshot_database(&snapshot_db_path, &snapshot_path).unwrap();
         assert!(snapshot_stats.keyspace_count >= 10);
         assert!(snapshot_stats.entry_count >= 10);
 

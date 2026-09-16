@@ -23,11 +23,11 @@ use crate::structs::identity::realm::{
     RealmDiscoveryConfig, RealmId, RealmNodeKind,
 };
 use crate::structs::placement::compute_config::RealmComputeConfig;
-use crate::structs::placement::placement_record::{
+use crate::structs::placement::record::{
     BandPool, BindingScope, DocumentClass, HandleRange, MAX_SHARD_COUNT, NodePlacementEntry,
     PlacementBinding, PlacementOverride, PlacementStrategy, StrategyBinding,
 };
-use crate::structs::placement::placement_transition::{
+use crate::structs::placement::transition::{
     BucketBarrier, BucketCompletion, BucketForceFinalize, CandidatePlacementMap, CompletionProof,
     PlacementActivation, PlacementTransition, StallReport, TransitionPlan, TransitionStatus,
 };
@@ -35,7 +35,7 @@ use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::reserved_label;
 use crate::structured_id::PlacementHandle;
 use crate::types::RoleId;
-use crate::user_validation::{
+use crate::user::validation::{
     UserAttributeError, validate_attribute_key, validate_attribute_value,
 };
 
@@ -348,21 +348,21 @@ impl AdminDocumentState {
     }
 
     fn event_path_stale(&self, event: &AdminDocumentEvent, path: &str) -> bool {
-        let same_origin_at_or_after = |dot: &AdminDocumentDot| {
+        let origin_not_before = |dot: &AdminDocumentDot| {
             dot.origin_node_id == event.origin_node_id && dot.origin_seq >= event.origin_seq
         };
 
         self.version_for_path(path)
-            .is_some_and(|version| same_origin_at_or_after(&version.dot))
+            .is_some_and(|version| origin_not_before(&version.dot))
             || self
                 .equivalent_value_dots
                 .get(path)
-                .is_some_and(|dots| dots.iter().any(same_origin_at_or_after))
+                .is_some_and(|dots| dots.iter().any(origin_not_before))
             || self.conflicts.get(path).is_some_and(|conflict| {
                 conflict
                     .values
                     .iter()
-                    .any(|value| same_origin_at_or_after(&value.dot))
+                    .any(|value| origin_not_before(&value.dot))
             })
     }
 

@@ -2093,13 +2093,13 @@ async fn conflict_metrics_separate() {
 
     assert!(matches!(event, Event::Storage(StorageEvent::Error { .. })));
 
-    let metrics_after_not_found = handle.snapshot_metrics();
-    assert_eq!(metrics_after_not_found.requests_total, 1);
-    assert_eq!(metrics_after_not_found.errors_total, 1);
-    assert_eq!(metrics_after_not_found.conflicts_total, 0);
-    assert_eq!(metrics_after_not_found.failed_total, 1);
+    let not_found_metrics = handle.snapshot_metrics();
+    assert_eq!(not_found_metrics.requests_total, 1);
+    assert_eq!(not_found_metrics.errors_total, 1);
+    assert_eq!(not_found_metrics.conflicts_total, 0);
+    assert_eq!(not_found_metrics.failed_total, 1);
     assert_eq!(
-        metrics_after_not_found.last_error,
+        not_found_metrics.last_error,
         Some("Transaction not found".to_string())
     );
 

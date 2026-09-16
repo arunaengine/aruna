@@ -86,7 +86,7 @@ use aruna_operations::s3::object::copy::{
     CopyObjectInput as CopyObjectData, CopyReferences, copy_object,
 };
 use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjectOperation};
-use aruna_operations::s3::object::delete_bulk::{
+use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput as DOSI, delete_objects,
 };
 use aruna_operations::s3::object::get::{
@@ -1557,8 +1557,8 @@ impl S3 for ArunaS3Service {
         )?;
 
         let requested = RequestedAttributes::from_request(&req.input.object_attributes)?;
-        let requested_part_number_marker = req.input.part_number_marker;
-        let part_number_marker = parse_part_marker(requested_part_number_marker)?;
+        let requested_part_marker = req.input.part_number_marker;
+        let part_number_marker = parse_part_marker(requested_part_marker)?;
         let max_parts = parse_max_parts(req.input.max_parts)?;
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket.clone();
@@ -1622,7 +1622,7 @@ impl S3 for ArunaS3Service {
             .then(|| {
                 attributes_parts(
                     &result,
-                    requested_part_number_marker,
+                    requested_part_marker,
                     part_number_marker,
                     max_parts,
                 )
@@ -1814,9 +1814,9 @@ impl S3 for ArunaS3Service {
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
         let key_marker = req.input.key_marker.clone();
-        let requested_upload_id_marker = req.input.upload_id_marker.clone();
+        let requested_upload_marker = req.input.upload_id_marker.clone();
         let upload_id_marker =
-            parse_upload_marker(key_marker.as_deref(), requested_upload_id_marker.as_deref())?;
+            parse_upload_marker(key_marker.as_deref(), requested_upload_marker.as_deref())?;
         let max_uploads = match req.input.max_uploads {
             None => ListUploadsOperation::DEFAULT_MAX_UPLOADS,
             Some(max_uploads) => usize::try_from(max_uploads)
@@ -1861,8 +1861,8 @@ impl S3 for ArunaS3Service {
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
         let key_marker = req.input.key_marker.clone();
-        let requested_version_id_marker = req.input.version_id_marker.clone();
-        let version_id_marker = match requested_version_id_marker.as_deref() {
+        let requested_version_marker = req.input.version_id_marker.clone();
+        let version_id_marker = match requested_version_marker.as_deref() {
             None => None,
             Some(marker) => Some(
                 ulid::Ulid::from_string(marker)

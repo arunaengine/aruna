@@ -1,5 +1,5 @@
 use crate::error::{ServerError, ServerResult};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::onboarding::{
@@ -1003,11 +1003,11 @@ fn verify_issuer_proof(
         .as_ref()
         .ok_or(ServerError::BadRequest)?;
     let signature = Signature::from_str(issuer_proof).map_err(|_| ServerError::Unauthorized)?;
-    let issuer_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+    let issuer_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(issuer_public_key)
         .map_err(|_| ServerError::BadRequest)?;
     let verifying_key = VerifyingKey::from_bytes(
-        issuer_public_key_bytes
+        issuer_key_bytes
             .as_slice()
             .try_into()
             .map_err(|_| ServerError::BadRequest)?,
@@ -1033,11 +1033,11 @@ fn wrap_realm_key(
     transport_public_key: &str,
 ) -> ServerResult<(String, String, String)> {
     let realm_key_pem = state.realm_key_pem().ok_or(ServerError::Forbidden)?;
-    let transport_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+    let transport_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(transport_public_key)
         .map_err(|_| ServerError::BadRequest)?;
     let transport_public_key = TransportPublicKey::from(
-        <[u8; 32]>::try_from(transport_public_key_bytes.as_slice())
+        <[u8; 32]>::try_from(transport_key_bytes.as_slice())
             .map_err(|_| ServerError::BadRequest)?,
     );
     let wrapping_secret_key = TransportSecretKey::generate(&mut CryptoOsRng);
