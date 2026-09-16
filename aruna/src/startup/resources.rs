@@ -508,6 +508,7 @@ async fn ensure_usage_counters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shutdown::MIN_SHUTDOWN_GRACE;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
@@ -616,8 +617,9 @@ mod tests {
         worker.join().expect("storage responder should finish");
     }
 
-    // A failure with no fallible resource acquired yet still releases storage,
-    // and later acquisitions are absent rather than faked.
+    // A failure with nothing fallible acquired still releases storage; later
+    // acquisitions stay absent rather than faked. The smallest supported grace
+    // funds writer phases rather than racing their acknowledgements against a zero budget.
     #[tokio::test]
     async fn cleanup_releases_subset() {
         let temp = tempdir().expect("temp dir");
@@ -628,7 +630,7 @@ mod tests {
         assert!(acquired.metadata_handle.is_none());
         assert!(acquired.ops_handle.is_none());
 
-        let outcome = acquired.cleanup(Duration::from_secs(1)).await;
+        let outcome = acquired.cleanup(MIN_SHUTDOWN_GRACE).await;
         assert!(
             outcome.complete(),
             "an idle acquired subset must release cleanly: {outcome:?}"
@@ -669,6 +671,42 @@ mod tests {
             "a pending tracked child must not be reported drained: {outcome:?}"
         );
         assert!(!outcome.complete());
+
+        let event = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: "late".to_string(),
+                key: b"key".to_vec().into(),
+                value: b"value".to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Closed
+            })
+        ));
+    }
+
+    // A grace below `MIN_SHUTDOWN_GRACE` cannot fund the protected tail, so the
+    // writer phases get no budget. The exhausted sequence must still close the
+    // store and report an incomplete outcome, not a clean release.
+    #[tokio::test]
+    async fn budget_exhausted_incomplete() {
+        let temp = tempdir().expect("temp dir");
+        let storage_handle = open_storage(&temp);
+        let task_handle = TaskHandle::new();
+        let acquired = Acquired::new(storage_handle.clone(), task_handle);
+        // Documented too-small grace: one second instead of the supported
+        // minimum, so no writer phase has a usable budget.
+        let too_small = Duration::from_secs(1);
+
+        let outcome = acquired.cleanup(too_small).await;
+
+        assert!(
+            !outcome.complete(),
+            "an exhausted writer budget must not report a clean release: {outcome:?}"
+        );
 
         let event = storage_handle
             .send_storage_effect(StorageEffect::Write {

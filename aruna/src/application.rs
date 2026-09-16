@@ -919,12 +919,61 @@ mod tests {
         crate::settings::read_settings_from(&map).expect("settings parse")
     }
 
+    /// A tracked timer handler that holds the production task drain at its
+    /// real join: it signals once it is running and finishes only after the
+    /// test releases it, so cleanup cannot pass the tasks phase early.
+    #[derive(Clone)]
+    struct BoundaryTask {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl BoundaryTask {
+        fn new() -> Self {
+            Self {
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        async fn entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl aruna_tasks::InboundTaskHandler for BoundaryTask {
+        #[allow(clippy::type_complexity)]
+        fn handle_timer<'life0, 'async_trait>(
+            &'life0 self,
+            _key: aruna_core::task::TaskKey,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: Sync + 'async_trait,
+        {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+            })
+        }
+    }
+
     // A stop accepted between acquisition stages releases the acquired subset
-    // on the escalation policy: the drain callback arms the second-signal task
-    // while the acquisition future is still draining.
+    // on the escalation policy while the drain callback arms the second signal;
+    // a tracked task holds the real tasks-phase join, so the boundary is not a race.
     #[tokio::test]
     async fn escalation_during_acquisition() {
         use crate::startup::resources::{StartupStage, acquire_with_storage};
+        use aruna_core::effects::Effect;
+        use aruna_core::handle::Handle;
+        use aruna_core::task::{TaskEffect, TaskKey};
+        use std::time::Duration;
+
+        const BOUND: Duration = Duration::from_secs(30);
 
         let aborted = Arc::new(AtomicBool::new(false));
         let (signal, _fire) = ControlledSignal::new(aborted.clone());
@@ -938,6 +987,22 @@ mod tests {
         let settings = startup_settings(&path);
         let storage = crate::config::open_storage(&settings).expect("storage opens");
         let task_handle = aruna_tasks::TaskHandle::new();
+
+        // The tracked handler blocks the real tasks-phase join that cleanup
+        // waits on; it is released only after the escalation completed.
+        let boundary = BoundaryTask::new();
+        task_handle
+            .set_inbound_handler(Arc::new(boundary.clone()))
+            .await;
+        let _ = task_handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: TaskKey::DrainSyncOutbox,
+                after: Duration::ZERO,
+            }))
+            .await;
+        tokio::time::timeout(BOUND, boundary.entered())
+            .await
+            .expect("the tracked handler must start before acquisition");
 
         let drain_stop = stop.clone();
         let mut checkpoint = move |stage: StartupStage| {
@@ -956,17 +1021,25 @@ mod tests {
             &mut on_drain,
         ));
 
-        tokio::select! {
-            _ = &mut acquisition => {
-                panic!("acquisition returned before the escalation action armed");
+        tokio::time::timeout(BOUND, async {
+            tokio::select! {
+                () = async {
+                    escalation.wait_until_armed().await;
+                    escalation.fire_second();
+                    escalation.wait_until_completed().await;
+                    boundary.release();
+                } => {}
+                _ = &mut acquisition => {
+                    panic!("acquisition finished while the tracked boundary was held");
+                }
             }
-            () = escalation.wait_until_armed() => {}
-        }
-        escalation.fire_second();
-        escalation.wait_until_completed().await;
+        })
+        .await
+        .expect("the escalation path must complete while cleanup is held");
 
-        let outcome = acquisition
+        let outcome = tokio::time::timeout(BOUND, acquisition)
             .await
+            .expect("the released acquisition must finish")
             .expect("an accepted stop is not a failure");
         assert!(
             outcome.is_none(),
