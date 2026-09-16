@@ -7,9 +7,7 @@ use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
 use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind};
-use aruna_core::structs::placement::record::{
-    NodePlacementEntry, normalize_placement_input,
-};
+use aruna_core::structs::placement::record::{NodePlacementEntry, normalize_placement_input};
 use aruna_core::structs::storage::node_info::reserved_label;
 use aruna_core::time::unix_timestamp_millis;
 use ed25519_dalek::SigningKey;

@@ -9,14 +9,14 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::policy::{
-    PlacementPolicy, PlacementPolicyError, VerifiedPolicy,
-};
-use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyAuthorityError, PolicyPublication, PolicyPublicationClaim,
     placement_policy_change, placement_policy_target, policy_authority_path,
 };
+use aruna_core::structs::placement::policy::{
+    PlacementPolicy, PlacementPolicyError, VerifiedPolicy,
+};
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, Value};
 use smallvec::smallvec;

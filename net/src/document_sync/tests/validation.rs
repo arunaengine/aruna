@@ -367,10 +367,10 @@ async fn defers_unknown_authority() {
 
 #[test]
 fn binds_policy_target() {
+    use aruna_core::structs::placement::policy::document::placement_policy_change;
     use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
-    use aruna_core::structs::placement::policy::document::placement_policy_change;
 
     let realm_id = RealmId::from_bytes([2u8; 32]);
     let policy_id = Ulid::from_bytes([8u8; 16]);

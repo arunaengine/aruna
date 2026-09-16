@@ -502,8 +502,8 @@ mod tests {
     use aruna::bootstrap::ensure_onboarding_secret;
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListSecretsResponse;
-    use aruna_api::server::{Server, ServerConfig};
     use aruna_api::server::state::ServerState;
+    use aruna_api::server::{Server, ServerConfig};
     use aruna_core::UserId;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};

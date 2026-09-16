@@ -1004,18 +1004,15 @@ fn preserves_affinity_data() {
         replica_count: None,
         distinct_locations: false,
         shard_count: 64,
-        affinity: vec![
-            aruna_core::structs::placement::record::AffinityRule {
-                matcher: aruna_core::structs::placement::record::LabelMatch {
-                    key: "tier".to_string(),
-                    value: "hot".to_string(),
-                },
-                effect:
-                    aruna_core::structs::placement::record::AffinityEffect::Multiply {
-                        permille: 1500,
-                    },
+        affinity: vec![aruna_core::structs::placement::record::AffinityRule {
+            matcher: aruna_core::structs::placement::record::LabelMatch {
+                key: "tier".to_string(),
+                value: "hot".to_string(),
             },
-        ],
+            effect: aruna_core::structs::placement::record::AffinityEffect::Multiply {
+                permille: 1500,
+            },
+        }],
     };
     let mutation = RealmPlacementMutation::UpsertStrategy(strategy.clone());
     let document = RealmConfigDocument::new(RealmId::from_bytes([7; 32]), Vec::new(), 3);

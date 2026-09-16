@@ -1960,9 +1960,7 @@ mod test {
         let mut config = RealmConfigDocument::new(RealmId([5u8; 32]), Vec::new(), 2);
         config.seed_default_placement();
         let bound = config
-            .class_strategy(
-                crate::structs::placement::record::DocumentClass::PlacementPolicy,
-            )
+            .class_strategy(crate::structs::placement::record::DocumentClass::PlacementPolicy)
             .expect("binding resolves")
             .expect("a strategy is bound");
         assert_eq!(Some(bound.strategy_id), config.default_strategy_id);

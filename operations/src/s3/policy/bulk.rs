@@ -15,14 +15,14 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::placement::policy::{
-    PlacementPolicyRef, PlacementSubject, PolicyResolution,
-};
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun, PolicyIntent,
     PolicyIntentKey, PolicyIntentOutcome, PolicyRefMode, PolicyStatus,
 };
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
+use aruna_core::structs::placement::policy::{
+    PlacementPolicyRef, PlacementSubject, PolicyResolution,
+};
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
@@ -986,12 +986,12 @@ mod tests {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::policy::{
-        PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
-    };
     use aruna_core::structs::placement::policy::attachment::{
         BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentKey,
         PolicyIntentOutcome, PolicyStatus,
+    };
+    use aruna_core::structs::placement::policy::{
+        PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::{
         Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,

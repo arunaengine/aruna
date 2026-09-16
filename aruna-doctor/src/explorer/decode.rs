@@ -981,7 +981,6 @@ mod tests {
     use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-    use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
     use aruna_core::structs::placement::policy::attachment::{
         BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBulkRun,
         PolicyIntent, PolicyIntentOutcome, PolicyMutationParams, PolicyMutationRecord,
@@ -990,6 +989,7 @@ mod tests {
     use aruna_core::structs::placement::policy::document::{
         PlacementPolicyDocument, PolicyPublication, placement_policy_key,
     };
+    use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, HashIndex,

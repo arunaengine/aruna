@@ -1728,17 +1728,10 @@ async fn query_forwards_token() {
     assert_contains_name(&anonymous.names, "Remote Public Dataset");
     assert_excludes_name(&anonymous.names, "Remote Private Dataset");
 
-    let no_forwardable_token =
-        query_remote_names(&test, Some(token_auth.clone()), None).await;
+    let no_forwardable_token = query_remote_names(&test, Some(token_auth.clone()), None).await;
     assert_eq!(no_forwardable_token.nodes_failed, 0);
-    assert_contains_name(
-        &no_forwardable_token.names,
-        "Remote Public Dataset",
-    );
-    assert_excludes_name(
-        &no_forwardable_token.names,
-        "Remote Private Dataset",
-    );
+    assert_contains_name(&no_forwardable_token.names, "Remote Public Dataset");
+    assert_excludes_name(&no_forwardable_token.names, "Remote Private Dataset");
 
     let oversized_token = query_remote_names(
         &test,
@@ -1747,14 +1740,8 @@ async fn query_forwards_token() {
     )
     .await;
     assert_eq!(oversized_token.nodes_failed, 0);
-    assert_contains_name(
-        &oversized_token.names,
-        "Remote Public Dataset",
-    );
-    assert_excludes_name(
-        &oversized_token.names,
-        "Remote Private Dataset",
-    );
+    assert_contains_name(&oversized_token.names, "Remote Public Dataset");
+    assert_excludes_name(&oversized_token.names, "Remote Private Dataset");
 
     assert!(
         crate::auth::handle_token(test.coordinator.state.as_ref(), "not-a-jwt")

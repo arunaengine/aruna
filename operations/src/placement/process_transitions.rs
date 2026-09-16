@@ -1086,18 +1086,16 @@ mod tests {
             strategy_id,
             shard: 0,
         };
-        let mut transition = PlacementTransition::new(
-            aruna_core::structs::placement::transition::TransitionPlan {
+        let mut transition =
+            PlacementTransition::new(aruna_core::structs::placement::transition::TransitionPlan {
                 transition_id: Ulid::from_bytes([8; 16]),
                 strategy_id,
-                buckets: vec![
-                    aruna_core::structs::placement::transition::BucketPlan {
-                        bucket: 0,
-                        old_holders: vec![node(1)],
-                        target_holders: vec![node(2)],
-                        predecessor_epoch: 1,
-                    },
-                ],
+                buckets: vec![aruna_core::structs::placement::transition::BucketPlan {
+                    bucket: 0,
+                    old_holders: vec![node(1)],
+                    target_holders: vec![node(2)],
+                    predecessor_epoch: 1,
+                }],
                 target_map_epoch: 1,
                 limits: aruna_core::structs::placement::transition::TransitionLimits {
                     max_incomplete_buckets: 1,
@@ -1105,8 +1103,7 @@ mod tests {
                 },
                 created_by: node(2),
                 created_at_ms: 1,
-            },
-        );
+            });
         transition.completed.push(
             aruna_core::structs::placement::transition::BucketCompletion {
                 bucket: 0,

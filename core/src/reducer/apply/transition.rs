@@ -33,9 +33,7 @@ impl AdminDocumentState {
                 if *reported_by != event.origin_node_id {
                     return Err(AdminDocumentError::TransitionOriginMismatch);
                 }
-                if frontier.len()
-                    > crate::structs::placement::transition::MAX_FRONTIER_BYTES
-                {
+                if frontier.len() > crate::structs::placement::transition::MAX_FRONTIER_BYTES {
                     return Err(AdminDocumentError::TransitionReportOversized);
                 }
                 self.apply_transition_report(
@@ -80,9 +78,7 @@ impl AdminDocumentState {
                 bucket,
                 at_risk_report,
             } => {
-                if at_risk_report.len()
-                    > crate::structs::placement::transition::MAX_STALL_BYTES
-                {
+                if at_risk_report.len() > crate::structs::placement::transition::MAX_STALL_BYTES {
                     return Err(AdminDocumentError::TransitionReportOversized);
                 }
                 self.apply_transition_report(

@@ -553,14 +553,12 @@ mod test {
             aruna_core::structs::placement::policy::PlacementPolicy::new(
                 Ulid::from_bytes([4u8; 16]),
                 "residency".to_string(),
-                vec![
-                    aruna_core::structs::placement::policy::PlacementSelector {
-                        node_id: Some(node_id),
-                        location: None,
-                        labels: Vec::new(),
-                        executor_kind: None,
-                    },
-                ],
+                vec![aruna_core::structs::placement::policy::PlacementSelector {
+                    node_id: Some(node_id),
+                    location: None,
+                    labels: Vec::new(),
+                    executor_kind: None,
+                }],
             )
             .expect("policy is valid"),
         )
@@ -640,14 +638,12 @@ mod test {
             aruna_core::structs::placement::policy::PlacementPolicy::new(
                 Ulid::from_bytes([7u8; 16]),
                 "residency".to_string(),
-                vec![
-                    aruna_core::structs::placement::policy::PlacementSelector {
-                        node_id: Some(elsewhere),
-                        location: None,
-                        labels: Vec::new(),
-                        executor_kind: None,
-                    },
-                ],
+                vec![aruna_core::structs::placement::policy::PlacementSelector {
+                    node_id: Some(elsewhere),
+                    location: None,
+                    labels: Vec::new(),
+                    executor_kind: None,
+                }],
             )
             .expect("policy is valid"),
         )

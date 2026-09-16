@@ -240,10 +240,7 @@ fn foreign_reports_dropped() {
             transition_id: plan.transition_id,
             bucket: 0,
             reported_by: node(1),
-            frontier: vec![
-                0;
-                crate::structs::placement::transition::MAX_FRONTIER_BYTES + 1
-            ],
+            frontier: vec![0; crate::structs::placement::transition::MAX_FRONTIER_BYTES + 1],
         },
     );
     assert!(matches!(

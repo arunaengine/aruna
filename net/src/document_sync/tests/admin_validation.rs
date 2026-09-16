@@ -27,14 +27,12 @@ fn outsider_reports_rejected() {
             aruna_core::structs::placement::transition::TransitionPlan {
                 transition_id,
                 strategy_id,
-                buckets: vec![
-                    aruna_core::structs::placement::transition::BucketPlan {
-                        bucket: 0,
-                        old_holders: vec![node(1)],
-                        target_holders: vec![node(2)],
-                        predecessor_epoch: 1,
-                    },
-                ],
+                buckets: vec![aruna_core::structs::placement::transition::BucketPlan {
+                    bucket: 0,
+                    old_holders: vec![node(1)],
+                    target_holders: vec![node(2)],
+                    predecessor_epoch: 1,
+                }],
                 target_map_epoch: 2,
                 limits: Default::default(),
                 created_by: node(1),

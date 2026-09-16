@@ -816,9 +816,8 @@ pub mod test {
         let target = AdminDocumentTarget::Realm { realm_id };
         let stale_conflict_path =
             format!("realm.roles.{role_id}.assigned_users.{assigned_user_id}");
-        let retained_conflict_path = format!(
-            "realm.roles.{conflict_role_id}.assigned_users.{conflict_user_id}"
-        );
+        let retained_conflict_path =
+            format!("realm.roles.{conflict_role_id}.assigned_users.{conflict_user_id}");
         let stale_add_dot = conflict_dot(2, 1);
         let stale_remove_dot = conflict_dot(3, 1);
         let retained_add_dot = conflict_dot(4, 1);

@@ -10,8 +10,8 @@ use crate::structs::execution::source_access::{
     ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::structs::identity::realm::RealmId;
-use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementDecision};
 use crate::structs::placement::policy::document::{PlacementPolicyDocument, PolicyPublication};
+use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementDecision};
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
 use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::storage::routing::GroupRoutingInputs;

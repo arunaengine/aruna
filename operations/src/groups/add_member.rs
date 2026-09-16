@@ -1091,12 +1091,8 @@ pub mod test {
                 },
             )]),
         };
-        let previous_state = assignment_conflict_state(
-            group_id,
-            role_id,
-            assigned_user_id,
-            conflict_user_id,
-        );
+        let previous_state =
+            assignment_conflict_state(group_id, role_id, assigned_user_id, conflict_user_id);
         let input = AddUserInput {
             actor: actor.clone(),
             group_id,
@@ -1164,10 +1160,7 @@ pub mod test {
                 assert_eq!(conflict_writes.len(), 1);
                 let conflict: AdminConflict =
                     postcard::from_bytes(conflict_writes[0].2.as_ref()).unwrap();
-                assert_eq!(
-                    conflict.path,
-                    assignment_path(role_id, conflict_user_id)
-                );
+                assert_eq!(conflict.path, assignment_path(role_id, conflict_user_id));
 
                 (
                     GroupAuthorizationDocument::from_bytes(auth_write.2.as_ref()).unwrap(),

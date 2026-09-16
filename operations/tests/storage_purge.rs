@@ -53,10 +53,12 @@ use aruna_operations::s3::multipart::part_upload::{
 use aruna_operations::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
+use aruna_operations::s3::object::delete::bulk::{
+    BulkDeleteEntry, BulkDeleteInput, delete_objects,
+};
 use aruna_operations::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
 };
-use aruna_operations::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };

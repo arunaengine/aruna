@@ -1239,8 +1239,7 @@ async fn foreign_realm_unimplemented() {
     let node = spawn_test_node(provider, true).await;
 
     let foreign_signing_key = generate_signing_key();
-    let foreign_realm_id =
-        RealmId::from_bytes(foreign_signing_key.verifying_key().to_bytes());
+    let foreign_realm_id = RealmId::from_bytes(foreign_signing_key.verifying_key().to_bytes());
     node.state.add_trusted_realm(foreign_realm_id).await;
     let foreign_user_id = UserId::local(Ulid::generate(), foreign_realm_id);
     match node
@@ -1301,8 +1300,7 @@ async fn foreign_realm_unimplemented() {
             expiry: None,
             user_id: foreign_user_id,
             realm_id: foreign_realm_id,
-            node_capabilities: NodeCapabilities::management_node(foreign_signing_key)
-                .unwrap(),
+            node_capabilities: NodeCapabilities::management_node(foreign_signing_key).unwrap(),
 
             session: None,
         })

@@ -13,11 +13,11 @@ use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
-use aruna_core::structs::placement::policy::{
-    PlacementPolicyError, PlacementPolicyRef, VerifiedPolicy,
-};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyAuthorityError, placement_policy_target, verify_policy_authority,
+};
+use aruna_core::structs::placement::policy::{
+    PlacementPolicyError, PlacementPolicyRef, VerifiedPolicy,
 };
 use aruna_core::types::{Effects, Value};
 use smallvec::smallvec;
@@ -471,9 +471,9 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::effects::NetEffect;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::structs::placement::policy::document::PolicyPublicationClaim;
     use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
     use aruna_core::structs::placement::record::LabelMatch;
-    use aruna_core::structs::placement::policy::document::PolicyPublicationClaim;
     use byteview::ByteView;
     use ulid::Ulid;
 

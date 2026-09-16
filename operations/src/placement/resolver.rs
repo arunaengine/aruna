@@ -9,9 +9,7 @@ use aruna_core::structs::identity::realm::{ClassStrategyError, RealmConfigDocume
 use aruna_core::structs::placement::record::{
     AffinityEffect, BindingScope, DocumentClass, LabelMatch, PlacementOverride, PlacementStrategy,
 };
-use aruna_core::structs::placement::transition::{
-    CandidateMapNode, CandidatePlacementMap,
-};
+use aruna_core::structs::placement::transition::{CandidateMapNode, CandidatePlacementMap};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 

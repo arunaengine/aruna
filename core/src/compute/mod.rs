@@ -15,9 +15,7 @@ use zeroize::Zeroize;
 
 use crate::NodeId;
 use crate::structs::execution::job::EffectiveResources;
-use crate::structs::placement::policy::{
-    MAX_KIND_LEN, PlacementPolicyError, PlacementSubject,
-};
+use crate::structs::placement::policy::{MAX_KIND_LEN, PlacementPolicyError, PlacementSubject};
 
 pub mod quota;
 pub mod runtimes;

@@ -17,8 +17,8 @@ use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecy
 use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::persistent_id_key;
-use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use crate::structs::placement::policy::document::placement_policy_key;
+use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use crate::structs::storage::node_info::node_info_key;
 use crate::structs::storage::usage::{usage_global_key, usage_snapshot_key};
 use crate::types::{GroupId, Key};

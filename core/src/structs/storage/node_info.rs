@@ -1,6 +1,6 @@
 use crate::NodeId;
-use crate::compute::{AdvertisementError, ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
 use crate::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
+use crate::compute::{AdvertisementError, ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
 use crate::errors::ConversionError;
 use crate::structs::placement::policy::{MAX_LABEL_LEN, MAX_VALUE_LEN};
 use serde::{Deserialize, Serialize};

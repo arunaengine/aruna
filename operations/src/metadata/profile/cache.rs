@@ -40,7 +40,11 @@ impl ProfileCache {
         }
     }
 
-    pub(in crate::metadata) fn get(&self, profile_id: Ulid, revision: Ulid) -> Option<Arc<Vec<String>>> {
+    pub(in crate::metadata) fn get(
+        &self,
+        profile_id: Ulid,
+        revision: Ulid,
+    ) -> Option<Arc<Vec<String>>> {
         let key = ProfileCacheKey {
             profile_id,
             revision,
@@ -51,7 +55,12 @@ impl ProfileCache {
 
     /// Records one fetched revision. Every call means a fetch happened, which
     /// is what [`ProfileCache::loads`] reports.
-    pub(in crate::metadata) fn insert(&self, profile_id: Ulid, revision: Ulid, shapes: Arc<Vec<String>>) {
+    pub(in crate::metadata) fn insert(
+        &self,
+        profile_id: Ulid,
+        revision: Ulid,
+        shapes: Arc<Vec<String>>,
+    ) {
         let key = ProfileCacheKey {
             profile_id,
             revision,

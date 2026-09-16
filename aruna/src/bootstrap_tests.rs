@@ -621,34 +621,31 @@ fn readiness_requires_all() {
         labels: Default::default(),
     });
     config.seed_default_placement();
-    config.placement_handle_ranges.push(
-        aruna_core::structs::placement::record::HandleRange {
+    config
+        .placement_handle_ranges
+        .push(aruna_core::structs::placement::record::HandleRange {
             range_id: ulid::Ulid::from_bytes([3; 16]),
             owner: node_id,
             start: aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE,
             end: aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE
                 + aruna_core::structs::placement::record::HANDLE_RANGE_SIZE,
-        },
-    );
+        });
     // A grant without its JobControl binding is not ready yet.
     assert!(!node_is_ready(&config, node_id));
-    config.placement_bindings.push(
-        aruna_core::structs::placement::record::PlacementBinding {
+    config
+        .placement_bindings
+        .push(aruna_core::structs::placement::record::PlacementBinding {
             handle: aruna_core::structured_id::PlacementHandle::new(
                 aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE,
             )
             .unwrap(),
-            scope: aruna_core::structs::placement::record::PlacementScope::Realm(
-                realm_id,
-            ),
-            document_class:
-                aruna_core::structs::placement::record::DocumentClass::JobControl,
+            scope: aruna_core::structs::placement::record::PlacementScope::Realm(realm_id),
+            document_class: aruna_core::structs::placement::record::DocumentClass::JobControl,
             strategy_id: config.default_strategy_id.unwrap(),
             allocator_range_id: Some(ulid::Ulid::from_bytes([3; 16])),
             allocated_by: Some(node_id),
             allocated_at_ms: Some(1),
-        },
-    );
+        });
     assert!(node_is_ready(&config, node_id));
 }
 

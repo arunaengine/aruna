@@ -1181,9 +1181,7 @@ mod pure_tests {
         document.placement_bindings.push(
             aruna_core::structs::placement::record::PlacementBinding {
                 handle: aruna_core::structured_id::PlacementHandle::new(range.start).unwrap(),
-                scope: aruna_core::structs::placement::record::PlacementScope::Realm(
-                    realm_id,
-                ),
+                scope: aruna_core::structs::placement::record::PlacementScope::Realm(realm_id),
                 document_class: DocumentClass::JobControl,
                 strategy_id: Ulid::from_bytes([12; 16]),
                 allocator_range_id: Some(range.range_id),

@@ -1067,38 +1067,36 @@ mod pure_tests {
                 predecessor_epoch: 1,
             }
         };
-        let mut transition =
-            aruna_core::structs::placement::transition::PlacementTransition::new(
-                aruna_core::structs::placement::transition::TransitionPlan {
-                    transition_id: Ulid::from_bytes([8; 16]),
-                    strategy_id,
-                    buckets: vec![
-                        bucket(7, vec![node(9)], vec![node(2)]),
-                        bucket(8, Vec::new(), vec![node(8)]),
-                        bucket(9, Vec::new(), vec![node(7)]),
-                    ],
-                    target_map_epoch: 2,
-                    limits:
-                        aruna_core::structs::placement::transition::TransitionLimits {
-                            max_incomplete_buckets: 1,
-                            grace_ms: 1_000,
-                        },
-                    created_by: node(1),
-                    created_at_ms: 1,
+        let mut transition = aruna_core::structs::placement::transition::PlacementTransition::new(
+            aruna_core::structs::placement::transition::TransitionPlan {
+                transition_id: Ulid::from_bytes([8; 16]),
+                strategy_id,
+                buckets: vec![
+                    bucket(7, vec![node(9)], vec![node(2)]),
+                    bucket(8, Vec::new(), vec![node(8)]),
+                    bucket(9, Vec::new(), vec![node(7)]),
+                ],
+                target_map_epoch: 2,
+                limits: aruna_core::structs::placement::transition::TransitionLimits {
+                    max_incomplete_buckets: 1,
+                    grace_ms: 1_000,
                 },
-            );
+                created_by: node(1),
+                created_at_ms: 1,
+            },
+        );
         transition.completed.push(
             aruna_core::structs::placement::transition::BucketCompletion {
                 bucket: 7,
                 completed_at_ms: 100,
             },
         );
-        transition.drained.push(
-            aruna_core::structs::placement::transition::BucketDrain {
+        transition
+            .drained
+            .push(aruna_core::structs::placement::transition::BucketDrain {
                 bucket: 7,
                 reported_by: node(9),
-            },
-        );
+            });
         config.placement_transitions.push(transition);
         (config, strategy_id)
     }
@@ -1337,16 +1335,13 @@ mod pure_tests {
         }
         config.snapshot_candidate_map();
         for strategy in config.strategies.iter_mut() {
-            strategy.affinity = vec![
-                aruna_core::structs::placement::record::AffinityRule {
-                    matcher: aruna_core::structs::placement::record::LabelMatch {
-                        key: "tier".to_string(),
-                        value: "hot".to_string(),
-                    },
-                    effect:
-                        aruna_core::structs::placement::record::AffinityEffect::Filter,
+            strategy.affinity = vec![aruna_core::structs::placement::record::AffinityRule {
+                matcher: aruna_core::structs::placement::record::LabelMatch {
+                    key: "tier".to_string(),
+                    value: "hot".to_string(),
                 },
-            ];
+                effect: aruna_core::structs::placement::record::AffinityEffect::Filter,
+            }];
         }
         assert_eq!(first_empty_shard(&config), None);
 
@@ -1374,14 +1369,12 @@ mod pure_tests {
                 aruna_core::structs::placement::transition::TransitionPlan {
                     transition_id: Ulid::from_bytes([7; 16]),
                     strategy_id: placement.strategy_id,
-                    buckets: vec![
-                        aruna_core::structs::placement::transition::BucketPlan {
-                            bucket: placement.shard,
-                            old_holders: activated.clone(),
-                            target_holders: targets.clone(),
-                            predecessor_epoch: 1,
-                        },
-                    ],
+                    buckets: vec![aruna_core::structs::placement::transition::BucketPlan {
+                        bucket: placement.shard,
+                        old_holders: activated.clone(),
+                        target_holders: targets.clone(),
+                        predecessor_epoch: 1,
+                    }],
                     target_map_epoch: 2,
                     limits: Default::default(),
                     created_by: node(1),
@@ -1521,9 +1514,7 @@ mod pure_tests {
                     .expect("applies");
             }
             let mut fenced =
-                aruna_core::structs::placement::transition::PlacementTransition::new(
-                    plan.clone(),
-                );
+                aruna_core::structs::placement::transition::PlacementTransition::new(plan.clone());
             fenced.barriers = bucket
                 .old_holders
                 .iter()

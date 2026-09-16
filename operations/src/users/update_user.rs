@@ -1243,16 +1243,16 @@ mod pure_tests {
             actor.node_id,
             aruna_core::structs::identity::realm::RealmNodeKind::Server,
         );
-        config.strategies.push(
-            aruna_core::structs::placement::record::PlacementStrategy {
+        config
+            .strategies
+            .push(aruna_core::structs::placement::record::PlacementStrategy {
                 strategy_id: Ulid::from_bytes([5; 16]),
                 name: "default".to_string(),
                 replica_count: Some(1),
                 distinct_locations: false,
                 affinity: Vec::new(),
                 shard_count: 16,
-            },
-        );
+            });
         config.default_strategy_id = Some(config.strategies[0].strategy_id);
         config.snapshot_candidate_map();
         config

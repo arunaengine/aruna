@@ -4,11 +4,11 @@
 
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::policy::{
-    PlacementPolicyError, PlacementPolicyRef, VerifiedPolicy,
-};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyAuthorityError,
+};
+use aruna_core::structs::placement::policy::{
+    PlacementPolicyError, PlacementPolicyRef, VerifiedPolicy,
 };
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;

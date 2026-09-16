@@ -13,9 +13,9 @@ use aruna_core::metadata::{
 };
 use aruna_core::structs::execution::job::SubmissionId;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::replication::VersionedObjectArn;

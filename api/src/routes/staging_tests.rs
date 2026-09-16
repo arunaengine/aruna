@@ -580,19 +580,13 @@ async fn setup_state() -> TestState {
 
     let bucket_group_id = Ulid::generate();
     let source_group_id = Ulid::generate();
-    let mut bucket_auth = GroupAuthorizationDocument::default_group_doc(
-        with_source_read,
-        realm_id,
-        bucket_group_id,
-    );
+    let mut bucket_auth =
+        GroupAuthorizationDocument::default_group_doc(with_source_read, realm_id, bucket_group_id);
     for role in bucket_auth.roles.values_mut() {
         role.assigned_users.insert(without_source_read);
     }
-    let mut source_auth = GroupAuthorizationDocument::default_group_doc(
-        with_source_read,
-        realm_id,
-        source_group_id,
-    );
+    let mut source_auth =
+        GroupAuthorizationDocument::default_group_doc(with_source_read, realm_id, source_group_id);
     for role in source_auth.roles.values_mut() {
         role.assigned_users.remove(&without_source_read);
     }

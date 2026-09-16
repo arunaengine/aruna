@@ -7,12 +7,12 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
+use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::placement::policy::{
     PlacementPolicy, PlacementPolicyError, PlacementPolicyRef, PlacementSelector,
 };
 use aruna_core::structs::placement::record::LabelMatch;
-use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
-use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_operations::driver::{drive, gate_context, now_ms};
 use aruna_operations::forward::transport::MetadataWriteError;
@@ -645,7 +645,8 @@ async fn ensure_placement_writer(
     bucket: &str,
 ) -> ServerResult<()> {
     let realm_id = auth.realm_id;
-    let config_admin = aruna_core::structs::placement::policy::document::policy_admin_path(realm_id);
+    let config_admin =
+        aruna_core::structs::placement::policy::document::policy_admin_path(realm_id);
     if crate::auth::permission_granted(
         state,
         auth,

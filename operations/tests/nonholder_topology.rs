@@ -418,14 +418,14 @@ async fn swap_keeps_owner() -> TestResult<()> {
             entry.draining = true;
         }
     }
-    config.placement_overrides.push(
-        aruna_core::structs::placement::record::PlacementOverride {
+    config
+        .placement_overrides
+        .push(aruna_core::structs::placement::record::PlacementOverride {
             subject: b"any-shard-subject".to_vec(),
             pinned: Vec::new(),
             excluded: vec![owner_id],
             strategy_id: None,
-        },
-    );
+        });
     realm.apply_config(config).await?;
     assert_eq!(
         derived_owner(&realm, submitted.job_id)?,

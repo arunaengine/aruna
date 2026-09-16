@@ -1219,14 +1219,12 @@ async fn plan_report_coalesce() {
     let plan = aruna_core::structs::placement::transition::TransitionPlan {
         transition_id,
         strategy_id: Ulid::from_parts(1_751, 1),
-        buckets: vec![
-            aruna_core::structs::placement::transition::BucketPlan {
-                bucket: 0,
-                old_holders: vec![local_actor.node_id],
-                target_holders: vec![node(76)],
-                predecessor_epoch: 1,
-            },
-        ],
+        buckets: vec![aruna_core::structs::placement::transition::BucketPlan {
+            bucket: 0,
+            old_holders: vec![local_actor.node_id],
+            target_holders: vec![node(76)],
+            predecessor_epoch: 1,
+        }],
         target_map_epoch: 2,
         limits: Default::default(),
         created_by: local_actor.node_id,

@@ -82,9 +82,7 @@ pub(crate) mod tests {
         PlacementDecision, PlacementPolicy, PlacementSelector, PlacementSubject, PolicyResolution,
         VerifiedPolicy, evaluate_placement,
     };
-    use aruna_core::structs::placement::record::{
-        DEFAULT_NODE_WEIGHT, NodePlacementEntry,
-    };
+    use aruna_core::structs::placement::record::{DEFAULT_NODE_WEIGHT, NodePlacementEntry};
     use std::collections::{BTreeMap, HashMap, HashSet};
     use ulid::Ulid;
 

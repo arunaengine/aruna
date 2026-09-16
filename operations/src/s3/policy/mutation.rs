@@ -7,11 +7,11 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
+use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
 use aruna_core::structs::placement::policy::{
     PlacementPolicyRef, PlacementSubject, PolicyResolution,
 };
-use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
-use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
 use aruna_core::structs::storage::blob::{BucketIdentity, CurrentVersionPointer};
 use aruna_core::types::Effects;
 use smallvec::smallvec;

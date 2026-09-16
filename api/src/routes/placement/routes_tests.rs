@@ -14,11 +14,11 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
-use aruna_core::structs::placement::policy::{
-    PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
-};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyPublicationClaim, placement_policy_key,
+};
+use aruna_core::structs::placement::policy::{
+    PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
 };
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,

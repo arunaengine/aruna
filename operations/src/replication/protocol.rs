@@ -7,9 +7,7 @@ use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::policy::{
-    MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject,
-};
+use aruna_core::structs::placement::policy::{MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject};
 use aruna_core::structs::storage::blob::{BackendLocation, CopyOrigin};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,

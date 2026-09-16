@@ -293,11 +293,10 @@ async fn resolve_inputs(
                     .map(|metadata| metadata.content_length)
             })
             .unwrap_or_default();
-        let policies =
-            aruna_core::structs::placement::policy::PlacementPolicyRef::canonical_set(
-                &head.source_policies,
-            )
-            .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
+        let policies = aruna_core::structs::placement::policy::PlacementPolicyRef::canonical_set(
+            &head.source_policies,
+        )
+        .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
         captured_inputs.push(CapturedInput {
             destination_key: input.dest_key.clone(),
             source_node_id: local,
@@ -354,10 +353,8 @@ async fn resolve_inputs(
         output_policies.extend(info.placement_policies);
     }
     output_policies =
-        aruna_core::structs::placement::policy::PlacementPolicyRef::canonical_set(
-            &output_policies,
-        )
-        .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
+        aruna_core::structs::placement::policy::PlacementPolicyRef::canonical_set(&output_policies)
+            .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
     Ok((captured_inputs, output_policies))
 }
 

@@ -882,12 +882,8 @@ pub mod test {
             ]),
             operation_restrictions: HashMap::new(),
         };
-        let previous_state = conflicted_reducer_state(
-            realm_id,
-            role_id,
-            assigned_user_id,
-            conflict_user_id,
-        );
+        let previous_state =
+            conflicted_reducer_state(realm_id, role_id, assigned_user_id, conflict_user_id);
         let input = AssignRolesInput {
             actor: actor.clone(),
             realm_id,
@@ -939,10 +935,7 @@ pub mod test {
                 assert_eq!(conflict_writes.len(), 1);
                 let conflict: AdminConflict =
                     postcard::from_bytes(conflict_writes[0].2.as_ref()).unwrap();
-                assert_eq!(
-                    conflict.path,
-                    assignment_path(role_id, conflict_user_id)
-                );
+                assert_eq!(conflict.path, assignment_path(role_id, conflict_user_id));
 
                 (
                     RealmAuthorizationDocument::from_bytes(auth_write.2.as_ref()).unwrap(),

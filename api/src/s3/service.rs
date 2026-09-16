@@ -85,10 +85,10 @@ use aruna_operations::s3::object::attributes::{
 use aruna_operations::s3::object::copy::{
     CopyObjectInput as CopyObjectData, CopyReferences, copy_object,
 };
-use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjectOperation};
 use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput as DOSI, delete_objects,
 };
+use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{
     GetObjectInput as GOI, get_object_info, get_object_routed,
 };

@@ -34,8 +34,8 @@ use aruna_core::structs::identity::realm::{
     RealmId, RealmNodeKind, StaticRealmEndpoint,
 };
 use aruna_core::structs::identity::user::User;
-use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
 use aruna_core::types::Value;
@@ -675,16 +675,17 @@ pub(crate) fn signed_policy_document(
     seed: u8,
 ) -> PlacementPolicyDocument {
     let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
-    let publication = aruna_core::structs::placement::policy::document::PolicyPublicationClaim::new(
-        realm_id,
-        policy,
-        secret.public(),
-        policy_admin(realm_id),
-        Ulid::from_bytes([5u8; 16]),
-        9,
-        [0u8; 32],
-    )
-    .sign(&secret);
+    let publication =
+        aruna_core::structs::placement::policy::document::PolicyPublicationClaim::new(
+            realm_id,
+            policy,
+            secret.public(),
+            policy_admin(realm_id),
+            Ulid::from_bytes([5u8; 16]),
+            9,
+            [0u8; 32],
+        )
+        .sign(&secret);
     PlacementPolicyDocument::new(realm_id, policy, publication)
 }
 

@@ -1427,16 +1427,16 @@ mod pure_tests {
             aruna_core::structs::identity::realm::RealmNodeKind::Server,
         );
         let strategy_id = Ulid::from_bytes([5u8; 16]);
-        config.strategies.push(
-            aruna_core::structs::placement::record::PlacementStrategy {
+        config
+            .strategies
+            .push(aruna_core::structs::placement::record::PlacementStrategy {
                 strategy_id,
                 name: "default".to_string(),
                 replica_count: Some(1),
                 distinct_locations: false,
                 affinity: Vec::new(),
                 shard_count: 16,
-            },
-        );
+            });
         config.default_strategy_id = Some(strategy_id);
         config.snapshot_candidate_map();
         record.placement = PlacementRef {

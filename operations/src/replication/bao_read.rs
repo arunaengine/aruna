@@ -1884,9 +1884,7 @@ mod pure_tests {
         // the authenticated peer decides where governed bytes may go.
         use aruna_core::structs::placement::node_subject::storage_subject;
         use aruna_core::structs::placement::policy::PlacementSubject;
-        use aruna_core::structs::placement::record::{
-            DEFAULT_NODE_WEIGHT, NodePlacementEntry,
-        };
+        use aruna_core::structs::placement::record::{DEFAULT_NODE_WEIGHT, NodePlacementEntry};
 
         let local_node = node_from_seed(1);
         let peer = node_from_seed(2);

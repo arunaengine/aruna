@@ -9,10 +9,10 @@ use aruna_core::effects::{Effect, PolicyFetchEffect, StorageEffect};
 use aruna_core::events::{Event, PolicyFetchEvent, PolicySignEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::policy::{PlacementPolicyRef, VerifiedPolicy};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyPublicationClaim, placement_policy_target,
 };
+use aruna_core::structs::placement::policy::{PlacementPolicyRef, VerifiedPolicy};
 use tokio::time::timeout_at;
 use tracing::warn;
 

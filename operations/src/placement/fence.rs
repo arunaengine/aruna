@@ -254,16 +254,16 @@ mod tests {
         // admitted: the answer must line up with the reads it was asked for.
         let realm_id = RealmId::from_bytes([11; 32]);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        config.strategies.push(
-            aruna_core::structs::placement::record::PlacementStrategy {
+        config
+            .strategies
+            .push(aruna_core::structs::placement::record::PlacementStrategy {
                 strategy_id: placement().strategy_id,
                 name: "default".to_string(),
                 replica_count: Some(1),
                 distinct_locations: false,
                 affinity: Vec::new(),
                 shard_count: 16,
-            },
-        );
+            });
         config.snapshot_candidate_map();
 
         let mut fence = WriteFence::default();

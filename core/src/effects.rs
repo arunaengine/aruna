@@ -15,8 +15,8 @@ use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind, Submissio
 use crate::structs::execution::source_access::ResolvedSourceAccess;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
-use crate::structs::placement::record::PlacementRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
+use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobKey, ResolvedBackend};
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::task::TaskEffect;

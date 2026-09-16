@@ -210,10 +210,10 @@ mod pure_tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::policy::document::placement_policy_key;
     use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
-    use aruna_core::structs::placement::policy::document::placement_policy_key;
     use aruna_core::types::Key;
     use ulid::Ulid;
 

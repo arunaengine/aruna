@@ -282,8 +282,8 @@ mod tests {
     use super::{ConfigView, fetch_info, http_base_url};
     use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::config::load;
-    use aruna_api::server::{Server, ServerConfig};
     use aruna_api::server::state::ServerState;
+    use aruna_api::server::{Server, ServerConfig};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;

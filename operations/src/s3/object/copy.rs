@@ -553,21 +553,16 @@ pub(crate) mod test {
     }
 
     /// A rule that admits exactly this node, so a governed write is allowed.
-    fn admits(
-        node_id: NodeId,
-        seed: u8,
-    ) -> aruna_core::structs::placement::policy::VerifiedPolicy {
+    fn admits(node_id: NodeId, seed: u8) -> aruna_core::structs::placement::policy::VerifiedPolicy {
         let policy = aruna_core::structs::placement::policy::PlacementPolicy::new(
             Ulid::from_bytes([seed; 16]),
             "residency".to_string(),
-            vec![
-                aruna_core::structs::placement::policy::PlacementSelector {
-                    node_id: Some(node_id),
-                    location: None,
-                    labels: Vec::new(),
-                    executor_kind: None,
-                },
-            ],
+            vec![aruna_core::structs::placement::policy::PlacementSelector {
+                node_id: Some(node_id),
+                location: None,
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
         )
         .expect("policy is valid");
         aruna_core::structs::placement::policy::VerifiedPolicy::verify(policy)

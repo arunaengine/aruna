@@ -803,10 +803,9 @@ impl NetHandle {
         // The inbound boundary closes first, while outgoing effects stay
         // available for the writer drains ahead of the network phase.
         self.close_admission();
-        let drained_before_teardown =
-            tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
-                .await
-                .is_ok();
+        let drained_before_teardown = tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
+            .await
+            .is_ok();
         let inbound_pending_deadline = self.inner.inbound_tasks.len();
         if !drained_before_teardown {
             warn!(
