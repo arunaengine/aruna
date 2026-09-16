@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Style checks: folders >=4 files, declaration names and .rs stems <=3 terms, comments <=3 lines.
-Terms split on _ and CamelCase; HTTP, UUID, S3, SHA256, OIDC and Ro-Crate count as one.
-Skips structural roots, fixtures assets, license notices, strings and attributes; EXTERNAL_NAMES
-maps each exempt name to the reason it is exempt."""
+"""Style checks for folders, shared prefixes, names, comments and exceptions.
+Terms split on _ and CamelCase; acronyms count once; strings and attributes
+are skipped; EXTERNAL_NAMES and SMALL_DOMAINS hold reviewed exceptions."""
 import argparse
 import bisect
+import io
 import os
 import re
 import sys
+import tokenize
 
 SKIP_PARTS = frozenset(
     {"target", "vendor", "node_modules", ".git", ".github", ".cargo", ".config", ".claude"}
@@ -15,8 +16,47 @@ SKIP_PARTS = frozenset(
 ASSET_PARTS = frozenset({"fixtures", "snapshots", "testdata"})
 LICENSE_MARKS = ("spdx-license-identifier", "copyright", "licensed under", "license")
 STRUCT_NAMES = frozenset({"bin", "benches", "examples"})
+GENERIC_PREFIXES = frozenset({("get",), ("set",), ("test",), ("tests",)})
 EXTERNAL_NAMES = {}
-FOLDER_MIN = 4
+SMALL_DOMAINS = {
+    "api/src/metadata": "grouped shared-prefix domain",
+    "api/src/routes/access/credentials": "grouped shared-prefix domain",
+    "api/src/routes/access/users": "grouped shared-prefix domain",
+    "api/src/routes/device/folders": "grouped shared-prefix domain",
+    "api/src/routes/execution/job": "grouped shared-prefix domain",
+    "api/src/routes/placement": "grouped shared-prefix domain",
+    "api/src/routes/sync": "grouped shared-prefix domain",
+    "api/src/server": "grouped shared-prefix domain",
+    "api/src/tests": "coherent ownership scope",
+    "aruna-doctor/src/explorer": "grouped shared-prefix domain",
+    "aruna/src/compute_setup": "coherent ownership scope",
+    "compute/src/executor/apptainer": "grouped shared-prefix domain",
+    "compute/src/executor/docker": "grouped shared-prefix domain",
+    "compute/src/executor/kubernetes": "grouped shared-prefix domain",
+    "compute/src/session": "grouped shared-prefix domain",
+    "core/src/compute": "grouped shared-prefix domain",
+    "core/src/structs/identity": "identity record scope; hoisting recreates identity_*",
+    "core/src/structs/identity/user": "grouped shared-prefix domain",
+    "core/src/structs/placement/policy": "grouped shared-prefix domain",
+    "core/src/structured_id": "grouped shared-prefix domain",
+    "core/src/user": "grouped shared-prefix domain",
+    "operations/src/assistant": "coherent ownership scope",
+    "operations/src/forward": "coherent ownership scope",
+    "operations/src/harvest": "harvest operation scope; hoisting recreates harvest_*",
+    "operations/src/harvest/oai_pmh": "grouped shared-prefix domain",
+    "operations/src/jobs/export": "grouped shared-prefix domain",
+    "operations/src/jobs/store": "coherent ownership scope",
+    "operations/src/metadata/forward": "grouped shared-prefix domain",
+    "operations/src/metadata/profile": "grouped shared-prefix domain",
+    "operations/src/replication/incoming": "grouped shared-prefix domain",
+    "operations/src/s3": "coherent ownership scope",
+    "operations/src/s3/object/delete": "grouped shared-prefix domain",
+    "operations/src/s3/policy": "coherent ownership scope",
+    "operations/src/session": "coherent ownership scope",
+    "operations/src/shard": "coherent ownership scope",
+    "operations/src/tasks": "coherent ownership scope",
+}
+FOLDER_MIN = 5
 TERM_MAX = 3
 COMMENT_MAX = 3
 
@@ -28,7 +68,12 @@ BLANK_RE = re.compile(r"[^\n]")
 TEST_ATTR_RE = re.compile(r"\b(?:test|rstest)\b")
 MARK_RE = re.compile(r"^\s*(///|//!|/\*+|//|\*+/|\*)\s?")
 PREFIXES = ("b", "c", "r", "br", "rb", "cr")
-DECL_KEYWORDS = frozenset({"fn", "struct", "enum", "trait", "type", "mod", "const", "static", "union"})
+DECL_KEYWORDS = frozenset(
+    {"fn", "struct", "enum", "trait", "type", "mod", "const", "static", "union", "macro_rules"}
+)
+PATTERN_SKIP = frozenset(
+    {"mut", "ref", "self", "crate", "super", "dyn", "impl", "const", "in", "move", "as", "true", "false"}
+)
 TYPE_KEYWORDS = frozenset({"struct", "enum", "trait", "type", "union"})
 RESTATE_KEYWORDS = frozenset({"fn", "struct", "enum", "trait", "type", "union", "mod"})
 PAIR_OPEN = {"(": ")", "[": "]", "{": "}"}
@@ -154,15 +199,18 @@ def macro_body_start(text, start):
     named = IDENT_RE.match(text, i)
     if not named:
         return None
-    i = named.end()
-    while i < n and text[i] in " \t\r\n":
-        i += 1
-    return i if text[i : i + 1] in "([{" else None
+    name_end = named.end()
+    j = name_end
+    while j < n and text[j] in " \t\r\n":
+        j += 1
+    if text[j : j + 1] not in "([{":
+        return None
+    return named.group(0), named.start(), name_end, j
 
 
 def mask_source(text):
     """Return (masked, comments, attrs, tokens); strings, chars, comments and
-    attributes are blanked, macro_rules definitions are skipped entirely, other
+    attributes are blanked, macro_rules bodies are skipped after their name, other
     macro token trees keep their tokens so handwritten declarations are seen."""
     n = len(text)
     masked = list(text)
@@ -218,8 +266,11 @@ def mask_source(text):
                     i = end
                     continue
             if text[i:j] == "macro_rules":
-                d = macro_body_start(text, j)
-                if d is not None:
+                info = macro_body_start(text, j)
+                if info is not None:
+                    name, name_start, name_end, d = info
+                    tokens.append(("ident", text[i:j], i, j))
+                    tokens.append(("ident", name, name_start, name_end))
                     end = balanced_end(text, d, text[d], PAIR_OPEN[text[d]], comments)
                     blank(i, end)
                     i = end
@@ -313,11 +364,91 @@ def find_body(tokens, start):
     return None
 
 
+def param_open(tokens, start):
+    angle = 0
+    for index in range(start, len(tokens)):
+        kind, word, _start, _end = tokens[index]
+        if kind != "punct":
+            continue
+        if word == "<":
+            angle += 1
+        elif word == ">" and angle > 0 and tokens[index - 1][1] != "-":
+            angle -= 1
+        elif angle == 0 and word == "(":
+            return index
+        elif angle == 0 and word in ")]};{":
+            return None
+    return None
+
+
+def pattern_names(tokens, start, stop):
+    names = []
+    for index in range(start, stop):
+        kind, word, offset, _end = tokens[index]
+        if kind != "ident" or word in PATTERN_SKIP or word.startswith("_") or word[0].isupper():
+            continue
+        names.append((word, offset))
+    return names
+
+
+def param_names(tokens, open_index):
+    close = matching_punct(tokens, open_index)
+    names = []
+    depth, angle = 0, 0
+    in_pattern, seg_start = True, open_index + 1
+    for index in range(open_index + 1, close):
+        kind, word, _start, _end = tokens[index]
+        if kind != "punct":
+            continue
+        if word in PAIR_OPEN:
+            depth += 1
+        elif word in ")]}":
+            depth -= 1
+        elif word == "<":
+            angle += 1
+        elif word == ">" and angle > 0 and tokens[index - 1][1] != "-":
+            angle -= 1
+        elif depth == 0 and angle == 0 and word in ",:=":
+            if in_pattern:
+                names.extend(pattern_names(tokens, seg_start, index))
+            in_pattern = word == ","
+            seg_start = index + 1
+    if in_pattern:
+        names.extend(pattern_names(tokens, seg_start, close))
+    return names
+
+
+def local_names(tokens, index):
+    names = []
+    depth = 0
+    seg_start = index + 1
+    for position in range(index + 1, len(tokens)):
+        kind, word, _start, _end = tokens[position]
+        if kind != "punct":
+            continue
+        if word in PAIR_OPEN:
+            depth += 1
+        elif word in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and word in ":;=":
+            names.extend(pattern_names(tokens, seg_start, position))
+            return names
+    return names
+
+
 def iter_declarations(tokens, masked, attrs):
     total = len(tokens)
     for index in range(total):
         kind, word, start, _end = tokens[index]
-        if kind != "ident" or word not in DECL_KEYWORDS:
+        if kind != "ident":
+            continue
+        if word == "let":
+            for name, offset in local_names(tokens, index):
+                yield ("let", name, "let", offset)
+            continue
+        if word not in DECL_KEYWORDS:
             continue
         nxt = tokens[index + 1] if index + 1 < total else None
         if word == "const" and nxt and nxt[0] == "ident" and nxt[1] == "fn":
@@ -333,6 +464,10 @@ def iter_declarations(tokens, masked, attrs):
         if word == "fn":
             chain = attrs_before(attrs, start, masked)
             category = "testfn" if any(TEST_ATTR_RE.search(attr["body"]) for attr in chain) else "fn"
+            open_index = param_open(tokens, index + 2)
+            if open_index is not None:
+                for param_name, offset in param_names(tokens, open_index):
+                    yield ("param", param_name, "param", offset)
         elif word in TYPE_KEYWORDS:
             category = "type"
             body = find_body(tokens, index + 2)
@@ -345,6 +480,8 @@ def iter_declarations(tokens, masked, attrs):
                         yield (member_kind, member, member_kind, offset)
         elif word == "mod":
             category = "mod"
+        elif word == "macro_rules":
+            category = "macro"
         else:
             category = "const"
         yield (category, name, word, name_start)
@@ -376,26 +513,73 @@ def src_roots(root):
                 yield src
 
 
+def direct_files(files):
+    return [f for f in files if not f.startswith(".") and f != "mod.rs"]
+
+
+def direct_stems(files):
+    return [f[:-3] for f in direct_files(files) if f.endswith(".rs")]
+
+
+def shared_prefix(stems):
+    counts = {}
+    for stem in stems:
+        terms = split_terms(stem)
+        for size in range(1, len(terms) + 1):
+            prefix = tuple(terms[:size])
+            counts[prefix] = counts.get(prefix, 0) + 1
+    best, best_count = None, 0
+    for prefix, count in counts.items():
+        if count < 3 or prefix in GENERIC_PREFIXES:
+            continue
+        if best is None or len(prefix) > len(best):
+            best, best_count = prefix, count
+    return (best, best_count) if best else None
+
+
+def prefix_findings(rel, dirpath, files):
+    stems = direct_stems(files)
+    found = shared_prefix(stems)
+    if found is None:
+        return
+    prefix, count = found
+    text = "_".join(prefix)
+    if tuple(split_terms(os.path.basename(dirpath))) == prefix:
+        continuing = 0
+        for stem in stems:
+            terms = split_terms(stem)
+            if tuple(terms[: len(prefix)]) == prefix and len(terms) > len(prefix):
+                continuing += 1
+        if continuing >= 3:
+            yield ("prefix", rel, 0, f"{continuing} children repeat prefix '{text}'; drop it from their names")
+        return
+    yield ("prefix", rel, 0, f"{count} siblings share prefix '{text}'; group them into '{text}/'")
+
+
 def check_folders(root):
     for src in src_roots(root):
         pkg = os.path.dirname(src)
         for dirpath, dirs, files in os.walk(src):
             dirs[:] = [d for d in dirs if d not in SKIP_PARTS and d not in ASSET_PARTS]
-            if dirpath == src:
-                continue
+            rel = os.path.relpath(dirpath, root)
             if os.path.basename(dirpath) in STRUCT_NAMES and os.path.dirname(dirpath) == src:
                 dirs[:] = []
                 continue
             if os.path.basename(dirpath) == "tests" and os.path.dirname(dirpath) == pkg:
                 dirs[:] = []
                 continue
-            real = [f for f in files if not f.startswith(".") and f != "mod.rs"]
+            yield from prefix_findings(rel, dirpath, files)
+            if dirpath == src:
+                continue
+            if os.path.basename(dirpath) == "tests" and os.path.dirname(dirpath) == src and "mod.rs" in files:
+                continue
+            real = direct_files(files)
             if not real and not any(f.endswith(".rs") for f in files):
                 continue
-            modules = [d for d in dirs if not d.startswith(".")]
-            count = len(real) + len(modules)
-            if count < FOLDER_MIN:
-                yield (os.path.relpath(dirpath, root), count)
+            if rel in SMALL_DOMAINS:
+                continue
+            if len(real) < FOLDER_MIN:
+                yield ("folder", rel, 0, f"{len(real)} of {FOLDER_MIN} direct files besides mod.rs")
 
 
 def decl_terms(name):
@@ -478,19 +662,96 @@ def comment_findings(rel, text, masked, comments, tokens):
             yield ("restates", rel, group["start_line"], f"comment repeats '{name}'")
 
 
+def iter_python_files(root):
+    base = os.path.join(root, "scripts")
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_PARTS and d != "__pycache__"]
+        for name in sorted(filenames):
+            if name.endswith(".py"):
+                yield os.path.join(dirpath, name)
+
+
+def python_findings(root):
+    for path in iter_python_files(root):
+        rel = os.path.relpath(path, root)
+        text = read_source(path)
+        try:
+            tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+        except (tokenize.TokenError, SyntaxError):
+            continue
+        yield from python_name_findings(rel, tokens)
+        yield from python_comment_findings(rel, text, tokens)
+
+
+def python_name_findings(rel, tokens):
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.NAME or token.string not in ("def", "class"):
+            continue
+        for following in tokens[index + 1 : index + 3]:
+            if following.type != tokenize.NAME:
+                continue
+            terms = decl_terms(following.string)
+            if terms > TERM_MAX:
+                yield ("pydecl", rel, following.start[0], f"{token.string} '{following.string}' has {terms} terms")
+            break
+
+
+def python_comment_findings(rel, text, tokens):
+    lines = text.split("\n")
+    groups = []
+    for token in tokens:
+        if token.type != tokenize.COMMENT:
+            continue
+        row, column = token.start
+        if lines[row - 1][:column].strip():
+            continue
+        if groups and groups[-1][1] + 1 == row:
+            groups[-1] = (groups[-1][0], row)
+        else:
+            groups.append((row, row))
+    for start_row, end_row in groups:
+        span = end_row - start_row + 1
+        if span > COMMENT_MAX:
+            yield ("pycomment", rel, start_row, f"comment spans {span} lines")
+
+
 def report(findings, limit):
-    order = ["folder", "fn", "testfn", "type", "mod", "const", "field", "variant", "file", "comment", "restates"]
+    order = [
+        "folder",
+        "prefix",
+        "file",
+        "fn",
+        "testfn",
+        "param",
+        "let",
+        "type",
+        "mod",
+        "const",
+        "macro",
+        "field",
+        "variant",
+        "comment",
+        "pydecl",
+        "pycomment",
+        "restates",
+    ]
     labels = {
         "folder": "folder",
+        "prefix": "prefix",
+        "file": "file",
         "fn": "fn",
         "testfn": "test fn",
+        "param": "param",
+        "let": "let",
         "type": "type",
         "mod": "mod",
         "const": "const",
+        "macro": "macro",
         "field": "field",
         "variant": "variant",
-        "file": "file",
         "comment": "comment",
+        "pydecl": "python decl",
+        "pycomment": "python comment",
         "restates": "warning",
     }
     counts = {key: 0 for key in order}
@@ -528,8 +789,9 @@ def main(argv):
         print(f"EXTERNAL_NAMES needs a reason for: {', '.join(sorted(missing))}", file=sys.stderr)
         return 2
     findings = []
-    findings.extend(("folder", path, 0, f"{count} of {FOLDER_MIN} entries besides mod.rs") for path, count in check_folders(root))
+    findings.extend(check_folders(root))
     findings.extend(check_sources(root))
+    findings.extend(python_findings(root))
     return report(findings, args.limit)
 
 
