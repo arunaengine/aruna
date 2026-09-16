@@ -24,16 +24,17 @@ Add behavior to the family that already owns it:
 - persisted records: `core/src/structs/{placement,identity,storage,execution}/`;
 - effect adapters: `operations/src/effect_adapters/`;
 - test helpers: in a `src/tests/` folder beside the domain when the helper
-  family qualifies under the folder threshold (four or more real entries
-  besides `mod.rs`; `api/src/tests/assistant.rs`,
+  family qualifies under the folder threshold (five direct files, or a valid
+  shared-prefix domain; `api/src/tests/assistant.rs`,
   `operations/src/tests/s3.rs`), otherwise a hoisted sibling file declared
   with an explicit `#[path]` (`aruna/src/bootstrap_tests.rs`);
 - raw fixture assets: the owning crate's `tests/fixtures/`
   (`operations/tests/fixtures/`, `blob/tests/fixtures/`).
 
-A new subfolder needs at least four real cohesive entries besides `mod.rs`,
-where a nested module folder counts as one cohesive entry; `CONTRIBUTING.md`
-owns the threshold, hoisting, and naming rules.
+A new subfolder needs at least five real, directly contained files besides
+`mod.rs`, unless three or more related siblings share a meaningful domain
+prefix and group into it; root `STYLE.md` and `CONTRIBUTING.md` own the
+threshold, hoisting, and naming rules.
 
 ## One request, end to end
 

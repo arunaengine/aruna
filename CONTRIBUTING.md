@@ -33,14 +33,16 @@ recipe checks. The local recipes are not the entire CI matrix.
 
 ### Structure and naming
 
-- **Folder threshold.** A source subfolder needs at least four real, cohesive
-  entries besides `mod.rs`, with a nested module folder counting as one
-  cohesive entry; examples and tests count toward that total. A
-  one-file folder is hoisted into its parent, and a folder with two to four
-  files is flattened into sibling files beside the parent or merged into it.
-  The threshold does not apply to structural roots: workspace and package
-  roots, Cargo `src`, integration-test roots, `.github/workflows`, `.cargo`,
-  `.config`, and `tests/fixtures` raw assets.
+- **Folder threshold.** An optional source subfolder needs at least five real,
+  related, directly contained files, excluding an optional `mod.rs`; child
+  directories do not count as entries. Three or more related sibling files
+  sharing a meaningful domain prefix must group into the matching submodule,
+  and the resulting three- or four-file domain is a valid exception to the
+  five-file minimum; remove the prefix from the child filenames. A one-file
+  folder is hoisted into its parent. Explicit exceptions remain for required
+  package or tooling roots (workspace and package roots, Cargo `src`,
+  `.github/workflows`, `.cargo`, `.config`), genuine integration-test roots,
+  and the designated `tests/fixtures` asset root.
 - **Three-term names.** Functions, tests, types, traits, aliases, modules,
   filenames, fields, variants, and constants use at most three terms. Count
   underscore-separated or CamelCase words; `HTTP`, `UUID`, `S3`, `SHA256`,
@@ -79,8 +81,9 @@ recipe checks. The local recipes are not the entire CI matrix.
 - **Fixtures.** Raw assets live under `tests/fixtures/` in the owning crate
   (`operations/tests/fixtures/`, `blob/tests/fixtures/`). Fixture helper code
   lives in a `src/tests/` folder beside its domain when the helper family
-  qualifies under the folder threshold (four or more real entries besides
-  `mod.rs`; `api/src/tests/assistant.rs`, `operations/src/tests/s3.rs`);
+  qualifies under the folder threshold (five direct files, or a valid
+  shared-prefix domain; `api/src/tests/assistant.rs`,
+  `operations/src/tests/s3.rs`);
   otherwise it stays a hoisted sibling file declared with an explicit `#[path]`
   (`aruna/src/bootstrap_tests.rs`).
 - **Behavior homes.** Bucket, object, multipart, and access operations belong
