@@ -298,3 +298,119 @@ async fn public_role_grants_anonymous_read_and_nothing_else() -> TestResult<()> 
     seed.shutdown().await;
     result
 }
+
+/// An unsigned browser request for a public folder key gets an HTML index of
+/// the readable entries. Clients without `Accept: text/html`, signed requests,
+/// and private folders keep their S3 answers.
+#[tokio::test]
+async fn public_folder_index() -> TestResult<()> {
+    let seed = spawn_full_seed_node().await?;
+
+    let result = async {
+        let bearer_token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_via_http(&seed.base_url, &bearer_token, "public-index").await?;
+        let s3_endpoint = seed
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+        let credentials =
+            create_s3_credentials_via_http(&seed.base_url, &bearer_token, &group.group_id).await?;
+        let s3 = s3_client(s3_endpoint, &credentials);
+
+        let bucket = "index-bucket";
+        s3.create_bucket().bucket(bucket).send().await?;
+        for key in [
+            "open/",
+            "open/a <b>.txt",
+            "open/sub/inner.txt",
+            "mixed/visible.txt",
+            "mixed/hidden.txt",
+            "closed/secret.txt",
+        ] {
+            s3.put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(PUBLIC_BODY))
+                .send()
+                .await?;
+        }
+
+        let group_ulid = Ulid::from_string(&group.group_id)?;
+        let bucket_path =
+            blob_bucket_permission_path(seed.realm_id, group_ulid, seed.net.node_id(), bucket);
+        let permissions = std::collections::HashMap::from([
+            (format!("{bucket_path}/open/**"), "read"),
+            (format!("{bucket_path}/mixed/"), "read"),
+            (format!("{bucket_path}/mixed/visible.txt"), "read"),
+        ]);
+        let http = reqwest::Client::new();
+        let created = http
+            .post(format!(
+                "{}/api/v1/access/groups/{}/roles",
+                seed.base_url, group.group_id
+            ))
+            .bearer_auth(&bearer_token)
+            .json(&json!({ "name": "public", "permissions": permissions, "public": true }))
+            .send()
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let browser = |url: String| {
+            http.get(url)
+                .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+                .send()
+        };
+        let base = &s3_endpoint.endpoint_url;
+
+        let index = browser(format!("{base}/{bucket}/open/")).await?;
+        assert_eq!(index.status(), StatusCode::OK);
+        let headers = index.headers().clone();
+        assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["vary"], "Accept");
+        let html = index.text().await?;
+        assert!(html.contains("Index of /index-bucket/open/"), "{html}");
+        assert!(html.contains("<a href=\"sub/\">sub/</a>"), "{html}");
+        assert!(
+            html.contains("href=\"a%20%3Cb%3E.txt\">a &lt;b&gt;.txt</a>"),
+            "{html}"
+        );
+        assert!(!html.contains("<b>"), "names must be escaped: {html}");
+
+        let mixed = browser(format!("{base}/{bucket}/mixed/"))
+            .await?
+            .text()
+            .await?;
+        assert!(mixed.contains("visible.txt"), "{mixed}");
+        assert!(
+            !mixed.contains("hidden.txt"),
+            "a private entry must not be listed: {mixed}"
+        );
+
+        let closed = browser(format!("{base}/{bucket}/closed/")).await?;
+        assert_eq!(closed.status(), StatusCode::FORBIDDEN);
+
+        // Without an HTML Accept header the folder key is still the marker object.
+        let plain = http.get(format!("{base}/{bucket}/open/")).send().await?;
+        assert_eq!(plain.status(), StatusCode::OK);
+        assert_eq!(plain.bytes().await?.as_ref(), PUBLIC_BODY);
+
+        let signed = s3.get_object().bucket(bucket).key("open/").send().await?;
+        assert_eq!(
+            signed.body.collect().await?.into_bytes().as_ref(),
+            PUBLIC_BODY
+        );
+
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
