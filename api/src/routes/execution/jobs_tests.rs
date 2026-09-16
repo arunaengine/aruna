@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::DriverContext;
@@ -42,7 +42,7 @@ fn family_report_fixture() -> FamilyReport {
         EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec,
         LogicalJobState, OutputObject, SubmissionId,
     };
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
 
     let created_by = user(2);
     let job_id = JobId::from_bytes([3u8; 16]);

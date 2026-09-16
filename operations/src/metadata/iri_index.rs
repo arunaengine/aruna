@@ -535,7 +535,7 @@ mod tests {
     use super::*;
     use aruna_core::storage_entries::iri_reference_key;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_storage::FjallStorage;
 
     fn index_key(document_id: Ulid, cursor: Ulid) -> ByteView {

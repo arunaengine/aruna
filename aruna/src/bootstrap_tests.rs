@@ -14,7 +14,7 @@ use aruna_core::structs::execution::notification_watch::{
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
+use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::watch::interest::publish_watch_interest;
@@ -36,11 +36,11 @@ fn user_topics_deduplicate() {
     let second = DocumentTarget::User {
         user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
     };
-    let first_shard = aruna_core::structs::placement::placement_record::PlacementRef {
+    let first_shard = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: ulid::Ulid::from_bytes([4u8; 16]),
         shard: 7,
     };
-    let second_shard = aruna_core::structs::placement::placement_record::PlacementRef {
+    let second_shard = aruna_core::structs::placement::record::PlacementRef {
         shard: 8,
         ..first_shard
     };
@@ -622,27 +622,27 @@ fn readiness_requires_all() {
     });
     config.seed_default_placement();
     config.placement_handle_ranges.push(
-        aruna_core::structs::placement::placement_record::HandleRange {
+        aruna_core::structs::placement::record::HandleRange {
             range_id: ulid::Ulid::from_bytes([3; 16]),
             owner: node_id,
-            start: aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE,
-            end: aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE
-                + aruna_core::structs::placement::placement_record::HANDLE_RANGE_SIZE,
+            start: aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE,
+            end: aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE
+                + aruna_core::structs::placement::record::HANDLE_RANGE_SIZE,
         },
     );
     // A grant without its JobControl binding is not ready yet.
     assert!(!node_is_ready(&config, node_id));
     config.placement_bindings.push(
-        aruna_core::structs::placement::placement_record::PlacementBinding {
+        aruna_core::structs::placement::record::PlacementBinding {
             handle: aruna_core::structured_id::PlacementHandle::new(
-                aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE,
+                aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE,
             )
             .unwrap(),
-            scope: aruna_core::structs::placement::placement_record::PlacementScope::Realm(
+            scope: aruna_core::structs::placement::record::PlacementScope::Realm(
                 realm_id,
             ),
             document_class:
-                aruna_core::structs::placement::placement_record::DocumentClass::JobControl,
+                aruna_core::structs::placement::record::DocumentClass::JobControl,
             strategy_id: config.default_strategy_id.unwrap(),
             allocator_range_id: Some(ulid::Ulid::from_bytes([3; 16])),
             allocated_by: Some(node_id),

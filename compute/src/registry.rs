@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementSubject};
+use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
 
 use crate::executor::{BackendCaps, ExecutorBackend};
 use crate::session::SessionRegistry;

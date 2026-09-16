@@ -4,7 +4,7 @@ use crate::scheduling::*;
 use crate::structs::execution::job::{EffectiveResources, SubmissionId};
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::compute_config::{LocationLink, RealmComputeConfig};
-use crate::structs::placement::placement_policy::{
+use crate::structs::placement::policy::{
     PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, PolicyResolution,
     VerifiedPolicy,
 };

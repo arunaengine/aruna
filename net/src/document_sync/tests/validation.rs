@@ -292,7 +292,7 @@ async fn rejects_forged_publication() {
     let self_authored = PlacementPolicyDocument::new(
         realm_id,
         &policy,
-        aruna_core::structs::placement::policy_document::PolicyPublicationClaim::new(
+        aruna_core::structs::placement::policy::document::PolicyPublicationClaim::new(
             realm_id,
             &policy,
             secret.public(),
@@ -367,10 +367,10 @@ async fn defers_unknown_authority() {
 
 #[test]
 fn binds_policy_target() {
-    use aruna_core::structs::placement::placement_policy::{
+    use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
-    use aruna_core::structs::placement::policy_document::placement_policy_change;
+    use aruna_core::structs::placement::policy::document::placement_policy_change;
 
     let realm_id = RealmId::from_bytes([2u8; 32]);
     let policy_id = Ulid::from_bytes([8u8; 16]);
@@ -461,7 +461,7 @@ async fn forged_upsert_skipped() {
             updated_at_ms: 1,
         },
         kind: DocumentChangeKind::Upsert,
-        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
     };
     let forged_digest = WatchInterestDigest::from_subscriptions(
         forged_node,
@@ -602,7 +602,7 @@ async fn forged_watch_skipped() {
             updated_at_ms: 1,
         },
         kind,
-        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
     };
     let digest = WatchInterestDigest::from_subscriptions(
         local_node,
@@ -752,7 +752,7 @@ async fn forged_usage_skipped() {
             updated_at_ms: 1,
         },
         kind,
-        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
     };
 
     let snapshot = NodeUsageSnapshot {

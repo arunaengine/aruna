@@ -225,7 +225,7 @@ async fn resolve_inputs(
 ) -> Result<
     (
         Vec<CapturedInput>,
-        Vec<aruna_core::structs::placement::placement_policy::PlacementPolicyRef>,
+        Vec<aruna_core::structs::placement::policy::PlacementPolicyRef>,
     ),
     SubmitJobError,
 > {
@@ -294,7 +294,7 @@ async fn resolve_inputs(
             })
             .unwrap_or_default();
         let policies =
-            aruna_core::structs::placement::placement_policy::PlacementPolicyRef::canonical_set(
+            aruna_core::structs::placement::policy::PlacementPolicyRef::canonical_set(
                 &head.source_policies,
             )
             .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
@@ -354,7 +354,7 @@ async fn resolve_inputs(
         output_policies.extend(info.placement_policies);
     }
     output_policies =
-        aruna_core::structs::placement::placement_policy::PlacementPolicyRef::canonical_set(
+        aruna_core::structs::placement::policy::PlacementPolicyRef::canonical_set(
             &output_policies,
         )
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;

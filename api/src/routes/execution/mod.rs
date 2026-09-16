@@ -3,7 +3,6 @@
 
 pub mod compute;
 pub mod device_compute;
-pub mod job_audit;
-pub mod job_session;
+pub mod job;
 pub mod jobs;
 pub mod tes;

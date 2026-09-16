@@ -8,13 +8,13 @@ use crate::structs::identity::auth::Actor;
 use crate::structs::identity::auth::{Permission, Role};
 use crate::structs::placement::binding_directory::{BindingDirectory, BindingError};
 use crate::structs::placement::handle_allocation::HandleRangeDirectory;
-use crate::structs::placement::placement_record::{
+use crate::structs::placement::record::{
     BandPool, BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT,
     DocumentClass, HandleRange, METADATA_HANDLE, NodePlacementEntry, PlacementBinding,
     PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy, SHARD_SUBJECT_LEN,
     StrategyBinding, band_start, shard_for_subject,
 };
-use crate::structs::placement::placement_transition::{
+use crate::structs::placement::transition::{
     CandidateMapNode, CandidatePlacementMap, FrozenStrategySelector, PlacementActivation,
     PlacementTransition,
 };
@@ -184,7 +184,7 @@ pub struct RealmConfigDocument {
     pub placement_handle_ranges: Vec<HandleRange>,
     /// Append-only coordinator band pools forming a causal delegation tree.
     /// Each coordinator grants node bands only from pools it owns; precedence
-    /// is by lineage (see [`crate::structs::placement::placement_record::coordinator_spans`]).
+    /// is by lineage (see [`crate::structs::placement::record::coordinator_spans`]).
     pub band_pools: Vec<BandPool>,
     /// Immutable snapshots of the placement view. `placement_map` stays the
     /// edit surface; only a published map can become a holder-set input.
@@ -1103,11 +1103,11 @@ mod test {
         OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmDiscoveryConfig,
         RealmId, RealmNodeKind, TokenRevocation, default_discovery_config,
     };
-    use crate::structs::placement::placement_record::{
+    use crate::structs::placement::record::{
         BindingScope, DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy,
         StrategyBinding, shard_for_subject,
     };
-    use crate::structs::placement::placement_transition::CandidatePlacementMap;
+    use crate::structs::placement::transition::CandidatePlacementMap;
     use crate::structs::storage::node_info::{KIND_LABEL_KEY, NODE_LABEL_KEY};
     use ulid::Ulid;
 
@@ -1466,7 +1466,7 @@ mod test {
 
     #[test]
     fn snapshot_freezes_view() {
-        use crate::structs::placement::placement_record::NodePlacementEntry;
+        use crate::structs::placement::record::NodePlacementEntry;
 
         fn node_id(seed: u8) -> NodeId {
             iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -1550,7 +1550,7 @@ mod test {
         let extra = reordered.freeze_map(9);
         reordered.candidate_maps.push(extra.clone());
         reordered.placement_activations.push(
-            crate::structs::placement::placement_transition::PlacementActivation {
+            crate::structs::placement::transition::PlacementActivation {
                 strategy_id: reordered.default_strategy_id.unwrap(),
                 shard: 63,
                 activation_epoch: 2,
@@ -1814,7 +1814,7 @@ mod test {
         // placement-map, strategy, and override changes never move it.
         use crate::structs::execution::job::JobId;
         use crate::structs::identity::realm::JobOwnerError;
-        use crate::structs::placement::placement_record::{
+        use crate::structs::placement::record::{
             DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
             NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementScope,
         };
@@ -1901,7 +1901,7 @@ mod test {
 
     #[test]
     fn directory_rebuilds_state() {
-        use crate::structs::placement::placement_record::{
+        use crate::structs::placement::record::{
             DocumentClass, HandleRange, PlacementBinding, PlacementScope,
         };
         use crate::structured_id::PlacementHandle;
@@ -1961,7 +1961,7 @@ mod test {
         config.seed_default_placement();
         let bound = config
             .class_strategy(
-                crate::structs::placement::placement_record::DocumentClass::PlacementPolicy,
+                crate::structs::placement::record::DocumentClass::PlacementPolicy,
             )
             .expect("binding resolves")
             .expect("a strategy is bound");

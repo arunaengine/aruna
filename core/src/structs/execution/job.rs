@@ -18,8 +18,8 @@ use crate::structs::execution::notification::invert_timestamp_ms;
 use crate::structs::execution::staging::StagingStrategy;
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
-use crate::structs::placement::placement_policy::PlacementPolicyRef;
-use crate::structs::placement::placement_record::PlacementRef;
+use crate::structs::placement::policy::PlacementPolicyRef;
+use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobKey};
 use crate::structs::storage::storage_purge::{
     StoragePurgeResult, StoragePurgeScope, StoragePurgeSpec,

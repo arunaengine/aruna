@@ -41,7 +41,7 @@ pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvel
 /// One signed launch whose encoded size grows with the executor-kind width.
 pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
     use crate::structs::execution::job::{JobFamilyRecord, JobId, LaunchIntent, SubmissionId};
-    use crate::structs::placement::placement_record::PlacementRef;
+    use crate::structs::placement::record::PlacementRef;
 
     let secret = iroh::SecretKey::from_bytes(&[4u8; 32]);
     let record = JobFamilyRecord::Launch(Box::new(LaunchIntent {

@@ -15,7 +15,7 @@ use aruna_core::structs::execution::job::{
     ImportRoCrateTarget, JobState, RoCrateLimits, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::placement::placement_record::band_start;
+use aruna_core::structs::placement::record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
@@ -419,7 +419,7 @@ async fn swap_keeps_owner() -> TestResult<()> {
         }
     }
     config.placement_overrides.push(
-        aruna_core::structs::placement::placement_record::PlacementOverride {
+        aruna_core::structs::placement::record::PlacementOverride {
             subject: b"any-shard-subject".to_vec(),
             pinned: Vec::new(),
             excluded: vec![owner_id],
@@ -1180,7 +1180,7 @@ async fn create_document(
     group_id: Ulid,
     document_id: Ulid,
     document_path: &str,
-) -> TestResult<aruna_core::structs::placement::placement_record::PlacementRef> {
+) -> TestResult<aruna_core::structs::placement::record::PlacementRef> {
     let created = drive(
         CreateDocumentOperation::new(document_config(
             realm,

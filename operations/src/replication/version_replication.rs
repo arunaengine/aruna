@@ -35,7 +35,7 @@ use aruna_core::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
@@ -199,14 +199,14 @@ fn reference_fingerprint(
 enum ReplicationVersion {
     Materialized {
         created_at: SystemTime,
-        created_by: aruna_core::user_id::UserId,
+        created_by: aruna_core::user::id::UserId,
         location: BackendLocation,
         source: Option<VersionSourceBinding>,
         metadata: HashMap<String, String>,
     },
     Reference {
         created_at: SystemTime,
-        created_by: aruna_core::user_id::UserId,
+        created_by: aruna_core::user::id::UserId,
         source: VersionSourceBinding,
         cached_metadata: SourceMetadata,
         last_refresh: SystemTime,
@@ -215,14 +215,14 @@ enum ReplicationVersion {
     },
     Deleted {
         created_at: SystemTime,
-        created_by: aruna_core::user_id::UserId,
+        created_by: aruna_core::user::id::UserId,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingMaterializedVersion {
     created_at: SystemTime,
-    created_by: aruna_core::user_id::UserId,
+    created_by: aruna_core::user::id::UserId,
     blob_hash: [u8; 32],
     source: Option<VersionSourceBinding>,
     metadata: HashMap<String, String>,

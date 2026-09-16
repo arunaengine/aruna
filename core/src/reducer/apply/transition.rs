@@ -34,7 +34,7 @@ impl AdminDocumentState {
                     return Err(AdminDocumentError::TransitionOriginMismatch);
                 }
                 if frontier.len()
-                    > crate::structs::placement::placement_transition::MAX_FRONTIER_BYTES
+                    > crate::structs::placement::transition::MAX_FRONTIER_BYTES
                 {
                     return Err(AdminDocumentError::TransitionReportOversized);
                 }
@@ -81,7 +81,7 @@ impl AdminDocumentState {
                 at_risk_report,
             } => {
                 if at_risk_report.len()
-                    > crate::structs::placement::placement_transition::MAX_STALL_BYTES
+                    > crate::structs::placement::transition::MAX_STALL_BYTES
                 {
                     return Err(AdminDocumentError::TransitionReportOversized);
                 }
@@ -100,7 +100,7 @@ impl AdminDocumentState {
                 if *reported_by != event.origin_node_id {
                     return Err(AdminDocumentError::TransitionOriginMismatch);
                 }
-                if reason.len() > crate::structs::placement::placement_transition::MAX_STALL_BYTES {
+                if reason.len() > crate::structs::placement::transition::MAX_STALL_BYTES {
                     return Err(AdminDocumentError::TransitionReportOversized);
                 }
                 self.apply_transition_report(

@@ -1,5 +1,5 @@
 use super::*;
-use crate::server_state::ROCRATE_UPLOAD_SLOTS;
+use crate::server::state::ROCRATE_UPLOAD_SLOTS;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;

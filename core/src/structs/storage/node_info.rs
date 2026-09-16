@@ -1,8 +1,8 @@
 use crate::NodeId;
 use crate::compute::{AdvertisementError, ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
-use crate::compute_quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
+use crate::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
 use crate::errors::ConversionError;
-use crate::structs::placement::placement_policy::{MAX_LABEL_LEN, MAX_VALUE_LEN};
+use crate::structs::placement::policy::{MAX_LABEL_LEN, MAX_VALUE_LEN};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -194,7 +194,7 @@ pub struct NodeUtilization {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::placement::placement_policy::PlacementSubject;
+    use crate::structs::placement::policy::PlacementSubject;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn rejects_unbounded_demand() {
-        use crate::compute_quota::{DemandFamily, DemandGroup};
+        use crate::compute::quota::{DemandFamily, DemandGroup};
         use crate::structs::execution::job::{EffectiveResources, SubmissionId};
 
         let mut document = document(node(1), epoch(1, 1));

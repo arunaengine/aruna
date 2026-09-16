@@ -1,5 +1,5 @@
 use crate::config::{PortalArtifactConfig, PortalConfig};
-use aruna_api::server_state::{PortalStatus, ServerState};
+use aruna_api::server::state::{PortalStatus, ServerState};
 use chrono::{SecondsFormat, Utc};
 use flate2::read::GzDecoder;
 use serde::Deserialize;

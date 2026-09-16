@@ -43,7 +43,7 @@ pub enum ServerError {
     /// Standing compute quota refused a new admission; the typed reason is
     /// carried in the body so a client can act on the exact dimension.
     #[error("{0}")]
-    ComputeQuotaDenied(aruna_core::compute_quota::QuotaDenied),
+    ComputeQuotaDenied(aruna_core::compute::quota::QuotaDenied),
     #[error("{0}")]
     PayloadTooLarge(String),
     /// The record existed and was deleted; unlike a 404 it will not come back.
@@ -194,9 +194,9 @@ pub struct QuotaDeniedResponse {
     pub limit: u64,
 }
 
-impl From<aruna_core::compute_quota::QuotaDenied> for QuotaDeniedResponse {
-    fn from(denied: aruna_core::compute_quota::QuotaDenied) -> Self {
-        use aruna_core::compute_quota::{QuotaDimension, QuotaScope};
+impl From<aruna_core::compute::quota::QuotaDenied> for QuotaDeniedResponse {
+    fn from(denied: aruna_core::compute::quota::QuotaDenied) -> Self {
+        use aruna_core::compute::quota::{QuotaDimension, QuotaScope};
         Self {
             scope: match denied.scope {
                 QuotaScope::Job => "job",
@@ -566,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn quota_denial_typed() {
         // The refusal must carry the exact dimension and numbers, not prose.
-        use aruna_core::compute_quota::{QuotaDenied, QuotaDimension, QuotaScope};
+        use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
 
         let response = ServerError::ComputeQuotaDenied(QuotaDenied {
             scope: QuotaScope::Group,

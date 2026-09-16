@@ -11,7 +11,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::{
     NODE_SUBJECT_KEY, NodeSubjectRecord, storage_subject,
 };
-use aruna_core::structs::placement::placement_policy::PlacementSubject;
+use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::blob::{
     ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
 };
@@ -526,7 +526,7 @@ mod pure_tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
+    use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
         VersionKey,

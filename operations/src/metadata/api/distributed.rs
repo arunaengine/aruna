@@ -331,7 +331,7 @@ pub(super) async fn run_search_distributed(
                 Some(object_iri) => {
                     let mut hits = Vec::new();
                     for object_iri in
-                        crate::metadata::profile_validation::equivalent_profile_iris(&object_iri)
+                        crate::metadata::profile::validation::equivalent_profile_iris(&object_iri)
                     {
                         hits.extend(
                             handle
@@ -376,7 +376,7 @@ pub(super) async fn run_search_distributed(
                 Some(object_iri) => {
                     let mut hits = Vec::new();
                     for object_iri in
-                        crate::metadata::profile_validation::equivalent_profile_iris(&object_iri)
+                        crate::metadata::profile::validation::equivalent_profile_iris(&object_iri)
                     {
                         hits.extend(
                             handle

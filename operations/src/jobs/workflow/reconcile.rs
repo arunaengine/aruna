@@ -537,7 +537,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::structs::execution::job::{AttemptIntent, JobClaim, JobId};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;

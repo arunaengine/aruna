@@ -14,7 +14,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, METADATA_AUDIT_KEYSPACE};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
@@ -953,7 +953,7 @@ mod tests {
         let document_id = aruna_core::MetaResourceId::from_parts(
             13,
             aruna_core::structured_id::PlacementHandle::new(
-                aruna_core::structs::placement::placement_record::METADATA_HANDLE,
+                aruna_core::structs::placement::record::METADATA_HANDLE,
             )
             .unwrap(),
             aruna_core::structured_id::BucketId::new(3).unwrap(),

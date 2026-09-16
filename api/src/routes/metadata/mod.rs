@@ -11,7 +11,7 @@ pub(crate) mod validation;
 #[cfg(test)]
 mod tests;
 
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;

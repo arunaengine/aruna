@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, HashSet};
 use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::structs::identity::realm::{ClassStrategyError, RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     AffinityEffect, BindingScope, DocumentClass, LabelMatch, PlacementOverride, PlacementStrategy,
 };
-use aruna_core::structs::placement::placement_transition::{
+use aruna_core::structs::placement::transition::{
     CandidateMapNode, CandidatePlacementMap,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -422,7 +422,7 @@ mod pure_tests {
     use aruna_core::admin_documents::AdminDocumentTarget;
     use aruna_core::reducer::{AdminDocumentState, overlay_placement};
     use aruna_core::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
-    use aruna_core::structs::placement::placement_record::{
+    use aruna_core::structs::placement::record::{
         AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, NodePlacementEntry, StrategyBinding,
     };
     use aruna_core::structs::storage::node_info::{KIND_LABEL_KEY, LOCATION_LABEL_KEY};
@@ -1165,7 +1165,7 @@ mod pure_tests {
 
     #[test]
     fn variants_share_shard() {
-        use aruna_core::structs::placement::placement_record::shard_for_subject;
+        use aruna_core::structs::placement::record::shard_for_subject;
 
         let document_id = sid(4);
         let variants = [

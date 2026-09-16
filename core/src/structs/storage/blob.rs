@@ -9,7 +9,7 @@ use crate::structs::execution::source_access::SourceMetadata;
 use crate::structs::execution::staging::VersionSourceBinding;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
-use crate::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use crate::structs::storage::group_backend::GroupBackendKind;
 use crate::structs::storage::routing::StorageRoutingRule;
 use crate::types::GroupId;
@@ -1284,7 +1284,7 @@ mod tests {
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
     use crate::structs::identity::realm::RealmId;
-    use crate::structs::placement::placement_policy::{
+    use crate::structs::placement::policy::{
         MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef,
     };
     use std::collections::HashMap;

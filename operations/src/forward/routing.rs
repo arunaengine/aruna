@@ -8,7 +8,7 @@ use crate::placement::resolve_shard_holders;
 use aruna_core::NodeId;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use std::sync::Arc;
 use ulid::Ulid;
 

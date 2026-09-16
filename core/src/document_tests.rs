@@ -13,7 +13,7 @@ use crate::keyspaces::{
     GROUP_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
 use crate::structs::identity::realm::RealmId;
-use crate::structs::placement::placement_record::PlacementRef;
+use crate::structs::placement::record::PlacementRef;
 use ulid::Ulid;
 
 fn test_ulid(seed: u8) -> Ulid {
@@ -44,7 +44,7 @@ fn change(
         base,
         current: revision(generation, event_seed, actor_seed),
         kind,
-        placement: crate::structs::placement::placement_record::PlacementRef::NIL,
+        placement: crate::structs::placement::record::PlacementRef::NIL,
     }
 }
 

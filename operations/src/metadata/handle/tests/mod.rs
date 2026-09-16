@@ -11,7 +11,7 @@ use aruna_core::metadata::ApplyRoCrateRequest;
 use aruna_core::storage_entries::graph_lifecycle_key;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::{RealmNodeKind, TokenRevocation};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
 use aruna_storage::FjallStorage;

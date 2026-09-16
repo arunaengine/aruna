@@ -700,7 +700,7 @@ impl AdminDocumentState {
                             && !plan.target_holders.contains(&reported_by)
                     }) {
                         transition.drained.push(
-                            crate::structs::placement::placement_transition::BucketDrain {
+                            crate::structs::placement::transition::BucketDrain {
                                 bucket,
                                 reported_by,
                             },

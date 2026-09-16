@@ -15,7 +15,7 @@ use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, TxnId};

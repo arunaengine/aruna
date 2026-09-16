@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::compute::ExecutorCapability;
-use aruna_core::compute_quota::{
+use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeDepartureReport, ComputeReservationSnapshot, DemandFamily,
     DemandGroup, JobReservationRecord, MAX_DEMAND_FAMILIES, MAX_DEMAND_GROUPS,
     MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability, bound_demand,
@@ -24,7 +24,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, CLASS_LABEL_PREFIX, NodeInfoDocument, NodeUrls, NodeUtilization,
     node_info_key,
@@ -594,7 +594,7 @@ pub async fn group_demand(
             None => break,
         }
     }
-    Ok(aruna_core::compute_quota::merge_demand(
+    Ok(aruna_core::compute::quota::merge_demand(
         snapshots.iter(),
         group_id,
     ))
@@ -1078,7 +1078,7 @@ mod tests {
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::storage_entries::metadata_registry_key;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-    use aruna_core::structs::placement::placement_record::{
+    use aruna_core::structs::placement::record::{
         NodePlacementEntry, PlacementRef, PlacementStrategy,
     };
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;

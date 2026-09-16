@@ -187,7 +187,7 @@ mod pure_tests {
     use aruna_core::metadata::AuthToken;
     use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
     use aruna_core::structs::identity::auth::AuthContext;
-    use aruna_core::structs::placement::placement_record::{
+    use aruna_core::structs::placement::record::{
         DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
         PlacementScope,
     };

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(tags((

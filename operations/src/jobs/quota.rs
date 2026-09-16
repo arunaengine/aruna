@@ -4,7 +4,7 @@ use crate::driver::DriverContext;
 use crate::jobs::records::rows::from_bytes;
 use crate::node::node_info::group_demand;
 use aruna_core::NodeId;
-use aruna_core::compute_quota::{
+use aruna_core::compute::quota::{
     ComputeQuota, QuotaDenied, ResourceTotals, admits, understated_denial,
 };
 use aruna_core::effects::StorageEffect;
@@ -104,7 +104,7 @@ async fn quota_revision(context: &DriverContext, group_id: GroupId) -> Result<u6
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::compute_quota::{QuotaDimension, QuotaScope};
+    use aruna_core::compute::quota::{QuotaDimension, QuotaScope};
     use ulid::Ulid;
 
     fn resources() -> EffectiveResources {

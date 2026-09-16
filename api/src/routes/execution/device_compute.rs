@@ -15,7 +15,7 @@ use aruna_operations::device::compute::{ComputeStatus, compute_status};
 use crate::auth::require_owner;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::routes::execution::jobs::map_local_error;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 
 /// The device tag itself is declared by the device plane's own document.
 #[derive(OpenApi)]

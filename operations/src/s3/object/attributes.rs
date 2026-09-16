@@ -12,7 +12,7 @@ use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,

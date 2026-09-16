@@ -6,7 +6,7 @@ use aruna_core::document::PendingShardPlacement;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_record::{PLACEMENT_EPOCH_PAD, PlacementRef};
+use aruna_core::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::Key;

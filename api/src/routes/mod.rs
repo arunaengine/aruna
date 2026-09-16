@@ -1,5 +1,5 @@
 use crate::auth::auth_middleware;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use crate::telemetry::request_tracing_middleware;
 use axum::Router;
 use axum::middleware::from_fn_with_state;
@@ -27,15 +27,12 @@ pub mod search;
 pub mod staging;
 pub mod storage;
 pub mod sync;
-pub mod sync_quarantine;
 
 // Temporary aliases for the pre-family module paths; the access, execution
 // and storage families own these modules now. Remove once consumers migrate.
 pub use access::{credentials, group_join, groups, sessions, tokens, users};
-pub use execution::{compute, device_compute, job_audit, job_session, jobs, tes};
-pub use storage::{
-    blobs, bucket_usage, connectors, group_backends, storage_deletion, storage_routing,
-};
+pub use execution::{compute, device_compute, jobs, tes};
+pub use storage::{blobs, bucket_usage, connectors, group_backends};
 
 /// The single REST source: every route is registered from a `#[utoipa::path]`
 /// handler, so the runtime router and the generated document cannot diverge.
@@ -49,11 +46,11 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::bucket_usage::router())
         .merge(drs::router())
         .merge(staging::router())
-        .merge(storage::storage_deletion::router())
+        .merge(storage::deletion::router())
         .merge(storage::group_backends::router())
-        .merge(storage::storage_routing::router())
+        .merge(storage::routing::router())
         .merge(sync::router())
-        .merge(sync_quarantine::router())
+        .merge(sync::quarantine::router())
         .merge(execution::compute::router())
         .merge(storage::connectors::router())
         .merge(access::credentials::router())
@@ -61,9 +58,9 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(execution::device_compute::router())
         .merge(access::groups::router())
         .merge(access::group_join::router())
-        .merge(execution::job_session::router())
+        .merge(execution::job::session::router())
         .merge(execution::jobs::router())
-        .merge(execution::job_audit::router())
+        .merge(execution::job::audit::router())
         .merge(metadata::router())
         .merge(oai::router())
         .merge(pid::router())

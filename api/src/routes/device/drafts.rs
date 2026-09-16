@@ -16,7 +16,7 @@ use utoipa_axum::routes;
 use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{ProfilePreviewRequest, ProfilePreviewResponse, ensure_metadata_scope};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
 use aruna_operations::device::enqueue_draft::{
@@ -26,7 +26,7 @@ use aruna_operations::device::inspect_draft::{InspectDraftError, InspectDraftOpe
 use aruna_operations::device::list_drafts::ListDraftsOperation;
 use aruna_operations::device::publish_queue::{PublishEntry, PublishState};
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::profile_validation::preview_submission;
+use aruna_operations::metadata::profile::validation::preview_submission;
 use aruna_operations::metadata::public_preview::restricted_files;
 
 use crate::auth::require_owner;

@@ -14,7 +14,7 @@ use aruna_core::metadata::GraphPruneRecord;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -148,7 +148,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
     let target = DocumentTarget::RealmAuthorization { realm_id };
     let topic = target.sync_topic_id(
         realm_id,
-        &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        &aruna_core::structs::placement::record::PlacementRef::NIL,
     );
     net.ensure_sync_topics(&[topic], Vec::new())
         .expect("shared topic genesis");
@@ -162,7 +162,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
                 bytes: index.to_be_bytes().to_vec(),
                 change: change(),
             },
-            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+            aruna_core::structs::placement::record::PlacementRef::NIL,
             true,
         );
         write_outbox_record(&storage, &record).await;
@@ -214,7 +214,7 @@ pub(crate) fn change() -> DocumentChange {
             updated_at_ms: 9,
         },
         kind: DocumentChangeKind::Upsert,
-        placement: aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
     }
 }
 

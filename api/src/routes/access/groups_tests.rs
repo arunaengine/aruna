@@ -5,7 +5,7 @@ use super::{
 };
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use crate::tests::routes::{seed_realm_auth, test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};

@@ -9,8 +9,8 @@ use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE, POLICY
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
-use aruna_core::structs::placement::policy_document::policy_admin_path;
+use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
+use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::blob::{ManagedCopyRecord, ManagedCopyState, VersionKey};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -326,12 +326,12 @@ mod pure_tests {
         iroh::SecretKey::from_bytes(&[3u8; 32]).public()
     }
 
-    fn policy() -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
-        let policy = aruna_core::structs::placement::placement_policy::PlacementPolicy::new(
+    fn policy() -> aruna_core::structs::placement::policy::VerifiedPolicy {
+        let policy = aruna_core::structs::placement::policy::PlacementPolicy::new(
             Ulid::from_bytes([5u8; 16]),
             "residency".to_string(),
             vec![
-                aruna_core::structs::placement::placement_policy::PlacementSelector {
+                aruna_core::structs::placement::policy::PlacementSelector {
                     node_id: Some(node_id()),
                     location: None,
                     labels: Vec::new(),
@@ -340,7 +340,7 @@ mod pure_tests {
             ],
         )
         .expect("policy is valid");
-        aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(policy)
+        aruna_core::structs::placement::policy::VerifiedPolicy::verify(policy)
             .expect("policy verifies")
     }
 

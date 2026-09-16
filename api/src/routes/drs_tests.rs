@@ -4,7 +4,7 @@ use super::{
     get_authorizations, get_object, parse_object_id, post_objects, resolve_object, routed_deadline,
 };
 use crate::openapi::ApiDoc;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state as build_state,
     test_storage,

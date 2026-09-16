@@ -24,7 +24,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
+use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
@@ -1204,7 +1204,7 @@ async fn publish_to_peer(
     target: DocumentTarget,
     bytes: Vec<u8>,
     peer: aruna_core::NodeId,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match node
         .net
@@ -1234,7 +1234,7 @@ fn publish_change(
     node_id: aruna_core::NodeId,
     target: &DocumentTarget,
     bytes: &[u8],
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
 ) -> Result<DocumentChange, Box<dyn std::error::Error>> {
     match target {
         DocumentTarget::MetadataDocumentLifecycle { document_id } => {

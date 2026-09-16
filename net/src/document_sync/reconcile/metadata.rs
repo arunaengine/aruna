@@ -1,6 +1,6 @@
 use aruna_core::document::{DocumentEvent, DocumentTarget};
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataLifecycleRecord};
-use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{PersistentIdMapping, SyncQuarantineIdentity};
 use tracing::warn;

@@ -1,7 +1,7 @@
 use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::storage_routing::ensure_group_admin;
-use crate::server_state::ServerState;
+use crate::routes::storage::routing::ensure_group_admin;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;

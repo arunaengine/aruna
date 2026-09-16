@@ -29,7 +29,7 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::forward::{
     admits_profile_peer, export_profile_local, route_metadata_create,
 };
-use aruna_operations::metadata::profile_validation::{
+use aruna_operations::metadata::profile::validation::{
     current_validation_status, load_validation_status, preview_submission, profile_public_iri,
     revalidate_current,
 };

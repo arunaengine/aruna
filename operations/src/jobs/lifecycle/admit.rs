@@ -2,7 +2,7 @@
 //! its claim in one transaction, or nothing. A matching claim replays the alias
 //! and a conflicting claim is visible; signed candidates make this decide only.
 
-use aruna_core::compute_quota::QuotaDenied;
+use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;

@@ -18,11 +18,11 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId};
-use aruna_core::user_validation::{
+use aruna_core::user::validation::{
     UserAttributeError, validate_attribute_count, validate_attribute_key, validate_attribute_value,
 };
 use aruna_core::{DOCUMENT_STATE_KEYSPACE, SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
@@ -758,7 +758,7 @@ mod pure_tests {
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_core::{
@@ -1244,7 +1244,7 @@ mod pure_tests {
             aruna_core::structs::identity::realm::RealmNodeKind::Server,
         );
         config.strategies.push(
-            aruna_core::structs::placement::placement_record::PlacementStrategy {
+            aruna_core::structs::placement::record::PlacementStrategy {
                 strategy_id: Ulid::from_bytes([5; 16]),
                 name: "default".to_string(),
                 replica_count: Some(1),

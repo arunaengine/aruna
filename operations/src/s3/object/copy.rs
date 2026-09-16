@@ -556,12 +556,12 @@ pub(crate) mod test {
     fn admits(
         node_id: NodeId,
         seed: u8,
-    ) -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
-        let policy = aruna_core::structs::placement::placement_policy::PlacementPolicy::new(
+    ) -> aruna_core::structs::placement::policy::VerifiedPolicy {
+        let policy = aruna_core::structs::placement::policy::PlacementPolicy::new(
             Ulid::from_bytes([seed; 16]),
             "residency".to_string(),
             vec![
-                aruna_core::structs::placement::placement_policy::PlacementSelector {
+                aruna_core::structs::placement::policy::PlacementSelector {
                     node_id: Some(node_id),
                     location: None,
                     labels: Vec::new(),
@@ -570,7 +570,7 @@ pub(crate) mod test {
             ],
         )
         .expect("policy is valid");
-        aruna_core::structs::placement::placement_policy::VerifiedPolicy::verify(policy)
+        aruna_core::structs::placement::policy::VerifiedPolicy::verify(policy)
             .expect("policy verifies")
     }
 
@@ -579,7 +579,7 @@ pub(crate) mod test {
         bucket: &str,
         group_id: GroupId,
         user_id: UserId,
-        policies: Vec<aruna_core::structs::placement::placement_policy::PlacementPolicyRef>,
+        policies: Vec<aruna_core::structs::placement::policy::PlacementPolicyRef>,
     ) {
         let info = aruna_core::structs::storage::blob::BucketInfo {
             group_id,

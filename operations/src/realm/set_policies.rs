@@ -12,7 +12,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::policy_document::policy_admin_path;
+use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -433,7 +433,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
-    use aruna_core::structs::placement::policy_document::policy_admin_path;
+    use aruna_core::structs::placement::policy::document::policy_admin_path;
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;

@@ -16,7 +16,7 @@ use aruna_core::structs::execution::job::{
     PhysicalExecutionState, SubmissionId,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use futures_util::future::join_all;
 use tokio::time::timeout_at;
 use tracing::warn;

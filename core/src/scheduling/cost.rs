@@ -7,8 +7,8 @@ use crate::compute::ResourceEnvelope;
 use crate::scheduling::eligibility::allows;
 use crate::scheduling::inputs::{PlanRequest, ResolvedInput, TargetCandidate, TargetScore};
 use crate::structs::placement::compute_config::RealmComputeConfig;
-use crate::structs::placement::placement_policy::PlacementSubject;
-use crate::structs::placement::placement_record::DEFAULT_LOCATION;
+use crate::structs::placement::policy::PlacementSubject;
+use crate::structs::placement::record::DEFAULT_LOCATION;
 use std::collections::BTreeMap;
 
 /// Rank value of an unknown or stale ranking hint: as bad as a fully loaded

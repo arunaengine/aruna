@@ -3,7 +3,7 @@
 use aruna_api::auth::OidcValidator;
 use aruna_api::routes::users::RegisterUserResponse;
 use aruna_api::server::{Server, ServerConfig};
-use aruna_api::server_state::ServerState;
+use aruna_api::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

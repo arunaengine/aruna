@@ -40,7 +40,7 @@ use crate::driver::DriverContext;
 use crate::tasks::queue_backoff::{due_after, retry_delay_ms};
 
 use super::iri_index::MetadataIriError;
-use super::profile_validation::{assess_render, violation_count};
+use super::profile::validation::{assess_render, violation_count};
 use super::queue_storage::{
     MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
     start_write_transaction,

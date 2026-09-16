@@ -4,8 +4,8 @@
 
 use aruna_core::NodeId;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_record::{PlacementRef, PlacementStrategy};
-use aruna_core::structs::placement::placement_transition::{
+use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
+use aruna_core::structs::placement::transition::{
     BucketPlan, CandidatePlacementMap, TRANSITION_OVERDUE_MS, TransitionLimits, TransitionPlan,
 };
 use thiserror::Error;
@@ -287,7 +287,7 @@ fn locations_of(config: &RealmConfigDocument, holders: &[NodeId]) -> Vec<String>
 mod pure_tests {
     use super::*;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-    use aruna_core::structs::placement::placement_transition::{
+    use aruna_core::structs::placement::transition::{
         PlacementTransition, StallReport, TransitionStatus,
     };
 

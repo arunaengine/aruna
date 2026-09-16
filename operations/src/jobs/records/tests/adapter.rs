@@ -165,7 +165,7 @@ async fn refuses_unknown_offer() {
 async fn refuses_page_mismatch() {
     // A peer cannot use a valid local placement to read another submission.
     let (_dir, context, net, family) = fixture().await;
-    let placement = aruna_core::structs::placement::placement_record::PlacementRef {
+    let placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: family.placement.strategy_id,
         shard: family.placement.shard + 1,
     };

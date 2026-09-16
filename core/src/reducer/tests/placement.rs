@@ -1117,8 +1117,8 @@ fn grants_replicate_usable() {
     assert_eq!(
         directory.free_band_in(&[(
             FIRST_GRANTABLE_HANDLE,
-            crate::structs::placement::placement_record::band_start(
-                crate::structs::placement::placement_record::HANDLE_BANDS
+            crate::structs::placement::record::band_start(
+                crate::structs::placement::record::HANDLE_BANDS
             )
         )]),
         Some((2051, 3075))

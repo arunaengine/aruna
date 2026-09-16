@@ -14,7 +14,7 @@ use aruna_core::storage_entries::{
     profile_validation_entry, raw_budget_entry, raw_budget_key, sync_revision_entry,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
 };
@@ -31,7 +31,7 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::materialization_queue::{
     new_materialization_job, new_pending_status, schedule_materialization,
 };
-use crate::metadata::profile_validation::{
+use crate::metadata::profile::validation::{
     not_profiled_status, stale_status, submission_profile_tag, validate_submission,
 };
 use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
@@ -1014,7 +1014,7 @@ mod pure_tests {
     };
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
 
     fn actor() -> Actor {
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -1428,7 +1428,7 @@ mod pure_tests {
         );
         let strategy_id = Ulid::from_bytes([5u8; 16]);
         config.strategies.push(
-            aruna_core::structs::placement::placement_record::PlacementStrategy {
+            aruna_core::structs::placement::record::PlacementStrategy {
                 strategy_id,
                 name: "default".to_string(),
                 replica_count: Some(1),

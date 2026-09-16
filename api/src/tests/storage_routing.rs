@@ -1,4 +1,4 @@
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
 };

@@ -248,7 +248,7 @@ pub enum ConversionError {
     #[error("RO-Crate conversion error: {0}")]
     RoCrateError(String),
     #[error(transparent)]
-    PlacementPolicyError(#[from] crate::structs::placement::placement_policy::PlacementPolicyError),
+    PlacementPolicyError(#[from] crate::structs::placement::policy::PlacementPolicyError),
     #[error(transparent)]
     AdvertisementError(#[from] crate::compute::AdvertisementError),
     #[error("policy refs must be sorted and deduplicated")]

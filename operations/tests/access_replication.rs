@@ -65,7 +65,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
     let topic = aruna_core::document::DocumentTarget::RealmAuthorization { realm_id }
         .sync_topic_id(
             realm_id,
-            &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+            &aruna_core::structs::placement::record::PlacementRef::NIL,
         );
     nodes[1]
         .net

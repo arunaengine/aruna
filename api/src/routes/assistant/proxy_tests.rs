@@ -1,5 +1,5 @@
 use super::*;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use crate::tests::assistant::{setup_state, spawn_mock};
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;

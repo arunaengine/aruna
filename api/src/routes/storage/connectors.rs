@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::errors::SourceResolutionError;
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceEntryKind};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};

@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-use aruna_core::structs::placement::placement_policy::{
+use aruna_core::structs::placement::policy::{
     PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, evaluate_placement,
 };
 use aruna_core::structs::storage::blob::{BucketIdentity, BucketInfo};
@@ -221,7 +221,7 @@ pub enum PolicyGateError {
     #[error(transparent)]
     Read(#[from] ReadPolicyError),
     #[error(transparent)]
-    Policy(#[from] aruna_core::structs::placement::placement_policy::PlacementPolicyError),
+    Policy(#[from] aruna_core::structs::placement::policy::PlacementPolicyError),
 }
 
 /// Builds the gate for one governed destination. `Ok(None)` means the ref set is
@@ -440,7 +440,7 @@ mod pure_tests {
     use super::super::cache::PolicyCacheEntry;
     use super::*;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::placement::placement_policy::{
+    use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
     use aruna_core::types::Value;
@@ -718,7 +718,7 @@ mod pure_tests {
 
     fn document(
         policy: &VerifiedPolicy,
-    ) -> aruna_core::structs::placement::policy_document::PlacementPolicyDocument {
+    ) -> aruna_core::structs::placement::policy::document::PlacementPolicyDocument {
         crate::tests::policy::signed_document(realm(), policy, 1)
     }
 

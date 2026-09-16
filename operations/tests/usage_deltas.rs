@@ -15,8 +15,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, RealmId};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-use aruna_core::structs::placement::placement_policy::PlacementSubject;
-use aruna_core::structs::placement::policy_attachment::PolicyRefMode;
+use aruna_core::structs::placement::policy::PlacementSubject;
+use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BlobHeadKey, BucketInfo, CurrentVersionPointer,
 };

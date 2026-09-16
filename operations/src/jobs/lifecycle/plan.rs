@@ -16,7 +16,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::node_subject::storage_subject;
-use aruna_core::structs::placement::placement_policy::{
+use aruna_core::structs::placement::policy::{
     PlacementPolicyRef, PlacementSubject, PolicyResolution,
 };
 use aruna_core::structs::storage::blob::{

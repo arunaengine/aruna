@@ -56,7 +56,7 @@ use aruna_operations::s3::object::copy::{
 use aruna_operations::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
 };
-use aruna_operations::s3::object::delete_bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use aruna_operations::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };

@@ -1,5 +1,5 @@
 use crate::rate_limit::{LocalKey, LocalPermit};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::stream::{BackendStream, StreamError};
 use axum::body::Body;
 use bytes::Bytes;

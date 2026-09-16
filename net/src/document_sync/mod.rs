@@ -69,11 +69,11 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::binding_directory::BindingError;
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, PlacementRef, PlacementScope,
     PoolAdmission, admit_band_pool, coordinator_spans,
 };
-use aruna_core::structs::placement::policy_document::{
+use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_change, placement_policy_target,
     verify_policy_authority,
 };

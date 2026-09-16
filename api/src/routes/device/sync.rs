@@ -10,7 +10,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerResult};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::sync_status::{
     DatasetRow, DocumentRow, SyncStatus, start_sync_run, sync_status,

@@ -984,7 +984,7 @@ pub(in crate::document_sync) fn materialize_user_operation(
         | AdminDocumentOperation::UserAttributeRemoved { key } => {
             let path = user_attribute_path(key);
             if reducer_state.conflicts.contains_key(&path) {
-                if key.starts_with(aruna_core::user_profile::VISIBILITY_PREFIX) {
+                if key.starts_with(aruna_core::user::profile::VISIBILITY_PREFIX) {
                     user.attributes.insert(key.clone(), "private".to_string());
                 } else {
                     user.attributes.remove(key);

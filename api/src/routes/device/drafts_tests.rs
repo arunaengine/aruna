@@ -1,7 +1,7 @@
 use super::{DeviceDraft, preview_draft};
 use crate::error::ServerError;
 use crate::metadata::ProfilePreviewRequest;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

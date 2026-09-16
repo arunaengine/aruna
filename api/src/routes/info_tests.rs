@@ -8,7 +8,7 @@ use super::{
 };
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -19,7 +19,7 @@ use aruna_core::keyspaces::GROUP_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
-use aruna_core::structs::placement::placement_record::{DocumentClass, PlacementScope};
+use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::placement::allocate_handle::{
@@ -379,7 +379,7 @@ async fn usage_requires_auth() {
 #[tokio::test]
 async fn usage_counts_documents() {
     use aruna_core::storage_entries::registry_write_entries;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
     let storage_dir = tempdir().unwrap();
@@ -1386,7 +1386,7 @@ async fn realm_node_details() {
     // the default location/weight. Publish a node info document for it too.
     let mut docker = aruna_core::compute::ExecutorCapability::new(
         "docker".to_string(),
-        aruna_core::structs::placement::placement_policy::PlacementSubject {
+        aruna_core::structs::placement::policy::PlacementSubject {
             node_id,
             generation: 1,
             location: "eu-west".to_string(),

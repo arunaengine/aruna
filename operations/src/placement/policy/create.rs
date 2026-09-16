@@ -9,11 +9,11 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_policy::{
+use aruna_core::structs::placement::policy::{
     PlacementPolicy, PlacementPolicyError, VerifiedPolicy,
 };
-use aruna_core::structs::placement::placement_record::PlacementRef;
-use aruna_core::structs::placement::policy_document::{
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyAuthorityError, PolicyPublication, PolicyPublicationClaim,
     placement_policy_change, placement_policy_target, policy_authority_path,
 };
@@ -476,8 +476,8 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::handle::Handle;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_policy::PlacementSelector;
-    use aruna_core::structs::placement::policy_document::verify_policy_authority;
+    use aruna_core::structs::placement::policy::PlacementSelector;
+    use aruna_core::structs::placement::policy::document::verify_policy_authority;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;

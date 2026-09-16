@@ -13,7 +13,7 @@ use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::complete::CompleteUploadResult;
 use aruna_operations::s3::object::delete::{DeleteObjectError, DeleteObjectResult};
-use aruna_operations::s3::object::delete_bulk::BulkDeleteOutcome;
+use aruna_operations::s3::object::delete::bulk::BulkDeleteOutcome;
 use aruna_operations::s3::object::get::{GetObjectResult, ObjectInfo};
 use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 use aruna_operations::s3::object::put::PutObjectResult;

@@ -4,7 +4,7 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::ShardManifest;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use tokio::time::{Instant, timeout};

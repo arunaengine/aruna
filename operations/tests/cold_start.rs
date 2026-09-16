@@ -12,7 +12,7 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::metadata_registry_key;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};

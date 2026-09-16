@@ -8,7 +8,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentTarget;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;

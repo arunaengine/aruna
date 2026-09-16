@@ -10,7 +10,7 @@ use crate::metadata::{
     PreflightVisibleResponse, bearer_token_string, map_api_error, map_query_mode,
     map_references_response,
 };
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::metadata::api::{
     MetadataReferencesRequest, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,

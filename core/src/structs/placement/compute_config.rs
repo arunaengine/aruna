@@ -2,8 +2,8 @@
 //! measure for itself: the directed bandwidth between placement locations, the bandwidth to assume for
 //! an unconfigured link, and how long an availability sample stays meaningful.
 
-use crate::compute_quota::ComputeQuota;
-use crate::structs::placement::placement_record::MAX_LOCATION_LEN;
+use crate::compute::quota::ComputeQuota;
+use crate::structs::placement::record::MAX_LOCATION_LEN;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

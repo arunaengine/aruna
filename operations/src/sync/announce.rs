@@ -14,8 +14,8 @@ use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::persistent_id_change;
-use aruna_core::structs::placement::placement_record::PlacementRef;
-use aruna_core::structs::placement::policy_document::{
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_change,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;

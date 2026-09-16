@@ -16,7 +16,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
     PlacementBinding, PlacementScope, band_start, coordinator_spans, owned_pools,
 };
@@ -754,7 +754,7 @@ mod pure_tests {
     use aruna_core::storage_entries::reducer_conflict_key;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use aruna_core::structs::placement::placement_record::{
+    use aruna_core::structs::placement::record::{
         BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS,
         HANDLE_RANGE_SIZE, HandleRange, NodePlacementEntry, PlacementOverride, PlacementStrategy,
         StrategyBinding, band_start, coordinator_spans,
@@ -1179,9 +1179,9 @@ mod pure_tests {
         document.placement_handle_ranges.push(range);
         // The reserved JobControl binding already exists: nothing to append.
         document.placement_bindings.push(
-            aruna_core::structs::placement::placement_record::PlacementBinding {
+            aruna_core::structs::placement::record::PlacementBinding {
                 handle: aruna_core::structured_id::PlacementHandle::new(range.start).unwrap(),
-                scope: aruna_core::structs::placement::placement_record::PlacementScope::Realm(
+                scope: aruna_core::structs::placement::record::PlacementScope::Realm(
                     realm_id,
                 ),
                 document_class: DocumentClass::JobControl,

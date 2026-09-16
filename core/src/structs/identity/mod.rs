@@ -5,5 +5,3 @@ pub mod group;
 pub mod realm;
 pub mod s3_session;
 pub mod user;
-pub mod user_session;
-pub mod user_vault;

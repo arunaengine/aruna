@@ -249,7 +249,7 @@ mod tests {
     use crate::tests::staging::setup_driver_context;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
-    use aruna_core::structs::placement::placement_policy::PlacementSubject;
+    use aruna_core::structs::placement::policy::PlacementSubject;
     use aruna_core::structs::storage::blob::{BackendRef, ResolvedBackend};
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::routing::{

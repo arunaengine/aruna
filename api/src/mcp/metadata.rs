@@ -16,7 +16,7 @@ use aruna_operations::metadata::api::{
 };
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::{export_rocrate_routed, route_metadata_update};
-use aruna_operations::metadata::profile_validation::preview_submission;
+use aruna_operations::metadata::profile::validation::preview_submission;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
@@ -993,7 +993,7 @@ mod tests {
 #[cfg(test)]
 mod authorization_tests {
     use super::*;
-    use crate::server_state::ServerState;
+    use crate::server::state::ServerState;
     use crate::tests::routes::{
         seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
     };

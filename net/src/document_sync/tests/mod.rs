@@ -26,7 +26,7 @@ use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StaticRealmEndpoint,
     UserCapOverride,
 };
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HandleRange,
     METADATA_HANDLE, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
     PlacementStrategy, StrategyBinding, band_start,

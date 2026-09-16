@@ -11,7 +11,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, PENDING_PROJECTION_KEYSPACE};
 use aruna_core::storage_entries::pending_projection_key;
 use aruna_core::structs::execution::job::{JobId, pid_dedup_key};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{
     MintPersistentSpec, PersistentIdMapping, PersistentIdRevision, PersistentIdStatus,

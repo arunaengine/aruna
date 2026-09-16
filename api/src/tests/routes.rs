@@ -1,4 +1,4 @@
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};

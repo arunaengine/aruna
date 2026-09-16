@@ -9,7 +9,7 @@ use crate::metadata::{
     local_write_record, map_api_error, map_write_error, parse_document_id, run_create_metadata,
     run_document_list, serialize_jsonld_object,
 };
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::metadata::api::{

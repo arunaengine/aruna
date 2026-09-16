@@ -33,7 +33,7 @@ use crate::structs::execution::notification::{
 use crate::structs::execution::notification_watch::{WatchSubscription, watch_subscription_key};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::User;
-use crate::structs::placement::placement_record::{PLACEMENT_EPOCH_PAD, PlacementRef};
+use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::types::{GroupId, Key, KeySpace, Value};
 
@@ -870,7 +870,7 @@ mod tests {
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
     use crate::structs::identity::realm::RealmId;
-    use crate::structs::placement::placement_record::PlacementRef;
+    use crate::structs::placement::record::PlacementRef;
     use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
     use crate::{NodeId, UserId};
 

@@ -1,6 +1,6 @@
 use crate::auth::require_unrestricted_auth;
 use crate::cors::CorsConfig;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};

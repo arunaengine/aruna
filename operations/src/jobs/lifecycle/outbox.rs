@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;

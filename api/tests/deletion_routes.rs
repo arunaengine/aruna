@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use aruna_api::routes::storage_deletion::{
+use aruna_api::routes::storage::deletion::{
     DeletionPreflightRequest, PurgeScopeRequest, SubmitPurgeRequest, deletion_preflight,
     submit_purge,
 };
-use aruna_api::server_state::ServerState;
+use aruna_api::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

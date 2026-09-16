@@ -255,7 +255,7 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use craqle::VectorClock;
     use ulid::Ulid;

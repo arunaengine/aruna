@@ -1,7 +1,7 @@
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::unix_rfc3339;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{AssistantChatHead, AssistantChatTurn};

@@ -1,5 +1,5 @@
 use crate::error::{OidcError, ServerError, ServerResult, TokenError};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission, TokenClaims};

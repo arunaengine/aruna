@@ -2,8 +2,8 @@
 //! generation and blocks serving until local inventory is revalidated for that generation.
 
 use crate::errors::ConversionError;
-use crate::structs::placement::placement_policy::{PlacementPolicyError, PlacementSubject};
-use crate::structs::placement::placement_record::NodePlacementEntry;
+use crate::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
+use crate::structs::placement::record::NodePlacementEntry;
 use serde::{Deserialize, Serialize};
 
 /// Single-row key of the local subject record.
@@ -100,7 +100,7 @@ pub fn storage_subject(entry: &NodePlacementEntry, generation: u64) -> Placement
 #[cfg(test)]
 mod tests {
     use super::{NodeSubjectRecord, storage_subject};
-    use crate::structs::placement::placement_record::{DEFAULT_NODE_WEIGHT, NodePlacementEntry};
+    use crate::structs::placement::record::{DEFAULT_NODE_WEIGHT, NodePlacementEntry};
     use std::collections::BTreeMap;
 
     fn entry(location: &str, label: Option<(&str, &str)>) -> NodePlacementEntry {

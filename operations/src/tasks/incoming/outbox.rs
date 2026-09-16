@@ -49,7 +49,7 @@ pub(super) fn publish_from_outbox(
     event_id: ulid::Ulid,
     target: DocumentTarget,
     event: DocumentOutboxEvent,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
     allow_genesis: bool,
 ) -> DocumentSyncPublish {
     match event {
@@ -106,14 +106,14 @@ pub(super) async fn load_drain_config(
 pub(super) fn resolve_publish_placement(
     config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
     target: &DocumentTarget,
-    current: aruna_core::structs::placement::placement_record::PlacementRef,
-) -> aruna_core::structs::placement::placement_record::PlacementRef {
-    if current != aruna_core::structs::placement::placement_record::PlacementRef::NIL {
+    current: aruna_core::structs::placement::record::PlacementRef,
+) -> aruna_core::structs::placement::record::PlacementRef {
+    if current != aruna_core::structs::placement::record::PlacementRef::NIL {
         return current;
     }
     match config {
         Some(config) => crate::placement::target_placement_ref(config, target, Default::default()),
-        None => aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        None => aruna_core::structs::placement::record::PlacementRef::NIL,
     }
 }
 

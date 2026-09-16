@@ -36,7 +36,7 @@ use ulid::Ulid;
 
 use crate::auth::{ValidatedBearer, require_owner, require_unrestricted_auth};
 use crate::error::ServerError;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_operations::driver::drive;
 
 /// An output path count bound shared with the transport documentation.
@@ -58,7 +58,7 @@ pub(crate) enum JobRequestError {
     /// The idempotency key is bound to a different plan.
     JobPlanConflict(String),
     /// Standing compute quota refused the admission.
-    ComputeQuotaDenied(aruna_core::compute_quota::QuotaDenied),
+    ComputeQuotaDenied(aruna_core::compute::quota::QuotaDenied),
     /// A retryable dependency did not answer.
     ServiceUnavailableReason(String),
     /// A fault that is not the caller's to fix.

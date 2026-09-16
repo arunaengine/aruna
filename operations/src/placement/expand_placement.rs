@@ -4,7 +4,7 @@
 
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_transition::{
+use aruna_core::structs::placement::transition::{
     CandidatePlacementMap, TransitionLimits,
 };
 use aruna_core::time::unix_timestamp_millis;

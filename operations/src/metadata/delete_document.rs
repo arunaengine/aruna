@@ -13,7 +13,7 @@ use aruna_core::storage_entries::{
     graph_revision_change, lifecycle_revision_change, updated_index_delete,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
@@ -1022,7 +1022,7 @@ mod pure_tests {
     use aruna_core::storage_entries::sync_revision_key;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-    use aruna_core::structs::placement::placement_record::PlacementStrategy;
+    use aruna_core::structs::placement::record::PlacementStrategy;
     use aruna_core::structs::{PersistentIdMapping, PersistentIdStatus, persistent_id_key};
 
     fn actor() -> aruna_core::structs::identity::auth::Actor {

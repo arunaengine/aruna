@@ -267,7 +267,7 @@ type StuckRecord = (
     u64,
     DocumentTarget,
     irokle::TopicId,
-    aruna_core::structs::placement::placement_record::PlacementRef,
+    aruna_core::structs::placement::record::PlacementRef,
 );
 
 struct DrainInvocation {

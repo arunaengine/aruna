@@ -5,7 +5,7 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::USER_SESSION_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::user_session::UserSession;
+use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;

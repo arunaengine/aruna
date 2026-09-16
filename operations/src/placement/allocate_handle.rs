@@ -14,7 +14,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::handle_allocation::HandleAllocationCursor;
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     DocumentClass, HandleRange, PlacementBinding, PlacementScope,
 };
 use aruna_core::structured_id::PlacementHandle;
@@ -310,7 +310,7 @@ mod tests {
     use aruna_core::document::DocumentTarget;
     use aruna_core::events::Event;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-    use aruna_core::structs::placement::placement_record::{FIRST_GRANTABLE_HANDLE, HandleRange};
+    use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, HandleRange};
     use tempfile::tempdir;
 
     fn node(seed: u8) -> NodeId {

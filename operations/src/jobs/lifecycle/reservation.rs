@@ -35,7 +35,7 @@ pub const MAX_RESERVATION_SCAN: usize = 512;
 
 /// Capacity held for one physical execution: the shared core contract, written
 /// with the receipt and released at that execution's terminal state.
-pub use aruna_core::compute_quota::JobReservationRecord as ExecutionReservation;
+pub use aruna_core::compute::quota::JobReservationRecord as ExecutionReservation;
 
 pub fn reservation_key(execution_id: Ulid) -> Key {
     Key::from(execution_id.to_bytes().as_slice())

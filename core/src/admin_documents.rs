@@ -11,11 +11,11 @@ use crate::structs::identity::realm::{
     RealmNodeKind,
 };
 use crate::structs::placement::compute_config::RealmComputeConfig;
-use crate::structs::placement::placement_record::{
+use crate::structs::placement::record::{
     BandPool, BindingScope, HandleRange, NodePlacementEntry, PlacementBinding, PlacementOverride,
     PlacementRef, PlacementStrategy, StrategyBinding,
 };
-use crate::structs::placement::placement_transition::{
+use crate::structs::placement::transition::{
     CandidatePlacementMap, CompletionProof, TransitionPlan,
 };
 use crate::types::{GroupId, RoleId};
@@ -359,7 +359,7 @@ mod tests {
         RealmNodeKind,
     };
     use crate::structs::placement::compute_config::RealmComputeConfig;
-    use crate::structs::placement::placement_record::{
+    use crate::structs::placement::record::{
         AffinityEffect, AffinityRule, BandPool, BindingScope, DocumentClass, HandleRange,
         LabelMatch, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementScope,
         PlacementStrategy, StrategyBinding,
@@ -636,7 +636,7 @@ mod tests {
         // relay cannot move or rewrite the envelope it republishes.
         use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent};
         use crate::structs::identity::auth::Actor;
-        use crate::structs::placement::placement_record::PlacementRef;
+        use crate::structs::placement::record::PlacementRef;
 
         let realm_id = RealmId::from_bytes([9; 32]);
         let secret = iroh::SecretKey::from_bytes(&[11; 32]);

@@ -1,7 +1,7 @@
 use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::groups::refuse_group_edit;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyDecision, PolicyKind, PolicyRequest, PolicySession, PolicyTraceEntry,

@@ -12,7 +12,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     AffinityEffect, AffinityRule, LabelMatch, NodePlacementEntry,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;

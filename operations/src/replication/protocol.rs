@@ -7,7 +7,7 @@ use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_policy::{
+use aruna_core::structs::placement::policy::{
     MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject,
 };
 use aruna_core::structs::storage::blob::{BackendLocation, CopyOrigin};
@@ -240,7 +240,7 @@ impl BaoReadRequest {
     pub fn validate(&self) -> Result<(), ConversionError> {
         if self.known_refs.len() > MAX_REF_INPUT {
             return Err(ConversionError::PlacementPolicyError(
-                aruna_core::structs::placement::placement_policy::PlacementPolicyError::RefCount,
+                aruna_core::structs::placement::policy::PlacementPolicyError::RefCount,
             ));
         }
         if PlacementPolicyRef::canonical_set(&self.known_refs)? != self.known_refs {
@@ -594,7 +594,7 @@ impl VersionReplicationMessage {
             Self::PlacementPolicyDenied { policy_ids } => {
                 if policy_ids.len() > MAX_REF_INPUT {
                     return Err(ConversionError::PlacementPolicyError(
-                        aruna_core::structs::placement::placement_policy::PlacementPolicyError::RefCount,
+                        aruna_core::structs::placement::policy::PlacementPolicyError::RefCount,
                     ));
                 }
                 None
@@ -649,7 +649,7 @@ mod pure_tests {
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+    use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,

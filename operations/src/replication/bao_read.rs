@@ -18,8 +18,8 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::storage_subject;
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
-use aruna_core::structs::placement::placement_record::NodePlacementEntry;
+use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
+use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo, HashIndex,
     ManagedCopyKey, VersionKey, object_permission_path,
@@ -1475,7 +1475,7 @@ mod pure_tests {
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+    use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobVersion, BucketInfo,
     };
@@ -1883,8 +1883,8 @@ mod pure_tests {
         // The requester may assert any subject; only the realm's placement of
         // the authenticated peer decides where governed bytes may go.
         use aruna_core::structs::placement::node_subject::storage_subject;
-        use aruna_core::structs::placement::placement_policy::PlacementSubject;
-        use aruna_core::structs::placement::placement_record::{
+        use aruna_core::structs::placement::policy::PlacementSubject;
+        use aruna_core::structs::placement::record::{
             DEFAULT_NODE_WEIGHT, NodePlacementEntry,
         };
 

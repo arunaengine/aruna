@@ -19,7 +19,7 @@ use aruna_core::structs::identity::group::{
     Group, GroupAuthorizationDocument, owner_group_key, owner_group_prefix,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
@@ -806,7 +806,7 @@ mod test {
             aruna_core::structs::identity::realm::RealmNodeKind::Server,
         );
         config.strategies.push(
-            aruna_core::structs::placement::placement_record::PlacementStrategy {
+            aruna_core::structs::placement::record::PlacementStrategy {
                 strategy_id: Ulid::from_bytes([5; 16]),
                 name: "default".to_string(),
                 replica_count: Some(1),

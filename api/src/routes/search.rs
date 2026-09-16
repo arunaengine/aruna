@@ -4,7 +4,7 @@ use crate::metadata::{
     MetadataQueryMode, SearchHitResponse, map_api_error, map_query_mode, map_search_hit,
 };
 use crate::routes::access::users::MIN_QUERY_CHARS;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::drive;

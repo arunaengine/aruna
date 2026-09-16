@@ -27,8 +27,8 @@ use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
-use aruna_core::structs::placement::placement_record::{NodePlacementEntry, PlacementRef};
-use aruna_core::structs::placement::placement_transition::TransitionLimits;
+use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
+use aruna_core::structs::placement::transition::TransitionLimits;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
@@ -703,7 +703,7 @@ impl Topology {
                         // under a rival plan or will never move.
                         if !matches!(
                             transition.status,
-                            aruna_core::structs::placement::placement_transition::TransitionStatus::Aborted
+                            aruna_core::structs::placement::transition::TransitionStatus::Aborted
                         ) {
                             pending += transition
                                 .plan

@@ -3,7 +3,7 @@
 //! Persisted identity and enrollment live in `crate::identity`.
 
 use crate::identity::PersistedNodeState;
-use aruna_api::server_state::{ONBOARDING_SECRET_KEY, load_persisted_state, persist_state};
+use aruna_api::server::state::{ONBOARDING_SECRET_KEY, load_persisted_state, persist_state};
 use aruna_core::document::{DocumentNetEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
@@ -149,7 +149,7 @@ pub async fn prepare_core_documents(
         net_handle
             .sync_topic_exists(watch_target.sync_topic_id(
                 realm_id,
-                &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+                &aruna_core::structs::placement::record::PlacementRef::NIL,
             ))
             .map_err(|error| format!("failed to check watch interest topic: {error}"))?
     } else {
@@ -221,7 +221,7 @@ pub async fn fetch_core_documents(
         }
         let topic = document.sync_topic_id(
             realm_id,
-            &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+            &aruna_core::structs::placement::record::PlacementRef::NIL,
         );
         sync_with_retry(net_handle, topic, bootstrap_peer, &document, timeout).await?;
     }
@@ -232,9 +232,9 @@ pub async fn fetch_core_documents(
         for document in user_documents {
             let placement = match config.as_ref() {
                 Some(config) => target_placement_ref(config, &document, Default::default()),
-                None => aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+                None => aruna_core::structs::placement::record::PlacementRef::NIL,
             };
-            if placement == aruna_core::structs::placement::placement_record::PlacementRef::NIL {
+            if placement == aruna_core::structs::placement::record::PlacementRef::NIL {
                 warn!(document = ?document, "Skipping onboarding user document without a shard placement");
                 continue;
             }
@@ -329,7 +329,7 @@ pub async fn wait_for_placement(
                             .ok_or("net handle unavailable")?,
                         target.sync_topic_id(
                             realm_id,
-                            &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+                            &aruna_core::structs::placement::record::PlacementRef::NIL,
                         ),
                         bootstrap_peer,
                         &target,
@@ -408,7 +408,7 @@ async fn load_realm_config(
 fn unique_user_topic(
     synced_topics: &mut HashSet<::irokle::TopicId>,
     realm_id: aruna_core::structs::identity::realm::RealmId,
-    placement: &aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: &aruna_core::structs::placement::record::PlacementRef,
     document: &DocumentTarget,
 ) -> Option<::irokle::TopicId> {
     let topic = document.sync_topic_id(realm_id, placement);

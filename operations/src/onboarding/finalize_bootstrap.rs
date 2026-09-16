@@ -7,7 +7,7 @@ use aruna_core::onboarding::{OnboardingMode, OnboardingSecretError};
 use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{METADATA_REPLICATION_FACTOR, RealmId, RealmNodeKind};
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     NodePlacementEntry, normalize_placement_input,
 };
 use aruna_core::structs::storage::node_info::reserved_label;
@@ -331,7 +331,7 @@ async fn onboarding_sync_topics(
     ticket: &aruna_core::onboarding::OnboardingTicket,
 ) -> Result<OnboardingSyncTopics, BootstrapFinalizeError> {
     use aruna_core::document::DocumentTarget;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     let config = drive(GetConfigOperation::new(realm_id), context.as_ref()).await?;
     let mut topics = OnboardingSyncTopics {
         shared: Vec::new(),
@@ -393,7 +393,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
-    use aruna_core::structs::placement::placement_record::{BindingScope, DocumentClass};
+    use aruna_core::structs::placement::record::{BindingScope, DocumentClass};
     use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
@@ -768,7 +768,7 @@ mod tests {
             .storage()
             .topic_state(&target.sync_topic_id(
                 fixture.realm_id,
-                &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+                &aruna_core::structs::placement::record::PlacementRef::NIL,
             ))
             .unwrap()
             .expect("issuer node-info topic admitted during finalize");
@@ -817,7 +817,7 @@ mod tests {
         }
         .sync_topic_id(
             fixture.realm_id,
-            &aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+            &aruna_core::structs::placement::record::PlacementRef::NIL,
         );
         let storage = net_handle.document_sync_node().storage().clone();
         assert!(storage.topic_state(&shared_topic).unwrap().is_none());

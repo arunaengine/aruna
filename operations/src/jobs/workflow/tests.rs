@@ -24,7 +24,7 @@ use aruna_core::structs::execution::job::{
     OutputSelection, SessionReportDetail, SessionReportRow, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
@@ -1149,11 +1149,11 @@ fn carries_network_access() {
 /// Writes the receipted reservation and the node subject a fenced start
 /// compares against.
 async fn store_site(storage: &StorageHandle, job_id: JobId, generation: u64, digest: [u8; 32]) {
-    use aruna_core::compute_quota::JobReservationRecord;
+    use aruna_core::compute::quota::JobReservationRecord;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{JOB_RESERVATION_KEYSPACE, NODE_SUBJECT_KEYSPACE};
     use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-    use aruna_core::structs::placement::placement_policy::PlacementSubject;
+    use aruna_core::structs::placement::policy::PlacementSubject;
 
     let reservation = JobReservationRecord {
         execution_id: Ulid::from_bytes([0xA1; 16]),
@@ -1275,7 +1275,7 @@ async fn stored_site_starts() {
     use aruna_compute::ExecutorRegistry;
     use aruna_core::compute::ExecutorCapability;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-    use aruna_core::structs::placement::placement_policy::PlacementSubject;
+    use aruna_core::structs::placement::policy::PlacementSubject;
 
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();

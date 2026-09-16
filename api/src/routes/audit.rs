@@ -1,7 +1,7 @@
 use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
 use aruna_operations::forward::routing::is_user_origin;

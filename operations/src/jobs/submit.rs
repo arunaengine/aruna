@@ -92,7 +92,7 @@ pub enum SubmitJobError {
     TooManyOutputs { limit: usize },
     /// Standing compute quota refused the new logical admission.
     #[error("compute quota denied: {0}")]
-    QuotaDenied(#[from] aruna_core::compute_quota::QuotaDenied),
+    QuotaDenied(#[from] aruna_core::compute::quota::QuotaDenied),
     #[error(transparent)]
     Composition(#[from] aruna_core::structs::execution::job::CompositionError),
     #[error("active RO-Crate job limit reached ({limit})")]
@@ -461,7 +461,7 @@ mod tests {
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;

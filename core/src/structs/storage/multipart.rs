@@ -1,7 +1,7 @@
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};
-use crate::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use crate::structs::storage::blob::checked_refs;
 use crate::structs::storage::blob::{BackendLocation, BackendRef};
 use crate::types::GroupId;

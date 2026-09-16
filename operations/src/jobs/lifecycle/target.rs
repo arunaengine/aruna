@@ -22,7 +22,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_policy::{
+use aruna_core::structs::placement::policy::{
     PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, evaluate_placement,
 };
 use aruna_core::structs::storage::blob::group_permission_path;

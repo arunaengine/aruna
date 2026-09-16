@@ -1,7 +1,7 @@
 use crate::auth::{ValidatedBearer, claims_for_revocation, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::time::unix_timestamp_secs;

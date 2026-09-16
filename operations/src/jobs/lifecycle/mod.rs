@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use aruna_core::compute_quota::QuotaDenied;
+use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::{JobId, JobRecordError};

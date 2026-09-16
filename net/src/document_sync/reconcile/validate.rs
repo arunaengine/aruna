@@ -800,7 +800,7 @@ pub(in crate::document_sync) fn has_write_permission<'a>(
     roles: impl IntoIterator<Item = &'a Role>,
 ) -> bool {
     !user_id.is_nil()
-        && aruna_core::structs::placement::policy_document::holds_admin_write(
+        && aruna_core::structs::placement::policy::document::holds_admin_write(
             user_id,
             path,
             roles.into_iter(),
@@ -1237,7 +1237,7 @@ fn validate_event_scope(event: &AdminDocumentEvent) -> std::result::Result<(), S
         AdminDocumentOperation::PlacementBindingAppended { binding }
             if matches!(
                 binding.scope,
-                aruna_core::structs::placement::placement_record::PlacementScope::Realm(binding_realm_id)
+                aruna_core::structs::placement::record::PlacementScope::Realm(binding_realm_id)
                     if binding_realm_id != event.actor.realm_id
             )
     ) {
@@ -1348,7 +1348,7 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("transition report does not come from the node it names".to_string());
             }
             if frontier.len()
-                > aruna_core::structs::placement::placement_transition::MAX_FRONTIER_BYTES
+                > aruna_core::structs::placement::transition::MAX_FRONTIER_BYTES
             {
                 return Err("transition barrier frontier exceeds its size bound".to_string());
             }
@@ -1361,7 +1361,7 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
             if *reported_by != event.origin_node_id {
                 return Err("transition report does not come from the node it names".to_string());
             }
-            if reason.len() > aruna_core::structs::placement::placement_transition::MAX_STALL_BYTES
+            if reason.len() > aruna_core::structs::placement::transition::MAX_STALL_BYTES
             {
                 return Err("transition stall reason exceeds its size bound".to_string());
             }

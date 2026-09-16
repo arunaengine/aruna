@@ -1,7 +1,7 @@
 use crate::error::CliError;
 use aruna::config::load;
 use aruna_api::routes::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
-use aruna_api::server_state::load_persisted_state;
+use aruna_api::server::state::load_persisted_state;
 use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::onboarding::{
@@ -503,7 +503,7 @@ mod tests {
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListSecretsResponse;
     use aruna_api::server::{Server, ServerConfig};
-    use aruna_api::server_state::ServerState;
+    use aruna_api::server::state::ServerState;
     use aruna_core::UserId;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};

@@ -272,7 +272,7 @@ fn maps_submit_errors() {
     // A TES client retries 500, so every non-retryable admission refusal
     // must keep the status the native submit surface answers with.
     use aruna_core::ClockHealthError;
-    use aruna_core::compute_quota::{QuotaDenied, QuotaDimension, QuotaScope};
+    use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
     use aruna_core::structs::execution::job::CompositionError;
     use aruna_operations::jobs::submit::SubmitJobError;
 
@@ -904,7 +904,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
         LogicalJobState, OutputObject, SubmissionId, WorkspaceMode,
     };
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_operations::jobs::lifecycle::FamilyReport;
 
     let realm_id = RealmId([1u8; 32]);

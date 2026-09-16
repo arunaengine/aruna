@@ -13,7 +13,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -1636,7 +1636,7 @@ mod tests {
     use aruna_core::events::{DhtEntry, DhtEvent, NetEvent};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
-    use aruna_core::structs::placement::placement_record::{PlacementOverride, PlacementStrategy};
+    use aruna_core::structs::placement::record::{PlacementOverride, PlacementStrategy};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;

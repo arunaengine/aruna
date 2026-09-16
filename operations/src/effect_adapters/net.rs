@@ -59,7 +59,7 @@ mod pure_tests {
         DocumentChange, DocumentChangeKind, DocumentSyncPublish, DocumentSyncRevision,
         DocumentTarget,
     };
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::GroupId;
     use ulid::Ulid;
 

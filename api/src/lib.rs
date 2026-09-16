@@ -20,7 +20,6 @@ pub mod rate_limit;
 pub mod routes;
 pub mod s3;
 pub mod server;
-pub mod server_state;
 pub mod telemetry;
 
 #[cfg(test)]

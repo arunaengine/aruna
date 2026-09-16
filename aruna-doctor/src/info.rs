@@ -1,6 +1,6 @@
 use crate::error::CliError;
 use aruna_api::routes::info::InfoResponse;
-use aruna_api::server_state::client_bind_url;
+use aruna_api::server::state::client_bind_url;
 use aruna_core::structs::storage::backends::BackendsFile;
 use reqwest::Client;
 use serde::Serialize;
@@ -283,7 +283,7 @@ mod tests {
     use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::config::load;
     use aruna_api::server::{Server, ServerConfig};
-    use aruna_api::server_state::ServerState;
+    use aruna_api::server::state::ServerState;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;

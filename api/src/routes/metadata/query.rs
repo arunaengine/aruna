@@ -8,7 +8,7 @@ use crate::metadata::{
     SparqlQueryRequest, bearer_token_string, map_api_error, map_query_mode, map_query_results,
     map_search_hit, parse_document_id,
 };
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::metadata::api::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataSearchRequest,

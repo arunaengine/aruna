@@ -34,8 +34,8 @@ use aruna_core::structs::identity::realm::{
     RealmId, RealmNodeKind, StaticRealmEndpoint,
 };
 use aruna_core::structs::identity::user::User;
-use aruna_core::structs::placement::placement_record::PlacementRef;
-use aruna_core::structs::placement::policy_document::PlacementPolicyDocument;
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
 use aruna_core::types::Value;
@@ -539,7 +539,7 @@ pub(crate) fn metadata_lifecycle_change(
     aruna_core::storage_entries::lifecycle_revision_change(
         lifecycle,
         actor,
-        aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+        aruna_core::structs::placement::record::PlacementRef::NIL,
     )
 }
 
@@ -671,11 +671,11 @@ pub(crate) fn policy_admin(realm_id: RealmId) -> UserId {
 /// One authentic publication of `policy` by node `seed`.
 pub(crate) fn signed_policy_document(
     realm_id: RealmId,
-    policy: &aruna_core::structs::placement::placement_policy::VerifiedPolicy,
+    policy: &aruna_core::structs::placement::policy::VerifiedPolicy,
     seed: u8,
 ) -> PlacementPolicyDocument {
     let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
-    let publication = aruna_core::structs::placement::policy_document::PolicyPublicationClaim::new(
+    let publication = aruna_core::structs::placement::policy::document::PolicyPublicationClaim::new(
         realm_id,
         policy,
         secret.public(),
@@ -750,8 +750,8 @@ pub(crate) async fn write_realm_view(
 
 pub(crate) fn policy_fixture(
     policy_id: Ulid,
-) -> aruna_core::structs::placement::placement_policy::VerifiedPolicy {
-    use aruna_core::structs::placement::placement_policy::{
+) -> aruna_core::structs::placement::policy::VerifiedPolicy {
+    use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
 

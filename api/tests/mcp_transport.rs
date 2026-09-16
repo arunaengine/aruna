@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use aruna_api::cors::CorsConfig;
 use aruna_api::server::{MAX_BODY_SIZE, Server, ServerConfig};
-use aruna_api::server_state::ServerState;
+use aruna_api::server::state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;

@@ -10,8 +10,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
-use aruna_core::structs::placement::policy_document::policy_admin_path;
+use aruna_core::structs::placement::policy::PlacementPolicyRef;
+use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey,
     ManagedCopyRecord, VersionKey,
@@ -635,7 +635,7 @@ mod pure_tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+    use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
         ManagedCopyRecord, ManagedCopyState, VersionKey,

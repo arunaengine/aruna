@@ -21,11 +21,11 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_policy::{
+use aruna_core::structs::placement::policy::{
     PlacementDecision, PlacementPolicyError, PlacementPolicyRef, PlacementSubject,
     PolicyResolution, evaluate_placement,
 };
-use aruna_core::structs::placement::policy_attachment::{
+use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyBlockedReason, PolicyIntent,
     PolicyIntentOutcome, PolicyMutationParams, PolicyMutationRecord, PolicyRefMode,
 };
@@ -1010,11 +1010,11 @@ mod pure_tests {
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-    use aruna_core::structs::placement::placement_policy::{
+    use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, PolicyResolution,
         VerifiedPolicy,
     };
-    use aruna_core::structs::placement::policy_attachment::{
+    use aruna_core::structs::placement::policy::attachment::{
         BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentOutcome,
         PolicyMutationRecord, PolicyRefMode,
     };

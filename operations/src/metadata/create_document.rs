@@ -22,7 +22,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::binding_directory::BindingError;
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     DocumentClass, PlacementRef, PlacementScope, PlacementStrategy, shard_for_subject,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -37,7 +37,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::persistent_id::{mapping_revision, mapping_route_for, transition_entries};
-use crate::metadata::profile_validation::{
+use crate::metadata::profile::validation::{
     not_profiled_status, submission_profile_tag, validate_submission,
 };
 use crate::metadata::projector::schedule_projection_drain;
@@ -1160,7 +1160,7 @@ mod tests {
     use aruna_core::structs::execution::job::{JobPayload, JobRecord};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use aruna_core::structs::placement::placement_record::{
+    use aruna_core::structs::placement::record::{
         DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
         PlacementRef, PlacementScope,
     };

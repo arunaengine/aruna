@@ -13,10 +13,10 @@ use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
-use aruna_core::structs::placement::placement_policy::{
+use aruna_core::structs::placement::policy::{
     PlacementPolicyError, PlacementPolicyRef, VerifiedPolicy,
 };
-use aruna_core::structs::placement::policy_document::{
+use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyAuthorityError, placement_policy_target, verify_policy_authority,
 };
 use aruna_core::types::{Effects, Value};
@@ -158,7 +158,7 @@ impl ReadPolicyOperation {
     /// ref, so neither a stale local row nor a peer can substitute a rule.
     fn accept(
         &self,
-        policy: aruna_core::structs::placement::placement_policy::PlacementPolicy,
+        policy: aruna_core::structs::placement::policy::PlacementPolicy,
     ) -> Result<VerifiedPolicy, ReadPolicyError> {
         let verified = VerifiedPolicy::verify(policy)?;
         if verified.policy_ref() != self.config.policy_ref {
@@ -471,9 +471,9 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::effects::NetEffect;
     use aruna_core::structs::identity::realm::RealmNodeKind;
-    use aruna_core::structs::placement::placement_policy::{PlacementPolicy, PlacementSelector};
-    use aruna_core::structs::placement::placement_record::LabelMatch;
-    use aruna_core::structs::placement::policy_document::PolicyPublicationClaim;
+    use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
+    use aruna_core::structs::placement::record::LabelMatch;
+    use aruna_core::structs::placement::policy::document::PolicyPublicationClaim;
     use byteview::ByteView;
     use ulid::Ulid;
 

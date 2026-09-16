@@ -1,8 +1,8 @@
 use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, SessionKind};
-use aruna_core::structs::identity::user_session::UserSession;
+use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::session::{

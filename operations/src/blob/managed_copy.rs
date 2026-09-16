@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
     BackendLocation, CopyOrigin, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState, VersionKey,
 };
@@ -379,7 +379,7 @@ mod pure_tests {
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
+    use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
     use aruna_core::structs::storage::blob::CopyOrigin;
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
@@ -834,7 +834,7 @@ mod driver_tests {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-    use aruna_core::structs::placement::placement_policy::{PlacementPolicyRef, PlacementSubject};
+    use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
     use aruna_core::structs::storage::blob::{
         Backend, BackendConfig, BackendRef, BlobVersion, ManagedCopyKey, ManagedCopyQuarantine,
         ManagedCopyRecord, ManagedCopyState, VersionKey,

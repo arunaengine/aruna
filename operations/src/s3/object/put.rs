@@ -34,7 +34,7 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CopyOrigin, CurrentVersionPointer, ManagedCopyKey, VersionKey, WriteOwner,
@@ -1873,7 +1873,7 @@ mod decision_tests {
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_policy::{
+    use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::BucketInfo;

@@ -7,7 +7,6 @@ pub mod alpn;
 pub mod audit;
 pub mod auth;
 pub mod compute;
-pub mod compute_quota;
 pub mod credential_encryption;
 pub mod document;
 pub mod effects;
@@ -38,9 +37,7 @@ pub mod telemetry;
 pub mod time;
 pub mod trace_context;
 pub mod types;
-pub mod user_id;
-pub mod user_profile;
-pub mod user_validation;
+pub mod user;
 
 #[cfg(test)]
 mod tests;
@@ -59,4 +56,4 @@ pub use structured_id::{
 };
 pub use task::{TaskEffect, TaskEvent, TaskKey};
 pub use trace_context::DistributedTraceContext;
-pub use user_id::UserId;
+pub use user::id::UserId;

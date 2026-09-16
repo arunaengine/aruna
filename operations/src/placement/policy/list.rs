@@ -9,7 +9,7 @@ use aruna_core::keyspaces::PLACEMENT_POLICY_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::policy_document::{
+use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, group_admin_path, policy_admin_path,
 };
 use aruna_core::types::{Effects, GroupId, Key};
@@ -210,10 +210,10 @@ mod pure_tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_policy::{
+    use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
-    use aruna_core::structs::placement::policy_document::placement_policy_key;
+    use aruna_core::structs::placement::policy::document::placement_policy_key;
     use aruna_core::types::Key;
     use ulid::Ulid;
 

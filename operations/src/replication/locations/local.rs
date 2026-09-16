@@ -24,7 +24,7 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
-use aruna_core::structs::placement::placement_policy::PlacementPolicyRef;
+use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, ManagedCopyKey, VersionKey, bucket_permission_path,
@@ -936,8 +936,8 @@ mod pure_tests {
         location
     }
 
-    fn policy_ref() -> aruna_core::structs::placement::placement_policy::PlacementPolicyRef {
-        aruna_core::structs::placement::placement_policy::PlacementPolicyRef {
+    fn policy_ref() -> aruna_core::structs::placement::policy::PlacementPolicyRef {
+        aruna_core::structs::placement::policy::PlacementPolicyRef {
             policy_id: Ulid::from_bytes([4u8; 16]),
             digest: [5u8; 32],
         }
@@ -975,7 +975,7 @@ mod pure_tests {
         blocked: bool,
     ) -> Event {
         let mut subject = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
-            aruna_core::structs::placement::placement_policy::PlacementSubject {
+            aruna_core::structs::placement::policy::PlacementSubject {
                 node_id: node_id(5),
                 generation: 1,
                 location: "eu-west".to_string(),

@@ -41,7 +41,7 @@ use utoipa_axum::routes;
 use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 
 const ZIP_MEDIA_TYPE: &str = "application/zip";
 const ELN_MEDIA_TYPE: &str = "application/vnd.eln+zip";

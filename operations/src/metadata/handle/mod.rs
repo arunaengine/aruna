@@ -36,8 +36,8 @@ use self::query::snapshot_iri_references;
 use self::search::{AllowedGraphAuthorizer, describe_hit_properties};
 use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
-use super::profile_cache::ProfileCache;
-use super::profile_shacl::{
+use super::profile::cache::ProfileCache;
+use super::profile::shacl::{
     ProfileShaclEngine, ProfileShaclError, ProfileShaclReport, ProfileShapes,
 };
 use super::query_cache::MetadataQueryCache;

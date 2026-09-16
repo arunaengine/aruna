@@ -4,7 +4,7 @@
 
 use crate::compute::NetworkAccess;
 use crate::scheduling::inputs::{PlanRequest, TargetCandidate};
-use crate::structs::placement::placement_policy::{
+use crate::structs::placement::policy::{
     PlacementDecision, PlacementPolicyRef, PlacementSubject, evaluate_placement,
 };
 use serde::{Deserialize, Serialize};

@@ -1,4 +1,4 @@
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::{Request, State};

@@ -3,7 +3,7 @@ use aruna_core::NodeId;
 use aruna_core::keyspaces::{IRI_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE};
 use aruna_core::storage_entries::{create_event_entry, raw_revision_key};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::{FjallStorage, StorageHandle};
 use std::collections::BTreeSet;

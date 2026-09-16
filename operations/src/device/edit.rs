@@ -283,7 +283,7 @@ mod tests {
         MetadataGraphPolicy, MetadataRequestDurability,
     };
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use craqle::VectorClock;
     use std::sync::Arc;

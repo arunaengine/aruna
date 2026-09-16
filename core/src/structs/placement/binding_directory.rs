@@ -7,7 +7,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::structs::placement::handle_allocation::HandleRangeDirectory;
-use crate::structs::placement::placement_record::{
+use crate::structs::placement::record::{
     BindingTuple, DocumentClass, PlacementBinding, PlacementScope,
 };
 use crate::structured_id::{BucketId, BucketRangeError, PlacementHandle, StructuredId};

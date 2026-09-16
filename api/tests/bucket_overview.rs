@@ -4,10 +4,10 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use aruna_api::error::ServerError;
 use aruna_api::routes::bucket_usage::{BucketUsageQuery, get_bucket_usage};
-use aruna_api::routes::storage_routing::{
+use aruna_api::routes::storage::routing::{
     BucketRoutingRequest, get_bucket_routing, put_bucket_routing,
 };
-use aruna_api::server_state::ServerState;
+use aruna_api::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

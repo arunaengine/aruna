@@ -416,7 +416,7 @@ mod tests {
         AttemptIntent, JobClaim, JobPayload, JobState, due_index_key,
     };
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use aruna_storage::FjallStorage;
     use std::sync::Mutex;

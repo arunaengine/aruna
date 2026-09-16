@@ -6,7 +6,7 @@ use aruna_core::events::StorageEvent;
 use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
 use aruna_core::storage_entries::{create_projection_entries, registry_write_entries};
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     AffinityEffect, AffinityRule, DEFAULT_NODE_WEIGHT, DEFAULT_SHARD_COUNT, DocumentClass,
     FIRST_GRANTABLE_HANDLE, HandleRange, LabelMatch, PlacementBinding, PlacementRef,
     PlacementScope,
@@ -20,7 +20,7 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::placement::transition::{TransitionRequest, plan_transition};
 use crate::realm::get_config::GetConfigOperation;
-use aruna_core::structs::placement::placement_transition::{
+use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,
 };
 
@@ -1005,13 +1005,13 @@ fn preserves_affinity_data() {
         distinct_locations: false,
         shard_count: 64,
         affinity: vec![
-            aruna_core::structs::placement::placement_record::AffinityRule {
-                matcher: aruna_core::structs::placement::placement_record::LabelMatch {
+            aruna_core::structs::placement::record::AffinityRule {
+                matcher: aruna_core::structs::placement::record::LabelMatch {
                     key: "tier".to_string(),
                     value: "hot".to_string(),
                 },
                 effect:
-                    aruna_core::structs::placement::placement_record::AffinityEffect::Multiply {
+                    aruna_core::structs::placement::record::AffinityEffect::Multiply {
                         permille: 1500,
                     },
             },

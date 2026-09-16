@@ -9,7 +9,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use byteview::ByteView;
@@ -63,7 +63,7 @@ async fn ensure_held_topics(
                 transition.plan.strategy_id == placement.strategy_id
                     && matches!(
                         transition.status,
-                        aruna_core::structs::placement::placement_transition::TransitionStatus::Active
+                        aruna_core::structs::placement::transition::TransitionStatus::Active
                     )
                     && transition
                         .plan
@@ -855,7 +855,7 @@ async fn abort_release_txn(
 mod pure_tests {
     use super::*;
     use aruna_core::structs::identity::realm::RealmNodeKind;
-    use aruna_core::structs::placement::placement_record::{PlacementRef, PlacementStrategy};
+    use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

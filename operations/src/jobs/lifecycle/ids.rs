@@ -13,8 +13,8 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, SubmissionId, WorkspaceMode,
 };
-use aruna_core::structs::placement::placement_policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
-use aruna_core::structs::placement::placement_record::LabelMatch;
+use aruna_core::structs::placement::policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
+use aruna_core::structs::placement::record::LabelMatch;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

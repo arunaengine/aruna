@@ -5,5 +5,5 @@ pub mod blobs;
 pub mod bucket_usage;
 pub mod connectors;
 pub mod group_backends;
-pub mod storage_deletion;
-pub mod storage_routing;
+pub mod deletion;
+pub mod routing;

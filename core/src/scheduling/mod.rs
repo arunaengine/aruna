@@ -30,7 +30,7 @@ pub struct PlannedInput {
     pub version_id: Ulid,
     pub blake3: [u8; 32],
     pub bytes: u64,
-    pub policies: Vec<crate::structs::placement::placement_policy::PlacementPolicyRef>,
+    pub policies: Vec<crate::structs::placement::policy::PlacementPolicyRef>,
     /// `None` when the target already holds the exact compliant copy.
     pub source_node_id: Option<crate::NodeId>,
     pub transfer_ms: u64,
@@ -57,7 +57,7 @@ pub struct Selection {
     pub subject_generation: u64,
     pub score: TargetScore,
     pub inputs: Vec<PlannedInput>,
-    pub output_policies: Vec<crate::structs::placement::placement_policy::PlacementPolicyRef>,
+    pub output_policies: Vec<crate::structs::placement::policy::PlacementPolicyRef>,
     pub plan_digest: [u8; 32],
 }
 

@@ -153,7 +153,7 @@ pub fn write_document_lifecycle(
 pub fn write_lifecycle_revision(
     record: &MetadataLifecycleRecord,
     delete_actor: NodeId,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     let mut writes = vec![
@@ -376,7 +376,7 @@ mod pure_tests {
     use aruna_core::metadata::MetadataEventPayload;
     use aruna_core::storage_entries::{shard_manifest_key, sync_revision_key, updated_index_key};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
 
     fn node(seed: u8) -> NodeId {

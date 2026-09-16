@@ -16,7 +16,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::compute_config::RealmComputeConfig;
-use aruna_core::structs::placement::policy_document::policy_admin_path;
+use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
@@ -413,7 +413,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::realm::get_config::GetConfigOperation;
     use aruna_core::UserId;
-    use aruna_core::compute_quota::ComputeQuota;
+    use aruna_core::compute::quota::ComputeQuota;
     use aruna_core::document::DocumentTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;

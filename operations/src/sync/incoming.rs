@@ -25,7 +25,7 @@ use crate::placement::process_placements::reconcile_shard_topics;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoOperation;
-use crate::replication::incoming_version::{IncomingVersionOperation, IncomingVersionResult};
+use crate::replication::incoming::{IncomingVersionOperation, IncomingVersionResult};
 use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::{
     BaoReadRequest, LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,

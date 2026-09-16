@@ -32,7 +32,7 @@ use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
@@ -1928,7 +1928,7 @@ mod decision_tests {
     use super::pure_tests::TEST_NOW_MS;
     use super::*;
     use crate::placement::policy::PolicyCacheEntry;
-    use aruna_core::structs::placement::placement_policy::{
+    use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::BackendRef;

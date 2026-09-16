@@ -4,7 +4,7 @@
 
 use crate::error::ServerError;
 use crate::routes::info::{load_node_documents, management_node_urls};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;

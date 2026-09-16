@@ -31,7 +31,7 @@ use aruna_operations::metadata::persistent_id::forward::{
 use crate::auth::{ValidatedBearer, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{forwarded_auth_token, map_api_error};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(

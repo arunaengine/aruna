@@ -19,15 +19,15 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::binding_directory::BindingError;
 use aruna_core::structs::placement::node_subject::storage_subject;
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     BindingScope, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
     PlacementBinding, PlacementOverride, PlacementRef, PlacementScope, PlacementStrategy,
     StrategyBinding, normalize_placement_input,
 };
-use aruna_core::structs::placement::placement_transition::{
+use aruna_core::structs::placement::transition::{
     BucketPlan, CandidatePlacementMap, CompletionProof, TransitionPlan,
 };
-use aruna_core::structs::placement::policy_document::policy_admin_path;
+use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::reserved_label;
 use aruna_core::task::TaskEvent;

@@ -30,7 +30,7 @@ use aruna_operations::metadata::visibility_index::{
 };
 
 use crate::forwarded::external_base_url;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 
 /// OAI identifiers are the document graph IRI (`graph_iri_for`).
 const GRAPH_IRI_PREFIX: &str = "https://w3id.org/aruna/";

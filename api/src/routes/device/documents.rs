@@ -12,7 +12,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::replica::{ReplicaOrigin, ReplicaRecord, list_replicas};
 use aruna_operations::device::selection::{SelectionError, deselect_document, select_document};

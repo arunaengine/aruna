@@ -46,7 +46,7 @@ pub use subject::{
 };
 pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
 
-use aruna_core::structs::placement::placement_policy::PolicyResolution;
+use aruna_core::structs::placement::policy::PolicyResolution;
 use aruna_core::types::GroupId;
 use std::collections::BTreeMap;
 use ulid::Ulid;
@@ -78,11 +78,11 @@ pub(crate) mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
-    use aruna_core::structs::placement::placement_policy::{
+    use aruna_core::structs::placement::policy::{
         PlacementDecision, PlacementPolicy, PlacementSelector, PlacementSubject, PolicyResolution,
         VerifiedPolicy, evaluate_placement,
     };
-    use aruna_core::structs::placement::placement_record::{
+    use aruna_core::structs::placement::record::{
         DEFAULT_NODE_WEIGHT, NodePlacementEntry,
     };
     use std::collections::{BTreeMap, HashMap, HashSet};

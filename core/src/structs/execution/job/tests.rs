@@ -344,7 +344,7 @@ fn routable_child_ids() {
     // Child obligations remain on a non-default, high parent bucket.
     let parent = JobId::from_parts(
         1,
-        PlacementHandle::new(crate::structs::placement::placement_record::FIRST_GRANTABLE_HANDLE)
+        PlacementHandle::new(crate::structs::placement::record::FIRST_GRANTABLE_HANDLE)
             .unwrap(),
         BucketId::new(3_000).unwrap(),
         4,

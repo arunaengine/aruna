@@ -706,7 +706,7 @@ pub async fn search_metadata(
         return Err(MetadataApiError::BadRequest);
     }
     if let Some(iri) = request.conforms_to.take() {
-        request.conforms_to = crate::metadata::profile_validation::equivalent_profile_iris(&iri)
+        request.conforms_to = crate::metadata::profile::validation::equivalent_profile_iris(&iri)
             .into_iter()
             .next();
     }

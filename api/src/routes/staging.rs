@@ -7,7 +7,7 @@ use crate::routes::execution::jobs::{
     decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
 };
 use crate::routes::storage::connectors::ApiConnectorKind;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::structs::execution::job::{

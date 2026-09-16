@@ -763,7 +763,7 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
     use aruna_core::structs::identity::realm::{
         RealmConfigDocument, RealmDiscoveryConfig, RealmNodeKind,
     };
-    use aruna_core::structs::placement::placement_record::PlacementStrategy;
+    use aruna_core::structs::placement::record::PlacementStrategy;
 
     let storage = env.open_storage().await;
     let event = storage
@@ -922,7 +922,7 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_operations::sync::document_outbox::{new_outbox_record, outbox_write_entry};
 
     let storage = env.open_storage().await;

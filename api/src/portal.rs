@@ -1,6 +1,6 @@
 use crate::csp::{PortalCspConfig, PortalSecurity, portal_security_headers};
 use crate::error::ServerSetupError;
-use crate::server_state::{PortalRuntimeState, ServerState};
+use crate::server::state::{PortalRuntimeState, ServerState};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -204,7 +204,7 @@ mod tests {
     use crate::cors::CorsConfig;
     use crate::csp::PortalCspConfig;
     use crate::server::{MAX_BODY_SIZE, Server, ServerConfig};
-    use crate::server_state::{PortalStatus, ServerState};
+    use crate::server::state::{PortalStatus, ServerState};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};

@@ -9,7 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARD_MANIFEST_KEYSPACE;
 use aruna_core::storage_entries::{shard_manifest_prefix, sync_revision_key};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::placement_record::PlacementRef;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use aruna_net::NetHandle;

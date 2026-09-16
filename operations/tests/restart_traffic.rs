@@ -56,7 +56,7 @@ struct IncidentFixture {
     secrets: [iroh::SecretKey; 3],
     config: RealmConfigDocument,
     target: aruna_core::document::DocumentTarget,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
 }
 
 struct OutageFixture {
@@ -66,7 +66,7 @@ struct OutageFixture {
     secrets: [iroh::SecretKey; 3],
     config: RealmConfigDocument,
     target: aruna_core::document::DocumentTarget,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
     group_id: GroupId,
     document_id: Ulid,
     seeded: Vec<Vec<u8>>,
@@ -922,8 +922,8 @@ async fn spawn_incident_nodes(
     Ok(nodes)
 }
 
-fn incident_strategy() -> aruna_core::structs::placement::placement_record::PlacementStrategy {
-    aruna_core::structs::placement::placement_record::PlacementStrategy {
+fn incident_strategy() -> aruna_core::structs::placement::record::PlacementStrategy {
+    aruna_core::structs::placement::record::PlacementStrategy {
         strategy_id: Ulid::from_bytes([6u8; 16]),
         name: "incident".to_string(),
         replica_count: None,
@@ -936,9 +936,9 @@ fn incident_strategy() -> aruna_core::structs::placement::placement_record::Plac
 fn incident_config(
     realm_id: RealmId,
     nodes: &[TestNode],
-    strategy: &aruna_core::structs::placement::placement_record::PlacementStrategy,
+    strategy: &aruna_core::structs::placement::record::PlacementStrategy,
 ) -> RealmConfigDocument {
-    use aruna_core::structs::placement::placement_record::{
+    use aruna_core::structs::placement::record::{
         DocumentClass, METADATA_HANDLE, PlacementBinding, PlacementScope,
     };
     use aruna_core::structured_id::PlacementHandle;
@@ -962,11 +962,11 @@ fn incident_config(
 }
 
 fn incident_target(
-    strategy: &aruna_core::structs::placement::placement_record::PlacementStrategy,
+    strategy: &aruna_core::structs::placement::record::PlacementStrategy,
 ) -> Result<
     (
         aruna_core::document::DocumentTarget,
-        aruna_core::structs::placement::placement_record::PlacementRef,
+        aruna_core::structs::placement::record::PlacementRef,
     ),
     BoxError,
 > {
@@ -974,13 +974,13 @@ fn incident_target(
     use aruna_core::document::DocumentTarget;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
 
-    let placement = aruna_core::structs::placement::placement_record::PlacementRef {
+    let placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: strategy.strategy_id,
         shard: 5,
     };
     let document_id: Ulid = MetaResourceId::from_parts(
         2,
-        PlacementHandle::new(aruna_core::structs::placement::placement_record::METADATA_HANDLE)?,
+        PlacementHandle::new(aruna_core::structs::placement::record::METADATA_HANDLE)?,
         BucketId::new(5)?,
         2,
     )?
@@ -997,9 +997,9 @@ fn incident_target(
 fn ensure_incident_topics(
     realm_id: RealmId,
     nodes: &[TestNode],
-    strategy: &aruna_core::structs::placement::placement_record::PlacementStrategy,
+    strategy: &aruna_core::structs::placement::record::PlacementStrategy,
     target: &aruna_core::document::DocumentTarget,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
 ) -> Result<(), BoxError> {
     let local = nodes[0].net.node_id();
     let peer_two = nodes[2].net.node_id();
@@ -1007,7 +1007,7 @@ fn ensure_incident_topics(
         .map(|shard| {
             aruna_core::document::shard_topic_id(
                 realm_id,
-                &aruna_core::structs::placement::placement_record::PlacementRef {
+                &aruna_core::structs::placement::record::PlacementRef {
                     strategy_id: strategy.strategy_id,
                     shard,
                 },
@@ -1063,7 +1063,7 @@ async fn seed_outbox(
     realm_id: RealmId,
     local: aruna_core::NodeId,
     target: &aruna_core::document::DocumentTarget,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
     holders: &[aruna_core::NodeId],
     record_count: usize,
 ) -> Result<Vec<Vec<u8>>, BoxError> {
@@ -1103,7 +1103,7 @@ fn incident_record(
     realm_id: RealmId,
     local: aruna_core::NodeId,
     target: &aruna_core::document::DocumentTarget,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
     holders: &[aruna_core::NodeId],
     index: usize,
 ) -> Result<aruna_core::document::DocumentOutboxRecord, BoxError> {
@@ -1142,7 +1142,7 @@ fn incident_record(
                 bytes: postcard::to_allocvec(&registry)?,
                 change,
             },
-            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+            aruna_core::structs::placement::record::PlacementRef::NIL,
             false,
         ),
     )
@@ -1150,7 +1150,7 @@ fn incident_record(
 
 fn incident_delete(
     local: aruna_core::NodeId,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
     holders: &[aruna_core::NodeId],
     index: usize,
 ) -> Result<aruna_core::document::DocumentOutboxRecord, BoxError> {
@@ -1180,7 +1180,7 @@ fn incident_delete(
             target,
             holders.to_vec(),
             DocumentOutboxEvent::Delete { change },
-            aruna_core::structs::placement::placement_record::PlacementRef::NIL,
+            aruna_core::structs::placement::record::PlacementRef::NIL,
             false,
         ),
     )
@@ -1189,7 +1189,7 @@ fn incident_delete(
 fn incident_registry(
     realm_id: RealmId,
     target: &aruna_core::document::DocumentTarget,
-    placement: aruna_core::structs::placement::placement_record::PlacementRef,
+    placement: aruna_core::structs::placement::record::PlacementRef,
     holders: &[aruna_core::NodeId],
     index: usize,
 ) -> Result<aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord, BoxError> {

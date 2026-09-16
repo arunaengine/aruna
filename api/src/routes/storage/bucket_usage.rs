@@ -15,8 +15,8 @@ use utoipa_axum::routes;
 
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::storage_deletion::bucket_info;
-use crate::server_state::ServerState;
+use crate::routes::storage::deletion::bucket_info;
+use crate::server::state::ServerState;
 
 const DEFAULT_USAGE_LIMIT: usize = 10_000;
 const MAX_USAGE_LIMIT: usize = 100_000;

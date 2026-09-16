@@ -23,12 +23,12 @@ fn outsider_reports_rejected() {
         config.ensure_node(node(seed), kind);
     }
     config.placement_transitions.push(
-        aruna_core::structs::placement::placement_transition::PlacementTransition::new(
-            aruna_core::structs::placement::placement_transition::TransitionPlan {
+        aruna_core::structs::placement::transition::PlacementTransition::new(
+            aruna_core::structs::placement::transition::TransitionPlan {
                 transition_id,
                 strategy_id,
                 buckets: vec![
-                    aruna_core::structs::placement::placement_transition::BucketPlan {
+                    aruna_core::structs::placement::transition::BucketPlan {
                         bucket: 0,
                         old_holders: vec![node(1)],
                         target_holders: vec![node(2)],
@@ -77,7 +77,7 @@ fn outsider_reports_rejected() {
     // A proof from a non-target is rejected before any signature check.
     let foreign_proof = {
         let actor = test_actor(4, UserId::nil(realm_id), realm_id);
-        let claim = aruna_core::structs::placement::placement_transition::ProofClaim {
+        let claim = aruna_core::structs::placement::transition::ProofClaim {
             realm_id,
             transition_id,
             strategy_id,

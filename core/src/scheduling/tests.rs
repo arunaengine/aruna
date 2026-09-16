@@ -2,8 +2,8 @@ use super::*;
 use crate::NodeId;
 use crate::compute::{ExecutorAvailability, NetworkAccess, ResourceEnvelope, StagingMode};
 use crate::structs::identity::realm::RealmNodeKind;
-use crate::structs::placement::placement_policy::PlacementSelector;
-use crate::structs::placement::placement_record::LabelMatch;
+use crate::structs::placement::policy::PlacementSelector;
+use crate::structs::placement::record::LabelMatch;
 
 use crate::tests::scheduling::*;
 

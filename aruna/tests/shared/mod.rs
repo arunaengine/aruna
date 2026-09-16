@@ -13,7 +13,7 @@ use aruna_api::routes::credentials::{CreatePathRestriction, CreateS3Request, Cre
 use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupInfoResponse};
 use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::{Server, ServerConfig};
-use aruna_api::server_state::ServerState;
+use aruna_api::server::state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::UserId;

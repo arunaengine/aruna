@@ -4,7 +4,7 @@
 
 use crate::error::ErrorResponse;
 use crate::forwarded::client_ip;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::AuthContext;
 use axum::body::Body;

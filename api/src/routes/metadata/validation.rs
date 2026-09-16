@@ -8,11 +8,11 @@ use crate::metadata::{
     ProfileValidationResponse, ensure_metadata_scope, forwarded_auth_token, map_api_error,
     map_metadata_error, parse_document_id, serialize_jsonld_object,
 };
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::metadata::api::GetVisibleRequest;
 use aruna_operations::metadata::forward::route_profile_status as run_profile_validation_status;
-use aruna_operations::metadata::profile_validation::{
+use aruna_operations::metadata::profile::validation::{
     SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name, preview_submission as run_preview_submission,
 };
 use aruna_operations::metadata::public_preview::restricted_files as run_restricted_files;

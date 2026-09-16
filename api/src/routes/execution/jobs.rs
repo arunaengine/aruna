@@ -45,7 +45,7 @@ use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::{JobRequestError, admit_execution, hex32};
 use crate::rate_limit::LocalKey;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;

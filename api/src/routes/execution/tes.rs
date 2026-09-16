@@ -40,7 +40,7 @@ use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::error::ServerError;
 use crate::forwarded::external_base_url;
 use crate::routes::execution::jobs::{ExecutionTarget, map_local_error};
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 
 /// GA4GH TES version this facade implements.
 const TES_VERSION: &str = "1.1.0";

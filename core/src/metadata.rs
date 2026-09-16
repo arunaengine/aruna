@@ -1241,7 +1241,7 @@ mod tests {
         compare_metadata_clocks, raw_quotas, resolve_raw_revision,
     };
     use crate::structs::identity::realm::RealmId;
-    use crate::structs::placement::placement_record::PlacementRef;
+    use crate::structs::placement::record::PlacementRef;
     use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
     use crate::{NodeId, UserId};
     use craqle::{ActorId, VectorClock};

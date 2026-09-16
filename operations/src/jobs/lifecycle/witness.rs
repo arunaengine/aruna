@@ -20,7 +20,7 @@ use aruna_core::structs::execution::job::{
     PhysicalExecutionState, WitnessBudgetRecord,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::placement_policy::PlacementDecision;
+use aruna_core::structs::placement::policy::PlacementDecision;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId};
 use serde::{Deserialize, Serialize};

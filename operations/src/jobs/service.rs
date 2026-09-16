@@ -13,7 +13,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{JobOwnerError, RealmId};
-use aruna_core::structs::placement::placement_record::{
+use aruna_core::structs::placement::record::{
     DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
 };
 use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;

@@ -18,18 +18,18 @@ use crate::structs::identity::realm::{
     RealmDiscoveryConfig, RealmNodeKind, UserCapOverride,
 };
 use crate::structs::placement::binding_directory::BindingError;
-use crate::structs::placement::placement_record::{
+use crate::structs::placement::record::{
     AffinityEffect, AffinityRule, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HandleRange,
     LabelMatch, MAX_SHARD_COUNT, NodePlacementEntry, PlacementBinding, PlacementOverride,
     PlacementScope, PlacementStrategy, StrategyBinding,
 };
-use crate::structs::placement::placement_transition::{
+use crate::structs::placement::transition::{
     BucketPlan, CandidateMapNode, CandidatePlacementMap, CompletionProof, ProofClaim,
     TransitionLimits, TransitionPlan, TransitionStatus,
 };
 use crate::structs::storage::node_info::{CLASS_LABEL_PREFIX, KIND_LABEL_KEY};
 use crate::structured_id::PlacementHandle;
-use crate::user_validation::UserAttributeError;
+use crate::user::validation::UserAttributeError;
 use crate::{NodeId, UserId};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;

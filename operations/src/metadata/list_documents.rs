@@ -172,7 +172,7 @@ mod tests {
     use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
     use aruna_core::metadata::GraphLifecycleRecord;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::placement_record::PlacementRef;
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_storage::FjallStorage;
     use byteview::ByteView;

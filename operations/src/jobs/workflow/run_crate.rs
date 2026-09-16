@@ -833,7 +833,7 @@ mod tests {
     fn meets_builtin_profile() {
         // The built-in shapes must accept what this generator writes.
         use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-        use crate::metadata::profile_shacl::{ProfileShaclEngine, ProfileShapes};
+        use crate::metadata::profile::shacl::{ProfileShaclEngine, ProfileShapes};
 
         let (record, spec) = execution_record();
         let jsonld = build_crate_jsonld(&record, &spec, Ulid::from_bytes(record.job_id.to_bytes()));

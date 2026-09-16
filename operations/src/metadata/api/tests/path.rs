@@ -195,7 +195,7 @@ fn path_config(
     replica_count: Option<u32>,
 ) -> (RealmConfigDocument, Ulid) {
     let mut config = RealmConfigDocument::new(TEST_REALM_ID, Vec::new(), 3);
-    let strategy = aruna_core::structs::placement::placement_record::PlacementStrategy {
+    let strategy = aruna_core::structs::placement::record::PlacementStrategy {
         strategy_id: Ulid::from_bytes([5u8; 16]),
         name: "metadata-registry".to_string(),
         replica_count,

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::placement::placement_record::{
+use crate::structs::placement::record::{
     FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
 };
 use crate::structured_id::PlacementHandle;
@@ -154,7 +154,7 @@ impl HandleAllocationCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::placement::placement_record::{
+    use crate::structs::placement::record::{
         HANDLE_BANDS, HANDLE_RANGE_SIZE, HANDLE_SPACE_END, band_start,
     };
 
