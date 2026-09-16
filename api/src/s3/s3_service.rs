@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::s3::auth::map_authorize_error;
+use crate::s3::browse::{IndexEntry, render_index, wants_index};
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
     encode_checksums, parse_complete_multipart_checksum_request, parse_upload_checksum_request,
@@ -1097,6 +1098,99 @@ impl ArunaS3Service {
                 },
             });
         }
+    }
+}
+
+impl ArunaS3Service {
+    /// One page directly below a public folder for an unsigned browser request.
+    /// The access layer authorized the folder; each entry is checked again for
+    /// the Everyone principal, so a narrower rule never lists a private name.
+    async fn folder_index(
+        &self,
+        extensions: &http::Extensions,
+        group_id: aruna_core::types::GroupId,
+        bucket: &str,
+        prefix: &str,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let extras = extensions
+            .get::<PolicyRequestExtras>()
+            .cloned()
+            .ok_or_else(|| s3_error!(InternalError, "Missing policy context"))?;
+        let page = self
+            .run_object_listing(
+                LOV2I {
+                    bucket: bucket.to_owned(),
+                    group_id,
+                    continuation_token: None,
+                    max_keys: Some(ListObjectsV2Operation::DEFAULT_MAX_KEYS),
+                    prefix: Some(prefix.to_owned()),
+                    delimiter: Some("/".to_owned()),
+                    start_after: None,
+                },
+                None,
+                false,
+                None,
+            )
+            .await?;
+        let truncated = page.continuation_token.is_some();
+        let folders = page
+            .common_prefixes
+            .into_iter()
+            .filter_map(|folder| folder.prefix)
+            .map(|key| (key, None, None));
+        let objects = page.contents.into_iter().filter_map(|object| {
+            object
+                .key
+                .map(|key| (key, object.size, object.last_modified))
+        });
+        let anonymous = AuthContext::anonymous(self.realm_id);
+        let mut entries = Vec::new();
+        for (key, size, modified) in folders.chain(objects) {
+            let Some(name) = key.strip_prefix(prefix).filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let path =
+                blob_object_permission_path(self.realm_id, group_id, self.node_id, bucket, &key);
+            match authorize(
+                &self.state,
+                self.realm_id,
+                &anonymous,
+                &path,
+                &Permission::READ,
+                extras.clone(),
+            )
+            .await
+            {
+                Ok(_) => entries.push(IndexEntry {
+                    name: name.to_owned(),
+                    size,
+                    modified,
+                }),
+                Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {}
+                Err(error) => return Err(map_authorize_error(error)),
+            }
+        }
+
+        let html = render_index(bucket, prefix, &entries, truncated);
+        let output = GetObjectOutput {
+            content_length: i64::try_from(html.len()).ok(),
+            content_type: Some("text/html; charset=utf-8".to_owned()),
+            body: Some(StreamingBlob::from(bytes::Bytes::from(html))),
+            ..Default::default()
+        };
+        let mut response = S3Response::new(output);
+        response
+            .headers
+            .insert(http::header::VARY, http::HeaderValue::from_static("Accept"));
+        response.headers.insert(
+            http::header::X_CONTENT_TYPE_OPTIONS,
+            http::HeaderValue::from_static("nosniff"),
+        );
+        response.headers.insert(
+            http::header::CONTENT_SECURITY_POLICY,
+            http::HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
+        );
+        Ok(response)
     }
 }
 
@@ -2515,6 +2609,15 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        if user_access.user_identity.is_nil() && wants_index(&req.headers, &req.input.key) {
+            let group_id = bucket_info
+                .as_ref()
+                .map(|bucket_info| bucket_info.group_id)
+                .unwrap_or(user_access.group_id);
+            return self
+                .folder_index(&req.extensions, group_id, &req.input.bucket, &req.input.key)
+                .await;
+        }
         let requested_range = req.input.range;
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket;

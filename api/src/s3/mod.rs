@@ -1,4 +1,5 @@
 pub mod auth;
+mod browse;
 pub mod checksum;
 mod cors;
 mod error;
