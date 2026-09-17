@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -680,6 +682,157 @@ impl OperationsTaskHandler {
             crate::device::sync_status::note_sync(&self.context).await;
         }
     }
+
+    /// The timer map. Each arm is boxed here, outside an async body, so only
+    /// the selected timer's future stays on the stack while its work runs.
+    fn timer_work(&self, key: TaskKey) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        match key {
+            TaskKey::RealmPresence { realm_id, node_id } => Box::pin(async move {
+                // A User-kind device is DHT read-only and never publishes
+                // presence. An unreadable config is bootstrap, which announces.
+                if matches!(
+                    crate::forward::routing::is_user_origin(&self.context, realm_id, node_id).await,
+                    Ok(true)
+                ) {
+                    return;
+                }
+                let op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
+                    realm_id,
+                    node_id,
+                    schedule_refresh: true,
+                });
+                if let Err(err) = drive(op, self.context.as_ref()).await {
+                    error!(error = ?err, "Failed to process realm presence timer event");
+                    self.reschedule_timer(
+                        TaskKey::RealmPresence { realm_id, node_id },
+                        PRESENCE_REFRESH_AFTER,
+                    )
+                    .await;
+                }
+            }),
+            TaskKey::SyncPlacements { realm_id, node_id } => Box::pin(async move {
+                let key = TaskKey::SyncPlacements { realm_id, node_id };
+                // The same observation that reconciles shards reconciles this node's placement subject: a moved,
+                // draining or removed node stops admitting governed data and revalidates its inventory.
+                if let Err(error) =
+                    observe_placement(&self.context, realm_id, node_id, unix_timestamp_millis())
+                        .await
+                {
+                    warn!(error = %error, "Placement subject reconcile failed");
+                }
+                let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
+                match outcome.status {
+                    PlacementReconcileStatus::Clean => self.reset_backoff(&key),
+                    PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {
+                        let after = self.placement_retry_after(&key);
+                        self.reschedule_timer(key, after).await;
+                    }
+                    PlacementReconcileStatus::RetryScheduled => {}
+                    PlacementReconcileStatus::StorageFailure => {
+                        self.reschedule_timer(key, PLACEMENT_RETRY_AFTER).await;
+                    }
+                }
+            }),
+            TaskKey::DrainSyncOutbox => Box::pin(async move {
+                self.drain_sync_outbox().await;
+            }),
+            TaskKey::PublishUsageSnapshots => Box::pin(async move {
+                self.publish_usage_snapshots().await;
+            }),
+            TaskKey::PublishNodeInfo => Box::pin(async move {
+                self.publish_node_info().await;
+            }),
+            TaskKey::DrainProjectionQueue => Box::pin(async move {
+                self.drain_projection_queue().await;
+            }),
+            TaskKey::DrainMaterializationQueue => Box::pin(async move {
+                self.drain_materialization_queue().await;
+            }),
+            TaskKey::DrainPruneQueue => Box::pin(async move {
+                self.drain_graph_queue().await;
+            }),
+            TaskKey::DrainReplicationQueue => Box::pin(async move {
+                self.drain_replication_queue().await;
+            }),
+            TaskKey::DrainRefreshQueue => Box::pin(async move {
+                self.drain_refresh_queue().await;
+            }),
+            TaskKey::DrainNotificationOutbox => Box::pin(async move {
+                self.drain_notification_outbox().await;
+            }),
+            TaskKey::PruneNotifications => Box::pin(async move {
+                self.prune_notifications().await;
+            }),
+            TaskKey::PublishWatchInterest => Box::pin(async move {
+                self.publish_watch_interest().await;
+            }),
+            TaskKey::DrainJobQueue => Box::pin(async move {
+                self.drain_job_queue().await;
+            }),
+            TaskKey::PruneJobs => Box::pin(async move {
+                self.prune_jobs().await;
+            }),
+            TaskKey::DrainMirrorRepair => Box::pin(async move {
+                self.drain_mirror_repair().await;
+            }),
+            TaskKey::SweepHiddenBlobs => Box::pin(async move {
+                self.sweep_hidden_blobs().await;
+            }),
+            TaskKey::DrainCleanupQueue => Box::pin(async move {
+                self.drain_blob_cleanup().await;
+            }),
+            TaskKey::DrainReclaimQueue => Box::pin(async move {
+                self.drain_blob_reclaim().await;
+            }),
+            TaskKey::RefreshBlobHolders => Box::pin(async move {
+                self.refresh_blob_holders().await;
+            }),
+            TaskKey::DrainFamilyOutbox => Box::pin(async move {
+                self.drain_family_outbox().await;
+            }),
+            TaskKey::DrainWitnessQueue => Box::pin(async move {
+                self.drain_witness_queue().await;
+            }),
+            TaskKey::SettleJobTerminals => Box::pin(async move {
+                self.settle_job_terminals().await;
+            }),
+            TaskKey::ReconcileSyncedFolders => Box::pin(async move {
+                let after = match crate::device::sync::reconcile_folders(&self.context).await {
+                    DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
+                    DrainOutcome::Recheck => RECONCILE_CONTINUE_AFTER,
+                    DrainOutcome::Idle => RECONCILE_IDLE_AFTER,
+                };
+                self.reschedule_timer(TaskKey::ReconcileSyncedFolders, after)
+                    .await;
+                // After the folders, never before them: an unreachable realm
+                // must not hold up the owner's own files.
+                self.fetch_realm_documents().await;
+                self.refresh_device_replicas().await;
+            }),
+            TaskKey::DrainUploadOutbox => Box::pin(async move {
+                let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
+                    DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
+                    DrainOutcome::Recheck => Some(UPLOAD_CONTINUE_AFTER),
+                    DrainOutcome::Idle => None,
+                };
+                if let Some(after) = after {
+                    self.reschedule_timer(TaskKey::DrainUploadOutbox, after)
+                        .await;
+                }
+            }),
+            TaskKey::DrainDeviceIntake => Box::pin(async move {
+                let after = match crate::device::drain::drain_publish_queue(&self.context).await {
+                    DrainOutcome::Deferred => Some(PUBLISH_DEFER_AFTER),
+                    DrainOutcome::Recheck => Some(PUBLISH_CONTINUE_AFTER),
+                    DrainOutcome::Idle => None,
+                };
+                if let Some(after) = after {
+                    self.reschedule_timer(TaskKey::DrainDeviceIntake, after)
+                        .await;
+                }
+            }),
+        }
+    }
 }
 
 /// The durable queue work deferred until after the local serving gate.
@@ -702,152 +855,7 @@ pub struct OutboxDrainer {
 impl InboundTaskHandler for OperationsTaskHandler {
     async fn handle_timer(&self, key: TaskKey) {
         delete_persisted_timer(&self.context.storage_handle, &key).await;
-        match key {
-            TaskKey::RealmPresence { realm_id, node_id } => {
-                // A User-kind device is DHT read-only and never publishes
-                // presence. An unreadable config is bootstrap, which announces.
-                if matches!(
-                    crate::forward::routing::is_user_origin(&self.context, realm_id, node_id).await,
-                    Ok(true)
-                ) {
-                    return;
-                }
-                let op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-                    realm_id,
-                    node_id,
-                    schedule_refresh: true,
-                });
-                if let Err(err) = drive(op, self.context.as_ref()).await {
-                    error!(error = ?err, "Failed to process realm presence timer event");
-                    self.reschedule_timer(
-                        TaskKey::RealmPresence { realm_id, node_id },
-                        PRESENCE_REFRESH_AFTER,
-                    )
-                    .await;
-                }
-            }
-            TaskKey::SyncPlacements { realm_id, node_id } => {
-                let key = TaskKey::SyncPlacements { realm_id, node_id };
-                // The same observation that reconciles shards reconciles this node's placement subject: a moved,
-                // draining or removed node stops admitting governed data and revalidates its inventory.
-                if let Err(error) =
-                    observe_placement(&self.context, realm_id, node_id, unix_timestamp_millis())
-                        .await
-                {
-                    warn!(error = %error, "Placement subject reconcile failed");
-                }
-                let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
-                match outcome.status {
-                    PlacementReconcileStatus::Clean => self.reset_backoff(&key),
-                    PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {
-                        let after = self.placement_retry_after(&key);
-                        self.reschedule_timer(key, after).await;
-                    }
-                    PlacementReconcileStatus::RetryScheduled => {}
-                    PlacementReconcileStatus::StorageFailure => {
-                        self.reschedule_timer(key, PLACEMENT_RETRY_AFTER).await;
-                    }
-                }
-            }
-            TaskKey::DrainSyncOutbox => {
-                self.drain_sync_outbox().await;
-            }
-            TaskKey::PublishUsageSnapshots => {
-                self.publish_usage_snapshots().await;
-            }
-            TaskKey::PublishNodeInfo => {
-                self.publish_node_info().await;
-            }
-            TaskKey::DrainProjectionQueue => {
-                self.drain_projection_queue().await;
-            }
-            TaskKey::DrainMaterializationQueue => {
-                self.drain_materialization_queue().await;
-            }
-            TaskKey::DrainPruneQueue => {
-                self.drain_graph_queue().await;
-            }
-            TaskKey::DrainReplicationQueue => {
-                self.drain_replication_queue().await;
-            }
-            TaskKey::DrainRefreshQueue => {
-                self.drain_refresh_queue().await;
-            }
-            TaskKey::DrainNotificationOutbox => {
-                self.drain_notification_outbox().await;
-            }
-            TaskKey::PruneNotifications => {
-                self.prune_notifications().await;
-            }
-            TaskKey::PublishWatchInterest => {
-                self.publish_watch_interest().await;
-            }
-            TaskKey::DrainJobQueue => {
-                self.drain_job_queue().await;
-            }
-            TaskKey::PruneJobs => {
-                self.prune_jobs().await;
-            }
-            TaskKey::DrainMirrorRepair => {
-                self.drain_mirror_repair().await;
-            }
-            TaskKey::SweepHiddenBlobs => {
-                self.sweep_hidden_blobs().await;
-            }
-            TaskKey::DrainCleanupQueue => {
-                self.drain_blob_cleanup().await;
-            }
-            TaskKey::DrainReclaimQueue => {
-                self.drain_blob_reclaim().await;
-            }
-            TaskKey::RefreshBlobHolders => {
-                self.refresh_blob_holders().await;
-            }
-            TaskKey::DrainFamilyOutbox => {
-                self.drain_family_outbox().await;
-            }
-            TaskKey::DrainWitnessQueue => {
-                self.drain_witness_queue().await;
-            }
-            TaskKey::SettleJobTerminals => {
-                self.settle_job_terminals().await;
-            }
-            TaskKey::ReconcileSyncedFolders => {
-                let after = match crate::device::sync::reconcile_folders(&self.context).await {
-                    DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
-                    DrainOutcome::Recheck => RECONCILE_CONTINUE_AFTER,
-                    DrainOutcome::Idle => RECONCILE_IDLE_AFTER,
-                };
-                self.reschedule_timer(TaskKey::ReconcileSyncedFolders, after)
-                    .await;
-                // After the folders, never before them: an unreachable realm
-                // must not hold up the owner's own files.
-                self.fetch_realm_documents().await;
-                self.refresh_device_replicas().await;
-            }
-            TaskKey::DrainUploadOutbox => {
-                let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
-                    DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
-                    DrainOutcome::Recheck => Some(UPLOAD_CONTINUE_AFTER),
-                    DrainOutcome::Idle => None,
-                };
-                if let Some(after) = after {
-                    self.reschedule_timer(TaskKey::DrainUploadOutbox, after)
-                        .await;
-                }
-            }
-            TaskKey::DrainDeviceIntake => {
-                let after = match crate::device::drain::drain_publish_queue(&self.context).await {
-                    DrainOutcome::Deferred => Some(PUBLISH_DEFER_AFTER),
-                    DrainOutcome::Recheck => Some(PUBLISH_CONTINUE_AFTER),
-                    DrainOutcome::Idle => None,
-                };
-                if let Some(after) = after {
-                    self.reschedule_timer(TaskKey::DrainDeviceIntake, after)
-                        .await;
-                }
-            }
-        }
+        self.timer_work(key).await;
     }
 }
 

@@ -687,7 +687,9 @@ pub async fn drive<O: Operation>(
     );
 
     let mut run = ParentRun(&mut operation);
-    let mut state = drive_effects(
+    // Heap the effect loop: an adapter may drive another operation inline, and
+    // nested effect-loop futures otherwise stack up in one caller's future.
+    let mut state = Box::pin(drive_effects(
         &mut run,
         context,
         0,
@@ -695,7 +697,7 @@ pub async fn drive<O: Operation>(
         DeadlineAbort::BeforeCommitOnly,
         ExpiryRecheck::Once,
         None,
-    )
+    ))
     .await;
     abort_leaked_transaction(&mut state.tracker, context, 0, None).await;
     let result = operation.finalize();
