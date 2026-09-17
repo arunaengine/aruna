@@ -742,7 +742,9 @@ mod tests {
             })
         ));
 
-        release.send(()).expect("the boundary child must still wait");
+        release
+            .send(())
+            .expect("the boundary child must still wait");
         tokio::time::timeout(Duration::from_secs(5), finished_rx)
             .await
             .expect("the released boundary child must finish")

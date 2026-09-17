@@ -867,10 +867,13 @@ async fn superseded_releases_session() {
     let taken_over = lose_claim(&storage, job_id, token).await;
 
     skip_heartbeat().await;
-    tokio::time::timeout(Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000), supervisor)
-        .await
-        .expect("the superseded supervisor must return")
-        .expect("the supervisor task must not panic");
+    tokio::time::timeout(
+        Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000),
+        supervisor,
+    )
+    .await
+    .expect("the superseded supervisor must return")
+    .expect("the supervisor task must not panic");
 
     assert_eq!(session.finished().await, EndReason::Cancelled);
     assert!(
@@ -930,10 +933,13 @@ async fn superseded_keeps_replacement() {
     let taken_over = lose_claim(&storage, job_id, token).await;
 
     skip_heartbeat().await;
-    tokio::time::timeout(Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000), supervisor)
-        .await
-        .expect("the superseded supervisor must return")
-        .expect("the supervisor task must not panic");
+    tokio::time::timeout(
+        Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000),
+        supervisor,
+    )
+    .await
+    .expect("the superseded supervisor must return")
+    .expect("the supervisor task must not panic");
 
     let registered = registry
         .sessions()

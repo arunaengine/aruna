@@ -743,7 +743,10 @@ mod tests {
             Duration::from_secs(1)
         );
         assert_eq!(ingress_budget(grace, Duration::ZERO), Duration::ZERO);
-        assert_eq!(ingress_budget(Duration::ZERO, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            ingress_budget(Duration::ZERO, Duration::ZERO),
+            Duration::ZERO
+        );
     }
 
     // A configured grace too small for the protected tail is invalid, not a
