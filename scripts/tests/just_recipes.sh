@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fast contract test for the ten public Just recipes. It never starts a real
+# Fast contract test for the thirteen public Just recipes. It never starts a real
 # service: stub binaries and fake prerequisite commands cover every path.
 set -uo pipefail
 
@@ -193,8 +193,8 @@ test_recipe_list() {
       | sort \
       | tr '\n' ' '
   )"
-  check_eq "recipe list is exactly the ten public recipes" \
-    "check lint local local-cluster local-cluster-oidc local-new preview preview-no-oidc stop test " "$names"
+  check_eq "recipe list is exactly the thirteen public recipes" \
+    "check lint local local-cluster local-cluster-oidc local-new preview preview-no-oidc stop style test test-fast test-fast-workspace " "$names"
 }
 
 test_dry_runs() {
