@@ -1,6 +1,6 @@
 # glibc, not musl: musl's `cmsghdr` is 4-byte aligned, so noq-udp's receive
 # timestamp decode trips its alignment assertion and aborts the process.
-FROM rust:1.98.1-trixie@sha256:462a9af3c54fb4718850d3c602fc0e54452c20b1c12a4e4080fdb001d4b9acbf AS builder
+FROM rust:1.97.1-trixie@sha256:1bcff4befb740599103a2c7cb51058e14479b2e35e3a34a3f0dc4ede09927488 AS builder
 WORKDIR /build
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 # mold and clang back `.cargo/config.toml`, which only applies to the gnu target.

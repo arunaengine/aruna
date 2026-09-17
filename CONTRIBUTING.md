@@ -15,7 +15,7 @@ During local work, use focused checks for the changed behavior and run
 the same formatting and Clippy commands as CI. The lint recipe
 pins `nightly-2026-09-14`; install it with
 `rustup toolchain install nightly-2026-09-14 -c rustfmt -c clippy` if it is
-missing. Builds use stable `1.98.1` from `rust-toolchain.toml`. Do not run the
+missing. Builds use stable `1.97.1` from `rust-toolchain.toml`. Do not run the
 general test suite per edit or commit; documentation-only changes need
 reference and formatting checks.
 
