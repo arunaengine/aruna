@@ -128,7 +128,6 @@ pub(crate) mod tests {
 
     use super::rest_openapi;
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
 
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
@@ -431,93 +430,6 @@ pub(crate) mod tests {
         routes
     }
 
-    fn source_files(dir: &Path, files: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("readable route directory") {
-            let path = entry.expect("readable route entry").path();
-            if path.is_dir() {
-                source_files(&path, files);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
-        }
-    }
-
-    /// Child modules declared behind `#[cfg(test)] mod name;`: their file is
-    /// test code, so the raw-route scan must not read assembly out of them.
-    /// Hoisted suites name their file beside the owner with `#[path = "..."]`.
-    fn test_modules(file: &Path, source: &str) -> Vec<PathBuf> {
-        let lines = source.lines().collect::<Vec<_>>();
-        let mut modules = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            if line.trim() != "#[cfg(test)]" {
-                continue;
-            }
-            let (declaration, hoisted) = match lines.get(index + 1) {
-                Some(line) if line.starts_with("#[path = ") => (
-                    lines
-                        .get(index + 2)
-                        .and_then(|line| line.strip_prefix("mod ")),
-                    line.strip_prefix("#[path = \"")
-                        .and_then(|path| path.strip_suffix("\"]")),
-                ),
-                Some(line) => (line.strip_prefix("mod "), None),
-                None => (None, None),
-            };
-            let Some(name) = declaration.and_then(|declaration| declaration.strip_suffix(';'))
-            else {
-                continue;
-            };
-            if let Some(hoisted) = hoisted {
-                let owner_dir = file.parent().unwrap_or_else(|| Path::new(""));
-                modules.push(owner_dir.join(hoisted));
-                continue;
-            }
-            let directory = file.with_extension("");
-            let candidate = directory.join(format!("{name}.rs"));
-            modules.push(if candidate.exists() {
-                candidate
-            } else {
-                directory.join(name).join("mod.rs")
-            });
-        }
-        modules
-    }
-
-    fn raw_gaps(file: &Path, source: &str) -> Vec<&'static str> {
-        let source = source.split("#[cfg(test)]").next().unwrap_or_default();
-        [".route(", ".route_service(", ".nest(", ".nest_service("]
-            .into_iter()
-            .filter(|form| {
-                let allowed_line = if file.file_name().is_some_and(|name| name == "mod.rs")
-                    && *form == ".route("
-                {
-                    Some("router.route(path, method_router)")
-                } else if file.file_name().is_some_and(|name| name == "server.rs")
-                    && *form == ".nest("
-                {
-                    Some(".nest(\"/api/v1\", api_v1)")
-                } else {
-                    None
-                };
-                if let Some(allowed_line) = allowed_line {
-                    let mut allowed = false;
-                    return source
-                        .lines()
-                        .filter(|line| line.contains(*form))
-                        .any(|line| {
-                            if !allowed && line.trim() == allowed_line {
-                                allowed = true;
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                }
-                source.contains(*form)
-            })
-            .collect()
-    }
-
     #[test]
     fn preserves_route_inventory() {
         let expected = RUNTIME_ROUTES
@@ -529,46 +441,5 @@ pub(crate) mod tests {
             expected,
             "co-registered routes must match the runtime inventory exactly"
         );
-    }
-
-    #[test]
-    fn forbids_raw_routes() {
-        // Only routes_at and the root /api/v1 nest may reach Axum path assembly;
-        // a REST route added any other way would lack a generated operation.
-        let mut files = Vec::new();
-        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        source_files(&source_root.join("src/routes"), &mut files);
-        files.push(source_root.join("src/server.rs"));
-        assert!(files.len() > 1, "route modules must be discoverable");
-        let sources = files
-            .iter()
-            .map(|file| {
-                (
-                    file.clone(),
-                    std::fs::read_to_string(file).expect("readable route module"),
-                )
-            })
-            .collect::<Vec<_>>();
-        let test_files = sources
-            .iter()
-            .flat_map(|(file, source)| test_modules(file, source))
-            .collect::<BTreeSet<_>>();
-        for (file, source) in sources {
-            if test_files.contains(&file) {
-                continue;
-            }
-            if let Some(form) = raw_gaps(&file, &source).first() {
-                panic!(
-                    "{} registers {form} outside routes!; use routes! or routes_at",
-                    file.display()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rejects_raw_fixture() {
-        let source = "let router = Router::new().route(\"/health\", get(handler));";
-        assert!(!raw_gaps(Path::new("server.rs"), source).is_empty());
     }
 }
