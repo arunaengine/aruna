@@ -130,7 +130,8 @@ struct NetInner {
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
     inbound_handler_registered: Arc<Notify>,
     inbound_tasks: TaskTracker,
-    // Released with admission, or the inbound stream task never sees the channel close.
+    // Released at final network teardown, not at admission close: handlers
+    // already accepted keep reaching this node while the writers drain.
     loopback_streams: parking_lot::Mutex<Option<mpsc::Sender<(Alpn, streams::BiStream, NodeId)>>>,
     /// Accepted effect futures the dispatcher spawned; shutdown waits for these
     /// as well as for the dispatcher that accepted them.
@@ -674,7 +675,10 @@ impl NetHandle {
                     "node no longer admits streams".to_string(),
                 ));
             };
-            return streams::open_loopback(alpn, node_id, &loopback_streams);
+            return self
+                .inner
+                .streams
+                .open_loopback(alpn, node_id, &loopback_streams);
         }
         if node_id != self.inner.node_id {
             if let Err(err) = self.inner.dht.add_peer(node_id) {
@@ -787,13 +791,19 @@ impl NetHandle {
         self.shutdown_with_drain(DEFAULT_INBOUND_DRAIN).await;
     }
 
-    /// Stops accepting inbound streams and further handlers without waiting for
-    /// in-flight ones or tearing the endpoint down: outgoing effects stay until
-    /// final closure. A closed tracker only lets `wait` finish, never rejects.
+    /// Stops external inbound admission without waiting for in-flight handlers
+    /// or tearing the endpoint down: effects and the same-node loopback stay
+    /// open until final closure, so accepted work can still reach this node.
     pub fn close_admission(&self) {
         self.inner.accept_shutdown.cancel();
-        self.inner.loopback_streams.lock().take();
         self.inner.inbound_tasks.close();
+    }
+
+    /// Final loopback closure: new same-node dials fail and pending local IO
+    /// wakes with a broken pipe. Idempotent, so a resumed shutdown repeats it.
+    fn close_loopback_admission(&self) {
+        self.inner.loopback_streams.lock().take();
+        self.inner.streams.close_loopback();
     }
 
     /// Stops inbound admission, gives running handlers up to `drain`, then
@@ -814,6 +824,11 @@ impl NetHandle {
                 "Inbound stream handlers outlived the drain deadline; closing the endpoint under them"
             );
         }
+
+        // Every accepted handler had its drain window. Close the in-process
+        // loopback so local IO they still await fails instead of blocking the
+        // forced joins, and no new same-node work is admitted from here on.
+        self.close_loopback_admission();
 
         // Final closure of the outgoing-effect boundary. The dispatcher settles
         // every buffered effect and outstanding send reservation under the

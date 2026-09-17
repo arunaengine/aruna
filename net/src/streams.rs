@@ -6,9 +6,9 @@ use iroh::endpoint::{ClosedStream, Connection, ReadError, ReadToEndError, VarInt
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::Semaphore;
@@ -256,20 +256,117 @@ impl Drop for InboundConnectionPermit {
 /// Pipe capacity per direction of an in-process stream.
 const LOOPBACK_PIPE_SIZE: usize = 64 * 1024;
 
+/// Cancellation flag shared by every half of one in-process stream. Closing
+/// the loopback wakes every task parked on a local read or write, so those
+/// futures fail instead of waiting on a pipe whose peer will never run again.
+#[derive(Debug, Default)]
+pub struct StreamCancellation {
+    cancelled: AtomicBool,
+    wakers: Mutex<Vec<Waker>>,
+}
+
+impl StreamCancellation {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let wakers = std::mem::take(&mut *self.wakers.lock());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// True when already cancelled; otherwise registers the poll's waker so
+    /// the next cancel wakes it. The check after the push closes the race with
+    /// a cancel that lands between the first check and the registration.
+    fn register(&self, waker: &Waker) -> bool {
+        if self.cancelled() {
+            return true;
+        }
+        {
+            let mut wakers = self.wakers.lock();
+            if !wakers.iter().any(|registered| registered.will_wake(waker)) {
+                wakers.push(waker.clone());
+            }
+        }
+        self.cancelled()
+    }
+}
+
+/// Lifetime owner of the loopback admission. One cancellation per dial is
+/// shared by all four halves, so closing the service wakes every parked
+/// stream; new dials are refused once it is closed.
+#[derive(Debug, Default)]
+pub(crate) struct LoopbackService {
+    state: Mutex<LoopbackState>,
+}
+
+#[derive(Debug, Default)]
+struct LoopbackState {
+    closed: bool,
+    live: Vec<Weak<StreamCancellation>>,
+}
+
+impl LoopbackService {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn open(
+        &self,
+        alpn: Alpn,
+        node_id: NodeId,
+        stream_handler: &mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    ) -> Result<BiStream> {
+        let cancellation = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Err(NetError::Stream("loopback admission is closed".to_string()));
+            }
+            state.live.retain(|live| live.strong_count() > 0);
+            let cancellation = Arc::new(StreamCancellation::new());
+            state.live.push(Arc::downgrade(&cancellation));
+            cancellation
+        };
+        open_loopback(alpn, node_id, stream_handler, &cancellation)
+    }
+
+    /// Idempotent: closing again only re-asserts the closed state, so a
+    /// resumed shutdown may repeat it.
+    pub(crate) fn close(&self) {
+        let live = {
+            let mut state = self.state.lock();
+            state.closed = true;
+            std::mem::take(&mut state.live)
+        };
+        for weak in live {
+            if let Some(cancellation) = weak.upgrade() {
+                cancellation.cancel();
+            }
+        }
+    }
+}
+
 /// Send half of a stream: an iroh stream to a peer, or one end of an
 /// in-process pipe when the node dials itself. `finish` drops the pipe end,
 /// which the reading side observes as end of stream.
 #[derive(Debug)]
 pub enum SendStream {
     Remote(iroh::endpoint::SendStream),
-    Local(Option<DuplexStream>),
+    Local(Option<DuplexStream>, Arc<StreamCancellation>),
 }
 
 impl SendStream {
     pub fn finish(&mut self) -> std::result::Result<(), ClosedStream> {
         match self {
             Self::Remote(stream) => stream.finish(),
-            Self::Local(pipe) => {
+            Self::Local(pipe, _) => {
                 pipe.take();
                 Ok(())
             }
@@ -279,7 +376,7 @@ impl SendStream {
     pub fn reset(&mut self, error_code: VarInt) -> std::result::Result<(), ClosedStream> {
         match self {
             Self::Remote(stream) => stream.reset(error_code),
-            Self::Local(pipe) => {
+            Self::Local(pipe, _) => {
                 pipe.take();
                 Ok(())
             }
@@ -295,24 +392,34 @@ impl AsyncWrite for SendStream {
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Self::Remote(stream) => AsyncWrite::poll_write(Pin::new(stream), cx, buf),
-            Self::Local(Some(pipe)) => Pin::new(pipe).poll_write(cx, buf),
-            Self::Local(None) => Poll::Ready(Err(finished_pipe())),
+            Self::Local(Some(pipe), cancellation) => {
+                if cancellation.cancelled() {
+                    return Poll::Ready(Err(cancelled_pipe()));
+                }
+                match Pin::new(pipe).poll_write(cx, buf) {
+                    Poll::Pending if cancellation.register(cx.waker()) => {
+                        Poll::Ready(Err(cancelled_pipe()))
+                    }
+                    poll => poll,
+                }
+            }
+            Self::Local(None, _) => Poll::Ready(Err(finished_pipe())),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Remote(stream) => AsyncWrite::poll_flush(Pin::new(stream), cx),
-            Self::Local(Some(pipe)) => Pin::new(pipe).poll_flush(cx),
-            Self::Local(None) => Poll::Ready(Err(finished_pipe())),
+            Self::Local(Some(pipe), _) => Pin::new(pipe).poll_flush(cx),
+            Self::Local(None, _) => Poll::Ready(Err(finished_pipe())),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Remote(stream) => AsyncWrite::poll_shutdown(Pin::new(stream), cx),
-            Self::Local(Some(pipe)) => Pin::new(pipe).poll_shutdown(cx),
-            Self::Local(None) => Poll::Ready(Ok(())),
+            Self::Local(Some(pipe), _) => Pin::new(pipe).poll_shutdown(cx),
+            Self::Local(None, _) => Poll::Ready(Ok(())),
         }
     }
 }
@@ -321,19 +428,23 @@ fn finished_pipe() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "local stream finished")
 }
 
+fn cancelled_pipe() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "local stream cancelled")
+}
+
 /// Receive half of a stream; `stop` drops a pipe end so the writer sees a
 /// broken pipe, like a stopped iroh stream.
 #[derive(Debug)]
 pub enum RecvStream {
     Remote(iroh::endpoint::RecvStream),
-    Local(Option<DuplexStream>),
+    Local(Option<DuplexStream>, Arc<StreamCancellation>),
 }
 
 impl RecvStream {
     pub fn stop(&mut self, error_code: VarInt) -> std::result::Result<(), ClosedStream> {
         match self {
             Self::Remote(stream) => stream.stop(error_code),
-            Self::Local(pipe) => {
+            Self::Local(pipe, _) => {
                 pipe.take();
                 Ok(())
             }
@@ -345,22 +456,18 @@ impl RecvStream {
         &mut self,
         size_limit: usize,
     ) -> std::result::Result<Vec<u8>, ReadToEndError> {
-        match self {
-            Self::Remote(stream) => stream.read_to_end(size_limit).await,
-            Self::Local(pipe) => {
-                let mut bytes = Vec::new();
-                if let Some(pipe) = pipe {
-                    AsyncReadExt::take(pipe, size_limit as u64 + 1)
-                        .read_to_end(&mut bytes)
-                        .await
-                        .map_err(|_| ReadToEndError::Read(ReadError::ClosedStream))?;
-                }
-                if bytes.len() > size_limit {
-                    return Err(ReadToEndError::TooLong);
-                }
-                Ok(bytes)
-            }
+        if let Self::Remote(stream) = self {
+            return stream.read_to_end(size_limit).await;
         }
+        let mut bytes = Vec::new();
+        AsyncReadExt::take(&mut *self, size_limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| ReadToEndError::Read(ReadError::ClosedStream))?;
+        if bytes.len() > size_limit {
+            return Err(ReadToEndError::TooLong);
+        }
+        Ok(bytes)
     }
 }
 
@@ -372,32 +479,44 @@ impl AsyncRead for RecvStream {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Remote(stream) => AsyncRead::poll_read(Pin::new(stream), cx, buf),
-            Self::Local(Some(pipe)) => Pin::new(pipe).poll_read(cx, buf),
-            Self::Local(None) => Poll::Ready(Ok(())),
+            Self::Local(Some(pipe), cancellation) => {
+                if cancellation.cancelled() {
+                    return Poll::Ready(Err(cancelled_pipe()));
+                }
+                match Pin::new(pipe).poll_read(cx, buf) {
+                    Poll::Pending if cancellation.register(cx.waker()) => {
+                        Poll::Ready(Err(cancelled_pipe()))
+                    }
+                    poll => poll,
+                }
+            }
+            Self::Local(None, _) => Poll::Ready(Ok(())),
         }
     }
 }
 
-/// Opens a stream to this node itself. One pipe carries each direction; the
-/// far end is queued to the inbound stream handler like an accepted stream.
+/// Opens a stream to this node itself: one pipe per direction, and the far
+/// end is queued to the inbound stream handler like an accepted stream. Both
+/// ends share `cancellation`, so closing the loopback wakes parked halves.
 pub(crate) fn open_loopback(
     alpn: Alpn,
     node_id: NodeId,
     stream_handler: &mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    cancellation: &Arc<StreamCancellation>,
 ) -> Result<BiStream> {
     let (outbound_send, inbound_recv) = tokio::io::duplex(LOOPBACK_PIPE_SIZE);
     let (inbound_send, outbound_recv) = tokio::io::duplex(LOOPBACK_PIPE_SIZE);
     let inbound = BiStream(
-        SendStream::Local(Some(inbound_send)),
-        RecvStream::Local(Some(inbound_recv)),
+        SendStream::Local(Some(inbound_send), cancellation.clone()),
+        RecvStream::Local(Some(inbound_recv), cancellation.clone()),
         None,
     );
     stream_handler
         .try_send((alpn, inbound, node_id))
         .map_err(|error| NetError::Stream(format!("loopback {alpn} stream not queued: {error}")))?;
     Ok(BiStream(
-        SendStream::Local(Some(outbound_send)),
-        RecvStream::Local(Some(outbound_recv)),
+        SendStream::Local(Some(outbound_send), cancellation.clone()),
+        RecvStream::Local(Some(outbound_recv), cancellation.clone()),
         None,
     ))
 }
@@ -435,11 +554,30 @@ impl AsyncRead for LeasedRecvStream {
 
 pub struct StreamsService {
     connection_pool: ConnectionPool,
+    loopback: LoopbackService,
 }
 
 impl StreamsService {
     pub fn new(connection_pool: ConnectionPool) -> Self {
-        Self { connection_pool }
+        Self {
+            connection_pool,
+            loopback: LoopbackService::new(),
+        }
+    }
+
+    pub(crate) fn open_loopback(
+        &self,
+        alpn: Alpn,
+        node_id: NodeId,
+        stream_handler: &mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    ) -> Result<BiStream> {
+        self.loopback.open(alpn, node_id, stream_handler)
+    }
+
+    /// Closes the loopback admission for good: new same-node dials fail and
+    /// every live local pipe half wakes with a broken pipe. Idempotent.
+    pub(crate) fn close_loopback(&self) {
+        self.loopback.close();
     }
 
     #[tracing::instrument(
@@ -1246,5 +1384,71 @@ mod tests {
             _ = &mut timers.lifetime => {}
             _ = std::future::ready(()) => panic!("lifetime must fire despite activity"),
         }
+    }
+
+    #[tokio::test]
+    async fn loopback_queue_saturated() {
+        let (stream_tx, _stream_rx) = mpsc::channel(1);
+        let service = LoopbackService::new();
+        let _queued = service
+            .open(Alpn::Bao, peer(1), &stream_tx)
+            .expect("the empty queue accepts the first loopback dial");
+        let error = service
+            .open(Alpn::Bao, peer(1), &stream_tx)
+            .expect_err("a saturated inbound queue refuses the dial");
+        assert!(matches!(error, NetError::Stream(_)));
+    }
+
+    #[tokio::test]
+    async fn close_wakes_pending() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let service = LoopbackService::new();
+        let dialed = service
+            .open(Alpn::Bao, peer(1), &stream_tx)
+            .expect("loopback dial is queued");
+        // The queued handler half stays parked: nothing reads or writes it, so
+        // both dialed halves stay pending until the cancellation wakes them.
+        let _held = stream_rx.recv().await.expect("queued loopback stream");
+        let BiStream(send, recv, _) = dialed;
+
+        let (read_done, read_result) = oneshot::channel();
+        let read_task = tokio::spawn(async move {
+            let mut recv = recv;
+            let mut buf = [0u8; 8];
+            let _ = read_done.send(recv.read(&mut buf).await.is_err());
+        });
+        let (write_done, write_result) = oneshot::channel();
+        let write_task = tokio::spawn(async move {
+            let mut send = send;
+            let payload = vec![0u8; LOOPBACK_PIPE_SIZE * 2];
+            let _ = write_done.send(send.write_all(&payload).await.is_err());
+        });
+
+        service.close();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), read_result)
+                .await
+                .expect("a parked local read must wake")
+                .expect("the read task must report"),
+            "a parked local read must fail once the loopback closes"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), write_result)
+                .await
+                .expect("a blocked local write must wake")
+                .expect("the write task must report"),
+            "a blocked local write must fail once the loopback closes"
+        );
+        read_task.await.expect("the read task joins");
+        write_task.await.expect("the write task joins");
+
+        let error = service
+            .open(Alpn::Bao, peer(1), &stream_tx)
+            .expect_err("a closed loopback admits no new dial");
+        assert!(matches!(error, NetError::Stream(_)));
     }
 }
