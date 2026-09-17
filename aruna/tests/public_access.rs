@@ -295,7 +295,7 @@ async fn public_grants_read() -> TestResult<()> {
 /// and private folders keep their S3 answers.
 #[tokio::test]
 async fn public_folder_index() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+    let seed = spawn_complete_seed().await?;
 
     let result = async {
         let bearer_token = create_bearer_token(
@@ -305,13 +305,13 @@ async fn public_folder_index() -> TestResult<()> {
             seed.capabilities.clone(),
         )
         .await?;
-        let group = create_group_via_http(&seed.base_url, &bearer_token, "public-index").await?;
+        let group = create_group_http(&seed.base_url, &bearer_token, "public-index").await?;
         let s3_endpoint = seed
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
         let credentials =
-            create_s3_credentials_via_http(&seed.base_url, &bearer_token, &group.group_id).await?;
+            create_s3_credentials(&seed.base_url, &bearer_token, &group.group_id).await?;
         let s3 = s3_client(s3_endpoint, &credentials);
 
         let bucket = "index-bucket";
@@ -334,7 +334,7 @@ async fn public_folder_index() -> TestResult<()> {
 
         let group_ulid = Ulid::from_string(&group.group_id)?;
         let bucket_path =
-            blob_bucket_permission_path(seed.realm_id, group_ulid, seed.net.node_id(), bucket);
+            bucket_permission_path(seed.realm_id, group_ulid, seed.net.node_id(), bucket);
         let permissions = std::collections::HashMap::from([
             (format!("{bucket_path}/open/**"), "read"),
             (format!("{bucket_path}/mixed/"), "read"),
