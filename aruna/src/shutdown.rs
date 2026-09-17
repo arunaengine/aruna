@@ -988,8 +988,9 @@ mod tests {
 
     // The real ingress deadline must not lose either S3 owner: both listeners
     // drain active connection work past their slice, so only the retained
-    // forced cleanup can release them before storage closes.
-    #[tokio::test(start_paused = true)]
+    // forced cleanup can release them before storage closes. The clock stays
+    // real: a paused one advances over the storage and socket waits below.
+    #[tokio::test]
     async fn ingress_timeout_retains() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -999,26 +1000,23 @@ mod tests {
         let (main_addr, main_s3) = bound_s3_server(storage_handle.clone(), &shutdown).await;
         let (session_addr, session_s3) = bound_s3_server(storage_handle.clone(), &shutdown).await;
 
-        // A request with an unfinished body keeps one connection child busy per
-        // listener, so the graceful wait cannot finish inside its slice.
+        // An unfinished request head keeps one connection child reading per
+        // listener. A finished request would be answered and closed, leaving
+        // the graceful wait nothing to outlive.
         let mut main_client = tokio::net::TcpStream::connect(main_addr)
             .await
             .expect("main S3 connect");
         main_client
-            .write_all(
-                b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab",
-            )
+            .write_all(b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\n")
             .await
-            .expect("main partial body");
+            .expect("main partial head");
         let mut session_client = tokio::net::TcpStream::connect(session_addr)
             .await
             .expect("session S3 connect");
         session_client
-            .write_all(
-                b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab",
-            )
+            .write_all(b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\n")
             .await
-            .expect("session partial body");
+            .expect("session partial head");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
@@ -1029,9 +1027,13 @@ mod tests {
         sequence.grace = Duration::from_millis(200);
         let started = tokio::time::Instant::now();
 
-        sequence.run().await;
+        let outcome = sequence.run().await;
 
         let elapsed = started.elapsed();
+        assert!(
+            outcome.ingress_forced,
+            "the busy connections must outlive the ingress slice"
+        );
         assert!(
             elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(5),
             "the ingress phase must expire on its slice, not on the connection, took {elapsed:?}"
