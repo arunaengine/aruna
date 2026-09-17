@@ -59,6 +59,8 @@ pub(crate) struct ManifestPagePlan {
 
 #[derive(Serialize)]
 enum BorrowedTransportResponse<'a> {
+    #[allow(dead_code)]
+    Reject,
     ManifestPage(BorrowedManifestPage<'a>),
 }
 
