@@ -608,8 +608,7 @@ async fn proxy_redacts_secrets() {
     secret.access_token = Some(Secret::new(ACCESS));
     secret.refresh_token = Some(Secret::new(REFRESH));
     provider.token_obtained_at = Some(0);
-    let expected = provider.clone();
-    drive(
+    let stored = drive(
         CreateProviderOperation::new(
             provider,
             secret,
@@ -620,7 +619,7 @@ async fn proxy_redacts_secrets() {
     )
     .await
     .expect("the refresh fixture persists");
-    let refreshed = super::super::chatgpt::fresh_provider(&state, expected)
+    let refreshed = super::super::chatgpt::fresh_provider(&state, stored)
         .await
         .expect("the controlled issuer answers the refresh");
     assert_eq!(
@@ -650,8 +649,7 @@ async fn proxy_redacts_secrets() {
     secret.access_token = Some(Secret::new(ACCESS));
     secret.refresh_token = Some(Secret::new(REFRESH));
     failing.token_obtained_at = Some(0);
-    let expected = failing.clone();
-    drive(
+    let stored = drive(
         CreateProviderOperation::new(
             failing,
             secret,
@@ -662,7 +660,7 @@ async fn proxy_redacts_secrets() {
     )
     .await
     .expect("the failing refresh fixture persists");
-    let refresh_error = super::super::chatgpt::fresh_provider(&state, expected)
+    let refresh_error = super::super::chatgpt::fresh_provider(&state, stored)
         .await
         .expect_err("the second refresh is refused");
     assert!(
