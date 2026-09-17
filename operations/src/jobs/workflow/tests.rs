@@ -13,7 +13,7 @@ use crate::jobs::workflow::workspace::mint_workspace_credential;
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_compute::ExecutorRegistry;
-use aruna_compute::session::{EndReason, Session};
+use aruna_compute::session::{EndReason, Session, SessionConfig};
 use aruna_core::UserId;
 use aruna_core::compute::{
     AdoptableEvidence, AttemptPhase, AttemptStatus, CancelEvidence, LogLimits, LogTails, NOBODY,
@@ -731,9 +731,8 @@ async fn session_end_succeeds() {
         "ws-test".to_string(),
         CancellationToken::new(),
     ));
-    wait_for_session(&registry, job_id, &backend)
-        .await
-        .end(EndReason::Ended);
+    let session = wait_for_session(&registry, job_id, &backend).await;
+    session.end(EndReason::Ended);
     supervisor.await.unwrap();
 
     let stored = read_job_record(&storage, job_id, None)
@@ -742,6 +741,7 @@ async fn session_end_succeeds() {
         .unwrap();
     assert_eq!(stored.state, JobState::Succeeded);
     assert!(stored.report_digest.is_some());
+    assert_eq!(session.finished().await, EndReason::Ended);
     assert!(registry.sessions().get(&job_id.to_string()).is_none());
     let report =
         crate::jobs::service::read_owned_report(&ctx, stored.created_by, job_id, None, None, 10)
@@ -828,6 +828,161 @@ async fn session_kernel_fails() {
         .unwrap();
     assert_eq!(stored.state, JobState::Failed);
     assert_eq!(stored.last_error.unwrap().message, "session kernel exited");
+    net.shutdown().await;
+}
+
+/// Moves virtual time past the next execution heartbeat so a rotated claim is
+/// noticed without a real wait.
+async fn skip_heartbeat() {
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(2 * JOB_HEARTBEAT_MS)).await;
+    tokio::time::resume();
+}
+
+// A lost claim while the attempt wait is still pending must stop and release
+// this node's session instead of leaking it in the registry.
+#[tokio::test]
+async fn superseded_releases_session() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let (ctx, net, registry) = session_context(storage.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let job_id = record.job_id;
+    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+    let backend = StubBackend::new(StubReconcile::Waiting);
+
+    let supervisor = tokio::spawn(supervise_and_finalize(
+        ctx,
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        session_spec(None),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    ));
+    let session = wait_for_session(&registry, job_id, &backend).await;
+    let taken_over = lose_claim(&storage, job_id, token).await;
+
+    skip_heartbeat().await;
+    tokio::time::timeout(Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000), supervisor)
+        .await
+        .expect("the superseded supervisor must return")
+        .expect("the supervisor task must not panic");
+
+    assert_eq!(session.finished().await, EndReason::Cancelled);
+    assert!(
+        registry.sessions().get(&job_id.to_string()).is_none(),
+        "the superseded session must be released"
+    );
+    let after = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, taken_over, "a lost claim must not be written");
+    net.shutdown().await;
+}
+
+// A replacement registered under the same job id while the old attempt is
+// still supervised must survive the superseded supervisor's cleanup.
+#[tokio::test]
+async fn superseded_keeps_replacement() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let (ctx, net, registry) = session_context(storage.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let job_id = record.job_id;
+    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+    let backend = StubBackend::new(StubReconcile::Waiting);
+
+    let supervisor = tokio::spawn(supervise_and_finalize(
+        ctx,
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        session_spec(None),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    ));
+    let first = wait_for_session(&registry, job_id, &backend).await;
+    // The attempt's session ends without terminalizing, so a replacement can
+    // register under the same job id while the supervisor still waits.
+    first.end(EndReason::Cancelled);
+    let replacement = registry.sessions().open(
+        SessionConfig {
+            job_id: job_id.to_string(),
+            public_job_id: job_id.to_string(),
+            runtime: "python-notebook".to_string(),
+            workspace_bucket: "ws-test".to_string(),
+            executor_node_id: node_id(7).to_string(),
+            idle_after_ms: 600_000,
+            credential_expires_ms: 0,
+        },
+        backend.clone(),
+        fence(&attempt),
+    );
+    assert!(!Arc::ptr_eq(&first, &replacement));
+    let taken_over = lose_claim(&storage, job_id, token).await;
+
+    skip_heartbeat().await;
+    tokio::time::timeout(Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000), supervisor)
+        .await
+        .expect("the superseded supervisor must return")
+        .expect("the supervisor task must not panic");
+
+    let registered = registry
+        .sessions()
+        .get(&job_id.to_string())
+        .expect("the replacement must survive the old cleanup");
+    assert!(Arc::ptr_eq(&registered, &replacement));
+    let after = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, taken_over, "a lost claim must not be written");
+    net.shutdown().await;
+}
+
+// A cancellation that ends supervision must still release the session.
+#[tokio::test]
+async fn cancel_releases_session() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let (ctx, net, registry) = session_context(storage.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let job_id = record.job_id;
+    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+        .await
+        .unwrap();
+    set_cancel_requested(&storage, job_id, 7).await.unwrap();
+    let backend = StubBackend::new(StubReconcile::NotFound);
+
+    supervise_and_finalize(
+        ctx,
+        job_id,
+        token,
+        backend.clone(),
+        fence(&attempt),
+        session_spec(None),
+        "ws-test".to_string(),
+        CancellationToken::new(),
+    )
+    .await;
+
+    let stored = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert!(
+        registry.sessions().get(&job_id.to_string()).is_none(),
+        "the session must be released"
+    );
     net.shutdown().await;
 }
 

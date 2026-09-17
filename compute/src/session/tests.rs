@@ -68,7 +68,29 @@ async fn ended_session_stays() {
     let (session, _channel) = registry.open_detached(config.clone());
     session.end(EndReason::Ended);
     assert!(registry.get(&config.job_id).is_some());
-    registry.close(&config.job_id);
+    registry.close(&session);
+    assert!(registry.get(&config.job_id).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn replacement_survives_close() {
+    // An attempt that ended is replaced under the same job id; the old
+    // attempt's cleanup must not drop the replacement.
+    let registry = Arc::new(SessionRegistry::new());
+    let config = config(600_000);
+    let (first, _first_channel) = registry.open_detached(config.clone());
+    first.end(EndReason::Ended);
+    let (second, _second_channel) = registry.open_detached(config.clone());
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert!(Arc::ptr_eq(&registry.get(&config.job_id).unwrap(), &second));
+
+    registry.close(&first);
+    let registered = registry
+        .get(&config.job_id)
+        .expect("the replacement stays registered");
+    assert!(Arc::ptr_eq(&registered, &second));
+
+    registry.close(&second);
     assert!(registry.get(&config.job_id).is_none());
 }
 

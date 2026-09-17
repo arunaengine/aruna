@@ -117,7 +117,7 @@ pub async fn supervise_and_finalize(
             }
         }
     };
-    if with_execution_heartbeat(
+    let superseded = with_execution_heartbeat(
         storage,
         job_id,
         token,
@@ -125,15 +125,20 @@ pub async fn supervise_and_finalize(
         Box::pin(wait_and_finalize),
     )
     .await
-    .is_none()
-    {
+    .is_none();
+    if superseded {
         info!(job_id = %job_id, "Execution supervisor superseded; abandoning");
-        return;
+        // This node no longer owns the attempt, so its session stops here even
+        // though nothing else delivered an end for it.
+        if let Some(session) = &session {
+            session.end(EndReason::Cancelled);
+        }
     }
-    // The session outlives its end until here, so a client that reads or
-    // ends it during the teardown still gets the ended state, not 409.
+    // The session outlives its end until here, so a client that reads or ends
+    // it during teardown still gets the ended state, not 409. The identity
+    // check keeps this cleanup from dropping a same-id replacement.
     if let (Some(session), Some(registry)) = (&session, context.compute_handle.as_ref()) {
-        registry.sessions().close(session.job_id());
+        registry.sessions().close(session);
     }
 }
 

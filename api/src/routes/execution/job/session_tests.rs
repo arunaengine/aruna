@@ -595,9 +595,9 @@ fn registry_session(state: &Arc<ServerState>, job_id: JobId) -> Option<Arc<Sessi
 fn drop_session(state: &Arc<ServerState>, job_id: JobId) {
     if let Some(session) = registry_session(state, job_id) {
         session.end(EndReason::Ended);
-    }
-    if let Some(registry) = state.get_ctx().compute_handle.as_ref() {
-        registry.sessions().close(&job_id.to_string());
+        if let Some(registry) = state.get_ctx().compute_handle.as_ref() {
+            registry.sessions().close(&session);
+        }
     }
 }
 

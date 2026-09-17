@@ -753,10 +753,17 @@ impl SessionRegistry {
     }
 
     /// Drops a session once its job is finished, so an ended session still
-    /// answers state, replay and end calls while the job tears down.
-    pub fn close(&self, job_id: &str) {
+    /// answers state, replay and end calls during teardown. The identity
+    /// check keeps an older attempt from dropping a same-id replacement.
+    pub fn close(&self, session: &Arc<Session>) {
         if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.remove(job_id);
+            let job_id = session.job_id();
+            if sessions
+                .get(job_id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, session))
+            {
+                sessions.remove(job_id);
+            }
         }
     }
 
