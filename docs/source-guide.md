@@ -33,13 +33,13 @@ Add behavior to the family that already owns it:
 
 A new subfolder needs at least five real, directly contained files besides
 `mod.rs`, unless three or more related siblings share a meaningful domain
-prefix and group into it; root `STYLE.md` and `CONTRIBUTING.md` own the
-threshold, hoisting, and naming rules.
+prefix and group into it; root `STYLE.md` owns the threshold, hoisting, and
+naming rules.
 
 ## One request, end to end
 
 1. A transport accepts bytes and authenticates the caller:
-   `api/src/server.rs` (REST), `api/src/s3/server.rs` (S3),
+   `api/src/server/mod.rs` (REST), `api/src/s3/server.rs` (S3),
    `api/src/mcp/mod.rs` (MCP).
 2. The transport handler builds a request value and calls one named operation
    through `aruna_operations::driver::drive`, for example
