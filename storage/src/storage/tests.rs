@@ -868,6 +868,70 @@ async fn started_txn(
     }
 }
 
+// The worker retry may commit a timed-out commit ahead of its queued original, so it
+// must never run before effects the owner awaited, and the original must stay inert.
+#[tokio::test]
+async fn retry_keeps_order() {
+    let dir = tempdir().unwrap();
+    let (handle, receivers) = StorageHandle::new();
+    let mut storage = worker(&dir, &handle);
+    let txn_id = started_txn(&handle, &receivers, &mut storage).await;
+    let mut staged = Box::pin(handle.send_storage_effect(StorageEffect::Write {
+        key_space: "fenced".to_string(),
+        key: b"staged".to_vec().into(),
+        value: b"value".to_vec().into(),
+        txn_id: Some(txn_id),
+    }));
+    // No reply before the worker applies the write, so the owner cannot commit ahead of it.
+    poll_queued(&mut staged).await;
+    serve_next(&mut storage, &receivers.foreground);
+    assert!(matches!(
+        staged.await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+
+    let mut blocker = Box::pin(handle.send_storage_effect(keyed_write("blocker")));
+    poll_queued(&mut blocker).await;
+    // The real request timeout elapses while this thread serves nothing.
+    assert!(matches!(
+        handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await,
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout
+        })
+    ));
+    assert!(handle.commit_unknown(txn_id));
+    assert!(matches!(
+        handle
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await,
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict
+        })
+    ));
+    assert_eq!(handle.in_flight(), 2, "blocker and commit stay queued");
+
+    serve_next(&mut storage, &receivers.foreground);
+    assert!(storage.txns.is_empty(), "retry commits after the blocker");
+    assert_eq!(handle.pending_transactions(), 0);
+    assert_eq!(handle.in_flight(), 1, "original commit is still queued");
+    serve_next(&mut storage, &receivers.foreground);
+    assert_eq!(handle.in_flight(), 0);
+    assert_eq!(handle.pending_transactions(), 0);
+    assert!(matches!(
+        blocker.await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    let mut read = Box::pin(handle.send_storage_effect(keyed_read("staged")));
+    poll_queued(&mut read).await;
+    serve_next(&mut storage, &receivers.foreground);
+    assert!(matches!(
+        read.await,
+        Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+    ));
+}
+
 // A cleanup write that wins channel capacity after the fence is rejected by
 // the worker gate rather than committing behind the final fsync.
 #[tokio::test]
