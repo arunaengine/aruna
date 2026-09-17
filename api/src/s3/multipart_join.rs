@@ -62,3 +62,39 @@ pub async fn await_completion(watch: JoinWatch<CompletionOutcome>) -> Completion
         )))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(code: S3ErrorCode) -> CompletionOutcome {
+        Arc::new(Err(CompletionFailure::new(&S3Error::new(code))))
+    }
+
+    fn failure_code(outcome: &CompletionOutcome) -> Option<S3ErrorCode> {
+        outcome
+            .as_ref()
+            .as_ref()
+            .err()
+            .map(|failure| failure.code.clone())
+    }
+
+    // A refused or vanished completion must not answer a retry of the same upload.
+    #[tokio::test]
+    async fn retry_runs_again() {
+        let registry = completion_registry();
+        let key: CompletionKey = ("bucket".to_string(), "key".to_string(), Ulid::nil());
+
+        let refusal = registry.join(key.clone(), async { refused(S3ErrorCode::NoSuchUpload) });
+        let outcome = await_completion(refusal).await;
+        assert_eq!(failure_code(&outcome), Some(S3ErrorCode::NoSuchUpload));
+
+        let vanished = registry.join(key.clone(), async { panic!("completion failed") });
+        let outcome = await_completion(vanished).await;
+        assert_eq!(failure_code(&outcome), Some(S3ErrorCode::InternalError));
+
+        let retried = registry.join(key, async { refused(S3ErrorCode::InvalidPart) });
+        let outcome = await_completion(retried).await;
+        assert_eq!(failure_code(&outcome), Some(S3ErrorCode::InvalidPart));
+    }
+}

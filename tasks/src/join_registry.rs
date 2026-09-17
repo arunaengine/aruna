@@ -49,7 +49,8 @@ where
     }
 
     /// Joins the work already running for `key`, or spawns `work` for it. The
-    /// work is detached, so dropping the returned watch never cancels it.
+    /// work is detached, so dropping the returned watch never cancels it. Work
+    /// that ended without a value, such as by panicking, is not joined again.
     pub fn join<F>(&self, key: K, work: F) -> JoinWatch<V>
     where
         F: Future<Output = V> + Send + 'static,
@@ -58,7 +59,10 @@ where
         let retention = self.retention;
         let retain_if = self.retain_if;
         entries.retain(|_, watch| {
-            watch.borrow().as_ref().is_none_or(|joined| {
+            // Read closed first, so a value sent just before the producer ended is seen.
+            // An ended producer without a value failed, so its key must start fresh work.
+            let ended = watch.has_changed().is_err();
+            watch.borrow().as_ref().map_or(!ended, |joined| {
                 joined.finished.elapsed() < retention
                     && retain_if.is_none_or(|keep| keep(&joined.value))
             })
@@ -165,5 +169,74 @@ mod tests {
 
         let retried = registry.join("key", async { Ok("retried") });
         assert_eq!(await_joined(retried).await, Some(Ok("retried")));
+    }
+
+    // A panicked producer leaves no value, so the key must not stay joined to it.
+    #[tokio::test(start_paused = true)]
+    async fn retries_panicked_work() {
+        let registry: JoinRegistry<&str, &str> = JoinRegistry::new(RETENTION);
+
+        let failed = registry.join("key", async { panic!("producer failed") });
+        assert_eq!(await_joined(failed).await, None);
+
+        let retried = registry.join("key", async { "retried" });
+        assert_eq!(await_joined(retried).await, Some("retried"));
+    }
+
+    // Callers arriving after a failure must share one fresh run and its value.
+    #[tokio::test(start_paused = true)]
+    async fn shares_retried_work() {
+        let registry: JoinRegistry<&str, usize> = JoinRegistry::new(RETENTION);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let failed = registry.join("key", async { panic!("producer failed") });
+        assert_eq!(await_joined(failed).await, None);
+
+        let (gate, blocked) = tokio::sync::oneshot::channel();
+        let first = registry.join("key", {
+            let runs = runs.clone();
+            async move {
+                let _ = blocked.await;
+                runs.fetch_add(1, Ordering::SeqCst);
+                1
+            }
+        });
+        let later: Vec<_> = (2..5)
+            .map(|value| {
+                let runs = runs.clone();
+                registry.join("key", async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    value
+                })
+            })
+            .collect();
+
+        let _ = gate.send(());
+        assert_eq!(await_joined(first).await, Some(1));
+        for watch in later {
+            assert_eq!(await_joined(watch).await, Some(1));
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    // Evicting the failed entry must spare its running replacement, which a later
+    // cleanup pass must keep so its finished value stays joinable.
+    #[tokio::test(start_paused = true)]
+    async fn keeps_replacement_entry() {
+        let registry: JoinRegistry<&str, usize> = JoinRegistry::new(RETENTION);
+        let failed = registry.join("key", async { panic!("producer failed") });
+        assert_eq!(await_joined(failed).await, None);
+
+        let (gate, blocked) = tokio::sync::oneshot::channel();
+        let replacement = registry.join("key", async move {
+            let _ = blocked.await;
+            1
+        });
+        let other = registry.join("other", async { 2 });
+        assert_eq!(await_joined(other).await, Some(2));
+
+        let _ = gate.send(());
+        assert_eq!(await_joined(replacement).await, Some(1));
+        let later = registry.join("key", async { 3 });
+        assert_eq!(await_joined(later).await, Some(1));
     }
 }
