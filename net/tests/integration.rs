@@ -17,9 +17,10 @@ use aruna_net::{
 use aruna_storage::FjallStorage;
 use async_trait::async_trait;
 use byteview::ByteView;
+use iroh::endpoint::ReadToEndError;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use ulid::Ulid;
 
 const NETWORK_HANG_CAP: Duration = Duration::from_secs(45);
@@ -87,6 +88,53 @@ impl InboundEventHandler for TestInboundHandler {
         if let Some(tx) = &self.stream_tx {
             let _ = tx.send((alpn, stream, node_id));
         }
+    }
+}
+
+/// A single-node handle for the in-process loopback tests.
+async fn local_handle() -> Result<(NetHandle, tempfile::TempDir), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let storage = FjallStorage::open(dir.path().to_str().ok_or("invalid temp path")?)?;
+    let handle = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage,
+    )
+    .await?;
+    Ok((handle, dir))
+}
+
+/// Forwards every inbound stream and returns, so the inbound tracker drains
+/// as soon as the stream was handed over.
+fn forwarding_handler() -> (
+    Arc<TestInboundHandler>,
+    mpsc::UnboundedReceiver<(Alpn, BiStream, NodeId)>,
+) {
+    let (stream_tx, stream_rx) = mpsc::unbounded_channel();
+    (
+        Arc::new(TestInboundHandler {
+            stream_tx: Some(stream_tx),
+        }),
+        stream_rx,
+    )
+}
+
+/// Hands the inbound stream over, then holds the handler until released, so
+/// a test controls whether the drain deadline is met.
+struct HoldingInboundHandler {
+    arrivals: mpsc::UnboundedSender<(Alpn, BiStream, NodeId)>,
+    release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl InboundEventHandler for HoldingInboundHandler {
+    async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
+        let _ = self.arrivals.send((alpn, stream, node_id));
+        let _ = self.release.acquire().await;
     }
 }
 
@@ -373,6 +421,204 @@ async fn stream_send_receive() -> Result<(), Box<dyn std::error::Error>> {
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;
+    Ok(())
+}
+
+// A same-node stream must still reach the handler after admission closes
+// (the writer-drain window), and the final closure rejects it.
+#[tokio::test]
+async fn loopback_survives_admission() -> Result<(), Box<dyn std::error::Error>> {
+    let (handle, _dir) = local_handle().await?;
+    let (handler, mut stream_rx) = forwarding_handler();
+    handle.set_inbound_handler(handler);
+
+    let mut first = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut first_inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    first.0.write_all(b"before").await?;
+    let mut seen = [0u8; 6];
+    first_inbound.1.read_exact(&mut seen).await?;
+    assert_eq!(&seen, b"before");
+
+    handle.close_admission();
+
+    // Writer-drain window: same-node work still reaches the handler.
+    let mut second = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut second_inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback must stay open while writers drain")?;
+    second.0.write_all(b"during").await?;
+    let mut seen = [0u8; 6];
+    second_inbound.1.read_exact(&mut seen).await?;
+    assert_eq!(&seen, b"during");
+
+    let outcome = handle.shutdown_with_drain(Duration::from_millis(100)).await;
+    assert!(outcome.complete(), "handlers drained: {outcome:?}");
+
+    let rejected = handle.open_stream(handle.node_id(), Alpn::Bao).await;
+    assert!(
+        rejected.is_err(),
+        "loopback must be closed after final shutdown"
+    );
+    Ok(())
+}
+
+// A parked local read and a blocked local write both wake with an error when
+// the final shutdown closes the loopback.
+#[tokio::test]
+async fn loopback_io_wakes() -> Result<(), Box<dyn std::error::Error>> {
+    let (handle, _dir) = local_handle().await?;
+    let (handler, mut stream_rx) = forwarding_handler();
+    handle.set_inbound_handler(handler);
+
+    let dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    let send = dialed.0;
+    let recv = dialed.1;
+
+    // A write larger than the 64 KiB pipe blocks; the read has no writer.
+    let (write_done, mut write_result) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut send = send;
+        let payload = vec![0u8; 128 * 1024];
+        let _ = write_done.send(send.write_all(&payload).await);
+    });
+    let (read_done, mut read_result) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut recv = recv;
+        let mut buf = [0u8; 8];
+        let _ = read_done.send(recv.read(&mut buf).await);
+    });
+
+    // Bounded check: neither can finish while its peer half stays idle here.
+    let parked = tokio::time::timeout(Duration::from_millis(200), async {
+        tokio::join!(&mut read_result, &mut write_result)
+    })
+    .await;
+    assert!(
+        parked.is_err(),
+        "local IO must park while its peer half is idle"
+    );
+
+    let outcome = handle.shutdown_with_drain(Duration::from_millis(100)).await;
+    assert!(outcome.complete(), "no handler is pending: {outcome:?}");
+
+    let read = tokio::time::timeout(Duration::from_secs(5), read_result).await?;
+    assert!(
+        read.map_err(|error| std::io::Error::other(error.to_string()))?
+            .is_err(),
+        "a parked local read must fail at final shutdown"
+    );
+    let write = tokio::time::timeout(Duration::from_secs(5), write_result).await?;
+    assert!(
+        write
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .is_err(),
+        "a blocked local write must fail at final shutdown"
+    );
+
+    drop(inbound);
+    Ok(())
+}
+
+// A handler that outlives its drain deadline keeps the first attempt
+// incomplete; releasing it lets a resumed shutdown join and complete.
+#[tokio::test]
+async fn loopback_shutdown_resumes() -> Result<(), Box<dyn std::error::Error>> {
+    let (handle, _dir) = local_handle().await?;
+    let release = Arc::new(Semaphore::new(0));
+    let (arrivals, mut stream_rx) = mpsc::unbounded_channel();
+    handle.set_inbound_handler(Arc::new(HoldingInboundHandler {
+        arrivals,
+        release: release.clone(),
+    }));
+
+    let dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, held, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("held handler must receive the loopback stream")?;
+
+    let interrupted = handle.shutdown_with_drain(Duration::from_millis(50)).await;
+    assert!(
+        !interrupted.complete(),
+        "held handler must keep the shutdown incomplete: {interrupted:?}"
+    );
+    assert_eq!(interrupted.inbound_pending, 1);
+
+    release.add_permits(1);
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(30),
+        handle.shutdown_with_drain(Duration::from_millis(500)),
+    )
+    .await?;
+    assert!(
+        resumed.complete(),
+        "the resumed shutdown joins the released handler: {resumed:?}"
+    );
+
+    drop((dialed, held));
+    Ok(())
+}
+
+// Normal loopback stream semantics: half-close, reset, and the read limit.
+#[tokio::test]
+async fn loopback_stream_bounds() -> Result<(), Box<dyn std::error::Error>> {
+    let (handle, _dir) = local_handle().await?;
+    let (handler, mut stream_rx) = forwarding_handler();
+    handle.set_inbound_handler(handler);
+
+    // Half-close: finish ends the write direction, the reader sees EOF.
+    let mut dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    dialed.0.write_all(b"payload").await?;
+    dialed
+        .0
+        .finish()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let body = inbound
+        .1
+        .read_to_end(64)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    assert_eq!(body, b"payload".to_vec());
+
+    // Reset: stop drops the read direction; the writer then sees a broken pipe.
+    let mut dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    dialed.0.write_all(b"early").await?;
+    inbound
+        .1
+        .stop(0u32.into())
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let payload = vec![0u8; 128 * 1024];
+    let reset = dialed
+        .0
+        .write_all(&payload)
+        .await
+        .expect_err("a stopped local read must break the writer");
+    assert_eq!(reset.kind(), std::io::ErrorKind::BrokenPipe);
+
+    // Size limit: one byte over the limit fails with TooLong.
+    let mut dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    dialed.0.write_all(b"x").await?;
+    dialed
+        .0
+        .finish()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let limited = inbound.1.read_to_end(0).await;
+    assert!(matches!(limited, Err(ReadToEndError::TooLong)));
+
+    handle.shutdown().await;
     Ok(())
 }
 
