@@ -701,6 +701,51 @@ mod tests {
         );
     }
 
+    // Every bounded phase keeps the reserve for the work behind it. A budget
+    // inside its reserve yields zero, and the zero-budget case stays zero.
+    #[test]
+    fn budget_arithmetic() {
+        assert_eq!(
+            writer_budget(TAIL_RESERVE + Duration::from_secs(4)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(writer_budget(TAIL_RESERVE), Duration::ZERO);
+        assert_eq!(
+            writer_budget(TAIL_RESERVE - Duration::from_secs(1)),
+            Duration::ZERO
+        );
+
+        assert_eq!(
+            task_drain_budget(TASK_ABORT_MARGIN + Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(task_drain_budget(TASK_ABORT_MARGIN), Duration::ZERO);
+        assert_eq!(
+            task_drain_budget(TASK_ABORT_MARGIN - Duration::from_secs(1)),
+            Duration::ZERO
+        );
+
+        let net_reserve = FORCED_INBOUND_DRAIN + NET_TEARDOWN_MARGIN;
+        assert_eq!(
+            net_drain_budget(net_reserve + Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(net_drain_budget(net_reserve), Duration::ZERO);
+        assert_eq!(
+            net_drain_budget(net_reserve - Duration::from_secs(1)),
+            Duration::ZERO
+        );
+
+        let grace = Duration::from_secs(20);
+        assert_eq!(ingress_budget(grace, grace), grace / INGRESS_BUDGET_DIVISOR);
+        assert_eq!(
+            ingress_budget(grace, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(ingress_budget(grace, Duration::ZERO), Duration::ZERO);
+        assert_eq!(ingress_budget(Duration::ZERO, Duration::ZERO), Duration::ZERO);
+    }
+
     // A configured grace too small for the protected tail is invalid, not a
     // shorter sequence.
     #[test]

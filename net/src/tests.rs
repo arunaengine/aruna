@@ -629,6 +629,7 @@ async fn endpoint_only_unauthorized() -> Result<()> {
 
 struct HoldingInboundHandler {
     streams: tokio::sync::Mutex<Vec<streams::BiStream>>,
+    received: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[async_trait]
@@ -640,6 +641,9 @@ impl InboundEventHandler for HoldingInboundHandler {
         _node_id: NodeId,
     ) {
         self.streams.lock().await.push(stream);
+        if let Some(received) = self.received.lock().await.take() {
+            let _ = received.send(());
+        }
     }
 }
 
@@ -664,6 +668,7 @@ async fn test_net_handle() -> Result<(NetHandle, TempDir)> {
     .await?;
     handle.set_inbound_handler(Arc::new(HoldingInboundHandler {
         streams: tokio::sync::Mutex::new(Vec::new()),
+        received: tokio::sync::Mutex::new(None),
     }));
 
     Ok((handle, temp_dir))
@@ -833,8 +838,10 @@ async fn refuses_predecessor_alpn() -> Result<()> {
 #[tokio::test]
 async fn loopback_reaches_handler() -> Result<()> {
     let (handle, _dir) = test_net_handle().await?;
+    let (received, receipt) = tokio::sync::oneshot::channel();
     let holding = Arc::new(HoldingInboundHandler {
         streams: tokio::sync::Mutex::new(Vec::new()),
+        received: tokio::sync::Mutex::new(Some(received)),
     });
     handle.set_inbound_handler(holding.clone());
 
@@ -844,15 +851,16 @@ async fn loopback_reaches_handler() -> Result<()> {
         .write_all(b"manifest")
         .await
         .map_err(|e| NetError::Io(e.to_string()))?;
-    let mut inbound = None;
-    for _ in 0..50 {
-        inbound = holding.streams.lock().await.pop();
-        if inbound.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    let mut inbound = inbound.expect("loopback stream reaches the inbound handler");
+    tokio::time::timeout(Duration::from_secs(5), receipt)
+        .await
+        .expect("the inbound handler must report the loopback stream")
+        .expect("the receipt signal must survive");
+    let mut inbound = holding
+        .streams
+        .lock()
+        .await
+        .pop()
+        .expect("loopback stream reaches the inbound handler");
 
     let mut request = [0u8; 8];
     inbound
@@ -884,6 +892,10 @@ async fn loopback_reaches_handler() -> Result<()> {
         .await
         .map_err(|e| NetError::Stream(e.to_string()))?;
     assert!(rest.is_empty());
+
+    // Release the stream owners before shutdown instead of leaving them held.
+    drop(inbound);
+    drop(outbound);
 
     handle.shutdown().await;
     Ok(())

@@ -689,8 +689,8 @@ mod tests {
     }
 
     // A grace below `MIN_SHUTDOWN_GRACE` cannot fund the protected tail, so the
-    // writer phases get no budget. The exhausted sequence must still close the
-    // store and report an incomplete outcome, not a clean release.
+    // writer phases get no budget. A held tracked child keeps the outcome
+    // incomplete; it is released before the test returns.
     #[tokio::test]
     async fn budget_exhausted_incomplete() {
         let temp = tempdir().expect("temp dir");
@@ -701,8 +701,27 @@ mod tests {
         // minimum, so no writer phase has a usable budget.
         let too_small = Duration::from_secs(1);
 
+        // The tracked child holds the background drain at its real join: it
+        // reports that it started and finishes only once the test releases it.
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (finished, finished_rx) = tokio::sync::oneshot::channel();
+        acquired.shutdown.spawn(async move {
+            let _ = started.send(());
+            let _ = release_rx.await;
+            let _ = finished.send(());
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the boundary child must start")
+            .expect("the boundary child must signal");
+
         let outcome = acquired.cleanup(too_small).await;
 
+        assert!(
+            !outcome.background_drained,
+            "a held background child must not be reported drained: {outcome:?}"
+        );
         assert!(
             !outcome.complete(),
             "an exhausted writer budget must not report a clean release: {outcome:?}"
@@ -722,6 +741,12 @@ mod tests {
                 error: StorageError::Closed
             })
         ));
+
+        release.send(()).expect("the boundary child must still wait");
+        tokio::time::timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect("the released boundary child must finish")
+            .expect("the boundary child must report completion");
     }
 
     // A failure after any acquisition stage must release exactly the acquired
