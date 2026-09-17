@@ -1,4 +1,7 @@
-use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, require_realm_auth};
+use crate::auth::{
+    ValidatedBearer, ensure_permission, permission_granted, require_realm_auth,
+    require_unrestricted_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
@@ -920,8 +923,8 @@ fn map_removal_error(error: RemoveFromError) -> ServerError {
     summary = "Read a group's storage usage",
     description = r#"Reports what this node stores for a group next to the realm-wide totals.
 
-**Authentication**: realm bearer token and membership in the group. Membership is the only check, so
-a realm administrator who is not a member is refused.
+**Authentication**: realm bearer token without path restrictions, and membership in the group.
+Membership is the only permission check, so a realm administrator who is not a member is refused.
 
 **Behavior**
 - The flat counters report what this node stores for the group, while `realm` reports the totals
@@ -973,7 +976,7 @@ a realm administrator who is not a member is refused.
         ),
         (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, or the caller is not a member of the group", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller is not a member of the group", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -994,7 +997,7 @@ pub(crate) async fn run_group_usage(
     auth: Option<AuthContext>,
     group_id: &str,
 ) -> ServerResult<crate::routes::info::UsageResponse> {
-    let auth = require_realm_auth(state, auth)?;
+    let auth = require_unrestricted_auth(state, auth)?;
     let group_id = parse_group_id(group_id)?;
     let (_, auth_doc) = load_group(state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
@@ -1047,8 +1050,8 @@ pub(crate) async fn run_group_usage(
     summary = "List the members of a group",
     description = r#"Returns every member of a group with the roles that assign them.
 
-**Authentication**: realm bearer token and membership in the group; the member list is never exposed
-to a non-member.
+**Authentication**: realm bearer token without path restrictions, and membership in the group; the
+member list is never exposed to a non-member.
 
 **Behavior**
 - The whole membership comes back in one response, sorted by user id, with each member's roles
@@ -1083,7 +1086,7 @@ to a non-member.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, or the caller is not a member of the group", body = ErrorResponse)
+        (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller is not a member of the group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1103,7 +1106,7 @@ pub(crate) async fn run_group_members(
     auth: Option<AuthContext>,
     group_id: &str,
 ) -> ServerResult<GroupMembersResponse> {
-    let auth = require_realm_auth(state, auth)?;
+    let auth = require_unrestricted_auth(state, auth)?;
     let group_id = parse_group_id(group_id)?;
     let (_, auth_doc) = load_group(state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {

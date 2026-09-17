@@ -1,7 +1,8 @@
 use super::{
     AddMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, GroupInfoResponse,
     ListGroupsQuery, UpdateGroupRequest, add_group_member, create_group, get_group,
-    get_group_usage, list_data_paths, list_group_members, list_groups, run_get_group, update_group,
+    get_group_usage, list_data_paths, list_group_members, list_groups, run_get_group,
+    run_group_members, run_group_usage, update_group,
 };
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
@@ -16,7 +17,9 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     GROUP_KEYSPACE, S3_BUCKET_KEYSPACE, USER_KEYSPACE,
 };
-use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Role};
+use aruna_core::structs::identity::auth::{
+    Actor, AuthContext, NodeCapabilities, PathRestriction, Permission, Role,
+};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
@@ -608,6 +611,58 @@ async fn nonmember_usage_denied() {
         .await,
         Err(ServerError::Forbidden)
     ));
+}
+
+#[tokio::test]
+async fn nonmember_members_denied() {
+    let (state, _tempdir) = setup_state().await;
+    let owner = UserId::local(Ulid::generate(), state.get_realm_id());
+    let group_id = seed_group(&state, owner).await.to_string();
+    let outsider = member_auth(UserId::local(Ulid::generate(), state.get_realm_id()));
+
+    let members = run_group_members(&state, Some(outsider), &group_id).await;
+    assert!(
+        matches!(members, Err(ServerError::Forbidden)),
+        "member list leaked to a non-member: {members:?}"
+    );
+}
+
+/// Membership ignores a token's path confinement, so even a member's delegated
+/// token must not read group-wide usage or the member list.
+#[tokio::test]
+async fn restricted_member_denied() {
+    let (state, _tempdir) = setup_state().await;
+    let owner = UserId::local(Ulid::generate(), state.get_realm_id());
+    let group_id = seed_group(&state, owner).await.to_string();
+    let mut restricted = member_auth(owner);
+    restricted.path_restrictions = Some(vec![PathRestriction {
+        pattern: "/**".to_string(),
+        permission: Permission::READ,
+    }]);
+
+    let usage = run_group_usage(&state, Some(restricted.clone()), &group_id).await;
+    assert!(
+        matches!(usage, Err(ServerError::Forbidden)),
+        "usage leaked to a restricted token: {usage:?}"
+    );
+    let members = run_group_members(&state, Some(restricted), &group_id).await;
+    assert!(
+        matches!(members, Err(ServerError::Forbidden)),
+        "member list leaked to a restricted token: {members:?}"
+    );
+
+    let usage = run_group_usage(&state, Some(member_auth(owner)), &group_id).await;
+    assert!(usage.is_ok(), "member usage refused: {usage:?}");
+    let members = run_group_members(&state, Some(member_auth(owner)), &group_id)
+        .await
+        .unwrap();
+    assert!(
+        members
+            .members
+            .iter()
+            .any(|member| member.user_id == owner.to_string()),
+        "unrestricted member missing from the list"
+    );
 }
 
 #[tokio::test]
