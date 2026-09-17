@@ -209,7 +209,6 @@ impl ArunaS3Service {
     }
 }
 
-#[async_trait::async_trait]
 impl ArunaS3Service {
     /// One page directly below a public folder for an unsigned browser request.
     /// The access layer authorized the folder; each entry is checked again for
@@ -231,7 +230,7 @@ impl ArunaS3Service {
                     bucket: bucket.to_owned(),
                     group_id,
                     continuation_token: None,
-                    max_keys: Some(ListObjectsV2Operation::DEFAULT_MAX_KEYS),
+                    max_keys: Some(ListBucketOperation::DEFAULT_MAX_KEYS),
                     prefix: Some(prefix.to_owned()),
                     delimiter: Some("/".to_owned()),
                     start_after: None,
@@ -258,13 +257,7 @@ impl ArunaS3Service {
             let Some(name) = key.strip_prefix(prefix).filter(|name| !name.is_empty()) else {
                 continue;
             };
-            let path = aruna_core::structs::blob_object_permission_path(
-                self.realm_id,
-                group_id,
-                self.node_id,
-                bucket,
-                &key,
-            );
+            let path = object_permission_path(self.realm_id, group_id, self.node_id, bucket, &key);
             match authorize(
                 &self.state,
                 self.realm_id,
@@ -308,6 +301,7 @@ impl ArunaS3Service {
     }
 }
 
+#[async_trait::async_trait]
 impl S3 for ArunaS3Service {
     #[tracing::instrument(err, skip(self, req))]
     async fn create_bucket(
