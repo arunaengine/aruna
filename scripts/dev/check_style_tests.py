@@ -144,6 +144,57 @@ class IdentifierKindsTest(unittest.TestCase):
             findings, [("macro", "probe.rs", 1, "macro_rules 'maximum_retry_count_value' has 4 terms")]
         )
 
+    def test_for_binding(self):
+        findings = scan("fn tiny() { for four_term_name_here in values { } }\n")
+        self.assertEqual(findings, [("for", "probe.rs", 1, "for 'four_term_name_here' has 4 terms")])
+
+    def test_for_destructure(self):
+        findings = scan("fn tiny() { for (four_term_name_here, other) in pairs { } }\n")
+        self.assertEqual(findings, [("for", "probe.rs", 1, "for 'four_term_name_here' has 4 terms")])
+
+    def test_match_arm(self):
+        findings = scan("fn tiny() { match value { Some(four_term_name_here) => { } None => {} } }\n")
+        self.assertEqual(findings, [("match", "probe.rs", 1, "match arm 'four_term_name_here' has 4 terms")])
+
+    def test_match_struct(self):
+        findings = scan("fn tiny() { match value { Config { four_term_name_here } => {} } }\n")
+        self.assertEqual(findings, [("match", "probe.rs", 1, "match arm 'four_term_name_here' has 4 terms")])
+
+    def test_match_path(self):
+        findings = scan("fn tiny() { match value { Option::Some(four_term_name_here) => {} } }\n")
+        self.assertEqual(findings, [("match", "probe.rs", 1, "match arm 'four_term_name_here' has 4 terms")])
+
+    def test_match_guard(self):
+        findings = scan("fn tiny() { match value { Some(four_term_name_here) if check(value) => {} } }\n")
+        self.assertEqual(findings, [("match", "probe.rs", 1, "match arm 'four_term_name_here' has 4 terms")])
+
+    def test_closure_param(self):
+        findings = scan("fn tiny() { let action = |four_term_name_here: u8| four_term_name_here; }\n")
+        self.assertEqual(findings, [("closure", "probe.rs", 1, "closure param 'four_term_name_here' has 4 terms")])
+
+    def test_closure_list(self):
+        findings = scan("fn tiny() { let action = |value: u8, four_term_name_here| value; }\n")
+        self.assertEqual(findings, [("closure", "probe.rs", 1, "closure param 'four_term_name_here' has 4 terms")])
+
+    def test_move_closure(self):
+        findings = scan("fn tiny() { let action = move |four_term_name_here| { }; }\n")
+        self.assertEqual(findings, [("closure", "probe.rs", 1, "closure param 'four_term_name_here' has 4 terms")])
+
+    def test_underscore_let(self):
+        findings = scan("fn tiny() { let _four_term_name_here = 0; }\n")
+        self.assertEqual(findings, [("let", "probe.rs", 1, "let '_four_term_name_here' has 4 terms")])
+
+    def test_underscore_param(self):
+        findings = scan("fn tiny(_four_term_name_here: u8) {}\n")
+        self.assertEqual(findings, [("param", "probe.rs", 1, "param '_four_term_name_here' has 4 terms")])
+
+    def test_underscore_for(self):
+        findings = scan("fn tiny() { for _four_term_name_here in values { } }\n")
+        self.assertEqual(findings, [("for", "probe.rs", 1, "for '_four_term_name_here' has 4 terms")])
+
+    def test_underscore_three(self):
+        self.assertEqual(scan("fn tiny() { let _three_term_name = 0; }\n"), [])
+
 
 class TermBoundaryTest(unittest.TestCase):
     def test_three_terms(self):
@@ -282,6 +333,47 @@ class MacroTest(unittest.TestCase):
         self.assertEqual(scan(text), [])
 
 
+class ProbeTest(unittest.TestCase):
+    def test_string_payload(self):
+        text = (
+            'const A: &str = "for four_term_name_here in values { } '
+            'match value { Some(four_term_name_here) => {} } '
+            'let _four_term_name_here = 0;";\n'
+        )
+        self.assertEqual(scan(text), [])
+
+    def test_attribute_payload(self):
+        text = '#[doc = "for four_term_name_here in values"]\n#[allow(dead_code)]\nfn tiny() {}\n'
+        self.assertEqual(scan(text), [])
+
+    def test_macro_payload(self):
+        text = (
+            "macro_rules! helper {\n"
+            "    () => { for four_term_name_here in values { } };\n"
+            "    () => { match value { Some(four_term_name_here) => {} } };\n"
+            "    () => { let _four_term_name_here = 0; };\n"
+            "}\n"
+        )
+        self.assertEqual(scan(text), [])
+
+    def test_scrutinee_ref(self):
+        self.assertEqual(scan("fn tiny() { match four_term_name_here { Some(_) => {} } }\n"), [])
+
+    def test_path_const(self):
+        self.assertEqual(scan("fn tiny() { match value { Numbers::four_term_name_here => {} } }\n"), [])
+
+    def test_field_ref(self):
+        text = "fn tiny() { match value { Config { maximum_retry_count_value: x } => {} } }\n"
+        self.assertEqual(scan(text), [])
+
+    def test_or_operand(self):
+        text = "fn tiny() { let mask = first_value | second_value | four_term_name_here; }\n"
+        self.assertEqual(scan(text), [])
+
+    def test_let_initializer(self):
+        self.assertEqual(scan("fn tiny() { let other = four_term_name_here; }\n"), [])
+
+
 class TreeTest(unittest.TestCase):
     def write(self, root, relpath, text=""):
         path = os.path.join(root, relpath)
@@ -293,6 +385,7 @@ class TreeTest(unittest.TestCase):
 class FolderTest(TreeTest):
     def setUp(self):
         self.saved = dict(check_style.SMALL_DOMAINS)
+        check_style.SMALL_DOMAINS.clear()
 
     def tearDown(self):
         check_style.SMALL_DOMAINS.clear()
@@ -451,6 +544,127 @@ class FolderTest(TreeTest):
         ]
         self.assertIn(("folder", "pkg/src/tests", 0, "2 of 5 direct files besides mod.rs"), self.folders(tree))
 
+    def test_fixture_module(self):
+        tree = [("pkg/Cargo.toml", ""), ("pkg/src/lib.rs", ""), ("pkg/src/fixtures/one.rs", "")]
+        self.assertEqual(
+            self.folders(tree), [("folder", "pkg/src/fixtures", 0, "1 of 5 direct files besides mod.rs")]
+        )
+
+    def test_fixture_assets(self):
+        tree = [
+            ("pkg/Cargo.toml", ""),
+            ("pkg/src/lib.rs", ""),
+            ("pkg/src/fixtures/one.bin", ""),
+            ("pkg/src/fixtures/two.bin", ""),
+        ]
+        self.assertEqual(self.folders(tree), [])
+
+    def test_singleton_tests(self):
+        tree = [
+            ("pkg/Cargo.toml", ""),
+            ("pkg/src/lib.rs", ""),
+            ("pkg/src/tests/mod.rs", ""),
+            ("pkg/src/tests/one.rs", ""),
+        ]
+        self.assertEqual(
+            self.folders(tree), [("folder", "pkg/src/tests", 0, "1 of 5 direct files besides mod.rs")]
+        )
+
+    def test_shrunk_domain(self):
+        tree = [("pkg/Cargo.toml", ""), ("pkg/src/lib.rs", ""), ("pkg/src/scope/one.rs", "")]
+        check_style.SMALL_DOMAINS["pkg/src/scope"] = "reviewed small scope"
+        self.assertEqual(
+            self.folders(tree),
+            [
+                (
+                    "folder",
+                    "pkg/src/scope",
+                    0,
+                    "1 of 5 direct files besides mod.rs; the SMALL_DOMAINS entry no longer qualifies",
+                )
+            ],
+        )
+
+    def test_asset_domain(self):
+        tree = [("pkg/Cargo.toml", ""), ("pkg/src/lib.rs", ""), ("pkg/src/fixtures/one.bin", "")]
+        check_style.SMALL_DOMAINS["pkg/src/fixtures"] = "reviewed small scope"
+        self.assertEqual(
+            self.folders(tree),
+            [
+                (
+                    "folder",
+                    "pkg/src/fixtures",
+                    0,
+                    "1 of 5 direct files besides mod.rs; the SMALL_DOMAINS entry no longer qualifies",
+                )
+            ],
+        )
+
+    def test_grouped_shrunk(self):
+        tree = [("pkg/Cargo.toml", ""), ("pkg/src/lib.rs", ""), ("pkg/src/compute/mod.rs", "")]
+        check_style.SMALL_DOMAINS["pkg/src/compute"] = "grouped shared-prefix domain"
+        self.assertEqual(
+            self.folders(tree),
+            [
+                (
+                    "folder",
+                    "pkg/src/compute",
+                    0,
+                    "0 of 5 direct files besides mod.rs; the SMALL_DOMAINS entry no longer qualifies",
+                )
+            ],
+        )
+
+    def test_grouped_prefix(self):
+        tree = [
+            ("pkg/Cargo.toml", ""),
+            ("pkg/src/lib.rs", ""),
+            ("pkg/src/compute/mod.rs", ""),
+            ("pkg/src/compute/compute_config.rs", ""),
+            ("pkg/src/compute/compute_backend.rs", ""),
+            ("pkg/src/compute/compute_tests.rs", ""),
+        ]
+        check_style.SMALL_DOMAINS["pkg/src/compute"] = "grouped shared-prefix domain"
+        self.assertEqual(
+            self.folders(tree),
+            [("prefix", "pkg/src/compute", 0, "3 children repeat prefix 'compute'; drop it from their names")],
+        )
+
+    def test_stale_domain(self):
+        tree = [("pkg/Cargo.toml", ""), ("pkg/src/lib.rs", "")]
+        check_style.SMALL_DOMAINS["pkg/src/absent"] = "reviewed small scope"
+        self.assertEqual(
+            self.folders(tree),
+            [("folder", "pkg/src/absent", 0, "SMALL_DOMAINS entry does not exist; remove it")],
+        )
+
+
+class FixtureSourceTest(TreeTest):
+    def sources(self, tree):
+        with tempfile.TemporaryDirectory() as tmp:
+            for relpath, text in tree:
+                self.write(tmp, relpath, text)
+            return sorted(check_style.check_sources(tmp))
+
+    def test_fixture_source(self):
+        findings = self.sources([("pkg/src/fixtures/four_term_file_name.rs", "fn four_term_name_here() {}\n")])
+        self.assertEqual(
+            findings,
+            [
+                ("file", "pkg/src/fixtures/four_term_file_name.rs", 0, "filename 'four_term_file_name' has 4 terms"),
+                ("fn", "pkg/src/fixtures/four_term_file_name.rs", 1, "fn 'four_term_name_here' has 4 terms"),
+            ],
+        )
+
+    def test_tests_source(self):
+        findings = self.sources([("pkg/tests/four_term_file_name.rs", "")])
+        self.assertEqual(
+            findings,
+            [
+                ("file", "pkg/tests/four_term_file_name.rs", 0, "filename 'four_term_file_name' has 4 terms"),
+            ],
+        )
+
 
 class ExternalNamesTest(unittest.TestCase):
     def setUp(self):
@@ -508,6 +722,98 @@ class PythonToolTest(TreeTest):
     def test_string_skip(self):
         findings = self.python([("scripts/dev/tool.py", 'TEXT = "def four_term_name_here(): pass"\n')])
         self.assertEqual(findings, [])
+
+    def test_file_name(self):
+        findings = self.python([("scripts/dev/four_term_file_name.py", "value = 1\n")])
+        self.assertEqual(
+            findings,
+            [("pyfile", "scripts/dev/four_term_file_name.py", 0, "filename 'four_term_file_name' has 4 terms")],
+        )
+
+    def test_param_name(self):
+        findings = self.python([("scripts/dev/tool.py", "def tiny(maximum_retry_count_value):\n    pass\n")])
+        self.assertEqual(
+            findings,
+            [("pyparam", "scripts/dev/tool.py", 1, "param 'maximum_retry_count_value' has 4 terms")],
+        )
+
+    def test_typed_param(self):
+        text = "def tiny(maximum_retry_count_value: int = 0):\n    pass\n"
+        findings = self.python([("scripts/dev/tool.py", text)])
+        self.assertEqual(
+            findings,
+            [("pyparam", "scripts/dev/tool.py", 1, "param 'maximum_retry_count_value' has 4 terms")],
+        )
+
+    def test_star_param(self):
+        findings = self.python([("scripts/dev/tool.py", "def tiny(*maximum_retry_count_value):\n    pass\n")])
+        self.assertEqual(
+            findings,
+            [("pyparam", "scripts/dev/tool.py", 1, "param 'maximum_retry_count_value' has 4 terms")],
+        )
+
+    def test_lambda_param(self):
+        text = "action = lambda maximum_retry_count_value: maximum_retry_count_value\n"
+        findings = self.python([("scripts/dev/tool.py", text)])
+        self.assertEqual(
+            findings,
+            [("pyparam", "scripts/dev/tool.py", 1, "param 'maximum_retry_count_value' has 4 terms")],
+        )
+
+    def test_let_name(self):
+        findings = self.python([("scripts/dev/tool.py", "maximum_retry_count_value = 1\n")])
+        self.assertEqual(
+            findings,
+            [("pylet", "scripts/dev/tool.py", 1, "binding 'maximum_retry_count_value' has 4 terms")],
+        )
+
+    def test_annotated_name(self):
+        findings = self.python([("scripts/dev/tool.py", "maximum_retry_count_value: int = 1\n")])
+        self.assertEqual(
+            findings,
+            [("pylet", "scripts/dev/tool.py", 1, "binding 'maximum_retry_count_value' has 4 terms")],
+        )
+
+    def test_bare_annotation(self):
+        findings = self.python([("scripts/dev/tool.py", "maximum_retry_count_value: int\n")])
+        self.assertEqual(
+            findings,
+            [("pylet", "scripts/dev/tool.py", 1, "binding 'maximum_retry_count_value' has 4 terms")],
+        )
+
+    def test_const_name(self):
+        text = "MAXIMUM_RETRY_COUNT_VALUE_LIMIT = 1\n"
+        findings = self.python([("scripts/dev/tool.py", text)])
+        self.assertEqual(
+            findings,
+            [("pyconst", "scripts/dev/tool.py", 1, "constant 'MAXIMUM_RETRY_COUNT_VALUE_LIMIT' has 5 terms")],
+        )
+
+    def test_attr_target(self):
+        text = "self.maximum_retry_count_value = 1\nother.maximum_retry_count_value = 2\n"
+        self.assertEqual(self.python([("scripts/dev/tool.py", text)]), [])
+
+    def test_binding_ref(self):
+        text = "def tiny():\n    value = maximum_retry_count_value\n"
+        self.assertEqual(self.python([("scripts/dev/tool.py", text)]), [])
+
+    def test_module_docstring(self):
+        text = '"""one\ntwo\nthree\nfour"""\nvalue = 1\n'
+        self.assertEqual(
+            self.python([("scripts/dev/tool.py", text)]),
+            [("pycomment", "scripts/dev/tool.py", 1, "docstring spans 4 lines")],
+        )
+
+    def test_function_docstring(self):
+        text = 'def tiny():\n    """one\n    two\n    three\n    four\n    """\n'
+        self.assertEqual(
+            self.python([("scripts/dev/tool.py", text)]),
+            [("pycomment", "scripts/dev/tool.py", 2, "docstring spans 5 lines")],
+        )
+
+    def test_short_docstring(self):
+        text = 'def tiny():\n    """one\n    two\n    """\n'
+        self.assertEqual(self.python([("scripts/dev/tool.py", text)]), [])
 
 
 class OwnFilesTest(unittest.TestCase):

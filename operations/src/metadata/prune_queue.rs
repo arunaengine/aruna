@@ -1074,7 +1074,7 @@ mod tests {
         )
         .await;
 
-        let (jobs, has_more_due, _next_due_at_ms) =
+        let (jobs, has_more_due, _due_at_ms) =
             scan_due_prune(&storage, now_ms, 8).await.unwrap();
 
         assert_eq!(jobs, vec![(graph_prune_key(&due_job).to_vec(), due_job)]);
@@ -1122,7 +1122,7 @@ mod tests {
         )
         .await;
 
-        let (jobs, has_more_due, _next_due_at_ms) =
+        let (jobs, has_more_due, _due_at_ms) =
             scan_due_prune(&storage, now_ms, 8).await.unwrap();
 
         assert_eq!(jobs, vec![(graph_prune_key(&due_job).to_vec(), due_job)]);

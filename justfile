@@ -1,5 +1,7 @@
-# Formatting and Clippy with the pinned nightly toolchain, as CI runs them.
+# Style, formatting and Clippy, as CI runs them.
 lint:
+	python3 scripts/dev/check_style_tests.py
+	python3 scripts/dev/check_style.py
 	cargo +nightly-2026-09-14 fmt --all -- --check
 	cargo +nightly-2026-09-14 clippy --workspace --all-targets --all-features --locked -- -D warnings
 

@@ -5,6 +5,7 @@ are skipped; EXTERNAL_NAMES and SMALL_DOMAINS hold reviewed exceptions."""
 import argparse
 import bisect
 import io
+import keyword
 import os
 import re
 import sys
@@ -74,6 +75,8 @@ DECL_KEYWORDS = frozenset(
 PATTERN_SKIP = frozenset(
     {"mut", "ref", "self", "crate", "super", "dyn", "impl", "const", "in", "move", "as", "true", "false"}
 )
+CLOSURE_PUNCT = frozenset("=([{,;:&?>")
+CLOSURE_WORDS = frozenset({"move", "async", "return"})
 TYPE_KEYWORDS = frozenset({"struct", "enum", "trait", "type", "union"})
 RESTATE_KEYWORDS = frozenset({"fn", "struct", "enum", "trait", "type", "union", "mod"})
 PAIR_OPEN = {"(": ")", "[": "]", "{": "}"}
@@ -385,18 +388,26 @@ def pattern_names(tokens, start, stop):
     names = []
     for index in range(start, stop):
         kind, word, offset, _end = tokens[index]
-        if kind != "ident" or word in PATTERN_SKIP or word.startswith("_") or word[0].isupper():
+        if kind != "ident" or word in PATTERN_SKIP:
+            continue
+        prev = tokens[index - 1] if index else None
+        nxt = tokens[index + 1] if index + 1 < len(tokens) else None
+        if nxt and index + 1 < stop and nxt[1] == ":":
+            continue
+        if prev and prev[1] == ":" and index - 2 >= 0 and tokens[index - 2][1] == ":":
+            continue
+        stripped = word.lstrip("_")
+        if not stripped or stripped[0].isupper():
             continue
         names.append((word, offset))
     return names
 
 
-def param_names(tokens, open_index):
-    close = matching_punct(tokens, open_index)
+def segment_names(tokens, start, stop):
     names = []
     depth, angle = 0, 0
-    in_pattern, seg_start = True, open_index + 1
-    for index in range(open_index + 1, close):
+    in_pattern, seg_start = True, start
+    for index in range(start, stop):
         kind, word, _start, _end = tokens[index]
         if kind != "punct":
             continue
@@ -414,8 +425,89 @@ def param_names(tokens, open_index):
             in_pattern = word == ","
             seg_start = index + 1
     if in_pattern:
-        names.extend(pattern_names(tokens, seg_start, close))
+        names.extend(pattern_names(tokens, seg_start, stop))
     return names
+
+
+def param_names(tokens, open_index):
+    return segment_names(tokens, open_index + 1, matching_punct(tokens, open_index))
+
+
+def pattern_join(tokens, start, stop_words):
+    depth = 0
+    for index in range(start, len(tokens)):
+        kind, word, _start, _end = tokens[index]
+        if kind == "punct":
+            if word in PAIR_OPEN:
+                depth += 1
+            elif word in ")]}":
+                if depth == 0:
+                    return None
+                depth -= 1
+        elif depth == 0 and word in stop_words:
+            return index
+    return None
+
+
+def match_names(tokens, open_index):
+    close = matching_punct(tokens, open_index)
+    names = []
+    depth = 0
+    seg_start = open_index + 1
+    guard = None
+    after_arrow = False
+    for index in range(open_index + 1, close):
+        kind, word, _start, _end = tokens[index]
+        if kind == "punct":
+            if word in PAIR_OPEN:
+                depth += 1
+            elif word in ")]}":
+                depth -= 1
+                if depth == 0 and word == "}" and after_arrow:
+                    seg_start, guard, after_arrow = index + 1, None, False
+            elif depth == 0 and word == "=" and index + 1 < close and tokens[index + 1][1] == ">":
+                stop = guard if guard is not None else index
+                names.extend(pattern_names(tokens, seg_start, stop))
+                after_arrow = True
+            elif depth == 0 and word == ",":
+                seg_start, guard, after_arrow = index + 1, None, False
+        elif depth == 0 and not after_arrow and word == "if" and guard is None:
+            guard = index
+    return names
+
+
+def closure_start(tokens, index, closes):
+    if index == 0:
+        return True
+    kind, word, _start, _end = tokens[index - 1]
+    if kind == "punct":
+        if word in CLOSURE_PUNCT:
+            return True
+        if word == "|":
+            return index - 1 in closes
+        return False
+    return word in CLOSURE_WORDS
+
+
+def closure_end(tokens, start):
+    depth = 0
+    for index in range(start + 1, len(tokens)):
+        kind, word, _start, _end = tokens[index]
+        if kind != "punct":
+            continue
+        if word in PAIR_OPEN:
+            depth += 1
+        elif word in ")]}":
+            if depth == 0:
+                return None
+            depth -= 1
+        elif depth == 0 and word == "|":
+            return index
+        elif depth == 0 and word in ";{":
+            return None
+        elif depth == 0 and word == "=" and index + 1 < len(tokens) and tokens[index + 1][1] == ">":
+            return None
+    return None
 
 
 def local_names(tokens, index):
@@ -440,13 +532,36 @@ def local_names(tokens, index):
 
 def iter_declarations(tokens, masked, attrs):
     total = len(tokens)
+    closure_closes = set()
     for index in range(total):
         kind, word, start, _end = tokens[index]
+        if kind == "punct" and word == "|":
+            if closure_start(tokens, index, closure_closes):
+                close = closure_end(tokens, index)
+                if close is not None:
+                    closure_closes.add(close)
+                    for name, offset in segment_names(tokens, index + 1, close):
+                        yield ("closure", name, "closure param", offset)
+            continue
         if kind != "ident":
             continue
         if word == "let":
             for name, offset in local_names(tokens, index):
                 yield ("let", name, "let", offset)
+            continue
+        if word == "for":
+            nxt = tokens[index + 1] if index + 1 < total else None
+            if nxt is None or nxt[0] != "punct" or nxt[1] != "<":
+                stop = pattern_join(tokens, index + 1, ("in",))
+                if stop is not None:
+                    for name, offset in pattern_names(tokens, index + 1, stop):
+                        yield ("for", name, "for", offset)
+            continue
+        if word == "match":
+            open_index = find_body(tokens, index + 1)
+            if open_index is not None:
+                for name, offset in match_names(tokens, open_index):
+                    yield ("match", name, "match arm", offset)
             continue
         if word not in DECL_KEYWORDS:
             continue
@@ -494,11 +609,7 @@ def read_source(path):
 
 def iter_rust_files(root):
     for dirpath, dirnames, filenames in os.walk(root):
-        rel = os.path.relpath(dirpath, root)
-        parts = [] if rel == "." else rel.split(os.sep)
         dirnames[:] = [d for d in dirnames if d not in SKIP_PARTS]
-        if set(parts) & ASSET_PARTS:
-            continue
         for name in sorted(filenames):
             if name.endswith(".rs"):
                 yield os.path.join(dirpath, name)
@@ -557,10 +668,11 @@ def prefix_findings(rel, dirpath, files):
 
 
 def check_folders(root):
+    seen = set()
     for src in src_roots(root):
         pkg = os.path.dirname(src)
         for dirpath, dirs, files in os.walk(src):
-            dirs[:] = [d for d in dirs if d not in SKIP_PARTS and d not in ASSET_PARTS]
+            dirs[:] = [d for d in dirs if d not in SKIP_PARTS]
             rel = os.path.relpath(dirpath, root)
             if os.path.basename(dirpath) in STRUCT_NAMES and os.path.dirname(dirpath) == src:
                 dirs[:] = []
@@ -568,18 +680,37 @@ def check_folders(root):
             if os.path.basename(dirpath) == "tests" and os.path.dirname(dirpath) == pkg:
                 dirs[:] = []
                 continue
+            if (
+                os.path.basename(dirpath) in ASSET_PARTS
+                and rel not in SMALL_DOMAINS
+                and not any(f.endswith(".rs") for f in files)
+            ):
+                dirs[:] = []
+                continue
             yield from prefix_findings(rel, dirpath, files)
             if dirpath == src:
                 continue
-            if os.path.basename(dirpath) == "tests" and os.path.dirname(dirpath) == src and "mod.rs" in files:
-                continue
             real = direct_files(files)
+            if (
+                os.path.basename(dirpath) == "tests"
+                and os.path.dirname(dirpath) == src
+                and "mod.rs" in files
+                and len(real) >= 2
+            ):
+                seen.add(rel)
+                continue
             if not real and not any(f.endswith(".rs") for f in files):
                 continue
             if rel in SMALL_DOMAINS:
+                seen.add(rel)
+                if len(real) >= 2:
+                    continue
+                yield ("folder", rel, 0, f"{len(real)} of {FOLDER_MIN} direct files besides mod.rs; the SMALL_DOMAINS entry no longer qualifies")
                 continue
             if len(real) < FOLDER_MIN:
                 yield ("folder", rel, 0, f"{len(real)} of {FOLDER_MIN} direct files besides mod.rs")
+    for rel in sorted(set(SMALL_DOMAINS) - seen):
+        yield ("folder", rel, 0, "SMALL_DOMAINS entry does not exist; remove it")
 
 
 def decl_terms(name):
@@ -679,8 +810,273 @@ def python_findings(root):
             tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
         except (tokenize.TokenError, SyntaxError):
             continue
+        yield from python_file_findings(rel, path)
         yield from python_name_findings(rel, tokens)
+        yield from python_param_findings(rel, tokens)
+        yield from python_binding_findings(rel, tokens)
         yield from python_comment_findings(rel, text, tokens)
+        yield from python_docstring_findings(rel, tokens)
+
+
+def python_file_findings(rel, path):
+    stem = os.path.basename(path)[:-3]
+    if stem not in EXTERNAL_NAMES and decl_terms(stem) > TERM_MAX:
+        yield ("pyfile", rel, 0, f"filename '{stem}' has {decl_terms(stem)} terms")
+
+
+def python_lines(tokens):
+    line = []
+    for token in tokens:
+        if token.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+            if line:
+                yield line
+            line = []
+        else:
+            line.append(token)
+    if line:
+        yield line
+
+
+def python_statements(line):
+    statements = []
+    current = []
+    depth = 0
+    for token in line:
+        if token.type == tokenize.OP:
+            if token.string in "([{":
+                depth += 1
+            elif token.string in ")]}":
+                depth -= 1
+            elif token.string == ";" and depth == 0:
+                statements.append(current)
+                current = []
+                continue
+        current.append(token)
+    statements.append(current)
+    return statements
+
+
+def python_significant(statement):
+    return [
+        token
+        for token in statement
+        if token.type not in (tokenize.COMMENT, tokenize.NL, tokenize.INDENT, tokenize.DEDENT)
+    ]
+
+
+def python_param_open(tokens, index):
+    depth = 0
+    for position in range(index + 1, len(tokens)):
+        token = tokens[position]
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            if token.string == "(" and depth == 0:
+                return position
+            depth += 1
+        elif token.string in ")]}":
+            depth -= 1
+    return None
+
+
+def python_param_close(tokens, open_index):
+    depth = 0
+    for position in range(open_index, len(tokens)):
+        token = tokens[position]
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            depth += 1
+        elif token.string in ")]}":
+            depth -= 1
+            if depth == 0:
+                return position
+    return None
+
+
+def python_lambda_stop(tokens, index):
+    depth = 0
+    for position in range(index + 1, len(tokens)):
+        token = tokens[position]
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            depth += 1
+        elif token.string in ")]}":
+            depth -= 1
+        elif token.string == ":" and depth == 0:
+            return position
+    return None
+
+
+def python_param_names(tokens, start, stop):
+    names = []
+    segments, seg_start, depth = [], start, 0
+    for position in range(start, stop):
+        token = tokens[position]
+        if token.type == tokenize.OP:
+            if token.string in "([{":
+                depth += 1
+            elif token.string in ")]}":
+                depth -= 1
+            elif token.string == "," and depth == 0:
+                segments.append(tokens[seg_start:position])
+                seg_start = position + 1
+    segments.append(tokens[seg_start:stop])
+    for segment in segments:
+        for token in segment:
+            if token.type == tokenize.OP and token.string in (":", "="):
+                break
+            if token.type == tokenize.NAME and not keyword.iskeyword(token.string):
+                names.append((token.string, token.start[0]))
+                break
+    return names
+
+
+def python_param_findings(rel, tokens):
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.NAME or token.string not in ("def", "lambda"):
+            continue
+        if token.string == "def":
+            open_index = python_param_open(tokens, index)
+            if open_index is None:
+                continue
+            stop = python_param_close(tokens, open_index)
+            start = open_index + 1
+        else:
+            start = index + 1
+            stop = python_lambda_stop(tokens, index)
+        if stop is None:
+            continue
+        for name, row in python_param_names(tokens, start, stop):
+            terms = decl_terms(name)
+            if terms > TERM_MAX:
+                yield ("pyparam", rel, row, f"param '{name}' has {terms} terms")
+
+
+def python_target_names(region):
+    cut, brackets = len(region), []
+    for index, token in enumerate(region):
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            brackets.append(token.string)
+        elif token.string in ")]}":
+            if brackets:
+                brackets.pop()
+        elif token.string == ":" and not brackets:
+            cut = min(cut, index)
+    names, brackets = [], []
+    for index, token in enumerate(region[:cut]):
+        if token.type == tokenize.OP:
+            if token.string in "([{":
+                brackets.append(token.string)
+            elif token.string in ")]}":
+                if brackets:
+                    brackets.pop()
+            continue
+        if token.type != tokenize.NAME or keyword.iskeyword(token.string):
+            continue
+        if "[" in brackets:
+            continue
+        prev = region[index - 1] if index else None
+        nxt = region[index + 1] if index + 1 < len(region) else None
+        if prev is not None and prev.type == tokenize.OP and prev.string == ".":
+            continue
+        if nxt is not None and nxt.type == tokenize.OP and nxt.string in ".([":
+            continue
+        names.append((token.string, token.start[0]))
+    return names
+
+
+def python_separators(tokens):
+    separators, depth = [], 0
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            depth += 1
+        elif token.string in ")]}":
+            depth -= 1
+        elif token.string == "=" and depth == 0:
+            separators.append(index)
+    return separators
+
+
+def python_binding(rel, name, row):
+    terms = decl_terms(name)
+    if terms <= TERM_MAX:
+        return None
+    core = name.strip("_")
+    if core and core.upper() == core:
+        return ("pyconst", rel, row, f"constant '{name}' has {terms} terms")
+    return ("pylet", rel, row, f"binding '{name}' has {terms} terms")
+
+
+def python_binding_findings(rel, tokens):
+    for line in python_lines(tokens):
+        for statement in python_statements(line):
+            tokens_in = python_significant(statement)
+            if not tokens_in:
+                continue
+            first = tokens_in[0]
+            if first.type == tokenize.NAME and (
+                keyword.iskeyword(first.string) or first.string in ("match", "case")
+            ):
+                continue
+            separators = python_separators(tokens_in)
+            if separators:
+                previous = 0
+                for index in separators:
+                    for name, row in python_target_names(tokens_in[previous:index]):
+                        finding = python_binding(rel, name, row)
+                        if finding:
+                            yield finding
+                    previous = index + 1
+                continue
+            colon = None
+            depth = 0
+            for index, token in enumerate(tokens_in):
+                if token.type != tokenize.OP:
+                    continue
+                if token.string in "([{":
+                    depth += 1
+                elif token.string in ")]}":
+                    depth -= 1
+                elif token.string == ":" and depth == 0:
+                    colon = index
+                    break
+            if colon is None:
+                continue
+            for name, row in python_target_names(tokens_in[:colon]):
+                finding = python_binding(rel, name, row)
+                if finding:
+                    yield finding
+
+
+def python_docstring_findings(rel, tokens):
+    last = None
+    at_start = True
+    for token in tokens:
+        if token.type in (
+            tokenize.COMMENT,
+            tokenize.NL,
+            tokenize.NEWLINE,
+            tokenize.INDENT,
+            tokenize.DEDENT,
+            tokenize.ENCODING,
+        ):
+            if token.type in (tokenize.NEWLINE, tokenize.INDENT):
+                at_start = True
+            continue
+        if at_start and token.type == tokenize.STRING and (
+            last is None or (last.type == tokenize.OP and last.string == ":")
+        ):
+            span = token.end[0] - token.start[0] + 1
+            if span > COMMENT_MAX:
+                yield ("pycomment", rel, token.start[0], f"docstring spans {span} lines")
+        last = token
+        at_start = False
 
 
 def python_name_findings(rel, tokens):
@@ -723,7 +1119,10 @@ def report(findings, limit):
         "fn",
         "testfn",
         "param",
+        "closure",
         "let",
+        "for",
+        "match",
         "type",
         "mod",
         "const",
@@ -731,7 +1130,11 @@ def report(findings, limit):
         "field",
         "variant",
         "comment",
+        "pyfile",
         "pydecl",
+        "pyparam",
+        "pylet",
+        "pyconst",
         "pycomment",
         "restates",
     ]
@@ -742,7 +1145,10 @@ def report(findings, limit):
         "fn": "fn",
         "testfn": "test fn",
         "param": "param",
+        "closure": "closure param",
         "let": "let",
+        "for": "for",
+        "match": "match arm",
         "type": "type",
         "mod": "mod",
         "const": "const",
@@ -750,7 +1156,11 @@ def report(findings, limit):
         "field": "field",
         "variant": "variant",
         "comment": "comment",
+        "pyfile": "python file",
         "pydecl": "python decl",
+        "pyparam": "python param",
+        "pylet": "python binding",
+        "pyconst": "python const",
         "pycomment": "python comment",
         "restates": "warning",
     }
