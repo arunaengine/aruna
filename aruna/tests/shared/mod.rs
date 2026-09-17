@@ -595,7 +595,7 @@ pub(crate) async fn spawn_complete_joiner(
     seed: &SeedNode,
     onboarding_secret: String,
 ) -> TestResult<JoinerNode> {
-    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Minimal).await
+    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Full).await
 }
 
 #[allow(dead_code)]
@@ -603,7 +603,7 @@ pub(crate) async fn spawn_joiner_node(
     seed: &SeedNode,
     onboarding_secret: String,
 ) -> TestResult<JoinerNode> {
-    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Full).await
+    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Minimal).await
 }
 
 async fn spawn_seed_mode(
