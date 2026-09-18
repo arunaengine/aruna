@@ -284,10 +284,10 @@ impl PreparedRequest {
                 .try_acquire_local(LocalKey::Ip(charged_ip))
             {
                 Some(permit) => permit,
-                None => return Ok(self.local_limited_response()),
+                None => return self.local_limited_response(),
             };
             if !self.lease.hold(permit) {
-                return Ok(self.local_limited_response());
+                return self.local_limited_response();
             }
         }
         self.request
@@ -405,10 +405,10 @@ impl PreparedRequest {
             .await
     }
 
-    fn local_limited_response(&mut self) -> HttpResponse {
+    fn local_limited_response(&mut self) -> Result<HttpResponse, HttpError> {
         self.request = None;
         self.admission = None;
-        slow_down_response(1)
+        self.trace.respond("local_limited", slow_down_response(1))
     }
 
     /// Releases the admission and capture permits and stops the request stream
@@ -1164,6 +1164,66 @@ mod tests {
             charge("198.51.100.2").await,
             http::StatusCode::SERVICE_UNAVAILABLE
         );
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn counts_local_limit() {
+        // A request refused by the per-IP slot limit still reaches the request
+        // metrics, so dashboards count every 503.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("local addr");
+        let metrics = Arc::new(NodeMetrics::new());
+        let server = S3Server::new(
+            "127.0.0.1:0",
+            format!("localhost:{}", address.port()),
+            driver_ctx,
+            RealmId([6u8; 32]),
+            iroh::SecretKey::generate().public(),
+            CredentialEncryptionKey::random(),
+            RoCrateLimits::default(),
+            CorsConfig::default(),
+            metrics.clone(),
+        )
+        .await
+        .expect("s3 server builds");
+        let client_ip = LocalKey::Ip(std::net::IpAddr::from([127, 0, 0, 1]));
+        let mut held = Vec::new();
+        while let Some(permit) = server.rate_limits.try_acquire_local(client_ip) {
+            held.push(permit);
+        }
+        let (_bound, task) = server
+            .run_with_listener(listener, CancellationToken::new())
+            .expect("server runs");
+
+        let status = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{}/bucket/key", address.port()))
+            .send()
+            .await
+            .expect("request completes")
+            .status();
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+        let refused = metrics
+            .http_requests
+            .get_or_create(&RequestLabels {
+                interface: "s3",
+                method: method_label("GET"),
+                code: 503,
+            })
+            .get();
+        assert_eq!(refused, 1);
+        assert!(metrics.render().await.contains(r#"op="local_limited""#));
 
         task.abort();
     }
