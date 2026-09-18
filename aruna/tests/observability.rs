@@ -636,6 +636,16 @@ mod process {
             self.wait_path(path, expected).await;
         }
 
+        /// Releases the pinned outbox drain, which then joins on its own.
+        pub fn release_outbox(&self) {
+            let path = self
+                .paths
+                .outbox
+                .as_ref()
+                .expect("outbox barrier path is present");
+            std::fs::write(path, b"release").expect("release the outbox barrier");
+        }
+
         async fn wait_path(&mut self, path: PathBuf, expected: &str) {
             let deadline = Instant::now() + HANG_GUARD;
             let reached = |path: &PathBuf| {
@@ -1221,6 +1231,8 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
     // Readiness closes before the children join, so sample it first; waiting for
     // the joins would leave only the last instant before exit to observe it in.
     let body = node.wait_draining().await;
+    // Released only once draining is observable, so the join order stays checkable.
+    node.release_outbox();
     wait_children(&mut node).await;
     let ready: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(ready["ready"], serde_json::json!(false));
@@ -1249,8 +1261,8 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
 async fn second_signal_exits() -> TestResult<()> {
     use std::os::unix::process::ExitStatusExt;
 
-    // The pinned recovery and outbox children keep the drain active until the
-    // second signal lands; without them shutdown can win the /readyz probe.
+    // This test never releases the outbox barrier, so the pinned children keep
+    // the drain active until the second signal; else shutdown wins the probes.
     let env = process::NodeEnv::new();
     let mut node = prepare_shutdown(&env).await?;
 

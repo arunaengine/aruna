@@ -192,12 +192,16 @@ impl OutboxBarrier {
         Some(barrier)
     }
 
-    /// Holds the drain until shutdown closes admission, so the test sees an
-    /// active drain that still joins on its own.
-    pub(super) async fn wait_start(&self, task_handle: Option<&TaskHandle>) {
-        match task_handle {
-            Some(handle) => handle.await_admission_closed().await,
-            None => std::future::pending::<()>().await,
+    /// Holds the drain open until the test writes "release" into the marker
+    /// file, so the test alone decides when this drain may finish.
+    pub(super) async fn wait_start(&self) {
+        loop {
+            let released =
+                std::fs::read_to_string(&self.marker).is_ok_and(|value| value.trim() == "release");
+            if released {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 }
@@ -430,7 +434,7 @@ impl OperationsTaskHandler {
         let _drain = self.drain_guard.lock().await;
         #[cfg(debug_assertions)]
         if let Some(barrier) = OutboxBarrier::new() {
-            barrier.wait_start(self.context.task_handle.as_ref()).await;
+            barrier.wait_start().await;
         }
 
         self.run_drain().await;
