@@ -1,3 +1,8 @@
+//! Owns placement: maps documents to buckets and resolves which nodes hold each bucket.
+//! Also holds the drain and membership helpers shared by the placement submodules.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod allocate_handle;
 #[cfg(test)]
 mod distribution;

@@ -1,3 +1,7 @@
+//! Tests the multipart complete state machine: fences, rollbacks, cleanup and commits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
 use super::*;

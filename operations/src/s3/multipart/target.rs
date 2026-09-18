@@ -1,3 +1,7 @@
+//! Checks that an upload record matches the target object and is open enough to write.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use thiserror::Error;
 

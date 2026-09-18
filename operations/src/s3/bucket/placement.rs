@@ -1,6 +1,7 @@
-//! Bucket default placement refs: the default governs versions minted after it
-//! is set and never rewrites stored ones. This operation owns the generation bump,
-//! authenticates every ref via the ordinary read path, and is realm-admin only.
+//! Sets the bucket default placement refs and bumps the placement policy generation.
+//! Realm admins only; the default applies to later versions and never rewrites stored ones.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};

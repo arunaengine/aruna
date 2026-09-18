@@ -1,6 +1,7 @@
-//! Adapter I/O for [`PolicyFetchEffect`], kept out of the sans-I/O operations.
-//! One request per resolved holder, in rank order, over the existing control
-//! transport; nothing here routes or widens the holder list.
+//! Runs the adapter side of a policy fetch, one request per resolved holder in rank order.
+//! It uses the existing control transport and never reroutes or widens the holder list.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

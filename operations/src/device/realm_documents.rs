@@ -1,6 +1,7 @@
-//! A device's copy of the realm-wide documents, fetched by routed read into the
-//! realm keyspaces. Installs never regress, so revocations survive, and a marker
-//! every peer disagrees with is re-based.
+//! Keeps a device's copy of the realm-wide documents, fetched by routed reads from peers.
+//! Installs never regress, and a marker every peer disagrees with is re-based.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
 use std::str::FromStr;

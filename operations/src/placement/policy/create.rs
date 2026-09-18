@@ -1,4 +1,6 @@
-//! Creation of an immutable placement-policy document on one of its holders.
+//! Creates an immutable placement policy document on the holders its policy id resolves to.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};

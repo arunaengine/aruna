@@ -1,6 +1,7 @@
-//! Two-way synced folders on the owner's own machine.
-//! One realm bucket prefix per folder: local files form a read-only bucket the
-//! node pulls from, realm changes return through guarded writes, local data wins.
+//! Owns the device's two-way synced folders and drives the repeated reconcile passes.
+//! Local files form a read-only bucket the realm node pulls from, and local data wins.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod actions;
 pub mod folders;

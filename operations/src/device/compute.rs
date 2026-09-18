@@ -1,6 +1,7 @@
-//! Owner-initiated local execution on a user device.
-//!
-//! Runs only its owner's jobs on device-local data; staging reads realm-held inputs.
+//! Accepts owner-initiated local runs on a user device and submits them as jobs.
+//! Only the owner's work runs here; staging reads the realm-held inputs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
 use aruna_core::compute::{ExecutorKind, ResourceEnvelope};

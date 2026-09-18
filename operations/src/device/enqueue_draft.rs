@@ -1,4 +1,6 @@
-//! Queues one offline authoring intent on the device.
+//! Queues one offline authoring draft on the device while the queue limit allows it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

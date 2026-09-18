@@ -1,3 +1,7 @@
+//! Deletes many keys in one request and reports a per-key outcome for the caller.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,

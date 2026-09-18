@@ -1,5 +1,6 @@
-//! Placement view assembly and holder resolution over the weighted
-//! two-level rendezvous primitives in [`crate::placement::selector`].
+//! Builds the placement view and resolves bucket holders with the weighted rendezvous ranking.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashSet};
 

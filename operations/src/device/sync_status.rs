@@ -1,6 +1,6 @@
-//! What this device still owes the realm, and how to make it run now.
-//! Derived only from local state (replica ledger, publish queue, folder rows), so
-//! the Sync view answers while the realm is out of reach.
+//! Builds the Sync view of what this device still owes the realm, from local state alone.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

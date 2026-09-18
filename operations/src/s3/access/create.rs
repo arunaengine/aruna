@@ -1,3 +1,7 @@
+//! Creates an S3 access key and encrypted secret for a user, with path limits and an expiry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::UserId;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{

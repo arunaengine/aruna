@@ -1,6 +1,7 @@
-//! Responder-local coverage of a bucket default: a default only governs versions
-//! minted after it, so this scan reports what THIS node observes of its current
-//! heads and its compared refs/generation. Historical versions are diagnostic.
+//! Scans this node's heads in pages and reports where a bucket default is not attached yet.
+//! A default only governs versions minted after it, so historical rows are diagnostic only.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

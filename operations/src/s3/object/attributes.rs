@@ -1,3 +1,7 @@
+//! Describes one object version: its location, checksums, part summary and part list.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::blob::records::blob_location_read;
 use crate::s3::object::lookup::{

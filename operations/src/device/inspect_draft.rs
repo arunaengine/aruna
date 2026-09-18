@@ -1,4 +1,6 @@
-//! Reads one queued authoring intent.
+//! Reads one queued authoring draft from the device queue.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};

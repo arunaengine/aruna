@@ -1,6 +1,7 @@
-//! The metadata documents this device keeps a local craqle replica of.
-//! The ledger names selected documents, sync progress, registry records and last
-//! valid renders so reads work offline; only the publish drain makes it realm state.
+//! Stores the local craqle replicas of the metadata documents this device keeps.
+//! The ledger holds sync progress, registry records and renders so reads work offline.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

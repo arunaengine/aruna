@@ -1,6 +1,7 @@
-//! Node-local placement-handle allocation from bootstrap-assigned ranges.
-//! The durable cursor is persisted before returning, so crashes may skip a
-//! handle but cannot reissue one.
+//! Allocates placement handles from bootstrap-assigned ranges on the local node.
+//! The cursor is stored before returning, so a crash may skip a handle but never reissue one.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};

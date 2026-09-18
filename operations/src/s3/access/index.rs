@@ -1,3 +1,7 @@
+//! Encodes and decodes the per-user index of active S3 access key ids.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::storage::blob::UserAccess;

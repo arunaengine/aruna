@@ -1,3 +1,8 @@
+//! Owns the shared S3 session helpers: access keys, index keys and secret encryption.
+//! It also re-exports the create, get, list, refresh, revoke, touch and purge operations.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 mod create;
 mod get;
 mod list;

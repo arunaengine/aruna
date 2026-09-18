@@ -1,4 +1,6 @@
 //! Publishes queued authoring intents once the realm is reachable again.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;

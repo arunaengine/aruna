@@ -1,6 +1,7 @@
-//! Deterministic statistical distribution gates for the weighted resolver.
-//! Subjects come from a blake3 counter stream (no RNG), so observed shares
-//! reproduce on every run and platform.
+//! Tests that weighted resolution spreads subjects across nodes in proportion to weight.
+//! Subjects come from a blake3 counter stream, so the shares repeat on every run and platform.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 

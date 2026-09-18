@@ -1,6 +1,7 @@
-//! Per-bucket write-admission fence.
-//! A writer reads the bucket's fence in its commit transaction, so a departing
-//! holder's durable close conflicts every uncommitted predecessor generation.
+//! Provides the per-bucket write fence that admits writes at the bucket activation epoch.
+//! A writer reads the fence in its commit, so a holder close conflicts with pending writes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;

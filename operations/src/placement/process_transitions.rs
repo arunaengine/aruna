@@ -1,6 +1,7 @@
-//! Per-node execution of placement transitions (DECISIONS D9): old holders freeze
-//! their frontier; targets join, pull, verify and sign the converged digest. A
-//! target never mints a genesis (#400): a rival genesis is a permanent split-brain.
+//! Runs the placement transition steps this node owns: freeze, join, pull, verify and sign.
+//! A target node never mints a genesis, since a rival genesis would split the topic forever.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

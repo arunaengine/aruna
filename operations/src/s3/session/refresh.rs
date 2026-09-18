@@ -1,3 +1,7 @@
+//! Refreshes an S3 session with a new secret and expiry, and rewrites its index rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     S3SessionCredentials, S3SessionError, build_session, decode_index, expiry_key, owner_key,
 };

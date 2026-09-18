@@ -1,6 +1,7 @@
-//! Responder-local listing of the placement policies this node holds.
-//! Documents replicate only to the holders their policy id resolves to, so a
-//! page names what this node stores and never claims to be the realm catalog.
+//! Lists the placement policy documents this node holds, one bounded page at a time.
+//! A page names local rows only, so it never claims to be the full realm catalog.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

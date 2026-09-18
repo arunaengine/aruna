@@ -1,3 +1,7 @@
+//! Copies bytes from an existing object into one part of an open multipart upload.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
 use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
 use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};

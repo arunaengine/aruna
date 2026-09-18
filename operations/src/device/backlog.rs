@@ -1,6 +1,7 @@
-//! Retry bookkeeping, page draining and timer arming shared by the device
-//! publish queue and the synced-folder upload outbox. The stored state
-//! enums stay distinct; only their arithmetic and control flow live here.
+//! Shared retry math, page draining and timer arming for the two device queues.
+//! The stored state enums stay distinct; only their control flow lives here.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
 use std::time::Duration;

@@ -1,3 +1,7 @@
+//! Starts a multipart upload, gating placement and pinning the backend on the upload record.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,

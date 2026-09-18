@@ -1,3 +1,7 @@
+//! Tests PutObject gates, commit conflict retries, cleanup on failure and per backend dedup.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,

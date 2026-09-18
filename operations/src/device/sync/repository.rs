@@ -1,4 +1,6 @@
-//! Storage shape of the device-local synced folders.
+//! Holds the storage shape and row helpers for the device-local synced folder state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

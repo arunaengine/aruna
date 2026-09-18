@@ -1,3 +1,7 @@
+//! Completes a multipart upload by composing its parts into one blob version and committing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::blob::cleanup::schedule_cleanup_effect;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{

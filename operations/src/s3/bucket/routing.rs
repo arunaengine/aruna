@@ -1,3 +1,7 @@
+//! Writes and reads the storage routing rules that a bucket record carries.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::groups::storage_routing::load_group_inputs;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

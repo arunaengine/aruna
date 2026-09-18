@@ -1,6 +1,7 @@
-//! Resolving a governed ref set and evaluating one subject against it. The
-//! sans-I/O gate every enforcement point shares: it obtains the rules and calls
-//! the pure evaluator, and a selector never grants what authorization denied.
+//! Resolves the governing policy refs and evaluates one subject against all of them.
+//! This is the shared gate: it gathers the rules and calls the pure evaluator.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};

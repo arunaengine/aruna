@@ -1,6 +1,7 @@
-//! Bounded bulk application of a bucket default to current heads. Each run
-//! captures one target per transaction and mints via the single-object
-//! sub-operation, which re-reads default/head/intent and unions, never removes.
+//! Applies a bucket default to current heads in bounded pages, one target per transaction.
+//! Each mint runs the single object sub-operation, which unions refs and never removes them.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::records::HeadAliasContext;

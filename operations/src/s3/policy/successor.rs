@@ -1,6 +1,7 @@
-//! Explicit policy attachment as a successor version. It never rewrites a stored
-//! version: it mints a successor and advances the head from an exact pointer, with
-//! the VersionId durably assigned under `mutation_id` so retries resolve to it.
+//! Mints a successor version that carries new policy refs and advances the head pointer.
+//! It never rewrites a stored version; a retry with the same mutation id returns that version.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::managed_copy::{
     COPY_PAGE_LIMIT, CopyRegistration, CopyRequest, ManagedCopyError, ManagedCopyPage,

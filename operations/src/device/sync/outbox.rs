@@ -1,6 +1,7 @@
 //! Asks each folder's realm node to pull the local versions that changed.
-//! The device never pushes: one request names the exact local version, which the
-//! node reads back and commits as the owner.
+//! The device never pushes bytes; a request names the exact local version to read back.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;

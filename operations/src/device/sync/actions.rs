@@ -1,6 +1,7 @@
-//! The explicit owner decisions that may change local bytes.
-//! Automatic sync never replaces divergent bytes or removes files; only these
-//! actions do, for the exact bytes shown, each with an audit row.
+//! Runs the owner's explicit sync actions that may replace or remove local bytes.
+//! Automatic sync never does this, and every action writes an audit row.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

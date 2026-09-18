@@ -1,3 +1,7 @@
+//! Stores one uploaded part: writes the blob, records the part and retries write conflicts.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::placement::policy::PolicyGateError;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};

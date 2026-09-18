@@ -1,3 +1,7 @@
+//! Searches buckets across nodes and drops hits the caller may not see by realm or group.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, VecDeque};
 use std::time::SystemTime;
 

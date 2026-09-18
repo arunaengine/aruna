@@ -1,3 +1,7 @@
+//! Runs the S3 GetObject state machine, including range reads and reference drift successors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::blob::records::blob_location_read;

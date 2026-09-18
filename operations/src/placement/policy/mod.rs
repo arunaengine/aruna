@@ -1,6 +1,7 @@
-//! Placement-policy documents: creation, read by ref, and fetch transport.
-//! Document and selector placement are separate: holders come from the policy
-//! id, while admitted subjects come from selectors via `evaluate_placement`.
+//! Owns placement policy documents: creation, lookup, caching, gating and fetch transport.
+//! Holders follow from the policy id, while admitted subjects follow from the selectors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod cache;
 pub mod create;

@@ -1,6 +1,7 @@
-//! Device-local plane of a user node: the offline publish queue and the
-//! owner's node controls. Nothing here is realm authority; a queued intent
-//! becomes realm state only when the drain forwards it as an ordinary create.
+//! Owns the device-local plane of a user node: the offline publish queue and node controls.
+//! A queued intent becomes realm state only when the drain forwards it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod backlog;
 pub mod compute;

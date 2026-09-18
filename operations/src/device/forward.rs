@@ -1,3 +1,7 @@
+//! Serves the realm documents and document graphs a device asks for, and applies its edits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::groups::get_group::GetGroupConfig;

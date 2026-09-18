@@ -1,6 +1,7 @@
-//! Operator resolution of quarantined local copies. A scan leaving copies
-//! quarantined keeps this node draining; releasing drops one version's local
-//! registrations and the block ends once nothing quarantined remains.
+//! Lets an operator release the quarantined local copies of one version, or rescan them.
+//! This node keeps draining until no quarantined copy is left.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};

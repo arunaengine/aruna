@@ -1,3 +1,7 @@
+//! Runs the S3 HeadObject state machine that resolves object metadata without reading data.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::blob::records::blob_location_read;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};

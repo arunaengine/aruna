@@ -1,3 +1,7 @@
+//! Tests GetObject range resolution, holder failure reporting and reference drift successors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::UsageCounterUpdate;
 use crate::replication::bao_read::BaoReadError;

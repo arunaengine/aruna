@@ -1,3 +1,7 @@
+//! Revokes one S3 access credential and removes its key id from the owner index.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::index::{decode_index, encode_index, owner_key};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

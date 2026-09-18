@@ -1,3 +1,7 @@
+//! Searches object keys across a realm's buckets and filters hits by the caller's permissions.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::time::SystemTime;
 

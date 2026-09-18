@@ -1,3 +1,7 @@
+//! Creates an S3 session credential and drops the oldest ones past the per group limit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     MAX_GROUP_SESSIONS, S3SessionCredentials, S3SessionError, build_session, decode_index,
     encode_index, expiry_key, owner_key, session_age,

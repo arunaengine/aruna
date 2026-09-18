@@ -1,4 +1,6 @@
-//! Binding, listing and unbinding the folders this device syncs.
+//! Binds, lists and unbinds the realm folders this device keeps in sync.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

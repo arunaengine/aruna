@@ -1,6 +1,7 @@
-//! Responder-local policy diagnostics: what this node enforces, which of its
-//! own registered copies are not serveable, and its durable policy cache. Every
-//! number observes only this node's rows; cache coverage is not policy truth.
+//! Reports which policies this node enforces, which local copies cannot serve, and cache use.
+//! Every number covers this node's own rows only, so cache coverage is not policy truth.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

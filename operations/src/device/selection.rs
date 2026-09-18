@@ -1,6 +1,7 @@
-//! What the owner keeps available offline on this device.
-//! A selected document gets a local replica read and edited without the realm;
-//! a deselected one is forwarded like any other read.
+//! Selects and deselects the documents the owner keeps available offline on this device.
+//! A selected document gets a local replica; a deselected one is read through the realm.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

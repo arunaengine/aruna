@@ -1,3 +1,7 @@
+//! Deletes an object version, moves the head pointer and updates usage and cleanup work.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 use crate::blob::records::{
     HeadAliasContext, blob_location_read, build_transition_effects, delete_index_effect,

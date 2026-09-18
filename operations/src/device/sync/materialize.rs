@@ -1,6 +1,7 @@
 //! Writes one remote version into a synced folder and records what happened.
-//!
-//! A rename whose bytes changed leaves a pending entry; the action's audit joins its base row.
+//! A refused write keeps the local bytes and leaves the entry pending for the owner.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

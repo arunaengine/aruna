@@ -1,3 +1,7 @@
+//! Lists the S3 credentials a user owns by reading the owner index and each record.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::index::{decode_index, owner_key};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};

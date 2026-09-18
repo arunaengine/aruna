@@ -1,3 +1,7 @@
+//! Validates an S3 session token and records the last used time, retrying on conflict.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::S3SessionError;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;

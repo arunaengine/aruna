@@ -1,5 +1,6 @@
-//! Shared version-location lookup steps for the S3 object read operations: the
-//! managed-copy gate, the blob location read and the multipart summary read.
+//! Shares the managed copy gate, blob location and multipart summary reads for object reads.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::managed_copy::{
     CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,

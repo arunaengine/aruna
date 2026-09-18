@@ -1,4 +1,6 @@
-//! Reservation release, durable cleanup queue and pending error shared by S3 writes.
+//! Tracks the reservation release, durable cleanup queue and pending error of an S3 write.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::cleanup::PendingCleanup;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

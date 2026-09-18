@@ -1,6 +1,7 @@
-//! Realm-admin mutation attaching an exact policy set to one object. It
-//! authorizes and authenticates refs before the mint transaction, and mints a
-//! collision-checked successor VersionId inside it.
+//! Attaches an exact policy set to one object as a realm admin mutation.
+//! It resolves and authorizes the refs first, then mints a collision checked successor version.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;

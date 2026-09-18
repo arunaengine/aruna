@@ -1,6 +1,6 @@
-//! Planning and preview for placement transitions: the pure functions that
-//! turn "move these buckets onto that candidate map" into a self-describing
-//! plan every node can re-derive.
+//! Plans and previews placement transitions as pure functions every node can re-derive.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::structs::identity::realm::RealmConfigDocument;

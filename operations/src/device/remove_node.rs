@@ -1,6 +1,7 @@
-//! Eviction of an enrolled device.
-//! A management-node-only realm-config event: an owner reaches its bound devices,
-//! a realm admin every enrolled device but never an infrastructure node.
+//! Evicts an enrolled device by writing a realm config event on a management node.
+//! An owner reaches its own devices, a realm admin every device, never an infrastructure node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};

@@ -1,3 +1,7 @@
+//! Tests object delete: tombstones, audit records, pointer rewrites and queued copy cleanup.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};

@@ -1,6 +1,7 @@
-//! Seeding and refreshing the replicas this device keeps: with no bucket to push
-//! to it, a device pulls a holder's graph snapshot and joins it as an OR-Set
-//! union, so unpublished local edits survive and repeats are no-ops.
+//! Seeds and refreshes device replicas by joining a holder's graph snapshot as an OR-Set.
+//! Unpublished local edits survive, and a repeated refresh changes nothing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;

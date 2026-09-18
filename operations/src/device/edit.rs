@@ -1,6 +1,7 @@
-//! Edits the owner makes on this device's own replicas.
-//!
-//! Planned against the local graph, queued, then merged; the holder re-checks authority on forward.
+//! Applies one owner edit to a local replica and queues it for the realm.
+//! The holder re-checks authority when the queued edit is forwarded.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;

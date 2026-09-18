@@ -1,6 +1,7 @@
-//! Bounded local revalidation of this node's registered copies: advance the
-//! local subject, re-evaluate the inventory, then decide every registration
-//! against it, without waiting for a realm-wide acknowledgement.
+//! Revalidates this node's registered copies after its own placement subject changed.
+//! It advances the stored subject, rescans the inventory and decides every registration.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

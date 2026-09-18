@@ -1,6 +1,7 @@
-//! Machine-initiated placement expansion at onboarding: a joining node does not
-//! siphon buckets by existing. Only buckets whose target set contains their
-//! current set get a transition; weight changes, removals and drains never do.
+//! Expands placement when a node joins, without taking buckets away from current holders.
+//! Only buckets whose target set contains the current set get a transition.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;

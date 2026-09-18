@@ -1,3 +1,7 @@
+//! Shares the S3 listing helpers: common prefixes, resume markers and page building.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::cmp::Ordering;
 use ulid::Ulid;
 

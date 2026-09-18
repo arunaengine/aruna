@@ -1,3 +1,7 @@
+//! Lists a user's S3 sessions by scanning the owner index in batches.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{S3SessionError, decode_index};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};

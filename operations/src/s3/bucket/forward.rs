@@ -1,3 +1,7 @@
+//! Handles a bucket creation forwarded by a peer node and answers with the result.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::metadata::protocol::AuthToken;

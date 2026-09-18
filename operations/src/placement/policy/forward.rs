@@ -1,6 +1,7 @@
-//! Routing a policy publication to a holder of its bucket. Only a holder may
-//! commit the immutable document, so an origin holding no replica forwards it,
-//! and the holder's create re-checks realm-admin authority for that caller.
+//! Routes a policy publication to a holder of its bucket when this node holds no replica.
+//! The holder's create checks realm admin authority again for the forwarded caller.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

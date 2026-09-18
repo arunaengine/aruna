@@ -1,4 +1,6 @@
-//! Removes one queued authoring intent.
+//! Removes one queued authoring draft from the device publish queue.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

@@ -1,4 +1,6 @@
-//! Storage shape of the device-local publish queue.
+//! Storage shape, keys and limits of the device-local publish queue.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};

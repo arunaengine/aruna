@@ -1,6 +1,7 @@
-//! Integer-only weighted two-level rendezvous primitives.
-//! Determinism is the contract: identical inputs must produce identical rankings
-//! on every platform, so no floating point appears outside `#[cfg(test)]`.
+//! Provides the integer-only weighted two-level rendezvous ranking primitives.
+//! Equal inputs must rank equally on every platform, so no floating point is used here.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::cmp::Ordering;
 

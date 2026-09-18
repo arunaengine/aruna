@@ -1,6 +1,7 @@
-//! Display names for policy refs, read from the rows this node already holds.
-//! A ref this node does not hold is absent from the answer: the lookup is a
-//! display convenience, never an existence oracle, and it never fetches.
+//! Looks up display names for policy refs from the policy rows this node already holds.
+//! A ref this node does not hold is left out, and the lookup never fetches from other nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};

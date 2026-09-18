@@ -1,3 +1,7 @@
+//! Runs the S3 ListObjectsV2 state machine over blob heads, versions and blob locations.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::s3::listing::PrefixTracker;
 use crate::s3::object::versions::served_copy;
 use aruna_core::NodeId;

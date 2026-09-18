@@ -1,3 +1,8 @@
+//! Reconciles the shard topics this node holds with its co-holders.
+//! Rank zero creates the genesis, other holders pull it, then pending records set members.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 

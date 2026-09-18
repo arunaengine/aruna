@@ -1,6 +1,7 @@
-//! Durable node-local cache of resolved placement policies, keyed by
-//! `(policy_id, digest)` since an id-only key could accept changed bytes. A
-//! positive entry is bytes, never a trusted document, so it is re-verified.
+//! Caches resolved placement policies on the node, keyed by policy id and content digest.
+//! Cached bytes are verified again on read, so a hit never grants unchecked trust.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::realm::RealmId;

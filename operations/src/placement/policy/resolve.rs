@@ -1,6 +1,7 @@
-//! Resolving one policy ref to a verified policy: durable cache first, the
-//! ordinary read, then a bounded cache insert. Cache misses are latency only
-//! and never change the answer; a missing policy is unavailable, not denied.
+//! Resolves a policy ref to a verified policy: cache first, then a read, then a cache insert.
+//! A cache miss costs latency only, and a missing policy is unavailable rather than denied.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;

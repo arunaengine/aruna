@@ -1,3 +1,7 @@
+//! Aborts a multipart upload, deletes its records and queues the staged blobs for cleanup.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

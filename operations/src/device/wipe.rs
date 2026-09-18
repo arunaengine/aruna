@@ -1,6 +1,7 @@
-//! Owner-driven wipe of the device this node runs on.
-//! Realm-side eviction is an earlier, separate step: the desktop calls
-//! `DELETE /users/me/devices/{id}` on a management node, then asks this node to erase.
+//! Erases the local data of the device this node runs on and picks its wipe exit code.
+//! Realm-side eviction of the device is a separate, earlier step.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::fs;
 use std::path::{Path, PathBuf};

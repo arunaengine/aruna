@@ -1,6 +1,6 @@
-//! Decides one page of a synced folder, touching no network and only the hashes
-//! the decision needs. It writes only device-local rows; bytes reach disk via
-//! guarded local-file effects and the realm via queued upload rows.
+//! Decides one page of a synced folder without any network, writing only device-local rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
 

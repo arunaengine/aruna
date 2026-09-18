@@ -1,6 +1,7 @@
-//! Sequential resolution of a bounded ref set through the authenticated read
-//! path, shared by the administration operations. It never evaluates a subject;
-//! it only obtains the definitions a mutation must authenticate before use.
+//! Resolves a bounded set of policy refs one after another through the authenticated read.
+//! It only obtains the definitions a mutation must verify, and never evaluates a subject.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::events::Event;

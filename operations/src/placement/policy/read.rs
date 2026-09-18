@@ -1,6 +1,7 @@
-//! Reading one immutable policy document by ref: local row first, then a
-//! bounded fetch from the holders its id resolves to. No catalog is consulted;
-//! a document failing the hash or realm-admin authority is refused, not returned.
+//! Reads one immutable policy document by ref: local row first, then a bounded holder fetch.
+//! A document failing the hash or the admin authority check is refused, not returned.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{

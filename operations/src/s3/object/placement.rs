@@ -1,6 +1,7 @@
-//! The placement references one object's current head carries, with the head
-//! generation an exact-set mutation must present. Read-only and node-local: it
-//! reports what this node stores; the caller authorizes the read before driving it.
+//! Reads one object head's placement references and its generation from this node only.
+//! Does no authorization; the caller authorizes the read before driving this operation.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

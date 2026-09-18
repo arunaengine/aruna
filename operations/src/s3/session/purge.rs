@@ -1,3 +1,7 @@
+//! Purges expired S3 sessions in batches and clears their expiry and owner index rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     PURGE_BATCH, S3SessionError, decode_index, encode_index, expiry_key, expiry_parts, expiry_secs,
     owner_key,
