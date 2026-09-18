@@ -1003,7 +1003,7 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
-        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, USAGE_STATS_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
@@ -1286,8 +1286,8 @@ mod pure_tests {
             .collect()
     }
 
-    /// Runs the embedded counter update from the record batch to its own write
-    /// and returns the counters the owning group would commit.
+    /// Runs the embedded counter update from the record batch to its deltas
+    /// and returns the counters the owning group would commit from zero.
     fn group_counters(mint: &mut SuccessorMint, txn_id: TxnId) -> UsageCounters {
         let mut effect = first_effect(
             mint.step(
@@ -1306,23 +1306,17 @@ mod pure_tests {
                     .expect("no ceiling applies"),
             );
         }
-        let Effect::Storage(StorageEffect::BatchRead { reads, .. }) = effect else {
-            panic!("expected the counter read");
+        let Effect::Storage(StorageEffect::AddUsage { deltas, .. }) = effect else {
+            panic!("expected the counter deltas");
         };
-        let values = reads.into_iter().map(|(_, key)| (key, None)).collect();
-        let effect = first_effect(
-            mint.step(
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-                Some(txn_id),
-            )
-            .expect("the counters are written"),
-        );
         let group_key = usage_group_key(bucket().group_id);
-        batch_writes(effect)
+        let (_, delta) = deltas
             .into_iter()
-            .find(|(space, key, _)| space == USAGE_STATS_KEYSPACE && *key == group_key)
-            .map(|(_, _, value)| UsageCounters::from_bytes(&value).expect("counters decode"))
-            .expect("the group counter is written")
+            .find(|(key, _)| key.as_ref() == group_key.as_slice())
+            .expect("the group counter is charged");
+        let mut counters = UsageCounters::default();
+        counters.apply(&delta).expect("the delta applies");
+        counters
     }
 
     fn first_effect(effects: Option<aruna_core::types::Effects>) -> Effect {

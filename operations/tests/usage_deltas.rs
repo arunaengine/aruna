@@ -399,6 +399,40 @@ async fn put_delta_updates() {
 }
 
 #[tokio::test]
+async fn parallel_group_puts() {
+    let h = setup().await;
+    let group_id = Ulid::generate();
+    create_bucket(&h, "bucket", group_id).await;
+
+    // Every upload into one group changes the same group counter rows.
+    let uploads: Vec<(String, Vec<u8>)> = (0..32u8)
+        .map(|i| (format!("file-{i}"), vec![i; 100 + usize::from(i)]))
+        .collect();
+    let results = futures_util::future::join_all(
+        uploads
+            .iter()
+            .map(|(key, data)| try_put_object(&h, "bucket", key, group_id, data, None)),
+    )
+    .await;
+    for (result, (key, _)) in results.into_iter().zip(&uploads) {
+        if let Err(error) = result {
+            panic!("parallel put of {key} failed: {error}");
+        }
+    }
+
+    let group = read_group(&h.driver, group_id).await;
+    assert_eq!(group.objects, uploads.len() as u64);
+    assert_eq!(
+        group.logical_bytes,
+        uploads
+            .iter()
+            .map(|(_, data)| data.len() as u64)
+            .sum::<u64>()
+    );
+    assert_matches_rebuild(&h.driver).await;
+}
+
+#[tokio::test]
 async fn overwrite_accumulates_bytes() {
     let h = setup().await;
     let group_id = Ulid::generate();
