@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Self-tests for check_style.py. Plain Python; no Rust toolchain or build."""
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
 import os
 import sys
 import tempfile
@@ -17,6 +19,10 @@ def scan(text, name="probe.rs"):
 
 def messages(findings):
     return [finding[3] for finding in findings]
+
+
+NOTICE_BLOCK = "// Copyright (c) 2026 The Aruna Contributors\n// SPDX-License-Identifier: MIT or Apache-2.0\n"
+HASH_NOTICES = "# Copyright (c) 2026 The Aruna Contributors\n# SPDX-License-Identifier: MIT or Apache-2.0\n"
 
 
 class IdentifierKindsTest(unittest.TestCase):
@@ -292,6 +298,18 @@ class CommentTest(unittest.TestCase):
 
     def test_three_lines(self):
         self.assertEqual(self.comments("// one\n// two\n// three\nfn tiny() {}\n"), [])
+
+    def test_header_group(self):
+        text = "//! one\n//! two\n" + NOTICE_BLOCK + "fn tiny() {}\n"
+        self.assertEqual(self.comments(text), [])
+
+    def test_header_long(self):
+        text = "//! one\n//! two\n//! three\n//! four\n" + NOTICE_BLOCK + "fn tiny() {}\n"
+        self.assertEqual(self.comments(text), [("comment", "probe.rs", 1, "comment spans 4 lines")])
+
+    def test_after_notices(self):
+        text = "//! one\n" + NOTICE_BLOCK + "// a\n// b\n// c\n// d\nfn tiny() {}\n"
+        self.assertEqual(self.comments(text), [("comment", "probe.rs", 4, "comment spans 4 lines")])
 
     def test_four_lines(self):
         self.assertEqual(
@@ -816,6 +834,136 @@ class PythonToolTest(TreeTest):
         self.assertEqual(self.python([("scripts/dev/tool.py", text)]), [])
 
 
+class HeaderTest(TreeTest):
+    def setUp(self):
+        self.saved = dict(check_style.HEADER_EXCEPTIONS)
+        check_style.HEADER_EXCEPTIONS.clear()
+
+    def tearDown(self):
+        check_style.HEADER_EXCEPTIONS.clear()
+        check_style.HEADER_EXCEPTIONS.update(self.saved)
+
+    def headers(self, tree):
+        with tempfile.TemporaryDirectory() as tmp:
+            for relpath, text in tree:
+                self.write(tmp, relpath, text)
+            return sorted(check_style.check_headers(tmp))
+
+    def rust(self, text):
+        return self.headers([("pkg/src/probe.rs", text)])
+
+    def test_one_line(self):
+        self.assertEqual(self.rust("//! Starts the node.\n" + NOTICE_BLOCK + "\nfn tiny() {}\n"), [])
+
+    def test_two_lines(self):
+        text = "//! Starts the node.\n//! Shutdown drains the queue.\n" + NOTICE_BLOCK
+        self.assertEqual(self.rust(text), [])
+
+    def test_three_lines(self):
+        text = "//! One.\n//! Two.\n//! Three.\n" + NOTICE_BLOCK
+        self.assertEqual(
+            self.rust(text), [("header", "pkg/src/probe.rs", 1, "description spans 3 lines")]
+        )
+
+    def test_no_header(self):
+        self.assertEqual(
+            self.rust("fn tiny() {}\n"), [("header", "pkg/src/probe.rs", 1, "missing file header")]
+        )
+
+    def test_item_doc(self):
+        text = "/// Starts the node.\n" + NOTICE_BLOCK
+        self.assertIn(
+            ("header", "pkg/src/probe.rs", 1, "the description must use '//!', not a plain comment"),
+            self.rust(text),
+        )
+
+    def test_doc_notices(self):
+        text = "//! Starts the node.\n//! Copyright (c) 2026 The Aruna Contributors\n"
+        self.assertIn(("header", "pkg/src/probe.rs", 2, "the notices must not use '//!'"), self.rust(text))
+
+    def test_license_text(self):
+        text = "//! Starts the node.\n// Copyright (c) 2026 The Aruna Contributors\n// SPDX-License-Identifier: MIT OR Apache-2.0\n"
+        self.assertEqual(
+            messages(self.rust(text)),
+            ["line must read '// SPDX-License-Identifier: MIT or Apache-2.0'"],
+        )
+
+    def test_notice_order(self):
+        text = "//! Starts the node.\n// SPDX-License-Identifier: MIT or Apache-2.0\n// Copyright (c) 2026 The Aruna Contributors\n"
+        self.assertEqual(len(self.rust(text)), 2)
+
+    def test_description_last(self):
+        text = NOTICE_BLOCK + "//! Starts the node.\n"
+        self.assertEqual(
+            messages(self.rust(text)), ["the description must come before the notices"]
+        )
+
+    def test_empty_description(self):
+        self.assertIn(
+            ("header", "pkg/src/probe.rs", 1, "the description line is empty"),
+            self.rust("//!\n" + NOTICE_BLOCK),
+        )
+
+    def test_hash_files(self):
+        shell = "#!/bin/sh\n# Starts the demonstration cluster.\n" + HASH_NOTICES + "set -eu\n"
+        manifest = "# Workspace manifest.\n" + HASH_NOTICES + "[package]\n"
+        self.assertEqual(self.headers([("run.sh", shell), ("Cargo.toml", manifest)]), [])
+
+    def test_hash_missing(self):
+        text = "# Workspace manifest.\n[package]\n"
+        self.assertEqual(
+            messages(self.headers([("Cargo.toml", text)])),
+            [
+                "line must read '# Copyright (c) 2026 The Aruna Contributors'",
+                "line must read '# SPDX-License-Identifier: MIT or Apache-2.0'",
+            ],
+        )
+
+    def test_python_header(self):
+        text = '#!/usr/bin/env python3\n"""Checks the style."""\n' + HASH_NOTICES + "import os\n"
+        self.assertEqual(self.headers([("scripts/dev/tool.py", text)]), [])
+
+    def test_python_missing(self):
+        text = "import os\n"
+        self.assertIn(
+            ("header", "scripts/dev/tool.py", 1, "missing module docstring above the notices"),
+            self.headers([("scripts/dev/tool.py", text)]),
+        )
+
+    def test_python_long(self):
+        text = '"""One.\nTwo.\nThree."""\n' + HASH_NOTICES
+        self.assertEqual(
+            messages(self.headers([("scripts/dev/tool.py", text)])), ["description spans 3 lines"]
+        )
+
+    def test_markdown_header(self):
+        text = (
+            "<!-- The contributor guide. -->\n"
+            "<!-- Copyright (c) 2026 The Aruna Contributors -->\n"
+            "<!-- SPDX-License-Identifier: MIT or Apache-2.0 -->\n\n# Guide\n"
+        )
+        self.assertEqual(self.headers([("CONTRIBUTING.md", text)]), [])
+
+    def test_format_skipped(self):
+        tree = [("data.json", "{}\n"), ("LICENSE-MIT", "Permission is hereby granted\n")]
+        self.assertEqual(self.headers(tree), [])
+
+    def test_exception(self):
+        check_style.HEADER_EXCEPTIONS["fixtures/sample.md"] = "copied fixture; bytes must not change"
+        self.assertEqual(self.headers([("fixtures/sample.md", "# Sample\n")]), [])
+
+    def test_stale_exception(self):
+        check_style.HEADER_EXCEPTIONS["fixtures/absent.md"] = "copied fixture"
+        self.assertEqual(
+            self.headers([("pkg/src/probe.rs", "//! Starts the node.\n" + NOTICE_BLOCK)]),
+            [("header", "fixtures/absent.md", 0, "HEADER_EXCEPTIONS entry does not exist; remove it")],
+        )
+
+    def test_exception_reason(self):
+        check_style.HEADER_EXCEPTIONS["fixtures/sample.md"] = ""
+        self.assertEqual(check_style.without_reason(check_style.HEADER_EXCEPTIONS), ["fixtures/sample.md"])
+
+
 class OwnFilesTest(unittest.TestCase):
     def test_own_clean(self):
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -826,6 +974,15 @@ class OwnFilesTest(unittest.TestCase):
             if finding[1].endswith(("check_style.py", "check_style_tests.py"))
         ]
         self.assertEqual(own, [])
+
+    def test_own_header(self):
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        findings = [
+            finding
+            for finding in check_style.check_headers(root)
+            if finding[1].endswith(("check_style.py", "check_style_tests.py"))
+        ]
+        self.assertEqual(findings, [])
 
 
 if __name__ == "__main__":

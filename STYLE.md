@@ -189,6 +189,24 @@ Keep explanations accurate when behavior changes. A comment promising completion
 
 Do not delete safety obligations, public API descriptions, license text, or provenance to pass a length check. Retain a short accurate source contract and move longer editable material deliberately without losing required published descriptions. Mandatory notices and generated or third-party text need explicit treatment rather than destructive pruning.
 
+### Open each file with its header
+
+**Every repository-owned source file must start with a short description, then the copyright notice, then the license notice, in that order.** The description says what this file does. One line is the rule; use a second line only when one cannot carry the meaning.
+
+```rust
+//! Starts the node and handles shutdown.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+```
+
+In Rust the description is a `//!` module comment and both notices are ordinary `//` comments. Never attach the file description to the first item with `///`. Other formats keep the same order in their own comment syntax: a Python module docstring followed by `#` notices, `#` comments in shell, TOML, YAML and similar files, and HTML comments in Markdown. A shebang, a parser directive, or another mandatory first line stays first, with the header directly below it.
+
+Write the description from the code in front of you. It must describe this file, not its crate, and a reader must not find a promise the file does not keep. Do not repeat one vague sentence across files.
+
+Rewrite an existing file introduction into those one or two accurate lines instead of adding a second introduction. Move a longer explanation that is still worth keeping into the matching documentation, or leave it as an ordinary comment below the notices.
+
+Generated output, copied fixtures, binary assets, formats without comments such as JSON, and fragments included into another file get no header. Each exception is narrow, named with its reason in the checker data, and never a whole crate, a whole test tree, or a whole fixture directory. Third-party notices and attribution stay exactly as they are.
+
 ## 8. Make dependencies and ownership explicit
 
 A module must own its implementation, not simply forward into the module from which it was supposedly separated. Remove circular responsibility and duplicate implementation homes.
@@ -259,7 +277,7 @@ Check generated API output and frozen historical fixtures where relevant. A curr
 
 Use the repository formatter. Avoid manual alignment and decorative source formatting that fights it. Run the style check through normal local and CI commands, with small tests for the checker itself.
 
-The checker must cover every category the policy claims to regulate: names, folder contents including maintained assets, the shared-prefix trigger, comments, and explicit exceptions. Use token-aware inspection where text matching would confuse strings, macros, or comments with declarations.
+The checker must cover every category the policy claims to regulate: names, folder contents including maintained assets, the shared-prefix trigger, comments, file headers, and explicit exceptions. Use token-aware inspection where text matching would confuse strings, macros, or comments with declarations.
 
 ### Apply folder rules in this order
 
@@ -273,7 +291,7 @@ The checker must cover every category the policy claims to regulate: names, fold
 
 Record the domain identity of a required three-file group in the checker's explicit rule data where needed. After prefixes disappear from child names, validation must not mistake the correctly grouped family for a new violation. Do not exempt all small folders to solve that problem.
 
-Include checker cases for three versus two prefixed files, a valid three-file domain after grouping, singleton test companions, an unrelated shared verb, fields/variants/constants, source assets, and long logical comments. Keep exceptions narrow and reviewable.
+Include checker cases for three versus two prefixed files, a valid three-file domain after grouping, singleton test companions, an unrelated shared verb, fields/variants/constants, source assets, long logical comments, and header order, comment type, notice text and description length. Keep exceptions narrow and reviewable.
 
 Style tooling may inspect source layout and names. Domain tests must not scan source text for filenames, private helpers, or call strings to prove behavior. A passing style gate does not prove correct authorization, persistence, or shutdown.
 

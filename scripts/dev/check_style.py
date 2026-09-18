@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Style checks for folders, shared prefixes, names, comments and exceptions.
-Terms split on _ and CamelCase; acronyms count once; strings and attributes
-are skipped; EXTERNAL_NAMES and SMALL_DOMAINS hold reviewed exceptions."""
+"""Style checks for folders, shared prefixes, names, comments and file headers.
+EXTERNAL_NAMES, SMALL_DOMAINS and HEADER_EXCEPTIONS hold the reviewed exceptions."""
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
 import argparse
 import bisect
 import io
 import keyword
 import os
 import re
+import subprocess
 import sys
 import tokenize
 
@@ -60,6 +62,20 @@ SMALL_DOMAINS = {
 FOLDER_MIN = 5
 TERM_MAX = 3
 COMMENT_MAX = 3
+HEADER_MAX = 2
+HEADER_NOTICES = (
+    "Copyright (c) 2026 The Aruna Contributors",
+    "SPDX-License-Identifier: MIT or Apache-2.0",
+)
+HEADER_SKIP = frozenset({"target", "vendor", "node_modules", ".git", ".claude"})
+HEADER_HASH_NAMES = frozenset({".dockerignore", ".gitignore", "Dockerfile", "justfile"})
+HEADER_HASH_SUFFIXES = (".env", ".example", ".sh", ".toml", ".ttl", ".yaml", ".yml")
+HEADER_EXCEPTIONS = {
+    "CODE_OF_CONDUCT.md": "Contributor Covenant text with its own attribution",
+    "api/src/mcp/dataset_authoring.md": "resource text served verbatim to MCP clients",
+    "api/src/mcp/metadata_profiles.md": "resource text served verbatim to MCP clients",
+    "operations/tests/fixtures/ELN_README.md": "copied fixture; its bytes must stay unchanged",
+}
 
 WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
 CHAR_RE = re.compile(r"'(?:\\.|\\u\{[0-9A-Fa-f_]+\}|[^'\\])'")
@@ -87,6 +103,7 @@ def string_prefix(text, start, end):
 
 
 def split_terms(name):
+    # Underscores and CamelCase boundaries split terms; an acronym counts once.
     terms = []
     for part in name.split("_"):
         terms.extend(WORD_RE.findall(part))
@@ -757,6 +774,29 @@ def clean_comment(body):
     return re.sub(r"[^a-z0-9]", "", " ".join(parts).lower())
 
 
+def notice_parts(group):
+    """Split a comment run around the header notices so each part counts alone."""
+    if group["kind"] != "line":
+        return None
+    lines = group["body"].split("\n")
+    present = {line.strip() for line in lines}
+    if not all(notice in present for notice in HEADER_NOTICES):
+        return None
+    parts, span, first = [], 0, group["start_line"]
+    for offset, line in enumerate(lines):
+        if line.strip() in HEADER_NOTICES:
+            if span:
+                parts.append((first, span))
+            span, first = 0, group["start_line"] + offset + 1
+            continue
+        if not span:
+            first = group["start_line"] + offset
+        span += 1
+    if span:
+        parts.append((first, span))
+    return parts
+
+
 def comment_findings(rel, text, masked, comments, tokens):
     if not comments:
         return
@@ -780,17 +820,172 @@ def comment_findings(rel, text, masked, comments, tokens):
             decls.setdefault(1 + text.count("\n", 0, start), nxt[1])
     lines = masked.split("\n")
     for group in groups:
-        if any(mark in group["body"].lower() for mark in LICENSE_MARKS):
-            continue
-        span = group["end_line"] - group["start_line"] + 1
-        if span > COMMENT_MAX:
-            yield ("comment", rel, group["start_line"], f"comment spans {span} lines")
+        parts = notice_parts(group)
+        if parts is not None:
+            for start_line, span in parts:
+                if span > COMMENT_MAX:
+                    yield ("comment", rel, start_line, f"comment spans {span} lines")
+        elif not any(mark in group["body"].lower() for mark in LICENSE_MARKS):
+            span = group["end_line"] - group["start_line"] + 1
+            if span > COMMENT_MAX:
+                yield ("comment", rel, group["start_line"], f"comment spans {span} lines")
         row = group["end_line"]
         while row < len(lines) and not lines[row].strip():
             row += 1
         name = decls.get(row + 1)
         if name and clean_comment(group["body"]) == re.sub(r"[^a-z0-9]", "", name.lower()):
             yield ("restates", rel, group["start_line"], f"comment repeats '{name}'")
+
+
+def header_marks(kind):
+    """The description marker and the two notice lines of the file header."""
+    if kind == "rust":
+        return "//!", tuple(f"// {notice}" for notice in HEADER_NOTICES)
+    if kind == "markdown":
+        return "<!--", tuple(f"<!-- {notice} -->" for notice in HEADER_NOTICES)
+    return "#", tuple(f"# {notice}" for notice in HEADER_NOTICES)
+
+
+def header_kind(rel, path):
+    name = os.path.basename(rel)
+    for suffix, kind in ((".rs", "rust"), (".py", "python"), (".md", "markdown")):
+        if name.endswith(suffix):
+            return kind
+    if name in HEADER_HASH_NAMES or name.endswith(HEADER_HASH_SUFFIXES):
+        return "hash"
+    if "." in name.lstrip("."):
+        return None
+    with open(path, "rb") as handle:
+        first = handle.readline().decode("utf-8", "replace")
+    if not first.startswith("#!"):
+        return None
+    return "python" if "python" in first else "hash"
+
+
+def header_text(kind, line):
+    """The comment text of a header line, or None when the line is not one."""
+    mark = header_marks(kind)[0]
+    stripped = line.strip()
+    if not stripped.startswith(mark):
+        return None
+    body = stripped[len(mark) :]
+    if kind == "markdown":
+        if not body.endswith("-->"):
+            return None
+        body = body[:-3]
+    return body.strip()
+
+
+def notice_findings(rel, lines, index, notices):
+    for offset, notice in enumerate(notices):
+        row = index + offset
+        found = lines[row].rstrip() if row < len(lines) else ""
+        if found != notice:
+            yield ("header", rel, row + 1, f"line must read '{notice}'")
+
+
+def comment_header(rel, kind, lines, start):
+    mark, notices = header_marks(kind)
+    index, described = start, []
+    while index < len(lines) and lines[index].rstrip() not in notices:
+        body = header_text(kind, lines[index])
+        if not body:
+            break
+        described.append((index, body))
+        index += 1
+    if not described:
+        first = lines[start].strip() if start < len(lines) else ""
+        if first in notices:
+            yield ("header", rel, start + 1, "the description must come before the notices")
+        elif header_text(kind, first) == "":
+            yield ("header", rel, start + 1, "the description line is empty")
+        elif kind == "rust" and first.startswith("//"):
+            yield ("header", rel, start + 1, f"the description must use '{mark}', not a plain comment")
+        else:
+            yield ("header", rel, start + 1, "missing file header")
+            return
+    for row, body in described:
+        if body.startswith(HEADER_NOTICES):
+            yield ("header", rel, row + 1, f"the notices must not use '{mark}'")
+    if len(described) > HEADER_MAX:
+        yield ("header", rel, start + 1, f"description spans {len(described)} lines")
+    yield from notice_findings(rel, lines, index, notices)
+
+
+def docstring_end(lines, start):
+    quote = lines[start].lstrip()[:3]
+    rest = lines[start].lstrip()[3:]
+    row = start
+    while quote not in rest:
+        row += 1
+        if row >= len(lines):
+            return None
+        rest = lines[row]
+    return row
+
+
+def python_header(rel, lines, start):
+    notices = header_marks("python")[1]
+    if start >= len(lines) or not lines[start].lstrip().startswith(('"""', "'''")):
+        yield ("header", rel, start + 1, "missing module docstring above the notices")
+        yield from notice_findings(rel, lines, start, notices)
+        return
+    end = docstring_end(lines, start)
+    if end is None:
+        yield ("header", rel, start + 1, "unterminated module docstring")
+        return
+    span = end - start + 1
+    if span > HEADER_MAX:
+        yield ("header", rel, start + 1, f"description spans {span} lines")
+    yield from notice_findings(rel, lines, end + 1, notices)
+
+
+def repo_files(root):
+    """Repository-owned paths: the tracked files, or a plain walk without Git."""
+    try:
+        listed = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z"], capture_output=True, text=True, check=True
+        ).stdout
+        names = [name for name in listed.split("\0") if name]
+        if names:
+            return names
+    except (OSError, subprocess.SubprocessError):
+        pass
+    names = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in HEADER_SKIP]
+        for name in sorted(filenames):
+            names.append(os.path.relpath(os.path.join(dirpath, name), root))
+    return sorted(names)
+
+
+def check_headers(root):
+    excused = set()
+    for rel in repo_files(root):
+        if any(part in HEADER_SKIP for part in rel.split("/")):
+            continue
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            continue
+        if rel in HEADER_EXCEPTIONS:
+            excused.add(rel)
+            continue
+        kind = header_kind(rel, path)
+        if kind is None:
+            continue
+        text = read_source(path)
+        if not text.strip():
+            continue
+        lines = text.split("\n")
+        start = 1 if kind in ("python", "hash") and lines[0].startswith("#!") else 0
+        if kind == "hash" and start < len(lines) and lines[start].lower().startswith("# syntax="):
+            start += 1
+        if kind == "python":
+            yield from python_header(rel, lines, start)
+        else:
+            yield from comment_header(rel, kind, lines, start)
+    for rel in sorted(set(HEADER_EXCEPTIONS) - excused):
+        yield ("header", rel, 0, "HEADER_EXCEPTIONS entry does not exist; remove it")
 
 
 def iter_python_files(root):
@@ -1130,6 +1325,7 @@ def report(findings, limit):
         "field",
         "variant",
         "comment",
+        "header",
         "pyfile",
         "pydecl",
         "pyparam",
@@ -1156,6 +1352,7 @@ def report(findings, limit):
         "field": "field",
         "variant": "variant",
         "comment": "comment",
+        "header": "header",
         "pyfile": "python file",
         "pydecl": "python decl",
         "pyparam": "python param",
@@ -1184,8 +1381,12 @@ def report(findings, limit):
     return 1 if errors else 0
 
 
+def without_reason(table):
+    return [name for name, reason in table.items() if not isinstance(reason, str) or not reason.strip()]
+
+
 def external_without_reason():
-    return [name for name, reason in EXTERNAL_NAMES.items() if not isinstance(reason, str) or not reason.strip()]
+    return without_reason(EXTERNAL_NAMES)
 
 
 def main(argv):
@@ -1198,9 +1399,14 @@ def main(argv):
     if missing:
         print(f"EXTERNAL_NAMES needs a reason for: {', '.join(sorted(missing))}", file=sys.stderr)
         return 2
+    missing = without_reason(HEADER_EXCEPTIONS)
+    if missing:
+        print(f"HEADER_EXCEPTIONS needs a reason for: {', '.join(sorted(missing))}", file=sys.stderr)
+        return 2
     findings = []
     findings.extend(check_folders(root))
     findings.extend(check_sources(root))
+    findings.extend(check_headers(root))
     findings.extend(python_findings(root))
     return report(findings, args.limit)
 
