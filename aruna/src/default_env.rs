@@ -1,62 +1,60 @@
-//! Refuses to start when the live environment still holds the shipped demonstration values.
+//! Refuses to start when the environment still holds a published demonstration key.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::io::Cursor;
 use thiserror::Error;
-
-// The demonstration environment as tracked in the repository. A build context
-// without `.env` fails here instead of shipping a guard with nothing to match.
-const SHIPPED_ENV: &str = include_str!("../../.env");
 
 /// Opt-in that downgrades the refusal to a warning.
 pub const OVERRIDE_FLAG: &str = "--dangerously-use-default-env";
 pub const OVERRIDE_VAR: &str = "ARUNA_DANGEROUSLY_USE_DEFAULT_ENV";
 
-/// Key suffixes whose shipped value is published key material or a secret. A
-/// match on one of these cannot be a coincidence, so it blocks startup.
-const SECRET_SUFFIXES: [&str; 4] = ["_KEY", "_SECRET", "_TOKEN", "_PASSWORD"];
+/// PEM bodies of the demonstration keys the tracked `.env` published. The private
+/// keys shipped until 2026-09-12, so a copied old profile may still carry them.
+const PUBLISHED_KEYS: [(&str, &str); 4] = [
+    (
+        "REALM_PUBLIC_KEY",
+        "MCowBQYDK2VwAyEArYMI2Y2/rCqHcjjWLPxFDmKW8aqk6P+y8TujKj+fT9Q=",
+    ),
+    (
+        "NODE_PUBLIC_KEY",
+        "MCowBQYDK2VwAyEAgdoLXqmUs0dxmMBKMwJProc3jJi4GJ1Hh9cbXtnpqB4=",
+    ),
+    (
+        "REALM_PRIVATE_KEY",
+        "MC4CAQAwBQYDK2VwBCIEIIMoiSLBgtFREb89XfBV/I0DcpCrGmMk9BmeAMyMPwRp",
+    ),
+    (
+        "NODE_PRIVATE_KEY",
+        "MC4CAQAwBQYDK2VwBCIEIFpQrCQTORNWj+EAGWWNXRdO8csaJgfzc8KzMU6GvHGx",
+    ),
+];
 
 #[derive(Debug, Error)]
 #[error(
-    "refusing to start on the demonstration environment: {} still {} the shipped value. \
-     Set your own values, or pass {OVERRIDE_FLAG} (or {OVERRIDE_VAR}=1) to start anyway.",
+    "refusing to start on the demonstration environment: {} still {} the published key. \
+     Set your own keys, or pass {OVERRIDE_FLAG} (or {OVERRIDE_VAR}=1) to start anyway.",
     .keys.join(", "),
     if .keys.len() == 1 { "has" } else { "have" }
 )]
 pub struct DefaultEnvError {
-    keys: Vec<String>,
+    keys: Vec<&'static str>,
 }
 
-/// One shipped value still present in the live environment.
-#[derive(Debug, PartialEq, Eq)]
-pub struct DefaultInUse {
-    pub key: String,
-    /// Published key material or a secret, which never matches by chance.
-    pub secret: bool,
-}
-
-/// The shipped key/value pairs, skipping empty values because matching those
-/// says nothing about the deployment.
-pub fn shipped_values() -> Vec<(String, String)> {
-    dotenvy::from_read_iter(Cursor::new(SHIPPED_ENV))
-        .flatten()
-        .filter(|(_, value)| !value.is_empty())
+/// The published keys `lookup` still reports, in list order. Only the PEM body
+/// counts, so a copy with other line breaks or indentation still matches.
+pub fn keys_in_use(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    PUBLISHED_KEYS
+        .iter()
+        .filter(|(key, body)| lookup(key).is_some_and(|value| pem_body(&value) == *body))
+        .map(|(key, _)| *key)
         .collect()
 }
 
-/// The shipped values `lookup` still reports, in the order they are shipped.
-pub fn defaults_in_use(
-    shipped: &[(String, String)],
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Vec<DefaultInUse> {
-    shipped
-        .iter()
-        .filter(|(key, value)| lookup(key).as_ref() == Some(value))
-        .map(|(key, _)| DefaultInUse {
-            key: key.clone(),
-            secret: SECRET_SUFFIXES.iter().any(|suffix| key.ends_with(suffix)),
-        })
+fn pem_body(value: &str) -> String {
+    value
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("-----"))
+        .flat_map(str::split_whitespace)
         .collect()
 }
 
@@ -70,35 +68,26 @@ pub fn opted_in(
             .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
-/// Reports the shipped values in use. Returns an error when one of them carries
-/// key material and the operator did not opt in; otherwise the caller warns.
+/// Returns the published keys in use, or an error when there is one and the
+/// operator did not opt in. The caller warns for each admitted key.
 pub fn guard(
-    shipped: &[(String, String)],
     lookup: impl Fn(&str) -> Option<String> + Copy,
     args: impl Iterator<Item = String>,
-) -> Result<Vec<DefaultInUse>, DefaultEnvError> {
-    let in_use = defaults_in_use(shipped, lookup);
-    let secrets: Vec<String> = in_use
-        .iter()
-        .filter(|entry| entry.secret)
-        .map(|entry| entry.key.clone())
-        .collect();
-    if !secrets.is_empty() && !opted_in(args, lookup) {
-        return Err(DefaultEnvError { keys: secrets });
+) -> Result<Vec<&'static str>, DefaultEnvError> {
+    let keys = keys_in_use(lookup);
+    if !keys.is_empty() && !opted_in(args, lookup) {
+        return Err(DefaultEnvError { keys });
     }
-    Ok(in_use)
+    Ok(keys)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn shipped() -> Vec<(String, String)> {
-        vec![
-            ("REALM_PUBLIC_KEY".to_string(), "demo-key".to_string()),
-            ("SOCKET_ADDRESS".to_string(), "0.0.0.0:3000".to_string()),
-        ]
-    }
+    const REALM_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEArYMI2Y2/rCqHcjjWLPxFDmKW8aqk6P+y8TujKj+fT9Q=
+-----END PUBLIC KEY-----";
 
     fn env_of(
         pairs: &'static [(&'static str, &'static str)],
@@ -112,77 +101,63 @@ mod tests {
     }
 
     #[test]
-    fn shipped_env_parses() {
-        // The embedded file is the operator-facing demonstration profile, so a
-        // malformed one must not reach a release.
-        let shipped = shipped_values();
-        assert!(shipped.iter().any(|(key, _)| key == "REALM_PUBLIC_KEY"));
-        assert!(
-            shipped.iter().all(|(_, value)| !value.is_empty()),
-            "empty shipped values carry no signal"
-        );
-    }
-
-    #[test]
-    fn secret_match_blocks() {
+    fn published_key_blocks() {
         let error = guard(
-            &shipped(),
-            env_of(&[("REALM_PUBLIC_KEY", "demo-key")]),
+            env_of(&[("REALM_PUBLIC_KEY", REALM_PEM)]),
             std::iter::empty(),
         )
-        .expect_err("published key material blocks startup");
+        .expect_err("a published key blocks startup");
         assert!(error.to_string().contains("REALM_PUBLIC_KEY"));
     }
 
     #[test]
+    fn private_key_blocks() {
+        // The formerly shipped private key matters most: it signs as the demo realm.
+        let pem = "-----BEGIN PRIVATE KEY-----\n\
+                   MC4CAQAwBQYDK2VwBCIEIIMoiSLBgtFREb89XfBV/I0DcpCrGmMk9BmeAMyMPwRp\n\
+                   -----END PRIVATE KEY-----";
+        let lookup = move |key: &str| (key == "REALM_PRIVATE_KEY").then(|| pem.to_string());
+        let error = guard(lookup, std::iter::empty()).expect_err("a published key blocks");
+        assert!(error.to_string().contains("REALM_PRIVATE_KEY"));
+    }
+
+    #[test]
+    fn reformatted_key_matches() {
+        let reformatted = format!("  {}  ", REALM_PEM.replace('\n', "\r\n    "));
+        let lookup = move |key: &str| (key == "REALM_PUBLIC_KEY").then(|| reformatted.clone());
+        assert_eq!(keys_in_use(lookup), vec!["REALM_PUBLIC_KEY"]);
+    }
+
+    #[test]
     fn flag_allows_start() {
-        let in_use = guard(
-            &shipped(),
-            env_of(&[("REALM_PUBLIC_KEY", "demo-key")]),
+        let keys = guard(
+            env_of(&[("REALM_PUBLIC_KEY", REALM_PEM)]),
             [OVERRIDE_FLAG.to_string()].into_iter(),
         )
-        .expect("the flag admits the demonstration environment");
-        assert_eq!(
-            in_use,
-            vec![DefaultInUse {
-                key: "REALM_PUBLIC_KEY".to_string(),
-                secret: true,
-            }]
-        );
+        .expect("the flag admits the demonstration keys");
+        assert_eq!(keys, vec!["REALM_PUBLIC_KEY"]);
     }
 
     #[test]
     fn variable_allows_start() {
         guard(
-            &shipped(),
-            env_of(&[("REALM_PUBLIC_KEY", "demo-key"), (OVERRIDE_VAR, "1")]),
+            env_of(&[("REALM_PUBLIC_KEY", REALM_PEM), (OVERRIDE_VAR, "1")]),
             std::iter::empty(),
         )
-        .expect("the opt-in variable admits it too");
-    }
-
-    #[test]
-    fn plain_match_warns() {
-        // A bind address is a plausible production value, so it is reported
-        // without blocking the node.
-        let in_use = guard(
-            &shipped(),
-            env_of(&[("SOCKET_ADDRESS", "0.0.0.0:3000")]),
-            std::iter::empty(),
-        )
-        .expect("a non-secret match does not block");
-        assert_eq!(in_use.len(), 1);
-        assert!(!in_use[0].secret);
+        .expect("the opt-in variable admits them too");
     }
 
     #[test]
     fn own_values_pass() {
-        let in_use = guard(
-            &shipped(),
-            env_of(&[("REALM_PUBLIC_KEY", "operator-key")]),
+        // Other settings, such as an onboarding secret, never count as published.
+        let keys = guard(
+            env_of(&[
+                ("REALM_PUBLIC_KEY", "operator-key"),
+                ("ONBOARDING_SECRET", "own-secret"),
+            ]),
             std::iter::empty(),
         )
         .expect("own values start silently");
-        assert!(in_use.is_empty());
+        assert!(keys.is_empty());
     }
 }

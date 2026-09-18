@@ -70,22 +70,16 @@ fn dotenv_optional(
     }
 }
 
-/// Reports shipped demonstration values still in the environment. Key material
-/// refuses the start; a plain value is only named, because a deployment may pick
-/// the same bind address or bucket name on its own.
+/// Refuses the start while a published demonstration key is in the environment,
+/// unless the operator opted in; each admitted key is then named in a warning.
 fn report_default_env() -> Result<(), default_env::DefaultEnvError> {
-    let shipped = default_env::shipped_values();
-    let in_use = default_env::guard(&shipped, |key| std::env::var(key).ok(), std::env::args())?;
-    for entry in in_use {
-        if entry.secret {
-            warn!(
-                key = %entry.key,
-                "Serving with a published demonstration key, admitted by {}",
-                default_env::OVERRIDE_FLAG
-            );
-        } else {
-            warn!(key = %entry.key, "Environment still holds the shipped demonstration value");
-        }
+    let keys = default_env::guard(|key| std::env::var(key).ok(), std::env::args())?;
+    for key in keys {
+        warn!(
+            key,
+            "Serving with a published demonstration key, admitted by {}",
+            default_env::OVERRIDE_FLAG
+        );
     }
     Ok(())
 }
