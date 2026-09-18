@@ -1,3 +1,7 @@
+//! Submission family identity plus the job records, states and envelopes one family holds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 const SUBMISSION_KEYED_DOMAIN: &[u8] = b"aruna-submission-id-v1";

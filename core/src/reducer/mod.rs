@@ -1,6 +1,7 @@
-//! Admin-document reducer: applies replicated group, realm, user, and
-//! realm-config operations, keeping causal dots and surfacing conflicts
-//! instead of silently picking a winner.
+//! Owns the admin document state, its apply statuses, errors and recorded conflicts.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Included, Unbounded};

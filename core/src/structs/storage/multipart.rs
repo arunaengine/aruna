@@ -1,3 +1,7 @@
+//! Defines multipart upload records: upload state, part keys, parts and their checksums.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};

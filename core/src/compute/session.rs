@@ -1,6 +1,6 @@
-//! Contracts of interactive sessions: the states a client sees, the caps the
-//! node enforces, and the protocol it speaks to the session helper. The runtime
-//! driving them lives in the compute adapter.
+//! Defines interactive session states, caps and the protocol spoken to the session helper.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

@@ -1,3 +1,7 @@
+//! Chat head and turn records the node keeps per user, with the live chat and byte limits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::errors::ConversionError;
 use serde::{Deserialize, Serialize};

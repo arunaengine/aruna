@@ -1,3 +1,7 @@
+//! Node status snapshot types for connections, requests, network, backends and blobs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::alpn::Alpn;
 use crate::structs::identity::realm::RealmId;

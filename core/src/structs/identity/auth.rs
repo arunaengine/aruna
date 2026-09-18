@@ -1,3 +1,7 @@
+//! Permissions, roles, token claims and the auth context an authenticated request carries.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::UserId;
 use crate::errors::ConversionError;

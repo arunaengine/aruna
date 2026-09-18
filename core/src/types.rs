@@ -1,6 +1,6 @@
-//! Crate-wide aliases for the operation contract: effects, transaction and
-//! storage key types, and the ULID aliases; name [`crate::id`] and
-//! [`crate::user_id`] or the crate-root exports for the type-safe identifiers.
+//! Declares crate-wide aliases for effects, transaction ids, storage keys and ULID ids.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use byteview::ByteView;
 use smallvec::SmallVec;

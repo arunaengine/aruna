@@ -1,3 +1,7 @@
+//! Applies realm config events for nodes, OIDC providers, settings and token revocations.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 impl AdminDocumentState {

@@ -1,3 +1,7 @@
+//! Wraps a backend byte stream in a boxed type with one error kind and a success callback.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use futures::Stream;
 use std::error::Error;
 use std::fmt;

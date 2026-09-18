@@ -1,3 +1,7 @@
+//! Temporary S3 session credential with its encrypted secret, expiry and path limits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::auth::credential_hash;
 use crate::credential_encryption::{

@@ -1,3 +1,8 @@
+//! Defines what a backend does with bytes that no materialized version references any more.
+//! Also defines the reclaim queue keys, so candidates can be counted and drained per backend.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::BackendRef;
 use serde::{Deserialize, Serialize};

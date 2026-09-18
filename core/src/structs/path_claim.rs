@@ -1,6 +1,7 @@
-//! Deterministic metadata path claims (spec 6.3.6, DEC-PATH, #416).
-//! Every committed claim is retained; the lowest digest over its stable record
-//! and establishing event identity wins independently of arrival order.
+//! Resolves which committed Meta Resource wins a canonical metadata path claim.
+//! Every claim is retained and the lowest digest wins, so arrival order does not matter.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;

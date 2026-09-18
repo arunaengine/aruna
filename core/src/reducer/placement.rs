@@ -1,3 +1,7 @@
+//! Materializes placement state into the realm config and builds its attribute paths.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 /// Materializes reducer-owned placement state and repairs dangling references with the lowest live

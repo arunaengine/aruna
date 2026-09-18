@@ -1,6 +1,6 @@
-//! Durable records behind explicit policy attachment: the idempotency row one successor mint is keyed
-//! by, and the captured bulk run plus its per-object intents. Attaching a policy never rewrites a
-//! stored version, so every record here describes a successor that is minted instead.
+//! Durable records for policy attachment: mutation rows for replay, bulk runs and intents.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::errors::ConversionError;
 use crate::structs::placement::policy::PlacementPolicyRef;

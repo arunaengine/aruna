@@ -1,5 +1,6 @@
-//! Screens each advertisement page and retains only the bounded best candidates across the full scan.
-//! The plan is stored after the final page, rather than when an intermediate scan bound is reached.
+//! Walks the advertisement pages and keeps the bounded best candidates until the scan ends.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::cmp::Ordering;
 

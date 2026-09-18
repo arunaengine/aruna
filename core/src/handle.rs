@@ -1,3 +1,7 @@
+//! Declares the handle trait that sends one effect to an adapter and awaits its event.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use async_trait::async_trait;
 
 use crate::effects::Effect;

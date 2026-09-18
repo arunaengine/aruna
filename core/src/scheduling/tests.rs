@@ -1,3 +1,7 @@
+//! Tests planner routing, eligibility filters, ranking order, plan digests and paged scans.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::NodeId;
 use crate::compute::{ExecutorAvailability, NetworkAccess, ResourceEnvelope, StagingMode};

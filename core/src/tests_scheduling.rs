@@ -1,3 +1,7 @@
+//! Builds candidates, holders, policies and plan requests for the scheduling tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
 use crate::scheduling::*;

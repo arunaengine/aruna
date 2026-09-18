@@ -1,3 +1,7 @@
+//! Derives the node key that seals S3 credential secrets at rest and opens them again.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::types::GroupId;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};

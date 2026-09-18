@@ -1,3 +1,7 @@
+//! Tests selector matching, canonical digests, ref intersection and policy input bounds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 fn node(seed: u8) -> NodeId {

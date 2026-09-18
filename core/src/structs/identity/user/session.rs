@@ -1,3 +1,7 @@
+//! One stored login session of a user, with its kind, token hash, expiry and revoked flag.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::identity::auth::SessionKind;

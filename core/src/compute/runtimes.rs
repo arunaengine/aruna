@@ -1,3 +1,7 @@
+//! Lists the quick start runtime images and the job tags that mark an interactive session.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

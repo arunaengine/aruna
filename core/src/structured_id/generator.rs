@@ -1,3 +1,8 @@
+//! Generates structured ULIDs from an injectable clock and nonce source.
+//! It refuses timestamps that jump forward past the allowed clock skew.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::{sys::time::TimeValLike, time::ClockId};
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

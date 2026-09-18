@@ -1,3 +1,7 @@
+//! Defines administrative document events, their causal dots and the operations they carry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

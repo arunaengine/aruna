@@ -1,3 +1,7 @@
+//! Tests that document targets, storage keys, sync revisions and topic ids stay stable.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::cmp::Ordering;
 
 use super::{

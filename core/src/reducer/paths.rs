@@ -1,3 +1,7 @@
+//! Names the group, user and realm config attribute paths and the paths each operation writes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 pub const USER_NAME_PATH: &str = "user.name";

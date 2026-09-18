@@ -1,3 +1,7 @@
+//! Defines node, DHT key and topic identifiers plus short display and XOR distance helpers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};

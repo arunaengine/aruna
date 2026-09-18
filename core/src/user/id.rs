@@ -1,3 +1,7 @@
+//! Defines the user id of a ULID plus realm, with its text form and storage key.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;

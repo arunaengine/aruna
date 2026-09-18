@@ -1,5 +1,7 @@
-//! Directed network cost and ranking. An unknown value makes a target rank
-//! worse; it never becomes capacity the target did not advertise.
+//! Routes each pinned input to a candidate and scores it from directed link bandwidth.
+//! An unknown link makes a target rank worse, never adds capacity it did not advertise.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::NodeId;
 use crate::compute::ExecutorCapability;

@@ -1,5 +1,6 @@
-//! Storage and routing records: backends, blobs, versions, uploads, usage,
-//! and the routing rules that select them.
+//! Groups the storage records: backends, blobs, versions, uploads, usage and routing rules.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod backends;
 pub mod blob;

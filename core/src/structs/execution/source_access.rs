@@ -1,3 +1,7 @@
+//! A resolved data source: its access config, object metadata and listed entries.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::source_connector::{SourceConnector, SourceConnectorKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

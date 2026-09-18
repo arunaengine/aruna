@@ -1,6 +1,7 @@
-//! Persisted and wire records, grouped into domain modules. Small families
-//! stay flat; callers name a record through its domain, e.g.
-//! `structs::storage::blob::BlobVersion`.
+//! Owns the persisted and wire records, grouped into domain modules.
+//! Callers name a record through its domain, such as structs::storage::blob::BlobVersion.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod execution;
 pub mod identity;

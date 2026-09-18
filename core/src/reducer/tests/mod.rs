@@ -1,3 +1,7 @@
+//! Groups the reducer test modules and shares their imports and helper builders.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     AdminApplyStatus, AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentError,
     AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_DISCOVERY_PATH, CONFIG_QUOTA_PATH,

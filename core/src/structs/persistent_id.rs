@@ -1,3 +1,7 @@
+//! Persistent identifier mapping for a document, with its status, revisions and mint spec.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};

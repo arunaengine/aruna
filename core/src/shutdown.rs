@@ -1,6 +1,6 @@
-//! Single cancellation path for node shutdown.
-//! Subsystems register background children here so ordered shutdown can drain
-//! active work and know when nothing can write any more.
+//! Owns the node cancellation token and the tracker that drains background children.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
 use std::sync::{Arc, RwLock};

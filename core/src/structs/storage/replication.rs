@@ -1,3 +1,8 @@
+//! Defines Aruna resource names and w3id identifiers for replicated buckets and objects.
+//! Also defines the replication negotiation results and the per-item failure reasons.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;

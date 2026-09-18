@@ -1,3 +1,7 @@
+//! Notification records and inbox, outbox and prune keys, with the per class retention.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,7 @@
+//! Defines storage classes and routing rules, and selects the backend a write is stored on.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::{BackendRef, ResolvedBackend};

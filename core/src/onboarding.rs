@@ -1,3 +1,7 @@
+//! Defines onboarding secrets and tickets and the signed proofs that enroll a node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::UserId;
 use crate::auth::credential_hash;

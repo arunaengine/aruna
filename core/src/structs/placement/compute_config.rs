@@ -1,6 +1,7 @@
-//! Realm-wide compute configuration the pure planner reads. It carries operator knowledge no node can
-//! measure for itself: the directed bandwidth between placement locations, the bandwidth to assume for
-//! an unconfigured link, and how long an availability sample stays meaningful.
+//! Realm-wide compute configuration the planner reads, with its validation rules.
+//! It carries directed link bandwidth, the assumed unconfigured rate and sample staleness.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::compute::quota::ComputeQuota;
 use crate::structs::placement::record::MAX_LOCATION_LEN;

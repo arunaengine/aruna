@@ -1,3 +1,7 @@
+//! Tests realm config node, OIDC provider and settings updates and their conflict handling.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 #[test]

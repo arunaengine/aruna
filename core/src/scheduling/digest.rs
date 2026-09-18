@@ -1,5 +1,6 @@
-//! The stored plan digest. It covers every value the plan was made from, so a
-//! launch that replays it can be checked against the same evidence.
+//! Hashes every value a plan was made from, so a replayed launch can be checked against it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::compute::ResourceEnvelope;
 use crate::scheduling::cost::InputRoute;

@@ -1,3 +1,7 @@
+//! Owns the compute contracts: executor advertisements, task specs and output path rules.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;

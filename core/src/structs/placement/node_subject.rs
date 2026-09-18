@@ -1,5 +1,7 @@
-//! Advertised placement subject governing local writes and serves. A digest change advances its
-//! generation and blocks serving until local inventory is revalidated for that generation.
+//! Stores the node's advertised placement subject and bumps its generation on a digest change.
+//! Serving stays blocked until local inventory is revalidated for the new generation.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::errors::ConversionError;
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementSubject};

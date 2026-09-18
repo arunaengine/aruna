@@ -1,6 +1,7 @@
-//! Aruna Structured ULID codec (spec Appendix A.1, section 6.3.4): a 26-character
-//! Crockford ULID whose entropy splits into a 20-bit placement handle, a 12-bit
-//! placement bucket and a 48-bit nonce. Raw bit knowledge stays in [`layout`].
+//! Defines the structured ULID type and parses, formats and validates its fields.
+//! Its entropy splits into a placement handle, a placement bucket and a nonce.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod generator;
 mod layout;

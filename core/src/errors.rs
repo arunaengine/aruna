@@ -1,3 +1,7 @@
+//! Declares the shared error enums for authorization, blob, staging, storage, DHT and streams.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::structs::execution::source_connector::SourceConnectorKind;
 use crate::structs::storage::blob::BackendLocation;
 use std::array::TryFromSliceError;

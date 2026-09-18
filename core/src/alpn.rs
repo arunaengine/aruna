@@ -1,6 +1,7 @@
-//! Application Layer Protocol Negotiation identifiers for Aruna streams. The version suffix is the
-//! whole compatibility contract: a peer whose frames differ never negotiates the ALPN, so it fails the
-//! connection instead of decoding foreign bytes. There is no fallback ALPN and no downgrade.
+//! Names the ALPN protocol identifiers and which node kinds may serve or dial each one.
+//! The version suffix is the whole compatibility contract, with no fallback and no downgrade.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::structs::identity::realm::RealmNodeKind;
 

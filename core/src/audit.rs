@@ -1,6 +1,6 @@
-//! Contract for gathering a group's metadata audit trail across realm nodes.
-//! Audit rows are node-local projections, so a complete trail is assembled by
-//! asking every eligible node for its local page and merging the results.
+//! Defines the audit page request and response types and merges node pages into one trail.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
 

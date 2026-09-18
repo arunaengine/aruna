@@ -1,5 +1,7 @@
-//! Device folder sync adds absent or conflict copies and replaces only an unchanged recorded base.
-//! Deletion or replacement of other local bytes requires the owner.
+//! Defines device folder sync records: folder mode, state and per-file sync bookkeeping.
+//! Sync only adds copies or replaces an unchanged base; other local bytes need the owner.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::UserId;
 use crate::errors::ConversionError;

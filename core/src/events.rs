@@ -1,3 +1,7 @@
+//! Declares the events adapters return for each effect, one variant group per domain.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::audit::AuditPageBatch;
 use crate::effects::{
     FetchCursor, FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, ReceiptFrame,

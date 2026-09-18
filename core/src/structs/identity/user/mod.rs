@@ -1,3 +1,7 @@
+//! Owns the user record with its subjects, aliases and attributes, plus sessions and vault.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod session;
 pub mod vault;
 

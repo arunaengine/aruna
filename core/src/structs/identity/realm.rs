@@ -1,3 +1,7 @@
+//! Realm identity with its authorization and config documents, nodes, quotas and discovery.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::UserId;
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};

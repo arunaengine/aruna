@@ -1,5 +1,7 @@
-//! Shared observability: `LatencyAggregator` emits rate-limited per-key histogram summaries;
-//! `RequestStages` supplies task-local stage timings for slow-request warnings.
+//! Aggregates per-key latency histograms and collects task-local stage timings.
+//! Also moves the distributed trace context into and out of tracing spans.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
 use std::future::Future;

@@ -1,3 +1,7 @@
+//! Defines a bucket's sync relationship: mode, state, counters and its storage keys.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::storage::replication::{ArunaArn, ArunaArnType};

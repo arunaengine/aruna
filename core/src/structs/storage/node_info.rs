@@ -1,3 +1,8 @@
+//! Defines the info document a node advertises: labels, urls, capabilities and utilization.
+//! Derived labels such as kind, location and node id are stamped here and reject writes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
 use crate::compute::{AdvertisementError, ExecutorCapability, MAX_ADVERTISED_EXECUTORS};

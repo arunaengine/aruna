@@ -1,3 +1,7 @@
+//! One directory a device offers as a read-only bucket, with file stats and fingerprints.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::errors::ConversionError;
 use serde::{Deserialize, Serialize};

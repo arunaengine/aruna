@@ -1,3 +1,7 @@
+//! Generates signing keys and derives domain separated DHT and identity keys.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use ed25519_dalek::SigningKey;
 
 use crate::id::{DhtKeyId, NodeId};

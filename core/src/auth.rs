@@ -1,3 +1,7 @@
+//! Hashes bearer credentials and checks token lifetime and revocation retention bounds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub const REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 
 /// Maximum bearer-token lifetime accepted by replicated revocation admission.

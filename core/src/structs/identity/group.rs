@@ -1,3 +1,7 @@
+//! Group record, the owner index key and the group authorization document.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::identity::auth::Actor;

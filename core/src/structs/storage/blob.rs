@@ -1,3 +1,8 @@
+//! Defines blob storage records: backends, buckets, object keys, versions and managed copies.
+//! Also builds the permission paths and the location keys stored blobs are found under.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError, credential_aad,

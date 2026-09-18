@@ -1,3 +1,7 @@
+//! Builds signed job record envelopes of a chosen size for the effect size tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::compute::ExecutionTargetId;
 use crate::structs::execution::job::JobRecordEnvelope;
 use crate::structs::identity::realm::RealmId;

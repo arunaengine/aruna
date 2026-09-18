@@ -1,5 +1,7 @@
-//! Compute quota contracts separate approximate replicated group admission demand from exact node-local
-//! physical reservations. Converged excess demand only blocks new admissions; it never cancels work.
+//! Defines compute quota contracts: replicated group demand snapshots and node reservations.
+//! Converged excess demand only blocks new admissions, it never cancels running work.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::compute::{ExecutorAvailability, ResourceEnvelope};
 use crate::structs::execution::job::{EffectiveResources, JobId, SubmissionId};

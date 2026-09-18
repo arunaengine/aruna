@@ -1,3 +1,7 @@
+//! Tests that revoked tokens accumulate, stay bounded, converge and compact when expired.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 fn revoke_token(event_seed: u8, origin_seed: u8, token: &str) -> AdminDocumentEvent {

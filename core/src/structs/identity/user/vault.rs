@@ -1,3 +1,7 @@
+//! The passphrase sealed key payload of one user, which the node stores but cannot open.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::errors::ConversionError;
 use serde::{Deserialize, Serialize};

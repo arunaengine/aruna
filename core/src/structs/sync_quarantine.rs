@@ -1,3 +1,8 @@
+//! Retains sync operations a node rejected, keyed by topic, publisher actor and sequence.
+//! Tracks the quarantine's record and byte usage against its capacity limits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 #[cfg(test)]
 use crate::admin_documents::AdminDocumentTarget;

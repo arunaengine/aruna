@@ -1,6 +1,7 @@
-//! The immutable placed document carrying one [`PlacementPolicy`] to its holders.
-//! The holder set answers where the rule is obtained; the policy's own selectors
-//! answer where governed data may live. Neither set is derived from the other.
+//! Defines the placed document that carries one placement policy to its holder nodes.
+//! Checks the publication signature and the realm or group authority behind a definition.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::NodeId;
 use crate::UserId;

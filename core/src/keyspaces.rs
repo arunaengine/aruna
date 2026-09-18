@@ -1,3 +1,7 @@
+//! Names the persistent keyspaces the node stores its records in.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub const AUTH_KEYSPACE: &str = "auth";
 pub const GROUP_KEYSPACE: &str = "groups";
 pub const OWNER_INDEX_KEYSPACE: &str = "group_owner_index";

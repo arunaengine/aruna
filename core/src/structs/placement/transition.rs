@@ -1,5 +1,7 @@
-//! Candidate maps, activations, and transition records: the replicated state
-//! that pins a bucket's holder set until a proof-gated handoff moves it.
+//! Holds candidate maps, activations and transition records that pin a bucket's holder set.
+//! A proof-gated handoff is what moves those holders to other nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 

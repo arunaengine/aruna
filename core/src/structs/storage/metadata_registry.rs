@@ -1,3 +1,7 @@
+//! Holds the registry row of a metadata document: path claim, placement and holder nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

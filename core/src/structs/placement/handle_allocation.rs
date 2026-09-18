@@ -1,5 +1,7 @@
-//! Fail-closed directory over replicated handle grants plus the node-local
-//! durable allocation cursor. Overlapping grants never become allocatable.
+//! Builds the directory of replicated handle grants and the node's durable allocation cursor.
+//! Overlapping or conflicting grants are held back, so they never become allocatable.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, HashMap};
 

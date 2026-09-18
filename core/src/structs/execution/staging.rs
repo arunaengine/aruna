@@ -1,3 +1,7 @@
+//! Staging strategy and the portable source descriptor an object version binds to.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::id::NodeId;
 use crate::structs::execution::source_connector::SourceConnectorKind;
 use serde::{Deserialize, Serialize};

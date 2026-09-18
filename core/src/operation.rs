@@ -1,3 +1,7 @@
+//! Declares the operation and sub operation traits the runner drives with effects and events.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::any::Any;
 
 use crate::{events::Event, types::Effects};

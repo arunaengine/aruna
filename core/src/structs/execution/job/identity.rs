@@ -1,3 +1,7 @@
+//! Job identifier, state and execution class, plus the record key prefixes and retention.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 /// Version prefix keeping the record wrappable in a version envelope later (#286).

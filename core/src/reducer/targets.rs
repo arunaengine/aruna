@@ -1,3 +1,7 @@
+//! Materializes the reducer state into per target views for users, groups and realm config.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 impl AdminDocumentState {

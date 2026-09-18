@@ -1,5 +1,7 @@
-//! Fail-closed two-way index over immutable Placement Bindings (spec 6.3.4).
-//! Divergent tuples conflict without selecting an arrival-order winner.
+//! Two-way index over immutable placement bindings that resolves a handle to its tuple.
+//! It fails closed: an unknown or divergent handle conflicts instead of picking a winner.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, HashMap};
 

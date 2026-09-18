@@ -1,5 +1,6 @@
-//! Pinned scheduling inputs. Every value here is exact and already resolved:
-//! the planner performs no I/O and never invents a missing value.
+//! Holds the pinned request, input and target values a plan is built from, with bounds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};

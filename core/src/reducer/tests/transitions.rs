@@ -1,3 +1,7 @@
+//! Tests how the reducer admits transition plans, completion proofs, activation and aborts.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 fn secret(seed: u8) -> iroh::SecretKey {

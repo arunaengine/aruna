@@ -1,3 +1,7 @@
+//! Node-local job record with attempt fences, result payloads and legal transitions.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 const ATTEMPT_FENCE_DOMAIN: &[u8] = b"aruna-attempt-fence-v1";

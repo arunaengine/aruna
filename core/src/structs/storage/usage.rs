@@ -1,3 +1,7 @@
+//! Defines usage counters and the keys node and group usage snapshots are stored under.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::BackendRef;

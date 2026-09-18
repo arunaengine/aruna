@@ -1,3 +1,7 @@
+//! Owns the job records module and re-exports its family, identity, input and local parts.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;

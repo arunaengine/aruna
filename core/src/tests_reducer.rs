@@ -1,3 +1,7 @@
+//! Builds the admin document states and events the reducer tests replay.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     AdminRoleDefinition,

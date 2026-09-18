@@ -1,3 +1,7 @@
+//! Defines group join requests and decisions and the document paths that store them.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::reducer::AdminDocumentState;

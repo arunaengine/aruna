@@ -1,3 +1,7 @@
+//! Parses the node's backends TOML file into backend, routing and egress configuration.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::{Backend, BackendConfig, BackendRef, BlobTimeoutConfig};
 use crate::structs::storage::cleanup::CleanupStrategy;

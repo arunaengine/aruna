@@ -1,3 +1,8 @@
+//! Defines placement policies, selectors and advertised subjects with their validation limits.
+//! Decides whether a subject satisfies the policy refs on a governed object.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::structs::placement::record::{DEFAULT_LOCATION, LabelMatch, MAX_LOCATION_LEN};
 use crate::types::GroupId;

@@ -1,6 +1,6 @@
-//! Job-control RPC contract: the discrete request/response verbs an owner node
-//! answers, plus the wire projections they carry. Effects and events reference
-//! these so the routing policy stays sans-I/O.
+//! Defines the job control request and response verbs and the wire records they carry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::ops::Range;
 

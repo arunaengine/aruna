@@ -1,6 +1,7 @@
-//! Compiled-in egress policy for tenant-supplied endpoints. The deny table is
-//! a constant: no realm config, node config, or API input can remove an entry,
-//! and every consumer of a tenant endpoint screens here.
+//! Screens tenant supplied endpoints against a compiled in deny table of address ranges.
+//! The table is constant, so no realm config, node config or API input can remove an entry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

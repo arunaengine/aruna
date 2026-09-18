@@ -1,3 +1,7 @@
+//! Validates user attribute keys and values against the allowed charset and size limits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use thiserror::Error;
 
 pub const MAX_USER_ATTRIBUTES: usize = 128;

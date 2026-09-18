@@ -1,6 +1,7 @@
-//! Per-node Prometheus metrics registry. Each node owns one [`NodeMetrics`]. The registry is
-//! instance-scoped rather than process-global so the integration harness can run several full nodes in
-//! one process without their counters merging.
+//! Owns the per node Prometheus registry and the counters, gauges and histograms it holds.
+//! Each node keeps its own registry, so several nodes in one process never merge counters.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::EncodeLabelSet;

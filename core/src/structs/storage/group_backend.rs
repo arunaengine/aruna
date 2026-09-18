@@ -1,3 +1,7 @@
+//! Defines the storage backends a group may register and the secrets stored with them.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::storage::cleanup::CleanupStrategy;
