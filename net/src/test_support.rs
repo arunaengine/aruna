@@ -1,3 +1,7 @@
+//! Builds test secret keys, node ids and local endpoints for the net unit tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::alpn::Alpn;
 use aruna_core::id::NodeId;
 use iroh::SecretKey;

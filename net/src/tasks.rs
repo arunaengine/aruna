@@ -1,6 +1,7 @@
-//! Background task ownership and the loops the network starts at construction.
-//! `BackgroundTasks` owns every spawned loop; the constructor starts services
-//! first and tasks last, so no fallible step runs after the first spawn.
+//! Owns the background loops the network starts: effect dispatch, DHT forwarding and accepts.
+//! Services start before tasks, so no fallible step runs after the first spawn.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
 use std::sync::Arc;

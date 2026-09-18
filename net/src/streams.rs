@@ -1,3 +1,7 @@
+//! Opens and accepts peer streams: admission, connection budgets, loopback and stream types.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::alpn::{Alpn, AlpnRole};
 use aruna_core::structs::identity::realm::RealmNodeKind;

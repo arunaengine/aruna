@@ -1,6 +1,7 @@
-//! Network configuration: bind address, realm identity, discovery and relay
-//! selection, and durable document-sync runtime settings. Endpoint address
-//! parsing and formatting live here beside the `NetConfig` shape they encode.
+//! Defines the network configuration: bind address, realm, discovery, relay and sync settings.
+//! Also parses and formats endpoint addresses for peers and relays.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

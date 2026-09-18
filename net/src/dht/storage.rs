@@ -1,3 +1,7 @@
+//! Stores DHT entries with merge and retention rules, a deadline index and a checked clock.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

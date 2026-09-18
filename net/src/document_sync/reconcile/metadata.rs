@@ -1,3 +1,7 @@
+//! Applies metadata sync events for the registry, create events, lifecycle and policies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::document::{DocumentEvent, DocumentTarget};
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataLifecycleRecord};
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;

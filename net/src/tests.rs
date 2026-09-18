@@ -1,3 +1,7 @@
+//! Tests the net handle: endpoint discovery, eviction flush, loopback streams and shutdown.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 #[path = "tests_document_sync.rs"]

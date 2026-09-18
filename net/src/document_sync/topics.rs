@@ -1,3 +1,7 @@
+//! Creates, checks, seals and reopens the sync topics that document sync uses.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 impl DocumentSyncService {

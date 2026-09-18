@@ -1,3 +1,7 @@
+//! Turns genesis tie-break evictions into document events the node can re-emit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 impl DocumentSyncService {

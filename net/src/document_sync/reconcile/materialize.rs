@@ -1,3 +1,7 @@
+//! Writes reconciled documents into their storage keyspaces, guarded by create fences.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 pub(in crate::document_sync) fn target_write_entry(

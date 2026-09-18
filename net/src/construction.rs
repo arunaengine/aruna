@@ -1,6 +1,7 @@
-//! Network construction in named, ordered stages: bind the endpoint and freeze
-//! the configuration, load persisted peer and admission state, start services,
-//! then the loops. The socket is reachable exactly at `NetworkEndpoint::bind`.
+//! Builds the network handle in stages: bind endpoint, load state, start services and loops.
+//! The socket becomes reachable exactly at the endpoint bind stage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

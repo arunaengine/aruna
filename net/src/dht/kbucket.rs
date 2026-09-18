@@ -1,3 +1,7 @@
+//! Holds the Kademlia routing table of k-buckets that track peers by XOR distance.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::id::xor_distance_32;
 use aruna_core::id::{NodeId, NodeIdExt};
 use std::collections::VecDeque;

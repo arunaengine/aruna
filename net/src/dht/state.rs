@@ -1,3 +1,7 @@
+//! Decides DHT behavior in a pure state machine: lookups, routing updates and value checks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 

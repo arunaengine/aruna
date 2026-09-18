@@ -1,3 +1,7 @@
+//! Tests metadata registry lifecycle: upserts, fences, tombstones and delete pruning.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 #[tokio::test]

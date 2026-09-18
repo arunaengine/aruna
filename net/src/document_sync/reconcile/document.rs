@@ -1,3 +1,7 @@
+//! Reads bounded event batches from a sync topic, applies them and advances the cursor.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ::irokle::{Event as _, Storage as _};

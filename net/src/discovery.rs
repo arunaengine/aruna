@@ -1,6 +1,7 @@
-//! DHT-signed realm discovery and persisted peer state: announcement
-//! publication, endpoint lookup and validation, and the peer authorization list.
-//! The decisions below the I/O are pure, so tests pin them without a live DHT.
+//! Publishes and looks up DHT-signed realm endpoint announcements and checks them.
+//! Also loads and saves the persisted peer authorization list.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;

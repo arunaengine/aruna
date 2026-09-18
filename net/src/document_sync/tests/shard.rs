@@ -1,3 +1,7 @@
+//! Tests shard placement fences, membership checks and replay backlog for mapping documents.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 /// Only a correctly placed, structurally consistent, publisher-bound mapping

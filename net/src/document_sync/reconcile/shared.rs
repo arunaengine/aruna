@@ -1,3 +1,7 @@
+//! Applies shared topic events: watch subscriptions, watch interest, usage and node rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::document::{DocumentEvent, DocumentTarget};
 use aruna_core::structs::SyncQuarantineIdentity;
 use tracing::warn;

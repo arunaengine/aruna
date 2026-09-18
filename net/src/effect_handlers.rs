@@ -1,3 +1,7 @@
+//! Handles net, DHT and stream effects, including the cached realm presence lookups.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;

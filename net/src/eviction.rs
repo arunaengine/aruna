@@ -1,6 +1,7 @@
-//! Eviction maintenance beside the document-sync service it maintains: Irokle
-//! journal entries become durable outbox rows, and an entry is released only
-//! once its replacement records commit. `flush_evicted_documents` decides.
+//! Turns journalled document sync evictions into outbox rows through the inbound handler.
+//! An entry is released only once its replacement records are durable.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::mem;
 use std::sync::Arc;

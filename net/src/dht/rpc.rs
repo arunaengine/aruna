@@ -1,3 +1,7 @@
+//! Defines the DHT wire messages and their encoding, decoding and record signature checks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::DistributedTraceContext;
 use aruna_core::alpn::Alpn;
 use aruna_core::id::{DhtKeyId, NodeId};

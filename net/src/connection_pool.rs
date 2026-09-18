@@ -1,3 +1,8 @@
+//! Pools outbound connections per peer and ALPN with idle timeout, caps and failure cooldown.
+//! Also hooks the endpoint to report connection monitor state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::ops::Deref;

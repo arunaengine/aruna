@@ -1,3 +1,7 @@
+//! Publishes document events to sync topics and reports what was published or must retry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 impl DocumentSyncService {

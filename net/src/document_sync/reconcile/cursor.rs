@@ -1,3 +1,8 @@
+//! Reads and writes sync cursors per topic and drops one whose history was rebuilt.
+//! Also frames sync messages on a stream and processes summary and data responses.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::streams::{RecvStream, SendStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

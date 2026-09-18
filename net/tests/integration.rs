@@ -1,3 +1,7 @@
+//! Integration tests for two net handles: DHT lookups, streams, loopback and realm fan-out.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 use std::time::Duration;
 

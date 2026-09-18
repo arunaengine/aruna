@@ -1,3 +1,7 @@
+//! Runs the DHT driver loop that drives the state machine and its RPC and storage work.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 

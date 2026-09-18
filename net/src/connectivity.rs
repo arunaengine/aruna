@@ -1,6 +1,7 @@
-//! Peer connectivity management: retry/backoff decisions over the peer set, the
-//! run loop that waits and probes, and the diagnostic projection of managed
-//! peers. Registration lives on `NetHandle`; this module never touches admission.
+//! Manages peer reconnect attempts with backoff and reports peer connection diagnostics.
+//! Peer registration lives on the net handle, and this module never touches admission.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

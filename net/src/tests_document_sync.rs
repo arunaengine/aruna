@@ -1,3 +1,7 @@
+//! Shared test helpers for document sync: storage fixtures, admin events and record readers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::document_sync::reconcile::admin::apply_admin_operation;
 use crate::document_sync::reconcile::cursor::{AppliedCursor, topic_cursor_key};
 use crate::document_sync::storage::batch_write_to;

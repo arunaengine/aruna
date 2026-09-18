@@ -1,3 +1,7 @@
+# Manifest of aruna-net, the DHT, stream and document synchronization crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 [package]
 name = "aruna-net"
 version.workspace = true

@@ -1,3 +1,7 @@
+//! Tests sync summary handling, buffered publish after restart and fan-out failure reports.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 fn sync_summary(

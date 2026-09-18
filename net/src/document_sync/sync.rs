@@ -1,3 +1,7 @@
+//! Picks sync peers and runs topic sync, fan-out and bootstrap rounds for document sync.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 impl DocumentSyncService {

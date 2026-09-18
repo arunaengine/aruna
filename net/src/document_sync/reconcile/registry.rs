@@ -1,3 +1,7 @@
+//! Stores metadata registry records, fencing out stale rows and deleted documents.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 pub(in crate::document_sync) async fn store_registry_upsert(

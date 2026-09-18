@@ -1,3 +1,7 @@
+//! Owns the document sync service: its state, peer budgets and the parts that run sync.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;

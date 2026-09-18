@@ -1,3 +1,7 @@
+//! Holds the DHT tuning constants: channel sizes, timeouts, size caps and storage key names.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
 pub const CMD_CHANNEL_CAPACITY: usize = 1024;

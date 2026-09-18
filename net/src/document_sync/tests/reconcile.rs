@@ -1,3 +1,7 @@
+//! Tests reconcile replay: cursor lineage, publisher checks and rejected event handling.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 // The eager cursor delete is an optimization, not the invariant: a crash leaves

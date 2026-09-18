@@ -1,4 +1,6 @@
-//! Accept-time ALPN x node-kind boundary between realm nodes and user devices.
+//! Tests the accept-time ALPN and node kind boundary between realm nodes and user devices.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;

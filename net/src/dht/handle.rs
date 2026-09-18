@@ -1,3 +1,7 @@
+//! Spawns the DHT driver and offers the handle to put, get, bootstrap and shut down.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::{Duration, Instant};
 
 use aruna_core::effects::DhtGetOptions;

@@ -1,3 +1,7 @@
+//! Applies admin document operations for users, groups, realms and realm config.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 pub(crate) async fn apply_admin_operation(

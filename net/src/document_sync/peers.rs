@@ -1,3 +1,7 @@
+//! Filters document sync peers by node kind and keeps the allowed peer candidates.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 impl DocumentSyncService {

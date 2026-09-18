@@ -1,3 +1,7 @@
+//! Applies a batch of sync events and collects applied targets, rejections and deferrals.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeSet;
 
 use aruna_core::admin_documents::AdminDocumentEvent;

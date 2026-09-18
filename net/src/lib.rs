@@ -1,10 +1,10 @@
+//! Owns the node networking layer: peer state, DHT, document sync and the network handle.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 #![deny(unsafe_code)]
 #![recursion_limit = "256"]
-
-//! The node networking layer: peer state, DHT, document sync, and the network
-//! handle the rest of the node drives through effects. Each subsystem lives in
-//! its own module; the handle's public operations live in this file.
 
 mod config;
 mod connection_pool;

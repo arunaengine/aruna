@@ -1,3 +1,7 @@
+//! Owns the document sync test modules and covers topic tie-breaks, retries and quarantine.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::test_support::test_endpoint;
 use aruna_core::admin_documents::{

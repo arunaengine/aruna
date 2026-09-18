@@ -1,6 +1,7 @@
-//! Per-device inbound limits: a device holds and serves nothing, so inbound
-//! streams are charged against the realm-published per-node budget at the
-//! ALPN-by-kind admission point; realm nodes are never charged here.
+//! Charges inbound device streams against per-node rate and concurrency budgets.
+//! Only user devices are charged here, never realm nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use governor::clock::{Clock, DefaultClock};
