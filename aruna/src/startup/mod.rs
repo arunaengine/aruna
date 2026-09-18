@@ -1,6 +1,6 @@
-//! Node startup phases and the resources they own. The ordered flow lives in
-//! [`crate::application`]; modules here own acquired resources, realm
-//! preparation, listener binding, background work, and test instrumentation.
+//! Groups the node startup phases: resources, realm, listeners, background and test hooks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod background;
 pub mod listeners;

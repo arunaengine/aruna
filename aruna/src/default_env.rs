@@ -1,6 +1,6 @@
-//! Refuses to start on the demonstration environment shipped in the repository.
-//! The tracked `.env` is embedded at build time and compared against the live
-//! environment, so a node never serves with published keys by accident.
+//! Refuses to start when the live environment still holds the shipped demonstration values.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::io::Cursor;
 use thiserror::Error;

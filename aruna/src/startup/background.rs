@@ -1,4 +1,6 @@
-//! Background work started after ingress is bound.
+//! Starts the background work after ingress binds: recovery, job timers, sweeps and warmup.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

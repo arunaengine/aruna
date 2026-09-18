@@ -1,7 +1,10 @@
+//! Tests the MCP artifact contract: a captured PNG keeps its content type and is served by S3.
+//! Skips when Docker is unavailable.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "512"]
-//! End-to-end MCP artifact contract: compute reports a captured PNG with its exact
-//! content type and version, and S3 serves those bytes. Skips when Docker is unavailable.
 #![cfg(feature = "docker")]
 
 mod shared;

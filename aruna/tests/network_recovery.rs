@@ -1,3 +1,7 @@
+//! Tests that a realm survives a peer outage and recovers its connections and metadata.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![recursion_limit = "256"]
 
 mod shared;

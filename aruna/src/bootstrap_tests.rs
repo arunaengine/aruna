@@ -1,3 +1,7 @@
+//! Tests realm bootstrap: topic choice, retry backoff, watch interest publishing and readiness.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     backoff, node_is_ready, prepare_core_documents, publish_core_documents, sync_peer_topic,
     sync_with_retry, unique_user_topic, watch_target_needed,

@@ -1,6 +1,8 @@
-//! Embeds the tracked demonstration environment for the startup guard. A build
-//! context without the file, such as the container image, embeds nothing and
-//! the guard then has no shipped value to match.
+//! Embeds the tracked demonstration environment file so the startup guard can compare values.
+//! A build without that file embeds nothing, so the guard has no shipped value to match.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::path::Path;
 
 fn main() {

@@ -1,6 +1,6 @@
-//! Construction of the long-lived node resources, acquired in the order the
-//! node needs them. `Acquired` owns everything obtained so far, so a failure
-//! part-way releases exactly the acquired subset instead of leaking tasks.
+//! Acquires the long-lived node resources in order and releases them if a later step fails.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;

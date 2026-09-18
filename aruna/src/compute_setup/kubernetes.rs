@@ -1,4 +1,6 @@
-//! Kubernetes backend construction.
+//! Builds the Kubernetes executor backend, applies its network policy and returns the registry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_compute::ExecutorRegistry;
 use tracing::info;

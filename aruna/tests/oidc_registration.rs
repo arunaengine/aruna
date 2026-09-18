@@ -1,5 +1,10 @@
+//! Tests OIDC user registration against a fake provider, checking the user and subject index.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use aruna_api::auth::OidcValidator;
 use aruna_api::routes::users::RegisterUserResponse;
 use aruna_api::server::state::ServerState;

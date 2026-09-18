@@ -1,3 +1,7 @@
+//! Builds the node config from operator settings, opening storage and reading realm config.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};

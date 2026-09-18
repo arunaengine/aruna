@@ -1,6 +1,6 @@
-//! Ordered, bounded node shutdown.
-//!
-//! Ingress and writers stop before blob and storage are closed, drained, and synced.
+//! Runs the bounded shutdown order: ingress and writers first, then net, blob and storage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;

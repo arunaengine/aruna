@@ -1,3 +1,7 @@
+//! Process entry: installs the crypto provider, dispatches helpers and runs the node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![allow(clippy::result_large_err)]
 // The tracked recovery child overflows the default query depth in a fresh build.
 #![recursion_limit = "256"]

@@ -1,5 +1,10 @@
+//! Tests that the REST and S3 endpoints return the expected CORS headers per origin.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 mod shared;
 
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule};

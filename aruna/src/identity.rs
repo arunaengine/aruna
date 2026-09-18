@@ -1,6 +1,6 @@
-//! Persisted identity: the record, its store, the pure [`plan_enrollment`]
-//! decision, and [`IdentityError`]. Enrollment transport and response
-//! validation live in the `enrollment` submodule.
+//! Holds the persisted node identity record, its storage and the identity error type.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 #[path = "identity_enrollment.rs"]
 mod enrollment;

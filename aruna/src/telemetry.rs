@@ -1,3 +1,7 @@
+//! Sets up tracing: the log filter, text or JSON output and the OpenTelemetry tracer.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 

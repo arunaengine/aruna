@@ -1,6 +1,6 @@
-//! Compute settings read from an explicit operator-input source: [`collect`]
-//! consumes one [`crate::settings::SettingsEnv`] and returns typed values, so a
-//! builder never reads the process environment.
+//! Reads and parses every compute setting from one operator input source into typed values.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

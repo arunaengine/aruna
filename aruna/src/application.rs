@@ -1,6 +1,6 @@
-//! The ordered node lifecycle: acquire resources, prepare the realm, bind
-//! listeners, start background work, supervise ingress, then run the ordered
-//! shutdown (`run_node`).
+//! Runs the ordered node lifecycle: resources, realm, listeners, background work, shutdown.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_operations::device::wipe as device_wipe;
 

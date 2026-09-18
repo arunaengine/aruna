@@ -1,6 +1,6 @@
-//! Realm bootstrap duties after identity resolution: core-document preparation,
-//! publication, and fetch, placement waits, and the local onboarding secret.
-//! Persisted identity and enrollment live in `crate::identity`.
+//! Prepares, publishes and fetches the realm core documents and the local onboarding secret.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::identity::PersistedNodeState;
 use aruna_api::server::state::{ONBOARDING_SECRET_KEY, load_persisted_state, persist_state};

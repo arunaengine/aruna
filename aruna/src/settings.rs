@@ -1,6 +1,6 @@
-//! Operator settings parsing. [`read_settings_from`] is the only parser: it
-//! consumes an explicit [`SettingsEnv`] so tests pass maps, and it performs no
-//! filesystem, network, or storage I/O.
+//! Parses operator settings from one explicit environment source without any other input.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

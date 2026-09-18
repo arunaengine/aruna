@@ -1,8 +1,10 @@
+//! End-to-end compute tests that run jobs on a real Docker daemon and a real S3 endpoint.
+//! Each test skips with a written message when no daemon is reachable.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "512"]
-//! End-to-end compute-layer tests against a real Docker daemon and a real S3
-//! endpoint. Each test skips with a written message when no daemon is reachable,
-//! so a CI box without Docker records the skip rather than failing.
 #![cfg(feature = "docker")]
 
 mod shared;

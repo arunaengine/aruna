@@ -1,3 +1,7 @@
+//! Downloads, verifies and unpacks the portal web artifact and reports its install status.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::config::{PortalArtifactConfig, PortalConfig};
 use aruna_api::server::state::{PortalStatus, ServerState};
 use chrono::{SecondsFormat, Utc};

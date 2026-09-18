@@ -1,5 +1,6 @@
-//! Realm preparation during startup: metadata replay, realm bootstrap or
-//! joining, placement, and node-info seeding.
+//! Prepares the realm at startup: metadata replay, bootstrap or join, placement and node info.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

@@ -1,6 +1,6 @@
-//! Selection and construction of the node's compute executor: [`collect`] reads
-//! one explicit operator-input source into [`ComputeSettings`], and
-//! [`build_registry`] receives that value instead of rereading the environment.
+//! Selects the node's compute backend and builds its executor registry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 // Without a compiled backend the parsed settings are only constructed, never
 // read; keep the no-backend feature check warning-free.

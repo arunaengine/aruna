@@ -1,4 +1,6 @@
-//! Binding the node's ingress listeners and reporting their exit.
+//! Binds the REST, S3, portal and session listeners and reports which one exited.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

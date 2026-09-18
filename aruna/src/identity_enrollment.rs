@@ -1,6 +1,6 @@
-//! Enrollment planning and HTTP transport for the persisted identity:
-//! [`plan_enrollment`] decides whether a boot mints, bootstraps, refreshes, or
-//! reuses an identity, and the clients run only when the plan asks for them.
+//! Plans node enrollment and runs the calls that mint, bootstrap or refresh an identity.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 use std::time::Duration;
