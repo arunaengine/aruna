@@ -284,7 +284,11 @@ impl Operation for PutPlacementOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
+        // The resolver owns its storage events: cache failures are best effort,
+        // and a failed policy read is reported as unavailable, not as a fault.
+        if let Event::Storage(StorageEvent::Error { error }) = &event
+            && !matches!(self.state, PutPlacementState::Resolve)
+        {
             return self.fail(error.clone().into());
         }
         match self.state {
@@ -692,6 +696,22 @@ mod pure_tests {
             operation.finalize(),
             Err(PutPlacementError::PolicyUnavailable { .. })
         ));
+    }
+
+    #[test]
+    fn cache_failure_continues() {
+        // A failed policy cache read is best effort: resolution goes on to the
+        // holders instead of failing the whole request.
+        let policies = vec![policy(1)];
+        let mut operation = operation(&policies, None);
+        operation.start();
+        operation.step(authorized(true));
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: aruna_core::errors::StorageError::KeyNotFound,
+        }));
+
+        assert!(!effects.is_empty(), "resolution continues past the cache");
+        assert!(!operation.is_complete());
     }
 
     #[test]
