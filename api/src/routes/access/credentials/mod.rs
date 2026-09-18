@@ -5,6 +5,7 @@
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path};
 use aruna_operations::driver::drive;
@@ -711,7 +712,14 @@ async fn authorize_credential_issuance(
             &group_root,
         )
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| match error {
+            // An unknown or deleted group is a refusal, not a server fault.
+            AuthorizationError::DocNotFound
+            | AuthorizationError::GroupNotFound
+            | AuthorizationError::InvalidRealmId
+            | AuthorizationError::InvalidGroupId => ServerError::Forbidden,
+            _ => ServerError::InternalError(error.to_string()),
+        })?;
         if roots.is_empty() {
             return Err(ServerError::Forbidden);
         }

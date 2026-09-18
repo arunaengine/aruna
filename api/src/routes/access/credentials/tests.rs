@@ -316,6 +316,21 @@ async fn outsider_refused() {
 }
 
 #[tokio::test]
+async fn unknown_group_refused() {
+    // A group without an authorization document is refused, never a 500.
+    let (_dir, state, auth, _) = scoped_state(vec![(
+        "/other/g/group/data/**".to_string(),
+        Permission::READ,
+    )])
+    .await;
+
+    assert!(matches!(
+        create_credential(&state, &auth, Ulid::from_bytes([9u8; 16]), None).await,
+        Err(ServerError::Forbidden)
+    ));
+}
+
+#[tokio::test]
 async fn writer_cannot_revoke() {
     // Group write must not reach the S3 credential of another member.
     let (_dir, state, auth, access_key_id) = revoke_state().await;
