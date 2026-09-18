@@ -986,10 +986,9 @@ mod tests {
         (address, handle)
     }
 
-    // The real ingress deadline must not lose either S3 owner: both listeners
-    // drain active connection work past their slice, so only the retained
-    // forced cleanup can release them before storage closes. The clock stays
-    // real: a paused one advances over the storage and socket waits below.
+    // Both listeners drain active connection work past their slice, so only the
+    // retained forced cleanup releases them before storage closes. The clock
+    // stays real: a paused one advances over the storage and socket waits.
     #[tokio::test]
     async fn ingress_timeout_retains() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
