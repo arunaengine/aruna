@@ -1,4 +1,6 @@
-//! The metadata documents this device keeps available offline.
+//! Routes that list this device's document replicas and set which ones stay offline.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::str::FromStr;
 use std::sync::Arc;

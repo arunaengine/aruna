@@ -1,5 +1,6 @@
-//! Response metadata and builders for the S3 adapter, kept apart from the
-//! trait implementation that maps requests and operations.
+//! Builds get, put, delete and completion responses and queues reference metadata refresh.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{ArunaS3Service, reference_etag};
 use crate::s3::checksum::{

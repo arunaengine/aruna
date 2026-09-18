@@ -1,3 +1,7 @@
+//! MCP tools that start sessions, run scripts, and submit or cancel compute jobs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::data::{WriteObjectInput, write_text};
 use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,

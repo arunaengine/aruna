@@ -1,6 +1,6 @@
-//! Device-local plane of a user node. It is served only by a User-kind node
-//! and only to the owner that node is bound to, so the desktop app and the
-//! headless CLI share one authenticated surface.
+//! Collects the owner-only device routes a user node serves for the machine it runs on.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod documents;
 pub mod drafts;

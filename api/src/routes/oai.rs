@@ -1,6 +1,7 @@
-//! Read-only OAI-PMH 2.0 provider over the anonymous metadata visibility index.
+//! Serves a read-only OAI-PMH 2.0 provider over the anonymous metadata visibility index.
 //! Candidates are reauthorized and exported through their routed holder path.
-//! GET and POST share duplicate-preserving parsing with verb-specific validation.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

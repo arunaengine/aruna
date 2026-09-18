@@ -1,3 +1,7 @@
+//! Serves the portal single page app on its own listener with cache and security headers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::csp::{PortalCspConfig, PortalSecurity, portal_security_headers};
 use crate::error::ServerSetupError;
 use crate::server::state::{PortalRuntimeState, ServerState};

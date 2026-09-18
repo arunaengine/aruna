@@ -1,6 +1,6 @@
-//! Outbound egress policy for assistant provider connections. Only the assistant
-//! client accepts a caller-supplied origin and resolves names; the OIDC validator
-//! and management relay keep their own clients, so the rules stay separate.
+//! Builds the assistant outbound client and refuses provider names that resolve privately.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};

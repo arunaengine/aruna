@@ -1,5 +1,6 @@
-//! Multipart upload helpers for the S3 adapter. The trait implementation stays
-//! in `service`.
+//! Parses the upload id marker and hands a finished multipart put to the queue.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::ArunaS3Service;
 use aruna_core::structs::identity::auth::AuthContext;

@@ -1,3 +1,7 @@
+//! Tests that deletion preflight counts versions and that purge submission is idempotent.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};

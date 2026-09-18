@@ -1,3 +1,7 @@
+//! Serves the deletion preflight and purge job routes for files, prefixes and buckets.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

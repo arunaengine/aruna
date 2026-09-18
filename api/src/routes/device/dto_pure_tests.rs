@@ -1,3 +1,7 @@
+//! Tests that the device view helpers map sync states onto their wire names and reasons.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::structs::RemoteBinding;
 use ulid::Ulid;

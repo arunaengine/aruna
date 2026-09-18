@@ -1,6 +1,7 @@
-//! Realm compute configuration, approximate demand snapshots, and operator drain controls.
-//! Configuration drives planning and quota gates; drain controls stop new local work.
-//! Reported distributed values are approximate, and these controls do not cancel admitted work.
+//! Serves realm compute configuration, demand snapshots and operator drain controls.
+//! Reported demand is approximate, and drain only stops new local work.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

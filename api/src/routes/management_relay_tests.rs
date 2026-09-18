@@ -1,3 +1,7 @@
+//! Tests relay route matching, target selection, header filtering and retry decisions.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, relay_route, relay_targets,
     relay_url, relayed_headers,

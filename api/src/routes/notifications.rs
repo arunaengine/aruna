@@ -1,3 +1,7 @@
+//! Serves the notification inbox, its live stream and the caller's notification watches.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{ValidatedBearer, ensure_permission_with, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::execution::jobs::{decode_cursor, encode_cursor};

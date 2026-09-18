@@ -1,6 +1,6 @@
-//! Wire shapes of the device's synced folders. Every enum is snake_case on the
-//! wire, so the desktop reads one vocabulary across folders, entries, actions
-//! and transfers.
+//! Defines the snake_case wire types for synced folders, entries, actions and transfers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;

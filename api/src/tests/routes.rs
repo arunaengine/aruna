@@ -1,3 +1,7 @@
+//! Builds route test fixtures: temporary storage, driver context, state and seeded documents.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::server::state::ServerState;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

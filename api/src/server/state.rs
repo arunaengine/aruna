@@ -1,3 +1,7 @@
+//! Holds the shared server state: identity, realm config, interface runtimes and caches.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::OidcError;
 use crate::openapi::ApiDoc;

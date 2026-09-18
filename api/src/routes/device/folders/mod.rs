@@ -1,4 +1,6 @@
-//! The folders this device keeps in sync with a realm bucket prefix.
+//! Serves the owner routes that bind, list, pause and unbind this device's synced folders.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::str::FromStr;
 use std::sync::Arc;

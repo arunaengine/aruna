@@ -1,5 +1,6 @@
-//! Object range and path restriction helpers for the S3 adapter. The trait
-//! implementation stays in `service`.
+//! Converts S3 byte ranges and checks whether path restrictions reach into a bucket.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::permission_path::permission_pattern_matches;
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};

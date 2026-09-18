@@ -1,6 +1,6 @@
-//! Connection, stream and total-lifetime activity tracking for the S3 listener:
-//! [`ConnectionActivity`] only records progress and broadcasts generation
-//! changes, while the policy functions and adapters decide when to cancel.
+//! Tracks connection and stream progress for the S3 listener and cancels stalled work.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
 use std::sync::Arc;

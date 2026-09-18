@@ -1,3 +1,7 @@
+//! Serves the staging routes for single and batch stages, staging jobs and references.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{
     ValidatedBearer, blob_permission_path, ensure_permission, parse_connector_id, parse_group_id,
     require_realm_auth,

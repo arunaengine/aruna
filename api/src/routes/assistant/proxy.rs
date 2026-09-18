@@ -1,3 +1,7 @@
+//! Forwards allowed assistant calls upstream with stored credentials and streams replies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     PROXY_BODY_LIMIT, ProviderModel, ensure_enabled, forbidden_header, load_provider,
     validate_base_url,

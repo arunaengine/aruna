@@ -1,3 +1,7 @@
+//! Maps operation errors onto S3 error codes, messages and HTTP statuses.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::s3::checksum::checksum_mismatch_error;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::structs::storage::routing::RoutingError;

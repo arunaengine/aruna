@@ -1,5 +1,6 @@
-//! Adapter tests that need a storage handle: the read/lookup boundary and the
-//! realm/group permission gate.
+//! Tests the metadata adapter record lookup and its realm and group permission gate.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
 use crate::tests::routes::{seed_realm_auth, test_context, test_state, test_storage};

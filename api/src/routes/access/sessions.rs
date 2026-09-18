@@ -1,3 +1,7 @@
+//! Routes to create, list, and delete user bearer sessions.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;

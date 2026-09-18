@@ -1,3 +1,7 @@
+//! Tests storing policy sets, stale hash conflicts, admin checks and policy tracing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::NodeCapabilities;

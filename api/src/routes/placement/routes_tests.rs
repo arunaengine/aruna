@@ -1,3 +1,7 @@
+//! Tests the object placement route for reads, unknown keys and foreign readers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{ObjectPlacementQuery, get_object_placement};
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;

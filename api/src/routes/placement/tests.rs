@@ -1,3 +1,7 @@
+//! Tests that policy reference and selector bodies round trip and reject short digests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{PolicyRefBody, SelectorBody};
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSelector};
 use ulid::Ulid;

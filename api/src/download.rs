@@ -1,3 +1,7 @@
+//! Admits downloads against rate limits and streams the body under idle and lifetime limits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::rate_limit::{LocalKey, LocalPermit};
 use crate::server::state::ServerState;
 use aruna_core::stream::{BackendStream, StreamError};

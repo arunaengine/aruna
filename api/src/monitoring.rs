@@ -1,6 +1,6 @@
-//! Dedicated monitoring listener: liveness, readiness and Prometheus scrape on
-//! `OPS_SOCKET_ADDRESS`, so `/metrics` is unreachable through the public port and
-//! Kubernetes probes hit a container port not exposed via Service/Ingress.
+//! Serves liveness, readiness, and Prometheus metrics on a separate operations listener.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -1,3 +1,7 @@
+//! Tests that group backend routes demand group admin and round trip the cleanup policy.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     CleanupPolicy, CleanupStrategy, CreateBackendRequest, backend_reclaim_status,
     create_group_backend, delete_group_backend, enable_group_backend, list_group_backends,

@@ -1,5 +1,6 @@
-//! Metadata reference routes: thin request-to-operation conversion over the
-//! shared `crate::metadata` adapter.
+//! Serves the routes that list documents referencing an IRI and preflight destructive changes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerResult};

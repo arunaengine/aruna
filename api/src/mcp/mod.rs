@@ -1,3 +1,7 @@
+//! Wires the MCP server, its tool modules, and the shared helpers each tool uses.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::require_unrestricted_auth;
 use crate::cors::CorsConfig;
 use crate::server::state::ServerState;

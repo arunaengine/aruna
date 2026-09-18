@@ -1,3 +1,7 @@
+//! Serves the realm and group request policy routes plus validation and dry-run checks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::groups::refuse_group_edit;

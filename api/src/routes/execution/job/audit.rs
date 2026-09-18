@@ -1,6 +1,7 @@
-//! Paginated audit of one external job's immutable records and alternative outcomes.
-//! Responses redact identities, signatures, and envelopes while preserving execution evidence.
-//! Callers that did not submit the job receive the same 404 as an unknown id.
+//! Serves the paginated audit of one external job's records and alternative outcomes.
+//! Redacts identities and signatures, and answers 404 for a job the caller did not submit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -1,3 +1,7 @@
+//! Tests S3 session minting limits, listing, secret hiding, and revocation behavior.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;

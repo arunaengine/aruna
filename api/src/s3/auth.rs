@@ -1,3 +1,7 @@
+//! Looks up S3 signing secrets and authorizes each S3 request against permissions and policy.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::scope::resolve_scope;
 use super::server::S3OpLabel;
 use super::util::{anonymous_read_allowed, operation_permission};

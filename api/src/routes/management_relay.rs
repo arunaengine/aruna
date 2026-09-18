@@ -1,6 +1,6 @@
-//! Transparent relay of management-only REST routes: a route that reaches the
-//! wrong node kind is re-issued against a management node and its answer is
-//! passed back verbatim, so a caller never needs to know the serving node kind.
+//! Relays management-only REST routes to a management node and passes the answer back verbatim.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::ServerError;
 use crate::routes::info::{load_node_documents, management_node_urls};

@@ -1,3 +1,7 @@
+//! Tests that client URLs are built right from public, wildcard and IPv6 bind addresses.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{RestInterfaceRuntime, client_bind_url, client_host_url};
 
 #[test]

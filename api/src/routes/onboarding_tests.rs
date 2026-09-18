@@ -1,3 +1,7 @@
+//! Tests minting, polling, revoking and redeeming onboarding secrets over their routes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     ServerError, bootstrap_onboarding, create_onboarding_secret, get_secret_status,
     list_onboarding_secrets, map_finalize_error, revoke_onboarding_secret,

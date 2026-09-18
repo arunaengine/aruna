@@ -1,3 +1,7 @@
+//! Validates bearer and OIDC tokens on requests and checks caller permissions.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::{OidcError, ServerError, ServerResult, TokenError};
 use crate::server::state::ServerState;
 use crate::telemetry::record_auth_context;

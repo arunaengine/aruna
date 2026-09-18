@@ -1,6 +1,7 @@
-//! Metadata REST routes, grouped by family. Each handler converts one request
-//! family into a call on the shared `crate::metadata` adapter; the adapter and
-//! every MCP-facing mapper live there, so MCP never reaches into a handler.
+//! Groups the metadata REST routes and hands each request to the shared metadata adapter.
+//! Every MCP-facing mapper lives in that adapter, so MCP never reaches into a handler.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub(crate) mod documents;
 pub(crate) mod query;

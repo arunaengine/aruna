@@ -1,3 +1,7 @@
+//! Tests the device listing, revoke, and eviction routes and the callers they refuse.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     UserDeviceResponse, evict_device, list_user_devices, preferences_from_attributes,
     revoke_user_device,

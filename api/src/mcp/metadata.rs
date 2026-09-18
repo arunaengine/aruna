@@ -1,6 +1,7 @@
-//! MCP metadata tools. Tools convert through the shared `crate::metadata`
-//! adapter (request DTOs, error mapping, local-write lookup) and never call a
-//! REST handler.
+//! MCP metadata tools for profiles, dataset search, validation, writes, and SPARQL queries.
+//! They go through the shared metadata adapter instead of calling REST handlers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::data::{ReadObjectInput, read_text};
 use super::{

@@ -1,3 +1,7 @@
+//! Routes for user registration, profile reads and updates, lookup, and device management.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 mod vault;
 
 use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_realm_auth};

@@ -1,3 +1,7 @@
+//! Parses and returns bucket CORS rules and matches them to add allow headers per request.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::cors::{S3_PREFLIGHT_VARY, append_vary_headers};
 use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketCorsRule};
 use http::header::{self, HeaderName, HeaderValue};

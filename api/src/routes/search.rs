@@ -1,3 +1,7 @@
+//! Serves the search routes for buckets, object heads and the combined realm search.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{

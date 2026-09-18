@@ -1,3 +1,7 @@
+//! Route that records a realm bearer token in the replicated revocation set.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{ValidatedBearer, claims_for_revocation, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;

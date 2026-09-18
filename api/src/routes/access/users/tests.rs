@@ -1,3 +1,7 @@
+//! Tests user registration through OIDC and enrollment secrets, tokens, and profile reads.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
 use crate::auth::{OidcValidator, handle_token};
 use crate::routes::access::sessions::{CreateSessionRequest, CreateSessionResponse};

@@ -1,3 +1,7 @@
+//! Implements the S3 trait for Aruna and maps every S3 call onto node operations.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![allow(clippy::result_large_err)]
 
 mod attributes;

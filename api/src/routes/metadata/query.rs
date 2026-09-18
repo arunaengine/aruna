@@ -1,5 +1,6 @@
-//! Metadata query and search routes: thin request-to-operation conversion over
-//! the shared `crate::metadata` adapter.
+//! Serves the metadata routes for SPARQL queries and search over visible documents.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerResult};

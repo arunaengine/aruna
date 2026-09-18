@@ -1,5 +1,6 @@
-//! Metadata document lifecycle routes: thin request-to-operation conversion
-//! over the shared `crate::metadata` adapter.
+//! Serves the routes that create, list, read, delete and path-resolve metadata documents.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerResult};

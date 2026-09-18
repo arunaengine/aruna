@@ -1,3 +1,7 @@
+//! Tests hash parsing, folder naming and the error mapping the folder routes rely on.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     FolderError, ServerError, folder_name, map_action_error, map_folder_error, map_reconcile_error,
     parse_hash,

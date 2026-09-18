@@ -1,3 +1,7 @@
+//! Defines the server error types and how they turn into HTTP status codes and bodies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::array::TryFromSliceError;
 
 use aruna_core::errors::ConversionError;

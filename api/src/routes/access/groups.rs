@@ -1,3 +1,7 @@
+//! Routes that create and update groups and manage their members, roles, and data paths.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{
     ValidatedBearer, ensure_permission, permission_granted, require_realm_auth,
     require_unrestricted_auth,

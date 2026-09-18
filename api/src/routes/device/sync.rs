@@ -1,4 +1,6 @@
-//! What this device still owes the realm, and the control that makes it run.
+//! Serves the device sync status and the control that starts a new sync run.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

@@ -1,3 +1,7 @@
+//! Tests notification inbox reads, the live state stream and watch authorization.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::NodeId;
 use aruna_core::UserId;

@@ -1,3 +1,7 @@
+//! Tests that the user resolve route refuses anonymous, restricted, and foreign callers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{ResolveUsersRequest, resolve_users};
 use crate::error::ServerError;
 use crate::tests::users::{realm_auth, setup_state};

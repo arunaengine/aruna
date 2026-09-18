@@ -1,3 +1,7 @@
+//! Tests that quarantine routes page and acknowledge rows and refuse weak or foreign tokens.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::NodeId;
 use aruna_core::UserId;

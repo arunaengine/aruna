@@ -1,4 +1,6 @@
-//! Erasing this device and stopping the node.
+//! Serves the owner route that erases this device's data and stops the node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

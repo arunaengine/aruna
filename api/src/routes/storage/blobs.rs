@@ -1,3 +1,7 @@
+//! Serves the routes that queue a replication copy and list the nodes holding a version.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;

@@ -1,3 +1,7 @@
+//! Tests draft preview refusals, unchecked validation marks, and draft state mapping.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{DeviceDraft, preview_draft};
 use crate::error::ServerError;
 use crate::metadata::ProfilePreviewRequest;

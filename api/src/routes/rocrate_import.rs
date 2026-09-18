@@ -1,3 +1,7 @@
+//! Serves the RO-Crate upload route and the route that submits an import job.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::path::{Component, Path as FsPath};
 use std::sync::{Arc, Mutex};
 

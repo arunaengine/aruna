@@ -1,3 +1,7 @@
+//! Serves the GA4GH TES v1 routes for service info and task submit, list, read and cancel.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeMap;
 use std::path::Path as FilePath;
 use std::str::FromStr;

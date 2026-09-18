@@ -1,3 +1,7 @@
+//! Tests chat and turn writes, revision and sequence checks, and the stored size caps.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;

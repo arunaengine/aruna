@@ -1,5 +1,7 @@
-//! Typed w3id lifecycle and landing resolution routed to each document's PID authority.
-//! Documents use `/aruna/{document_id}` and profiles use `/aruna/profile/{document_id}`.
+//! Routes typed w3id lifecycle and landing resolution to each document's PID authority.
+//! Documents use /aruna/{document_id} and profiles use /aruna/profile/{document_id}.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

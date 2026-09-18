@@ -1,3 +1,7 @@
+//! Routes that create, list, refresh, and revoke short-lived S3 session credentials.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     authorize_credential_issuance, build_credential_restrictions, format_node_id,
     format_system_time, serialize_restrictions,

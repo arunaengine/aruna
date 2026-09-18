@@ -1,6 +1,7 @@
-//! Realm-admin placement policy transport and domain-error mapping.
-//! Operations own authorization, reference authentication, and transactional rules.
-//! Realm bearer authentication prevents policy identifiers from reaching public S3 callers.
+//! Serves the placement policy routes for publishing, bucket defaults, objects and runs.
+//! They need realm bearer auth, so policy identifiers stay away from public S3 callers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};

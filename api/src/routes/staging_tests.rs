@@ -1,3 +1,7 @@
+//! Tests staging permission checks, batch caps, prefix expansion and job listing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::openapi::ApiDoc;
 use crate::tests::routes::{

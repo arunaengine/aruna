@@ -1,4 +1,6 @@
-//! What this device still owes its realm node, and what it still has to fetch.
+//! Serves the uploads this device still owes and the downloads it has yet to fetch.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
 use std::sync::Arc;

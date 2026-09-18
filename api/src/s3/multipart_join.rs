@@ -1,5 +1,6 @@
-//! Node-local join point for detached CompleteMultipartUpload work.
-//! Concurrent requests for one upload join the same run and answer.
+//! Joins concurrent complete multipart requests for one upload onto one shared run.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;

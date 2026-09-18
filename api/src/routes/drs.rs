@@ -1,3 +1,7 @@
+//! Serves the GA4GH DRS v1 routes for service info, object lookup, bulk resolve and download.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::routes_at;
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::download::{self, AdmissionError};

@@ -1,3 +1,7 @@
+//! Serves the compute job routes to submit, list, read, report on, cancel and delete runs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;

@@ -1,3 +1,7 @@
+//! Tests that the relay middleware forwards to a management node and stops on a hop header.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 
 use super::{RELAY_HOP_HEADER, relay_middleware};

@@ -1,3 +1,7 @@
+//! Route that lists metadata audit trail entries for a group or a single document.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;

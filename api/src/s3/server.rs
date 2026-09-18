@@ -1,6 +1,7 @@
-//! The S3 listener: connection acceptance, the staged request pipeline, and
-//! response-lifetime ownership. Responding bodies keep their permits and
-//! accounting until the stream ends, so headers never release a request early.
+//! Runs the S3 listener: accepts connections, stages requests and owns response lifetimes.
+//! A response keeps its permits and accounting until its stream ends, not just its headers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod activity;
 mod body;

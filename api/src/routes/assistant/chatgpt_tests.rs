@@ -1,3 +1,7 @@
+//! Tests the ChatGPT login start and poll steps, token refresh, and claim parsing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::tests::assistant::{setup_state, spawn_mock};
 use axum::Router;

@@ -1,3 +1,7 @@
+//! Tests the system info routes for realm status, placement changes, quota and usage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
     PeerContacts, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,

@@ -1,5 +1,6 @@
-//! Pure adapter tests: parsing, mapping, and envelope shapes that need no
-//! runtime, storage, or network.
+//! Tests metadata adapter parsing, error mapping, and envelope shapes without any storage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
 use crate::auth::ValidatedBearer;

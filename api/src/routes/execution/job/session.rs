@@ -1,6 +1,7 @@
-//! Interactive session routes. They are served by the node that runs the
-//! session job, next to cancel and with the same authorization: only the
-//! submitter, and anybody else's job answers 404.
+//! Serves the interactive session routes on the node that runs the session job.
+//! Only the submitter may use them, and anybody else's job answers 404.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::convert::Infallible;
 use std::sync::Arc;

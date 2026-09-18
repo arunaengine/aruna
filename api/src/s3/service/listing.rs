@@ -1,5 +1,6 @@
-//! Object, upload and version listing helpers for the S3 adapter. The trait
-//! implementation stays in `service`.
+//! Builds the object, version, upload and part listing pages for the S3 adapter.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{ArunaS3Service, URL_ENCODE_SET};
 use crate::s3::checksum::{ChecksumSelection, encode_checksums};

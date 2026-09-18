@@ -1,3 +1,7 @@
+//! Builds the storage routing fixture with a group, a bucket and two auth contexts.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::server::state::ServerState;
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,

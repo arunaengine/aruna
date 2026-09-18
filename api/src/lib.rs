@@ -1,5 +1,7 @@
-//! The node transports: REST routes, MCP tools, the S3 service, and the
-//! shared server state they run against.
+//! Crate root for the node transports: REST, MCP, S3, and the shared server state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "512"]
 #![allow(clippy::result_large_err)]

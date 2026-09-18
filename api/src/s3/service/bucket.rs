@@ -1,5 +1,6 @@
-//! Bucket authorization, quota and replication helpers for the S3 adapter.
-//! The trait implementation stays in `service`.
+//! Holds the bucket helpers of the S3 adapter: authorization, quota and replication setup.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::ArunaS3Service;
 use super::object::restrictions_reach;

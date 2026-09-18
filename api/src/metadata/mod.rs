@@ -1,6 +1,7 @@
-//! Shared metadata application adapter for the REST and MCP transports:
-//! request DTOs in `model`, operation error mapping, the local-write lookup,
-//! and response assembly. Neither transport reaches into the other's handlers.
+//! Shared metadata adapter that both the REST and MCP transports call for metadata work.
+//! It maps operation errors, finds the local write target, and builds the response bodies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod model;
 

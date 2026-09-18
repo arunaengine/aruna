@@ -1,5 +1,6 @@
-//! Copy source authorization, conditions and response mapping for the S3
-//! adapter. The trait implementation stays in `service`.
+//! Authorizes copy sources and maps copy conditions and copy results for the S3 adapter.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{ArunaS3Service, reference_etag};
 use crate::s3::auth::map_authorize_error;

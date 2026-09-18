@@ -1,3 +1,7 @@
+//! Tests the job routes for listing, report paging, artifact headers, delete and cancel.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::jobs::{
     JobRequestError, MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs,

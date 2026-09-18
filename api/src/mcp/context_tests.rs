@@ -1,3 +1,7 @@
+//! Tests group id parsing, role mapping, and the error bodies of the context tools.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use std::collections::{HashMap, HashSet};
 

@@ -1,5 +1,6 @@
-//! Storage family: blobs, bucket usage, group connectors, and the group
-//! storage backends with their routing and deletion surfaces.
+//! Groups the storage routes: blobs, bucket usage, connectors, backends, routing and deletion.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod blobs;
 pub mod bucket_usage;

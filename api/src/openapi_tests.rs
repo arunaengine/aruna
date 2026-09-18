@@ -1,3 +1,7 @@
+//! Checks the generated OpenAPI document for security, prose, example, and leak rules.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::ApiDoc;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;

@@ -1,3 +1,7 @@
+//! Serves the system routes for node and realm status, placement, quota and usage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ServerError, ServerResult};
 pub use crate::server::state::PortalStatus;

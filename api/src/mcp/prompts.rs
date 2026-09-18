@@ -1,3 +1,7 @@
+//! Serves the MCP prompt list and the guided create-dataset prompt text.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::McpServer;
 use rmcp::model::{
     ErrorData, GetPromptRequestParams, GetPromptResponse, GetPromptResult, ListPromptsResult,

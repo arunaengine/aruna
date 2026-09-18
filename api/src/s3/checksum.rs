@@ -1,3 +1,7 @@
+//! Parses and verifies S3 checksum headers and puts computed digests on the responses.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_blob::hash::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use base64::Engine;

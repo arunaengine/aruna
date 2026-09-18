@@ -1,3 +1,7 @@
+//! Builds and runs the REST server: router, security headers, timeouts and listener.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::cors::CorsConfig;
 use crate::csp::baseline_security_headers;
 use crate::error::ServerSetupError;

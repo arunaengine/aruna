@@ -1,6 +1,6 @@
-//! Streaming response for a slow CompleteMultipartUpload: the 200 head first,
-//! whitespace while it works, the XML document last. [`super::body::ResponseBody`]
-//! wraps it and touches both activity watchers on every filler.
+//! Streams a slow multipart completion with whitespace filler until the XML result is ready.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::activity::STREAM_PROGRESS_BYTES;
 use bytes::Bytes;

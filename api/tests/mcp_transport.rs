@@ -1,3 +1,7 @@
+//! Tests the MCP server over a live HTTP transport: tools, guards, prompts and errors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![recursion_limit = "512"]
 
 use std::collections::{HashMap, HashSet};

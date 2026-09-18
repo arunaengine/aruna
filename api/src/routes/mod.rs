@@ -1,3 +1,7 @@
+//! Builds the REST router from every route family and adds the auth and tracing layers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::auth_middleware;
 use crate::server::state::ServerState;
 use crate::telemetry::request_tracing_middleware;

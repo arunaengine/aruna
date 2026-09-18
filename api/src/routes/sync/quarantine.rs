@@ -1,5 +1,7 @@
-//! Realm-admin surface over this node's sync-quarantine store (#338).
-//! Each node serves the events rejected by its own replication path.
+//! Serves realm-admin routes over this node's store of quarantined sync events.
+//! Each node only serves the events its own replication path rejected.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

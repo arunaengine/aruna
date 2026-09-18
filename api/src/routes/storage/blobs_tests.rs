@@ -1,3 +1,7 @@
+//! Tests blob location listing: copy state mapping, candidate caps and read checks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     BlobCopyCompliance, BlobCopyOrigin, BlobCopyState, BlobCopyStorage, BlobLocationsQuery,
     blob_locations, copy_response, pending_copy,

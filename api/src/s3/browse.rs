@@ -1,5 +1,7 @@
-//! A plain HTML index for public folders. Only an unsigned request that asks for
-//! HTML and names a folder key gets it; SDK, CLI and signed requests keep S3 semantics.
+//! Renders a plain HTML folder index for public folders.
+//! Only an unsigned request that asks for HTML and names a folder key gets it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use http::HeaderMap;
 use http::header::ACCEPT;

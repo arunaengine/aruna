@@ -1,3 +1,7 @@
+//! Tests the DRS routes for object id parsing, access URLs, bulk limits and denied reads.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     DATA_PREFIX, DrsBulkBody, GetObjectError, MAX_OBJECT_IDS, RequestedObjectId, ResolveOutcome,
     ResolvedObject, build_object_response, download_error, drs_denied_error, encode_component,

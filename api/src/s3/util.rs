@@ -1,3 +1,7 @@
+//! Maps S3 operation names to needed access and parses common S3 request fields.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::s3::auth::Action;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};

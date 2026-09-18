@@ -1,5 +1,6 @@
-//! RO-Crate routes: thin request-to-operation conversion over the shared
-//! `crate::metadata` adapter.
+//! Serves the RO-Crate routes to export, replace and upsert entities of one document.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::{
     ValidatedBearer, ensure_permission_with, require_realm_auth, require_unrestricted_auth,

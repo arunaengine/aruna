@@ -1,4 +1,6 @@
-//! The offline authoring queue this device holds for its owner.
+//! Routes for the offline draft queue: list, enqueue, inspect, preview, and delete.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::str::FromStr;
 use std::sync::Arc;

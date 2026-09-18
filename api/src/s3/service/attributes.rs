@@ -1,6 +1,6 @@
-//! Object-attribute decoding and response shaping for the S3 adapter. The
-//! `GetObjectAttributes` mask and its response shape live here so the trait impl
-//! stays a thin mapping and a missing version still falls back to the read path.
+//! Decodes the object attributes mask and shapes its response, part listing included.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::response::ObjectResponseFields;
 use crate::s3::checksum::{ChecksumSelection, EncodedChecksums, encode_checksums};

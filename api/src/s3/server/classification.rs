@@ -1,6 +1,6 @@
-//! Request classification for the S3 listener: bucket, CORS preflight inputs,
-//! DeleteObjects body shape, and lane assignment in one synchronous, I/O-free
-//! pass before anything may parse or store a request.
+//! Sorts an S3 request into bucket, CORS inputs, body shape and lane before any parsing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::cors::parse_requested_headers;
 use crate::s3::server::body::DELETE_MAX_BODY;

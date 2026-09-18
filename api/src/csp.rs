@@ -1,3 +1,7 @@
+//! Builds the portal content security policy and adds baseline security headers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::server::state::ServerState;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::GetConfigOperation;

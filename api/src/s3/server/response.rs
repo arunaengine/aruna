@@ -1,6 +1,6 @@
-//! Protocol responses and CORS answers of the S3 listener. These builders decide
-//! status, headers, and bodies for requests that never reach the s3s service
-//! (rate limits, oversized bodies, invalid buckets, timeouts, preflight).
+//! Builds the refusal and CORS answers for requests that never reach the S3 service.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::cors::CorsConfig;
 use crate::s3::cors::{

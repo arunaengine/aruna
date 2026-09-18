@@ -1,3 +1,7 @@
+//! Serves the sync routes that create, list, read, edit, run and delete bucket relationships.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{
     ValidatedBearer, ensure_permission, ensure_permission_with, require_unrestricted_auth,
 };

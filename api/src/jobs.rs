@@ -1,6 +1,6 @@
-//! Transport-independent job admission and session lookup. REST and MCP both
-//! build a command and call here; each transport maps the returned outcome to
-//! its own status or tool result.
+//! Admits compute jobs and looks up sessions for both the REST and MCP transports.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::str::FromStr;
 use std::sync::Arc;

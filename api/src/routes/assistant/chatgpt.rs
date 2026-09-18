@@ -1,3 +1,7 @@
+//! Runs the ChatGPT device login flow and stores the resulting provider tokens.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{ProviderModel, ensure_enabled, load_provider, save_provider, validate_base_url};
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};

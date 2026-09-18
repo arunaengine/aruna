@@ -1,6 +1,6 @@
-//! Per-IP and per-principal token buckets shared by a request plane. Limits
-//! bound abuse, not normal use: quotas are generous and identical for every
-//! caller, and a denied request reports when to retry.
+//! Per-IP and per-principal request limits and local slot permits, with a retry time on denial.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::ErrorResponse;
 use crate::forwarded::client_ip;

@@ -1,3 +1,7 @@
+//! Builds the CORS layers and preflight headers for the REST and S3 interfaces.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use axum::http::Method;
 use http::HeaderMap;
 use http::HeaderName;

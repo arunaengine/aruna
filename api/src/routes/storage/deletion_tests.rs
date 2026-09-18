@@ -1,3 +1,7 @@
+//! Tests that deletion preflight reports the sync relationships a purge would touch.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

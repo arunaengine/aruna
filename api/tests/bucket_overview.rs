@@ -1,3 +1,7 @@
+//! Tests the bucket usage counts and the bucket routing routes against a seeded node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};

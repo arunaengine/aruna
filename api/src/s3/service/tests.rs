@@ -1,3 +1,7 @@
+//! Tests the S3 adapter for content type, replication targets, watch events and refreshes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::bucket::MAX_REPLICATION_TARGETS;
 use super::listing::next_marker_of;
 use super::*;

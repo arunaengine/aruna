@@ -1,3 +1,7 @@
+//! MCP tools that list buckets and objects, read and write them, and aggregate or search.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::context::member_groups;
 use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,

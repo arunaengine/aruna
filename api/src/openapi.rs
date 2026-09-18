@@ -1,3 +1,7 @@
+//! Builds the OpenAPI document from the route registration and adds shared responses.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use serde_json::json;
 use utoipa::openapi::header::Header;
 use utoipa::openapi::response::{Response, ResponseBuilder};

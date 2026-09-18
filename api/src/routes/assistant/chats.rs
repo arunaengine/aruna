@@ -1,3 +1,7 @@
+//! Routes that list, save, and delete assistant chats and append or read their turns.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::unix_rfc3339;

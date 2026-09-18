@@ -1,6 +1,7 @@
-//! Request and response bodies of the S3 listener. Request bodies report
-//! progress (and capture a bounded DeleteObjects prefix); response bodies own a
-//! [`ResponseLifetime`] released once, on completion, error, or drop.
+//! Wraps S3 request and response bodies so progress is reported and permits released once.
+//! Request bodies also capture a bounded prefix of a DeleteObjects body.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::activity::{ActiveRequestGuard, ConnectionActivity};
 use crate::rate_limit::LocalLease;

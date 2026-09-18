@@ -1,3 +1,7 @@
+//! Serves the onboarding secret routes to mint, list, revoke, poll and redeem a secret.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;

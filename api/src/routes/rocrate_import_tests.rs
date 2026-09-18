@@ -1,3 +1,7 @@
+//! Tests RO-Crate upload streaming, media type and size caps, and import job submission.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::server::state::ROCRATE_UPLOAD_SLOTS;
 use aruna_blob::blob::BlobHandler;

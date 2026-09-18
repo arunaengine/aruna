@@ -1,6 +1,8 @@
-//! Read scopes for callers whose roles reach only a part of a bucket: the
-//! access hook resolves them once and the listing handlers narrow their page to
-//! them, while every concrete object path stays an ordinary permission check.
+//! Resolves the key prefixes a caller may read when a role reaches only part of a bucket.
+//! Listing handlers narrow their page to those prefixes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+// Every concrete object path still goes through an ordinary permission check.
 
 use aruna_core::errors::AuthorizationError;
 use aruna_core::permission_path::{path_within, readable_roots};

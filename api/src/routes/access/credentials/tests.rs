@@ -1,3 +1,7 @@
+//! Tests S3 credential issuance, path scope narrowing, and who may list or revoke them.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::error::ServerError;
 use crate::tests::routes::{

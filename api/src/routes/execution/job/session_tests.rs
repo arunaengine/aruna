@@ -1,3 +1,7 @@
+//! Tests session route authorization, cell streaming and the staging of session inputs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};

@@ -1,3 +1,7 @@
+//! Tests assistant proxy path rules, header handling, streaming, and token refresh on 401.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::server::state::ServerState;
 use crate::tests::assistant::{setup_state, spawn_mock};

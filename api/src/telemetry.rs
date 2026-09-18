@@ -1,3 +1,7 @@
+//! Wraps each HTTP request in a span, records its latency and reports the slow ones.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 

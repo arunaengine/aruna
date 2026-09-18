@@ -1,3 +1,7 @@
+//! Serves the group routes that manage tenant write backends and their cleanup policy.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::routing::ensure_group_admin;

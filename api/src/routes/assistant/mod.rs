@@ -1,3 +1,7 @@
+//! Owns the assistant provider routes and wires the chat, login, and proxy submodules.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 mod chatgpt;
 mod chats;
 pub(crate) mod egress;

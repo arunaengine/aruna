@@ -1,3 +1,7 @@
+//! Serves the bucket usage route that counts objects, versions and bytes of one bucket.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::{AuthContext, Permission};

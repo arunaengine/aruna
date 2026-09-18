@@ -1,3 +1,7 @@
+//! Tests group creation, renaming, member and role access, and the data path browse route.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     AddMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, GroupInfoResponse,
     ListGroupsQuery, UpdateGroupRequest, add_group_member, create_group, get_group,

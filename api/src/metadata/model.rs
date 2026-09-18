@@ -1,3 +1,7 @@
+//! Request and response types of the metadata adapter, with their OpenAPI schemas.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::format_timestamp_ms;
 use crate::error::{ProfileFindingResponse, ValidationViolationResponse};
 use aruna_core::metadata::{
