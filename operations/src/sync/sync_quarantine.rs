@@ -1,6 +1,6 @@
-//! Admin reads and reclamation for the durable sync-quarantine store.
-//! Replication writes evidence plus usage rows transactionally; this module owns
-//! listing, inspection, acknowledgement and bounded pruning of acknowledged rows.
+//! Lists, inspects, acknowledges and prunes rows in the durable sync quarantine store.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

@@ -1,3 +1,7 @@
+//! Tests that durable outbox and placement timers are restored and rearmed after a restart.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::harness::*;
 use super::*;
 

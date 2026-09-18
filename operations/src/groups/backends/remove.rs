@@ -1,3 +1,7 @@
+//! Deletes disabled tenant backends that hold nothing any more, records and secrets alike.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{RecordReadError, backend_key, index_key, parse_read};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

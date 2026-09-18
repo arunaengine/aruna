@@ -1,3 +1,7 @@
+//! Tests the chat head and turn operations against caps, stale revisions and storage errors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::events::StorageEvent;
 use aruna_core::operation::Operation;

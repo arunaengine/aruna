@@ -1,3 +1,7 @@
+//! Builds a driver context backed by temporary storage for device tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::DriverContext;
 use aruna_storage::storage::FjallStorage;
 use tempfile::{TempDir, tempdir};

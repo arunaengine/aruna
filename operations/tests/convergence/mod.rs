@@ -1,5 +1,6 @@
-//! Progress-detecting convergence waits and a per-poll hang cap, shared by the multi-node
-//! integration tests.
+//! Shares the test polling helpers that wait for convergence and cap a hung check.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 #![allow(dead_code)]
 

@@ -1,4 +1,7 @@
 //! Domain state machines and their adapters over the operation runner.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh (non-incremental) builds overflow the default query depth in the
 // deeply nested async state machines; incremental builds mask it.
 #![recursion_limit = "512"]

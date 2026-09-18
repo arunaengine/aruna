@@ -1,3 +1,7 @@
+//! Works off the blob cleanup backlog and sweeps multipart uploads that went stale.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
 use crate::replication::dht_registration::dht_registration_effect;

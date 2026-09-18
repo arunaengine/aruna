@@ -1,3 +1,7 @@
+//! Reads one group storage backend record and lists a group's backends page by page.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{RecordReadError, backend_key, index_prefix, parse_iter, parse_read};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::Event;

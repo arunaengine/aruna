@@ -1,3 +1,7 @@
+//! Applies realm config placement changes: nodes, strategies, bindings, maps and transitions.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};

@@ -1,3 +1,7 @@
+//! Materializes a staged source as a reference version that points at the source bytes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::connectors::repository::{connector_secret_key, source_connector_key};
 use crate::connectors::resolver::secret_fingerprint;

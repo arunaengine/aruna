@@ -1,6 +1,7 @@
-//! CEL policy enforcement runs after authorization allows an action and before
-//! execution; compile/evaluation failures, policy-state read failures, and
-//! absent policy state all deny.
+//! Enforces CEL request policies after authorization allows an action and before it runs.
+//! Any compile, evaluation or policy read failure denies the request.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::{DriverContext, drive};
 use crate::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};

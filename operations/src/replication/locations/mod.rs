@@ -1,5 +1,6 @@
-//! Answers "which copy of a version does a node hold": locally, from a peer,
-//! and from the replication queue.
+//! Groups the operations that answer which nodes hold a copy of a version, plus their error.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod local;
 mod queued;

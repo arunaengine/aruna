@@ -1,3 +1,7 @@
+//! Reads one source connector and reports whether it holds a secret config.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;

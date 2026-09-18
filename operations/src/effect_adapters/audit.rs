@@ -1,6 +1,6 @@
-//! Audit-page adapter: bounded fan-out to every node's local audit page. An
-//! unreachable, denied, or over-cap node is reported missing, so an empty page
-//! can never read as an almost complete audit trail.
+//! Asks every node for its local audit page and reports each node it could not read.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
 

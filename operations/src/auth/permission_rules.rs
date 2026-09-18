@@ -1,3 +1,7 @@
+//! Collects the roles and restrictions of a caller into path rules that many paths reuse.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeSet, HashMap};
 
 use aruna_core::effects::{Effect, StorageEffect};

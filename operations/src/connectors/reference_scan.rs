@@ -1,5 +1,7 @@
-//! Reference-page scanning shared by connector delete and replace.
-//! Each operation owns its transaction lifecycle and final mutation.
+//! Scans blob version pages for uses of a connector, shared by delete and replace.
+//! Each calling operation still owns its transaction and its final mutation.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::events::Event;
 use aruna_core::types::Key;

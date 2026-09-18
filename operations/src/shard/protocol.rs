@@ -1,3 +1,7 @@
+//! Defines the shard manifest wire messages and reads or writes them in size bounded frames.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::ops::Range;
 
 use aruna_core::NodeId;

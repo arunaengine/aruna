@@ -1,3 +1,7 @@
+//! Routes notification and watch calls to the local inbox holder or to a remote node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::metrics::WatchMetricReason;

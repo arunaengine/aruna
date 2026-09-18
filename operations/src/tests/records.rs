@@ -1,4 +1,6 @@
-//! One realm, one submission family, and signed records for it.
+//! Builds one realm, a submission family and signed job records for the jobs tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::UserId;

@@ -1,3 +1,7 @@
+//! Replaces a tenant backend's credentials and name while keeping its id and its store.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::create::{CreateBackendError, CreateBackendInput};
 use super::validation::{check_identity, validate_backend_input};
 use super::{backend_key, parse_read, record_writes};

@@ -1,3 +1,7 @@
+//! Scans the replication job keyspace for nodes that still have a queued copy of a version.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::LocationSummaryError;
 use crate::replication::queue::BlobJobRecord;
 use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};

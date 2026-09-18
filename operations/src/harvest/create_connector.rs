@@ -1,3 +1,7 @@
+//! Registers a repository connector for a group after screening its endpoint and config.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::time::SystemTime;
 

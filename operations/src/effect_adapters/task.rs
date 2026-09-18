@@ -1,6 +1,6 @@
-//! Task adapter: persist the task effect first, then hand it to the handle.
-//! Persistence happens even without a task handle, so a restart still sees the
-//! requested control; the missing handle is reported as an explicit task error.
+//! Persists each timer effect before handing it to the task handle, so a restart still sees it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;

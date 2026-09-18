@@ -1,5 +1,6 @@
-//! What production wiring establishes before a governed write is possible: an
-//! advertised subject and the policies this node has already resolved.
+//! Seeds the advertised node subject and resolved policies that governed write tests need.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;

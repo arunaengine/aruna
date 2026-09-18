@@ -1,3 +1,7 @@
+//! Decodes and validates bearer tokens, checking revocation and caching issuer keys.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::auth::{REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;

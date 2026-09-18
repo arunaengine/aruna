@@ -1,3 +1,7 @@
+//! Operations that list, create, rename and tombstone the chat heads of one user.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     CHAT_CAP, ChatStoreError, abort_effects, commit, decode_head, decode_heads, head_key,
     iter_heads, iter_turns, read_head, unexpected,

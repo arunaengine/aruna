@@ -1,3 +1,7 @@
+//! Sweeps hidden blobs, upload cleanup rows and abandoned RO-Crate uploads on a timer.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

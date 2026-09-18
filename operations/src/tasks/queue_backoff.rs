@@ -1,3 +1,7 @@
+//! Computes retry delays and jittered conflict backoff for queued task work.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
 pub(crate) const RETRY_BASE_MS: u64 = 250;

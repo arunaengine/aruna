@@ -1,6 +1,6 @@
-//! Network adapters: handle-backed net effects, the job-control frame round-trip
-//! (run here because the runner holds the context), and the no-handle
-//! publication fallback that reports the targets the operation already selected.
+//! Sends net effects through the net handle and runs the job control frame round trip.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, JobControlEffect, NetEffect};

@@ -1,3 +1,7 @@
+//! Builds the user session owner index key and encodes or decodes its session id set.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
 use aruna_core::types::{Key, Value};

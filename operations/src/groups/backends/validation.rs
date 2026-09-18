@@ -1,3 +1,7 @@
+//! Checks a tenant backend's config against the allowed keys for its backend kind.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::endpoint_screening;
 use aruna_core::structs::storage::blob::ensure_confined_path;
 use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};

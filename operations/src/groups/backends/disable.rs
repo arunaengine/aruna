@@ -1,3 +1,7 @@
+//! Sets or clears the disabled flag on one group storage backend record.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{RecordReadError, backend_key, parse_read, record_writes};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

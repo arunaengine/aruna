@@ -1,3 +1,7 @@
+//! Collects one node status snapshot from the network, blob and storage handles.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
 
 use crate::driver::DriverContext;

@@ -1,3 +1,7 @@
+//! Checks that a peer belongs to the realm and is trusted enough for the request it carries.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};

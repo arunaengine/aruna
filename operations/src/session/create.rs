@@ -1,3 +1,7 @@
+//! Creates a user session with a fresh token and drops stale sessions past the user limit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
 use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_token};
 use aruna_core::UserId;

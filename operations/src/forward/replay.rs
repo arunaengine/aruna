@@ -1,3 +1,7 @@
+//! Tells a replayed forwarded document write from a new one this node has not accepted yet.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentConfig;

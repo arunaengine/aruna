@@ -1,3 +1,7 @@
+//! Writes, restores and deletes durable task timers so they survive a node restart.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};

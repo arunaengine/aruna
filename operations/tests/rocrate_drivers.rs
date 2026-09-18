@@ -1,5 +1,10 @@
+//! Tests RO-Crate zip import drivers, covering bad archives, rollback and resumed rollback.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "512"]
+
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;

@@ -1,7 +1,9 @@
+//! Tests device folder sync in both directions, plus conflicts and refused remote bindings.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Two-node proof of the synced-folder contract: a device and the realm node it
-//! binds to. Every assertion here is about local data winning locally.
 
 mod topology;
 

@@ -1,3 +1,7 @@
+//! Defines the notification transport messages and reads and writes them framed.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::UserId;
 use aruna_core::structs::execution::notification::NotificationRecord;
 pub use aruna_core::structs::execution::notification_watch::{

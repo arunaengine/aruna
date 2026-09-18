@@ -1,3 +1,7 @@
+//! Sets up a driver context with blob and net handles plus test buckets and connectors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::CreateBucketOperation;

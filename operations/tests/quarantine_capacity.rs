@@ -1,5 +1,6 @@
-//! The quarantine store's hard capacity against the replication path that fills it (#338, fixed
-//! choice D-4).
+//! Tests that a full quarantine store refuses new rows until releases free space (#338).
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{

@@ -1,6 +1,9 @@
+//! Tests that persistent id minting, resolving and withdrawal route to the authority node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! The PID authority on a realm sized above the replication factor.
 
 mod topology;
 

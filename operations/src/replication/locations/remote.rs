@@ -1,3 +1,7 @@
+//! Asks one peer whether it holds a version and on what storage, without changing peer state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::LocationSummaryError;
 use crate::replication::protocol::{
     LocationSummary, LocationSummaryRequest, VersionReplicationMessage,

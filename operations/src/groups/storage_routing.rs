@@ -1,3 +1,7 @@
+//! Reads and writes where a group's data is stored, and gathers its routing inputs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::groups::backends::{RecordReadError, index_prefix, parse_iter, parse_read};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};

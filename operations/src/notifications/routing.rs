@@ -1,3 +1,7 @@
+//! Picks the recipients of a resource event or a watch event notification.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::UserId;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, ResourceEvent,

@@ -1,6 +1,7 @@
-//! The request-authorization entry point for REST and S3: [`authorize`] applies
-//! RBAC and public visibility first, then every applicable deny/require policy.
-//! Bulk routes reuse [`PolicyEvaluator`] to read one group's policy state once.
+//! Entry point that authorizes REST and S3 requests: RBAC first, then policy checks.
+//! Bulk routes reuse one evaluator so a group's policy state is read only once.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::request_policy::{

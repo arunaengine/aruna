@@ -1,3 +1,7 @@
+//! Pushes object versions to target nodes and picks the scope of objects to replicate.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::permission_rules::{
     PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };

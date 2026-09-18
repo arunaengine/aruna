@@ -1,3 +1,7 @@
+//! Publishes and refreshes this node's info document with executors, demand and usage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 

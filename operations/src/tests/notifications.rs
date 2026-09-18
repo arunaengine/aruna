@@ -1,3 +1,7 @@
+//! Builds temporary storage, users and seeded records for the notification tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::DriverContext;
 use crate::notifications::inbox::upsert_inbox_records;
 use aruna_core::UserId;

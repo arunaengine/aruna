@@ -1,3 +1,7 @@
+//! Resolves one blob hash to the indexed paths a permission check can decide on.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::blob::records::iter_hash_page;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

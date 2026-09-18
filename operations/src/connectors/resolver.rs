@@ -1,3 +1,7 @@
+//! Resolves a connector reference and source path into usable source access details.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::path::{Component, Path};
 

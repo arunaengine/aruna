@@ -1,3 +1,7 @@
+//! Shares task test helpers and tests drain delays, the retry ladder and a paused runtime.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 pub(super) use crate::tests::incoming::*;

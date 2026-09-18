@@ -1,6 +1,7 @@
-//! Registration screening for tenant-supplied endpoints. The connect-time guard
-//! in `aruna-blob` is what enforces the egress policy; this only makes a
-//! spelling the http client reads differently fail here instead of at first use.
+//! Screens endpoint and bucket spellings at registration so a respelled host fails right there.
+//! The egress policy itself is enforced later by the connect-time guard in aruna-blob.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use url::Url;
 

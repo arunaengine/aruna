@@ -1,3 +1,7 @@
+//! Writes storage entries and checks key presence for the metadata tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_storage::StorageHandle;

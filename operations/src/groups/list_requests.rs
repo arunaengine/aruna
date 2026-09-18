@@ -1,3 +1,7 @@
+//! Lists join requests as a page, optionally only the pending ones, for a permitted caller.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};

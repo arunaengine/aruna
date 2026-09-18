@@ -1,5 +1,10 @@
+//! Tests that documents written by a killed child process are still readable after restart.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;

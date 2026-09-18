@@ -1,3 +1,7 @@
+//! Builds owner index keys and encodes or decodes the capped name set stored per owner.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
 use aruna_core::types::{GroupId, Key, Value};

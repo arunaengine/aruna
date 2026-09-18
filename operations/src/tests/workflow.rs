@@ -1,3 +1,7 @@
+//! Builds a node id and a sample execution spec for the workflow tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{ComputeResources, ExecutionSpec};
 use ulid::Ulid;

@@ -1,3 +1,7 @@
+//! Tests the inbound version state machine step by step without a running driver.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState, ReceivedBlob};
 
 use crate::replication::protocol::{

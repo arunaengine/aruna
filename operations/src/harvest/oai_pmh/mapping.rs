@@ -1,3 +1,7 @@
+//! Maps a harvested oai_dc record into an RO-Crate JSON-LD document.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use serde_json::{Map, Value};
 
 use crate::harvest::oai_pmh::parse::{OaiRecord, parse_datestamp_ms};

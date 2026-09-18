@@ -1,3 +1,7 @@
+//! Groups the source connector storage, validation and resolver modules.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod create_connector;
 pub mod delete_connector;
 pub mod get_connector;

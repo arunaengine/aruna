@@ -1,3 +1,7 @@
+//! Tests how the outbox drain partitions, defers and publishes records across rotations.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::harness::*;
 use super::*;
 

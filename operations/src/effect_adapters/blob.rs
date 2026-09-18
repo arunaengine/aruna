@@ -1,6 +1,7 @@
-//! Blob-handle adapters: blob, staging-source, and local-file effects. All three
-//! need `DriverContext::blob_handle`; without it each keeps its explicit
-//! missing-handle outcome instead of silently succeeding.
+//! Hands blob, staging source and local file effects to this node's blob handle.
+//! A node without that handle reports a missing handle instead of quietly succeeding.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{BlobEffect, LocalFileEffect, StagingSourceEffect};
 use aruna_core::errors::{BlobError, StagingSourceError};

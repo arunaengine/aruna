@@ -1,3 +1,7 @@
+//! Requests and serves object bytes and metadata between nodes over the native source ALPN.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::str::FromStr;
 use std::time::Duration;
 

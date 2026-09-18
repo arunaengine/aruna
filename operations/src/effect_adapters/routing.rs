@@ -1,6 +1,6 @@
-//! Routing-input assembly for operation configs: callers build the snapshot,
-//! gate, or quota-marked catalog before the operation starts, operations never
-//! fetch it mid-step, and `crate::driver` re-exports the public entry points.
+//! Builds the routing snapshot, gate context and quota-marked catalog for a config.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;

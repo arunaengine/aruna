@@ -1,7 +1,9 @@
+//! Tests that a late joining node takes over buckets through an expansion transition.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! A late node joins and onboarding hands it the buckets with an expansion transition it issues
-//! itself.
 
 mod topology;
 

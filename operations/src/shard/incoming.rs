@@ -1,3 +1,7 @@
+//! Serves inbound shard manifest requests, checking realm and holder before paging a reply.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::future::Future;
 use std::time::Duration;
 

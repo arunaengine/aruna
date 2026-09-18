@@ -1,5 +1,6 @@
-//! Metadata handle adapter: a node without a metadata plane keeps the explicit
-//! `HandleMissing` outcome instead of dropping the effect.
+//! Hands metadata effects to the metadata handle, or answers that the handle is missing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;

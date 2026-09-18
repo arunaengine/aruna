@@ -1,3 +1,7 @@
+//! Parses OAI-PMH responses into record headers, Dublin Core values and resumption tokens.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::structs::execution::harvest::HarvestGranularity;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};

@@ -1,3 +1,7 @@
+//! Forwards a group create to a peer that may publish it and applies one arriving here.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::forward::authorize::authorize_forwarded_caller;

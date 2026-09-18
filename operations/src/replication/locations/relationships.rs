@@ -1,3 +1,7 @@
+//! Lists the destinations an enabled outbound sync relationship will replicate a version to.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::LocationSummaryError;
 use crate::replication::version_replication::map_sync_key;
 use aruna_core::NodeId;

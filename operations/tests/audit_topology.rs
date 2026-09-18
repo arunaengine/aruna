@@ -1,8 +1,9 @@
+//! Tests that a non-holder node fans out, merges audit pages and reports unreachable nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Distributed audit coverage: rows are node-local; non-holders fan out to
-//! metadata nodes, merge pages, and report unreachable nodes as partial rather
-//! than a false 200.
 
 mod topology;
 

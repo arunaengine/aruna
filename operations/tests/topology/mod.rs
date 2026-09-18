@@ -1,5 +1,6 @@
-//! Realm fixture with more sync-eligible nodes than the placement replication factor, plus a
-//! User-kind node that holds nothing at all.
+//! Shares the realm test fixture with spare holder nodes and a node that holds nothing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 #![allow(dead_code)]
 

@@ -1,6 +1,7 @@
-//! Storage adapter: one storage effect plus the peer refresh a successful
-//! realm-config write or transaction commit triggers. The bounded refresh runs
-//! after the event and never replaces it: a failure warns but does not fail.
+//! Runs one storage effect and refreshes realm peers after a config write or a commit.
+//! A failed refresh only warns; it never replaces the storage event.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

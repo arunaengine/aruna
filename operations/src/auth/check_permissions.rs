@@ -1,3 +1,7 @@
+//! Decides whether one auth context may use a single path at the required permission.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;

@@ -1,3 +1,7 @@
+//! Lists a realm's users in pages after checking the caller's permission.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::USER_KEYSPACE;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};

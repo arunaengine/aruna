@@ -1,3 +1,7 @@
+//! Answers which copy of one version this node holds, for local callers and peer requests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::LocationSummaryError;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};

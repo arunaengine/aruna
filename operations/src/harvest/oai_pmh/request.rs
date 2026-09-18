@@ -1,3 +1,7 @@
+//! Builds OAI-PMH request URLs and normalizes the metadata prefix and set of a selector.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use url::Url;
 
 use aruna_core::structs::execution::harvest::{HarvestGranularity, HarvestSelector};

@@ -1,5 +1,10 @@
+//! Tests that placement policy and node info documents converge to one inventory on all nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

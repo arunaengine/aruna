@@ -1,6 +1,9 @@
+//! Tests RO-Crate export that streams blob bytes from a second node over a Bao read.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Driven two-node remote (Bao read) RO-Crate export integration.
 
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;

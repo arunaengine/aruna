@@ -1,3 +1,7 @@
+//! Validates connector names and the public and secret config keys allowed per kind.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, HashSet};
 
 use crate::endpoint_screening;

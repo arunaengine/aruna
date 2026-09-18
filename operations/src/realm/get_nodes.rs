@@ -1,3 +1,8 @@
+//! Looks up the nodes that announce presence for a realm in the DHT.
+//! A stale snapshot is a fan-out hint only: it proves no membership and no write authority.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::time::Duration;

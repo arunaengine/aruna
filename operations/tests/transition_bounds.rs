@@ -1,6 +1,9 @@
+//! Tests that an aborted transition leaves no half moved bucket and that limits hold (#399).
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Membership bounds around a transition (#399).
 
 mod topology;
 

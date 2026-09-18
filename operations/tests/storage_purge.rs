@@ -1,3 +1,7 @@
+//! Tests that a storage purge fences its scope, checks live objects and resumes cleanly.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![recursion_limit = "256"]
 
 use std::collections::HashMap;

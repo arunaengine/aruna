@@ -1,3 +1,7 @@
+//! Finishes a node join: claims the secret, adds the node to the realm, issues a sync ticket.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 
 use aruna_core::NodeId;

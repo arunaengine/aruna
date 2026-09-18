@@ -1,3 +1,7 @@
+//! Signals and subscribes to dashboard changes and tells which targets affect them.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::document::DocumentTarget;
 use tokio::sync::watch;
 

@@ -1,3 +1,7 @@
+//! Tests inbound notification delivery, watch events and peer checks between two nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::notifications::client::{
     create_watch_remote, delete_watch_remote, deliver_events_remote, deliver_remote, list_remote,

@@ -1,3 +1,7 @@
+//! Provides shared fixtures and recording handlers for the task queue and outbox tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 use std::time::Duration;
 

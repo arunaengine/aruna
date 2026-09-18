@@ -1,6 +1,7 @@
-//! Local inventory of the logical version copies this node exposes. Every
-//! registration and removal joins the transaction that makes the copy visible,
-//! so an interrupted write can never leave a serveable unregistered copy.
+//! Keeps the local inventory of the version copies this node may serve.
+//! Every registration and removal joins the transaction that makes the copy visible.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;

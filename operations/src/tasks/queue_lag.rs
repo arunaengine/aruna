@@ -1,6 +1,7 @@
-//! Shared durable-queue lag sampling for tracing and Prometheus metrics.
-//! `queue.lag` lines are emitted only while a traced queue is non-empty plus one
-//! final drain line; idle cost is one limit-1 probe per queue per tick.
+//! Probes the depth and age of durable queues and reports the lag to tracing and metrics.
+//! Lag lines appear only while a queue is not empty, plus one final line when it drains.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
 use std::time::Duration;

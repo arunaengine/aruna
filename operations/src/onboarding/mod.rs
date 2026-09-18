@@ -1,3 +1,7 @@
+//! Groups the onboarding operations for enrollment secrets and node bootstrap.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod consume_secret;
 pub mod create_secret;
 pub mod delete_secret;

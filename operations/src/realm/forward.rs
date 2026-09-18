@@ -1,3 +1,8 @@
+//! Relays an origin-signed realm admin envelope to a holder of its shard, and accepts relays.
+//! Receivers still authorize the origin of the envelope, never the relaying node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::DriverContext;
 use crate::forward::authorize::is_sync_eligible;
 use crate::forward::transport::reject;

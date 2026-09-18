@@ -1,3 +1,7 @@
+//! Runs the operation that checks whether a resolved staging source is reachable.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::StagingSourceError;

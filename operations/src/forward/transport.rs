@@ -1,3 +1,7 @@
+//! Forwards a metadata write to holder nodes in rank order and maps their replies to errors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::routing::distinct_holders;
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;

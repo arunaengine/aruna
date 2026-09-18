@@ -1,3 +1,7 @@
+//! Owns the group operations and decodes stored group authorization records.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod add_member;
 pub mod add_role;
 pub mod backends;

@@ -1,7 +1,9 @@
+//! Tests that no config edit moves the holder set of a bucket that is already activated.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! The anti-reshuffle regression: once a bucket is activated, no config edit moves its holder
-//! set.
 
 mod topology;
 

@@ -1,3 +1,7 @@
+//! Opens temporary storage and a plain driver context for the S3 tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::DriverContext;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};

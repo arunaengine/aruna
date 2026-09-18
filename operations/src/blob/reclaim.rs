@@ -1,3 +1,7 @@
+//! Drains the reclaim queue and deletes blob copies that no alias references any more.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 

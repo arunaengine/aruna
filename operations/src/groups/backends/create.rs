@@ -1,3 +1,7 @@
+//! Registers a new tenant storage backend for a group after probing its credentials.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::validation::{GroupBackendError, validate_backend_input};
 use super::{RecordReadError, backend_key, record_writes};
 use aruna_core::UserId;

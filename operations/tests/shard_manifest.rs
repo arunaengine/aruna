@@ -1,5 +1,10 @@
+//! Tests that a created document leaves matching manifest rows on origin and receiver.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use std::sync::Arc;
 
 use aruna_core::StructuredId;

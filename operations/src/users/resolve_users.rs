@@ -1,3 +1,7 @@
+//! Resolves a list of user ids into their names and attributes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::USER_KEYSPACE;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};

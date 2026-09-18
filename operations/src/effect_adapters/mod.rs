@@ -1,6 +1,6 @@
-//! Effect adapters: one visible dispatch outline, one module per effect family.
-//! The runner owns execution and transaction ownership; this module only routes
-//! each effect to the adapter that performs it.
+//! Routes each effect to the adapter family that performs it, one module per family.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod audit;
 mod blob;

@@ -1,3 +1,7 @@
+//! Reconciles a new holder's shard digest against a co-holder and stores the verification row.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

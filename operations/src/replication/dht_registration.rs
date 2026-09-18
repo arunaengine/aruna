@@ -1,3 +1,7 @@
+//! Builds the DHT put effect that announces this node as a holder of a blob hash.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::DhtKeyId;

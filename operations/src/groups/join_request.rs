@@ -1,3 +1,7 @@
+//! Runs the group join flow: asking to join, withdrawing, and the owner's decision.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::placement::target_placement_ref;

@@ -1,3 +1,7 @@
+//! Builds shard placement records and keys and sets the sync and pull retry intervals.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::cmp::Ordering;
 use std::time::Duration;
 

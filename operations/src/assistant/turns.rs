@@ -1,3 +1,7 @@
+//! Reads chat turns and appends or rewrites the tail turn within the turn and byte caps.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     BUDGET_CAP, ChatStoreError, TURN_CAP, abort_effects, commit, decode_heads, head_key,
     iter_heads, iter_turns, live_head, read_head, turn_key, unexpected,

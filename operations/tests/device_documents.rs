@@ -1,6 +1,6 @@
-//! A device holds no realm data, but it is judged by the realm's own documents:
-//! a revoked token must stop working there too. A device runs no document sync,
-//! so it fetches them as a routed read whenever it comes back.
+//! Tests that a device holding no realm data fetches realm documents by routed read.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod topology;
 

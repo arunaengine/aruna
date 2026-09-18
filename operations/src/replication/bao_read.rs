@@ -1,3 +1,7 @@
+//! Reads blob bytes from a peer over bao, negotiating placement rules and serving such reads.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};

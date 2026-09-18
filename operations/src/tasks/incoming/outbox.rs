@@ -1,3 +1,7 @@
+//! Drains the sync outbox in pages and publishes batched document records to peers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 impl DrainInvocation {

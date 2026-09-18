@@ -1,5 +1,10 @@
+//! Tests that job inputs stage a pinned blob version and that replays reuse that version.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

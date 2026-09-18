@@ -1,3 +1,8 @@
+//! Builds the local node's shard manifest from a prefix scan plus the topic digest and cursor.
+//! It also groups the shard client, inbound server, protocol and verification modules.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod client;
 pub mod incoming;
 pub mod protocol;

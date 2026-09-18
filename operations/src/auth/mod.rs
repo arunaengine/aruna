@@ -1,3 +1,7 @@
+//! Collects the token, permission and policy modules that decide request authorization.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod bearer_token;
 pub mod check_permissions;
 pub mod create_token;

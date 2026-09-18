@@ -1,3 +1,7 @@
+//! Stores, drains and retries queued blob replication jobs and live copy obligations.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 

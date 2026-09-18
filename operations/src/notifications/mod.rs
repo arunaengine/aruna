@@ -1,3 +1,7 @@
+//! Groups notification delivery, inbox storage, watches, pruning and routing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod client;
 pub mod dispatch;
 pub mod emit;

@@ -1,3 +1,7 @@
+//! Tests the placement gate decision for an inbound replica, a missing subject and a reference.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::pure_tests::{make_manifest, make_reference_manifest};
 use super::*;
 use crate::placement::policy::PolicyCacheEntry;

@@ -1,3 +1,7 @@
+//! Wires up the task queue test modules for the harness, notifications, outbox and restore.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::outbox::partition_drain_records;
 use super::outbox::publish_from_outbox;
 use super::restore::drain_delay;

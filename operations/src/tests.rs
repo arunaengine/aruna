@@ -1,3 +1,7 @@
+//! Groups the shared test helper modules used across the operations crate tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub(crate) mod device;
 pub(crate) mod import;
 pub(crate) mod incoming;

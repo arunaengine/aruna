@@ -1,6 +1,7 @@
-//! Offering a directory as a read-only bucket on the device that holds it.
-//! Objects are reference versions bound to the device-local registration, not a
-//! path; writes are refused and files change only on the owner's filesystem.
+//! Offers a local directory as a read-only bucket of reference versions on this device.
+//! Writes are refused; the files change only on the owner's own filesystem.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};

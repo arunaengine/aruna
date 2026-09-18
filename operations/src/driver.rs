@@ -1,6 +1,6 @@
-//! The operation runner: [`drive`] and [`drive_until`] execute a parent
-//! [`Operation`]; suboperations share the effect loop, effect bodies live in
-//! `effect_adapters`, and `RunState` keeps transaction ownership explicit.
+//! Runs an operation's effect loop, nests suboperations and owns open transactions.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;

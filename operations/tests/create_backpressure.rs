@@ -1,7 +1,9 @@
+//! Ignored probe that times metadata creates with the materialization drains idle and active.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Debug probe (not a release gate): measures create-path latency with the materialization
-//! drain running concurrently vs.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -1,3 +1,7 @@
+//! Republishes the blob locations of this node to the DHT and looks up blob holders.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::VecDeque;
 use std::time::Duration;
 

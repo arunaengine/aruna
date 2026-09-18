@@ -1,6 +1,7 @@
-//! Realm-admin replacement of the compute configuration: the directed location links
-//! and standing group quotas are replaced wholesale through the shared admin-document
-//! path, so concurrent changes converge instead of one writer silently winning.
+//! Replaces the realm compute configuration: the location links and the standing group quotas.
+//! It writes through the shared admin document path, so concurrent changes converge.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};

@@ -1,7 +1,10 @@
-//! Metadata path budget shared by source creation and the harvest job: a
-//! source is accepted only when every record it can yield has a landing path.
+//! Holds the metadata path budget for harvested records and normalizes a target prefix.
+//! Source creation and the harvest job both use it to refuse a prefix with no room left.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 /// Budget for a harvested document's normalized metadata path.
+
 pub const HARVEST_PATH_BYTES: usize = 512;
 /// `b3-` plus 64 hex characters: the shortest segment any identifier can take.
 pub const DIGEST_SEGMENT_BYTES: usize = 67;

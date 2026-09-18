@@ -1,3 +1,7 @@
+//! Writes new notification records into the outbox and schedules the outbox drain.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::convert::Infallible;
 
 use aruna_core::effects::{Effect, StorageEffect};

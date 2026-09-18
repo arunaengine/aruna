@@ -1,3 +1,7 @@
+//! Publishes a realm's documents to chosen peers and stores the resulting shard placement.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentTarget, PendingShardPlacement};
 use aruna_core::effects::Effect;
