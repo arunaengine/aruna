@@ -868,9 +868,12 @@ fn required_dynamic_var(env: &dyn SettingsEnv, key: &str) -> Result<String, Setu
 }
 
 /// Rejects a relay list entry that is not a valid relay URL.
+/// Accepts what iroh accepts as a relay: stored realm configs are read with the
+/// same check, so a stricter one could stop a node from starting on its own config.
 pub(crate) fn validate_relay_urls(key: &'static str, urls: &[String]) -> Result<(), SetupError> {
     for url in urls {
-        validate_public_url(key, url)?;
+        url.parse::<iroh::RelayUrl>()
+            .map_err(|error| invalid_config_value(key, url, error))?;
     }
     Ok(())
 }
@@ -1198,6 +1201,8 @@ mod tests {
             invalid_key(parse(&[("P2P_ADDITIONAL_RELAY_URLS", "not-a-url")]).unwrap_err()),
             "P2P_ADDITIONAL_RELAY_URLS"
         );
+        // A relay URL iroh accepts must stay valid, as it was before the settings split.
+        assert!(validate_relay_urls("realm_relay", &["wss://relay.example".to_string()]).is_ok());
     }
 
     #[test]
