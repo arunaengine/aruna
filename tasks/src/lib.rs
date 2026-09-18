@@ -1,5 +1,7 @@
-//! The timer and task scheduler behind `TaskHandle`: due timers, running
-//! handlers, admission, and the ordered drain.
+//! Runs the timer and task scheduler behind TaskHandle, with admission and ordered drain.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

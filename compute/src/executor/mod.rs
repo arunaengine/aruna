@@ -1,3 +1,7 @@
+//! Defines the executor backend trait and the pieces every compute backend shares.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::compute::{
     AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails,
     ReconcileEvidence, ResourceEnvelope, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,

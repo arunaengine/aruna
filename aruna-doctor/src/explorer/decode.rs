@@ -1,6 +1,7 @@
-//! Persisted decoding: one decoder per keyspace, mapping raw key/value bytes to
-//! the presentation records in [`super::present`]. Malformed or unknown rows
-//! fall back to a raw hex record instead of failing the whole listing.
+//! Decodes raw key and value bytes per keyspace into the presentation records.
+//! Unknown or malformed rows fall back to a raw hex record instead of failing the listing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna::identity::PersistedNodeState;
 use aruna_api::server::state::ADMIN_CLAIMED_KEY;

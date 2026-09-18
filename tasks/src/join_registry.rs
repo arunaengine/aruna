@@ -1,5 +1,6 @@
-//! Keyed detached work that survives its initiating request.
-//! Concurrent callers share work, and finished values remain briefly joinable.
+//! Shares keyed detached work between callers and keeps finished values briefly joinable.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
 use std::future::Future;

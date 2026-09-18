@@ -1,3 +1,7 @@
+//! Sends and reads replication control messages with timeouts, and checks the init handshake.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{BlobHandler, ControlPlaneKind};
 use crate::framing::{MAX_CONTROL_FRAME, read_frame, write_frame};
 use crate::messages::{MessageType, ReplicationMessage};

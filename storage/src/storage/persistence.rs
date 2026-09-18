@@ -1,6 +1,7 @@
-//! Persistence policy and the journal/commit durability points that carry each
-//! commit acknowledgement, which keeps reporting conflicts distinctly from
-//! unknown commit failures.
+//! Picks the fjall persist mode and runs the journal and commit durability calls.
+//! A failed commit is reported as a conflict or as a write error, never as success.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FjallPersistPolicy {

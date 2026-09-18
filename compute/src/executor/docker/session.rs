@@ -1,3 +1,7 @@
+//! Creates and checks the internal bridge network that session containers join.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::net::Ipv4Addr;
 
 use aruna_core::compute::BackendError;

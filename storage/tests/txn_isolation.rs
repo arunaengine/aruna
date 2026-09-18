@@ -1,6 +1,8 @@
-//! A long transaction must conflict after a concurrent write changes data it read.
-//! fjall 3.1.8 once pruned required records when snapshot sequence numbers overlapped,
-//! allowing the stale transaction to commit; this test guards that regression.
+//! Tests that a long transaction conflicts when a concurrent write changes data it read.
+//! Fjall 3.1.8 once pruned the needed records, letting the stale transaction commit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};

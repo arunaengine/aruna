@@ -1,3 +1,7 @@
+# Manifest of aruna-blob, the blob backend, hashing and replication crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 [package]
 name = "aruna-blob"
 version.workspace = true

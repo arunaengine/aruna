@@ -1,3 +1,7 @@
+//! Keeps the last bytes of a log stream in a fixed ring while counting the total.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::VecDeque;
 
 /// Fixed-capacity ring retaining the last `cap` bytes seen while counting the

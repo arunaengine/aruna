@@ -1,3 +1,7 @@
+//! Builds opendal operators for backends and staging sources, and reads or lists a source.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::egress::EgressGuard;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;

@@ -1,3 +1,7 @@
+//! Defines the crate's internal error type wrapping io, postcard, opendal and client errors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

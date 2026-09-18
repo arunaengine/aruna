@@ -1,3 +1,7 @@
+//! Plans which task inputs are staged as files and which are mounted from object storage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

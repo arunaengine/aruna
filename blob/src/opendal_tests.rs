@@ -1,3 +1,7 @@
+//! Tests operator building, ambient credential blocking, denied hosts and staging source reads.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::egress::EgressPolicy;
 use std::sync::Arc;

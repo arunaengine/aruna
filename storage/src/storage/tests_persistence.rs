@@ -1,3 +1,7 @@
+//! Tests that buffered writes and commits survive a restart, using a child process.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::tests::{
     assert_read_result, assert_write_result, commit_transaction, start_write_transaction,
 };

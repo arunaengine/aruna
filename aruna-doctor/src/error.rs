@@ -1,3 +1,7 @@
+//! Defines the doctor's top level error type and the conversions into it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::explorer::ExplorerError;
 use crate::storage::SnapshotError;
 use aruna::config::SetupError;

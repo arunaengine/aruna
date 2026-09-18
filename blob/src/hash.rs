@@ -1,3 +1,7 @@
+//! Hashes blob bytes once with blake3, crc32, crc32c, crc64nvme, sha1, sha256 and md5.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::structs::checksum::{
     HASH_BLAKE3, HASH_CRC32, HASH_CRC32C, HASH_CRC64NVME, HASH_MD5, HASH_SHA1, HASH_SHA256,
 };

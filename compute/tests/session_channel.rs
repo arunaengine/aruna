@@ -1,6 +1,6 @@
-//! Contract of the session channel: a backend that advertises it hands the
-//! node a byte stream, and the session manager speaks the helper protocol over
-//! it without interpreting a cell.
+//! Tests that the session manager drives cells over a backend channel and reopens it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};
 use aruna_compute::session::{EventKind, SessionConfig, SessionPhase, SessionRegistry};

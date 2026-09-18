@@ -1,3 +1,7 @@
+//! Opens the fjall database, spawns the read and bulk pools, and builds the storage handle.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::thread;
 

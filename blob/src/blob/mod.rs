@@ -1,5 +1,7 @@
-//! The blob control plane: repository and group handles, staging writers,
-//! replication, and read streams over the configured backends.
+//! Owns the blob handler: backend registry, staging writers, replication and read streams.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::egress::EgressGuard;
 use aruna_core::NodeId;
 use aruna_net::NetHandle;

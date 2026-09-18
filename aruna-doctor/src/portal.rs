@@ -1,3 +1,7 @@
+//! Downloads and installs the portal artifact, optionally the latest website prerelease.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
 use aruna::config::PortalArtifactConfig;
 use aruna::portal::update_artifact;

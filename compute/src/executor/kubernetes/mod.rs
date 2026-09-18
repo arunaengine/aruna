@@ -1,3 +1,7 @@
+//! Runs tasks as Kubernetes Jobs and moves files in and out of their pods.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::{self, Read, Write};

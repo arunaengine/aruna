@@ -1,3 +1,7 @@
+//! Replicates blobs between nodes over verified bao streams and quarantines corrupt copies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::BlobHandler;
 use super::backend::rebuild_backend_path;
 use super::control_plane::{

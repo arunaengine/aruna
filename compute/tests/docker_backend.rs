@@ -1,6 +1,8 @@
-//! Integration tests against a real Docker daemon. Ignored by default; run
-//! with `--ignored` on a host with a daemon. Without one they skip, unless
-//! `ARUNA_COMPUTE_REQUIRE_DOCKER=1` makes an unavailable daemon fail the run.
+//! Tests the Docker backend against a real daemon, ignored unless run with --ignored.
+//! Without a daemon they skip, unless ARUNA_COMPUTE_REQUIRE_DOCKER=1 makes that a failure.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![cfg(feature = "docker")]
 
 use std::sync::atomic::{AtomicU64, Ordering};

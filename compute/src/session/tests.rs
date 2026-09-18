@@ -1,3 +1,7 @@
+//! Tests session helper line reading, cell admission limits and output truncation.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::compute::session::{MAX_CELL_OUTPUTS, MAX_RING_EVENTS, TRUNCATED_NOTICE};
 use serde_json::json;

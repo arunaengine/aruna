@@ -1,3 +1,7 @@
+//! Runs keyspace compaction jobs on a background thread once deleted rows pile up.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

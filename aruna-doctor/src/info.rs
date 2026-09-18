@@ -1,3 +1,7 @@
+//! Prints the node's local configuration together with its info endpoint response.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
 use aruna_api::routes::info::InfoResponse;
 use aruna_api::server::state::client_bind_url;

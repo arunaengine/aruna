@@ -1,3 +1,7 @@
+//! Writes, reads, lists and deletes blob objects on a backend, including hidden staged blobs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::BlobHandler;
 use super::backend::{
     build_backend_path, build_hidden_path, build_part_path, intent_key, intent_value,

@@ -1,6 +1,6 @@
-//! Spans and stable kind names for storage effects and events. Both the handle
-//! and the worker record through these, so the tracing fields stay identical on
-//! either side of the channel.
+//! Builds tracing spans and stable kind names for storage effects and events.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::StorageEvent;

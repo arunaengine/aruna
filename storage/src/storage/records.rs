@@ -1,3 +1,7 @@
+//! Runs read, write, delete, batch, iterate and last effects on a keyspace or transaction.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::effects::IterStart;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;

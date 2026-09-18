@@ -1,3 +1,7 @@
+//! Attaches an exec stream to a running task pod to reach the session helper socket.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};

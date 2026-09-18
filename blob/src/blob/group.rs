@@ -1,3 +1,7 @@
+//! Builds operators for tenant group backends and tracks holds so idle ones can be released.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{BlobHandler, NodeBackend};
 use crate::opendal::build_group_service;
 use aruna_core::effects::{BlobEffect, StorageEffect};

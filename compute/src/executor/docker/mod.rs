@@ -1,3 +1,7 @@
+//! Runs tasks as Docker containers through the daemon API and reports their status.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::PathBuf;

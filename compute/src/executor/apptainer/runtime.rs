@@ -1,3 +1,7 @@
+//! Runs the supervisor and launcher processes that start, watch and stop a payload.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

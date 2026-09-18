@@ -1,3 +1,7 @@
+//! Defines the storage crate's error type for fjall, conversion and channel failures.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::errors::ConversionError;
 use thiserror::Error;
 

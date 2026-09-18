@@ -1,5 +1,6 @@
-//! Doctor commands: open the keyspaces read-only, summarize the persisted rows,
-//! and print each summary as JSON.
+//! Opens the keyspaces read-only, summarizes stored rows and prints each summary as JSON.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::PendingShardPlacement;
 use aruna_core::keyspaces::{

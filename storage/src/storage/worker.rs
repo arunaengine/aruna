@@ -1,6 +1,6 @@
-//! The storage worker: the single write actor, grouped writes, per-lane read
-//! pools, and the worker-side transaction table. Lane choice stays in
-//! `LaneScheduler`; every outcome is reported through the reply token.
+//! Runs the single write actor thread, the read pools and the worker-side transaction table.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included, Unbounded};

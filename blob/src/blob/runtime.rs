@@ -1,3 +1,7 @@
+//! Runs the blob handle: dispatches effects, limits concurrency and drains writes on shutdown.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::group::{BackendClaim, GroupHold};
 use super::{BackendRegistry, BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
 use crate::egress::EgressGuard;

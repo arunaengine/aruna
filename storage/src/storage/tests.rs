@@ -1,3 +1,7 @@
+//! Tests storage lane admission, shutdown fences, transaction cleanup, reads and metrics.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{FjallPersistPolicy, FjallStorage, StorageHandle};
 use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;

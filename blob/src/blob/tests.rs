@@ -1,3 +1,7 @@
+//! Tests blob backend routing, bucket reservation, write cleanup, connection limits and groups.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::backend::{build_backend_path, build_part_path, rebuild_backend_path};
 use super::{
     BackendRegistry, BlobHandle, BlobHandler, ControlPlaneKind, NodeBackend,

@@ -1,6 +1,7 @@
-//! Re-encodes legacy job results and realm configs missing current fields.
-//! Current rows remain unchanged and the derived projection cache is cleared.
-//! The migration is safe to repeat.
+//! Re-encodes legacy job and realm rows that are missing current fields.
+//! Rows already current stay unchanged, the projection cache is cleared and repeats are safe.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;

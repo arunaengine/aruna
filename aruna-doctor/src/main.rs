@@ -1,5 +1,9 @@
+//! Runs the operator CLI and dispatches each subcommand to its handler.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![recursion_limit = "256"]
-//! Operator CLI for inspecting, recovering, and maintaining a node.
+
 use crate::cli::{
     Cli, Commands, ExploreCommands, IrohCommands, PortalCommands, ReclaimCommands, TopicCommands,
     TopicsCommands,

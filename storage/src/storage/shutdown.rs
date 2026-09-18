@@ -1,6 +1,6 @@
-//! Ordered shutdown for the storage handle: refuse new work, drain admitted work
-//! (including deferred cleanup and drop aborts), fence what is still queued, sync
-//! the backend, then join the worker. `close` is last; it releases the file lock.
+//! Shuts the storage handle down in order: refuse, drain, fence, sync, then join the worker.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};

@@ -1,6 +1,6 @@
-//! The Fjall-backed storage handle, its worker, and transaction ownership.
-//! This file is the facade: behavior lives in focused modules (`handle`, `owner`,
-//! `worker`, `lifecycle`, `persistence`, `metrics`, `telemetry`) re-exported here.
+//! Ties the storage submodules together and re-exports the handle, worker and owner types.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod handle;
 mod lifecycle;

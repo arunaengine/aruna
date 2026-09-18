@@ -1,6 +1,6 @@
-//! Storage counters and in-flight accounting, including the close/drain
-//! guarantees they latch. The handle reads these atomics and the worker sets
-//! them, so backlog and fence decisions stay observable after the worker exits.
+//! Counts storage requests, errors and in-flight work, and latches the close and drain flags.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};

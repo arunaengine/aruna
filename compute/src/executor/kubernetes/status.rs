@@ -1,3 +1,7 @@
+//! Reads Job and pod state and turns it into an attempt phase and status.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
 use aruna_core::compute::{AttemptPhase, AttemptStatus};

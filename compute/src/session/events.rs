@@ -1,5 +1,6 @@
-//! The per-session event log: a bounded ring the stream resumes from, plus the
-//! caps that keep one runaway cell from filling it.
+//! Keeps a bounded event ring per session plus the caps that bound one cell's output.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub use aruna_core::compute::session::{EventKind, TRUNCATED_NOTICE};
 use aruna_core::compute::session::{

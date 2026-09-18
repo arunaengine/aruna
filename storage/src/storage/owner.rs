@@ -1,6 +1,6 @@
-//! Cancellation-safe ownership for manually driven storage transactions: `finish`,
-//! `unknown`, and `Drop` are the only ways ownership ends, each mapping to one
-//! cleanup-registry transition. Cleanup registration itself stays in the handle.
+//! Owns a manual storage transaction so finish, unknown or a drop each ends ownership once.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use tracing::warn;
 use ulid::Ulid;

@@ -1,3 +1,7 @@
+//! Runs tasks in Apptainer containers and reports their attempt status.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;

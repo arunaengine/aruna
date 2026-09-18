@@ -1,6 +1,7 @@
-//! Connect-time enforcement of the egress policy: a URL check alone is
-//! defeated by redirects and DNS rebinding, so tenant traffic runs through
-//! clients that can only ever reach vetted addresses.
+//! Builds http clients that screen every connection against the egress policy.
+//! A URL check alone is defeated by redirects and DNS rebinding, so checks run at connect time.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::BlobLibError;
 use aruna_core::egress::{EgressError, EgressPolicy};

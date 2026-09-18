@@ -1,6 +1,7 @@
-//! Presentation of decoded keyspace rows: the JSON output records the doctor
-//! prints and the field-by-field projections that keep wire records readable
-//! without exposing unprojected bodies.
+//! Defines the JSON output records the doctor prints for decoded keyspace rows.
+//! Each record projects fields one by one so no unprojected body reaches the output.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna::identity::PersistedNodeState;
 use aruna_core::compute::quota::{ComputeDepartureReport, JobReservationRecord};

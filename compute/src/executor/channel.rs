@@ -1,3 +1,7 @@
+//! Wraps a channel receiver so transfer chunks can be read as a stream.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 

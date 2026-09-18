@@ -1,3 +1,7 @@
+//! Writes a database snapshot file and imports such a snapshot into a new database.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
 use blake3::Hasher;
 use fjall::{

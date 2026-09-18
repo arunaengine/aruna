@@ -1,3 +1,7 @@
+//! Holds the node's registered blob backends and resolves a backend ref to its operator.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
 use crate::opendal::init_operator;

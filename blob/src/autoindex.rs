@@ -1,6 +1,7 @@
-//! Directory listing for http staging sources.
-//! opendal's Http service lacks listing, so the directory URL is fetched and
-//! its anchors are parsed into entries; non-index responses are rejected.
+//! Lists directories of http staging sources by parsing the anchors of autoindex pages.
+//! The opendal Http service cannot list, so responses that are not an index are rejected.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::egress::EgressGuard;
 use aruna_core::errors::StagingSourceError;

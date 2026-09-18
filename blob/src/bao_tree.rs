@@ -1,3 +1,7 @@
+//! Wraps net streams, opendal objects and local files as bao tree readers and writers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
 use crate::opendal::abort_partial_writer;

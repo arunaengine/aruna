@@ -1,3 +1,7 @@
+//! Checks the node's iroh endpoint by dialing it and running a DHT request over it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
 use crate::info::{default_info_url, fetch_info_url, resolve_token};
 use aruna_api::routes::info::{

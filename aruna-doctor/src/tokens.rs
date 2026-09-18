@@ -1,3 +1,7 @@
+//! Creates bootstrap and OIDC tokens, recovers the admin secret and inspects a token.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
 use aruna::config::load;
 use aruna_api::routes::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};

@@ -1,6 +1,6 @@
-//! Interactive sessions this node runs, in memory only. A session owns the
-//! channel to its helper, the event log a client resumes from, and its idle
-//! timer.
+//! Runs interactive sessions in memory, each with a helper channel, event log and idle timer.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod events;
 

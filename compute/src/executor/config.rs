@@ -1,3 +1,7 @@
+//! Holds the compute backend settings for Docker, Apptainer and Kubernetes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::compute::ResourceEnvelope;
 use std::collections::BTreeMap;
 use std::path::PathBuf;

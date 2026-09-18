@@ -1,6 +1,7 @@
-//! Local, read-only inspection of a stopped node's persisted state: persisted
-//! decoding, doctor commands, and JSON presentation. `node-state` prints the
-//! persisted identity including its network secret by design; fixtures are synthetic.
+//! Owns the read-only inspection of a stopped node's persisted state.
+//! Note that node-state prints the persisted identity including its network secret.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod commands;
 mod decode;

@@ -1,6 +1,8 @@
-//! Read-only access to a directory the owner offers; the write half is in
-//! `fs_write`. Resolved entries must stay inside the canonicalized root, but
-//! the check is resolve-and-verify, not a kernel-enforced no-follow open.
+//! Reads a directory the owner offers: lists entries, stats files and streams file contents.
+//! Paths must resolve inside the canonical root, but the check is not a no-follow open.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::errors::StagingSourceError;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::offered_directory::{

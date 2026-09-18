@@ -1,6 +1,7 @@
-//! The public storage handle: lane admission, close and drain fences, the
-//! transaction cleanup registry, and reply mapping. Aborts always take the
-//! foreground lane, and cleanup registers before an effect is queued.
+//! Fronts the storage worker: admits effects to a lane, fences on close and maps replies.
+//! Aborts take the foreground lane, and cleanup registers before an effect is queued.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;

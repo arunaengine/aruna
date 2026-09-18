@@ -1,6 +1,7 @@
-//! Guarded writes into a folder the owner syncs on their own machine.
-//! Writes land only through a guard re-verified at rename time, conflicted
-//! copies never replace anything, and removals move files aside.
+//! Writes files into an owner's synced folder through a guard rechecked at rename time.
+//! A conflict makes a copy instead of replacing, and a removal moves the file aside.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{LocalFileEvent, LocalFileRefusal};

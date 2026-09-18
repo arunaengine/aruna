@@ -1,3 +1,7 @@
+//! Defines the on-disk records and the control guard for Apptainer attempts.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};

@@ -1,3 +1,7 @@
+//! Seeds blob reclaim candidates for one backend and prints the reclaim queue status.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
 use aruna_core::keyspaces::{

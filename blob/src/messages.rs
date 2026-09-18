@@ -1,3 +1,7 @@
+//! Defines the replication control messages and encodes them as postcard frames on a stream.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::BlobLibError;
 use crate::framing::{MAX_CONTROL_FRAME, read_frame, write_frame};
 use aruna_core::errors::BlobError;

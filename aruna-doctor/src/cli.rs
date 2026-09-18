@@ -1,4 +1,6 @@
-//! Command-line surface for the doctor.
+//! Defines the doctor command line parser and every subcommand it accepts.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
