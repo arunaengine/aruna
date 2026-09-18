@@ -311,7 +311,14 @@ pub(crate) async fn ensure_genesis_group(
     .await;
 
     if !to_ensure.is_empty() {
-        match net_handle.ensure_sync_topics(&to_ensure, co_members) {
+        // The net layer reads an empty peer list as all realm peers. A topic held here
+        // alone stays local, or the reconcile below removes those peers on every pass.
+        let ensured = if co_members.is_empty() {
+            net_handle.ensure_local_topics(&to_ensure)
+        } else {
+            net_handle.ensure_sync_topics(&to_ensure, co_members)
+        };
+        match ensured {
             Ok(()) => {
                 if let Err(error) = net_handle
                     .reconcile_shard_membership(
@@ -908,5 +915,87 @@ mod pure_tests {
         let (config, placement) = config_with(&[node(1), node(2), node(3), node(4)], Some(2));
         let holders = resolve_shard_holders(&config, &placement);
         assert_eq!(holders.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use irokle::Storage as _;
+    use ulid::Ulid;
+
+    use super::*;
+
+    // A rank-0 group held here alone must keep the realm's default peers out of its
+    // topic, so a repeated pass signs no membership change.
+    #[tokio::test]
+    async fn sole_holder_local() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let realm_id = RealmId::from_bytes([61u8; 32]);
+        let storage_path = dir.path().join("storage");
+        let storage_handle =
+            aruna_storage::FjallStorage::open(storage_path.to_str().expect("utf8 path"))
+                .expect("storage opens");
+        let peer = iroh::SecretKey::from_bytes(&[62u8; 32]).public();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind address"),
+                realm_id,
+                peer_nodes: vec![peer],
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                sync_storage_path: Some(dir.path().join("document-sync")),
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .expect("net handle");
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        let local = net.node_id();
+        let topic = shard_topic_id(
+            realm_id,
+            &PlacementRef {
+                strategy_id: Ulid::from_bytes([63u8; 16]),
+                shard: 0,
+            },
+        );
+        let node = net.document_sync_node();
+        let peer_id = irokle::PeerId::from_bytes(*peer.as_bytes());
+        let mut clocks = Vec::new();
+        for _ in 0..2 {
+            let withheld = ensure_genesis_group(
+                &context,
+                &net,
+                local,
+                Vec::new(),
+                vec![local],
+                vec![topic],
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &mut BTreeSet::new(),
+            )
+            .await;
+            assert!(!withheld, "a sole holder mints and keeps its topic");
+            let state = node
+                .storage()
+                .topic_state(&topic)
+                .expect("topic state reads")
+                .expect("topic minted");
+            assert!(!state.members.contains(&peer_id), "{:?}", state.members);
+            clocks.push(node.storage().actor_clock(&topic).expect("clock reads"));
+        }
+        assert_eq!(
+            clocks[0], clocks[1],
+            "a repeated pass signed membership ops"
+        );
+        net.shutdown().await;
     }
 }
