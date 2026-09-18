@@ -361,14 +361,14 @@ enum DeadlineAbort {
     BeforeCommitOnly,
     /// Parents keep the operation's opt-in: only an `abort` that protects
     /// already committed work may run after one.
-    OperationOptIn { abort_after_commit: bool },
+    OperationOptIn,
 }
 
 impl DeadlineAbort {
-    fn allows(self, committed: bool) -> bool {
+    fn allows(self, committed: bool, abort_after_commit: bool) -> bool {
         match self {
             Self::BeforeCommitOnly => !committed,
-            Self::OperationOptIn { abort_after_commit } => !committed || abort_after_commit,
+            Self::OperationOptIn => !committed || abort_after_commit,
         }
     }
 }
@@ -390,6 +390,11 @@ trait Drive: Send {
     fn step(&mut self, event: Event) -> Effects;
     fn is_complete(&self) -> bool;
     fn abort(&mut self) -> Effects;
+    /// Read at each deadline decision: an operation may opt in only once it has
+    /// committed work to protect.
+    fn abort_after_commit(&self) -> bool {
+        false
+    }
 }
 
 /// Parent adapter: the operation borrows, while typed finalization stays in the
@@ -411,6 +416,10 @@ impl<O: Operation> Drive for ParentRun<'_, O> {
 
     fn abort(&mut self) -> Effects {
         self.0.abort()
+    }
+
+    fn abort_after_commit(&self) -> bool {
+        self.0.abort_after_commit()
     }
 }
 
@@ -472,7 +481,7 @@ async fn drive_effects(
                 queue.clear();
                 // Suppress aborts after commit. Dropping `state.holds` releases
                 // backend reservations.
-                if abort_policy.allows(state.committed) {
+                if abort_policy.allows(state.committed, executable.abort_after_commit()) {
                     extend_unblocked(&mut queue, executable.abort(), &state.tracker);
                 }
                 continue;
@@ -526,7 +535,9 @@ async fn drive_effects(
                                     error: StorageError::CommitFailed,
                                 })
                             } else {
-                                if abort_policy.allows(state.committed) {
+                                if abort_policy
+                                    .allows(state.committed, executable.abort_after_commit())
+                                {
                                     extend_unblocked(
                                         &mut queue,
                                         executable.abort(),
@@ -620,14 +631,13 @@ pub async fn drive_until<O: Operation>(
     context: &DriverContext,
     deadline: tokio::time::Instant,
 ) -> Result<O::Output, O::Error> {
-    let abort_after_commit = operation.abort_after_commit();
     let mut run = ParentRun(&mut operation);
     let mut state = drive_effects(
         &mut run,
         context,
         0,
         Some(deadline),
-        DeadlineAbort::OperationOptIn { abort_after_commit },
+        DeadlineAbort::OperationOptIn,
         ExpiryRecheck::Once,
         Some(type_name::<O>()),
     )
@@ -1174,26 +1184,11 @@ mod test {
     fn deadline_abort_policy() {
         // A suboperation stops at an acknowledged commit; a parent continues
         // only through the operation's opt-in.
-        assert!(DeadlineAbort::BeforeCommitOnly.allows(false));
-        assert!(!DeadlineAbort::BeforeCommitOnly.allows(true));
-        assert!(
-            DeadlineAbort::OperationOptIn {
-                abort_after_commit: false
-            }
-            .allows(false)
-        );
-        assert!(
-            !DeadlineAbort::OperationOptIn {
-                abort_after_commit: false
-            }
-            .allows(true)
-        );
-        assert!(
-            DeadlineAbort::OperationOptIn {
-                abort_after_commit: true
-            }
-            .allows(true)
-        );
+        assert!(DeadlineAbort::BeforeCommitOnly.allows(false, false));
+        assert!(!DeadlineAbort::BeforeCommitOnly.allows(true, true));
+        assert!(DeadlineAbort::OperationOptIn.allows(false, false));
+        assert!(!DeadlineAbort::OperationOptIn.allows(true, false));
+        assert!(DeadlineAbort::OperationOptIn.allows(true, true));
     }
 
     #[test]
@@ -1470,6 +1465,100 @@ mod test {
         .await;
 
         assert_eq!(result, Err(2));
+    }
+
+    /// Opts in only after its commit, like a multipart completion that must
+    /// reopen the upload its committed mark left `Completing`.
+    #[derive(Debug)]
+    struct LateOptIn {
+        state: u8,
+        ready: Arc<tokio::sync::Notify>,
+    }
+
+    impl PartialEq for LateOptIn {
+        fn eq(&self, other: &Self) -> bool {
+            self.state == other.state
+        }
+    }
+
+    impl Operation for LateOptIn {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.state = 1;
+            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match (event, self.state) {
+                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
+                    self.state = 2;
+                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id
+                    })]
+                }
+                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 2) => {
+                    self.ready.notify_one();
+                    self.state = 3;
+                    smallvec::smallvec![pending_blob()]
+                }
+                (Event::Storage(StorageEvent::WriteResult { .. }), 4) => {
+                    self.state = 5;
+                    smallvec::smallvec![]
+                }
+                _ => smallvec::smallvec![],
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.state == 5
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.state == 5 { Ok(()) } else { Err(()) }
+        }
+
+        fn abort_after_commit(&self) -> bool {
+            self.state >= 3
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            self.state = 4;
+            smallvec::smallvec![Effect::Storage(StorageEffect::Write {
+                key_space: "default".to_string(),
+                key: ByteView::from(*b"abort-marker"),
+                value: ByteView::from(*b"ran"),
+                txn_id: None,
+            })]
+        }
+    }
+
+    #[tokio::test]
+    async fn late_opt_in() {
+        // The storage roundtrips run in real time; only the deadline uses virtual time.
+        let (_directory, context) = blob_context().await;
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let operation = LateOptIn {
+            state: 0,
+            ready: ready.clone(),
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move {
+            crate::driver::drive_until(operation, &task_context, deadline).await
+        });
+
+        ready.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(3601)).await;
+        tokio::time::resume();
+
+        // The opt-in turned on after the commit, so the abort effect must still run.
+        assert_eq!(task.await.unwrap(), Ok(()));
+        assert!(!marker_absent(&context).await);
     }
 
     #[derive(Debug, PartialEq)]
