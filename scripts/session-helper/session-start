@@ -1,7 +1,8 @@
 #!/bin/sh
-# Start command of every Aruna session image. It installs the dependencies the
-# portal staged, points fsspec and the AWS SDK at the node's S3 endpoint, and
-# then becomes the session helper.
+# Start command of every session image: installs staged dependencies, then execs the helper.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 set -eu
 
 workdir=$(pwd)

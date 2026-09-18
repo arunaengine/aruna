@@ -1,3 +1,7 @@
+# Tracked-tree exclusions: build output, local state and untracked documentation.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 target/
 # Internal docs stay untracked; the contributor source guide is tracked.
 docs/*

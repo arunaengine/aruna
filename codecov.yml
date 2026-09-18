@@ -1,3 +1,7 @@
+# Codecov targets and thresholds for the project and patch status checks.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 coverage:
   status:
     project:

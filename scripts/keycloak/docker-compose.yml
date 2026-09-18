@@ -1,4 +1,7 @@
-# Development-only stack. Do not use in production.
+# Development-only Compose file that runs Keycloak with the Aruna realm import.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.6

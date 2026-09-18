@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Stops whatever cluster_start.sh left running: the deploy script while
-# it still monitors, every node named by a pid file under the deployment root,
-# and the Keycloak compose project. Safe to run twice.
+# Stops every node, the deploy script and Keycloak that cluster_start.sh left running.
+# Running it twice is safe.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

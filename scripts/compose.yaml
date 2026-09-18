@@ -1,4 +1,7 @@
-# Development-only stack. Do not use in production.
+# Development-only Compose stack with Keycloak and one node; never for production.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 # The ARUNA_* variables exist so an isolated test run can pick its own ports and
 # config paths; every default reproduces the normal interactive stack.
 services:

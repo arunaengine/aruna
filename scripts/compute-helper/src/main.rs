@@ -1,3 +1,7 @@
+//! Runs the in-container helper that stages inputs, fetches outputs and lists files.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;

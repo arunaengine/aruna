@@ -1,3 +1,7 @@
+<!-- Project readme: what Aruna is, how to run a node, and where the guides are. -->
+<!-- Copyright (c) 2026 The Aruna Contributors -->
+<!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
+
 [![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-APACHE)
 [![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-MIT)

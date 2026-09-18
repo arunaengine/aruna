@@ -72,8 +72,13 @@ HEADER_HASH_NAMES = frozenset({".dockerignore", ".gitignore", "Dockerfile", "jus
 HEADER_HASH_SUFFIXES = (".env", ".example", ".sh", ".toml", ".ttl", ".yaml", ".yml")
 HEADER_EXCEPTIONS = {
     "CODE_OF_CONDUCT.md": "Contributor Covenant text with its own attribution",
+    "Cargo.lock": "generated lockfile; Cargo rewrites it",
     "api/src/mcp/dataset_authoring.md": "resource text served verbatim to MCP clients",
     "api/src/mcp/metadata_profiles.md": "resource text served verbatim to MCP clients",
+    "blob/tests/fixtures/apache_pre.html": "copied index page; the parser test needs its bytes",
+    "blob/tests/fixtures/apache_table.html": "copied index page; the parser test needs its bytes",
+    "blob/tests/fixtures/autoindex_nginx.html": "copied index page; the parser test needs its bytes",
+    "blob/tests/fixtures/non_index.html": "copied page; the rejection test needs its bytes",
     "operations/tests/fixtures/ELN_README.md": "copied fixture; its bytes must stay unchanged",
 }
 

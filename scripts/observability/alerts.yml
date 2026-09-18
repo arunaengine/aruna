@@ -1,3 +1,7 @@
+# Prometheus alert rules for stalled recovery, capped or old outbox work and probe loss.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 groups:
   - name: aruna-recovery
     rules:

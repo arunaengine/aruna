@@ -1,3 +1,7 @@
+# Manifest of aruna-api, the REST, S3 and MCP transport crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 [package]
 name = "aruna-api"
 version.workspace = true

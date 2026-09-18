@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Brings the Compose node up with Keycloak, waits for readiness and follows its logs.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -1,3 +1,7 @@
+# Coverage workflow that builds the workspace report and uploads it to Codecov.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 name: coverage
 
 on:

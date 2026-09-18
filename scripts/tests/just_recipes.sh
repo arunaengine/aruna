@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Fast contract test for the thirteen public Just recipes. It never starts a real
-# service: stub binaries and fake prerequisite commands cover every path.
+# Contract test for the public Just recipes; stub binaries replace every real service.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"

@@ -1,3 +1,7 @@
+<!-- Contributor guide: where to report issues and how to work on the code. -->
+<!-- Copyright (c) 2026 The Aruna Contributors -->
+<!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
+
 # CONTRIBUTING
 
 Thank you for your interest in contributing to the project. Issues, Bug reports or feature request can be made via GitHub issues. For detailed developer information please see the sections below.

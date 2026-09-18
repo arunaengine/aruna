@@ -1,3 +1,7 @@
+<!-- Repository policy for structure, naming, comments, file headers and enforcement. -->
+<!-- Copyright (c) 2026 The Aruna Contributors -->
+<!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
+
 # Repository style and structure
 
 **The location explains the domain. The name explains the action or concept. The code exposes sequence and ownership. Comments explain reasons that are not apparent from the code.**
@@ -205,7 +209,7 @@ Write the description from the code in front of you. It must describe this file,
 
 Rewrite an existing file introduction into those one or two accurate lines instead of adding a second introduction. Move a longer explanation that is still worth keeping into the matching documentation, or leave it as an ordinary comment below the notices.
 
-Generated output, copied fixtures, binary assets, formats without comments such as JSON, and fragments included into another file get no header. Each exception is narrow, named with its reason in the checker data, and never a whole crate, a whole test tree, or a whole fixture directory. Third-party notices and attribution stay exactly as they are.
+Generated output, copied fixtures, binary assets, formats without comments such as JSON, and fragments included into another file get no header. Where the format could carry one, name the file and its reason in the checker data. Keep every exception narrow: never a whole crate, a whole test tree, or a whole fixture directory. Third-party notices and attribution stay exactly as they are.
 
 ## 8. Make dependencies and ownership explicit
 

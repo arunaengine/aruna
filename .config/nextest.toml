@@ -1,3 +1,7 @@
+# Nextest profiles for concurrency, slow-test detection and the audited fast selection.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 # Multi-node tests run real in-process clusters, so two concurrent tests match
 # what a CI runner can serve without oversubscription.
 [profile.default]

@@ -1,3 +1,7 @@
+# Workspace manifest: members, shared package metadata and dependency versions.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 [workspace]
 members = [
     "api",

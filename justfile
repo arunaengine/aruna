@@ -1,3 +1,7 @@
+# Local recipes for linting, testing, checking and deploying, as CI runs them.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 # Style, formatting and Clippy, as CI runs them.
 lint:
 	python3 scripts/dev/check_style_tests.py

@@ -1,3 +1,7 @@
+# Builds the node image: a Cargo release build, then a distroless runtime stage.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 # glibc, not musl: musl's `cmsghdr` is 4-byte aligned, so noq-udp's receive
 # timestamp decode trips its alignment assertion and aborts the process.
 FROM rust:1.97.1-trixie@sha256:1bcff4befb740599103a2c7cb51058e14479b2e35e3a34a3f0dc4ede09927488 AS builder

@@ -1,3 +1,7 @@
+# Dependency policy for cargo-deny: advisories, licenses, bans and sources.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 [graph]
 all-features = true
 

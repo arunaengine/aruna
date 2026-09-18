@@ -1,3 +1,7 @@
+# Promtool unit tests that feed series to the rules in alerts.yml.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 rule_files:
   - alerts.yml
 

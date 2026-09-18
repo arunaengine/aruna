@@ -1,3 +1,7 @@
+<!-- Source guide: which crate owns what, and the request and startup paths end to end. -->
+<!-- Copyright (c) 2026 The Aruna Contributors -->
+<!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
+
 # Source guide
 
 Where new behavior belongs, and the two paths most changes follow. If this
