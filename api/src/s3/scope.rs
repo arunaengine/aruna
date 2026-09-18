@@ -5,7 +5,7 @@
 // Every concrete object path still goes through an ordinary permission check.
 
 use aruna_core::errors::AuthorizationError;
-use aruna_core::permission_path::{path_within, readable_roots};
+use aruna_core::permission_path::readable_roots;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::auth::permission_rules::{PermissionRules, permission_rules};
@@ -55,15 +55,14 @@ impl SubpathScope {
             .allows(&format!("{}/{key}", self.root), &Permission::READ)
     }
 
-    /// Whether a listing prefix is an ancestor of, equal to, or inside an
-    /// allowed prefix. A request prefix without such an overlap is refused.
+    /// Whether a listing prefix starts, equals, or lies inside an allowed prefix,
+    /// so `imag` starts `imaging`. A request prefix without such an overlap is refused.
     pub(super) fn allows_prefix(&self, prefix: &str) -> bool {
-        let prefix = prefix.trim_end_matches('/');
         self.prefixes.iter().any(|allowed| {
             allowed.is_empty()
-                || prefix.is_empty()
-                || path_within(prefix, allowed)
-                || path_within(allowed, prefix)
+                || allowed.starts_with(prefix)
+                || prefix == allowed
+                || prefix.starts_with(&format!("{allowed}/"))
         })
     }
 
@@ -154,6 +153,9 @@ mod tests {
         assert!(scope.allows_prefix(""));
         assert!(scope.allows_prefix("imaging/"));
         assert!(scope.allows_prefix("imaging/2026/"));
+        assert!(scope.allows_prefix("imag"));
+        assert!(!scope.allows_prefix("imag/"));
+        assert!(!scope.allows_prefix("imagery/"));
         assert!(!scope.allows_prefix("sequencing/"));
     }
 

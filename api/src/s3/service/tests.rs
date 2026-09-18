@@ -1780,6 +1780,71 @@ async fn subpath_refuses_sibling() {
     assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
 }
 
+/// Narrows the caller to `imaging/2026` and seeds keys around that folder.
+async fn restrict_to_year(service: &ArunaS3Service, user_access: &mut UserAccess, group_id: Ulid) {
+    seed_materialized_keys(
+        &service.state.storage_handle,
+        "study",
+        &["imaging/2025/x", "imaging/2026/y", "imagery/z"],
+        user_access.user_identity,
+        UNIX_EPOCH,
+    )
+    .await;
+    let root = bucket_permission_path(service.realm_id, group_id, service.node_id, "study");
+    user_access.path_restrictions = Some(vec![PathRestriction {
+        pattern: format!("{root}/imaging/2026/**"),
+        permission: Permission::READ,
+    }]);
+}
+
+async fn scoped_listing(
+    service: &ArunaS3Service,
+    user_access: &UserAccess,
+    group_id: Ulid,
+    prefix: &str,
+    delimiter: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let mut request = subpath_request(service, user_access, group_id, Some(prefix)).await;
+    request.input.delimiter = delimiter.map(str::to_string);
+    let output = service.list_objects_v2(request).await.unwrap().output;
+    let keys = output
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|object| object.key)
+        .collect();
+    let prefixes = output
+        .common_prefixes
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|prefix| prefix.prefix)
+        .collect();
+    (keys, prefixes)
+}
+
+#[tokio::test]
+async fn partial_prefix_lists() {
+    // Shell completion lists a partial segment, as in `aws s3 ls s3://study/imag`.
+    let (_storage_dir, service, mut user_access, group_id) = subpath_node().await;
+    let listed = scoped_listing(&service, &user_access, group_id, "imag", Some("/")).await;
+    assert_eq!(listed, (vec![], vec!["imaging/".to_string()]));
+
+    restrict_to_year(&service, &mut user_access, group_id).await;
+    let listed = scoped_listing(&service, &user_access, group_id, "imaging/20", Some("/")).await;
+    assert_eq!(listed, (vec![], vec!["imaging/2026/".to_string()]));
+}
+
+#[tokio::test]
+async fn partial_prefix_filtered() {
+    // A partial prefix reaches past the allowed folder, so keys stay filtered one by one.
+    let (_storage_dir, service, mut user_access, group_id) = subpath_node().await;
+    restrict_to_year(&service, &mut user_access, group_id).await;
+    for prefix in ["imag", "imaging/20"] {
+        let listed = scoped_listing(&service, &user_access, group_id, prefix, None).await;
+        assert_eq!(listed, (vec!["imaging/2026/y".to_string()], vec![]));
+    }
+}
+
 #[tokio::test]
 async fn object_path_decides() {
     // Object reads stay authorized at their own path, inside and outside
