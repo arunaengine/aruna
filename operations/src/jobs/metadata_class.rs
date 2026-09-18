@@ -1,3 +1,7 @@
+//! Sorts a failed metadata write into a validation, permanent or retryable job outcome.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
 use aruna_core::structs::placement::binding_directory::BindingError;

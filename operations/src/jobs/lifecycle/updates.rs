@@ -1,6 +1,7 @@
-//! The monotonic execution chain one executor publishes. Only the fenced node may
-//! advance one; each update chains by digest from the receipt, so a gap cannot skip
-//! a state or forge a result, and success names only a durable output.
+//! Publishes the monotonic execution chain, each update chained by digest from the receipt.
+//! Only the fenced node may advance a chain, and success may name only a durable output record.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 

@@ -1,3 +1,7 @@
+//! Starts the interactive session of a session job and writes its session report.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::str::FromStr;
 use std::sync::Arc;
 

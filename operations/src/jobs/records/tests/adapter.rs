@@ -1,4 +1,6 @@
-//! The transport peer and the record publisher are separate authorities.
+//! Tests that record transport separates the peer from the publisher and refuses bad offers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

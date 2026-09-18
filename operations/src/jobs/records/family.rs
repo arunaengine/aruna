@@ -1,6 +1,7 @@
-//! Complete reads of one job family. Scheduling, admission, and state publication
-//! may only decide on the whole family: a prefix, a failed decode, or a bounded
-//! scan is an availability failure, never evidence that a record does not exist.
+//! Reads every record of one job family completely, or reports why it could not.
+//! A partial or failed read is an availability failure, never proof that a record is absent.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
 

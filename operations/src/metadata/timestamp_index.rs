@@ -1,3 +1,7 @@
+//! Pages registry records by update time and sweeps stale timestamp index keys.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 use std::time::Duration;
 

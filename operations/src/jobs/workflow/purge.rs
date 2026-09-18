@@ -1,3 +1,7 @@
+//! Runs the storage purge job that deletes object versions and aborts multipart uploads.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeSet;
 
 use aruna_core::effects::StorageEffect;

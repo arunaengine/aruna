@@ -1,3 +1,7 @@
+//! Runs the RO-Crate export job that streams the selected objects into a resumable ZIP archive.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path};
 

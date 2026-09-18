@@ -1,3 +1,7 @@
+//! Runs local SPARQL queries over the graphs a caller may read, with row and byte limits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::effects::warn_slow_call;
 use super::lifecycle::list_read_records;
 use super::search::{LocalReadScope, resolve_visibility_scope};

@@ -1,6 +1,6 @@
-//! Rebuilding one family's projection from its immutable records. The projection
-//! is a cache with a bounded revision, never authority: it is delete-and-rebuild
-//! safe, invalidated by every append, and the bridged job row is only a local view.
+//! Rebuilds one job family projection cache from its records and bridges the local job row.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

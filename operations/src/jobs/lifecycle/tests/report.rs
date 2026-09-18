@@ -1,5 +1,6 @@
-//! What the external surfaces read back from one family, including the
-//! responder-local diagnostics that stay outside the projection digest.
+//! Tests what external surfaces read back from a family, including local diagnostics.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
 use aruna_core::effects::JobRecordFrame;

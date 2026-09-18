@@ -1,3 +1,7 @@
+//! Writes the RO-Crate document that records a finished execution job.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::StructuredId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::execution::job::{

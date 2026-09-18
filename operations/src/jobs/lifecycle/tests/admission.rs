@@ -1,5 +1,6 @@
-//! Local admission, idempotent replay, conflict visibility, and the reads the
-//! family projection answers afterwards.
+//! Tests local admission: replayed claims, conflict reporting and the reads by alias after it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;

@@ -1,6 +1,7 @@
-//! Leaderless witness scheduling: every current holder of a submission family is
-//! a witness, and each computes the same rank from the immutable identity. No
-//! witness holds a lease, so a partition may produce one execution per witness.
+//! Runs leaderless witness scheduling: every family holder ranks itself and may offer a launch.
+//! No witness holds a lease, so a partition can produce one execution per witness.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
 use std::time::Duration;

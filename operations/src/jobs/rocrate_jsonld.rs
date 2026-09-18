@@ -1,3 +1,7 @@
+//! Resolves JSON-LD context terms of an RO-Crate so ids, graphs, and file types are found.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};

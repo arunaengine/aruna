@@ -1,3 +1,7 @@
+//! Signs, parses and merges the cursors that page metadata search results.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 

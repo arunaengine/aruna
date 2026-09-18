@@ -1,3 +1,7 @@
+//! Routes metadata reads such as get, profile status and RO-Crate export to holder nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::device::replica::ReplicaRecord;
 use crate::device::replica::read_replica;
 use crate::driver::DriverContext;

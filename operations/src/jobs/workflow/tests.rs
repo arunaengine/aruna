@@ -1,3 +1,7 @@
+//! Tests the execution workflow: submit recovery, sessions, cancels, walltime, and reconcile.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::finalize::{collect_or_park, exit_message, finalize_attempt, finalize_cancel};
 use super::prepare::{NETWORK_TAG_KEY, PreparedTask, build_task_spec, prepare_workspace};
 use super::recovery::{pre_submit_failure, recover_failed_submit};

@@ -1,3 +1,7 @@
+//! Resolves metadata paths by picking holder nodes, forwarding lookups and merging replies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     AuthContext, AuthFailure, AuthToken, DISTRIBUTED_QUERY_DEADLINE, DriverContext, GroupId,
     GroupPermissionRules, HashSet, MetaResourceId, MetadataApiError, MetadataPathCandidate,

@@ -1,3 +1,7 @@
+//! Lists the metadata documents a caller may see, with paging limits and filters.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     AuthContext, Deserialize, DriverContext, EVENT_LOG_KEYSPACE, Event, GroupId,
     GroupPermissionRules, HashMap, IterStart, LIST_METADATA_SIZE, ListGroupOperation,

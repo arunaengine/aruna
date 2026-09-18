@@ -1,6 +1,7 @@
-//! The sans-I/O append of one immutable job record. Every check runs before it
-//! becomes visible: frame bounds, signature, the kind's author rule, placement,
-//! stored evidence, and the digest. All writes of one append commit atomically.
+//! Appends one immutable job record after checking its frame, signature, and evidence.
+//! All writes of one append commit together or not at all.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, VecDeque};
 

@@ -1,3 +1,7 @@
+//! Declares the metadata handle test modules and the imports they share.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::lifecycle::records_for_group;
 use super::search::{GraphVisibilityScope, LifecycleVisibility, record_for_graph};
 use super::search::{

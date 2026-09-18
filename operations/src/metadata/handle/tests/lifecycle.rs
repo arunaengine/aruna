@@ -1,3 +1,7 @@
+//! Tests graph lifecycle: live group records, scan caps, tombstone blocking and sync flush.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::auth::{auth_storage, node_id_seed};
 use super::effect::memory_handle;
 use super::visibility::{group_record, registry_record};

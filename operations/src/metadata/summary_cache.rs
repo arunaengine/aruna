@@ -1,3 +1,7 @@
+//! Caches RO-Crate summaries keyed by graph IRI and document cursor.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};

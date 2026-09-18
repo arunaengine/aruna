@@ -1,3 +1,7 @@
+//! Routes persistent identifier requests to the one node that owns that document's PID state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::resolve_metadata_id;

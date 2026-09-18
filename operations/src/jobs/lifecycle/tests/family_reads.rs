@@ -1,4 +1,6 @@
-//! Family reads that must be complete before anything is decided from them.
+//! Tests that a family read is complete before anything is decided from it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

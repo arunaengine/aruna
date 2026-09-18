@@ -1,6 +1,6 @@
-//! The deterministic reducer. It reads only immutable authentic records: arrival
-//! order and batching, duplication, the responder's clock, tasks, and reachability
-//! are never inputs, so replicas with the same record set produce the same projection.
+//! Reduces one family's immutable records to a single projection, the same way on every node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 

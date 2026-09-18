@@ -1,6 +1,7 @@
-//! Profiles the node validates from embedded shapes, with no realm document.
-//! Their shapes ship with the binary, so a revision is a constant rather than a
-//! registry event id, and no registry row backs them.
+//! Serves the SHACL shapes that ship inside the node binary for built-in profiles.
+//! These profiles need no realm document, so their revision is a constant, not an event id.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 

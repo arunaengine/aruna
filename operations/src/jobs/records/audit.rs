@@ -1,6 +1,6 @@
-//! Paginated audit of the immutable log. Pages are ordered by the stable record
-//! key, never by arrival, so a cursor is a position in the log rather than a
-//! responder snapshot, and refused conflict rows are returned too.
+//! Pages the immutable job record log in stable key order, including refused conflict rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, FetchCursor, IterStart, PageLimit, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

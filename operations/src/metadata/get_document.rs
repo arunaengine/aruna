@@ -1,3 +1,7 @@
+//! Reads a metadata document view from its registry row, lifecycle and materialization state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{

@@ -1,6 +1,7 @@
-//! Realm side of a device's synced folders. A device never pushes; it asks
-//! its realm node to pull one exact local version, and the node commits it
-//! through the ordinary object write, keeping all write side effects intact.
+//! Serves a device's sync: lists local object versions and pulls one exact version on request.
+//! The pull commits through the ordinary object write, so all write side effects stay intact.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
 use std::sync::Arc;

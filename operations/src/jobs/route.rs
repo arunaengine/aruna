@@ -1,3 +1,7 @@
+//! Routes one job control request to the node that owns or answers for the job.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
 use aruna_core::events::{Event, JobControlEvent, NetEvent, StorageEvent};

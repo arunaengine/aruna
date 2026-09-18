@@ -1,6 +1,7 @@
-//! Replication of locally published records to the other family holders.
-//! Delivery is asynchronous and needs no quorum: every current holder eventually
-//! accepts the immutable record, and an unreachable family leaves it queued.
+//! Replicates locally published job records to the other family holders.
+//! Delivery is asynchronous and needs no quorum; an unreachable family leaves entries queued.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 

@@ -1,3 +1,7 @@
+//! Searches local graphs the caller may see and enriches each hit with title, types and text.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::effects::warn_slow_call;
 use super::entity_convert::{decode_hit_properties, hit_from_craqle};
 use super::lifecycle::{list_deleted_iris, list_read_records};

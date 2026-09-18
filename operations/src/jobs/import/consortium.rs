@@ -1,3 +1,7 @@
+//! Tests that the real eLabFTW, PASTA and Kadi4Mat ELN fixtures inspect and validate.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeSet;
 
 use aruna_blob::blob::BlobHandle;

@@ -1,3 +1,7 @@
+//! Runs the job that mints a w3id persistent identifier for a metadata document.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::structs::execution::job::{JobError, JobResultPayload};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdFailure};

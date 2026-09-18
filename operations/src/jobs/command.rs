@@ -1,6 +1,7 @@
-//! Transport-independent execution commands shared by REST and MCP: the
-//! submission shape both transports accept, the session directives a node
-//! resolves into it, and the named outcome an accepted submission produces.
+//! Defines the execution submission shape shared by REST and MCP, plus its accepted outcome.
+//! Also resolves session directives such as runtime, mount and expiry tags into that shape.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 

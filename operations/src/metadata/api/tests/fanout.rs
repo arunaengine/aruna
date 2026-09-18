@@ -1,3 +1,7 @@
+//! Tests query fan-out node choice, cursor tamper checks and forwarded bearer limits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::list::{auth_for, user_role, write_policy_docs};
 use super::*;
 

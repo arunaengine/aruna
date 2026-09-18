@@ -1,3 +1,7 @@
+//! Wires the metadata read API submodules together and maps their errors to one API error.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};

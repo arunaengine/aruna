@@ -1,5 +1,6 @@
-//! Two admissions racing one target: the storage conflict that stops the second
-//! commit must be answered from the receipt that won, never as a drain.
+//! Tests two admissions racing one target, so the loser answers from the winning receipt.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

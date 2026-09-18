@@ -1,6 +1,7 @@
-//! Timestamp-ordered index of the records an anonymous caller may read.
-//! Unauthenticated OAI-PMH enumeration cannot scan or policy-check per
-//! candidate, so a background pass publishes a generation readers re-check.
+//! Keeps a timestamp-ordered index of the records an anonymous caller may read.
+//! A background pass publishes a generation that readers re-check instead of scanning.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;

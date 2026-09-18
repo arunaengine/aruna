@@ -1,6 +1,6 @@
-//! The pure admission decision of the append-only store. Nothing here performs
-//! I/O: stored records, retained pending records, and one candidate decide what
-//! becomes visible. Admission can only admit more pending records, never rewrite.
+//! Decides without I/O whether one job record is admitted, retained pending, or rejected.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 

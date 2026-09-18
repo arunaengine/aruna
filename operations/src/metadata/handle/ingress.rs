@@ -1,3 +1,7 @@
+//! Serves inbound metadata stream requests from peers: query, search, sync and mirror delete.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::peer_auth::authorize_peer;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

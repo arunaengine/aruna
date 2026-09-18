@@ -1,3 +1,7 @@
+//! Reads a hidden blob in ranges and presents it as a seekable stream for the ZIP reader.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::future::Future;
 use std::io;
 use std::ops::Range;

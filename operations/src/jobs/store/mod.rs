@@ -1,3 +1,7 @@
+//! Owns the job store keyspaces, index writes, and the guarded job mutation helpers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::UserId;
 use aruna_core::compute::{AttemptRef, FenceContext};
 use aruna_core::effects::{IterStart, StorageEffect};

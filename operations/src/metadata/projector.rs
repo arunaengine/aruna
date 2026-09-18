@@ -1,3 +1,7 @@
+//! Projects logged metadata events into the registry and drains the pending queue.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 

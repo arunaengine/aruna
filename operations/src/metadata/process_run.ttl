@@ -1,5 +1,9 @@
-# SHACL shapes for the Process Run Crate 0.5 Profile, projected from the portal's
-# bundled definition (src/lib/profiles/builtinProfiles.ts, shapesFromEntityRules).
+# SHACL shapes for the Process Run Crate 0.5 Profile, embedded in the node binary.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+# Projected from the portal's bundled definition (src/lib/profiles/builtinProfiles.ts,
+# shapesFromEntityRules).
 # Presence and value constraints are split, so a missing MUST is a Violation, a
 # missing SHOULD a Warning, and an invalid value always a Violation.
 # Four value constraints deviate from that projection, which assumes plain JSON

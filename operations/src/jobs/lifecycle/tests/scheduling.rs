@@ -1,4 +1,6 @@
-//! Witness ranking, launch suppression, stored budgets, and staging refusals.
+//! Tests witness ranking, launch suppression, stored budgets and staging refusals.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::execution::job::{JobErrorKind, JobFamilyRecord, PhysicalExecutionState};
 use std::collections::BTreeSet;

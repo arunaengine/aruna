@@ -1,3 +1,7 @@
+//! Routes metadata create, update, delete and batch writes to the nodes that hold them.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;

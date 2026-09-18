@@ -1,6 +1,7 @@
-//! Assembling the pinned values one planning round decides on: exact input
-//! versions and holders, advertised targets, and publisher membership. Membership
-//! comes from the authenticated realm config, never from an advertisement's claims.
+//! Builds one planning round: pinned input versions and holders, plus the target candidates.
+//! Publisher membership comes from the authenticated realm config, not from advertised claims.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 

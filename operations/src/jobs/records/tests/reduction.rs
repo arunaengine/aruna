@@ -1,4 +1,6 @@
-//! The reducer must be a function of the record set alone.
+//! Tests that the reducer produces the same projection from any order of the same records.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::execution::job::{
     ExecutionRole, JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope,

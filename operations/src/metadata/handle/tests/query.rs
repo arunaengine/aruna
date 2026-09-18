@@ -1,3 +1,7 @@
+//! Tests that local query parsing accepts read-only SPARQL and rejects updates and SERVICE.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::super::query::parse_metadata_query;
 use super::super::*;
 #[test]

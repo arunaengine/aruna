@@ -1,5 +1,6 @@
-//! Cancelling a family has to reach the executions this node itself runs: the
-//! replicated record stops further launches, it does not stop a running one.
+//! Tests that cancelling a family stops local launches and leaves a running execution alone.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

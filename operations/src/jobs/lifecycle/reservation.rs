@@ -1,6 +1,7 @@
-//! Exact local capacity held for one accepted execution: the reservation, the
-//! signed receipt, and the record making both visible commit in one transaction,
-//! so concurrent offers cannot oversubscribe and no work starts before its receipt.
+//! Holds exact local capacity for one accepted execution and releases it again.
+//! Reservation, receipt and record commit together, so concurrent offers cannot oversubscribe.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::document::DocumentTarget;

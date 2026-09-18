@@ -1,6 +1,7 @@
-//! The decentralized submission-to-completion lifecycle: no leader, no quorum,
-//! no global scheduler. A submission is admitted by one family holder, planned
-//! by every witness, receipted by its target, and reduced by whoever is asked.
+//! Owns the decentralized submission lifecycle: no leader, no quorum, no global scheduler.
+//! One family holder admits a submission, every witness plans it, and its target receipts it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 

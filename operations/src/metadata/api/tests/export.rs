@@ -1,3 +1,7 @@
+//! Tests RO-Crate export for snapshot fencing, identity fences and cached summary freshness.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::list::summary_request;
 use super::*;
 

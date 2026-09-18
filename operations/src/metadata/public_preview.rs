@@ -1,3 +1,7 @@
+//! Lists draft files an anonymous reader could not fetch once the document is public.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeSet;
 
 use aruna_core::id::NodeId;

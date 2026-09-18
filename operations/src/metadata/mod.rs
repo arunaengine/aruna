@@ -1,3 +1,7 @@
+//! Groups the metadata modules and starts the background warmup of the metadata caches.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod api;
 pub mod audit;
 pub(crate) mod builtin;

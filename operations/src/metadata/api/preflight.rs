@@ -1,3 +1,7 @@
+//! Runs reference preflight: resolves target versions, fans out to nodes and merges locations.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     ARUNA_DATA_PREFIX, ApiQueryMode, Arc, AuthContext, AuthToken, BLOB_HEAD_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BTreeMap, BTreeSet, BlobHeadKey, BlobVersion, BlobVersionState,

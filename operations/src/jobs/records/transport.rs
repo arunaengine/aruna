@@ -1,6 +1,7 @@
-//! Adapter I/O for the job-record and launch-offer effects. The transport peer is
-//! authenticated as a sync-eligible realm node, but that is never a substitute for
-//! the publisher signature: a relay satisfies no author rule and records keep their publisher.
+//! Sends and serves job record and launch offer messages between realm nodes.
+//! A relaying peer is authenticated on its own and is never treated as the record author.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

@@ -1,3 +1,7 @@
+//! Declares the metadata API test modules and the imports and helpers they share.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 use super::export::raw_identity_matches;

@@ -1,3 +1,7 @@
+//! Caches metadata query results per caller scope with entry, byte and time bounds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;

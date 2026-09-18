@@ -1,6 +1,7 @@
-//! What the external surfaces report about one request family: immutable records
-//! plus two responder-local diagnostics kept outside the projection digest, the
-//! stored witness plan and retry state, so clients see local versus realm truth.
+//! Reports one request family to external surfaces: its records, status and audit pages.
+//! The witness plan and retry state stay outside the projection digest as local diagnostics.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{FetchCursor, PageLimit};

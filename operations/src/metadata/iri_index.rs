@@ -1,3 +1,7 @@
+//! Builds and rebuilds the IRI reference index that maps referenced IRIs back to documents.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aruna_core::effects::{IterStart, StorageEffect};

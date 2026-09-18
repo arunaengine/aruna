@@ -1,3 +1,7 @@
+//! Builds the storage effects that read and write metadata registry and lifecycle rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};

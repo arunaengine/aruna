@@ -1,3 +1,7 @@
+//! Tests the visibility cache: upserts, removals, tombstones, expiry and group scoping.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::auth::permission_rules::GroupPermissionRules;
 use aruna_core::structs::identity::auth::Permission;

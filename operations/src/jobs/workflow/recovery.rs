@@ -1,3 +1,7 @@
+//! Recovers an ambiguous attempt submit by retrying the same name, retiring, or parking it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 
 use aruna_compute::ExecutorBackend;

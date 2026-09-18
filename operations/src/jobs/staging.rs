@@ -1,3 +1,7 @@
+//! Runs the staging job that copies source entries into blobs and checkpoints its progress.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::path::{Component, Path};
 
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;

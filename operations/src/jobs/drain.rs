@@ -1,3 +1,7 @@
+//! Scans the job schedule index, claims due jobs per class budget and rearms the drain timer.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 use std::time::Duration;
 

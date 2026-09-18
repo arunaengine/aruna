@@ -1,3 +1,7 @@
+//! Runs leased jobs on this node with heartbeats, retries, and a draining shutdown.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;

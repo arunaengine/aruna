@@ -1,3 +1,7 @@
+//! Runs each metadata effect against the craqle backend and turns the result into an event.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

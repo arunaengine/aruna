@@ -1,3 +1,7 @@
+//! Declares the reconciler trait for job attempts whose external run was lost.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::structs::execution::job::JobRecord;
 use aruna_storage::StorageHandle;
 

@@ -1,3 +1,7 @@
+//! Submits one new job record, minting its id and honoring the dedup index.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 

@@ -1,3 +1,7 @@
+//! Exports one metadata document as RO-Crate, raw, or summary JSON-LD.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     AuthContext, Deserialize, DriverContext, Event, Instant, MetadataApiError,
     MetadataRegistryRecord, MetadataRoCratePage, RealmId, Serialize, StorageEffect, StorageEvent,

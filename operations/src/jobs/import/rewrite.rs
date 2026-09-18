@@ -1,3 +1,7 @@
+//! Validates a RO-Crate document and rewrites its file identifiers to the stored objects.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, HashSet};
 
 use aruna_core::metadata::MetadataValidationViolation;

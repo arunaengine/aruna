@@ -1,3 +1,7 @@
+//! Adopts a lost external attempt by name and resolves it from backend evidence.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::{Arc, Weak};
 
 use aruna_core::compute::{

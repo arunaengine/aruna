@@ -1,4 +1,6 @@
-//! The logical admission quota seam, wired to the replicated demand view.
+//! Checks one submission against the group compute quota using the replicated demand view.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
 use crate::jobs::records::rows::from_bytes;

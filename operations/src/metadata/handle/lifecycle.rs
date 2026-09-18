@@ -1,3 +1,7 @@
+//! Guards effects against deleted graphs and keeps the visibility and registry caches fresh.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::sync::sync_graph_once;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};

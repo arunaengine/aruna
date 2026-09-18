@@ -1,6 +1,7 @@
-//! Ingress of one external submission: the receiver commits it if its unconflicted
-//! view selects it as holder, else forwards it one hop; a non-holder writes
-//! nothing. A device always forwards; the admitting holder pins outputs.
+//! Takes in one external submission: the receiver commits it when its view makes it the holder.
+//! Otherwise it forwards the submission one hop and writes nothing; a device always forwards.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
 use aruna_core::effects::JobRecordFrame;

@@ -1,6 +1,7 @@
-//! Exact admission at the execution target. The target alone verifies the stored
-//! spec, re-authorizes the submitter, re-evaluates placement, reserves capacity,
-//! then signs the authorizing receipt. Replays return it; a ran family is declined.
+//! Admits one launch at the execution target after checking spec, submitter, placement and fit.
+//! It then signs the authorizing receipt; a replay returns it and a ran family is declined.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 

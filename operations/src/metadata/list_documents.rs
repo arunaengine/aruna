@@ -1,3 +1,7 @@
+//! Lists a group's metadata documents and leaves out graphs that already carry a tombstone.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashSet;
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};

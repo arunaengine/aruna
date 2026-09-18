@@ -1,4 +1,6 @@
-//! The append, projection, and audit operations against real storage.
+//! Tests the append, projection, and audit operations against real storage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{JobRecordFrame, PageLimit, StorageEffect};
 use aruna_core::keyspaces::JOB_KEYSPACE;

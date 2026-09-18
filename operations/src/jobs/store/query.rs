@@ -1,3 +1,7 @@
+//! Lists and pages stored job rows and runs the shared storage transaction helpers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 /// Owner-scoped listing, newest first, with an opaque cursor and record filter.

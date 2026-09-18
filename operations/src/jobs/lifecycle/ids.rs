@@ -1,6 +1,7 @@
-//! Request normalization and the identities derived from it.
-//! The same bytes must produce the same identity on every node, so nothing
-//! locally assigned enters a digest: no job id, origin, timestamp or topology.
+//! Normalizes a submission request and derives the identities that follow from it.
+//! The same bytes must give the same identity on every node, so nothing local enters a digest.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
 use aruna_core::compute::SessionMount;

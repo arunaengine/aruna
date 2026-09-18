@@ -1,3 +1,7 @@
+//! Holds the job run context and progress reporter, and dispatches a payload to its runner.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

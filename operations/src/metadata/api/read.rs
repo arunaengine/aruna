@@ -1,3 +1,7 @@
+//! Reads metadata documents and references, checking that each record is live and readable.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
     DISTRIBUTED_QUERY_DEADLINE, DOCUMENT_LIFECYCLE_KEYSPACE, DriverContext, Event,

@@ -1,3 +1,7 @@
+//! Queues and drains prune jobs that remove deleted metadata graphs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 

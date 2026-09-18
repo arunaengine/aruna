@@ -1,3 +1,7 @@
+//! Plans the export ZIP layout, recognizes crate entities and builds the rewritten report rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 pub(super) fn plan_export(

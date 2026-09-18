@@ -1,6 +1,7 @@
-//! The append-only job-record store. Cross-node truth about an external job lives
-//! here as immutable signed records, keyed once and never rewritten; the mutable
-//! job row is a local execution and projection cache, not the sole truth.
+//! Owns the append-only store of signed job records, with its shared limits and errors.
+//! The mutable job row is a local execution and projection cache, not the shared truth.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::FrameBoundsError;
 use aruna_core::errors::{ConversionError, StorageError};

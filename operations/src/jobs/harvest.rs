@@ -1,3 +1,7 @@
+//! Runs the harvest job that pages an OAI-PMH source and stores records as metadata documents.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::time::{Duration, SystemTime};

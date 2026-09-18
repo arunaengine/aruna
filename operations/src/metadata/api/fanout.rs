@@ -1,3 +1,7 @@
+//! Checks query form and fans metadata calls out to the selected realm nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::field;
 
 use super::{

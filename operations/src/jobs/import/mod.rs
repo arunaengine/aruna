@@ -1,3 +1,7 @@
+//! Runs the RO-Crate import job and re-exports the staged upload it reads the archive from.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub(crate) mod archive;
 #[cfg(test)]
 mod consortium;

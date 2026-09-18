@@ -1,3 +1,7 @@
+//! Flushes the document sync journal, either inside the request or on a deferred thread.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;

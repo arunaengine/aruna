@@ -1,6 +1,7 @@
-//! External reads answered from the family projection. An external job has no
-//! single owner: any node that reduced the family can answer, and the alias stays
-//! the stable handle. Byte reads still route to the node that produced them.
+//! Answers external job reads from the family projection, with the alias as the stable handle.
+//! Any node that reduced the family can answer; byte reads still route to the producing node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
 use aruna_core::id::NodeId;

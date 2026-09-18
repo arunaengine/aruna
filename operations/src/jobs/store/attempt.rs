@@ -1,3 +1,7 @@
+//! Reads and mutates the fenced attempt control row that guards one job execution.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 pub async fn read_attempt_control(

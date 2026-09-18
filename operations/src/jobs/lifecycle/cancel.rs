@@ -1,6 +1,6 @@
-//! Append-only cancellation of one request family: a permission-checked holder
-//! signs a token-free record; observers stop launching and active executions are
-//! asked to stop. A partitioned execution may finish with `cancel_requested` set.
+//! Cancels one request family by signing a cancel record and asking executions to stop.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::id::NodeId;

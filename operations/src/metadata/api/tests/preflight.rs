@@ -1,3 +1,7 @@
+//! Tests reference preflight fan-out reporting, cursor pagination, plan limits and failures.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 use super::super::preflight::{

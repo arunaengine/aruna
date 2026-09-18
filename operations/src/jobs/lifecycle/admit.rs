@@ -1,6 +1,7 @@
-//! Local admission of one submission: a holder commits the immutable spec and
-//! its claim in one transaction, or nothing. A matching claim replays the alias
-//! and a conflicting claim is visible; signed candidates make this decide only.
+//! Admits one submission locally, committing the spec and the claim in a single transaction.
+//! A matching claim replays the alias, and a conflicting claim stays visible to the caller.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::document::DocumentTarget;

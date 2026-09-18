@@ -1,3 +1,7 @@
+//! Converts between Aruna metadata requests and craqle types, including JSON-LD term parsing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataCrateRequest, MetadataDot, MetadataError,

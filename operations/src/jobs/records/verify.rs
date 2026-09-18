@@ -1,6 +1,7 @@
-//! The local view and the retained evidence one job record is judged against.
-//! Every input comes from this node's replicated state: the synchronized realm
-//! config and the records it stored as authentic. A relay supplies bytes only.
+//! Builds the local holder view and evidence plan one job record is judged against.
+//! Every input comes from this node's own replicated state, never from a relay.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
 

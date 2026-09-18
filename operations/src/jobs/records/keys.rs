@@ -1,6 +1,6 @@
-//! Storage keys of the append-only job-record store. Every key is built from
-//! the record's own signed identity, so a relay can never place a record under
-//! another family, kind, or subject.
+//! Builds the storage keys and prefixes of the append-only job record store.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::effects::{FetchCursor, FrameBoundsError};

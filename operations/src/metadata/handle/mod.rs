@@ -1,3 +1,7 @@
+//! Owns the metadata handle with its craqle backend, options, caches and submodules.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};

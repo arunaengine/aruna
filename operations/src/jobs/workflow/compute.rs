@@ -1,3 +1,7 @@
+//! Maps reconcile evidence of a compute attempt to the recovery action to take.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::compute::{AttemptPhase, ReconcileEvidence, ResumePoint};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,3 +1,7 @@
+//! Tests peer authorization: realm membership, bearer tokens, revocation and anonymous access.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::super::peer_auth::{authorize_peer, remote_auth_context};
 use super::*;
 use crate::auth::bearer_token::decode_bearer_token;

@@ -1,3 +1,7 @@
+//! Runs metadata queries and searches across realm nodes and merges the results.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     ApiQueryMode, Arc, AuthContext, BucketSearchHit, DriverContext, GroupId, HashMap, HashSet,
     Instant, MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError, MetadataFanoutOperation,

@@ -1,3 +1,7 @@
+//! Tests visible document listing: lifecycle filters, scan caps, policy visibility and order.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::export::{seed_registry_cache, write_entry, write_pending_marker};
 use super::*;
 use aruna_core::StructuredId;

@@ -1,6 +1,7 @@
-//! Read surface over the metadata audit trail. Audit rows are node-local
-//! projections, so a group's complete trail is gathered by asking every eligible
-//! realm node for its local page and merging the pages by their raw storage key.
+//! Reads the metadata audit trail for a group, one page at a time.
+//! Audit rows are node-local, so pages from each eligible realm node are merged by storage key.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};

@@ -1,3 +1,7 @@
+//! Searches metadata graphs, buckets and objects across nodes with signed page cursors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     ApiQueryMode, AuthContext, BlobHeadKey, BucketSearchHit, CursorEnvelopeError,
     DISTRIBUTED_QUERY_DEADLINE, Deserialize, DriverContext, GroupId, HashMap, HashSet,

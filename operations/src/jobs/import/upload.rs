@@ -1,3 +1,7 @@
+//! Stages an uploaded RO-Crate archive as a hidden blob and tracks its claim and cleanup.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};

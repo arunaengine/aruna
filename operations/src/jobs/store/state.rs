@@ -1,3 +1,7 @@
+//! Moves a job record through its states: claim, run, complete, fail, requeue, release.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 
 /// Read a job record, retaining malformed rows for offline recovery.

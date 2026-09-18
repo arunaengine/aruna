@@ -1,3 +1,7 @@
+//! Tests metadata write routing, holder sets, retry choices and forwarded response checks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::device::replica::ReplicaRecord;
 use crate::forward::authorize::peer_acts_for;
 use crate::forward::replay::create_record_matches;

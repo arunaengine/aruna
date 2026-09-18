@@ -1,6 +1,7 @@
-//! Server-side SHACL evaluation for registered metadata Profiles.
-//! Shapes and candidates live in a dedicated craqle store that is never
-//! committed to, so graph listing, replication and search never observe a run.
+//! Runs SHACL checks for registered metadata Profiles with a cache of compiled shapes.
+//! Shapes and candidates live in a scratch craqle store, so a run is never committed.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;

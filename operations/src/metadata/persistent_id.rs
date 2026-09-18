@@ -1,6 +1,7 @@
-//! The document-scoped PID authority. It advances a fenced `Requested` intent
-//! through `Processing` to `Active`; each step is a compare-and-set txn that
-//! also enqueues its sync publish, so replay cannot mint twice.
+//! Owns a document's persistent identifier state, moving it from requested to active.
+//! Each step is a compare-and-set that also queues its publish, so replay cannot mint twice.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 #[path = "persistent_id_forward.rs"]
 pub mod forward;

@@ -1,3 +1,7 @@
+//! Builds, signs and stores an execution's output record and returns the digest success names.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::structs::execution::job::{

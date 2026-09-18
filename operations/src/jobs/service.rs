@@ -1,3 +1,7 @@
+//! Provides the job service calls that submit, list, read, and delete jobs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::UserId;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};

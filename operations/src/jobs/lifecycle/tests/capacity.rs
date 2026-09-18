@@ -1,5 +1,6 @@
-//! Exact target admission: the reservation, the receipt it commits with, and
-//! the release that frees it again.
+//! Tests exact target admission: the reservation, the receipt it commits with and its release.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};

@@ -1,3 +1,7 @@
+//! Tests the materialization queue: graph fences, job scans, failure caps and dead letters.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{IRI_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE};

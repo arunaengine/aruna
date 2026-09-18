@@ -1,3 +1,7 @@
+//! Creates a metadata document: mints its id, picks its placement and writes the registry row.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aruna_core::NodeId;

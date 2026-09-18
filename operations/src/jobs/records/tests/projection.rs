@@ -1,4 +1,6 @@
-//! Truncation, cache completeness, and corrupt rows of one family projection.
+//! Tests family projection truncation, cache reuse, and corrupt or outdated cache rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
 

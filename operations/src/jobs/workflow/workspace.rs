@@ -1,3 +1,7 @@
+//! Mints run credentials, stages the workspace inputs, and captures the run outputs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};

@@ -1,3 +1,7 @@
+//! Carries job requests between nodes: sends one over the wire and serves an incoming stream.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 use std::time::Duration;
 

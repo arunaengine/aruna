@@ -1,3 +1,7 @@
+//! Prepares one execution run: authorizes the bucket, mounts inputs, builds the task spec.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 

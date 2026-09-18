@@ -1,6 +1,6 @@
-//! Reservation outcomes that prove nothing about this node's willingness to
-//! run work: a commit that neither succeeded nor was refused is reconciled from
-//! the store, a refused write is retried, and neither is ever a drain.
+//! Tests that an uncertain reservation commit is reconciled or retried, never taken as a drain.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;

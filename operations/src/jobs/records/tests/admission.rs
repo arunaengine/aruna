@@ -1,4 +1,6 @@
-//! Admission is decided against this node's own view and evidence only.
+//! Tests that admission decides only from this node's stored evidence and holder view.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 

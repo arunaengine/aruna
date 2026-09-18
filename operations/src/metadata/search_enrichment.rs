@@ -1,3 +1,7 @@
+//! Derives a title, types and a matching snippet for a metadata search hit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use oxrdf::Term;
 
 // Schema.org predicates craqle indexes into its full-text field. Enrichment

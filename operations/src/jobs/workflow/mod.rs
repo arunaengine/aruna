@@ -1,3 +1,7 @@
+//! Owns the execution job workflow and runs one execution job from prepare to finish.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 pub mod cleanup;
 pub mod compute;
 pub mod finalize;

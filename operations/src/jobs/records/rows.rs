@@ -1,5 +1,7 @@
-//! Stored rows of the append-only job-record store. Only the immutable record
-//! keyspace is authority; every other row is retained evidence or derived cache.
+//! Defines the stored row types of the job record store: pending, conflict, and cache rows.
+//! Only the immutable record keyspace is authority; the rest is evidence or cache.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::errors::ConversionError;

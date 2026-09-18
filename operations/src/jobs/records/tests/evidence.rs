@@ -1,5 +1,6 @@
-//! Evidence is read by exact key or by paging one whole kind, never from a
-//! bounded prefix of the family.
+//! Tests that evidence is read by exact key or by paging one whole record kind.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;

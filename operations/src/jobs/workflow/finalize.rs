@@ -1,3 +1,7 @@
+//! Finalizes a compute attempt: stores outputs and writes the terminal job state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 
 use aruna_compute::ExecutorBackend;

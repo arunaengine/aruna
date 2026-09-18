@@ -1,3 +1,7 @@
+//! Runs the copy job that duplicates one object between buckets under the quota ceiling.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;

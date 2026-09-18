@@ -1,6 +1,7 @@
-//! Cross-node staging of one stored input version: a target missing the bytes
-//! reads them from a legal holder through the managed-copy handshake, then writes
-//! them through the policy-gated workspace write, verified against the stored hash.
+//! Stages one stored input version on a target by reading it from a legal holder in turn.
+//! The bytes are checked against the stored hash before the policy-gated workspace write.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{InputSelection, InputSource, JobError, JobRecord};

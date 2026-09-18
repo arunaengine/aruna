@@ -1,3 +1,7 @@
+//! Tests metadata effects: entity plans, merge convergence, version reads and error mapping.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::auth::{auth_storage, node_id_seed};
 use super::*;
 use crate::metadata::protocol::MetadataReadError;

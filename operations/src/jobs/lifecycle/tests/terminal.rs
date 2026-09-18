@@ -1,6 +1,6 @@
-//! The terminal publication a receipted execution owes its family: the stored
-//! output record, the update that names its digest, and the projection both
-//! must reduce to.
+//! Tests the terminal publication a receipted execution owes: outputs, update and projection.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::JobRecordFrame;
