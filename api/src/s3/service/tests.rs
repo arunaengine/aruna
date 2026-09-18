@@ -197,6 +197,20 @@ fn reference_fields_present() {
         fields.e_tag,
         "the derived etag is stable"
     );
+    // A GET also passes its read information, which here holds neither.
+    let info = ObjectInfo {
+        size: 15,
+        version_created_at: None,
+        etag: None,
+        checksum_type: MultipartChecksumType::FullObject,
+        hashes: HashMap::new(),
+        composite_hashes: HashMap::new(),
+        part_count: None,
+    };
+    let read =
+        service.build_response_fields(None, Some(&info), None, Some(&bare), Some(refreshed), None);
+    assert_eq!(read.e_tag, fields.e_tag);
+    assert_eq!(read.last_modified, fields.last_modified);
 
     let given = aruna_core::structs::execution::source_access::SourceMetadata {
         etag: Some("\"abc-1\"".to_string()),
@@ -1344,40 +1358,9 @@ async fn subpath_request(
 #[tokio::test]
 async fn subpath_sees_bucket() {
     // Only the bucket holding the granted folder may appear. The access hook
-    // resolves the scope for a listing, so the request carries it here too.
-    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
-    let scope = resolve_scope(
-        &service.state,
-        &user_access,
-        &bucket_permission_path(service.realm_id, group_id, service.node_id, "study"),
-    )
-    .await
-    .unwrap();
-    let mut extensions = Extensions::new();
-    extensions.insert(user_access);
-    extensions.insert(scope);
-    extensions.insert(PolicyRequestExtras::operation("s3.ListBuckets"));
-    let request = S3Request {
-        input: ListBucketsInput::default(),
-        method: Method::GET,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions,
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
-
-    let response = service.list_buckets(request).await.unwrap();
-    let buckets: Vec<String> = response
-        .output
-        .buckets
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|bucket| bucket.name)
-        .collect();
-    assert_eq!(buckets, vec!["study"]);
+    // adds no scope to ListBuckets, which names no bucket.
+    let (_storage_dir, service, user_access, _group_id) = subpath_node().await;
+    assert_eq!(listed_buckets(&service, &user_access).await, vec!["study"]);
 }
 
 /// Adds a realm role that denies the caller the whole group data subtree.
@@ -2921,6 +2904,92 @@ async fn reference_returns_metadata() {
     );
 
     assert_eq!(output.is_truncated, Some(false));
+}
+
+/// Mountpoint reads ETag and Last-Modified from HEAD. A reference answers from
+/// its recorded observation instead of opening a source read.
+#[tokio::test]
+async fn bare_reference_head() {
+    let realm_id = RealmId([6u8; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+    let (_storage_dir, service) = parser_service(realm_id, node_id);
+    let group_id = Ulid::generate();
+    let created_by = UserId::local(Ulid::generate(), realm_id);
+    let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
+    let bare = SourceMetadata {
+        content_length: 15,
+        content_type: None,
+        etag: None,
+        last_modified: None,
+        source_version: None,
+    };
+    write_reference_metadata(
+        &service.state.storage_handle,
+        "bucket",
+        "ref-object",
+        Ulid::generate(),
+        bare.clone(),
+        UNIX_EPOCH,
+        created_by,
+        last_refresh,
+    )
+    .await;
+    let derived = service
+        .build_response_fields(None, None, None, Some(&bare), Some(last_refresh), None)
+        .e_tag;
+    assert!(derived.is_some());
+    let extensions = || {
+        let mut extensions = Extensions::new();
+        extensions.insert(test_user_access(group_id, realm_id));
+        extensions.insert(test_bucket_info(group_id, created_by));
+        extensions
+    };
+
+    let head = service
+        .head_object(S3Request {
+            input: HeadObjectInput {
+                bucket: "bucket".to_string(),
+                key: "ref-object".to_string(),
+                ..Default::default()
+            },
+            method: Method::HEAD,
+            uri: Uri::from_static("/bucket/ref-object"),
+            headers: HeaderMap::new(),
+            extensions: extensions(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        })
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.e_tag, derived);
+    assert_eq!(head.last_modified, Some(last_refresh.into()));
+
+    let attributes = service
+        .get_object_attributes(S3Request {
+            input: GetObjectAttributesInput {
+                bucket: "bucket".to_string(),
+                key: "ref-object".to_string(),
+                object_attributes: vec![s3s::dto::ObjectAttributes::from_static(
+                    s3s::dto::ObjectAttributes::ETAG,
+                )],
+                ..Default::default()
+            },
+            method: Method::GET,
+            uri: Uri::from_static("/bucket/ref-object?attributes"),
+            headers: HeaderMap::new(),
+            extensions: extensions(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        })
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(attributes.e_tag, derived);
 }
 
 #[tokio::test]

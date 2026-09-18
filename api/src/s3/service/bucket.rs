@@ -6,15 +6,13 @@ use super::ArunaS3Service;
 use super::object::restrictions_reach;
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
-use crate::s3::scope::SubpathScope;
+use crate::s3::scope::resolve_scope;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship};
 use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::auth::request_policy::{
-    PolicyRequestExtras, enforce_policies, policy_request_with,
-};
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::AuthToken;
 use aruna_operations::realm::get_config::GetConfigOperation;
@@ -45,7 +43,6 @@ impl ArunaS3Service {
         bucket: &str,
         bucket_info: &BucketInfo,
         extras: &PolicyRequestExtras,
-        scope: Option<&SubpathScope>,
     ) -> S3Result<bool> {
         let bucket_path =
             bucket_permission_path(self.realm_id, bucket_info.group_id, self.node_id, bucket);
@@ -73,29 +70,14 @@ impl ArunaS3Service {
             Err(AuthorizeError::CheckFailed(message)) => {
                 Err(s3_error!(InternalError, "{}", message))
             }
-            Err(AuthorizeError::PermissionDenied)
-                if scope.is_some_and(|scope| scope.overlaps(&bucket_path)) =>
-            {
-                enforce_policies(
-                    &self.state,
-                    self.realm_id,
-                    &policy_request_with(
-                        &bucket_path,
-                        &Permission::READ,
-                        Some(&AuthContext {
-                            user_id: user_access.user_identity,
-                            realm_id: user_access.user_identity.realm_id,
-                            path_restrictions: user_access.path_restrictions.clone(),
-                            session: None,
-                        }),
-                        extras.clone(),
-                    ),
-                )
-                .await
-                .map(|()| true)
-                .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))
-            }
             Err(error @ AuthorizeError::Storage(_)) => Err(map_authorize_error(error)),
+            // A member whose roles reach only a folder inside this bucket still
+            // owns the bucket holding it, so it stays visible.
+            Err(AuthorizeError::PermissionDenied) => {
+                Ok(!resolve_scope(&self.state, user_access, &bucket_path)
+                    .await?
+                    .is_empty())
+            }
             Err(_) => Ok(false),
         }
     }

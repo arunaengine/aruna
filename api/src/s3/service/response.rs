@@ -314,11 +314,13 @@ impl ArunaS3Service {
             content_type: source_metadata
                 .and_then(|metadata| metadata.content_type.clone())
                 .or(content_type),
-            // Read information carries the backing read's exact ETag.
+            // Read information carries the backing read's exact ETag. A reference
+            // source without one keeps the derived ETag its listing shows.
             e_tag: if let Some(info) = info {
                 info.etag
                     .as_deref()
                     .and_then(|etag| ETag::from_str(etag).ok())
+                    .or_else(|| source_metadata.map(reference_etag))
             } else {
                 location
                     .and_then(|location| {
@@ -330,7 +332,9 @@ impl ArunaS3Service {
                     .or_else(|| source_metadata.map(reference_etag))
             },
             last_modified: if let Some(info) = info {
-                info.version_created_at.map(Into::into)
+                info.version_created_at
+                    .map(Into::into)
+                    .or_else(|| last_refresh.map(Into::into))
             } else {
                 version_created_at
                     .map(Into::into)

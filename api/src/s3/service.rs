@@ -446,7 +446,6 @@ impl S3 for ArunaS3Service {
                 error!(error = "Missing policy context");
                 s3_error!(InternalError, "Missing policy context")
             })?;
-        let scope = req.extensions.get::<SubpathScope>().cloned();
 
         let result = drive(
             ListBucketsOperation::new(LBI {
@@ -466,7 +465,7 @@ impl S3 for ArunaS3Service {
         let mut buckets = Vec::new();
         for (bucket, bucket_info) in result.buckets {
             if self
-                .can_access_bucket(&user_access, &bucket, &bucket_info, &extras, scope.as_ref())
+                .can_access_bucket(&user_access, &bucket, &bucket_info, &extras)
                 .await?
             {
                 buckets.push(Bucket {
@@ -1579,7 +1578,8 @@ impl S3 for ArunaS3Service {
         .await
         .map_err(IntoS3Error::into_s3_error)?;
 
-        let remote_info = if result.location.is_none() {
+        // A reference answers from its source observation without opening a source read.
+        let remote_info = if result.location.is_none() && result.source_metadata.is_none() {
             Some(
                 get_object_info(
                     &self.state,
@@ -1674,7 +1674,8 @@ impl S3 for ArunaS3Service {
             .await
             .map_err(IntoS3Error::into_s3_error)?;
 
-        let remote_info = if result.location.is_none() {
+        // A reference answers from its source observation without opening a source read.
+        let remote_info = if result.location.is_none() && result.source_metadata.is_none() {
             Some(
                 get_object_info(
                     &self.state,
