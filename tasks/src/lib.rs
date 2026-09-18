@@ -11,7 +11,7 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use tracing::warn;
@@ -28,6 +28,7 @@ pub trait InboundTaskHandler: Send + Sync {
 pub struct TaskHandle {
     command_tx: mpsc::Sender<TaskCommand>,
     admission_closed: Arc<AtomicBool>,
+    admission_signal: Arc<Notify>,
 }
 
 enum TaskCommand {
@@ -679,6 +680,7 @@ impl TaskHandle {
         Ok(Self {
             command_tx,
             admission_closed,
+            admission_signal: Arc::new(Notify::new()),
         })
     }
 
@@ -697,6 +699,7 @@ impl TaskHandle {
         Self {
             command_tx,
             admission_closed: Arc::new(AtomicBool::new(false)),
+            admission_signal: Arc::new(Notify::new()),
         }
     }
 
@@ -785,6 +788,20 @@ impl TaskHandle {
     /// Permanently stops new timer handlers without waiting for the scheduler.
     pub fn close_admission(&self) {
         self.admission_closed.store(true, Ordering::Release);
+        self.admission_signal.notify_waiters();
+    }
+
+    /// Returns once admission is closed, at once if it already is. The flag
+    /// stays authoritative: the waiter registers before reading it, so a close
+    /// in between is never missed.
+    pub async fn await_admission_closed(&self) {
+        let notified = self.admission_signal.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.admission_closed.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 
     async fn stop_admission(&self) -> Option<usize> {
@@ -1700,6 +1717,7 @@ mod tests {
         let handle = TaskHandle {
             command_tx,
             admission_closed: Arc::new(AtomicBool::new(false)),
+            admission_signal: Arc::new(Notify::new()),
         };
         let scheduler = tokio::spawn(async move {
             match command_rx.recv().await {
@@ -1730,6 +1748,7 @@ mod tests {
         let handle = TaskHandle {
             command_tx,
             admission_closed: Arc::new(AtomicBool::new(false)),
+            admission_signal: Arc::new(Notify::new()),
         };
         let scheduler = tokio::spawn(async move {
             match command_rx.recv().await {
@@ -1753,6 +1772,7 @@ mod tests {
         let handle = TaskHandle {
             command_tx,
             admission_closed: Arc::new(AtomicBool::new(false)),
+            admission_signal: Arc::new(Notify::new()),
         };
         let scheduler = tokio::spawn(async move {
             match command_rx.recv().await {
@@ -1841,6 +1861,26 @@ mod tests {
         };
         assert_eq!(count, 0);
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    // A waiter must stay pending while admission is open, wake on the close,
+    // and return at once once the close already happened.
+    #[tokio::test(start_paused = true)]
+    async fn waiter_sees_close() {
+        let handle = TaskHandle::inactive();
+        let waiter = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.await_admission_closed().await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!waiter.is_finished());
+
+        handle.close_admission();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the close must wake the waiter")
+            .expect("the waiter must not panic");
+        handle.await_admission_closed().await;
     }
 
     /// Runs a synchronous section with no await point, so an abort request

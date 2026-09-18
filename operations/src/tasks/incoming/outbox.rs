@@ -192,8 +192,13 @@ impl OutboxBarrier {
         Some(barrier)
     }
 
-    pub(super) async fn wait_start(&self) {
-        std::future::pending::<()>().await;
+    /// Holds the drain until shutdown closes admission, so the test sees an
+    /// active drain that still joins on its own.
+    pub(super) async fn wait_start(&self, task_handle: Option<&TaskHandle>) {
+        match task_handle {
+            Some(handle) => handle.await_admission_closed().await,
+            None => std::future::pending::<()>().await,
+        }
     }
 }
 
@@ -425,7 +430,7 @@ impl OperationsTaskHandler {
         let _drain = self.drain_guard.lock().await;
         #[cfg(debug_assertions)]
         if let Some(barrier) = OutboxBarrier::new() {
-            barrier.wait_start().await;
+            barrier.wait_start(self.context.task_handle.as_ref()).await;
         }
 
         self.run_drain().await;
