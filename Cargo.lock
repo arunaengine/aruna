@@ -618,6 +618,7 @@ dependencies = [
  "byteview",
  "crossfire",
  "fjall",
+ "hex",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

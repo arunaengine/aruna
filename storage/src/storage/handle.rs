@@ -593,6 +593,7 @@ pub(super) fn storage_effect_mutates(effect: &StorageEffect) -> bool {
     match effect {
         StorageEffect::Write { .. }
         | StorageEffect::BatchWrite { .. }
+        | StorageEffect::AddUsage { .. }
         | StorageEffect::Delete { .. }
         | StorageEffect::BatchDelete { .. }
         | StorageEffect::CommitTransaction { .. } => true,
@@ -640,6 +641,7 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
             txn_id: Some(txn_id),
             ..
         }
+        | StorageEffect::AddUsage { txn_id, .. }
         | StorageEffect::CommitTransaction { txn_id }
         | StorageEffect::AbortTransaction { txn_id } => Some(*txn_id),
         StorageEffect::StartTransaction { .. }

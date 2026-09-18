@@ -23,6 +23,7 @@ use crate::structs::placement::policy::document::PolicyPublicationClaim;
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobKey, ResolvedBackend};
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
+use crate::structs::storage::usage::UsageDelta;
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
 use bytes::Bytes;
@@ -296,6 +297,14 @@ pub enum StorageEffect {
     BatchWrite {
         writes: Vec<(KeySpace, Key, Value)>,
         txn_id: Option<TxnId>,
+    },
+    /// Adds usage deltas to the latest stored counters when the write transaction commits.
+    /// The rows never join its read set, so parallel writers do not conflict on them.
+    /// Answers `BatchWriteResult`.
+    AddUsage {
+        key_space: KeySpace,
+        deltas: Vec<(Key, UsageDelta)>,
+        txn_id: TxnId,
     },
     Delete {
         key_space: KeySpace,

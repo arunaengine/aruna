@@ -13,6 +13,7 @@ use aruna_core::effects::{IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::prefix_upper_bound;
+use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::telemetry::duration_ms;
 use byteview::ByteView;
 use crossfire::select::Select;
@@ -49,6 +50,7 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         StorageEffect::BatchWrite { writes, .. } => {
             writes.first().map(|(key_space, _, _)| key_space.as_str())
         }
+        StorageEffect::AddUsage { key_space, .. } => Some(key_space),
         StorageEffect::BatchDelete { deletes, .. } => {
             deletes.first().map(|(key_space, _)| key_space.as_str())
         }
@@ -123,6 +125,7 @@ pub struct FjallStorage {
     /// Committed deletes per keyspace since its last compaction.
     pub(super) deletes: HashMap<String, u64>,
     pub(super) txn_deletes: HashMap<Ulid, HashMap<String, u64>>,
+    pub(super) txn_usage: HashMap<Ulid, Vec<(String, ByteView, UsageDelta)>>,
 }
 
 impl FjallStorage {
@@ -153,6 +156,7 @@ impl FjallStorage {
     /// terminal `Aborted` state, whether it was open or had a commit queued.
     fn retire_fenced_txn(&mut self, txn_id: Ulid) {
         self.take_txn_deletes(txn_id, false);
+        self.txn_usage.remove(&txn_id);
         if let Some(Txn::Write(txn)) = self.txns.remove(&txn_id) {
             txn.rollback();
         }
@@ -187,6 +191,11 @@ impl FjallStorage {
                 txn_id,
             } => self.write(key_space, key, value, txn_id),
             StorageEffect::BatchWrite { writes, txn_id } => self.batch_write(writes, txn_id),
+            StorageEffect::AddUsage {
+                key_space,
+                deltas,
+                txn_id,
+            } => self.add_usage(key_space, deltas, txn_id),
             StorageEffect::CommitTransaction { txn_id } => self.commit_transaction(txn_id),
             StorageEffect::Delete {
                 key_space,
