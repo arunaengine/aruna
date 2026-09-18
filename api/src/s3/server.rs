@@ -883,6 +883,30 @@ impl S3ServerHandle {
     }
 }
 
+/// A proxy may answer `Expect: 100-continue` itself and drop the header. A client that
+/// signed it then fails SigV4, so put back the only value the header can carry.
+fn restore_signed_expect(headers: &mut http::HeaderMap) {
+    if headers.contains_key(header::EXPECT) {
+        return;
+    }
+    let signs_expect = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once("SignedHeaders="))
+        .and_then(|(_, rest)| rest.split(',').next())
+        .is_some_and(|names| {
+            names
+                .split(';')
+                .any(|name| name.trim().eq_ignore_ascii_case("expect"))
+        });
+    if signs_expect {
+        headers.insert(
+            header::EXPECT,
+            http::HeaderValue::from_static("100-continue"),
+        );
+    }
+}
+
 impl Service<Request<Incoming>> for WrappingService {
     type Response = HttpResponse;
 
@@ -892,6 +916,7 @@ impl Service<Request<Incoming>> for WrappingService {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let (mut parts, body) = req.into_parts();
+        restore_signed_expect(&mut parts.headers);
         // Stage: classification. Route, bucket, CORS preconditions and body
         // shape are derived before anything is parsed or stored.
         let classification = RequestClassification::classify(&parts, &self.domain);

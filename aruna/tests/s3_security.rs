@@ -8,6 +8,9 @@
 mod shared;
 
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextMut;
+use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
+use aws_sdk_s3::error::BoxError;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, ServerSideEncryption};
@@ -84,6 +87,63 @@ async fn forged_credentials_rejected() -> TestResult<()> {
             service_error_code(&bad_key).as_deref(),
             Some("InvalidAccessKeyId"),
             "unknown access key must be rejected"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
+/// Signs `Expect` as aws-sdk-go v1 does on a retry, then drops it as Envoy does.
+#[derive(Debug)]
+struct DroppedExpect;
+
+impl Intercept for DroppedExpect {
+    fn name(&self) -> &'static str {
+        "DroppedExpect"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        context
+            .request_mut()
+            .headers_mut()
+            .insert("expect", "100-continue");
+        Ok(())
+    }
+
+    fn modify_before_transmit(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        context.request_mut().headers_mut().remove("expect");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn dropped_expect_accepted() -> TestResult<()> {
+    let (seed, _admin_token, credentials) = security_setup("s3-sec-expect").await?;
+
+    let result = async {
+        let listed = no_retry_client(&seed, &credentials)?
+            .list_buckets()
+            .customize()
+            .interceptor(DroppedExpect)
+            .send()
+            .await;
+        assert!(
+            listed.is_ok(),
+            "a signed Expect removed by a proxy must still verify: {:?}",
+            service_error_code(&listed)
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
