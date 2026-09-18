@@ -18,8 +18,8 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::command::{
-    CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget, InputMode, SessionMountSpec,
-    SubmitExecutionCommand, WorkspaceMode, WorkspaceSpec,
+    AcceptedExecution, CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget,
+    InputMode, SessionMountSpec, SubmitExecutionCommand, WorkspaceMode, WorkspaceSpec,
 };
 use aruna_operations::jobs::lifecycle::family_report;
 use aruna_operations::jobs::service::{
@@ -422,9 +422,7 @@ impl McpServer {
         )
         .await
         .map_err(|error| job_error(map_job_request(error)))?;
-        Ok(Json(JsonPayload(
-            serde_json::to_value(response).map_err(internal_error)?,
-        )))
+        accepted_payload(&self.state, response).await
     }
 
     #[tool(
@@ -552,8 +550,7 @@ impl McpServer {
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("run_script", &input)?;
-        let run_id = Ulid::from_parts(7, 7).to_string();
-        let plan = build_script(input, &run_id)?;
+        let plan = plan_script(input)?;
         write_text(
             self,
             &auth,
@@ -600,9 +597,7 @@ impl McpServer {
         )
         .await
         .map_err(|error| submit_error(map_job_request(error)))?;
-        Ok(Json(JsonPayload(
-            serde_json::to_value(response).map_err(internal_error)?,
-        )))
+        accepted_payload(&self.state, response).await
     }
 
     #[tool(
@@ -625,9 +620,7 @@ impl McpServer {
         )
         .await
         .map_err(|error| submit_error(map_job_request(error)))?;
-        Ok(Json(JsonPayload(
-            serde_json::to_value(response).map_err(internal_error)?,
-        )))
+        accepted_payload(&self.state, response).await
     }
 
     #[tool(
@@ -947,6 +940,28 @@ async fn artifact_output(
     }
 }
 
+/// Answers with the REST submit response, including the owner and status URLs.
+async fn accepted_payload(
+    state: &crate::server::state::ServerState,
+    accepted: AcceptedExecution,
+) -> Result<Json<JsonPayload>, CallToolResult> {
+    let urls = crate::routes::jobs::job_urls(state, accepted.job_id)
+        .await
+        .map_err(server_error)?;
+    let response = crate::routes::jobs::SubmitJobResponse {
+        job_id: accepted.job_id.to_string(),
+        created: accepted.created,
+        submission_id: accepted.submission_id,
+        canonical_job_id: accepted.canonical_job_id.to_string(),
+        state: accepted.state,
+        origin_node_url: urls.owner_node_url,
+        status_url: urls.status_url,
+    };
+    Ok(Json(JsonPayload(
+        serde_json::to_value(response).map_err(internal_error)?,
+    )))
+}
+
 fn request_bearer(parts: &http::request::Parts) -> Option<crate::auth::ValidatedBearer> {
     parts
         .extensions
@@ -1045,6 +1060,11 @@ async fn compute_probe(
     super::authorize_self(&server.state, auth, permission, extras)
         .await
         .map_err(server_error)
+}
+
+/// Each run gets a fresh id, so it stages its own script and is not a replay of an earlier run.
+fn plan_script(input: RunScriptInput) -> Result<ScriptPlan, CallToolResult> {
+    build_script(input, &Ulid::generate().to_string())
 }
 
 fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallToolResult> {

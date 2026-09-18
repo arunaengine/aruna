@@ -1,4 +1,4 @@
-//! Tests script request building, runtime checks, and job error mapping in the compute tools.
+//! Tests script plans, runtime checks, job error mapping and submit answers in the compute tools.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -186,4 +186,41 @@ fn runtime_output_ids() {
     assert!(ids.iter().any(|id| id == "bash"));
     assert!(ids.iter().any(|id| id == "deno"));
     assert!(ids.iter().any(|id| id == "python-uv"));
+}
+
+#[test]
+fn fresh_run_ids() {
+    let first = plan_script(script_input("bash", None)).unwrap();
+    let second = plan_script(script_input("bash", None)).unwrap();
+    assert_ne!(first.script_key, second.script_key);
+    assert_ne!(
+        first.request.idempotency_key,
+        second.request.idempotency_key
+    );
+}
+
+#[tokio::test]
+async fn accepted_carries_urls() {
+    let (state, _dir) = crate::tests::users::setup_state().await;
+    state
+        .register_rest_public(
+            "127.0.0.1:3000".parse().unwrap(),
+            Some("https://owner.example/"),
+        )
+        .await;
+    let job_id = aruna_core::structs::execution::job::JobId::from_bytes([13u8; 16]);
+    let accepted = AcceptedExecution {
+        job_id,
+        created: true,
+        submission_id: None,
+        canonical_job_id: job_id,
+        state: "queued".to_string(),
+    };
+    let Json(JsonPayload(body)) = accepted_payload(&state, accepted).await.unwrap();
+    assert_eq!(body["job_id"], job_id.to_string());
+    assert_eq!(body["origin_node_url"], "https://owner.example/api/v1");
+    assert_eq!(
+        body["status_url"],
+        format!("https://owner.example/api/v1/compute/jobs/{job_id}")
+    );
 }
