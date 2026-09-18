@@ -188,12 +188,26 @@ impl OutboxBarrier {
         let marker = std::env::var("ARUNA_TEST_OUTBOX_BARRIER")
             .ok()
             .map(std::path::PathBuf::from)?;
-        let barrier = Self { marker };
-        if let Err(error) = std::fs::write(&barrier.marker, b"active") {
-            warn!(error = %error, "Failed to arm outbox test barrier");
-            return None;
+        Self::arm(marker)
+    }
+
+    /// Pins only the first drain of a launch. The test releases it once, so a
+    /// retry or refire drain after that must run instead of waiting again.
+    pub(super) fn arm(marker: std::path::PathBuf) -> Option<Self> {
+        use std::io::Write;
+        let armed = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .and_then(|mut file| file.write_all(b"active"));
+        match armed {
+            Ok(()) => Some(Self { marker }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+            Err(error) => {
+                warn!(error = %error, "Failed to arm outbox test barrier");
+                None
+            }
         }
-        Some(barrier)
     }
 
     /// Holds the drain open until the test writes "release" into the marker

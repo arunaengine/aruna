@@ -393,6 +393,28 @@ fn rotation_close_clears() {
     assert_eq!(rotation.totals.examined, 0);
 }
 
+/// The test releases the barrier once per launch, so a retry or refire drain
+/// after that release must run instead of waiting on it again.
+#[cfg(debug_assertions)]
+#[test]
+fn barrier_pins_once() {
+    let dir = tempdir().expect("temp dir");
+    let marker = dir.path().join("outbox.barrier");
+    let read = || std::fs::read_to_string(&marker).expect("read marker");
+
+    let first = OutboxBarrier::arm(marker.clone()).expect("the first drain arms the barrier");
+    assert_eq!(read(), "active");
+    std::fs::write(&marker, b"release").expect("release the barrier");
+    drop(first);
+    assert_eq!(read(), "joined");
+
+    assert!(
+        OutboxBarrier::arm(marker.clone()).is_none(),
+        "a later drain of the same launch must not be pinned again"
+    );
+    assert_eq!(read(), "joined");
+}
+
 #[test]
 fn rotation_holds_boundary() {
     let mut rotation = OutboxRotation {
