@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 /// Budget for a harvested document's normalized metadata path.
-
 pub const HARVEST_PATH_BYTES: usize = 512;
 /// `b3-` plus 64 hex characters: the shortest segment any identifier can take.
 pub const DIGEST_SEGMENT_BYTES: usize = 67;

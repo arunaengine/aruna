@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 /// Returns 0 if system time is before UNIX epoch (should never happen in practice).
-
 #[inline]
 pub fn unix_timestamp_secs() -> u64 {
     std::time::SystemTime::now()
