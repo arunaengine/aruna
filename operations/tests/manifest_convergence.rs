@@ -142,22 +142,27 @@ async fn interleaved_writes_converge() -> Result<(), Box<dyn std::error::Error>>
                 .iter()
                 .find(|entry| entry.target == deleted_target)
                 .map(|entry| entry.revision);
-            if left_tomb.is_some() && left_tomb == right_tomb {
-                // Both holders now carry the same tombstone row: the whole entry set
-                // (tombstone included) and the digest must be identical.
-                assert_eq!(
-                    left.entries.len(),
-                    manifest_rows,
-                    "the delete keeps a tombstone row"
-                );
-                assert_eq!(sorted_entries(&left), sorted_entries(&right));
-                assert_eq!(left.digest, right.digest);
-                return Ok(0);
-            }
-            Ok(1)
+            // A matching tombstone alone is not convergence: an earlier write may
+            // still be in flight, so wait for the whole entry set before judging.
+            let agreed = left_tomb.is_some()
+                && left_tomb == right_tomb
+                && left.entries.len() == manifest_rows
+                && sorted_entries(&left) == sorted_entries(&right)
+                && left.digest == right.digest;
+            Ok(usize::from(!agreed))
         },
     )
     .await?;
+
+    let left = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
+    let right = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
+    assert_eq!(
+        left.entries.len(),
+        manifest_rows,
+        "the delete keeps a tombstone row"
+    );
+    assert_eq!(sorted_entries(&left), sorted_entries(&right));
+    assert_eq!(left.digest, right.digest);
 
     shutdown_nodes(nodes).await;
     Ok(())
