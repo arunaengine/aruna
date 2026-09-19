@@ -5,6 +5,9 @@
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
+use aruna_core::structs::storage::usage::{UsageCounters, UsageDelta};
+use byteview::ByteView;
+use fjall::Readable;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -13,6 +16,82 @@ use crate::compaction::{DELETE_THRESHOLD, compactable};
 use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Txn};
 
 impl FjallStorage {
+    #[tracing::instrument(
+        name = "storage.add_usage",
+        level = "debug",
+        skip(self, deltas),
+        fields(key_space = %key_space, delta_count = deltas.len(), txn_id = %txn_id)
+    )]
+    pub(super) fn add_usage(
+        &mut self,
+        key_space: String,
+        deltas: Vec<(ByteView, UsageDelta)>,
+        txn_id: Ulid,
+    ) -> StorageEvent {
+        if let Err(error) = self.store.resolve_keyspace(&key_space) {
+            return StorageEvent::Error { error };
+        }
+        if !matches!(self.txns.get(&txn_id), Some(Txn::Write(_))) {
+            return StorageEvent::Error {
+                error: StorageError::TransactionNotFound,
+            };
+        }
+        let pending = self.txn_usage.entry(txn_id).or_default();
+        let mut entries = Vec::with_capacity(deltas.len());
+        for (key, delta) in deltas {
+            entries.push((key_space.clone(), key.clone()));
+            match pending
+                .iter_mut()
+                .find(|(space, existing, _)| *space == key_space && *existing == key)
+            {
+                Some((_, _, existing)) => *existing = existing.merge(delta),
+                None => pending.push((key_space.clone(), key, delta)),
+            }
+        }
+        StorageEvent::BatchWriteResult { entries }
+    }
+
+    /// Writes the transaction's usage deltas on top of the latest committed counters. Only
+    /// this worker commits, so no other commit can land between this read and the commit.
+    fn stage_usage(
+        &mut self,
+        txn_id: Ulid,
+        txn: &mut fjall::OptimisticWriteTx,
+    ) -> Result<(), StorageError> {
+        let Some(pending) = self.txn_usage.remove(&txn_id) else {
+            return Ok(());
+        };
+        let snapshot = self.store.db.read_tx();
+        for (key_space, key, delta) in pending {
+            let keyspace = self.store.resolve_keyspace(&key_space)?;
+            let stored = snapshot
+                .get(&keyspace, &key)
+                .map_err(|error| StorageError::ReadError(error.to_string()))?;
+            let mut counters = match stored {
+                Some(bytes) => UsageCounters::from_bytes(&bytes)
+                    .map_err(|error| StorageError::WriteError(error.to_string()))?,
+                None => UsageCounters::default(),
+            };
+            let shortfalls = counters
+                .apply(&delta)
+                .map_err(|error| StorageError::WriteError(error.to_string()))?;
+            for shortfall in shortfalls {
+                warn!(
+                    event = "storage.usage.clamped",
+                    field = shortfall.field,
+                    key = hex::encode(&key),
+                    shortfall = shortfall.missing,
+                    "usage counter decrement clamped at zero"
+                );
+            }
+            let value = counters
+                .to_bytes()
+                .map_err(|error| StorageError::WriteError(error.to_string()))?;
+            txn.insert(keyspace, key, value);
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(
         name = "storage.start_transaction",
         level = "debug",
@@ -90,6 +169,7 @@ impl FjallStorage {
             };
         }
         self.take_txn_deletes(txn_id, false);
+        self.txn_usage.remove(&txn_id);
         match self.txns.remove(&txn_id) {
             Some(Txn::Write(txn)) => {
                 txn.rollback();
@@ -141,7 +221,12 @@ impl FjallStorage {
 
         match self.txns.remove(&txn_id) {
             Some(Txn::Read(_)) => StorageEvent::TransactionCommitted { txn_id },
-            Some(Txn::Write(txn)) => {
+            Some(Txn::Write(mut txn)) => {
+                if let Err(error) = self.stage_usage(txn_id, &mut txn) {
+                    self.take_txn_deletes(txn_id, false);
+                    txn.rollback();
+                    return StorageEvent::Error { error };
+                }
                 let committed = txn.commit();
                 self.take_txn_deletes(txn_id, matches!(committed, Ok(Ok(()))));
                 match committed {

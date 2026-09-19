@@ -1694,11 +1694,11 @@ fn indexes_noncurrent_version() {
     assert_eq!(op.state, IncomingVersionState::UpdateUsage);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { .. })]
+        [Effect::Storage(StorageEffect::AddUsage { .. })]
     ));
 
-    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(vec![0].into(), None), (vec![1].into(), None)],
+    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
     }));
     assert!(matches!(
         effects.as_slice(),
@@ -2951,8 +2951,8 @@ fn materialized_trace() {
     }));
     assert_eq!(op.state, IncomingVersionState::UpdateUsage);
 
-    op.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(vec![0].into(), None), (vec![1].into(), None)],
+    op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
     }));
     op.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),

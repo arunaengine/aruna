@@ -101,6 +101,7 @@ impl FjallStorage {
             compactor: Compactor::spawn(),
             deletes: HashMap::new(),
             txn_deletes: HashMap::new(),
+            txn_usage: HashMap::new(),
         }
     }
 }

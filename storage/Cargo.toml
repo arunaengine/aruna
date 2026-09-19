@@ -17,6 +17,7 @@ crossfire = { workspace = true }
 aruna-core = { workspace = true }
 ulid = { workspace = true }
 byteview = { workspace = true }
+hex = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }

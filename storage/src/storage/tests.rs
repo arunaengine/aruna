@@ -7,7 +7,9 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::structs::storage::usage::{UsageCounters, UsageDelta};
+use byteview::ByteView;
 use std::future::{Future, poll_fn};
 use std::sync::atomic::Ordering;
 use std::task::Poll;
@@ -329,6 +331,7 @@ fn bulk_full_rejects() {
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         txn_deletes: std::collections::HashMap::new(),
+        txn_usage: std::collections::HashMap::new(),
     };
     let metrics = std::sync::Arc::new(super::StorageMetrics::default());
     let read_effect = || StorageEffect::Read {
@@ -1308,6 +1311,7 @@ fn unknown_commit_runs() {
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         txn_deletes: std::collections::HashMap::new(),
+        txn_usage: std::collections::HashMap::new(),
     };
 
     let event = storage.commit_transaction(txn_id);
@@ -1355,6 +1359,7 @@ fn unknown_commit_retires() {
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         txn_deletes: std::collections::HashMap::new(),
+        txn_usage: std::collections::HashMap::new(),
     };
 
     for _ in 0..=super::MAX_CLEANUP_ATTEMPTS {
@@ -1399,6 +1404,7 @@ fn retry_skips_queued() {
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         txn_deletes: std::collections::HashMap::new(),
+        txn_usage: std::collections::HashMap::new(),
     };
 
     storage.retry_cleanup();
@@ -2315,4 +2321,139 @@ fn abort_drops_deletes() {
 
     assert!(!storage.deletes.contains_key("dht_meta_v2"));
     assert!(!storage.txn_deletes.contains_key(&txn_id));
+}
+
+async fn add_usage(handle: &StorageHandle, txn_id: Ulid, delta: UsageDelta) {
+    match handle
+        .send_storage_effect(StorageEffect::AddUsage {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            deltas: vec![(ByteView::from(b"group".to_vec()), delta)],
+            txn_id,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        other => panic!("unexpected storage event: {other:?}"),
+    }
+}
+
+async fn read_usage(handle: &StorageHandle, txn_id: Option<Ulid>) -> Option<UsageCounters> {
+    match handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: ByteView::from(b"group".to_vec()),
+            txn_id,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            value.map(|bytes| UsageCounters::from_bytes(&bytes).unwrap())
+        }
+        other => panic!("unexpected storage event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parallel_usage_commits() {
+    let dir = tempdir().unwrap();
+    let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let first = start_write_transaction(&handle).await;
+    let second = start_write_transaction(&handle).await;
+    let delta = UsageDelta {
+        objects: 1,
+        logical_bytes: 10,
+        ..Default::default()
+    };
+    add_usage(&handle, first, delta).await;
+    add_usage(&handle, second, delta.merge(delta)).await;
+
+    // Both transactions overlap on the row, but neither read it.
+    commit_transaction(&handle, first).await;
+    commit_transaction(&handle, second).await;
+
+    let counters = read_usage(&handle, None).await.unwrap();
+    assert_eq!((counters.objects, counters.logical_bytes), (3, 30));
+}
+
+#[tokio::test]
+async fn usage_reader_conflicts() {
+    let dir = tempdir().unwrap();
+    let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    // Like the quota gate, this transaction reads the row it depends on.
+    let reader = start_write_transaction(&handle).await;
+    assert_eq!(read_usage(&handle, Some(reader)).await, None);
+    let writer = start_write_transaction(&handle).await;
+    let delta = UsageDelta {
+        logical_bytes: 5,
+        ..Default::default()
+    };
+    add_usage(&handle, writer, delta).await;
+    commit_transaction(&handle, writer).await;
+
+    add_usage(&handle, reader, delta).await;
+    assert!(matches!(
+        handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id: reader })
+            .await,
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict
+        })
+    ));
+    assert_eq!(read_usage(&handle, None).await.unwrap().logical_bytes, 5);
+}
+
+#[tokio::test]
+async fn usage_clamps_zero() {
+    let dir = tempdir().unwrap();
+    let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let seed = start_write_transaction(&handle).await;
+    add_usage(
+        &handle,
+        seed,
+        UsageDelta {
+            objects: 1,
+            logical_bytes: 5,
+            ..Default::default()
+        },
+    )
+    .await;
+    commit_transaction(&handle, seed).await;
+
+    // A drifted row is clamped instead of refusing the commit.
+    let delete = start_write_transaction(&handle).await;
+    add_usage(
+        &handle,
+        delete,
+        UsageDelta {
+            objects: -1,
+            logical_bytes: -100,
+            ..Default::default()
+        },
+    )
+    .await;
+    commit_transaction(&handle, delete).await;
+
+    assert_eq!(
+        read_usage(&handle, None).await,
+        Some(UsageCounters::default())
+    );
+}
+
+#[tokio::test]
+async fn aborted_usage_discarded() {
+    let dir = tempdir().unwrap();
+    let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let txn_id = start_write_transaction(&handle).await;
+    add_usage(
+        &handle,
+        txn_id,
+        UsageDelta {
+            objects: 3,
+            ..Default::default()
+        },
+    )
+    .await;
+    abort_transaction(&handle, txn_id).await;
+
+    assert_eq!(read_usage(&handle, None).await, None);
 }

@@ -43,10 +43,6 @@ use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocume
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
-    #[error(transparent)]
-    ConversionError(#[from] ConversionError),
-    #[error(transparent)]
-    CounterError(#[from] UsageCounterError),
     #[error("usage counter update received unexpected event: {0:?}")]
     UnexpectedEvent(Event),
 }
@@ -54,14 +50,14 @@ pub enum UsageUpdateError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum UsageUpdatePhase {
     Pending,
-    Reading,
+    Adding,
     Writing,
     Done,
 }
 
-/// Embeddable read-modify-write of the maintained usage counters. Hosts run
-/// it inside their own transaction right before the commit so counter changes
-/// are atomic with the data they account for.
+/// Embeddable update of the maintained usage counters. Storage adds the deltas
+/// when the host's transaction commits, so counters stay atomic with the data
+/// and parallel writers of one group do not conflict on the counter rows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageCounterUpdate {
     entries: Vec<(Vec<u8>, UsageDelta)>,
@@ -201,54 +197,31 @@ impl UsageCounterUpdate {
     }
 
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
-        self.phase = UsageUpdatePhase::Reading;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self
+        self.phase = UsageUpdatePhase::Adding;
+        smallvec![Effect::Storage(StorageEffect::AddUsage {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            deltas: self
                 .entries
                 .iter()
-                .map(|(key, _)| (USAGE_STATS_KEYSPACE.to_string(), key.clone().into()))
+                .map(|(key, delta)| (key.clone().into(), *delta))
                 .collect(),
-            txn_id: Some(txn_id),
+            txn_id,
         })]
     }
 
     /// Returns `Ok(Some(effects))` while more storage work is needed and
-    /// `Ok(None)` once the counters are written.
+    /// `Ok(None)` once the update is staged in the transaction.
     pub fn step(
         &mut self,
         event: Event,
         txn_id: TxnId,
     ) -> Result<Option<Effects>, UsageUpdateError> {
         match (&self.phase, event) {
-            (
-                UsageUpdatePhase::Reading,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                let mut writes = Vec::with_capacity(self.entries.len() + 2);
-                for ((key, delta), (_, value)) in self.entries.iter().zip(values) {
-                    let mut counters = match value {
-                        Some(value) => UsageCounters::from_bytes(value.as_ref())?,
-                        None => UsageCounters::default(),
-                    };
-                    for shortfall in counters.apply(delta)? {
-                        warn!(
-                            field = shortfall.field,
-                            key = hex::encode(key),
-                            shortfall = shortfall.missing,
-                            "usage counter decrement clamped at zero"
-                        );
-                    }
-                    writes.push((
-                        USAGE_STATS_KEYSPACE.to_string(),
-                        key.clone().into(),
-                        counters.to_bytes()?.into(),
-                    ));
-                }
-                writes.extend(self.dirty_marker_writes());
+            (UsageUpdatePhase::Adding, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 self.phase = UsageUpdatePhase::Writing;
                 Ok(Some(smallvec![Effect::Storage(
                     StorageEffect::BatchWrite {
-                        writes,
+                        writes: self.dirty_marker_writes(),
                         txn_id: Some(txn_id),
                     }
                 )]))
@@ -1988,41 +1961,39 @@ mod tests {
         );
 
         let effects = update.start(txn_id);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 2
-        ));
-
-        let existing = UsageCounters {
-            objects: 5,
-            logical_bytes: 100,
+        let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+            panic!("expected the counter deltas, got {effects:?}");
+        };
+        let expected = UsageDelta {
+            objects: 1,
+            logical_bytes: 42,
             ..Default::default()
         };
+        assert_eq!(
+            deltas,
+            &vec![
+                (global_group_key(group_id).into(), expected),
+                (usage_group_key(group_id).into(), expected),
+            ]
+        );
+
         let effects = update
             .step(
-                Event::Storage(StorageEvent::BatchReadResult {
-                    values: vec![
-                        (
-                            global_group_key(group_id).into(),
-                            Some(existing.to_bytes().unwrap().into()),
-                        ),
-                        (usage_group_key(group_id).into(), None),
-                    ],
+                Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
                 }),
                 txn_id,
             )
             .unwrap()
             .unwrap();
-
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected counter batch write");
+            panic!("expected the dirty marker write");
         };
-        let global = UsageCounters::from_bytes(writes[0].2.as_ref()).unwrap();
-        assert_eq!(global.objects, 6);
-        assert_eq!(global.logical_bytes, 142);
-        let group = UsageCounters::from_bytes(writes[1].2.as_ref()).unwrap();
-        assert_eq!(group.objects, 1);
-        assert_eq!(group.logical_bytes, 42);
+        assert!(
+            writes
+                .iter()
+                .all(|(key_space, ..)| key_space == NODE_STATS_KEYSPACE)
+        );
 
         let done = update
             .step(
