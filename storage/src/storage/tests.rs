@@ -2403,7 +2403,7 @@ async fn usage_reader_conflicts() {
 }
 
 #[tokio::test]
-async fn usage_clamps_at_zero() {
+async fn usage_clamps_zero() {
     let dir = tempdir().unwrap();
     let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let seed = start_write_transaction(&handle).await;

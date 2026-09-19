@@ -1992,7 +1992,7 @@ mod tests {
         assert!(
             writes
                 .iter()
-                .all(|(key_space, ..)| key_space == USAGE_NODE_STATS_KEYSPACE)
+                .all(|(key_space, ..)| key_space == NODE_STATS_KEYSPACE)
         );
 
         let done = update
