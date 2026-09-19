@@ -1,3 +1,7 @@
+//! MCP tools that list buckets and objects, read and write them, and aggregate or search.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::context::member_groups;
 use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
@@ -5,24 +9,26 @@ use super::{
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{
-    AuthContext, BucketInfo, OBJECT_CONTENT_TYPE_KEY, Permission, blob_bucket_permission_path,
-    blob_object_permission_path, key_content_type,
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use aruna_operations::s3::get_object::{
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::replication::queue::complete_put;
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
+use aruna_operations::s3::object::get::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
-use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
-use aruna_operations::s3::list_objects_v2::{
-    ListObjectsV2ContinuationToken, ListObjectsV2Input, ListObjectsV2Object, ListObjectsV2Operation,
+use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::list::{
+    ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
 };
-use aruna_operations::s3::put_object::{
+use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
+use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -56,10 +62,8 @@ pub struct BucketsOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ListObjectsInput {
-    /// Bucket name as the S3 surface uses it, for example `project-data`. Three
-    /// to 63 characters of lowercase letters, digits, dots, and hyphens. Call
-    /// `list_buckets` for the readable names; this is not an `s3://` URL and
-    /// carries no key.
+    /// S3 bucket name, containing three to 63 lowercase letters, digits, dots, or hyphens.
+    /// Call `list_buckets` for names. Do not pass an `s3://` URL or key.
     pub bucket: String,
     /// Optional key prefix filter, for example `reads/2026/`. Matched literally
     /// from the start of the key, with no wildcards and no leading slash.
@@ -274,10 +278,8 @@ impl SearchKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchInput {
-    /// Search text, at least two characters after trimming. Matched as a
-    /// substring for buckets, groups, and users, and as a full-text query over
-    /// name, description, keywords, and identifier for documents. Plain terms
-    /// only: boolean operators, quotes, and wildcards are stripped.
+    /// Search text of at least two characters. Buckets, groups, and users use substring matching.
+    /// Documents search names, descriptions, keywords, and identifiers after removing operators.
     pub q: String,
     /// Restrict the answer to one section: `documents`, `buckets`, `groups`, or
     /// `users`. Omit to search all four. Each section returns at most ten hits,
@@ -322,14 +324,12 @@ impl McpServer {
                 &self.state.get_ctx(),
             )
             .await
-            .and_then(|result| result.transpose())
-            .map_err(internal_error)?
-            .ok_or_else(|| internal_error("bucket listing did not finish"))?;
+            .map_err(internal_error)?;
             for (bucket, info) in result.buckets {
                 authorize_tool(
                     &self.state,
                     &auth,
-                    blob_bucket_permission_path(
+                    bucket_permission_path(
                         self.state.get_realm_id(),
                         info.group_id,
                         self.state.get_node_id(),
@@ -370,7 +370,7 @@ impl McpServer {
         authorize_tool(
             &self.state,
             &auth,
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 self.state.get_realm_id(),
                 bucket_info.group_id,
                 self.state.get_node_id(),
@@ -384,7 +384,7 @@ impl McpServer {
         let cursor = input.cursor.as_deref().map(decode_cursor).transpose()?;
         let limit = input.limit.unwrap_or(100).clamp(1, 200);
         let result = drive(
-            ListObjectsV2Operation::new(ListObjectsV2Input {
+            ListBucketOperation::new(ListBucketInput {
                 bucket: input.bucket.clone(),
                 group_id: bucket_info.group_id,
                 continuation_token: cursor,
@@ -396,9 +396,7 @@ impl McpServer {
             &self.state.get_ctx(),
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(internal_error)?
-        .ok_or_else(|| internal_error("object listing did not finish"))?;
+        .map_err(internal_error)?;
         let objects = result
             .objects
             .into_iter()
@@ -493,7 +491,7 @@ impl McpServer {
         authorize_tool(
             &self.state,
             &auth,
-            blob_object_permission_path(
+            object_permission_path(
                 self.state.get_realm_id(),
                 bucket_info.group_id,
                 self.state.get_node_id(),
@@ -514,9 +512,7 @@ impl McpServer {
             &self.state.get_ctx(),
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(map_head_error)?
-        .ok_or_else(|| internal_error("object head did not finish"))?;
+        .map_err(map_head_error)?;
         let size = result
             .location
             .as_ref()
@@ -551,7 +547,7 @@ impl McpServer {
             .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
         let content_type = result
             .metadata
-            .get(OBJECT_CONTENT_TYPE_KEY)
+            .get(CONTENT_TYPE_KEY)
             .cloned()
             .or_else(|| {
                 result
@@ -606,7 +602,7 @@ impl McpServer {
         authorize_tool(
             &self.state,
             &auth,
-            blob_bucket_permission_path(
+            bucket_permission_path(
                 self.state.get_realm_id(),
                 bucket_info.group_id,
                 self.state.get_node_id(),
@@ -623,7 +619,7 @@ impl McpServer {
         let mut scan_truncated = false;
         loop {
             let page = drive(
-                ListObjectsV2Operation::new(ListObjectsV2Input {
+                ListBucketOperation::new(ListBucketInput {
                     bucket: input.bucket.clone(),
                     group_id: bucket_info.group_id,
                     continuation_token: cursor,
@@ -635,9 +631,7 @@ impl McpServer {
                 &self.state.get_ctx(),
             )
             .await
-            .and_then(|result| result.transpose())
-            .map_err(internal_error)?
-            .ok_or_else(|| internal_error("object listing did not finish"))?;
+            .map_err(internal_error)?;
             scanned = scanned.saturating_add(page.objects.len());
             for object in &page.objects {
                 let Some(at) = entry_time(object) else {
@@ -706,7 +700,7 @@ impl McpServer {
         authorize_search(self, &auth, extras).await?;
         let bearer = parts
             .extensions
-            .get::<Option<crate::auth::ValidatedArunaBearerTokenCarrier>>()
+            .get::<Option<crate::auth::ValidatedBearer>>()
             .cloned()
             .flatten()
             .map(|carrier| carrier.as_str().to_string());
@@ -734,17 +728,15 @@ impl McpServer {
 
     async fn bucket_info(&self, bucket: &str) -> Result<BucketInfo, CallToolResult> {
         drive(
-            GetBucketInfoOperation::new(bucket.to_string()),
+            GetBucketOperation::new(bucket.to_string()),
             &self.state.get_ctx(),
         )
         .await
-        .and_then(|result| result.transpose())
-        .map_err(map_bucket_error)?
-        .ok_or_else(|| internal_error("bucket lookup did not finish"))
+        .map_err(map_bucket_error)
     }
 }
 
-fn entry_size(object: &ListObjectsV2Object) -> Option<u64> {
+fn entry_size(object: &ListedObject) -> Option<u64> {
     object
         .location
         .as_ref()
@@ -757,7 +749,7 @@ fn entry_size(object: &ListObjectsV2Object) -> Option<u64> {
         })
 }
 
-fn entry_time(object: &ListObjectsV2Object) -> Option<std::time::SystemTime> {
+fn entry_time(object: &ListedObject) -> Option<std::time::SystemTime> {
     object
         .version_created_at
         .or(object.last_refresh)
@@ -872,7 +864,7 @@ pub(crate) async fn read_text(
     server: &McpServer,
     auth: &AuthContext,
     input: ReadObjectInput,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<ReadObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let max_bytes = bounded_bytes(input.max_bytes)?;
@@ -881,7 +873,7 @@ pub(crate) async fn read_text(
     authorize_tool(
         &server.state,
         auth,
-        blob_object_permission_path(
+        object_permission_path(
             server.state.get_realm_id(),
             bucket_info.group_id,
             server.state.get_node_id(),
@@ -917,12 +909,10 @@ pub(crate) async fn read_text(
         auth.path_restrictions.clone(),
     )
     .await
-    .and_then(|result| result.transpose())
-    .map_err(map_get_error)?
-    .ok_or_else(|| internal_error("object read did not finish"))?;
+    .map_err(map_get_error)?;
     let content_type = result
         .metadata
-        .remove(OBJECT_CONTENT_TYPE_KEY)
+        .remove(CONTENT_TYPE_KEY)
         .or_else(|| {
             result
                 .source_metadata
@@ -963,7 +953,7 @@ pub(crate) async fn write_text(
     server: &McpServer,
     auth: &AuthContext,
     input: WriteObjectInput,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<WriteObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let size = input.text.len();
@@ -975,11 +965,14 @@ pub(crate) async fn write_text(
             ),
         )));
     }
+    guard_bucket_write(server.state.get_ctx().as_ref(), &input.bucket)
+        .await
+        .map_err(map_offered_error)?;
     let bucket_info = server.bucket_info(&input.bucket).await?;
     authorize_tool(
         &server.state,
         auth,
-        blob_object_permission_path(
+        object_permission_path(
             server.state.get_realm_id(),
             bucket_info.group_id,
             server.state.get_node_id(),
@@ -996,7 +989,7 @@ pub(crate) async fn write_text(
         .clone()
         .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
     let realm = drive(
-        GetRealmConfigOperation::new(server.state.get_realm_id()),
+        GetConfigOperation::new(server.state.get_realm_id()),
         &server.state.get_ctx(),
     )
     .await
@@ -1036,24 +1029,20 @@ pub(crate) async fn write_text(
     })
     .with_rocrate_limits(server.state.rocrate_limits().clone())
     .with_metadata(HashMap::from([(
-        OBJECT_CONTENT_TYPE_KEY.to_string(),
+        CONTENT_TYPE_KEY.to_string(),
         content_type.clone(),
-    )]));
+    )]))
+    .with_restrictions(auth.path_restrictions.clone());
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
     let result = drive(operation, &server.state.get_ctx())
         .await
-        .and_then(|result| result.transpose())
-        .map_err(map_put_error)?
-        .ok_or_else(|| internal_error("object write did not finish"))?;
-    crate::s3::s3_service::ArunaS3Service::new(
-        server.state.get_ctx(),
+        .map_err(map_put_error)?;
+    complete_put(
+        &server.state.get_ctx(),
         server.state.get_realm_id(),
         server.state.get_node_id(),
-    )
-    .await
-    .complete_put(
         auth.clone(),
         bucket_info.group_id,
         input.bucket.clone(),
@@ -1084,6 +1073,16 @@ fn object_error(error: crate::error::ServerError, action: &str) -> CallToolResul
     }
 }
 
+fn map_offered_error(error: OfferedDirectoryError) -> CallToolResult {
+    match error {
+        OfferedDirectoryError::ReadOnly(bucket) => explained(
+            crate::error::ServerError::Forbidden,
+            format!("bucket {bucket} is an offered directory and is read-only"),
+        ),
+        error => internal_error(error),
+    }
+}
+
 /// The S3 key rule reads as an opaque `InvalidArgument`; a tool caller needs the
 /// shape a key must have.
 fn validate_key(key: &str) -> Result<(), CallToolResult> {
@@ -1107,15 +1106,15 @@ fn bounded_bytes(max_bytes: Option<usize>) -> Result<usize, CallToolResult> {
     Ok(max_bytes)
 }
 
-fn decode_cursor(cursor: &str) -> Result<ListObjectsV2ContinuationToken, CallToolResult> {
+fn decode_cursor(cursor: &str) -> Result<ListContinuationToken, CallToolResult> {
     const REASON: &str = "cursor must be a next_cursor value copied verbatim from a previous \
                           list_objects answer for the same bucket and prefix; omit it to start at \
                           the first page";
     let bytes = STANDARD.decode(cursor).map_err(|_| bad_request(REASON))?;
-    ListObjectsV2ContinuationToken::from_bytes(&bytes).map_err(|_| bad_request(REASON))
+    ListContinuationToken::from_bytes(&bytes).map_err(|_| bad_request(REASON))
 }
 
-fn encode_cursor(cursor: &ListObjectsV2ContinuationToken) -> Result<String, CallToolResult> {
+fn encode_cursor(cursor: &ListContinuationToken) -> Result<String, CallToolResult> {
     cursor
         .to_bytes()
         .map(|bytes| STANDARD.encode(bytes))
@@ -1127,26 +1126,26 @@ fn encode_cursor(cursor: &ListObjectsV2ContinuationToken) -> Result<String, Call
 async fn authorize_search(
     server: &McpServer,
     auth: &AuthContext,
-    extras: aruna_operations::request_policy::PolicyRequestExtras,
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(server.state.as_ref(), auth, Permission::READ, extras)
         .await
         .map_err(server_error)
 }
 
-fn map_bucket_error(error: GetBucketInfoError) -> CallToolResult {
+fn map_bucket_error(error: GetBucketError) -> CallToolResult {
     match error {
-        GetBucketInfoError::NotFound => missing_bucket(),
-        GetBucketInfoError::StorageError(error) => internal_error(error),
-        GetBucketInfoError::ConversionError(error) => internal_error(error),
-        GetBucketInfoError::InvalidStateEvent {
+        GetBucketError::NotFound => missing_bucket(),
+        GetBucketError::StorageError(error) => internal_error(error),
+        GetBucketError::ConversionError(error) => internal_error(error),
+        GetBucketError::InvalidStateEvent {
             state,
             expected,
             received,
         } => internal_error(format!(
             "unexpected bucket lookup event in {state:?}: expected {expected}, got {received:?}"
         )),
-        GetBucketInfoError::GetBucketInfoFailed => internal_error("bucket lookup failed"),
+        GetBucketError::Incomplete => internal_error("bucket lookup failed"),
     }
 }
 
@@ -1188,6 +1187,11 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
         GetObjectError::ManagedCopyError(error) => internal_error(error),
         GetObjectError::PolicyError(error) => internal_error(error),
         error @ GetObjectError::BlobNotLocal { .. } => internal_error(error),
+        GetObjectError::HolderAccessDenied => server_error(crate::error::ServerError::Forbidden),
+        error @ (GetObjectError::HoldersUnavailable | GetObjectError::HolderIntegrityFailure) => {
+            internal_error(error)
+        }
+        GetObjectError::NotFinished => internal_error("object read did not finish"),
         GetObjectError::GetObjectFailed => internal_error("object read failed"),
     }
 }
@@ -1220,6 +1224,7 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
         HeadObjectError::ResolveReferenceError(error) => internal_error(error),
         HeadObjectError::StagingSourceError(error) => internal_error(error),
         HeadObjectError::ManagedCopyError(error) => internal_error(error),
+        HeadObjectError::NotFinished => internal_error("object head did not finish"),
         HeadObjectError::HeadObjectFailed => internal_error("object head failed"),
     }
 }
@@ -1257,234 +1262,5 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn body(result: CallToolResult) -> serde_json::Value {
-        assert_eq!(result.is_error, Some(true));
-        result
-            .structured_content
-            .expect("a tool error carries the structured body")
-    }
-
-    #[test]
-    fn key_rejects_traversal() {
-        let text = body(validate_key("../secret").unwrap_err());
-        assert_eq!(text["code"], "Bad request");
-        assert!(
-            text["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("relative key")
-        );
-        assert!(validate_key("reads/sample.fastq.gz").is_ok());
-    }
-
-    #[test]
-    fn bounded_bytes_range() {
-        assert_eq!(bounded_bytes(None).unwrap(), MAX_TEXT_BYTES);
-        assert_eq!(bounded_bytes(Some(1024)).unwrap(), 1024);
-        assert!(bounded_bytes(Some(0)).is_err());
-        assert!(bounded_bytes(Some(MAX_TEXT_BYTES + 1)).is_err());
-    }
-
-    #[test]
-    fn cursor_rejects_garbage() {
-        // Non base64 and well-formed base64 that is not a token both refuse.
-        let text = body(decode_cursor("!not base64!").unwrap_err());
-        assert!(
-            text["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("next_cursor")
-        );
-        assert!(decode_cursor("Zm9v").is_err());
-    }
-
-    #[test]
-    fn object_error_forbidden() {
-        let forbidden = body(object_error(crate::error::ServerError::Forbidden, "write"));
-        assert!(
-            forbidden["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("write permission")
-        );
-        assert_eq!(
-            body(object_error(crate::error::ServerError::NotFound, "read"))["code"],
-            "Not found"
-        );
-    }
-
-    #[test]
-    fn bucket_error_maps() {
-        assert!(
-            body(map_bucket_error(GetBucketInfoError::NotFound))["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("list_buckets")
-        );
-        assert_eq!(
-            body(map_bucket_error(GetBucketInfoError::GetBucketInfoFailed))["code"],
-            "Internal error"
-        );
-    }
-
-    #[test]
-    fn get_error_categories() {
-        assert_eq!(
-            body(map_get_error(GetObjectError::NoSuchKey))["code"],
-            "Not found"
-        );
-        assert_eq!(
-            body(map_get_error(GetObjectError::InvalidRange))["code"],
-            "Bad request"
-        );
-        assert_eq!(
-            body(map_get_error(GetObjectError::GovernedUnavailable))["code"],
-            "Forbidden"
-        );
-        assert_eq!(
-            body(map_get_error(GetObjectError::ReferenceSourceChanged))["code"],
-            "Conflict"
-        );
-    }
-
-    #[test]
-    fn put_error_categories() {
-        assert_eq!(
-            body(map_put_error(PutObjectError::MissingBody))["code"],
-            "Bad request"
-        );
-        assert_eq!(
-            body(map_put_error(PutObjectError::QuotaExceeded {
-                limit: 10,
-                usage: 20
-            }))["code"],
-            "Conflict"
-        );
-        assert_eq!(
-            body(map_put_error(PutObjectError::PutObjectFailed))["code"],
-            "Internal error"
-        );
-    }
-
-    fn sample(at: &str, bytes: u64) -> ObjectSample {
-        ObjectSample {
-            at: chrono::DateTime::parse_from_rfc3339(at)
-                .expect("fixture timestamp")
-                .with_timezone(&chrono::Utc),
-            bytes,
-        }
-    }
-
-    #[test]
-    fn weeks_start_monday() {
-        // A Sunday belongs to the week that began on the preceding Monday.
-        let samples = [
-            sample("2026-01-04T23:59:59Z", 10),
-            sample("2026-01-05T00:00:00Z", 20),
-            sample("2026-01-11T12:00:00Z", 30),
-        ];
-        let folded = fold_buckets(&samples, BucketUnit::Week, 10);
-        assert_eq!(
-            folded.buckets,
-            vec![
-                TimeBucketOutput {
-                    start: "2025-12-29T00:00:00+00:00".to_string(),
-                    count: 1,
-                    bytes: 10,
-                },
-                TimeBucketOutput {
-                    start: "2026-01-05T00:00:00+00:00".to_string(),
-                    count: 2,
-                    bytes: 50,
-                },
-            ]
-        );
-        assert_eq!(folded.total_count, 3);
-        assert_eq!(folded.total_bytes, 60);
-        assert!(!folded.truncated);
-    }
-
-    #[test]
-    fn months_and_days() {
-        let samples = [
-            sample("2026-01-31T23:00:00Z", 1),
-            sample("2026-02-01T00:00:00Z", 2),
-        ];
-        let months = fold_buckets(&samples, BucketUnit::Month, 10);
-        assert_eq!(months.buckets.len(), 2);
-        assert_eq!(months.buckets[0].start, "2026-01-01T00:00:00+00:00");
-        assert_eq!(months.buckets[1].start, "2026-02-01T00:00:00+00:00");
-        let days = fold_buckets(&samples, BucketUnit::Day, 10);
-        assert_eq!(days.buckets[0].start, "2026-01-31T00:00:00+00:00");
-    }
-
-    #[test]
-    fn folds_empty_window() {
-        let folded = fold_buckets(&[], BucketUnit::Day, 1);
-        assert!(folded.buckets.is_empty());
-        assert_eq!(folded.total_count, 0);
-        assert!(!folded.truncated);
-    }
-
-    #[test]
-    fn caps_bucket_count() {
-        // Beyond the cap the series is cut, but the totals still cover it.
-        let samples = [
-            sample("2026-01-01T00:00:00Z", 1),
-            sample("2026-01-02T00:00:00Z", 2),
-            sample("2026-01-03T00:00:00Z", 4),
-        ];
-        let folded = fold_buckets(&samples, BucketUnit::Day, 2);
-        assert_eq!(folded.buckets.len(), 2);
-        assert!(folded.truncated);
-        assert_eq!(folded.total_count, 3);
-        assert_eq!(folded.total_bytes, 7);
-    }
-
-    #[test]
-    fn bound_rejects_garbage() {
-        assert!(parse_bound("since", Some("yesterday")).is_err());
-        assert!(parse_bound("since", None).unwrap().is_none());
-        assert!(
-            parse_bound("until", Some("2026-01-01T00:00:00Z"))
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn filenames_drop_prefix() {
-        assert_eq!(filename_of("results/run-1/chart.png"), "chart.png");
-        assert_eq!(filename_of("chart.png"), "chart.png");
-        assert_eq!(filename_of("results/"), "results");
-    }
-
-    #[test]
-    fn head_error_categories() {
-        assert_eq!(
-            body(map_head_error(HeadObjectError::NoSuchKey))["code"],
-            "Not found"
-        );
-        assert!(
-            body(map_head_error(HeadObjectError::NoSuchVersion))["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("version_id")
-        );
-        assert_eq!(
-            body(map_head_error(HeadObjectError::HeadObjectFailed))["code"],
-            "Internal error"
-        );
-    }
-
-    #[test]
-    fn search_kind_names() {
-        assert_eq!(SearchKind::Documents.as_str(), "documents");
-        assert_eq!(SearchKind::Buckets.as_str(), "buckets");
-        assert_eq!(SearchKind::Groups.as_str(), "groups");
-        assert_eq!(SearchKind::Users.as_str(), "users");
-    }
-}
+#[path = "data_tests.rs"]
+mod pure_tests;

@@ -1,3 +1,8 @@
+//! Generates structured ULIDs from an injectable clock and nonce source.
+//! It refuses timestamps that jump forward past the allowed clock skew.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::{sys::time::TimeValLike, time::ClockId};
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -10,7 +15,7 @@ use super::layout;
 use super::{BucketId, PlacementHandle, StructuredId};
 
 /// Realm skew bound default of five minutes (REQ-META-ID-TIME-001).
-pub const DEFAULT_MAX_ID_CLOCK_SKEW_MS: u64 = 300_000;
+pub const MAX_ID_SKEW: u64 = 300_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ClockHealthError {
@@ -106,13 +111,9 @@ struct ClockAnchor {
     monotonic_ms: u64,
 }
 
-/// Structured-ID generator: a monotonic ULID timestamp with a forward-clock-
-/// jump guard (REQ-META-ID-TIME-001, REQ-META-ID-NONCE-001). The nonce
-/// starts from a fresh random value for each timestamp and increments across
-/// every subsequent mint at that timestamp, including interleaved handles and
-/// buckets.
-/// It never emits a generic ULID, so the structured fields are always
-/// preserved.
+/// Structured-ID generator: a monotonic ULID timestamp with a forward-jump
+/// guard (REQ-META-ID-TIME-001, REQ-META-ID-NONCE-001). Nonces stay unique per
+/// timestamp across interleaved handles, and it never emits a generic ULID.
 pub struct StructuredIdGenerator<E: IdEnvironment = SystemEnvironment> {
     env: E,
     max_skew_ms: u64,
@@ -122,7 +123,7 @@ pub struct StructuredIdGenerator<E: IdEnvironment = SystemEnvironment> {
 
 impl StructuredIdGenerator<SystemEnvironment> {
     pub fn new() -> Self {
-        Self::with_environment(SystemEnvironment::new(), DEFAULT_MAX_ID_CLOCK_SKEW_MS)
+        Self::with_environment(SystemEnvironment::new(), MAX_ID_SKEW)
     }
 }
 
@@ -249,7 +250,7 @@ mod tests {
             self.monotonic.set(self.monotonic.get() + monotonic_ms);
         }
 
-        fn suspend_on_next_now(&self, elapsed_ms: u64) {
+        fn suspend_next_sample(&self, elapsed_ms: u64) {
             self.suspend_on_now.set(elapsed_ms);
         }
     }
@@ -372,12 +373,12 @@ mod tests {
     }
 
     #[test]
-    fn suspend_during_clock_sample_retries() {
+    fn suspend_retries_clock() {
         let mut generator =
             StructuredIdGenerator::with_environment(MockEnv::new(1000, [1, 2]), 300_000);
         let (handle, bucket) = handle_bucket();
         let _: MetaResourceId = generator.mint(handle, bucket).unwrap();
-        generator.env.suspend_on_next_now(600_000);
+        generator.env.suspend_next_sample(600_000);
         let id: MetaResourceId = generator.mint(handle, bucket).unwrap();
         assert_eq!(id.timestamp_ms(), 601_000);
     }
@@ -408,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_bucket_does_not_collide() {
+    fn interleaved_buckets_distinct() {
         // Returning to a bucket in the same ms continues the shared nonce sequence.
         let mut generator =
             StructuredIdGenerator::with_environment(MockEnv::new(1000, [10, 20, 10]), 300_000);

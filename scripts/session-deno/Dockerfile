@@ -1,3 +1,7 @@
+# Builds the Deno session image with the Jupyter client and the session helper.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 FROM denoland/deno:bin-2.9.3 AS deno
 
 FROM python:3.13-slim-bookworm

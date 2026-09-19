@@ -1,33 +1,35 @@
+//! Expands watch events into inbox records and retries the deliveries that failed.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, NOTIFICATION_WATCH_INTEREST_KEYSPACE, NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE,
+use aruna_core::keyspaces::{AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
+use aruna_core::metrics::WatchMetricReason;
+use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, watch_retry_key,
+    watch_retry_prefix, watch_subscription_key,
 };
-use aruna_core::metrics::WatchAuthorizationMetricReason;
-use aruna_core::structs::{
-    NotificationRecord, RealmId, WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription,
-    watch_retry_key, watch_retry_prefix, watch_subscription_key,
-};
-use aruna_core::types::{Key, KeySpace, TxnId, UserId};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::types::{Key, KeySpace, TxnId};
 use tracing::warn;
 
 use crate::driver::DriverContext;
-use crate::notifications::inbox::{
-    InboxWriteOutcome, UpsertFailure, upsert_inbox_records_in_transaction,
-};
-use crate::notifications::placement::filter_locally_held_watch_subscriptions;
+use crate::notifications::inbox::{InboxWriteOutcome, UpsertFailure, upsert_transactionally};
+use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::protocol::{
-    NOTIFICATION_WATCH_EVENT_BATCH_SIZE, NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP,
-    NOTIFICATION_WATCH_EXPANSION_RECORD_CAP, NOTIFICATION_WATCH_EXPANSION_WORK_CAP,
-    NOTIFICATION_WATCH_RETRY_BATCH_CAP, NOTIFICATION_WATCH_RETRY_BYTES_CAP,
+    EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, EXPANSION_WORK_CAP,
+    RETRY_BATCH_CAP, RETRY_BYTES_CAP,
 };
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_delivery, evaluate_watch_event_authorization,
+    WatchAuthorization, authorize_watch_event, evaluate_watch_delivery,
 };
 use crate::notifications::watch::interest::{
-    mark_watch_interest_dirty, schedule_watch_interest_publish, watch_interest_dirty_marker_write,
+    dirty_marker_write, mark_interest_dirty, schedule_interest_publish,
 };
 use crate::notifications::watch::subscriptions::list_watch_page;
 
@@ -37,22 +39,22 @@ use crate::notifications::watch::subscriptions::list_watch_page;
 pub async fn expand_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
-    realm_config: &aruna_core::structs::RealmConfigDocument,
+    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     local_node_id: aruna_core::NodeId,
     events: &[WatchEvent],
 ) -> Result<(InboxWriteOutcome, bool), String> {
     if events.is_empty() {
         return Ok((InboxWriteOutcome::default(), false));
     }
-    if events.len() > NOTIFICATION_WATCH_EVENT_BATCH_SIZE {
+    if events.len() > EVENT_BATCH_SIZE {
         return Err(format!(
             "watch event batch count {} exceeds cap {}",
             events.len(),
-            NOTIFICATION_WATCH_EVENT_BATCH_SIZE
+            EVENT_BATCH_SIZE
         ));
     }
     for attempt in 0..2 {
-        match expand_watch_events_once(
+        match expand_events_once(
             context,
             realm_id,
             realm_config,
@@ -82,10 +84,10 @@ type WatchCandidate<'a> = (
 
 const WATCH_PAGE_LIMIT: usize = 256;
 
-async fn expand_watch_events_once(
+async fn expand_events_once(
     context: &DriverContext,
     realm_id: RealmId,
-    realm_config: &aruna_core::structs::RealmConfigDocument,
+    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     local_node_id: aruna_core::NodeId,
     events: &[WatchEvent],
     start: Option<Vec<u8>>,
@@ -97,29 +99,20 @@ async fn expand_watch_events_once(
             .await
             .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
     let (subscriptions, found_stale) =
-        filter_locally_held_watch_subscriptions(subscriptions, realm_config, local_node_id)
+        filter_local_subscriptions(subscriptions, realm_config, local_node_id)
             .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
     let work = expansion_budget(events.len(), subscriptions.len()).map_err(UpsertFailure::Fatal)?;
-    let mut candidates = Vec::with_capacity(work.min(NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP));
+    let mut candidates = Vec::with_capacity(work.min(EXPANSION_CANDIDATE_CAP));
     let mut record_count = 0;
     for event in events {
         for subscription in &subscriptions {
             let routed = route_watch_event(event, std::slice::from_ref(subscription));
             if !routed.is_empty() {
-                add_limit(
-                    candidates.len(),
-                    1,
-                    NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP,
-                    "candidate",
-                )
-                .map_err(UpsertFailure::Fatal)?;
-                record_count = add_limit(
-                    record_count,
-                    routed.len(),
-                    NOTIFICATION_WATCH_EXPANSION_RECORD_CAP,
-                    "record",
-                )
-                .map_err(UpsertFailure::Fatal)?;
+                add_limit(candidates.len(), 1, EXPANSION_CANDIDATE_CAP, "candidate")
+                    .map_err(UpsertFailure::Fatal)?;
+                record_count =
+                    add_limit(record_count, routed.len(), EXPANSION_RECORD_CAP, "record")
+                        .map_err(UpsertFailure::Fatal)?;
                 candidates.push((subscription, event, routed));
             }
         }
@@ -140,7 +133,7 @@ async fn expand_watch_events_once(
         .transpose()?;
     if retry_value
         .as_ref()
-        .is_some_and(|value| value.len() > NOTIFICATION_WATCH_RETRY_BYTES_CAP)
+        .is_some_and(|value| value.len() > RETRY_BYTES_CAP)
     {
         return Err(UpsertFailure::Fatal(
             "watch retry event exceeds byte cap".to_string(),
@@ -162,65 +155,14 @@ async fn expand_watch_events_once(
             return Err(error);
         }
     };
-    let queue_changed = match (retry_key, retry_value) {
-        (Some(key), Some(value)) => {
-            if let Err(error) = stage_retry_write(context, realm_id, txn_id, key, value).await {
+    let queue_changed =
+        match stage_retry_change(context, realm_id, txn_id, retry_key, retry_value).await {
+            Ok(changed) => changed,
+            Err(error) => {
                 abort_transaction(context, txn_id).await;
                 return Err(error);
             }
-            true
-        }
-        (Some(key), None) => {
-            match context
-                .storage_handle
-                .send_storage_effect(StorageEffect::Read {
-                    key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                    key: key.clone().into(),
-                    txn_id: Some(txn_id),
-                })
-                .await
-            {
-                Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    abort_transaction(context, txn_id).await;
-                    return Err(UpsertFailure::Conflict);
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    abort_transaction(context, txn_id).await;
-                    return Err(classify_storage_error(error));
-                }
-                other => {
-                    abort_transaction(context, txn_id).await;
-                    return Err(UpsertFailure::Fatal(format!(
-                        "unexpected watch retry guard event: {other:?}"
-                    )));
-                }
-            }
-            match context
-                .storage_handle
-                .send_storage_effect(StorageEffect::Delete {
-                    key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
-                    key: key.into(),
-                    txn_id: Some(txn_id),
-                })
-                .await
-            {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => true,
-                Event::Storage(StorageEvent::Error { error }) => {
-                    abort_transaction(context, txn_id).await;
-                    return Err(classify_storage_error(error));
-                }
-                other => {
-                    abort_transaction(context, txn_id).await;
-                    return Err(UpsertFailure::Fatal(format!(
-                        "unexpected watch retry delete event: {other:?}"
-                    )));
-                }
-            }
-        }
-        (None, None) => false,
-        (None, Some(_)) => unreachable!(),
-    };
+        };
     let dropped = found_stale || denied;
     if (next.is_some() || dropped)
         && let Err(error) = stage_dirty_marker(context, realm_id, txn_id).await
@@ -239,7 +181,7 @@ async fn expand_watch_events_once(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
             if queue_changed && next.is_some() {
-                schedule_watch_interest_publish(context).await;
+                schedule_interest_publish(context).await;
             }
             Ok((outcome, dropped))
         }
@@ -250,19 +192,78 @@ async fn expand_watch_events_once(
     }
 }
 
+async fn stage_retry_change(
+    context: &DriverContext,
+    realm_id: RealmId,
+    txn_id: TxnId,
+    retry_key: Option<Vec<u8>>,
+    retry_value: Option<Vec<u8>>,
+) -> Result<bool, UpsertFailure> {
+    let key = match retry_key {
+        Some(key) => key,
+        None => {
+            return match retry_value {
+                None => Ok(false),
+                Some(_) => unreachable!(),
+            };
+        }
+    };
+    let Some(value) = retry_value else {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
+                key: key.clone().into(),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+                return Err(UpsertFailure::Conflict);
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(classify_storage_error(error));
+            }
+            other => {
+                return Err(UpsertFailure::Fatal(format!(
+                    "unexpected watch retry guard event: {other:?}"
+                )));
+            }
+        }
+        return match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
+                key: key.into(),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(true),
+            Event::Storage(StorageEvent::Error { error }) => Err(classify_storage_error(error)),
+            other => Err(UpsertFailure::Fatal(format!(
+                "unexpected watch retry delete event: {other:?}"
+            ))),
+        };
+    };
+    stage_retry_write(context, realm_id, txn_id, key, value).await?;
+    Ok(true)
+}
+
 pub async fn drain_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
-    realm_config: &aruna_core::structs::RealmConfigDocument,
+    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     local_node_id: aruna_core::NodeId,
 ) -> Result<(), String> {
     let values = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             prefix: Some(watch_retry_prefix(realm_id).into()),
             start: None,
-            limit: NOTIFICATION_WATCH_RETRY_BATCH_CAP.saturating_add(1),
+            limit: RETRY_BATCH_CAP.saturating_add(1),
             txn_id: None,
         })
         .await
@@ -280,14 +281,14 @@ pub async fn drain_watch_events(
             .await);
         }
     };
-    let over_batch = values.len() > NOTIFICATION_WATCH_RETRY_BATCH_CAP;
+    let over_batch = values.len() > RETRY_BATCH_CAP;
     if over_batch {
         warn!(%realm_id, "Watch retry queue row cap reached");
     }
     let mut failed = over_batch;
-    for (key, value) in values.into_iter().take(NOTIFICATION_WATCH_RETRY_BATCH_CAP) {
+    for (key, value) in values.into_iter().take(RETRY_BATCH_CAP) {
         let key = key.to_vec();
-        if value.len() > NOTIFICATION_WATCH_RETRY_BYTES_CAP {
+        if value.len() > RETRY_BYTES_CAP {
             warn!(%realm_id, "Retaining watch retry row over byte cap");
             failed = true;
             continue;
@@ -302,7 +303,7 @@ pub async fn drain_watch_events(
         };
         let mut applied = false;
         for attempt in 0..2 {
-            match expand_watch_events_once(
+            match expand_events_once(
                 context,
                 realm_id,
                 realm_config,
@@ -340,7 +341,7 @@ pub async fn drain_watch_events(
 }
 
 async fn defer_retry(context: &DriverContext, realm_id: RealmId, error: String) -> String {
-    if let Err(marker) = mark_watch_interest_dirty(context, realm_id).await {
+    if let Err(marker) = mark_interest_dirty(context, realm_id).await {
         warn!(%realm_id, %marker, "Failed to retain watch retry marker");
         return format!("{error}; failed to retain retry marker: {marker}");
     }
@@ -354,7 +355,7 @@ fn valid_retry(retry: &WatchEventRetry, realm_id: RealmId, key: &[u8]) -> bool {
     let Some(cursor) = retry.cursor.as_ref() else {
         return false;
     };
-    retry.events.len() <= NOTIFICATION_WATCH_EVENT_BATCH_SIZE
+    retry.events.len() <= EVENT_BATCH_SIZE
         && retry
             .events
             .iter()
@@ -377,9 +378,9 @@ fn page_limit(events: usize) -> Result<usize, String> {
     }
     let mut limit = WATCH_PAGE_LIMIT;
     for cap in [
-        NOTIFICATION_WATCH_EXPANSION_WORK_CAP,
-        NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP,
-        NOTIFICATION_WATCH_EXPANSION_RECORD_CAP,
+        EXPANSION_WORK_CAP,
+        EXPANSION_CANDIDATE_CAP,
+        EXPANSION_RECORD_CAP,
     ] {
         limit = limit.min(cap / events);
     }
@@ -398,10 +399,10 @@ async fn stage_retry_write(
     let values = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             prefix: Some(watch_retry_prefix(realm_id).into()),
             start: None,
-            limit: NOTIFICATION_WATCH_RETRY_BATCH_CAP.saturating_add(1),
+            limit: RETRY_BATCH_CAP.saturating_add(1),
             txn_id: Some(txn_id),
         })
         .await
@@ -416,7 +417,7 @@ async fn stage_retry_write(
             )));
         }
     };
-    if values.len() > NOTIFICATION_WATCH_RETRY_BATCH_CAP {
+    if values.len() > RETRY_BATCH_CAP {
         warn!(%realm_id, "Watch retry queue row cap reached");
         return Err(UpsertFailure::Fatal(
             "watch retry row cap reached".to_string(),
@@ -432,7 +433,7 @@ async fn stage_retry_write(
         .iter()
         .find(|(current, _)| current.as_ref() == key.as_slice());
     let replaced = existing.map_or(0, |(_, value)| value.len());
-    if replaced == 0 && values.len() >= NOTIFICATION_WATCH_RETRY_BATCH_CAP {
+    if replaced == 0 && values.len() >= RETRY_BATCH_CAP {
         warn!(%realm_id, "Watch retry queue row cap reached");
         return Err(UpsertFailure::Fatal(
             "watch retry row cap reached".to_string(),
@@ -452,7 +453,7 @@ async fn stage_retry_write(
         .checked_sub(replaced)
         .and_then(|bytes| bytes.checked_add(write_value.len()))
         .ok_or_else(|| UpsertFailure::Fatal("watch retry byte budget overflow".to_string()))?;
-    if next_bytes > NOTIFICATION_WATCH_RETRY_BYTES_CAP {
+    if next_bytes > RETRY_BYTES_CAP {
         warn!(%realm_id, "Watch retry queue byte cap reached");
         return Err(UpsertFailure::Fatal(
             "watch retry byte cap reached".to_string(),
@@ -461,7 +462,7 @@ async fn stage_retry_write(
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
             key: key.into(),
             value: write_value.into(),
             txn_id: Some(txn_id),
@@ -486,7 +487,7 @@ async fn stage_dirty_marker(
     realm_id: RealmId,
     txn_id: TxnId,
 ) -> Result<(), UpsertFailure> {
-    let (key_space, key, value) = watch_interest_dirty_marker_write(realm_id);
+    let (key_space, key, value) = dirty_marker_write(realm_id);
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
@@ -513,13 +514,8 @@ async fn stage_watch_expansion(
 ) -> Result<(InboxWriteOutcome, bool), UpsertFailure> {
     let mut record_budget = 0;
     for (_, _, routed) in &candidates {
-        record_budget = add_limit(
-            record_budget,
-            routed.len(),
-            NOTIFICATION_WATCH_EXPANSION_RECORD_CAP,
-            "record",
-        )
-        .map_err(UpsertFailure::Fatal)?;
+        record_budget = add_limit(record_budget, routed.len(), EXPANSION_RECORD_CAP, "record")
+            .map_err(UpsertFailure::Fatal)?;
     }
     let mut subscriptions = Vec::with_capacity(candidates.len());
     for (subscription, _, _) in &candidates {
@@ -534,7 +530,7 @@ async fn stage_watch_expansion(
         .iter()
         .map(|subscription| {
             (
-                NOTIFICATION_WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+                WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
                 watch_subscription_key(subscription.owner, subscription.watch_id),
             )
         })
@@ -615,14 +611,11 @@ async fn stage_watch_expansion(
                 continue;
             }
             Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
-                record_delivery_suppression(
-                    context,
-                    WatchAuthorizationMetricReason::AuthorizationUnavailable,
-                );
+                record_delivery_suppression(context, WatchMetricReason::AuthorizationUnavailable);
                 return Err(UpsertFailure::Fatal(error));
             }
         }
-        match evaluate_watch_event_authorization(
+        match authorize_watch_event(
             context,
             subscription.owner,
             &subscription.authorization,
@@ -635,10 +628,7 @@ async fn stage_watch_expansion(
                 record_delivery_suppression(context, reason.metric_reason());
             }
             Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
-                record_delivery_suppression(
-                    context,
-                    WatchAuthorizationMetricReason::AuthorizationUnavailable,
-                );
+                record_delivery_suppression(context, WatchMetricReason::AuthorizationUnavailable);
                 return Err(UpsertFailure::Fatal(error));
             }
         }
@@ -646,7 +636,7 @@ async fn stage_watch_expansion(
     if records.is_empty() {
         return Ok((InboxWriteOutcome::default(), dropped));
     }
-    upsert_inbox_records_in_transaction(&context.storage_handle, &records, txn_id)
+    upsert_transactionally(&context.storage_handle, &records, txn_id)
         .await
         .map(|outcome| (outcome, dropped))
 }
@@ -677,10 +667,10 @@ fn expansion_budget(events: usize, subscriptions: usize) -> Result<usize, String
     let work = events
         .checked_mul(subscriptions)
         .ok_or_else(|| "watch expansion work budget overflow".to_string())?;
-    if work > NOTIFICATION_WATCH_EXPANSION_WORK_CAP {
+    if work > EXPANSION_WORK_CAP {
         return Err(format!(
             "watch expansion work {} exceeds cap {}",
-            work, NOTIFICATION_WATCH_EXPANSION_WORK_CAP
+            work, EXPANSION_WORK_CAP
         ));
     }
     Ok(work)
@@ -705,7 +695,7 @@ async fn abort_transaction(context: &DriverContext, txn_id: TxnId) {
         .await;
 }
 
-fn record_delivery_suppression(context: &DriverContext, reason: WatchAuthorizationMetricReason) {
+fn record_delivery_suppression(context: &DriverContext, reason: WatchMetricReason) {
     if let Some(net_handle) = context.net_handle.as_ref() {
         net_handle
             .notification_watch_metrics()
@@ -721,24 +711,27 @@ fn record_delivery_suppression(context: &DriverContext, reason: WatchAuthorizati
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument,
-        RealmConfigDocument, RealmNodeKind, WatchAuthorizationBinding, WatchEventDetail,
-        WatchEventKind, WatchEventMask, blob_object_permission_path, data_watch_resource_path,
+    use aruna_core::structs::execution::notification_watch::{
+        WatchAuthorizationBinding, WatchEventDetail, WatchEventKind, WatchEventMask,
+        watch_resource_path,
     };
-    use aruna_core::types::UserId;
+    use aruna_core::structs::identity::auth::{Actor, Permission};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+    };
+    use aruna_core::structs::storage::blob::object_permission_path;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::notifications::watch::subscriptions::{
-        create_replicated_watch_subscription, create_watch_subscription,
-    };
+    use crate::notifications::watch::subscriptions::{create_holder_watch, create_local_watch};
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
         let dir = tempdir().expect("temp dir");
@@ -774,7 +767,7 @@ mod tests {
         group_id: Ulid,
         node_id: aruna_core::NodeId,
     ) -> WatchEvent {
-        let path = data_watch_resource_path(group_id, node_id, "bucket", "object");
+        let path = watch_resource_path(group_id, node_id, "bucket", "object");
         WatchEvent {
             event_id: Ulid::from_bytes([7u8; 16]),
             realm_id: realm,
@@ -806,9 +799,9 @@ mod tests {
     fn expansion_caps_candidates() {
         assert!(
             add_limit(
-                NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP,
+                EXPANSION_CANDIDATE_CAP,
                 1,
-                NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP,
+                EXPANSION_CANDIDATE_CAP,
                 "candidate"
             )
             .is_err()
@@ -817,15 +810,7 @@ mod tests {
 
     #[test]
     fn expansion_caps_records() {
-        assert!(
-            add_limit(
-                NOTIFICATION_WATCH_EXPANSION_RECORD_CAP,
-                1,
-                NOTIFICATION_WATCH_EXPANSION_RECORD_CAP,
-                "record"
-            )
-            .is_err()
-        );
+        assert!(add_limit(EXPANSION_RECORD_CAP, 1, EXPANSION_RECORD_CAP, "record").is_err());
     }
 
     #[test]
@@ -834,8 +819,8 @@ mod tests {
         // record budgets can never abort a dense expansion mid-stream.
         assert_eq!(page_limit(1).expect("one event fits"), WATCH_PAGE_LIMIT);
         assert_eq!(
-            page_limit(NOTIFICATION_WATCH_EVENT_BATCH_SIZE).unwrap(),
-            NOTIFICATION_WATCH_EXPANSION_CANDIDATE_CAP / NOTIFICATION_WATCH_EVENT_BATCH_SIZE
+            page_limit(EVENT_BATCH_SIZE).unwrap(),
+            EXPANSION_CANDIDATE_CAP / EVENT_BATCH_SIZE
         );
         assert!(page_limit(usize::MAX).is_err());
     }
@@ -867,8 +852,8 @@ mod tests {
             user_id: owner,
             realm_id: realm,
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm);
-        let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm, group_id);
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm, group_id);
         // Policy loading resolves the group record before group policies apply.
         let group = Group {
             display_name: "watch".to_string(),
@@ -919,7 +904,7 @@ mod tests {
     async fn retry_rows(storage: &StorageHandle, realm: RealmId) -> Vec<(Vec<u8>, Vec<u8>)> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                 prefix: Some(watch_retry_prefix(realm).into()),
                 start: None,
                 limit: 64,
@@ -941,7 +926,7 @@ mod tests {
             context
                 .storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: NOTIFICATION_WATCH_INTEREST_KEYSPACE.to_string(),
+                    key_space: WATCH_INTEREST_KEYSPACE.to_string(),
                     key: key.to_vec().into(),
                     value: value.into(),
                     txn_id: None,
@@ -990,7 +975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expansion_is_idempotent_across_redelivery() {
+    async fn expansion_idempotent() {
         let (_dir, context) = temp_context();
         let realm = RealmId([1u8; 32]);
         let (local_node_id, config) = local_config(realm);
@@ -1002,11 +987,11 @@ mod tests {
             expires_at_secs: 1,
             ..Default::default()
         };
-        create_replicated_watch_subscription(
+        create_holder_watch(
             &context,
             local_node_id,
             owner,
-            data_watch_resource_path(group_id, local_node_id, "bucket", ""),
+            watch_resource_path(group_id, local_node_id, "bucket", ""),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             expired_binding,
             1,
@@ -1030,7 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expansion_without_subscriptions_writes_nothing() {
+    async fn no_subscriptions_noop() {
         let (_dir, context) = temp_context();
         let realm = RealmId([1u8; 32]);
         let (local_node_id, config) = local_config(realm);
@@ -1046,7 +1031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_event_deny_suppresses_nested_object() {
+    async fn exact_deny_suppresses() {
         let (_dir, context) = temp_context();
         let realm = RealmId([4u8; 32]);
         let (local_node_id, config) = local_config(realm);
@@ -1054,17 +1039,17 @@ mod tests {
         let actor = user(realm, 2);
         let group_id = Ulid::from_bytes([6u8; 16]);
         install_authorization(&context, realm, local_node_id, group_id, owner).await;
-        create_watch_subscription(
+        create_local_watch(
             &context.storage_handle,
             owner,
-            data_watch_resource_path(group_id, local_node_id, "bucket", ""),
+            watch_resource_path(group_id, local_node_id, "bucket", ""),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             1,
         )
         .await
         .expect("create");
 
-        let mut group = GroupAuthorizationDocument::new_default_group_doc(owner, realm, group_id);
+        let mut group = GroupAuthorizationDocument::default_group_doc(owner, realm, group_id);
         group
             .roles
             .values_mut()
@@ -1072,7 +1057,7 @@ mod tests {
             .expect("admin role")
             .permissions
             .insert(
-                blob_object_permission_path(realm, group_id, local_node_id, "bucket", "object"),
+                object_permission_path(realm, group_id, local_node_id, "bucket", "object"),
                 Permission::DENY,
             );
         let actor_record = Actor {
@@ -1107,7 +1092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_revocation_prevents_watch_delivery_commit() {
+    async fn revocation_prevents_delivery() {
         let (_dir, context) = temp_context();
         let realm = RealmId([2u8; 32]);
         let (local_node_id, config) = local_config(realm);
@@ -1116,10 +1101,10 @@ mod tests {
         let replacement_owner = user(realm, 3);
         let group_id = Ulid::from_bytes([4u8; 16]);
         install_authorization(&context, realm, local_node_id, group_id, owner).await;
-        let subscription = create_watch_subscription(
+        let subscription = create_local_watch(
             &context.storage_handle,
             owner,
-            data_watch_resource_path(group_id, local_node_id, "bucket", ""),
+            watch_resource_path(group_id, local_node_id, "bucket", ""),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             1,
         )
@@ -1155,7 +1140,7 @@ mod tests {
         assert_eq!(staged.0.written, 1);
 
         let replacement =
-            GroupAuthorizationDocument::new_default_group_doc(replacement_owner, realm, group_id);
+            GroupAuthorizationDocument::default_group_doc(replacement_owner, realm, group_id);
         let actor_record = Actor {
             node_id: local_node_id,
             user_id: replacement_owner,
@@ -1193,7 +1178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthorized_subscription_does_not_block_authorized_owner() {
+    async fn unauthorized_subscription_skipped() {
         let (_dir, context) = temp_context();
         let realm = RealmId([3u8; 32]);
         let (local_node_id, config) = local_config(realm);
@@ -1201,10 +1186,10 @@ mod tests {
         let unauthorized_owner = user(realm, 2);
         let actor = user(realm, 3);
         let group_id = Ulid::from_bytes([5u8; 16]);
-        let prefix = data_watch_resource_path(group_id, local_node_id, "bucket", "");
+        let prefix = watch_resource_path(group_id, local_node_id, "bucket", "");
         install_authorization(&context, realm, local_node_id, group_id, authorized_owner).await;
         for owner in [authorized_owner, unauthorized_owner] {
-            create_watch_subscription(
+            create_local_watch(
                 &context.storage_handle,
                 owner,
                 prefix.clone(),
@@ -1243,30 +1228,30 @@ mod tests {
         install_authorization(&context, realm, local_node_id, group_id, late_owner).await;
 
         let mut events = vec![upload_event(realm, actor, group_id, local_node_id)];
-        while events.len() < NOTIFICATION_WATCH_EVENT_BATCH_SIZE {
+        while events.len() < EVENT_BATCH_SIZE {
             let mut quiet = upload_event(realm, actor, group_id, local_node_id);
             let mut bytes = [9u8; 16];
             bytes[..8].copy_from_slice(&(events.len() as u64).to_be_bytes());
             quiet.event_id = Ulid::from_bytes(bytes);
-            quiet.path = data_watch_resource_path(group_id, local_node_id, "quiet", "object");
+            quiet.path = watch_resource_path(group_id, local_node_id, "quiet", "object");
             events.push(quiet);
         }
         let page = page_limit(events.len()).expect("page limit");
         for seed in 1..=page {
-            create_watch_subscription(
+            create_local_watch(
                 &context.storage_handle,
                 user(realm, seed as u8),
-                data_watch_resource_path(group_id, local_node_id, "idle", ""),
+                watch_resource_path(group_id, local_node_id, "idle", ""),
                 WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
                 1,
             )
             .await
             .expect("create");
         }
-        create_watch_subscription(
+        create_local_watch(
             &context.storage_handle,
             late_owner,
-            data_watch_resource_path(group_id, local_node_id, "bucket", ""),
+            watch_resource_path(group_id, local_node_id, "bucket", ""),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             1,
         )
@@ -1308,10 +1293,10 @@ mod tests {
         let owner = user(realm, 1);
         let group_id = Ulid::from_bytes([8u8; 16]);
         install_authorization(&context, realm, local_node_id, group_id, owner).await;
-        create_watch_subscription(
+        create_local_watch(
             &context.storage_handle,
             owner,
-            data_watch_resource_path(group_id, local_node_id, "bucket", ""),
+            watch_resource_path(group_id, local_node_id, "bucket", ""),
             WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
             1,
         )
@@ -1396,7 +1381,7 @@ mod tests {
         let base = upload_event(realm, user(realm, 2), Ulid::from_bytes([3u8; 16]), node_id);
         let cursor = watch_subscription_key(user(realm, 2), Ulid::nil()).to_vec();
         let mut queued = Vec::new();
-        for seed in 0..NOTIFICATION_WATCH_RETRY_BATCH_CAP {
+        for seed in 0..RETRY_BATCH_CAP {
             let mut event = base.clone();
             event.event_id = Ulid::from_bytes([seed as u8 + 20; 16]);
             let key = watch_retry_key(realm, event.event_id);
@@ -1443,7 +1428,7 @@ mod tests {
         .expect("queued row still advances");
         assert_eq!(
             retry_rows(&context.storage_handle, realm).await.len(),
-            NOTIFICATION_WATCH_RETRY_BATCH_CAP
+            RETRY_BATCH_CAP
         );
     }
 
@@ -1458,7 +1443,7 @@ mod tests {
             Ulid::from_bytes([3u8; 16]),
             local_node_id,
         );
-        let events = vec![event; NOTIFICATION_WATCH_EVENT_BATCH_SIZE + 1];
+        let events = vec![event; EVENT_BATCH_SIZE + 1];
 
         let error = expand_watch_events(&context, realm, &config, local_node_id, &events)
             .await

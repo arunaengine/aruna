@@ -1,16 +1,13 @@
-//! Two-way synced folders on an owner's device.
-//!
-//! Local data takes precedence over convergence (LB1): the automatic sync may
-//! only add files that are absent, add conflicted copies beside files that
-//! diverged, and replace a file whose current fingerprint AND blake3 still
-//! equal the recorded base. Replacing divergent or unknown-base bytes and
-//! removing a file are explicit, audited owner actions, and a remote deletion
-//! never deletes a local file.
+//! Defines device folder sync records: folder mode, state and per-file sync bookkeeping.
+//! Sync only adds copies or replaces an unchanged base; other local bytes need the owner.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
-use crate::structs::FileStat;
-use crate::types::{GroupId, UserId};
+use crate::structs::execution::offered_directory::FileStat;
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -19,7 +16,7 @@ pub const MAX_SYNC_PAGE: usize = 256;
 
 /// Version metadata tag naming the device version a realm object was pulled
 /// from. It makes a replayed pull idempotent instead of a second version.
-pub const SYNC_SOURCE_VERSION_TAG: &str = "aruna-sync-source-version";
+pub const SYNC_VERSION_TAG: &str = "aruna-sync-source-version";
 
 /// Directory a folder's move-aside puts files into, relative to the root.
 pub const SYNC_TRASH_DIR: &str = ".aruna/trash";
@@ -95,7 +92,8 @@ pub struct SyncedFolder {
     pub created_at_ms: u64,
     pub last_reconcile_ms: Option<u64>,
     pub last_error: Option<String>,
-    pub last_error_at_ms: Option<u64>,
+    #[serde(rename = "last_error_at_ms")]
+    pub last_error_ms: Option<u64>,
     pub observed_files: u64,
     /// Where the next pass resumes listing the realm heads. A folder larger
     /// than one pass converges over several, and a pass never decides about
@@ -434,9 +432,8 @@ fn decide_two_way(
             // even when the realm deleted the object in the meantime.
             false => SyncAction::Upload { deleted: false },
         },
-        // No base: the bytes may be the same file or two unrelated ones, so
-        // nothing local is replaced, nothing local is published, and both sides
-        // stay until the owner decides which one the realm head should be.
+        // Without a base, neither side is replaced or published because equal-looking bytes may be unrelated.
+        // Both remain until the owner chooses the realm head.
         (Some(local), None, Some(remote)) => match same_bytes(local, remote) {
             true => SyncAction::AdoptBase,
             false => SyncAction::ConflictCopy {
@@ -654,7 +651,7 @@ impl TryFrom<usize> for SyncPageLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
 
     fn base(fingerprint: &str, hash: u8, remote: Option<Ulid>) -> SyncBase {
         SyncBase {
@@ -789,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn publishes_edit_over_delete() {
+    fn publishes_edit_delete() {
         // The realm deleted the object and the owner edited the file: the edit
         // wins locally and becomes the next realm version.
         let old = Ulid::from_bytes([1u8; 16]);
@@ -979,7 +976,7 @@ mod tests {
             created_at_ms: 7,
             last_reconcile_ms: None,
             last_error: None,
-            last_error_at_ms: None,
+            last_error_ms: None,
             observed_files: 0,
             list_cursor: None,
         };

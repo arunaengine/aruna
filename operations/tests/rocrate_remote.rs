@@ -1,11 +1,9 @@
+//! Tests RO-Crate export that streams blob bytes from a second node over a Bao read.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Driven two-node remote (Bao read) RO-Crate export integration.
-//!
-//! The exporter node holds only the metadata document; the payload version lives
-//! solely on a remote holder. `run_export_job` must resolve the File entity to
-//! the holder, fetch the bytes over the real net stack, and stream them into the
-//! artifact without ever registering the fetched blob locally.
 
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
@@ -14,30 +12,34 @@ use std::time::SystemTime;
 
 use aruna_blob::blob::BlobHandler;
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    ARUNA_DATA_PREFIX, Actor, ArtifactRef, AuthContext, Backend, BackendConfig, BackendLocation,
-    BackendRef, BlobLocationKey, BlobVersion, BucketInfo, ExportReportRow, ExportReportSource,
-    ExportRoCrateSpec, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, JobId,
-    JobPayload, JobRecord, JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
-    RoCrateLimits, VersionKey, VersionedObjectArn,
+use aruna_core::structs::execution::job::{
+    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobId, JobPayload,
+    JobRecord, JobResultPayload, ReasonCode, RoCrateLimits,
 };
-use aruna_core::types::{GroupId, UserId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+};
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo,
+    VersionKey,
+};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
-};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::export::run_export_job;
 use aruna_operations::jobs::service::read_artifact_range;
@@ -46,8 +48,12 @@ use aruna_operations::jobs::store::{
 };
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+};
+use aruna_operations::metadata::materialization_queue::process_materialization_batch;
+use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use bytes::Bytes;
@@ -146,7 +152,7 @@ async fn remote_export_streams() -> TestResult {
         0
     );
     assert_eq!(
-        keyspace_len(&exporter.context, HASH_PATHS_INDEX_KEYSPACE).await?,
+        keyspace_len(&exporter.context, PATHS_INDEX_KEYSPACE).await?,
         0
     );
 
@@ -233,7 +239,7 @@ async fn setup_remote(
         &location,
     )
     .await?;
-    initialize_net_incoming(holder.context.clone());
+    initialize_incoming_fixture(holder.context.clone());
 
     let config = seed_exporter(&exporter, holder.net.node_id(), owner, group_id, realm_id).await?;
     // Minted on the exporter so the document lands in a bucket it leads.
@@ -244,7 +250,7 @@ async fn setup_remote(
     };
     let document_id = mint_local_document(&config, &exporter_actor, group_id, DOC_PATH)?.as_ulid();
     let arn = VersionedObjectArn::new(realm_id, holder.net.node_id(), BUCKET, KEY, version_id)?;
-    let jsonld = remote_crate_json(&arn.to_w3id(), &content_hash_w3id(hash));
+    let jsonld = remote_crate_json(&arn.to_w3id(), &content_hash_iri(hash));
     create_document(&exporter, owner, group_id, realm_id, document_id, jsonld).await?;
     Ok((holder, exporter, document_id))
 }
@@ -331,7 +337,7 @@ async fn write_payload(
         .as_ref()
         .ok_or("holder blob handle is missing")?
         .send_blob_effect(BlobEffect::Write {
-            resolved: aruna_core::structs::ResolvedBackend::node_default(),
+            resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
             bucket: BUCKET.to_string(),
             key: KEY.to_string(),
             created_by: owner,
@@ -361,8 +367,8 @@ async fn seed_holder(
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.ensure_node(node.net.node_id(), RealmNodeKind::Server);
     config.ensure_node(peer, RealmNodeKind::Server);
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
     let bucket = BucketInfo {
         group_id,
         created_at: SystemTime::UNIX_EPOCH,
@@ -458,8 +464,8 @@ async fn seed_exporter(
     config.seed_job_control(node.net.node_id(), 0);
     config.ensure_node(peer, RealmNodeKind::Server);
     config.seed_job_control(peer, 1);
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
     let writes = vec![
         (
             REALM_CONFIG_KEYSPACE.to_string(),
@@ -524,7 +530,7 @@ async fn create_document(
     jsonld: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+        CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
                 node_id: node.net.node_id(),
                 user_id: owner,
@@ -534,13 +540,13 @@ async fn create_document(
             document_id,
             document_path: DOC_PATH.to_string(),
             public: false,
-            payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
+            payload: CreateDocumentPayload::RoCrate { jsonld },
         }),
         node.context.as_ref(),
     )
     .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
-    process_metadata_materialization_batch(node.context.as_ref()).await?;
+    replay_event_log(node.context.as_ref()).await?;
+    process_materialization_batch(node.context.as_ref()).await?;
     Ok(())
 }
 
@@ -625,7 +631,7 @@ fn remote_crate_json(arn_w3id: &str, hash_w3id: &str) -> String {
     .to_string()
 }
 
-fn content_hash_w3id(hash: [u8; 32]) -> String {
+fn content_hash_iri(hash: [u8; 32]) -> String {
     format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash))
 }
 

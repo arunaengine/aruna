@@ -1,9 +1,11 @@
-//! Family reads that must be complete before anything is decided from them.
+//! Tests that a family read is complete before anything is decided from it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::JOB_FAMILY_RECORD_KEYSPACE;
-use aruna_core::structs::{
+use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
+use aruna_core::structs::execution::job::{
     ExecutionReceipt, JobFamilyRecord, JobRecordKey, JobRecordKind, LogicalJobSpec,
 };
 use aruna_core::types::Value;
@@ -11,11 +13,11 @@ use aruna_core::types::Value;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::updates::chain_for;
 use crate::jobs::records::keys::record_key;
-use crate::jobs::records::tests::fixture::{Family, REALM, context};
 use crate::jobs::records::{
     AppendRecordConfig, AppendRecordOperation, FamilyReadError, RecordOrigin, load_family_complete,
     load_kind_complete,
 };
+use crate::tests::records::{Family, REALM, context};
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
 async fn seed(ctx: &DriverContext, family: &Family) -> (LogicalJobSpec, ExecutionReceipt) {
@@ -80,7 +82,7 @@ async fn poison(ctx: &DriverContext, family: &Family) {
     let event = ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             key,
             value: Value::from([0xffu8; 16].as_slice()),
             txn_id: None,
@@ -136,17 +138,17 @@ async fn resolves_session_alias() {
     assert_eq!(record.job_id, spec.job_id);
     assert_eq!(record.owner_node_id, family.target.public());
     assert_eq!(physical, Some(receipt.physical_job_id));
-    let now = aruna_core::util::unix_timestamp_millis();
-    let mut physical = aruna_core::structs::JobRecord::new(
+    let now = aruna_core::time::unix_timestamp_millis();
+    let mut physical = aruna_core::structs::execution::job::JobRecord::new(
         receipt.physical_job_id,
-        aruna_core::structs::JobPayload::Execution(spec.payload.clone()),
+        aruna_core::structs::execution::job::JobPayload::Execution(spec.payload.clone()),
         spec.created_by,
         family.target.public(),
         now,
         now,
         None,
     );
-    physical.state = aruna_core::structs::JobState::Succeeded;
+    physical.state = aruna_core::structs::execution::job::JobState::Succeeded;
     physical.finished_at_ms = Some(now);
     physical.report_digest = Some([4; 32]);
     crate::jobs::store::insert_job(&ctx.storage_handle, &physical)
@@ -167,7 +169,7 @@ async fn resolves_session_alias() {
         matches!(report, crate::jobs::service::JobReportLookup::Ready { job, .. }
         if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32])
     );
-    let stranger = aruna_core::types::UserId::new(ulid::Ulid(42), REALM);
+    let stranger = aruna_core::UserId::new(ulid::Ulid(42), REALM);
     assert!(matches!(
         crate::jobs::service::read_report_routed(&ctx, stranger, spec.job_id, None, None, 1, None)
             .await,

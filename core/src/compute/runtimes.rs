@@ -1,3 +1,7 @@
+//! Lists the quick start runtime images and the job tags that mark an interactive session.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -72,12 +76,12 @@ pub const SESSION_EXPIRY_TAG: &str = "aruna-engine.org/session-expires-at-ms";
 pub const SESSION_IDLE_TAG: &str = "aruna-engine.org/session-idle-ms";
 /// Key prefix of the workspace bucket a session mounts; empty means the whole
 /// bucket. Set by the node from the submission, defaulting to `data/`.
-pub const SESSION_MOUNT_PREFIX_TAG: &str = "aruna-engine.org/session-mount-prefix";
+pub const MOUNT_PREFIX_TAG: &str = "aruna-engine.org/session-mount-prefix";
 /// Container path that prefix is mounted at, below the working directory.
-pub const SESSION_MOUNT_PATH_TAG: &str = "aruna-engine.org/session-mount-path";
-pub const DEFAULT_SESSION_MOUNT_PREFIX: &str = "data/";
+pub const MOUNT_PATH_TAG: &str = "aruna-engine.org/session-mount-path";
+pub const SESSION_MOUNT_PREFIX: &str = "data/";
 /// Folder name below the working directory the default mount uses.
-pub const DEFAULT_SESSION_MOUNT_DIR: &str = "data";
+pub const SESSION_MOUNT_DIR: &str = "data";
 
 /// Unix socket the session helper listens on, relative to the working
 /// directory. The node passes the absolute path in `ARUNA_SESSION_SOCKET`.

@@ -1,19 +1,20 @@
-//! Read scopes for callers whose roles reach only a part of a bucket: the
-//! access hook resolves them once and the listing handlers narrow their page to
-//! them, while every concrete object path stays an ordinary permission check.
+//! Resolves the key prefixes a caller may read when a role reaches only part of a bucket.
+//! Listing handlers narrow their page to those prefixes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+// Every concrete object path still goes through an ordinary permission check.
 
 use aruna_core::errors::AuthorizationError;
 use aruna_core::permission_path::readable_roots;
-use aruna_core::structs::{AuthContext, PathRestriction, Permission, UserAccess};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::permission_rules::{
-    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
-};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::UserAccess;
+use aruna_operations::auth::permission_rules::{PermissionRules, permission_rules};
+use aruna_operations::driver::DriverContext;
 use s3s::{S3Result, s3_error};
 
 /// Navigable key prefixes and the rules deciding each concrete key's access.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct SubpathScope {
+pub(super) struct SubpathScope {
     prefixes: Vec<String>,
     root: String,
     rules: PermissionRules,
@@ -26,15 +27,14 @@ impl SubpathScope {
         restrictions: Option<&[PathRestriction]>,
         root: &str,
     ) -> Self {
-        let roots = readable_roots(&rules.direct_patterns(), restrictions, root);
         let inside = format!("{root}/");
-        let prefixes = roots
+        let prefixes = readable_roots(&rules.direct_patterns(), restrictions, root)
             .into_iter()
-            .filter_map(|candidate| {
-                if candidate == root {
+            .filter_map(|allowed| {
+                if allowed == root {
                     Some(String::new())
                 } else {
-                    candidate.strip_prefix(&inside).map(str::to_string)
+                    allowed.strip_prefix(&inside).map(str::to_string)
                 }
             })
             .collect();
@@ -45,19 +45,19 @@ impl SubpathScope {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.prefixes.is_empty()
     }
 
     /// Applies the ordinary permission decision, including denies and restrictions.
-    pub(crate) fn allows_key(&self, key: &str) -> bool {
+    pub(super) fn allows_key(&self, key: &str) -> bool {
         self.rules
             .allows(&format!("{}/{key}", self.root), &Permission::READ)
     }
 
-    /// Whether a listing prefix is an ancestor of, equal to, or inside an
-    /// allowed prefix. A request prefix without such an overlap is refused.
-    pub(crate) fn allows_prefix(&self, prefix: &str) -> bool {
+    /// Whether a listing prefix starts, equals, or lies inside an allowed prefix,
+    /// so `imag` starts `imaging`. A request prefix without such an overlap is refused.
+    pub(super) fn allows_prefix(&self, prefix: &str) -> bool {
         self.prefixes.iter().any(|allowed| {
             allowed.is_empty()
                 || allowed.starts_with(prefix)
@@ -65,12 +65,20 @@ impl SubpathScope {
                 || prefix.starts_with(&format!("{allowed}/"))
         })
     }
+
+    pub(super) fn overlaps(&self, path: &str) -> bool {
+        if path == self.root {
+            return !self.is_empty();
+        }
+        path.strip_prefix(&format!("{}/", self.root))
+            .is_some_and(|prefix| self.allows_prefix(prefix))
+    }
 }
 
 /// Resolves the subtrees at or below `root` the caller reaches through its
 /// realm and group roles, narrowed by the credential's own restrictions. A
 /// missing realm or group document grants nothing instead of failing.
-pub(crate) async fn resolve_scope(
+pub(super) async fn resolve_scope(
     context: &DriverContext,
     user_access: &UserAccess,
     root: &str,
@@ -81,21 +89,13 @@ pub(crate) async fn resolve_scope(
         path_restrictions: user_access.path_restrictions.clone(),
         session: None,
     };
-    let rules = match drive(
-        PermissionRulesOperation::new(PermissionRulesConfig {
-            auth_context,
-            path: root.to_string(),
-        }),
-        context,
-    )
-    .await
-    {
+    let rules = match permission_rules(context, &auth_context, root).await {
         Ok(rules) => rules,
         Err(
-            AuthorizationError::AuthDocNotFound
+            AuthorizationError::DocNotFound
             | AuthorizationError::GroupNotFound
-            | AuthorizationError::InvalidRealmId
-            | AuthorizationError::InvalidGroupId,
+            | AuthorizationError::InvalidGroupId
+            | AuthorizationError::InvalidRealmId,
         ) => return Ok(SubpathScope::default()),
         Err(error) => return Err(s3_error!(InternalError, "{}", error.to_string())),
     };
@@ -108,10 +108,9 @@ pub(crate) async fn resolve_scope(
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::{PathRestriction, Permission, Role};
-    use aruna_operations::permission_rules::{CollectedRole, PermissionRules};
-
     use super::SubpathScope;
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission, Role};
+    use aruna_operations::auth::permission_rules::{CollectedRole, PermissionRules};
 
     fn test_scope(
         patterns: &[(&str, Permission)],
@@ -154,6 +153,9 @@ mod tests {
         assert!(scope.allows_prefix(""));
         assert!(scope.allows_prefix("imaging/"));
         assert!(scope.allows_prefix("imaging/2026/"));
+        assert!(scope.allows_prefix("imag"));
+        assert!(!scope.allows_prefix("imag/"));
+        assert!(!scope.allows_prefix("imagery/"));
         assert!(!scope.allows_prefix("sequencing/"));
     }
 

@@ -1,15 +1,15 @@
-//! Complete reads of one job family.
-//!
-//! Scheduling, admission, and state publication may only decide on the whole
-//! family. A prefix of it, a row that failed to decode, or a scan that stopped
-//! at its bound is an availability failure, never evidence that a record does
-//! not exist.
+//! Reads every record of one job family completely, or reports why it could not.
+//! A partial or failed read is an availability failure, never proof that a record is absent.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
 
 use aruna_core::errors::ConversionError;
-use aruna_core::keyspaces::JOB_FAMILY_RECORD_KEYSPACE;
-use aruna_core::structs::{JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind};
+use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
+use aruna_core::structs::execution::job::{
+    JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind,
+};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
@@ -74,7 +74,7 @@ async fn stored_page(
 ) -> Result<RecordPage, String> {
     iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_RECORD_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE,
         Some(prefix),
         cursor,
         RECORD_PAGE_SIZE,
@@ -121,12 +121,12 @@ where
 mod tests {
     use std::cell::Cell;
 
-    use aruna_core::structs::PhysicalExecutionState;
+    use aruna_core::structs::execution::job::PhysicalExecutionState;
 
     use super::*;
     use crate::jobs::records::keys::record_key;
     use crate::jobs::records::rows::to_bytes;
-    use crate::jobs::records::tests::fixture::Family;
+    use crate::tests::records::Family;
 
     fn row(envelope: &JobRecordEnvelope) -> (Key, Value) {
         (

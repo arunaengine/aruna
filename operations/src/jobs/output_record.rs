@@ -1,6 +1,10 @@
+//! Builds, signs and stores an execution's output record and returns the digest success names.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::effects::JobRecordFrame;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     AttemptControl, ExecutionOutputRecord, JobError, JobFamilyRecord, JobId, JobRecord,
     JobRecordEnvelope, LocalExecution, OutputObject, OutputSet, SubmissionId,
 };
@@ -31,11 +35,8 @@ pub async fn store_outputs(
         .ok_or_else(|| JobError::permanent("execution job carries no plan digest"))?;
     let outputs = OutputSet::canonical(outputs.to_vec())
         .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
-    // A replay re-appends the record it already stored: the append is
-    // idempotent and a family view that was unavailable before may resolve now.
-    // A receipted execution binds the real chain: the replicated identity, the
-    // stored spec digest, and the target's own receipt. Without a receipt this
-    // is a purely local execution and the documented local stand-ins apply.
+    // A replay re-appends an idempotent record and a previously unavailable family
+    // may resolve now; a receipted execution binds the real chain, else locals.
     let chain = chain_of_attempt(context, record.job_id, control.execution_id).await;
     let receipted = chain.is_some();
     if let Some(frame) = stored_record(context, record.job_id, control, &outputs, net.node_id())
@@ -69,7 +70,7 @@ pub async fn store_outputs(
             .map(|chain| chain.receipt_digest)
             .unwrap_or_else(|| control.fence_digest(record.job_id)),
         outputs,
-        committed_at_ms: aruna_core::util::unix_timestamp_millis(),
+        committed_at_ms: aruna_core::time::unix_timestamp_millis(),
     };
     let envelope = JobRecordEnvelope::signed_with(
         record.created_by.realm_id,
@@ -83,13 +84,9 @@ pub async fn store_outputs(
     publish_output_record(context, record.job_id, control, frame, receipted).await
 }
 
-/// The record this execution already stored for the same exact output set. A
-/// replayed finalize reuses it instead of re-signing a second record that
-/// differs only by its commit timestamp.
-///
-/// The stored row is re-verified on read-back: a row whose signature or
-/// publisher no longer proves this node wrote it is not evidence, so a correct
-/// record is stored again instead of trusting it.
+/// The record this execution already stored for the same exact output set; a
+/// replayed finalize reuses it instead of re-signing a record that differs only
+/// by commit timestamp. Re-verified on read-back, so a bad row is re-stored.
 async fn stored_record(
     context: &DriverContext,
     job_id: JobId,
@@ -121,12 +118,9 @@ async fn stored_record(
     Ok(matches.then_some(envelope))
 }
 
-/// The one place this execution's signed output record leaves the workflow. It
-/// is durable locally before terminal success may name its digest, and it is
-/// appended to the family record store here, after the local write and before
-/// the digest is returned. The append marks it for family replication only when
-/// the replicated chain proves it: a record proven by this node's own fence
-/// alone stays local until its receipt exists.
+/// The one place this execution's signed output record leaves the workflow:
+/// durable locally before success may name its digest, then appended to the
+/// family store, replicated only when the chain proves it (not the local fence).
 async fn publish_output_record(
     context: &DriverContext,
     job_id: JobId,
@@ -182,7 +176,7 @@ async fn append_output_record(
         }),
         record: frame.clone(),
         origin: RecordOrigin::Local,
-        now_ms: aruna_core::util::unix_timestamp_millis(),
+        now_ms: aruna_core::time::unix_timestamp_millis(),
     };
     match drive(AppendRecordOperation::new(config), context).await {
         Ok(outcome) => match outcome.admission {
@@ -215,10 +209,11 @@ async fn append_output_record(
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::{
-        AttemptIntent, ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobState, RealmId,
+    use aruna_core::UserId;
+    use aruna_core::structs::execution::job::{
+        AttemptIntent, ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobState,
     };
-    use aruna_core::types::UserId;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -283,7 +278,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: net.node_id(),
             claim_token: TOKEN,
-            lease_expires_at_ms: 10_000,
+            lease_expires_ms: 10_000,
         });
         insert_job(&storage, &record).await.unwrap();
         let context = DriverContext {

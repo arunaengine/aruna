@@ -1,3 +1,7 @@
+//! Owns the blob handler: backend registry, staging writers, replication and read streams.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::egress::EgressGuard;
 use aruna_core::NodeId;
 use aruna_net::NetHandle;
@@ -8,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 mod backend;
@@ -40,7 +45,7 @@ struct Connection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ControlPlaneTimeoutKind {
+enum ControlPlaneKind {
     Connection,
     Read,
     Write,
@@ -71,6 +76,10 @@ pub struct BlobHandler {
     rejected_writes: Arc<AtomicU64>,
     writes_in_flight: Arc<AtomicUsize>,
     writes_drained: Arc<Notify>,
+    /// Stops the backend-status monitor at shutdown so its handler clone, and
+    /// with it the storage handle, is released before storage closes.
+    monitor_cancel: CancellationToken,
+    monitor_task: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Clone, Debug)]

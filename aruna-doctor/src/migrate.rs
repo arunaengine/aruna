@@ -1,22 +1,22 @@
-//! Re-encodes stored rows written before a field was added: job-family rows
-//! that embed a physical execution result without stdout and stderr tails, and
-//! realm configuration documents without the compute catch-up wait. Safe to
-//! repeat: a row already in the current shape is left untouched.
+//! Re-encodes legacy job and realm rows that are missing current fields.
+//! Rows already current stay unchanged, the projection cache is cleared and repeats are safe.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
+use aruna_core::NodeId;
 use aruna_core::keyspaces::{
-    JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
-    JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::structs::{
-    DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS, ExecutionOutputRecord,
-    ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord, JobRecordEnvelope,
-    LaunchIntent, LogicalJobSpec, PhysicalExecutionResult, PhysicalExecutionState,
-    RealmConfigDocument, RealmId, ResultMessage, SubmissionClaim, SubmissionId,
-    WitnessBudgetRecord,
+use aruna_core::structs::execution::job::{
+    ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
+    JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
+    PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
-use aruna_core::types::NodeId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
@@ -53,28 +53,18 @@ pub async fn migrate(database_path: String) -> Result<(), CliError> {
 
 fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
-    let record_rows = db.keyspace(JOB_FAMILY_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let pending_rows = db.keyspace(JOB_FAMILY_PENDING_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let conflict_rows =
-        db.keyspace(JOB_FAMILY_CONFLICT_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let cache_rows = db.keyspace(
-        JOB_FAMILY_PROJECTION_KEYSPACE,
-        KeyspaceCreateOptions::default,
-    )?;
+    let record_rows = db.keyspace(FAMILY_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let pending_rows = db.keyspace(FAMILY_PENDING_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let conflict_rows = db.keyspace(FAMILY_CONFLICT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let cache_rows = db.keyspace(FAMILY_PROJECTION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let config_rows = db.keyspace(REALM_CONFIG_KEYSPACE, KeyspaceCreateOptions::default)?;
 
-    let records = rewrites::<JobRecordEnvelope, LegacyEnvelope>(
-        &db,
-        &record_rows,
-        JOB_FAMILY_RECORD_KEYSPACE,
-    )?;
+    let records =
+        rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
     let pending =
-        rewrites::<PendingRecord, LegacyPending>(&db, &pending_rows, JOB_FAMILY_PENDING_KEYSPACE)?;
-    let conflicts = rewrites::<ConflictRecord, LegacyConflict>(
-        &db,
-        &conflict_rows,
-        JOB_FAMILY_CONFLICT_KEYSPACE,
-    )?;
+        rewrites::<PendingRecord, LegacyPending>(&db, &pending_rows, FAMILY_PENDING_KEYSPACE)?;
+    let conflicts =
+        rewrites::<ConflictRecord, LegacyConflict>(&db, &conflict_rows, FAMILY_CONFLICT_KEYSPACE)?;
     let projections = keys(&db, &cache_rows)?;
     let configs = realm_configs(&db, &config_rows)?;
 
@@ -164,8 +154,8 @@ fn realm_configs(
 /// Appends the trailing defaults an older row lacks, shortest suffix first, so
 /// a row missing only the newest value keeps the one it already has.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
-    let idle = postcard::to_allocvec(&DEFAULT_SESSION_IDLE_AFTER_MS).ok()?;
-    let catch_up = postcard::to_allocvec(&DEFAULT_CATCH_UP_AFTER_MS).ok()?;
+    let idle = postcard::to_allocvec(&IDLE_AFTER_MS).ok()?;
+    let catch_up = postcard::to_allocvec(&CATCH_UP_MS).ok()?;
     let mut both = catch_up;
     both.extend_from_slice(&idle);
     for suffix in [idle, both] {
@@ -355,14 +345,15 @@ mod tests {
         LegacyUpdate, migrate_output,
     };
     use aruna_core::keyspaces::{
-        JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE,
-        JOB_FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::structs::{
-        DEFAULT_CATCH_UP_AFTER_MS, DEFAULT_SESSION_IDLE_AFTER_MS, ExecutionUpdate, JobFamilyRecord,
-        JobRecordEnvelope, PhysicalExecutionState, RealmConfigDocument, RealmId, ResultMessage,
+    use aruna_core::structs::execution::job::{
+        ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
     };
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::BTreeMap;
@@ -447,14 +438,14 @@ mod tests {
         let current = postcard::to_allocvec(&current_envelope()).unwrap();
         write(
             &path,
-            JOB_FAMILY_RECORD_KEYSPACE,
+            FAMILY_RECORD_KEYSPACE,
             vec![(b"old", legacy), (b"new", current.clone())],
         );
 
         let output = migrate_output(path.to_str().unwrap()).unwrap();
 
         assert_eq!((output.records_scanned, output.records_rewritten), (2, 1));
-        let rows = read(&path, JOB_FAMILY_RECORD_KEYSPACE);
+        let rows = read(&path, FAMILY_RECORD_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
         let migrated: JobRecordEnvelope =
             postcard::from_bytes(&rows[b"old".as_slice()]).expect("row decodes");
@@ -493,8 +484,8 @@ mod tests {
             relayed_by: None,
         })
         .unwrap();
-        write(&path, JOB_FAMILY_PENDING_KEYSPACE, vec![(b"p", pending)]);
-        write(&path, JOB_FAMILY_CONFLICT_KEYSPACE, vec![(b"c", conflict)]);
+        write(&path, FAMILY_PENDING_KEYSPACE, vec![(b"p", pending)]);
+        write(&path, FAMILY_CONFLICT_KEYSPACE, vec![(b"c", conflict)]);
 
         let output = migrate_output(path.to_str().unwrap()).unwrap();
 
@@ -503,7 +494,7 @@ mod tests {
             (output.conflicts_scanned, output.conflicts_rewritten),
             (1, 1)
         );
-        let rows = read(&path, JOB_FAMILY_PENDING_KEYSPACE);
+        let rows = read(&path, FAMILY_PENDING_KEYSPACE);
         let migrated: PendingRecord =
             postcard::from_bytes(&rows[b"p".as_slice()]).expect("row decodes");
         assert_eq!(migrated.attempts, 2);
@@ -519,27 +510,26 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let cache = postcard::to_allocvec(&ProjectionCache::invalidated(None)).unwrap();
-        write(&path, JOB_FAMILY_PROJECTION_KEYSPACE, vec![(b"f", cache)]);
+        write(&path, FAMILY_PROJECTION_KEYSPACE, vec![(b"f", cache)]);
 
         let output = migrate_output(path.to_str().unwrap()).unwrap();
 
         assert_eq!(output.projections_cleared, 1);
-        assert!(read(&path, JOB_FAMILY_PROJECTION_KEYSPACE).is_empty());
+        assert!(read(&path, FAMILY_PROJECTION_KEYSPACE).is_empty());
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!(again.projections_cleared, 0);
     }
 
     #[test]
     fn rewrites_realm_configs() {
-        // A document stored before the catch-up wait or before the session idle
-        // timeout must decode again with the defaults, and a current document
-        // must stay byte-identical.
+        // Legacy documents decode with defaults for catch-up and session idle timeouts.
+        // Current documents remain byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
         let current = postcard::to_allocvec(&document).unwrap();
-        let idle = postcard::to_allocvec(&DEFAULT_SESSION_IDLE_AFTER_MS).unwrap();
-        let catch_up = postcard::to_allocvec(&DEFAULT_CATCH_UP_AFTER_MS).unwrap();
+        let idle = postcard::to_allocvec(&IDLE_AFTER_MS).unwrap();
+        let catch_up = postcard::to_allocvec(&CATCH_UP_MS).unwrap();
         let one_missing = current[..current.len() - idle.len()].to_vec();
         let both_missing = current[..current.len() - idle.len() - catch_up.len()].to_vec();
         write(
@@ -561,20 +551,11 @@ mod tests {
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
         let migrated = RealmConfigDocument::from_bytes(&rows[b"old".as_slice()]).unwrap();
-        assert_eq!(
-            migrated.compute.catch_up_after_ms,
-            DEFAULT_CATCH_UP_AFTER_MS
-        );
-        assert_eq!(
-            migrated.compute.session_idle_after_ms,
-            DEFAULT_SESSION_IDLE_AFTER_MS
-        );
+        assert_eq!(migrated.compute.catch_up_ms, CATCH_UP_MS);
+        assert_eq!(migrated.compute.session_idle_ms, IDLE_AFTER_MS);
         let newer = RealmConfigDocument::from_bytes(&rows[b"newer".as_slice()]).unwrap();
-        assert_eq!(newer.compute.catch_up_after_ms, DEFAULT_CATCH_UP_AFTER_MS);
-        assert_eq!(
-            newer.compute.session_idle_after_ms,
-            DEFAULT_SESSION_IDLE_AFTER_MS
-        );
+        assert_eq!(newer.compute.catch_up_ms, CATCH_UP_MS);
+        assert_eq!(newer.compute.session_idle_ms, IDLE_AFTER_MS);
 
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!(again.realm_configs_rewritten, 0);
@@ -588,13 +569,13 @@ mod tests {
         let path = temp.path().join("db");
         write(
             &path,
-            JOB_FAMILY_RECORD_KEYSPACE,
+            FAMILY_RECORD_KEYSPACE,
             vec![(b"bad", vec![0xff, 0xff, 0xff])],
         );
 
         let error = migrate_output(path.to_str().unwrap()).unwrap_err();
 
-        assert!(error.to_string().contains(JOB_FAMILY_RECORD_KEYSPACE));
+        assert!(error.to_string().contains(FAMILY_RECORD_KEYSPACE));
         assert!(error.to_string().contains(&hex::encode(b"bad")));
     }
 }

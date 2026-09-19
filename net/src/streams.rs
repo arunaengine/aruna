@@ -1,14 +1,18 @@
+//! Opens and accepts peer streams: admission, connection budgets, loopback and stream types.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
 use aruna_core::alpn::{Alpn, AlpnRole};
-use aruna_core::structs::RealmNodeKind;
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use iroh::Endpoint;
 use iroh::endpoint::{ClosedStream, Connection, ReadError, ReadToEndError, VarInt};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::Semaphore;
@@ -22,14 +26,12 @@ use crate::connection_pool::{ConnectionLease, ConnectionPool};
 use crate::device_limits::{DeviceLimiter, DeviceLimits, DevicePermit, DeviceRefusal};
 use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
-use crate::telemetry::{
-    duration_ms, record_duration_ms, warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
-};
+use crate::telemetry::{duration_ms, record_duration_ms, warn_iroh_phase, warn_iroh_request};
 
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
-const INBOUND_CONNECTION_GLOBAL_LIMIT: usize = 256;
-const INBOUND_CONNECTION_PEER_LIMIT: usize = 8;
-const INBOUND_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const INBOUND_CONNECTION_LIMIT: usize = 256;
+const CONNECTION_PEER_LIMIT: usize = 8;
+const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INBOUND_CONNECTION_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Configured node kind per realm key, shared with every subsystem that has to
@@ -185,7 +187,7 @@ struct ConnectionTimers {
 impl ConnectionTimers {
     fn new() -> Self {
         Self {
-            idle: Box::pin(tokio::time::sleep(INBOUND_CONNECTION_IDLE_TIMEOUT)),
+            idle: Box::pin(tokio::time::sleep(INBOUND_IDLE_TIMEOUT)),
             lifetime: Box::pin(tokio::time::sleep(INBOUND_CONNECTION_LIFETIME)),
         }
     }
@@ -193,7 +195,7 @@ impl ConnectionTimers {
     fn activity(&mut self) {
         self.idle
             .as_mut()
-            .reset(tokio::time::Instant::now() + INBOUND_CONNECTION_IDLE_TIMEOUT);
+            .reset(tokio::time::Instant::now() + INBOUND_IDLE_TIMEOUT);
     }
 }
 
@@ -211,7 +213,7 @@ struct InboundConnectionState {
 impl InboundConnectionBudget {
     fn acquire(self: &Arc<Self>) -> Option<InboundConnectionPermit> {
         let mut state = self.state.lock();
-        if state.global >= INBOUND_CONNECTION_GLOBAL_LIMIT {
+        if state.global >= INBOUND_CONNECTION_LIMIT {
             return None;
         }
         state.global += 1;
@@ -231,7 +233,7 @@ impl InboundConnectionPermit {
     fn admit(&mut self, peer: NodeId) -> bool {
         let mut state = self.budget.state.lock();
         let held = state.per_peer.get(&peer).copied().unwrap_or(0);
-        if held >= INBOUND_CONNECTION_PEER_LIMIT {
+        if held >= CONNECTION_PEER_LIMIT {
             return false;
         }
         *state.per_peer.entry(peer).or_insert(0) += 1;
@@ -258,20 +260,117 @@ impl Drop for InboundConnectionPermit {
 /// Pipe capacity per direction of an in-process stream.
 const LOOPBACK_PIPE_SIZE: usize = 64 * 1024;
 
+/// Cancellation flag shared by every half of one in-process stream. Closing
+/// the loopback wakes every task parked on a local read or write, so those
+/// futures fail instead of waiting on a pipe whose peer will never run again.
+#[derive(Debug, Default)]
+pub struct StreamCancellation {
+    cancelled: AtomicBool,
+    wakers: Mutex<Vec<Waker>>,
+}
+
+impl StreamCancellation {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let wakers = std::mem::take(&mut *self.wakers.lock());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// True when already cancelled; otherwise registers the poll's waker so
+    /// the next cancel wakes it. The check after the push closes the race with
+    /// a cancel that lands between the first check and the registration.
+    fn register(&self, waker: &Waker) -> bool {
+        if self.cancelled() {
+            return true;
+        }
+        {
+            let mut wakers = self.wakers.lock();
+            if !wakers.iter().any(|registered| registered.will_wake(waker)) {
+                wakers.push(waker.clone());
+            }
+        }
+        self.cancelled()
+    }
+}
+
+/// Lifetime owner of the loopback admission. One cancellation per dial is
+/// shared by all four halves, so closing the service wakes every parked
+/// stream; new dials are refused once it is closed.
+#[derive(Debug, Default)]
+pub(crate) struct LoopbackService {
+    state: Mutex<LoopbackState>,
+}
+
+#[derive(Debug, Default)]
+struct LoopbackState {
+    closed: bool,
+    live: Vec<Weak<StreamCancellation>>,
+}
+
+impl LoopbackService {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn open(
+        &self,
+        alpn: Alpn,
+        node_id: NodeId,
+        stream_handler: &mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    ) -> Result<BiStream> {
+        let cancellation = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Err(NetError::Stream("loopback admission is closed".to_string()));
+            }
+            state.live.retain(|live| live.strong_count() > 0);
+            let cancellation = Arc::new(StreamCancellation::new());
+            state.live.push(Arc::downgrade(&cancellation));
+            cancellation
+        };
+        open_loopback(alpn, node_id, stream_handler, &cancellation)
+    }
+
+    /// Idempotent: closing again only re-asserts the closed state, so a
+    /// resumed shutdown may repeat it.
+    pub(crate) fn close(&self) {
+        let live = {
+            let mut state = self.state.lock();
+            state.closed = true;
+            std::mem::take(&mut state.live)
+        };
+        for weak in live {
+            if let Some(cancellation) = weak.upgrade() {
+                cancellation.cancel();
+            }
+        }
+    }
+}
+
 /// Send half of a stream: an iroh stream to a peer, or one end of an
 /// in-process pipe when the node dials itself. `finish` drops the pipe end,
 /// which the reading side observes as end of stream.
 #[derive(Debug)]
 pub enum SendStream {
     Remote(iroh::endpoint::SendStream),
-    Local(Option<DuplexStream>),
+    Local(Option<DuplexStream>, Arc<StreamCancellation>),
 }
 
 impl SendStream {
     pub fn finish(&mut self) -> std::result::Result<(), ClosedStream> {
         match self {
             Self::Remote(stream) => stream.finish(),
-            Self::Local(pipe) => {
+            Self::Local(pipe, _) => {
                 pipe.take();
                 Ok(())
             }
@@ -281,7 +380,7 @@ impl SendStream {
     pub fn reset(&mut self, error_code: VarInt) -> std::result::Result<(), ClosedStream> {
         match self {
             Self::Remote(stream) => stream.reset(error_code),
-            Self::Local(pipe) => {
+            Self::Local(pipe, _) => {
                 pipe.take();
                 Ok(())
             }
@@ -297,24 +396,34 @@ impl AsyncWrite for SendStream {
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Self::Remote(stream) => AsyncWrite::poll_write(Pin::new(stream), cx, buf),
-            Self::Local(Some(pipe)) => Pin::new(pipe).poll_write(cx, buf),
-            Self::Local(None) => Poll::Ready(Err(finished_pipe())),
+            Self::Local(Some(pipe), cancellation) => {
+                if cancellation.cancelled() {
+                    return Poll::Ready(Err(cancelled_pipe()));
+                }
+                match Pin::new(pipe).poll_write(cx, buf) {
+                    Poll::Pending if cancellation.register(cx.waker()) => {
+                        Poll::Ready(Err(cancelled_pipe()))
+                    }
+                    poll => poll,
+                }
+            }
+            Self::Local(None, _) => Poll::Ready(Err(finished_pipe())),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Remote(stream) => AsyncWrite::poll_flush(Pin::new(stream), cx),
-            Self::Local(Some(pipe)) => Pin::new(pipe).poll_flush(cx),
-            Self::Local(None) => Poll::Ready(Err(finished_pipe())),
+            Self::Local(Some(pipe), _) => Pin::new(pipe).poll_flush(cx),
+            Self::Local(None, _) => Poll::Ready(Err(finished_pipe())),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Remote(stream) => AsyncWrite::poll_shutdown(Pin::new(stream), cx),
-            Self::Local(Some(pipe)) => Pin::new(pipe).poll_shutdown(cx),
-            Self::Local(None) => Poll::Ready(Ok(())),
+            Self::Local(Some(pipe), _) => Pin::new(pipe).poll_shutdown(cx),
+            Self::Local(None, _) => Poll::Ready(Ok(())),
         }
     }
 }
@@ -323,19 +432,23 @@ fn finished_pipe() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "local stream finished")
 }
 
+fn cancelled_pipe() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "local stream cancelled")
+}
+
 /// Receive half of a stream; `stop` drops a pipe end so the writer sees a
 /// broken pipe, like a stopped iroh stream.
 #[derive(Debug)]
 pub enum RecvStream {
     Remote(iroh::endpoint::RecvStream),
-    Local(Option<DuplexStream>),
+    Local(Option<DuplexStream>, Arc<StreamCancellation>),
 }
 
 impl RecvStream {
     pub fn stop(&mut self, error_code: VarInt) -> std::result::Result<(), ClosedStream> {
         match self {
             Self::Remote(stream) => stream.stop(error_code),
-            Self::Local(pipe) => {
+            Self::Local(pipe, _) => {
                 pipe.take();
                 Ok(())
             }
@@ -347,22 +460,18 @@ impl RecvStream {
         &mut self,
         size_limit: usize,
     ) -> std::result::Result<Vec<u8>, ReadToEndError> {
-        match self {
-            Self::Remote(stream) => stream.read_to_end(size_limit).await,
-            Self::Local(pipe) => {
-                let mut bytes = Vec::new();
-                if let Some(pipe) = pipe {
-                    AsyncReadExt::take(pipe, size_limit as u64 + 1)
-                        .read_to_end(&mut bytes)
-                        .await
-                        .map_err(|_| ReadToEndError::Read(ReadError::ClosedStream))?;
-                }
-                if bytes.len() > size_limit {
-                    return Err(ReadToEndError::TooLong);
-                }
-                Ok(bytes)
-            }
+        if let Self::Remote(stream) = self {
+            return stream.read_to_end(size_limit).await;
         }
+        let mut bytes = Vec::new();
+        AsyncReadExt::take(&mut *self, size_limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| ReadToEndError::Read(ReadError::ClosedStream))?;
+        if bytes.len() > size_limit {
+            return Err(ReadToEndError::TooLong);
+        }
+        Ok(bytes)
     }
 }
 
@@ -374,32 +483,44 @@ impl AsyncRead for RecvStream {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Remote(stream) => AsyncRead::poll_read(Pin::new(stream), cx, buf),
-            Self::Local(Some(pipe)) => Pin::new(pipe).poll_read(cx, buf),
-            Self::Local(None) => Poll::Ready(Ok(())),
+            Self::Local(Some(pipe), cancellation) => {
+                if cancellation.cancelled() {
+                    return Poll::Ready(Err(cancelled_pipe()));
+                }
+                match Pin::new(pipe).poll_read(cx, buf) {
+                    Poll::Pending if cancellation.register(cx.waker()) => {
+                        Poll::Ready(Err(cancelled_pipe()))
+                    }
+                    poll => poll,
+                }
+            }
+            Self::Local(None, _) => Poll::Ready(Ok(())),
         }
     }
 }
 
-/// Opens a stream to this node itself. One pipe carries each direction; the
-/// far end is queued to the inbound stream handler like an accepted stream.
+/// Opens a stream to this node itself: one pipe per direction, and the far
+/// end is queued to the inbound stream handler like an accepted stream. Both
+/// ends share `cancellation`, so closing the loopback wakes parked halves.
 pub(crate) fn open_loopback(
     alpn: Alpn,
     node_id: NodeId,
     stream_handler: &mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    cancellation: &Arc<StreamCancellation>,
 ) -> Result<BiStream> {
     let (outbound_send, inbound_recv) = tokio::io::duplex(LOOPBACK_PIPE_SIZE);
     let (inbound_send, outbound_recv) = tokio::io::duplex(LOOPBACK_PIPE_SIZE);
     let inbound = BiStream(
-        SendStream::Local(Some(inbound_send)),
-        RecvStream::Local(Some(inbound_recv)),
+        SendStream::Local(Some(inbound_send), cancellation.clone()),
+        RecvStream::Local(Some(inbound_recv), cancellation.clone()),
         None,
     );
     stream_handler
         .try_send((alpn, inbound, node_id))
         .map_err(|error| NetError::Stream(format!("loopback {alpn} stream not queued: {error}")))?;
     Ok(BiStream(
-        SendStream::Local(Some(outbound_send)),
-        RecvStream::Local(Some(outbound_recv)),
+        SendStream::Local(Some(outbound_send), cancellation.clone()),
+        RecvStream::Local(Some(outbound_recv), cancellation.clone()),
         None,
     ))
 }
@@ -437,16 +558,30 @@ impl AsyncRead for LeasedRecvStream {
 
 pub struct StreamsService {
     connection_pool: ConnectionPool,
-    #[allow(dead_code)]
-    shutdown: CancellationToken,
+    loopback: LoopbackService,
 }
 
 impl StreamsService {
-    pub fn new(connection_pool: ConnectionPool, shutdown: CancellationToken) -> Self {
+    pub fn new(connection_pool: ConnectionPool) -> Self {
         Self {
             connection_pool,
-            shutdown,
+            loopback: LoopbackService::new(),
         }
+    }
+
+    pub(crate) fn open_loopback(
+        &self,
+        alpn: Alpn,
+        node_id: NodeId,
+        stream_handler: &mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    ) -> Result<BiStream> {
+        self.loopback.open(alpn, node_id, stream_handler)
+    }
+
+    /// Closes the loopback admission for good: new same-node dials fail and
+    /// every live local pipe half wakes with a broken pipe. Idempotent.
+    pub(crate) fn close_loopback(&self) {
+        self.loopback.close();
     }
 
     #[tracing::instrument(
@@ -481,7 +616,7 @@ impl StreamsService {
                 Ok(conn) => {
                     let elapsed = connect_started.elapsed();
                     record_duration_ms(&span, "iroh.connect_ms", elapsed);
-                    warn_if_slow_iroh_phase("stream.open", "connect", elapsed);
+                    warn_iroh_phase("stream.open", "connect", elapsed);
                     trace!(
                         event = "iroh.stream.open_phase",
                         peer = %node_id,
@@ -516,7 +651,7 @@ impl StreamsService {
                 Ok(Ok(stream)) => {
                     let elapsed = open_started.elapsed();
                     record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
-                    warn_if_slow_iroh_phase("stream.open", "open_bi", elapsed);
+                    warn_iroh_phase("stream.open", "open_bi", elapsed);
                     trace!(
                         event = "iroh.stream.open_phase",
                         peer = %node_id,
@@ -566,7 +701,7 @@ impl StreamsService {
 
             let total_elapsed = total_started.elapsed();
             record_duration_ms(&span, "iroh.total_ms", total_elapsed);
-            warn_if_slow_iroh_request("stream.open", total_elapsed);
+            warn_iroh_request("stream.open", total_elapsed);
             span.record("otel.status_code", "OK");
             trace!(
                 event = "iroh.stream.open_completed",
@@ -619,7 +754,7 @@ pub async fn run_accept_loop(
     shutdown: CancellationToken,
 ) {
     let inbound_budget = Arc::new(InboundConnectionBudget::default());
-    let handshake_budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_GLOBAL_LIMIT));
+    let handshake_budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_LIMIT));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -688,8 +823,7 @@ pub async fn run_accept_loop(
                         return;
                     }
                     // A provisional session takes the same budget as an admitted
-                    // one, so one unknown identity cannot hold every handshake
-                    // permit and starve inbound admission for configured peers.
+                    // one so one unknown identity cannot starve inbound admission.
                     drop(handshake_permit);
                     let Some(mut permit) = inbound_budget.acquire() else {
                         warn!("Dropping inbound Iroh connection: connection limit reached");
@@ -765,9 +899,8 @@ pub async fn run_accept_loop(
                     };
                     drop(provisional);
                     if materialized_now {
-                        // The fresh config decides: an admitted peer keeps this
-                        // session instead of losing its in-flight requests, and
-                        // run_admitted closes the connection for everyone else.
+                        // The fresh config decides: an admitted peer keeps its
+                        // session; run_admitted closes the connection for others.
                         run_admitted(
                             admitted_conn,
                             alpn,
@@ -994,7 +1127,7 @@ mod tests {
     fn global_cap() {
         let budget = Arc::new(InboundConnectionBudget::default());
         let mut permits = Vec::new();
-        for _ in 0..INBOUND_CONNECTION_GLOBAL_LIMIT {
+        for _ in 0..INBOUND_CONNECTION_LIMIT {
             permits.push(budget.acquire().expect("within global limit"));
         }
         assert!(budget.acquire().is_none());
@@ -1002,9 +1135,9 @@ mod tests {
 
     #[test]
     fn handshake_cap() {
-        let budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_GLOBAL_LIMIT));
+        let budget = Arc::new(Semaphore::new(INBOUND_CONNECTION_LIMIT));
         let mut permits = Vec::new();
-        for _ in 0..INBOUND_CONNECTION_GLOBAL_LIMIT {
+        for _ in 0..INBOUND_CONNECTION_LIMIT {
             permits.push(
                 budget
                     .clone()
@@ -1019,7 +1152,7 @@ mod tests {
     fn peer_cap() {
         let budget = Arc::new(InboundConnectionBudget::default());
         let mut permits = Vec::new();
-        for _ in 0..INBOUND_CONNECTION_PEER_LIMIT {
+        for _ in 0..CONNECTION_PEER_LIMIT {
             let mut permit = budget.acquire().expect("within global limit");
             assert!(permit.admit(peer(1)));
             permits.push(permit);
@@ -1033,7 +1166,7 @@ mod tests {
     fn peer_fairness() {
         let budget = Arc::new(InboundConnectionBudget::default());
         let mut first = Vec::new();
-        for _ in 0..INBOUND_CONNECTION_PEER_LIMIT {
+        for _ in 0..CONNECTION_PEER_LIMIT {
             let mut permit = budget.acquire().expect("within global limit");
             assert!(permit.admit(peer(1)));
             first.push(permit);
@@ -1078,9 +1211,9 @@ mod tests {
 
     fn user_kind() -> RealmNodeKind {
         RealmNodeKind::User {
-            owner: aruna_core::types::UserId::nil(aruna_core::structs::RealmId::from_bytes(
-                [7u8; 32],
-            )),
+            owner: aruna_core::UserId::nil(
+                aruna_core::structs::identity::realm::RealmId::from_bytes([7u8; 32]),
+            ),
         }
     }
 
@@ -1164,9 +1297,8 @@ mod tests {
 
     #[test]
     fn device_sync_refused() {
-        // A device exchanges no documents with anybody: not with realm
-        // infrastructure, not with another device. It fetches what it needs as
-        // a routed metadata read instead.
+        // A device exchanges no documents: it fetches what it needs as a routed
+        // metadata read instead.
         let realm_peers = Arc::new(RwLock::new(vec![peer(1), peer(2)]));
         let admission = InboundAdmission::new(realm_peers, []);
         admission.mark_materialized();
@@ -1237,11 +1369,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn activity_resets_idle() {
         let mut timers = ConnectionTimers::new();
-        tokio::time::advance(INBOUND_CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        tokio::time::advance(INBOUND_IDLE_TIMEOUT - Duration::from_secs(1)).await;
         timers.activity();
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(!timers.idle.is_elapsed());
-        tokio::time::advance(INBOUND_CONNECTION_IDLE_TIMEOUT).await;
+        tokio::time::advance(INBOUND_IDLE_TIMEOUT).await;
         assert!(timers.idle.is_elapsed());
     }
 
@@ -1256,5 +1388,71 @@ mod tests {
             _ = &mut timers.lifetime => {}
             _ = std::future::ready(()) => panic!("lifetime must fire despite activity"),
         }
+    }
+
+    #[tokio::test]
+    async fn loopback_queue_saturated() {
+        let (stream_tx, _stream_rx) = mpsc::channel(1);
+        let service = LoopbackService::new();
+        let _queued = service
+            .open(Alpn::Bao, peer(1), &stream_tx)
+            .expect("the empty queue accepts the first loopback dial");
+        let error = service
+            .open(Alpn::Bao, peer(1), &stream_tx)
+            .expect_err("a saturated inbound queue refuses the dial");
+        assert!(matches!(error, NetError::Stream(_)));
+    }
+
+    #[tokio::test]
+    async fn close_wakes_pending() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let service = LoopbackService::new();
+        let dialed = service
+            .open(Alpn::Bao, peer(1), &stream_tx)
+            .expect("loopback dial is queued");
+        // The queued handler half stays parked: nothing reads or writes it, so
+        // both dialed halves stay pending until the cancellation wakes them.
+        let _held = stream_rx.recv().await.expect("queued loopback stream");
+        let BiStream(send, recv, _) = dialed;
+
+        let (read_done, read_result) = oneshot::channel();
+        let read_task = tokio::spawn(async move {
+            let mut recv = recv;
+            let mut buf = [0u8; 8];
+            let _ = read_done.send(recv.read(&mut buf).await.is_err());
+        });
+        let (write_done, write_result) = oneshot::channel();
+        let write_task = tokio::spawn(async move {
+            let mut send = send;
+            let payload = vec![0u8; LOOPBACK_PIPE_SIZE * 2];
+            let _ = write_done.send(send.write_all(&payload).await.is_err());
+        });
+
+        service.close();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), read_result)
+                .await
+                .expect("a parked local read must wake")
+                .expect("the read task must report"),
+            "a parked local read must fail once the loopback closes"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), write_result)
+                .await
+                .expect("a blocked local write must wake")
+                .expect("the write task must report"),
+            "a blocked local write must fail once the loopback closes"
+        );
+        read_task.await.expect("the read task joins");
+        write_task.await.expect("the write task joins");
+
+        let error = service
+            .open(Alpn::Bao, peer(1), &stream_tx)
+            .expect_err("a closed loopback admits no new dial");
+        assert!(matches!(error, NetError::Stream(_)));
     }
 }

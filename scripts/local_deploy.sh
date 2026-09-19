@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Brings the Compose node up with Keycloak, waits for readiness and follows its logs.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -131,7 +135,7 @@ service_logs() {
   compose logs --no-color --tail "$LOG_TAIL_LINES" aruna 2>&1 || true
 }
 
-clear_compose_data_dir() {
+clear_data_dir() {
   docker run --rm \
     -v "$COMPOSE_DATA_DIR:/data" \
     alpine:3.23 \
@@ -328,7 +332,7 @@ stop_stack
 
 if ((FRESH)); then
   log "Clearing mounted compose state at $COMPOSE_DATA_DIR"
-  clear_compose_data_dir
+  clear_data_dir
 fi
 
 if compose_database_exists; then

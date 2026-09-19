@@ -1,10 +1,14 @@
+//! Validates an S3 session token and records the last used time, retrying on conflict.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::S3SessionError;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_SESSION_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::S3Session;
+use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::time::SystemTime;
@@ -13,7 +17,7 @@ use ulid::Ulid;
 const TOUCH_ATTEMPTS: u8 = 4;
 
 #[derive(Debug, PartialEq)]
-pub struct TouchS3SessionConfig {
+pub struct TouchS3Config {
     pub access_key: String,
     pub token_hash: String,
     pub now: SystemTime,
@@ -32,8 +36,8 @@ enum TouchSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct TouchS3SessionOperation {
-    config: TouchS3SessionConfig,
+pub struct TouchS3Operation {
+    config: TouchS3Config,
     pending: Option<S3Session>,
     txn_id: Option<Ulid>,
     attempts: u8,
@@ -41,8 +45,8 @@ pub struct TouchS3SessionOperation {
     output: Result<S3Session, S3SessionError>,
 }
 
-impl TouchS3SessionOperation {
-    pub fn new(config: TouchS3SessionConfig) -> Self {
+impl TouchS3Operation {
+    pub fn new(config: TouchS3Config) -> Self {
         Self {
             config,
             pending: None,
@@ -169,7 +173,7 @@ impl TouchS3SessionOperation {
     }
 }
 
-impl Operation for TouchS3SessionOperation {
+impl Operation for TouchS3Operation {
     type Output = S3Session;
     type Error = S3SessionError;
 
@@ -223,12 +227,12 @@ impl Operation for TouchS3SessionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]
     fn retries_touch_conflict() {
-        let mut operation = TouchS3SessionOperation::new(TouchS3SessionConfig {
+        let mut operation = TouchS3Operation::new(TouchS3Config {
             access_key: S3Session::build_access_key("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
             token_hash: "token".to_string(),
             now: SystemTime::UNIX_EPOCH,

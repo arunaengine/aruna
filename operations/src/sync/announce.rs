@@ -1,0 +1,730 @@
+//! Announces a sync topic and queues its documents and user pages for publishing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::VecDeque;
+
+use aruna_core::UserId;
+use aruna_core::document::{
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
+};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
+use aruna_core::operation::Operation;
+use aruna_core::storage_entries::lifecycle_revision_change;
+use aruna_core::structs::PersistentIdMapping;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id_change;
+use aruna_core::structs::placement::policy::document::{
+    PlacementPolicyDocument, placement_policy_change,
+};
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::task::TaskEvent;
+use aruna_core::types::{Effects, Key};
+use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
+use smallvec::smallvec;
+use thiserror::Error;
+use ulid::Ulid;
+
+use crate::document_repository;
+use crate::sync::document_outbox::{new_outbox_record, schedule_drain_effect, write_outbox_effect};
+
+const USER_PAGE_SIZE: usize = 256;
+
+#[derive(Debug, Clone, PartialEq)]
+enum PendingDocumentSync {
+    Document {
+        document: DocumentTarget,
+        bytes: Option<Vec<u8>>,
+    },
+    UserPage {
+        realm_id: RealmId,
+        start_after: Option<Key>,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub struct AnnounceTopicOperation {
+    topic: TopicId,
+    document: Option<DocumentTarget>,
+    local_node_id: NodeId,
+    peers: Vec<NodeId>,
+    document_bytes: Option<Vec<u8>>,
+    placement: PlacementRef,
+    allow_genesis: bool,
+    state: AnnounceTopicState,
+    pending: VecDeque<PendingDocumentSync>,
+    current: Option<DocumentTarget>,
+    output: Option<Result<(), AnnounceTopicError>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum AnnounceTopicState {
+    Init,
+    ReadDocument,
+    ListUsers,
+    WriteOutbox,
+    ScheduleSync,
+    Finish,
+    Error,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum AnnounceTopicError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    MetadataError(#[from] MetadataError),
+    #[error("document sync failed: {0}")]
+    DocumentSync(String),
+    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        got: String,
+    },
+}
+
+impl AnnounceTopicOperation {
+    pub fn new(topic: TopicId, local_node_id: NodeId, allow_genesis: bool) -> Self {
+        Self::new_for_document(topic, local_node_id, None, allow_genesis)
+    }
+
+    pub fn new_for_document(
+        topic: TopicId,
+        local_node_id: NodeId,
+        document: Option<DocumentTarget>,
+        allow_genesis: bool,
+    ) -> Self {
+        Self::new_with_peers(topic, local_node_id, document, Vec::new(), allow_genesis)
+    }
+
+    pub fn new_with_peers(
+        topic: TopicId,
+        local_node_id: NodeId,
+        document: Option<DocumentTarget>,
+        peers: Vec<NodeId>,
+        allow_genesis: bool,
+    ) -> Self {
+        Self::new_with_placement(
+            topic,
+            local_node_id,
+            document,
+            peers,
+            PlacementRef::NIL,
+            allow_genesis,
+        )
+    }
+
+    pub fn new_with_placement(
+        topic: TopicId,
+        local_node_id: NodeId,
+        document: Option<DocumentTarget>,
+        peers: Vec<NodeId>,
+        placement: PlacementRef,
+        allow_genesis: bool,
+    ) -> Self {
+        Self {
+            topic,
+            document,
+            local_node_id,
+            peers,
+            document_bytes: None,
+            placement,
+            allow_genesis,
+            state: AnnounceTopicState::Init,
+            pending: VecDeque::new(),
+            current: None,
+            output: None,
+        }
+    }
+
+    pub fn new_with_bytes(
+        topic: TopicId,
+        local_node_id: NodeId,
+        document: DocumentTarget,
+        peers: Vec<NodeId>,
+        bytes: Vec<u8>,
+        allow_genesis: bool,
+    ) -> Self {
+        Self {
+            topic,
+            document: Some(document),
+            local_node_id,
+            peers,
+            document_bytes: Some(bytes),
+            placement: PlacementRef::NIL,
+            allow_genesis,
+            state: AnnounceTopicState::Init,
+            pending: VecDeque::new(),
+            current: None,
+            output: None,
+        }
+    }
+
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+        let state = format!("{:?}", self.state);
+        self.state = AnnounceTopicState::Error;
+        self.output = Some(Err(AnnounceTopicError::UnexpectedEvent {
+            state,
+            expected,
+            got,
+        }));
+        smallvec![]
+    }
+
+    fn fail(&mut self, error: AnnounceTopicError) -> Effects {
+        self.state = AnnounceTopicState::Error;
+        self.output = Some(Err(error));
+        smallvec![]
+    }
+
+    fn finish(&mut self) -> Effects {
+        self.state = AnnounceTopicState::Finish;
+        self.output = Some(Ok(()));
+        smallvec![]
+    }
+
+    fn queue_topic_documents(&mut self) {
+        if !self.pending.is_empty() {
+            return;
+        }
+
+        if let Some(document) = self.document.clone() {
+            self.pending.push_back(PendingDocumentSync::Document {
+                document,
+                bytes: self.document_bytes.take(),
+            });
+        }
+    }
+
+    fn write_outbox(&mut self, document: DocumentTarget, bytes: Vec<u8>) -> Effects {
+        let change = match self.document_upsert_change(&document, &bytes) {
+            Ok(change) => change,
+            Err(error) => return self.fail(error),
+        };
+        self.write_outbox_event(document, DocumentOutboxEvent::Upsert { bytes, change })
+    }
+
+    fn write_outbox_event(
+        &mut self,
+        document: DocumentTarget,
+        event: DocumentOutboxEvent,
+    ) -> Effects {
+        self.current = Some(document.clone());
+        self.state = AnnounceTopicState::WriteOutbox;
+        // Announce only ever emits Upsert here, so the record mirrors the
+        // change's placement; the admin fallback is unused.
+        let record = new_outbox_record(
+            self.local_node_id,
+            document,
+            self.peers.clone(),
+            event,
+            PlacementRef::NIL,
+            self.allow_genesis,
+        );
+        match write_outbox_effect(&record) {
+            Ok(effect) => smallvec![effect],
+            Err(error) => self.fail(AnnounceTopicError::ConversionError(error.into())),
+        }
+    }
+
+    fn document_upsert_change(
+        &self,
+        document: &DocumentTarget,
+        bytes: &[u8],
+    ) -> Result<DocumentChange, AnnounceTopicError> {
+        match document {
+            DocumentTarget::Group { .. }
+            | DocumentTarget::GroupAuthorization { .. }
+            | DocumentTarget::RealmAuthorization { .. }
+            | DocumentTarget::RealmConfig { .. }
+            | DocumentTarget::User { .. } => Err(AnnounceTopicError::DocumentSync(
+                "whole-document admin sync is unsupported; admin documents must sync as operations"
+                    .to_string(),
+            )),
+            DocumentTarget::WatchSubscription { .. } => Err(AnnounceTopicError::DocumentSync(
+                "watch subscriptions must sync through atomic watch CRUD outbox records"
+                    .to_string(),
+            )),
+            DocumentTarget::MetadataRegistry {
+                group_id,
+                document_id,
+            } => {
+                let record: MetadataRegistryRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if record.group_id != *group_id || record.document_id != *document_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "metadata registry target {group_id}/{document_id} does not match payload {}/{}",
+                        record.group_id, record.document_id
+                    )));
+                }
+                Ok(DocumentChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: record.updated_at_ms,
+                        event_id: record.last_event_id,
+                        actor: self.local_node_id,
+                        updated_at_ms: record.updated_at_ms,
+                    },
+                    kind: DocumentChangeKind::Upsert,
+                    placement: self.placement,
+                })
+            }
+            DocumentTarget::MetadataCreateEvent {
+                document_id,
+                event_id,
+            } => {
+                let record: MetadataEventRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if record.record.document_id != *document_id || record.event_id != *event_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "metadata create-event target {document_id}/{event_id} does not match payload {}/{}",
+                        record.record.document_id, record.event_id
+                    )));
+                }
+                Ok(DocumentChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: record.record.updated_at_ms,
+                        event_id: record.event_id,
+                        actor: record.node_id,
+                        updated_at_ms: record.occurred_at_ms,
+                    },
+                    kind: DocumentChangeKind::Upsert,
+                    placement: self.placement,
+                })
+            }
+            DocumentTarget::MetadataDocumentLifecycle { document_id } => {
+                let record: MetadataLifecycleRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if record.document_id() != *document_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "metadata document lifecycle target {document_id} does not match payload document {}",
+                        record.document_id()
+                    )));
+                }
+                Ok(lifecycle_revision_change(
+                    &record,
+                    self.local_node_id,
+                    self.placement,
+                ))
+            }
+            DocumentTarget::MetadataGraphLifecycle { graph_iri } => {
+                let record: GraphLifecycleRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if record.graph_iri != *graph_iri {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "metadata graph lifecycle target `{graph_iri}` does not match payload graph `{}`",
+                        record.graph_iri
+                    )));
+                }
+                Ok(DocumentChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: record.updated_at_ms,
+                        event_id: Ulid::generate(),
+                        actor: self.local_node_id,
+                        updated_at_ms: record.updated_at_ms,
+                    },
+                    kind: DocumentChangeKind::Upsert,
+                    placement: self.placement,
+                })
+            }
+            DocumentTarget::PersistentIdMapping { document_id } => {
+                let mapping = PersistentIdMapping::from_bytes(bytes)
+                    .map_err(AnnounceTopicError::ConversionError)?;
+                if mapping.target != *document_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "persistent id mapping target {document_id} does not match payload document {}",
+                        mapping.target
+                    )));
+                }
+                Ok(persistent_id_change(&mapping, self.placement))
+            }
+            DocumentTarget::PlacementPolicy { policy_id } => {
+                let document = PlacementPolicyDocument::from_bytes(bytes)
+                    .map_err(AnnounceTopicError::ConversionError)?;
+                if document.policy_id() != *policy_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "placement policy target {policy_id} does not match payload policy {}",
+                        document.policy_id()
+                    )));
+                }
+                Ok(placement_policy_change(&document, self.placement))
+            }
+            // Single-writer upserts need only this node's monotonic wall-clock generation.
+            DocumentTarget::NodeUsage { .. }
+            | DocumentTarget::WatchInterest { .. }
+            | DocumentTarget::NodeInfo { .. } => {
+                let now = aruna_core::time::unix_timestamp_millis();
+                Ok(DocumentChange {
+                    base: None,
+                    current: DocumentSyncRevision {
+                        generation: now,
+                        event_id: Ulid::generate(),
+                        actor: self.local_node_id,
+                        updated_at_ms: now,
+                    },
+                    kind: DocumentChangeKind::Upsert,
+                    placement: self.placement,
+                })
+            }
+        }
+    }
+
+    fn next_effect(&mut self) -> Effects {
+        match self.pending.pop_front() {
+            Some(PendingDocumentSync::Document { document, bytes }) => {
+                if let Some(bytes) = bytes {
+                    self.write_outbox(document, bytes)
+                } else {
+                    self.current = Some(document.clone());
+                    self.state = AnnounceTopicState::ReadDocument;
+                    smallvec![document_repository::read_effect(&document, None)]
+                }
+            }
+            Some(PendingDocumentSync::UserPage {
+                realm_id,
+                start_after,
+            }) => {
+                self.state = AnnounceTopicState::ListUsers;
+                smallvec![Effect::Storage(StorageEffect::Iter {
+                    key_space: USER_KEYSPACE.to_string(),
+                    prefix: Some(UserId::storage_prefix(realm_id)),
+                    start: start_after.map(IterStart::After),
+                    limit: USER_PAGE_SIZE,
+                    txn_id: None,
+                })]
+            }
+            None => self.finish(),
+        }
+    }
+}
+
+impl Operation for AnnounceTopicOperation {
+    type Output = ();
+    type Error = AnnounceTopicError;
+
+    fn start(&mut self) -> Effects {
+        self.queue_topic_documents();
+        self.next_effect()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match self.state {
+            AnnounceTopicState::ReadDocument => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let Some(document) = self.current.clone() else {
+                        return self.unexpected_event(
+                            "tracked document sync target",
+                            "missing current document".to_string(),
+                        );
+                    };
+                    let Some(bytes) = value else {
+                        return self.next_effect();
+                    };
+                    self.write_outbox(document, bytes.to_vec())
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage read result", format!("{other:?}")),
+            },
+            AnnounceTopicState::ListUsers => match event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    let TopicId::Users(realm_id) = self.topic else {
+                        return self.unexpected_event(
+                            "users topic",
+                            format!("unexpected topic {:?}", self.topic),
+                        );
+                    };
+                    for (key, _) in values {
+                        let user_id = match UserId::from_storage_key(&key) {
+                            Ok(user_id) => user_id,
+                            Err(error) => return self.fail(error.into()),
+                        };
+                        if user_id.realm_id == realm_id {
+                            self.pending.push_back(PendingDocumentSync::Document {
+                                document: DocumentTarget::User { user_id },
+                                bytes: None,
+                            });
+                        }
+                    }
+                    if let Some(start_after) = next_start_after {
+                        self.pending.push_back(PendingDocumentSync::UserPage {
+                            realm_id,
+                            start_after: Some(start_after),
+                        });
+                    }
+                    self.next_effect()
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage iter result", format!("{other:?}")),
+            },
+            AnnounceTopicState::WriteOutbox => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    if self.current.is_none() {
+                        return self.unexpected_event(
+                            "tracked document sync target",
+                            "missing current document".to_string(),
+                        );
+                    }
+                    self.state = AnnounceTopicState::ScheduleSync;
+                    smallvec![schedule_drain_effect()]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("document sync outbox write result", format!("{other:?}"))
+                }
+            },
+            AnnounceTopicState::ScheduleSync => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.current = None;
+                    self.next_effect()
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => {
+                    self.fail(AnnounceTopicError::DocumentSync(format!(
+                        "durable document sync scheduling failed: {message}"
+                    )))
+                }
+                other => {
+                    self.unexpected_event("document sync timer schedule", format!("{other:?}"))
+                }
+            },
+            AnnounceTopicState::Finish | AnnounceTopicState::Error | AnnounceTopicState::Init => {
+                smallvec![]
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(
+            self.state,
+            AnnounceTopicState::Finish | AnnounceTopicState::Error
+        )
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Ok(()))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    use aruna_core::document::DocumentOutboxRecord;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::metadata::GraphLifecycleRecord;
+    use aruna_core::types::GroupId;
+    use ulid::Ulid;
+
+    fn local_node_id() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1u8; 32]).public()
+    }
+
+    fn user_document() -> (UserId, DocumentTarget) {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        (user_id, DocumentTarget::User { user_id })
+    }
+
+    fn written_outbox_record(effects: &[Effect]) -> DocumentOutboxRecord {
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                value,
+                txn_id,
+                ..
+            }),
+        ] = effects
+        else {
+            panic!("expected one outbox write, got {effects:?}");
+        };
+        assert_eq!(key_space, SYNC_OUTBOX_KEYSPACE);
+        assert_eq!(txn_id, &None);
+        postcard::from_bytes(value.as_ref()).expect("outbox record decodes")
+    }
+
+    #[test]
+    fn provided_skips_read() {
+        for allow_genesis in [false, true] {
+            let local_node_id = local_node_id();
+            let lifecycle = GraphLifecycleRecord::deleted(
+                "urn:graph:announce".to_string(),
+                RealmId::from_bytes([2u8; 32]),
+                GroupId::generate(),
+                Ulid::from_parts(1, 1),
+                42,
+            );
+            let document = DocumentTarget::MetadataGraphLifecycle {
+                graph_iri: lifecycle.graph_iri.clone(),
+            };
+            let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
+            let mut operation = AnnounceTopicOperation::new_with_bytes(
+                document.topic_id(),
+                local_node_id,
+                document.clone(),
+                Vec::new(),
+                bytes.clone(),
+                allow_genesis,
+            );
+
+            let effects = operation.start();
+
+            let record = written_outbox_record(effects.as_slice());
+            assert_eq!(record.target, document);
+            assert_eq!(record.allow_genesis, allow_genesis);
+            let DocumentOutboxEvent::Upsert {
+                bytes: actual,
+                change,
+            } = record.event
+            else {
+                panic!("expected revisioned upsert");
+            };
+            assert_eq!(actual, bytes);
+            assert_eq!(change.kind, DocumentChangeKind::Upsert);
+        }
+    }
+
+    #[test]
+    fn announce_stamps_placement() {
+        let local_node_id = local_node_id();
+        let lifecycle = GraphLifecycleRecord::deleted(
+            "urn:graph:placed-announce".to_string(),
+            RealmId::from_bytes([2u8; 32]),
+            GroupId::generate(),
+            Ulid::from_parts(2, 2),
+            42,
+        );
+        let document = DocumentTarget::MetadataGraphLifecycle {
+            graph_iri: lifecycle.graph_iri.clone(),
+        };
+        let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([8; 16]),
+            shard: 5,
+        };
+        let mut operation = AnnounceTopicOperation::new_with_placement(
+            document.topic_id(),
+            local_node_id,
+            Some(document),
+            Vec::new(),
+            placement,
+            true,
+        );
+
+        assert!(matches!(
+            operation.start().as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: Some(bytes.into()),
+        }));
+        let record = written_outbox_record(effects.as_slice());
+        let DocumentOutboxEvent::Upsert { change, .. } = record.event else {
+            panic!("expected revisioned upsert");
+        };
+        assert_eq!(change.placement, placement);
+    }
+
+    #[test]
+    fn admin_refuses_announce() {
+        let local_node_id = local_node_id();
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let group_id = GroupId::generate();
+        let (user_id, _) = user_document();
+        let admin_targets = [
+            DocumentTarget::Group { group_id },
+            DocumentTarget::GroupAuthorization { group_id },
+            DocumentTarget::RealmAuthorization { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
+            DocumentTarget::User { user_id },
+        ];
+
+        for target in admin_targets {
+            assert!(target.is_admin_document(), "misclassified {target:?}");
+            let mut operation = AnnounceTopicOperation::new_with_bytes(
+                target.topic_id(),
+                local_node_id,
+                target.clone(),
+                Vec::new(),
+                b"whole admin document".to_vec(),
+                true,
+            );
+
+            let effects = operation.start();
+            assert!(effects.is_empty(), "unexpected outbox write for {target:?}");
+            assert!(operation.is_complete());
+            assert!(
+                matches!(
+                    operation.finalize(),
+                    Err(AnnounceTopicError::DocumentSync(error))
+                        if error.contains("admin documents must sync as operations")
+                ),
+                "whole-document announce must refuse {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_requires_revision() {
+        let local_node_id = local_node_id();
+        let (_, document) = user_document();
+        let mut operation = AnnounceTopicOperation::new_with_bytes(
+            document.topic_id(),
+            local_node_id,
+            document,
+            Vec::new(),
+            b"user whole document".to_vec(),
+            true,
+        );
+
+        let effects = operation.start();
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(AnnounceTopicError::DocumentSync(error))
+                if error.contains("admin documents must sync as operations")
+        ));
+    }
+
+    #[test]
+    fn admin_requires_revision() {
+        let local_node_id = local_node_id();
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let document = DocumentTarget::RealmConfig { realm_id };
+        let mut operation = AnnounceTopicOperation::new_with_bytes(
+            document.topic_id(),
+            local_node_id,
+            document,
+            Vec::new(),
+            b"realm config whole document".to_vec(),
+            true,
+        );
+
+        let effects = operation.start();
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(AnnounceTopicError::DocumentSync(error))
+                if error.contains("admin documents must sync as operations")
+        ));
+    }
+}

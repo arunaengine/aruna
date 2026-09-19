@@ -1,25 +1,29 @@
+//! Prunes due job records and their artifacts, page by page, and restores the prune timer.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
-use aruna_core::structs::{
-    HiddenBlobKey, JOB_PRUNE_INDEX_PREFIX, JobPayload, JobRecord, JobResultPayload, cleanup_job_id,
-    parse_job_schedule_index_key,
+use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
+use aruna_core::structs::execution::job::{
+    JobPayload, JobRecord, JobResultPayload, PRUNE_INDEX_PREFIX, cleanup_job_id, parse_schedule_key,
 };
+use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
 
-use super::JOB_PRUNE_SCAN_PAGE_SIZE;
+use super::JOB_PRUNE_PAGE;
 use super::store::{
     artifact_tombstone_key, batch_delete, first_schedule_entry, iter_prefix_page,
-    job_entry_deletes, job_prune_delete_entries, preserve_artifact_tombstone, read_job_record,
+    job_entry_deletes, preserve_artifact_tombstone, prune_delete_entries, read_job_record,
 };
 use crate::driver::DriverContext;
 
@@ -30,11 +34,11 @@ pub struct JobPruneOutcome {
     pub next_due_after: Option<Duration>,
 }
 
-pub async fn process_job_prune_batch(context: &DriverContext) -> Result<JobPruneOutcome, String> {
-    process_job_prune_batch_with_page_size(context, JOB_PRUNE_SCAN_PAGE_SIZE).await
+pub async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome, String> {
+    prune_job_page(context, JOB_PRUNE_PAGE).await
 }
 
-pub(crate) async fn process_job_prune_batch_with_page_size(
+pub(crate) async fn prune_job_page(
     context: &DriverContext,
     page_size: usize,
 ) -> Result<JobPruneOutcome, String> {
@@ -51,8 +55,8 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
     'scan: loop {
         let (values, next) = iter_prefix_page(
             storage,
-            JOB_SCHEDULE_INDEX_KEYSPACE,
-            Some(ByteView::from(JOB_PRUNE_INDEX_PREFIX.to_vec())),
+            SCHEDULE_INDEX_KEYSPACE,
+            Some(ByteView::from(PRUNE_INDEX_PREFIX.to_vec())),
             start_after.take(),
             page_size,
             None,
@@ -66,11 +70,11 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
                 has_more = true;
                 break 'scan;
             }
-            let (expiry_ms, job_id) = match parse_job_schedule_index_key(key.as_ref()) {
+            let (expiry_ms, job_id) = match parse_schedule_key(key.as_ref()) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     warn!(error = %error, "Deleting malformed job prune index row");
-                    deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key));
+                    deletes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), key));
                     continue;
                 }
             };
@@ -80,9 +84,8 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
             }
             match read_job_record(storage, job_id, None).await? {
                 Some(record) => {
-                    // The fence state a queued cleanup still needs outlives retention:
-                    // deleting it now would fail that cleanup permanently and strand
-                    // the backend attempt.
+                    // The fence state a queued cleanup needs outlives retention: deleting it now
+                    // fails the cleanup permanently and strands the backend attempt.
                     if cleanup_pending(storage, &record).await? {
                         continue;
                     }
@@ -106,12 +109,12 @@ pub(crate) async fn process_job_prune_batch_with_page_size(
                         .await?;
                     }
                     delete_job_artifact(context, &record).await?;
-                    deletes.extend(job_prune_delete_entries(&record));
+                    deletes.extend(prune_delete_entries(&record));
                 }
                 None => {
-                    deletes.push((JOB_SCHEDULE_INDEX_KEYSPACE.to_string(), key));
+                    deletes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), key));
                     deletes.push((
-                        aruna_core::keyspaces::JOB_ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
+                        aruna_core::keyspaces::ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
                         artifact_tombstone_key(job_id),
                     ));
                 }
@@ -176,8 +179,8 @@ async fn cleanup_pending(storage: &StorageHandle, record: &JobRecord) -> Result<
 }
 
 /// ShortenTimer restore keyed off the earliest `prune/` entry.
-pub async fn restore_job_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let after = match first_schedule_entry(storage, JOB_PRUNE_INDEX_PREFIX).await {
+pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+    let after = match first_schedule_entry(storage, PRUNE_INDEX_PREFIX).await {
         Ok(Some((expiry_ms, _))) => {
             Duration::from_millis(expiry_ms.saturating_sub(unix_timestamp_millis()))
         }
@@ -205,15 +208,18 @@ mod tests {
     use crate::jobs::store::{
         ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
     };
+    use aruna_core::UserId;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
-        JOB_ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE,
+        ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
     };
-    use aruna_core::structs::{
-        AuthContext, ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateResult,
+    use aruna_core::structs::execution::job::{
+        ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateResult,
         ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload,
-        JobProgress, JobRecord, JobResultPayload, JobState, RealmId, RoCrateLimits,
+        JobProgress, JobRecord, JobResultPayload, JobState, RoCrateLimits,
     };
-    use aruna_core::types::{NodeId, UserId};
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -324,13 +330,11 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = process_job_prune_batch(&context(storage.clone()))
-            .await
-            .unwrap();
+        let outcome = prune_job_batch(&context(storage.clone())).await.unwrap();
         assert_eq!(outcome.pruned, 1);
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 0);
-        assert_eq!(count(&storage, JOB_OWNER_INDEX_KEYSPACE).await, 0);
-        assert_eq!(count(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, JOB_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, SCHEDULE_INDEX_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
@@ -344,9 +348,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = process_job_prune_batch(&context(storage.clone()))
-            .await
-            .unwrap();
+        let outcome = prune_job_batch(&context(storage.clone())).await.unwrap();
         assert_eq!(outcome.pruned, 0);
         assert!(outcome.next_due_after.is_some());
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 1);
@@ -367,13 +369,11 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = process_job_prune_batch(&context(storage.clone()))
-            .await
-            .unwrap();
+        let outcome = prune_job_batch(&context(storage.clone())).await.unwrap();
 
         assert_eq!(outcome.pruned, 1);
-        assert_eq!(count(&storage, JOB_ARTIFACT_TOMBSTONE_KEYSPACE).await, 0);
-        assert_eq!(count(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, ARTIFACT_TOMBSTONE_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, SCHEDULE_INDEX_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
@@ -454,9 +454,7 @@ mod tests {
         .unwrap();
         assert_eq!(count(&storage, JOB_ENTRY_KEYSPACE).await, 1);
 
-        let outcome = process_job_prune_batch(&context(storage.clone()))
-            .await
-            .unwrap();
+        let outcome = prune_job_batch(&context(storage.clone())).await.unwrap();
         assert_eq!(outcome.pruned, 1);
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 0);
         assert_eq!(count(&storage, JOB_ENTRY_KEYSPACE).await, 0);
@@ -464,9 +462,8 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_holds_prune() {
-        // Cleanup retries are uncapped, so a queued cleanup can outlive retention. Its
-        // parent carries the fence state `authorize_cleanup` reads, and deleting that
-        // would fail the cleanup permanently and strand the backend attempt.
+        // Cleanup retries are uncapped, so a queued cleanup can outlive retention; the
+        // parent carries the fence state `authorize_cleanup` reads, so it is kept.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let job_id = JobId::from_bytes([4u8; 16]);
@@ -476,9 +473,7 @@ mod tests {
             .unwrap();
         insert_job(&storage, &cleanup_record(job_id)).await.unwrap();
 
-        let outcome = process_job_prune_batch(&context(storage.clone()))
-            .await
-            .unwrap();
+        let outcome = prune_job_batch(&context(storage.clone())).await.unwrap();
 
         assert_eq!(outcome.pruned, 0);
         assert!(!outcome.has_more, "a retained row must not re-arm at zero");
@@ -505,9 +500,7 @@ mod tests {
         cleanup.finished_at_ms = Some(finished);
         insert_job(&storage, &cleanup).await.unwrap();
 
-        let outcome = process_job_prune_batch(&context(storage.clone()))
-            .await
-            .unwrap();
+        let outcome = prune_job_batch(&context(storage.clone())).await.unwrap();
 
         assert_eq!(outcome.pruned, 2, "parent and cleanup both expired");
         assert!(
@@ -530,7 +523,7 @@ mod tests {
         .unwrap();
         let task_handle = TaskHandle::new();
 
-        restore_job_prune_timer(&storage, &task_handle).await;
+        restore_prune_timer(&storage, &task_handle).await;
 
         let Event::Task(TaskEvent::TimerScheduled { .. }) = task_handle
             .send_effect(Effect::Task(TaskEffect::ShortenTimer {

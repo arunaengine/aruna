@@ -1,10 +1,6 @@
-//! The paged advertisement scan.
-//!
-//! Discovery hands the planner one page of advertisements at a time. Each page
-//! is screened and ranked as it arrives and only the bounded best of everything
-//! seen so far is retained, so one planning operation reaches the end of the
-//! realm's advertisements and stores its plan after the last page instead of at
-//! a scan bound.
+//! Walks the advertisement pages and keeps the bounded best candidates until the scan ends.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::cmp::Ordering;
 
@@ -17,7 +13,7 @@ use crate::scheduling::inputs::{
 };
 use crate::scheduling::rank::{self, ScoredTarget};
 use crate::scheduling::{ExecutionPlan, RankedTarget, RejectedTarget, Selection};
-use crate::structs::RealmComputeConfig;
+use crate::structs::placement::compute_config::RealmComputeConfig;
 
 /// One planning operation over a scan that arrives in pages. The plan is only
 /// final once every page has been ranked.
@@ -53,10 +49,9 @@ impl<'a> Planner<'a> {
         })
     }
 
-    /// Screens, routes, and ranks one page of at most [`MAX_TARGET_SCAN`]
-    /// advertisements. The page must be in canonical target order and start
-    /// strictly after the cursor, which is what proves the scan repeats and
-    /// skips nothing. An empty page changes nothing.
+    /// Screens, routes, and ranks one page of at most [`MAX_TARGET_SCAN`] advertisements. The page must be
+    /// in canonical target order and start strictly after the cursor, which is what proves the scan repeats
+    /// and skips nothing. An empty page changes nothing.
     pub fn rank_page(&mut self, page: &[TargetCandidate]) -> Result<(), PlanError> {
         if page.len() > MAX_TARGET_SCAN {
             return Err(PlanError::ScanCount);
@@ -178,7 +173,7 @@ impl<'a> Planner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduling::tests::{candidate, config, node, request};
+    use crate::tests::scheduling::{candidate, config, node, request};
 
     fn planner(compute: &RealmComputeConfig) -> Planner<'_> {
         Planner::new(&request(Vec::new()), compute).expect("request is well formed")

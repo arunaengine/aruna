@@ -1,8 +1,7 @@
-//! Per-node Prometheus metrics registry.
-//!
-//! Each node owns one [`NodeMetrics`]. The registry is instance-scoped rather
-//! than process-global so the integration harness can run several full nodes in
-//! one process without their counters merging.
+//! Owns the per node Prometheus registry and the counters, gauges and histograms it holds.
+//! Each node keeps its own registry, so several nodes in one process never merge counters.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::EncodeLabelSet;
@@ -54,7 +53,7 @@ pub struct RouteLabels {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WatchAuthorizationMetricReason {
+pub enum WatchMetricReason {
     InvalidResource,
     InvalidOwner,
     TokenRestricted,
@@ -65,7 +64,7 @@ pub enum WatchAuthorizationMetricReason {
     InvalidState,
 }
 
-impl WatchAuthorizationMetricReason {
+impl WatchMetricReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidResource => "invalid_resource",
@@ -106,7 +105,7 @@ pub struct NotificationWatchMetrics {
 }
 
 impl NotificationWatchMetrics {
-    pub fn record_creation_denial(&self, reason: WatchAuthorizationMetricReason) {
+    pub fn record_creation_denial(&self, reason: WatchMetricReason) {
         self.creation_denials
             .get_or_create(&WatchAuthorizationLabels {
                 reason: reason.as_str(),
@@ -114,7 +113,7 @@ impl NotificationWatchMetrics {
             .inc();
     }
 
-    pub fn record_delivery_suppression(&self, reason: WatchAuthorizationMetricReason) {
+    pub fn record_delivery_suppression(&self, reason: WatchMetricReason) {
         self.delivery_suppressions
             .get_or_create(&WatchAuthorizationLabels {
                 reason: reason.as_str(),
@@ -261,7 +260,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn render_includes_builtin_metrics() {
+    async fn render_includes_metrics() {
         let metrics = NodeMetrics::new();
         metrics
             .http_requests
@@ -296,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn method_label_collapses_nonstandard_tokens() {
+    fn method_label_tokens() {
         assert_eq!(method_label("GET"), "GET");
         assert_eq!(method_label("PATCH"), "PATCH");
         assert_eq!(method_label("BREW"), "other");
@@ -304,7 +303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_started_gauge_tracks_flag() {
+    async fn node_started_flag() {
         let metrics = NodeMetrics::new();
         assert!(metrics.render().await.contains("aruna_node_started 0"));
         metrics.set_node_started(true);
@@ -312,7 +311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_registration_is_rendered() {
+    async fn late_registration_rendered() {
         let metrics = NodeMetrics::new();
         let gauge: Gauge = Gauge::default();
         gauge.set(7);
@@ -323,16 +322,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_watch_metrics_use_bounded_reason_labels() {
+    async fn notification_watch_labels() {
         assert_eq!(
-            WatchAuthorizationMetricReason::parse("token_revoked"),
-            Some(WatchAuthorizationMetricReason::TokenRevoked)
+            WatchMetricReason::parse("token_revoked"),
+            Some(WatchMetricReason::TokenRevoked)
         );
         let metrics = NodeMetrics::new();
         let watch_metrics = NotificationWatchMetrics::default();
         watch_metrics.register(&metrics).await;
-        watch_metrics.record_creation_denial(WatchAuthorizationMetricReason::PermissionDenied);
-        watch_metrics.record_delivery_suppression(WatchAuthorizationMetricReason::TokenRestricted);
+        watch_metrics.record_creation_denial(WatchMetricReason::PermissionDenied);
+        watch_metrics.record_delivery_suppression(WatchMetricReason::TokenRestricted);
 
         let body = metrics.render().await;
         assert!(body.contains(

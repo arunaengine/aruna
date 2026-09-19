@@ -1,10 +1,7 @@
 //! Writes one remote version into a synced folder and records what happened.
-//!
-//! The guard travels with the write: the adapter refuses the rename when the
-//! file no longer carries the bytes the decision was taken on, and the refusal
-//! becomes a pending entry the owner resolves explicitly. When the write is an
-//! explicit owner action, its audit row is committed in the same transaction as
-//! the base row that records it.
+//! A refused write keeps the local bytes and leaves the entry pending for the owner.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
@@ -14,12 +11,14 @@ use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal, StorageEvent};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{
-    ActionOutcome, AuthContext, EntrySide, EntryState, PendingMark, ReplaceReason,
-    SyncActionRecord, SyncBase, SyncedBytes, SyncedFolder, VersionedObjectArn, WriteGuard,
+    ActionOutcome, EntrySide, EntryState, PendingMark, ReplaceReason, SyncActionRecord, SyncBase,
+    SyncedBytes, SyncedFolder, WriteGuard,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, TxnId, Value};
-use aruna_core::util::unix_timestamp_millis;
 use bytes::Bytes;
 use smallvec::smallvec;
 use thiserror::Error;

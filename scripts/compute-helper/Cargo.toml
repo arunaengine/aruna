@@ -1,3 +1,7 @@
+# Manifest of the helper binary that moves job files inside compute containers.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 [package]
 name = "aruna-compute-helper"
 version.workspace = true

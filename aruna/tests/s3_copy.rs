@@ -1,5 +1,10 @@
+//! Tests S3 copy: etags, versioned sources, metadata, range assembly and rejected copies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 mod shared;
 
 use aws_sdk_s3::Client as S3Client;
@@ -7,8 +12,8 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective};
 use shared::{
-    SeedNode, TestResult, create_bearer_token, create_group_via_http,
-    create_s3_credentials_via_http, s3_client, spawn_full_seed_node,
+    SeedNode, TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
+    spawn_complete_seed,
 };
 
 fn service_error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
@@ -23,7 +28,7 @@ where
 }
 
 async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
-    let seed = spawn_full_seed_node().await?;
+    let seed = spawn_complete_seed().await?;
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -31,9 +36,8 @@ async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
         seed.capabilities.clone(),
     )
     .await?;
-    let group = create_group_via_http(&seed.base_url, &admin_token, group_name).await?;
-    let credentials =
-        create_s3_credentials_via_http(&seed.base_url, &admin_token, &group.group_id).await?;
+    let group = create_group_http(&seed.base_url, &admin_token, group_name).await?;
+    let credentials = create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
     let endpoint = seed
         .s3
         .as_ref()
@@ -43,7 +47,7 @@ async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
 }
 
 #[tokio::test]
-async fn copy_object_same_bucket_preserves_bytes_and_etag() -> TestResult<()> {
+async fn same_bucket_etag() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-copy-same-bucket").await?;
 
     let result = async {
@@ -93,7 +97,7 @@ async fn copy_object_same_bucket_preserves_bytes_and_etag() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn copy_object_with_version_id_source_copies_old_version() -> TestResult<()> {
+async fn version_copy_old() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-copy-version-source").await?;
 
     let result = async {
@@ -322,7 +326,7 @@ async fn metadata_roundtrip() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn copy_object_if_none_match_matching_source_etag_fails() -> TestResult<()> {
+async fn matching_etag_rejected() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-copy-precondition").await?;
 
     let result = async {
@@ -371,7 +375,7 @@ async fn copy_object_if_none_match_matching_source_etag_fails() -> TestResult<()
 }
 
 #[tokio::test]
-async fn upload_part_copy_range_assembles_expected_object() -> TestResult<()> {
+async fn range_copy_assembles() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-copy-upload-part").await?;
 
     let result = async {
@@ -467,7 +471,7 @@ async fn upload_part_copy_range_assembles_expected_object() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn self_copy_without_replace_directive_fails() -> TestResult<()> {
+async fn self_copy_rejected() -> TestResult<()> {
     let (seed, client) = s3_setup("s3-copy-self").await?;
 
     let result = async {

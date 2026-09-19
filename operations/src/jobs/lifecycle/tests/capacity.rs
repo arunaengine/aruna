@@ -1,14 +1,16 @@
-//! Exact target admission: the reservation, the receipt it commits with, and
-//! the release that frees it again.
+//! Tests exact target admission: the reservation, the receipt it commits with and its release.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
-use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     CapturedInput, EffectiveResources, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody,
-    LaunchIntent, LogicalJobSpec, PhysicalExecutionState, VersionedObjectArn,
+    LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
 };
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -20,10 +22,10 @@ use crate::jobs::lifecycle::reservation::{
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
 use crate::jobs::lifecycle::updates::chain_for;
-use crate::jobs::records::tests::fixture::{Family, REALM, context, node};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::iter_prefix_page;
 use crate::replication::protocol::BaoReadTarget;
+use crate::tests::records::{Family, REALM, context, node};
 
 fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {
@@ -125,8 +127,8 @@ fn holds_static_ceilings() {
     // concurrency ceiling admits nothing at all.
     let held = vec![ExecutionReservation {
         execution_id: Ulid::from_bytes([1u8; 16]),
-        job_id: aruna_core::structs::JobId::from_bytes([2u8; 16]),
-        logical_job_id: aruna_core::structs::JobId::from_bytes([2u8; 16]),
+        job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
+        logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
         resources: resources(),
         created_at_ms: 1,
         subject_generation: 1,
@@ -236,7 +238,7 @@ async fn persists_receipt_first() {
     );
     let (records, _) = iter_prefix_page(
         &ctx.storage_handle,
-        JOB_FAMILY_RECORD_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE,
         None,
         None,
         32,
@@ -334,9 +336,8 @@ fn declines_after_failure() {
 
 #[test]
 fn accepts_copy_pin() {
-    // A registered copy on any node may be the pinned source, but the captured
-    // version, hash and size still bind the bytes, and a pin naming this target
-    // itself is never a remote read.
+    // Any node's registered copy may be the pinned source, but captured version,
+    // hash and size bind the bytes; a pin naming this target is never remote.
     let family = Family::new([3u8; 32]);
     let ingress = family.holder.public();
     let local = family.target.public();

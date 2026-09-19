@@ -1,17 +1,18 @@
-//! The local view and the retained evidence one job record is judged against.
-//!
-//! Every input here comes from this node's own replicated state: the realm
-//! config it synchronized and the records it already stored as authentic. A
-//! relaying peer supplies bytes, never authority and never evidence.
+//! Builds the local holder view and evidence plan one job record is judged against.
+//! Every input comes from this node's own replicated state, never from a relay.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
 
 use aruna_core::NodeId;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ExecutionReceipt, ExecutionUpdate, HolderView, JobFamilyId, JobFamilyRecord, JobId,
     JobRecordContext, JobRecordKey, JobRecordKind, LaunchIntent, LocalExecution, LogicalJobSpec,
-    PlacementRef, RealmConfigDocument, RealmId, WitnessBudgetRecord,
+    WitnessBudgetRecord,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::record::PlacementRef;
 use ulid::Ulid;
 
 use super::keys::{budget_key, id_key};
@@ -28,10 +29,9 @@ pub struct FamilyView {
 }
 
 impl FamilyView {
-    /// Fail-closed derivation: `None` means this node cannot judge authority
-    /// yet, because the family placement, its activation, or the membership is
-    /// unavailable or conflicted. Verifying against an empty view would reject
-    /// every holder-authored record instead of retrying it.
+    /// Fail-closed derivation: `None` means this node cannot judge authority yet,
+    /// because placement, activation, or membership is unavailable or conflicted.
+    /// An empty view would reject holder-authored records instead of retrying them.
     pub fn resolve(
         config: &RealmConfigDocument,
         realm_id: RealmId,
@@ -40,7 +40,7 @@ impl FamilyView {
         let placement = config.family_placement(family.submission_id).ok()?;
         let strategy = config.strategy(&placement.strategy_id)?;
         let holders = activation_holders(config, strategy, &placement)?;
-        let members = config.sync_eligible_node_ids().ok()?;
+        let members = config.sync_eligible_nodes().ok()?;
         if holders.is_empty() || members.is_empty() {
             return None;
         }
@@ -99,12 +99,9 @@ pub struct Evidence<'a> {
     pub previous_update: Option<&'a ExecutionUpdate>,
 }
 
-/// The predecessor rows one set of candidates must be judged against.
-///
-/// A key is derived wherever the successor's own signed identity addresses its
-/// predecessor exactly. A whole kind is scanned only where selection is by a
-/// digest or an id no record key carries, and that scan must run to completion:
-/// a truncated one proves nothing absent.
+/// The predecessor rows one set of candidates must be judged against. A key is
+/// derived wherever the successor's signed identity addresses its predecessor
+/// exactly; otherwise a whole kind is scanned, which must run to completion.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct EvidencePlan {
     pub keys: BTreeSet<JobRecordKey>,

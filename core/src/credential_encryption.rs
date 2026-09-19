@@ -1,4 +1,9 @@
-use crate::types::{GroupId, UserId};
+//! Derives the node key that seals S3 credential secrets at rest and opens them again.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::UserId;
+use crate::types::GroupId;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
@@ -146,7 +151,7 @@ pub fn credential_aad(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::RealmId;
+    use crate::structs::identity::realm::RealmId;
     use ulid::Ulid;
 
     fn sample_aad() -> Vec<u8> {

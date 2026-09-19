@@ -1,18 +1,18 @@
-//! Job-control RPC contract: the discrete request/response verbs an owner node
-//! answers, plus the wire projections they carry. Effects and events reference
-//! these so the routing policy stays sans-I/O.
+//! Defines the job control request and response verbs and the wire records they carry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::metadata::MetadataAuthToken;
-use crate::structs::{
+use crate::UserId;
+use crate::metadata::AuthToken;
+use crate::structs::execution::job::{
     JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState,
     StagingJobCheckpoint, WorkspaceMode,
 };
-use crate::types::UserId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
@@ -181,35 +181,35 @@ pub struct WireArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobRequest {
     Status {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         job_id: JobId,
     },
     Report {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         job_id: JobId,
         expected_digest: Option<[u8; 32]>,
         last_key: Option<Vec<u8>>,
         limit: u16,
     },
     Artifact {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         job_id: JobId,
         range: Option<WireRange>,
     },
     Cancel {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         job_id: JobId,
     },
     /// Full owner record for API projections (TES, staging) the status view
     /// cannot reconstruct off-owner.
     Record {
-        auth_token: MetadataAuthToken,
+        auth_token: AuthToken,
         job_id: JobId,
     },
 }
 
 impl JobRequest {
-    pub fn auth_token(&self) -> MetadataAuthToken {
+    pub fn auth_token(&self) -> AuthToken {
         match self {
             Self::Status { auth_token, .. }
             | Self::Report { auth_token, .. }

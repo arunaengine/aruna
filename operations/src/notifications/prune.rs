@@ -1,33 +1,29 @@
+//! Removes expired inbox notifications and enforces the transient per-user cap.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE};
-use aruna_core::structs::{
-    NOTIFICATION_DIRECT_TTL_MS, NOTIFICATION_TRANSIENT_PER_USER_CAP, NOTIFICATION_TRANSIENT_TTL_MS,
-    NotificationClass, NotificationRecord, notification_inbox_key, notification_prune_index_key,
-    parse_notification_prune_index_key,
+use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
+use aruna_core::structs::execution::notification::{
+    DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
+    notification_inbox_key, notification_prune_key, parse_prune_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, Value};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 
 use crate::driver::DriverContext;
 
-pub const NOTIFICATION_PRUNE_SCAN_PAGE_SIZE: usize = 512;
-pub const NOTIFICATION_PRUNE_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
-pub const NOTIFICATION_PRUNE_RETRY_AFTER: Duration = Duration::from_secs(30);
-
-pub fn schedule_notification_prune_effect(after: Duration) -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::PruneNotifications,
-        after,
-    })
-}
+pub const PRUNE_PAGE_SIZE: usize = 512;
+pub const NOTIFICATION_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
+pub const NOTIFICATION_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct NotificationPruneOutcome {
@@ -37,17 +33,16 @@ pub struct NotificationPruneOutcome {
     pub next_due_after: Option<Duration>,
 }
 
-pub async fn restore_notification_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let after = match first_prune_index_arm_after(storage).await {
+pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+    let after = match first_prune_delay(storage).await {
         Ok(after) => after,
         Err(error) => {
             warn!(error = %error, "Failed to scan notification prune index");
             return;
         }
     };
-    // ShortenTimer, never ResetTimer: this restore runs both at startup and inside the
-    // 5s durable-queue re-arm loop, where a ResetTimer would replace the handler's
-    // post-run re-arm every 5 seconds and push the deadline forward forever.
+    // ShortenTimer preserves an earlier deadline during startup and the 5s re-arm loop.
+    // ResetTimer would push the handler deadline forward forever.
     let event = task_handle
         .send_effect(Effect::Task(TaskEffect::ShortenTimer {
             key: TaskKey::PruneNotifications,
@@ -59,20 +54,19 @@ pub async fn restore_notification_prune_timer(storage: &StorageHandle, task_hand
     }
 }
 
-pub async fn process_notification_prune_batch(
+pub async fn process_prune_batch(
     context: &DriverContext,
 ) -> Result<NotificationPruneOutcome, String> {
-    process_notification_prune_batch_with_page_size(context, NOTIFICATION_PRUNE_SCAN_PAGE_SIZE)
-        .await
+    process_prune_page(context, PRUNE_PAGE_SIZE).await
 }
 
-pub(crate) async fn process_notification_prune_batch_with_page_size(
+pub(crate) async fn process_prune_page(
     context: &DriverContext,
     page_size: usize,
 ) -> Result<NotificationPruneOutcome, String> {
     let storage = &context.storage_handle;
     let now_ms = unix_timestamp_millis();
-    let phase_a = prune_expired_index_rows(storage, now_ms, page_size).await?;
+    let phase_a = prune_expired_rows(storage, now_ms, page_size).await?;
     let phase_b = sweep_primary_keyspace(storage, now_ms, page_size).await?;
     Ok(NotificationPruneOutcome {
         expired: phase_a.expired.saturating_add(phase_b.expired),
@@ -88,7 +82,7 @@ struct PhaseAOutcome {
     next_due_after: Option<Duration>,
 }
 
-async fn prune_expired_index_rows(
+async fn prune_expired_rows(
     storage: &StorageHandle,
     now_ms: u64,
     page_size: usize,
@@ -102,45 +96,35 @@ async fn prune_expired_index_rows(
     let mut start_after: Option<Key> = None;
 
     'scan: loop {
-        let (values, next_start_after) = iter_page(
-            storage,
-            NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
-            start_after.take(),
-            page_size,
-        )
-        .await?;
+        let (values, next_start_after) =
+            iter_page(storage, PRUNE_INDEX_KEYSPACE, start_after.take(), page_size).await?;
         if values.is_empty() {
             break;
         }
         for (key, _) in values {
-            let (expires_at_ms, recipient, notification_id) =
-                match parse_notification_prune_index_key(key.as_ref()) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        let raw = key.to_vec();
-                        warn!(error = %error, key = ?raw, "Deleting malformed notification prune index row");
-                        deletes.push((NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(), key));
-                        continue;
-                    }
-                };
+            let (expires_at_ms, recipient, notification_id) = match parse_prune_key(key.as_ref()) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let raw = key.to_vec();
+                    warn!(error = %error, key = ?raw, "Deleting malformed notification prune index row");
+                    deletes.push((PRUNE_INDEX_KEYSPACE.to_string(), key));
+                    continue;
+                }
+            };
             if expires_at_ms > now_ms {
                 next_due_after = Some(Duration::from_millis(expires_at_ms.saturating_sub(now_ms)));
                 break 'scan;
             }
-            // created_at_ms is not stored in the index key, but equals
-            // expires_at_ms - class.ttl_ms(); the two class TTLs differ, so at most one
-            // candidate can hold a real record (notification_id is unique per record). A
-            // saturated expires_at_ms (u64::MAX) yields candidates that cannot match the
-            // stored created_at_ms and would fall into the orphan arm, but such a row is
-            // always > now, so phase A stops before reaching it.
+            // Recover creation time as expiry minus class TTL; only one class can match.
+            // Saturated expiry is future, so phase A stops before unmatched candidates.
             let direct_key = notification_inbox_key(
                 recipient,
-                expires_at_ms.saturating_sub(NOTIFICATION_DIRECT_TTL_MS),
+                expires_at_ms.saturating_sub(DIRECT_TTL_MS),
                 notification_id,
             );
             let transient_key = notification_inbox_key(
                 recipient,
-                expires_at_ms.saturating_sub(NOTIFICATION_TRANSIENT_TTL_MS),
+                expires_at_ms.saturating_sub(TRANSIENT_TTL_MS),
                 notification_id,
             );
             let read = batch_read(
@@ -156,7 +140,7 @@ async fn prune_expired_index_rows(
             .await?;
             let direct_exists = read.first().is_some_and(|(_, value)| value.is_some());
             let transient_exists = read.get(1).is_some_and(|(_, value)| value.is_some());
-            deletes.push((NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(), key));
+            deletes.push((PRUNE_INDEX_KEYSPACE.to_string(), key));
             if direct_exists {
                 deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), direct_key));
                 expired = expired.saturating_add(1);
@@ -236,19 +220,19 @@ async fn sweep_primary_keyspace(
             if record.expires_at_ms() <= now_ms {
                 deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
                 deletes.push((
-                    NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
-                    notification_prune_index_key(&record),
+                    PRUNE_INDEX_KEYSPACE.to_string(),
+                    notification_prune_key(&record),
                 ));
                 expired = expired.saturating_add(1);
                 continue;
             }
             if record.class == NotificationClass::Transient {
                 transient_seen = transient_seen.saturating_add(1);
-                if transient_seen > NOTIFICATION_TRANSIENT_PER_USER_CAP {
+                if transient_seen > TRANSIENT_USER_CAP {
                     deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
                     deletes.push((
-                        NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
-                        notification_prune_index_key(&record),
+                        PRUNE_INDEX_KEYSPACE.to_string(),
+                        notification_prune_key(&record),
                     ));
                     capped = capped.saturating_add(1);
                 }
@@ -264,25 +248,21 @@ async fn sweep_primary_keyspace(
     Ok(PhaseBOutcome { expired, capped })
 }
 
-async fn first_prune_index_arm_after(storage: &StorageHandle) -> Result<Duration, String> {
-    let (values, _) = iter_page(storage, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE, None, 1).await?;
+async fn first_prune_delay(storage: &StorageHandle) -> Result<Duration, String> {
+    let (values, _) = iter_page(storage, PRUNE_INDEX_KEYSPACE, None, 1).await?;
     let Some((key, _)) = values.into_iter().next() else {
-        return Ok(NOTIFICATION_PRUNE_POLL_AFTER);
+        return Ok(NOTIFICATION_POLL_AFTER);
     };
-    match parse_notification_prune_index_key(key.as_ref()) {
+    match parse_prune_key(key.as_ref()) {
         Ok((expires_at_ms, _, _)) => {
             let due_after =
                 Duration::from_millis(expires_at_ms.saturating_sub(unix_timestamp_millis()));
-            Ok(due_after.min(NOTIFICATION_PRUNE_POLL_AFTER))
+            Ok(due_after.min(NOTIFICATION_POLL_AFTER))
         }
         Err(error) => {
             let raw = key.to_vec();
             warn!(error = %error, key = ?raw, "Deleting malformed notification prune index row during restore");
-            batch_delete(
-                storage,
-                vec![(NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(), key)],
-            )
-            .await?;
+            batch_delete(storage, vec![(PRUNE_INDEX_KEYSPACE.to_string(), key)]).await?;
             Ok(Duration::ZERO)
         }
     }
@@ -353,18 +333,13 @@ async fn batch_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::storage_entries::{
-        notification_inbox_update_entry, notification_inbox_write_entries,
-    };
-    use aruna_core::structs::{NotificationKind, RealmId};
-    use aruna_core::types::UserId;
-    use aruna_storage::FjallStorage;
+    use crate::tests::notifications::{context, record, temp_storage, user};
+    use aruna_core::UserId;
+    use aruna_core::storage_entries::{inbox_update_entry, inbox_write_entries};
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
     use std::sync::Arc;
-    use tempfile::tempdir;
     use tokio::sync::mpsc;
-    use ulid::Ulid;
 
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -379,49 +354,11 @@ mod tests {
         }
     }
 
-    fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (dir, storage)
-    }
-
-    fn context(storage: &StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
-
-    fn user(realm: u8, u: u8) -> UserId {
-        UserId::new(Ulid::from_bytes([u; 16]), RealmId([realm; 32]))
-    }
-
-    fn record(
-        recipient: UserId,
-        class: NotificationClass,
-        created_at_ms: u64,
-    ) -> NotificationRecord {
-        NotificationRecord::new(
-            recipient,
-            class,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::generate(),
-                actor_user_id: user(1, 200),
-            },
-            created_at_ms,
-        )
-    }
-
     /// Writes rows directly so fixtures can exceed the upsert-time transient cap.
     async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
         let writes = records
             .iter()
-            .flat_map(|record| notification_inbox_write_entries(record).expect("write entries"))
+            .flat_map(|record| inbox_write_entries(record).expect("write entries"))
             .collect();
         match storage
             .send_storage_effect(StorageEffect::BatchWrite {
@@ -436,8 +373,7 @@ mod tests {
     }
 
     async fn write_primary_only(storage: &StorageHandle, record: &NotificationRecord) {
-        let (key_space, key, value) =
-            notification_inbox_update_entry(record).expect("update entry");
+        let (key_space, key, value) = inbox_update_entry(record).expect("update entry");
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space,
@@ -453,7 +389,7 @@ mod tests {
     }
 
     async fn write_index_only(storage: &StorageHandle, record: &NotificationRecord) {
-        let (key_space, key, value) = notification_inbox_write_entries(record)
+        let (key_space, key, value) = inbox_write_entries(record)
             .expect("write entries")
             .into_iter()
             .nth(1)
@@ -508,8 +444,8 @@ mod tests {
     async fn index_exists(storage: &StorageHandle, record: &NotificationRecord) -> bool {
         key_exists(
             storage,
-            NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
-            notification_prune_index_key(record),
+            PRUNE_INDEX_KEYSPACE,
+            notification_prune_key(record),
         )
         .await
     }
@@ -557,7 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_direct_records_are_pruned() {
+    async fn direct_records_pruned() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let recipient = user(1, 1);
@@ -565,7 +501,7 @@ mod tests {
         let live = record(recipient, NotificationClass::Direct, now - DAY_MS);
         seed(&storage, &[expired.clone(), live.clone()]).await;
 
-        let outcome = process_notification_prune_batch(&context(&storage))
+        let outcome = process_prune_batch(&context(&storage))
             .await
             .expect("prune succeeds");
 
@@ -577,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_transient_records_are_pruned_at_30d() {
+    async fn transient_records_pruned() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let recipient = user(1, 1);
@@ -585,7 +521,7 @@ mod tests {
         let direct = record(recipient, NotificationClass::Direct, now - 31 * DAY_MS);
         seed(&storage, &[transient.clone(), direct.clone()]).await;
 
-        let outcome = process_notification_prune_batch(&context(&storage))
+        let outcome = process_prune_batch(&context(&storage))
             .await
             .expect("prune succeeds");
 
@@ -596,7 +532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_records_expire_like_unread() {
+    async fn read_records_expire() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let recipient = user(1, 1);
@@ -604,7 +540,7 @@ mod tests {
         seed(&storage, std::slice::from_ref(&expired)).await;
         mark_read(&storage, &expired, now).await;
 
-        let outcome = process_notification_prune_batch(&context(&storage))
+        let outcome = process_prune_batch(&context(&storage))
             .await
             .expect("prune succeeds");
 
@@ -614,7 +550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn future_records_yield_next_due() {
+    async fn future_records_due() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let recipient = user(1, 1);
@@ -622,7 +558,7 @@ mod tests {
         let later = record(recipient, NotificationClass::Direct, now);
         seed(&storage, &[soon.clone(), later]).await;
 
-        let outcome = process_notification_prune_batch(&context(&storage))
+        let outcome = process_prune_batch(&context(&storage))
             .await
             .expect("prune succeeds");
 
@@ -635,13 +571,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphan_index_rows_are_deleted_with_warn() {
+    async fn orphan_indexes_deleted() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let orphan = record(user(1, 1), NotificationClass::Direct, now - 91 * DAY_MS);
         write_index_only(&storage, &orphan).await;
 
-        let outcome = process_notification_prune_batch(&context(&storage))
+        let outcome = process_prune_batch(&context(&storage))
             .await
             .expect("prune succeeds");
 
@@ -650,7 +586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_cap_keeps_newest_500() {
+    async fn transient_cap_keeps() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let recipient = user(1, 1);
@@ -664,7 +600,7 @@ mod tests {
         }
         seed(&storage, &records).await;
 
-        let outcome = process_notification_prune_batch(&context(&storage))
+        let outcome = process_prune_batch(&context(&storage))
             .await
             .expect("prune succeeds");
 
@@ -680,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_cap_is_per_user_and_ignores_direct() {
+    async fn transient_cap_scoped() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let user_a = user(1, 1);
@@ -712,7 +648,7 @@ mod tests {
         seed(&storage, &a_records).await;
         seed(&storage, &b_records).await;
 
-        let outcome = process_notification_prune_batch_with_page_size(&context(&storage), 64)
+        let outcome = process_prune_page(&context(&storage), 64)
             .await
             .expect("prune succeeds");
 
@@ -734,14 +670,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_b_reclaims_expired_primary_without_index() {
+    async fn orphan_primary_reclaimed() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let recipient = user(1, 1);
         let expired = record(recipient, NotificationClass::Direct, now - 91 * DAY_MS);
         write_primary_only(&storage, &expired).await;
 
-        let outcome = process_notification_prune_batch(&context(&storage))
+        let outcome = process_prune_batch(&context(&storage))
             .await
             .expect("prune succeeds");
 
@@ -758,12 +694,12 @@ mod tests {
         let live = record(recipient, NotificationClass::Direct, now - DAY_MS);
         seed(&storage, &[expired, live]).await;
 
-        let first = process_notification_prune_batch(&context(&storage))
+        let first = process_prune_batch(&context(&storage))
             .await
             .expect("first prune succeeds");
         assert_eq!(first.expired, 1);
 
-        let second = process_notification_prune_batch(&context(&storage))
+        let second = process_prune_batch(&context(&storage))
             .await
             .expect("second prune succeeds");
         assert_eq!(second.expired, 0);
@@ -771,7 +707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_arms_zero_when_due() {
+    async fn due_restore_immediate() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let due = record(user(1, 1), NotificationClass::Direct, now - 91 * DAY_MS);
@@ -783,7 +719,7 @@ mod tests {
             .set_inbound_handler(Arc::new(RecordingHandler { seen: seen_tx }))
             .await;
 
-        restore_notification_prune_timer(&storage, &task_handle).await;
+        restore_prune_timer(&storage, &task_handle).await;
 
         let key = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
             .await
@@ -793,29 +729,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_arms_poll_when_empty() {
+    async fn empty_restore_polls() {
         let (_dir, storage) = temp_storage();
         let task_handle = TaskHandle::new();
 
-        restore_notification_prune_timer(&storage, &task_handle).await;
+        restore_prune_timer(&storage, &task_handle).await;
 
         let after = probe_shorten_after(&task_handle, Duration::from_secs(2 * 60 * 60)).await;
-        assert!(after <= NOTIFICATION_PRUNE_POLL_AFTER);
-        assert!(NOTIFICATION_PRUNE_POLL_AFTER.saturating_sub(after) <= Duration::from_secs(5));
+        assert!(after <= NOTIFICATION_POLL_AFTER);
+        assert!(NOTIFICATION_POLL_AFTER.saturating_sub(after) <= Duration::from_secs(5));
     }
 
     #[tokio::test]
-    async fn restore_arms_due_after_for_future() {
+    async fn future_restore_scheduled() {
         let (_dir, storage) = temp_storage();
         let now = unix_timestamp_millis();
         let future = record(user(1, 1), NotificationClass::Transient, now);
         write_index_only(&storage, &future).await;
 
         let task_handle = TaskHandle::new();
-        restore_notification_prune_timer(&storage, &task_handle).await;
+        restore_prune_timer(&storage, &task_handle).await;
         let after = probe_shorten_after(&task_handle, Duration::from_secs(2 * 60 * 60)).await;
-        assert!(after <= NOTIFICATION_PRUNE_POLL_AFTER);
-        assert!(NOTIFICATION_PRUNE_POLL_AFTER.saturating_sub(after) <= Duration::from_secs(5));
+        assert!(after <= NOTIFICATION_POLL_AFTER);
+        assert!(NOTIFICATION_POLL_AFTER.saturating_sub(after) <= Duration::from_secs(5));
 
         let task_handle = TaskHandle::new();
         let Event::Task(TaskEvent::TimerScheduled { .. }) = task_handle
@@ -827,7 +763,7 @@ mod tests {
         else {
             panic!("expected timer scheduled");
         };
-        restore_notification_prune_timer(&storage, &task_handle).await;
+        restore_prune_timer(&storage, &task_handle).await;
         let after = probe_shorten_after(&task_handle, Duration::from_secs(2 * 60 * 60)).await;
         assert!(
             after <= Duration::from_secs(10),

@@ -1,3 +1,7 @@
+//! Holds the compute backend settings for Docker, Apptainer and Kubernetes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::compute::ResourceEnvelope;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -6,7 +10,7 @@ use std::time::Duration;
 use super::WorkerSite;
 
 /// Node selector entries one backend stamps on every pod it creates.
-pub const MAX_NODE_SELECTOR_ENTRIES: usize = 16;
+pub const MAX_SELECTOR_ENTRIES: usize = 16;
 /// Name of the internal bridge network interactive sessions join.
 pub const SESSION_NETWORK: &str = "aruna-sessions";
 /// Subnet of that network when the operator configures none.

@@ -1,9 +1,13 @@
+//! Spawns the DHT driver and offers the handle to put, get, bootstrap and shut down.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::{Duration, Instant};
 
 use aruna_core::effects::DhtGetOptions;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_storage::StorageHandle;
 use crossfire::{TrySendError, mpsc};
 use iroh::Endpoint;
@@ -313,15 +317,10 @@ impl DhtHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_node(seed: u8) -> NodeId {
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        iroh::SecretKey::from_bytes(&seed_bytes).public()
-    }
+    use crate::test_support::make_node;
 
     #[test]
-    fn add_peer_returns_queue_full_when_channel_saturated() {
+    fn peer_queue_saturation() {
         let (cmd_tx, _cmd_rx) = mpsc::bounded_blocking_async(1);
         let local_id = make_node(1);
         let handle = DhtHandle {

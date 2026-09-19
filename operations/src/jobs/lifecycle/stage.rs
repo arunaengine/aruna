@@ -1,19 +1,16 @@
-//! Cross-node staging of one stored input version.
-//!
-//! The target may not hold the bytes an execution needs. It then reads them
-//! from a legal holder through the managed-copy handshake, which challenges a
-//! policy-unaware request, teaches the refs, and retries only once this node's
-//! own destination subject complies. The bytes land through the ordinary
-//! policy-gated workspace write, verified against the stored hash.
+//! Stages one stored input version on a target by reading it from a legal holder in turn.
+//! The bytes are checked against the stored hash before the policy-gated workspace write.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{
-    AuthContext, InputSelection, InputSource, JobError, JobRecord, VersionedObjectArn,
-};
+use aruna_core::structs::execution::job::{InputSelection, InputSource, JobError, JobRecord};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::blob_holders::GetBlobHoldersOperation;
+use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -41,7 +38,7 @@ pub async fn stage_remote_input(
         .ok_or_else(|| JobError::retryable("remote staging needs a net handle"))?;
     let realm_id = *net.realm_id();
     let mut holders = drive(
-        GetBlobHoldersOperation::new(blake3, realm_id, net.node_id()),
+        GetHoldersOperation::new(blake3, realm_id, net.node_id()),
         context,
     )
     .await
@@ -56,9 +53,8 @@ pub async fn stage_remote_input(
             "no known holder for input {bucket}/{key}"
         )));
     }
-    // Only the ingress endpoint owns the bucket/key/version identity. Any other
-    // holder keeps a registered copy of the same bytes, so it is asked by
-    // content hash once the exact version turns out not to be its own.
+    // Only ingress owns the bucket/key/version identity; any other holder has a
+    // registered copy, asked by content hash when the version is not its own.
     let ingress = record
         .captured_inputs
         .iter()

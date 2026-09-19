@@ -1,13 +1,17 @@
+//! Resolves JSON-LD context terms of an RO-Crate so ids, graphs, and file types are found.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
 pub(super) const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub(super) const SCHEMA_MEDIA_IRI: &str = "http://schema.org/MediaObject";
-pub(super) const SCHEMA_MEDIA_HTTPS_IRI: &str = "https://schema.org/MediaObject";
+pub(super) const MEDIA_HTTPS_IRI: &str = "https://schema.org/MediaObject";
 
 pub(super) fn is_file_type(value: &str) -> bool {
-    matches!(value, SCHEMA_MEDIA_IRI | SCHEMA_MEDIA_HTTPS_IRI)
+    matches!(value, SCHEMA_MEDIA_IRI | MEDIA_HTTPS_IRI)
 }
 
 pub(super) struct JsonLdKeywords {
@@ -103,13 +107,13 @@ fn collect_terms(context: &Value, terms: &mut HashMap<String, Option<String>>) {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]
     fn recognizes_file_iris() {
         assert!(is_file_type(SCHEMA_MEDIA_IRI));
-        assert!(is_file_type(SCHEMA_MEDIA_HTTPS_IRI));
+        assert!(is_file_type(MEDIA_HTTPS_IRI));
         assert!(!is_file_type("https://schema.org/Dataset"));
     }
 }

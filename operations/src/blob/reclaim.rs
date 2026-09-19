@@ -1,3 +1,7 @@
+//! Drains the reclaim queue and deletes blob copies that no alias references any more.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
@@ -7,13 +11,17 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    GROUP_STORAGE_BACKEND_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, CleanupStrategy,
-    GroupStorageBackend, HashPathIndexKey, ReclaimCandidate, ReclaimCandidateKey, VersionKey,
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, HashIndex,
+    VersionKey,
 };
+use aruna_core::structs::storage::cleanup::{
+    CleanupStrategy, ReclaimCandidate, ReclaimCandidateKey,
+};
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId};
 use aruna_storage::StorageHandle;
@@ -23,13 +31,13 @@ use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::blob::blob_keyspace_helper::{blob_location_read, iter_hash_path_index_effect};
-use crate::blob::cleanup::schedule_blob_cleanup_effect;
+use crate::blob::cleanup::schedule_cleanup_effect;
+use crate::blob::records::{blob_location_read, iter_index_effect};
 use crate::driver::{DriverContext, drive, node_routing};
-use crate::group_backends::{RecordReadError, backend_key, parse_read};
+use crate::groups::backends::{RecordReadError, backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
-use crate::task_persistence::persist_task_effect;
-use crate::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::tasks::task_persistence::persist_task_effect;
 
 pub const RECLAIM_SWEEP_AFTER: Duration = Duration::from_secs(15 * 60);
 pub const RECLAIM_SWEEP_RETRY: Duration = Duration::from_secs(60);
@@ -40,7 +48,7 @@ const RECLAIM_TICK_LIMIT: usize = 1024;
 
 pub async fn restore_reclaim_sweep(storage: &StorageHandle, task_handle: &TaskHandle) {
     let effect = TaskEffect::ShortenTimer {
-        key: TaskKey::DrainBlobReclaimQueue,
+        key: TaskKey::DrainReclaimQueue,
         after: Duration::ZERO,
     };
     if let Err(message) = persist_task_effect(storage, &effect).await {
@@ -82,11 +90,9 @@ pub struct ReclaimOutcome {
     pub next_start_after: Option<Key>,
 }
 
-/// Pages the queue from `start_after` so a candidate that keeps failing cannot
-/// starve the rows behind it: the cap moves the cursor past it either way.
-// Deferred (#359): recount / candidate-persistence hardening on top of this
-// already-working per-(hash,backend) reclaim sweep. The reference-cache GC part
-// of #359 is moot while the verified reference cache (#375) is deferred.
+/// Pages the queue from `start_after` so a failing candidate cannot starve rows
+/// behind it: the cap moves the cursor past it either way.
+// Deferred (#359): recount and candidate-persistence hardening.
 pub async fn process_reclaim_batch(
     context: &DriverContext,
     start_after: Option<Key>,
@@ -100,7 +106,7 @@ async fn sweep_at(
     mut start_after: Option<Key>,
 ) -> Result<ReclaimOutcome, String> {
     let catalog = node_routing(context).catalog;
-    let mut records: HashMap<Ulid, Option<GroupStorageBackend>> = HashMap::new();
+    let mut records: HashMap<Ulid, Option<GroupStorage>> = HashMap::new();
     let mut outcome = ReclaimOutcome::default();
     let mut driven = 0usize;
 
@@ -204,21 +210,20 @@ fn decode_candidate(key: &Key, value: &[u8]) -> Option<(ReclaimCandidateKey, Rec
 /// the bytes with.
 async fn group_strategy(
     context: &DriverContext,
-    records: &mut HashMap<Ulid, Option<GroupStorageBackend>>,
+    records: &mut HashMap<Ulid, Option<GroupStorage>>,
     backend_id: Ulid,
 ) -> Result<Option<CleanupStrategy>, String> {
     if let std::collections::hash_map::Entry::Vacant(slot) = records.entry(backend_id) {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+                key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
                 key: backend_key(backend_id),
                 txn_id: None,
             })
             .await;
         slot.insert(
-            parse_read(event, GroupStorageBackend::from_bytes)
-                .map_err(|error| error.to_string())?,
+            parse_read(event, GroupStorage::from_bytes).map_err(|error| error.to_string())?,
         );
     }
     Ok(records
@@ -448,7 +453,7 @@ impl ReclaimBlobOperation {
                     BackendRef::Group(backend_id) => {
                         self.state = ReclaimState::FenceBackend;
                         smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+                            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
                             key: backend_key(backend_id),
                             txn_id: self.txn_id,
                         })]
@@ -469,7 +474,7 @@ impl ReclaimBlobOperation {
     /// retain conflicts with this sweep instead of racing it. A grace the tenant
     /// lengthened since the sweep read it makes the candidate not due again.
     fn handle_fence(&mut self, event: Event) -> Effects {
-        let record = match parse_read(event, GroupStorageBackend::from_bytes) {
+        let record = match parse_read(event, GroupStorage::from_bytes) {
             Ok(Some(record)) => record,
             Ok(None) => return self.drop_candidate(ReclaimVerdict::Dropped),
             Err(error) => return self.fail(error.into()),
@@ -520,7 +525,7 @@ impl ReclaimBlobOperation {
 
     fn scan_aliases(&mut self, start: Option<Key>) -> Effects {
         self.state = ReclaimState::ScanAliases;
-        match iter_hash_path_index_effect(&self.key.blake3, start, self.txn_id) {
+        match iter_index_effect(&self.key.blake3, start, self.txn_id) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(error.into()),
         }
@@ -542,7 +547,7 @@ impl ReclaimBlobOperation {
         let reads = match values
             .iter()
             .map(|(key, _)| {
-                let alias = HashPathIndexKey::from_bytes(key.as_ref())?;
+                let alias = HashIndex::from_bytes(key.as_ref())?;
                 let version = VersionKey::new(&alias.bucket, &alias.key, alias.version_id);
                 Ok((
                     BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -707,7 +712,7 @@ impl ReclaimBlobOperation {
                 self.state = ReclaimState::Finish;
                 match self.output {
                     Some(Ok(ReclaimVerdict::Freed { .. })) => {
-                        smallvec![schedule_blob_cleanup_effect()]
+                        smallvec![schedule_cleanup_effect()]
                     }
                     _ => smallvec![],
                 }
@@ -794,8 +799,9 @@ impl Operation for ReclaimBlobOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::keyspaces::HASH_PATHS_INDEX_KEYSPACE;
-    use aruna_core::structs::{RealmId, UsageCounters, usage_backend_key, usage_hash_key};
+    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -919,11 +925,11 @@ mod tests {
     }
 
     fn shard_of_hash() -> usize {
-        aruna_core::structs::shard_for_hash(&HASH)
+        aruna_core::structs::storage::usage::shard_for_hash(&HASH)
     }
 
     async fn add_alias(context: &DriverContext, version_id: Ulid, pins: bool) {
-        let alias = HashPathIndexKey::new(
+        let alias = HashIndex::new(
             HASH,
             version_id,
             RealmId::from_bytes([1u8; 32]),
@@ -934,7 +940,7 @@ mod tests {
         );
         write(
             context,
-            HASH_PATHS_INDEX_KEYSPACE,
+            PATHS_INDEX_KEYSPACE,
             alias.to_bytes().unwrap(),
             Vec::new(),
         )
@@ -1099,6 +1105,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reclaim_uses_enqueue() {
+        // A candidate written after a long apply carries its enqueue time, so a
+        // sweep past the operation-start grace but not the enqueue grace must
+        // defer it rather than free the bytes early.
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        let started_at = SystemTime::UNIX_EPOCH;
+        let enqueued_at = started_at + Duration::from_secs(6 * 60 * 60);
+        write(
+            &context,
+            BLOB_RECLAIM_KEYSPACE,
+            candidate_key().to_bytes(),
+            ReclaimCandidate { enqueued_at }.to_bytes().unwrap(),
+        )
+        .await;
+
+        let started_grace =
+            started_at + CleanupStrategy::DEFAULT_RECLAIM_AFTER + Duration::from_secs(1);
+        let outcome = sweep_at(&context, started_grace, None).await.unwrap();
+
+        assert_eq!(outcome.not_due, 1);
+        assert_eq!(outcome.freed, 0);
+        assert!(
+            read(&context, BLOB_RECLAIM_KEYSPACE, candidate_key().to_bytes())
+                .await
+                .is_some()
+        );
+
+        let enqueued_grace =
+            enqueued_at + CleanupStrategy::DEFAULT_RECLAIM_AFTER + Duration::from_secs(1);
+        let outcome = sweep_at(&context, enqueued_grace, None).await.unwrap();
+
+        assert_eq!(outcome.freed, 1);
+        assert_eq!(outcome.freed_bytes, 10);
+    }
+
+    #[tokio::test]
     async fn sweep_frees_due() {
         let dir = tempdir().unwrap();
         let context = context(dir.path().to_str().unwrap());
@@ -1220,11 +1264,11 @@ mod tests {
     }
 
     fn group_record(backend_id: Ulid, cleanup: CleanupStrategy) -> Vec<u8> {
-        GroupStorageBackend {
+        GroupStorage {
             backend_id,
             group_id: Ulid::from_bytes([2u8; 16]),
             name: "tenant".to_string(),
-            kind: aruna_core::structs::GroupBackendKind::S3,
+            kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
             public_config: HashMap::new(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,

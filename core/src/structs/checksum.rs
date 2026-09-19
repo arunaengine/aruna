@@ -1,3 +1,7 @@
+//! Checksum algorithms with their hash keys, S3 names and digest lengths.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use serde::{Deserialize, Serialize};
 
 pub const HASH_BLAKE3: &str = "blake3";

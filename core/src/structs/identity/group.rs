@@ -1,0 +1,190 @@
+//! Group record, the owner index key and the group authorization document.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::UserId;
+use crate::errors::ConversionError;
+use crate::structs::identity::auth::Actor;
+use crate::structs::identity::auth::{Permission, Role};
+use crate::structs::identity::realm::RealmId;
+use crate::types::{GroupId, RoleId};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use ulid::Ulid;
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub display_name: String,
+    pub group_id: GroupId,
+    pub realm_id: RealmId,
+    pub roles: HashSet<RoleId>,
+    pub owner: UserId,
+}
+
+impl Group {
+    pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// Key in GROUP_OWNER_INDEX_KEYSPACE: owner storage key (realm + user ulid)
+/// followed by the group id, so a prefix scan counts a user's owned groups.
+pub fn owner_group_key(owner: UserId, group_id: GroupId) -> Vec<u8> {
+    let mut bytes = owner.to_storage_key();
+    bytes.extend_from_slice(&group_id.to_bytes());
+    bytes
+}
+
+pub fn owner_group_prefix(owner: UserId) -> Vec<u8> {
+    owner.to_storage_key()
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct GroupAuthorizationDocument {
+    pub group_id: GroupId,
+    pub roles: HashMap<RoleId, Role>,
+    /// Deny-only CEL request policies scoped to this group, evaluated after the
+    /// realm set. Either scope may deny; neither may grant.
+    pub policies: Vec<crate::request_policy::RequestPolicy>,
+}
+
+impl GroupAuthorizationDocument {
+    pub fn default_group_doc(user_id: UserId, realm_id: RealmId, group_id: GroupId) -> Self {
+        let mut roles = HashMap::new();
+        let admin = Ulid::generate();
+        roles.insert(
+            admin,
+            Role {
+                role_id: admin,
+                name: "admin".to_string(),
+                permissions: HashMap::from([(
+                    format!("/{realm_id}/g/{group_id}/**"),
+                    Permission::WRITE,
+                )]),
+                assigned_users: HashSet::from([(user_id)]),
+            },
+        );
+
+        let user = Ulid::generate();
+        roles.insert(
+            user,
+            Role {
+                role_id: user,
+                name: "user".to_string(),
+                assigned_users: HashSet::new(),
+                permissions: HashMap::from([
+                    (
+                        format!("/{realm_id}/g/{group_id}/meta/**"),
+                        Permission::WRITE,
+                    ),
+                    (
+                        format!("/{realm_id}/g/{group_id}/data/**"),
+                        Permission::WRITE,
+                    ),
+                    (
+                        format!("/{realm_id}/g/{group_id}/admin/**"),
+                        Permission::READ,
+                    ),
+                ]),
+            },
+        );
+
+        let viewer = Ulid::generate();
+        roles.insert(
+            viewer,
+            Role {
+                role_id: viewer,
+                name: "viewer".to_string(),
+                assigned_users: HashSet::new(),
+                permissions: HashMap::from([
+                    (
+                        format!("/{realm_id}/g/{group_id}/meta/**"),
+                        Permission::READ,
+                    ),
+                    (
+                        format!("/{realm_id}/g/{group_id}/data/**"),
+                        Permission::READ,
+                    ),
+                ]),
+            },
+        );
+        GroupAuthorizationDocument {
+            group_id,
+            roles,
+            policies: Vec::new(),
+        }
+    }
+
+    /// Permission patterns of every role this user is assigned to, for callers
+    /// that must reason about granted subtrees instead of a single path.
+    pub fn user_permissions(&self, user_id: UserId) -> Vec<(String, Permission)> {
+        self.roles
+            .values()
+            .filter(|role| role.assigned_users.contains(&user_id))
+            .flat_map(|role| {
+                role.permissions
+                    .iter()
+                    .map(|(pattern, permission)| (pattern.clone(), permission.clone()))
+            })
+            .collect()
+    }
+
+    pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashSet;
+
+    use crate::UserId;
+    use crate::structs::identity::auth::Actor;
+    use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use crate::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    #[test]
+    pub fn test_group_conversion() {
+        let group = Group {
+            display_name: "A group".to_string(),
+            group_id: Ulid::generate(),
+            realm_id: RealmId([0u8; 32]),
+            roles: HashSet::from([Ulid::generate(), Ulid::generate()]),
+            owner: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+        };
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
+        };
+        let bytes = group.to_bytes(&actor).unwrap();
+        let hydrated_group = Group::from_bytes(&bytes).unwrap();
+
+        assert_eq!(group, hydrated_group);
+    }
+
+    #[test]
+    pub fn group_auth_roundtrip() {
+        let auth_doc = GroupAuthorizationDocument::default_group_doc(
+            UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            RealmId([0u8; 32]),
+            Ulid::generate(),
+        );
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: UserId::local(Ulid::generate(), RealmId([0u8; 32])),
+            realm_id: RealmId([0u8; 32]),
+        };
+        let bytes = auth_doc.to_bytes(&actor).unwrap();
+        let hydrated_auth_doc = GroupAuthorizationDocument::from_bytes(&bytes).unwrap();
+
+        assert_eq!(auth_doc, hydrated_auth_doc);
+    }
+}

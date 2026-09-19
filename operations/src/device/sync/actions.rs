@@ -1,11 +1,11 @@
-//! The explicit owner decisions that may change local bytes.
-//!
-//! The automatic sync never replaces divergent bytes and never removes a file.
-//! Both happen only here, only for the exact bytes the owner was shown, and
-//! every one of them leaves an audit row committed with the state it changed.
+//! Runs the owner's explicit sync actions that may replace or remove local bytes.
+//! Automatic sync never does this, and every action writes an audit row.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
@@ -15,8 +15,8 @@ use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, EntryState, SyncActionRecord, SyncBase, SyncedFolder,
     WriteGuard,
 };
-use aruna_core::types::{Effects, Key, TxnId, UserId, Value};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -537,7 +537,7 @@ fn remove_failed(operation: &mut RemoveEntryOperation, error: ActionError) -> Ef
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::queued_upload;
     use aruna_core::structs::{EntrySide, EntryState, SyncBase};
     use ulid::Ulid;

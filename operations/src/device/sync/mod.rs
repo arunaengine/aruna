@@ -1,9 +1,7 @@
-//! Two-way synced folders on the owner's own machine.
-//!
-//! A folder is bound to one realm bucket prefix. The device observes its files
-//! as a read-only local bucket, asks the realm node to pull what changed, and
-//! writes what the realm changed back to disk through guarded local writes.
-//! Local data always wins locally: see `aruna_core::structs::decide`.
+//! Owns the device's two-way synced folders and drives the repeated reconcile passes.
+//! Local files form a read-only bucket the realm node pulls from, and local data wins.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod actions;
 pub mod folders;
@@ -16,14 +14,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::metadata::MetadataAuthToken;
+use aruna_core::id::NodeId;
+use aruna_core::metadata::AuthToken;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
-    AuthContext, FolderState, Observed, RemoteBinding, RemoteHead, SyncListCursor, SyncPageLimit,
-    SyncRefusal, SyncVersionPage, SyncedFolder,
+    FolderState, Observed, RemoteBinding, RemoteHead, SyncListCursor, SyncPageLimit, SyncRefusal,
+    SyncVersionPage, SyncedFolder,
 };
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::types::NodeId;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_tasks::TaskHandle;
 use thiserror::Error;
 use tracing::warn;
@@ -39,7 +38,7 @@ use reconcile::{ReconcileError, ReconcileFolderOperation, ReconcileInput, Reconc
 use repository::SYNC_PAGE_SIZE;
 
 pub use outbox::{
-    UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_RETRY_AFTER, drain_sync_outbox, restore_upload_timer,
+    UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox, restore_upload_timer,
 };
 
 /// Delay before the next pass when every folder is settled.
@@ -109,7 +108,7 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
         }
     }
     match work {
-        true => DrainOutcome::More,
+        true => DrainOutcome::Recheck,
         false => DrainOutcome::Idle,
     }
 }
@@ -194,19 +193,19 @@ pub async fn reconcile_folder(
         Ok((plan, list_cursor)) => {
             stored.last_reconcile_ms = Some(now_ms);
             stored.last_error = None;
-            stored.last_error_at_ms = None;
+            stored.last_error_ms = None;
             stored.list_cursor = list_cursor;
             store_folder(context, &stored)
                 .await
                 .map_err(|_| ReconcileFolderError::Unavailable)?;
             if plan.uploads > 0 {
-                arm_timer(context, TaskKey::DrainSyncUploadOutbox).await;
+                arm_timer(context, TaskKey::DrainUploadOutbox).await;
             }
             Ok(plan)
         }
         Err(error) => {
             stored.last_error = Some(error.describe(&folder.remote));
-            stored.last_error_at_ms = Some(now_ms);
+            stored.last_error_ms = Some(now_ms);
             if let Err(store_error) = store_folder(context, &stored).await {
                 warn!(folder = %folder.folder_id, reason = %store_error, "Could not store the folder error");
             }
@@ -328,7 +327,7 @@ pub(super) async fn request_versions(
         .request_forwarded_write(
             node_id,
             MetadataTransportMessage::ForwardListVersions {
-                auth_token: MetadataAuthToken::internal(auth),
+                auth_token: AuthToken::internal(auth),
                 bucket,
                 prefix,
                 cursor,
@@ -351,16 +350,15 @@ pub(super) async fn request_versions(
 
 /// Wakes the upload drain after an explicit owner action queued a row.
 pub(crate) async fn arm_upload_timer(context: &Arc<DriverContext>) {
-    arm_timer(context, TaskKey::DrainSyncUploadOutbox).await;
+    arm_timer(context, TaskKey::DrainUploadOutbox).await;
 }
 
 async fn arm_timer(context: &Arc<DriverContext>, key: TaskKey) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;
     };
-    if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_timer_if_idle(key, Duration::ZERO)
-        .await
+    if let TaskEvent::Error { message, .. } =
+        task_handle.schedule_idle_timer(key, Duration::ZERO).await
     {
         warn!(message = %message, "Failed to arm a synced-folder timer");
     }
@@ -375,7 +373,7 @@ pub async fn restore_sync_timers(context: &Arc<DriverContext>, task_handle: &Tas
         || local_is_device(context).await;
     if due
         && let TaskEvent::Error { message, .. } = task_handle
-            .schedule_timer_if_idle(TaskKey::ReconcileSyncedFolders, Duration::ZERO)
+            .schedule_idle_timer(TaskKey::ReconcileSyncedFolders, Duration::ZERO)
             .await
     {
         warn!(message = %message, "Failed to restore the synced-folder timer");
@@ -392,7 +390,7 @@ async fn local_is_device(context: &Arc<DriverContext>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn view(boundary: &str) -> RemoteView {
@@ -402,9 +400,8 @@ mod tests {
         }
     }
 
-    // The in-memory bound and the end of the listing can coincide. The window
-    // must then cover the keys after the last head, and the next pass must start
-    // over instead of listing exactly this window again forever.
+    // The in-memory bound and the listing end can coincide: the window must cover
+    // the keys after the last head, and the next pass restarts instead of repeating it.
     #[test]
     fn clears_final_boundary() {
         let mut exhausted = view("m.txt");

@@ -1,3 +1,7 @@
+//! Caches RO-Crate summaries keyed by graph IRI and document cursor.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -5,9 +9,8 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use ulid::Ulid;
 
-// Two maximum-size list pages worth of documents, capped by bytes so a few
-// unusually large summaries cannot grow the cache without bound. The pair
-// encodes a 16 KiB average summary and roughly 32 MiB of resident memory.
+// Two maximum-size list pages worth of documents, capped by bytes so a few unusually large
+// summaries cannot grow the cache without bound.
 const SUMMARY_CACHE_ENTRIES: usize = 2_048;
 const SUMMARY_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// Backstop staleness bound, matching the visibility and query cache TTLs, so
@@ -125,7 +128,7 @@ fn entry_size(graph_iri: &str, summary: &str) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     const TTL: Duration = Duration::from_secs(30);
@@ -137,7 +140,7 @@ mod tests {
     #[test]
     fn hit_returns_entry() {
         let cache = cache(4, 1024);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(1, 1);
         let now = Instant::now();
         cache.insert("urn:graph:a", cursor, "{\"@graph\":[]}", now);
 
@@ -152,8 +155,8 @@ mod tests {
     fn cursor_advance_misses() {
         // A stale summary must never survive an update of the same document.
         let cache = cache(4, 1024);
-        let first = Ulid::generate();
-        let second = Ulid::generate();
+        let first = Ulid::from_parts(2, 2);
+        let second = Ulid::from_parts(3, 3);
         let now = Instant::now();
         cache.insert("urn:graph:a", first, "stale", now);
 
@@ -170,7 +173,7 @@ mod tests {
     #[test]
     fn budget_evicts_lru() {
         let cache = cache(8, 32);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(4, 4);
         let now = Instant::now();
         cache.insert("a", cursor, &"x".repeat(15), now);
         cache.insert("b", cursor, &"y".repeat(15), now);
@@ -186,7 +189,7 @@ mod tests {
     #[test]
     fn oversized_entry_skipped() {
         let cache = cache(4, 16);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(5, 5);
         let now = Instant::now();
         cache.insert("a", cursor, &"x".repeat(64), now);
 
@@ -197,7 +200,7 @@ mod tests {
     #[test]
     fn remove_frees_budget() {
         let cache = cache(4, 32);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(6, 6);
         let now = Instant::now();
         cache.insert("a", cursor, &"x".repeat(20), now);
         cache.remove("a");
@@ -212,7 +215,7 @@ mod tests {
         // Document sync can land content under a cursor a listing already
         // cached, so only the synced graph loses its entry and its bytes.
         let cache = cache(4, 32);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(7, 7);
         let now = Instant::now();
         let kept = "y".repeat(10);
         cache.insert("a", cursor, &"x".repeat(10), now);
@@ -236,7 +239,7 @@ mod tests {
     fn expired_entry_misses() {
         // The TTL bounds any coherence hole the cursor key cannot see.
         let cache = cache(4, 1024);
-        let cursor = Ulid::generate();
+        let cursor = Ulid::from_parts(8, 8);
         let now = Instant::now();
         cache.insert("a", cursor, "summary", now);
         let fresh = now + TTL - Duration::from_secs(1);

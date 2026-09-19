@@ -1,17 +1,19 @@
+//! Sorts a failed metadata write into a validation, permanent or retryable job outcome.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
-use aruna_core::structs::BindingError;
+use aruna_core::structs::placement::binding_directory::BindingError;
 
-use crate::create_metadata_document::CreateMetadataDocumentError;
-use crate::delete_metadata_document::DeleteMetadataDocumentError;
-use crate::metadata::forward::MetadataWriteError;
-use crate::update_metadata_document::UpdateMetadataDocumentError;
+use crate::forward::transport::MetadataWriteError;
+use crate::metadata::create_document::CreateDocumentError;
+use crate::metadata::delete_document::DeleteDocumentError;
+use crate::metadata::update_document::UpdateDocumentError;
 
-/// What a job should do about a failed metadata write.
-///
-/// Shared by every job that writes through the metadata seam so one error means
-/// one thing everywhere: a document the backend will never accept is reported,
-/// never retried, while an overloaded or unreachable node is always retried.
+/// What a job should do about a failed metadata write, shared by every job that
+/// writes through the metadata seam: a document the backend will never accept
+/// is reported, never retried; an overloaded or unreachable node is retried.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetadataFailure {
     /// The document itself is rejected; retrying cannot change the outcome.
@@ -22,13 +24,13 @@ pub enum MetadataFailure {
 
 pub fn classify_metadata(error: MetadataWriteError) -> MetadataFailure {
     match error {
-        MetadataWriteError::Create(CreateMetadataDocumentError::MetadataError(
+        MetadataWriteError::Create(CreateDocumentError::MetadataError(
             MetadataError::Validation(violations),
         ))
-        | MetadataWriteError::Update(UpdateMetadataDocumentError::MetadataError(
+        | MetadataWriteError::Update(UpdateDocumentError::MetadataError(
             MetadataError::Validation(violations),
         ))
-        | MetadataWriteError::Delete(DeleteMetadataDocumentError::MetadataError(
+        | MetadataWriteError::Delete(DeleteDocumentError::MetadataError(
             MetadataError::Validation(violations),
         )) => MetadataFailure::Validation(violations),
         error if metadata_is_transient(&error) => MetadataFailure::Retryable(error.to_string()),
@@ -37,9 +39,8 @@ pub fn classify_metadata(error: MetadataWriteError) -> MetadataFailure {
 }
 
 /// Authorization, validation and invariant breaches are the document's fault
-/// and stay permanent. Capacity, transport and commit-ambiguity failures are
-/// the node's, and every metadata write is fenced by an idempotency check, so
-/// replaying an ambiguous commit is safe.
+/// and stay permanent. Capacity, transport and commit-ambiguity failures are the
+/// node's, and every write is fenced by an idempotency check, so replay is safe.
 pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
     match error {
         MetadataWriteError::Unauthorized
@@ -47,39 +48,37 @@ pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
         | MetadataWriteError::NotFound => false,
         MetadataWriteError::Undeliverable(_) => true,
         MetadataWriteError::Create(error) => match error {
-            CreateMetadataDocumentError::StorageError(error) => storage_is_transient(error),
-            CreateMetadataDocumentError::MetadataError(error) => metadata_error_transient(error),
-            CreateMetadataDocumentError::ClockHealth(_)
-            | CreateMetadataDocumentError::TopicAnnouncement(_)
-            | CreateMetadataDocumentError::OriginHoldsNoBucket
-            | CreateMetadataDocumentError::PlacementBindingUnavailable(_) => true,
-            CreateMetadataDocumentError::PlacementBinding(error) => binding_is_transient(error),
+            CreateDocumentError::StorageError(error) => storage_is_transient(error),
+            CreateDocumentError::MetadataError(error) => metadata_error_transient(error),
+            CreateDocumentError::ClockHealth(_)
+            | CreateDocumentError::TopicAnnouncement(_)
+            | CreateDocumentError::HoldsNoBucket
+            | CreateDocumentError::PlacementBindingUnavailable(_) => true,
+            CreateDocumentError::PlacementBinding(error) => binding_is_transient(error),
             _ => false,
         },
         MetadataWriteError::Update(error) => match error {
-            UpdateMetadataDocumentError::StorageError(error) => storage_is_transient(error),
-            UpdateMetadataDocumentError::MetadataError(error) => metadata_error_transient(error),
-            UpdateMetadataDocumentError::TopicAnnouncement(_) => true,
+            UpdateDocumentError::StorageError(error) => storage_is_transient(error),
+            UpdateDocumentError::MetadataError(error) => metadata_error_transient(error),
+            UpdateDocumentError::TopicAnnouncement(_) => true,
             _ => false,
         },
         MetadataWriteError::Delete(error) => match error {
-            DeleteMetadataDocumentError::StorageError(error) => storage_is_transient(error),
-            DeleteMetadataDocumentError::MetadataError(error) => metadata_error_transient(error),
-            DeleteMetadataDocumentError::SyncDelete(_) => true,
+            DeleteDocumentError::StorageError(error) => storage_is_transient(error),
+            DeleteDocumentError::MetadataError(error) => metadata_error_transient(error),
+            DeleteDocumentError::SyncDelete(_) => true,
             _ => false,
         },
     }
 }
 
-/// A binding set that is merely incomplete here still converges, so an unknown
-/// handle or strategy waits for replication. Divergent tuples and a bucket
-/// outside the strategy's range are settled values of the immutable binding set:
-/// no retry can resolve them, so burning a backoff schedule on them only hides
-/// the fault.
+/// An incomplete binding set still converges, so an unknown handle or strategy
+/// waits for replication. Divergent tuples and out-of-range buckets are settled
+/// values: retry cannot resolve them and only hides the fault.
 fn binding_is_transient(error: &BindingError) -> bool {
     match error {
         BindingError::Unknown(_) | BindingError::UnknownStrategy(_) => true,
-        BindingError::Conflicted(_) | BindingError::BucketOutOfRange(_) => false,
+        BindingError::Conflicted(_) | BindingError::OutOfRange(_) => false,
     }
 }
 
@@ -113,11 +112,10 @@ fn metadata_error_transient(error: &MetadataError) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::metadata::{
-        MetadataProfileValidationCompleteness, MetadataProfileValidationFinding,
-        MetadataProfileValidationSeverity,
+        ProfileValidationCompleteness, ProfileValidationFinding, ProfileValidationSeverity,
     };
 
     fn handle() -> aruna_core::structured_id::PlacementHandle {
@@ -133,23 +131,23 @@ mod tests {
         }]
     }
 
-    fn profile_finding(code: &str) -> MetadataProfileValidationFinding {
-        MetadataProfileValidationFinding {
+    fn profile_finding(code: &str) -> ProfileValidationFinding {
+        ProfileValidationFinding {
             code: code.to_string(),
-            severity: MetadataProfileValidationSeverity::Violation,
+            severity: ProfileValidationSeverity::Violation,
             focus_node: None,
             path: None,
             rule: code.to_string(),
             message: code.to_string(),
             profile_revision: None,
-            completeness: MetadataProfileValidationCompleteness::Incomplete,
+            completeness: ProfileValidationCompleteness::Incomplete,
         }
     }
 
     #[test]
-    fn profile_gate_is_permanent_except_for_unavailable_dependencies() {
+    fn profile_gate_exceptions() {
         for code in ["unsupported_constraint", "validation_limit"] {
-            let permanent = create(CreateMetadataDocumentError::MetadataError(
+            let permanent = create(CreateDocumentError::MetadataError(
                 MetadataError::ProfileValidation(vec![profile_finding(code)]),
             ));
             assert!(matches!(
@@ -158,7 +156,7 @@ mod tests {
             ));
         }
 
-        let retryable = create(CreateMetadataDocumentError::MetadataError(
+        let retryable = create(CreateDocumentError::MetadataError(
             MetadataError::ProfileValidation(vec![profile_finding("validator_unavailable")]),
         ));
         assert!(matches!(
@@ -167,15 +165,15 @@ mod tests {
         ));
     }
 
-    fn create(error: CreateMetadataDocumentError) -> MetadataWriteError {
+    fn create(error: CreateDocumentError) -> MetadataWriteError {
         MetadataWriteError::Create(error)
     }
 
-    fn update(error: UpdateMetadataDocumentError) -> MetadataWriteError {
+    fn update(error: UpdateDocumentError) -> MetadataWriteError {
         MetadataWriteError::Update(error)
     }
 
-    fn delete(error: DeleteMetadataDocumentError) -> MetadataWriteError {
+    fn delete(error: DeleteDocumentError) -> MetadataWriteError {
         MetadataWriteError::Delete(error)
     }
 
@@ -183,13 +181,13 @@ mod tests {
     #[test]
     fn validation_never_retries() {
         for error in [
-            create(CreateMetadataDocumentError::MetadataError(
+            create(CreateDocumentError::MetadataError(
                 MetadataError::Validation(violation()),
             )),
-            update(UpdateMetadataDocumentError::MetadataError(
+            update(UpdateDocumentError::MetadataError(
                 MetadataError::Validation(violation()),
             )),
-            delete(DeleteMetadataDocumentError::MetadataError(
+            delete(DeleteDocumentError::MetadataError(
                 MetadataError::Validation(violation()),
             )),
         ] {
@@ -206,43 +204,41 @@ mod tests {
             MetadataWriteError::Unauthorized,
             MetadataWriteError::Forbidden,
             MetadataWriteError::NotFound,
-            create(CreateMetadataDocumentError::DocumentAlreadyExists),
-            create(CreateMetadataDocumentError::MissingTransaction),
-            create(CreateMetadataDocumentError::NotFinished),
-            create(CreateMetadataDocumentError::RawLimit),
-            create(CreateMetadataDocumentError::UnexpectedEvent {
+            create(CreateDocumentError::DocumentAlreadyExists),
+            create(CreateDocumentError::MissingTransaction),
+            create(CreateDocumentError::NotFinished),
+            create(CreateDocumentError::RawLimit),
+            create(CreateDocumentError::UnexpectedEvent {
                 state: "s".to_string(),
                 expected: "e",
                 got: "g".to_string(),
             }),
-            create(CreateMetadataDocumentError::MetadataError(
+            create(CreateDocumentError::MetadataError(
                 MetadataError::InvalidInput("bad".to_string()),
             )),
-            create(CreateMetadataDocumentError::StorageError(
-                StorageError::KeyNotFound,
-            )),
-            update(UpdateMetadataDocumentError::DocumentNotFound),
-            update(UpdateMetadataDocumentError::MissingTransaction),
-            update(UpdateMetadataDocumentError::NotFinished),
-            update(UpdateMetadataDocumentError::RawLimit),
-            update(UpdateMetadataDocumentError::UnexpectedEvent {
+            create(CreateDocumentError::StorageError(StorageError::KeyNotFound)),
+            update(UpdateDocumentError::DocumentNotFound),
+            update(UpdateDocumentError::MissingTransaction),
+            update(UpdateDocumentError::NotFinished),
+            update(UpdateDocumentError::RawLimit),
+            update(UpdateDocumentError::UnexpectedEvent {
                 state: "s".to_string(),
                 expected: "e",
                 got: "g".to_string(),
             }),
-            delete(DeleteMetadataDocumentError::DocumentNotFound),
-            delete(DeleteMetadataDocumentError::MissingTransaction),
-            delete(DeleteMetadataDocumentError::UnexpectedEvent {
+            delete(DeleteDocumentError::DocumentNotFound),
+            delete(DeleteDocumentError::MissingTransaction),
+            delete(DeleteDocumentError::UnexpectedEvent {
                 state: "s".to_string(),
                 expected: "e",
                 got: "g".to_string(),
             }),
             // Settled values of the immutable binding set; a retry replays them.
-            create(CreateMetadataDocumentError::PlacementBinding(
+            create(CreateDocumentError::PlacementBinding(
                 BindingError::Conflicted(handle()),
             )),
-            create(CreateMetadataDocumentError::PlacementBinding(
-                BindingError::BucketOutOfRange(
+            create(CreateDocumentError::PlacementBinding(
+                BindingError::OutOfRange(
                     aruna_core::structured_id::BucketId::new(9)
                         .expect("bucket")
                         .in_strategy_range(4)
@@ -260,79 +256,71 @@ mod tests {
 
         let retryable: Vec<MetadataWriteError> = vec![
             MetadataWriteError::Undeliverable("no holder".to_string()),
-            create(CreateMetadataDocumentError::StorageError(
+            create(CreateDocumentError::StorageError(
                 StorageError::TransactionConflict,
             )),
-            create(CreateMetadataDocumentError::StorageError(
-                StorageError::QueueFull,
-            )),
-            create(CreateMetadataDocumentError::StorageError(
-                StorageError::Timeout,
-            )),
-            create(CreateMetadataDocumentError::StorageError(
+            create(CreateDocumentError::StorageError(StorageError::QueueFull)),
+            create(CreateDocumentError::StorageError(StorageError::Timeout)),
+            create(CreateDocumentError::StorageError(
                 StorageError::ChannelClosed,
             )),
-            create(CreateMetadataDocumentError::StorageError(
+            create(CreateDocumentError::StorageError(
                 StorageError::CommitFailed,
             )),
-            create(CreateMetadataDocumentError::StorageError(
-                StorageError::Closed,
-            )),
-            create(CreateMetadataDocumentError::TopicAnnouncement(
+            create(CreateDocumentError::StorageError(StorageError::Closed)),
+            create(CreateDocumentError::TopicAnnouncement(
                 "no topic".to_string(),
             )),
-            create(CreateMetadataDocumentError::OriginHoldsNoBucket),
-            create(CreateMetadataDocumentError::PlacementBindingUnavailable(
+            create(CreateDocumentError::HoldsNoBucket),
+            create(CreateDocumentError::PlacementBindingUnavailable(
                 "no binding".to_string(),
             )),
             // An incomplete local binding set still converges by replication.
-            create(CreateMetadataDocumentError::PlacementBinding(
+            create(CreateDocumentError::PlacementBinding(
                 BindingError::Unknown(handle()),
             )),
-            create(CreateMetadataDocumentError::PlacementBinding(
+            create(CreateDocumentError::PlacementBinding(
                 BindingError::UnknownStrategy(ulid::Ulid::nil()),
             )),
-            create(CreateMetadataDocumentError::MetadataError(
+            create(CreateDocumentError::MetadataError(
                 MetadataError::ChannelClosed,
             )),
-            create(CreateMetadataDocumentError::MetadataError(
+            create(CreateDocumentError::MetadataError(
                 MetadataError::HandleMissing,
             )),
-            create(CreateMetadataDocumentError::MetadataError(
-                MetadataError::Persist("disk".to_string()),
-            )),
-            create(CreateMetadataDocumentError::MetadataError(
-                MetadataError::Backend("busy".to_string()),
-            )),
-            create(CreateMetadataDocumentError::MetadataError(
-                MetadataError::TaskJoin("panic".to_string()),
-            )),
-            update(UpdateMetadataDocumentError::StorageError(
+            create(CreateDocumentError::MetadataError(MetadataError::Persist(
+                "disk".to_string(),
+            ))),
+            create(CreateDocumentError::MetadataError(MetadataError::Backend(
+                "busy".to_string(),
+            ))),
+            create(CreateDocumentError::MetadataError(MetadataError::TaskJoin(
+                "panic".to_string(),
+            ))),
+            update(UpdateDocumentError::StorageError(
                 StorageError::TransactionConflict,
             )),
-            update(UpdateMetadataDocumentError::StorageError(
-                StorageError::QueueFull,
-            )),
-            update(UpdateMetadataDocumentError::TopicAnnouncement(
+            update(UpdateDocumentError::StorageError(StorageError::QueueFull)),
+            update(UpdateDocumentError::TopicAnnouncement(
                 "no topic".to_string(),
             )),
-            update(UpdateMetadataDocumentError::MetadataError(
-                MetadataError::Backend("busy".to_string()),
-            )),
-            delete(DeleteMetadataDocumentError::StorageError(
+            update(UpdateDocumentError::MetadataError(MetadataError::Backend(
+                "busy".to_string(),
+            ))),
+            delete(DeleteDocumentError::StorageError(
                 StorageError::TransactionConflict,
             )),
-            delete(DeleteMetadataDocumentError::SyncDelete("peer".to_string())),
-            delete(DeleteMetadataDocumentError::MetadataError(
-                MetadataError::Persist("disk".to_string()),
-            )),
-            create(CreateMetadataDocumentError::MetadataError(
+            delete(DeleteDocumentError::SyncDelete("peer".to_string())),
+            delete(DeleteDocumentError::MetadataError(MetadataError::Persist(
+                "disk".to_string(),
+            ))),
+            create(CreateDocumentError::MetadataError(
                 MetadataError::GraphNotFound,
             )),
-            update(UpdateMetadataDocumentError::MetadataError(
+            update(UpdateDocumentError::MetadataError(
                 MetadataError::GraphNotFound,
             )),
-            delete(DeleteMetadataDocumentError::MetadataError(
+            delete(DeleteDocumentError::MetadataError(
                 MetadataError::GraphNotFound,
             )),
         ];
@@ -350,13 +338,13 @@ mod tests {
     #[test]
     fn missing_graph_unavailable() {
         assert!(matches!(
-            classify_metadata(update(UpdateMetadataDocumentError::MetadataError(
+            classify_metadata(update(UpdateDocumentError::MetadataError(
                 MetadataError::GraphNotFound
             ))),
             MetadataFailure::Retryable(_)
         ));
         assert!(matches!(
-            classify_metadata(update(UpdateMetadataDocumentError::MetadataError(
+            classify_metadata(update(UpdateDocumentError::MetadataError(
                 MetadataError::InvalidInput("not an iri".to_string())
             ))),
             MetadataFailure::Permanent(_)
@@ -365,7 +353,7 @@ mod tests {
 
     #[test]
     fn conversions_stay_permanent() {
-        let error = create(CreateMetadataDocumentError::ConversionError(
+        let error = create(CreateDocumentError::ConversionError(
             postcard::Error::SerdeSerCustom.into(),
         ));
         assert!(matches!(

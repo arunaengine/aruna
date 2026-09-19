@@ -1,8 +1,13 @@
+//! Inspects an uploaded RO-Crate ZIP: its entries, the metadata file and the signature entry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path};
 
 use aruna_blob::blob::BlobHandle;
-use aruna_core::structs::{BackendLocation, RoCrateLimits};
+use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::storage::blob::BackendLocation;
 use async_zip::Compression;
 use async_zip::base::read::seek::ZipFileReader as BaseZipReader;
 use futures_util::io::AsyncReadExt as FuturesReadExt;
@@ -745,7 +750,7 @@ fn reject_special_entry(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn entry(index: usize, path: &str) -> ArchiveEntry {

@@ -1,3 +1,7 @@
+# Manifest of aruna-operations, the use-case state machine crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 [package]
 name = "aruna-operations"
 version.workspace = true
@@ -34,6 +38,7 @@ opentelemetry = { workspace = true }
 postcard = { workspace = true }
 quick-xml = { workspace = true }
 rand = { workspace = true }
+schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
@@ -55,11 +60,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-futures-util = { workspace = true }
 proptest = { workspace = true }
-rand = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-tokio-util = { workspace = true }
 tracing-subscriber = { workspace = true }
 zip = { workspace = true }

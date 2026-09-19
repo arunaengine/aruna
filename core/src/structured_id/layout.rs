@@ -1,6 +1,7 @@
-//! Sole owner of the Aruna Structured ULID bit layout (Appendix A.1):
-//! `timestamp_ms(48) | placement_handle(20) | bucket(12) | nonce(48)`.
-//! No other module performs raw field shifts or masks.
+//! Owns the structured ULID bit layout: timestamp, placement handle, bucket and nonce.
+//! Packs and unpacks those fields, so no other module shifts or masks the raw bits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 pub const TIMESTAMP_BITS: u32 = 48;
 pub const HANDLE_BITS: u32 = 20;

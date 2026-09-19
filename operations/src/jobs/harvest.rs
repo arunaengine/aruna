@@ -1,3 +1,7 @@
+//! Runs the harvest job that pages an OAI-PMH source and stores records as metadata documents.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::time::{Duration, SystemTime};
@@ -6,28 +10,27 @@ use aruna_blob::blob::BlobHandle;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_PENDING_PROJECTION_KEYSPACE;
-use aruna_core::structs::{
-    Actor, AuthContext, HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance,
-    HarvestRecordState, HarvestSource, IncomingRecord, JobError, JobResultPayload,
-    MetadataRegistryRecord, ProvenanceDecision, RealmId, RepositoryConnector, provenance_decision,
+use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
+use aruna_core::structs::execution::harvest::{
+    HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance, HarvestRecordState,
+    HarvestSource, IncomingRecord, ProvenanceDecision, RepositoryConnector, provenance_decision,
 };
+use aruna_core::structs::execution::job::{JobError, JobResultPayload};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-    CreateMetadataDocumentPayload, mint_job_document,
-};
-use crate::get_metadata_document::load_metadata_record_by_document;
-use crate::harvest::oai::mapping::dc_to_jsonld;
-use crate::harvest::oai::parse::{
+use crate::forward::transport::MetadataWriteError;
+use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
+use crate::harvest::oai_pmh::parse::{
     OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
 };
-use crate::harvest::oai::request::{format_window, identify_url, list_records_url};
+use crate::harvest::oai_pmh::request::{format_window, identify_url, list_records_url};
 use crate::harvest::repository::{
     StorageReadError, parse_connector_read, parse_provenance_read, parse_source_read,
     read_connector_effect, read_provenance_effect, read_source_effect, write_provenance_effect,
@@ -36,12 +39,16 @@ use crate::harvest::repository::{
 use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
-use crate::metadata::MetadataAuthToken;
-use crate::metadata::forward::{
-    MetadataWriteError, create_metadata_document_routed, delete_metadata_document_routed,
-    update_metadata_document_routed,
+use crate::metadata::AuthToken;
+use crate::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
+    mint_job_document,
 };
-use crate::update_metadata_document::UpdateMetadataDocumentMutation;
+use crate::metadata::forward::{
+    route_metadata_create, route_metadata_delete, route_metadata_update,
+};
+use crate::metadata::get_document::load_document_record;
+use crate::metadata::update_document::UpdateDocumentMutation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a
@@ -69,10 +76,9 @@ enum HarvestFailure {
     Job(JobError),
 }
 
-/// Run one harvest of a repository source: page through OAI-PMH ListRecords,
-/// apply each record through the metadata write seam with the source's group
-/// authority, and advance the cursor. Idempotent by harvest provenance, so a
-/// fenced re-run re-applies nothing.
+/// Run one harvest: page through OAI-PMH ListRecords, apply each record through
+/// the metadata write seam with the source's group authority, and advance the
+/// cursor. Idempotent by harvest provenance, so a fenced re-run re-applies nothing.
 pub async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunOutcome {
     match harvest(ctx, spec).await {
         Ok(counts) => JobRunOutcome::Succeeded(JobResultPayload::Harvest {
@@ -313,9 +319,8 @@ async fn apply_record(
                     write_provenance(ctx, &row).await?;
                     counts.updated += 1;
                 }
-                // Local absence may only be registry lag. Ask the routed holders
-                // to update first; retire the identity only when all report it
-                // gone.
+                // Local absence may be registry lag: ask the routed holders to update first
+                // and retire the identity only when all report it gone.
                 None => {
                     confirm_absent(ctx, meta_resource_id).await?;
                     match update_document(
@@ -357,12 +362,8 @@ async fn apply_record(
 }
 
 /// Prove the harvested document is gone before its provenance may go terminal.
-///
-/// An empty local registry read is not evidence of absence: the row is a
-/// projection of a create that may still be queued here, and a `Tombstoned` row
-/// written over that race would leave the document live forever. Only a routed
-/// delete that succeeds, or one every holder answers as already absent, retires
-/// the identity; anything else is retryable and keeps the prior state.
+/// An empty local read is not evidence of absence, since the create may still be
+/// queued here; only a routed delete that succeeds or an all-absent answer retires it.
 async fn confirm_withdrawn(
     ctx: &JobContext,
     source: &HarvestSource,
@@ -374,7 +375,7 @@ async fn confirm_withdrawn(
     if stored.is_none() {
         confirm_absent(ctx, document_id).await?;
     }
-    match delete_metadata_document_routed(
+    match route_metadata_delete(
         &ctx.driver,
         actor.clone(),
         stored.as_ref(),
@@ -394,7 +395,7 @@ async fn read_stored(
     ctx: &JobContext,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, HarvestFailure> {
-    load_metadata_record_by_document(&ctx.driver, document_id)
+    load_document_record(&ctx.driver, document_id)
         .await
         .map_err(|error| retryable(format!("harvest record read: {error:?}")))
 }
@@ -417,7 +418,7 @@ async fn projection_pending(ctx: &JobContext, document_id: Ulid) -> Result<bool,
         .driver
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: METADATA_PENDING_PROJECTION_KEYSPACE.to_string(),
+            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(document_id.to_bytes().to_vec())),
             start: None,
             limit: 1,
@@ -436,9 +437,8 @@ async fn projection_pending(ctx: &JobContext, document_id: Ulid) -> Result<bool,
 }
 
 /// Allocate a structured document id, record it as `PendingCreate` before the
-/// create runs, then confirm it. A crash anywhere in between leaves a retry the
-/// same id, so a replay converges on one document instead of orphaning one per
-/// attempt.
+/// create runs, then confirm it. A crash in between leaves a retry the same id,
+/// so a replay converges on one document instead of orphaning one per attempt.
 async fn mint_and_create(
     ctx: &JobContext,
     source: &HarvestSource,
@@ -469,19 +469,17 @@ async fn create_document(
     record: &OaiRecord,
 ) -> Result<(), HarvestFailure> {
     let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
-    let created = create_metadata_document_routed(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
-            CreateMetadataDocumentConfig {
-                actor: actor.clone(),
-                group_id: source.group_id,
-                document_id,
-                document_path: document_path.clone(),
-                public: false,
-                payload: CreateMetadataDocumentPayload::RoCrate {
-                    jsonld: dc_to_jsonld(record),
-                },
+    let created = route_metadata_create(
+        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+            actor: actor.clone(),
+            group_id: source.group_id,
+            document_id,
+            document_path: document_path.clone(),
+            public: false,
+            payload: CreateDocumentPayload::RoCrate {
+                jsonld: dc_to_jsonld(record),
             },
-        ),
+        }),
         ctx.driver.clone(),
         Some(internal_token(source.created_by, realm_id)),
     )
@@ -490,7 +488,7 @@ async fn create_document(
         Ok(_) => Ok(()),
         // A create the pending identity already committed under a different
         // payload: the id is resolved, and the newer content lands as an update.
-        Err(MetadataWriteError::Create(CreateMetadataDocumentError::DocumentAlreadyExists)) => {
+        Err(MetadataWriteError::Create(CreateDocumentError::DocumentAlreadyExists)) => {
             let stored = read_stored(ctx, document_id).await?;
             update_document(
                 ctx,
@@ -517,13 +515,13 @@ async fn update_document(
     stored: Option<&MetadataRegistryRecord>,
     record: &OaiRecord,
 ) -> Result<(), MetadataWriteError> {
-    update_metadata_document_routed(
+    route_metadata_update(
         &ctx.driver,
         actor.clone(),
         stored,
         document_id,
         None,
-        UpdateMetadataDocumentMutation::ReplaceRoCrate {
+        UpdateDocumentMutation::ReplaceRoCrate {
             jsonld: dc_to_jsonld(record),
         },
         Some(internal_token(source.created_by, realm_id)),
@@ -534,8 +532,8 @@ async fn update_document(
 
 /// Harvest writes run as the source owner, unrestricted: the source record is
 /// the authorization decision, made when an operator created it.
-fn internal_token(created_by: aruna_core::types::UserId, realm_id: RealmId) -> MetadataAuthToken {
-    MetadataAuthToken::internal(AuthContext {
+fn internal_token(created_by: aruna_core::UserId, realm_id: RealmId) -> AuthToken {
+    AuthToken::internal(AuthContext {
         user_id: created_by,
         realm_id,
         path_restrictions: None,
@@ -549,14 +547,9 @@ fn next_version(existing: Option<&HarvestProvenance>) -> u64 {
         .unwrap_or(1)
 }
 
-/// Land a source record under its target prefix at a stable, path-safe segment
-/// derived from the OAI identifier.
-///
-/// Every identifier is encoded into one of two disjoint domains so no two raw
-/// identifiers can ever share a segment: `b64-` carries the exact identifier as
-/// URL-safe unpadded base64 whenever it fits the path budget, `b3-` carries the
-/// full 256-bit BLAKE3 digest of anything longer. Provenance keeps the raw
-/// identifier, so the encoding never has to be reversed.
+/// Land a source record under its target prefix at a stable, path-safe segment.
+/// `b64-` carries the OAI identifier as URL-safe base64 when it fits the budget,
+/// `b3-` its BLAKE3 digest; the disjoint domains prevent segment collisions.
 fn harvest_document_path(prefix: &str, identifier: &str) -> Result<String, HarvestFailure> {
     let Some(prefix) = normalize_target_prefix(prefix) else {
         return Err(permanent(format!(
@@ -623,12 +616,9 @@ async fn discover_granularity(
     parse_granularity(&body)
 }
 
-/// Fetch one OAI-PMH response under a hard byte cap and a total wall-clock
-/// deadline.
-///
-/// The egress client only bounds connect and read *inactivity*, so a slow-drip
-/// or endless response would otherwise run until the node stops. Chunks are
-/// counted after decoding, which is what a compressed body expands to.
+/// Fetch one OAI-PMH response under a hard byte cap and wall-clock deadline.
+/// Egress bounds only connect and read *inactivity*, so a slow-drip response
+/// would otherwise run until the node stops; the cap counts decoded bytes.
 async fn fetch(
     ctx: &JobContext,
     blob: &BlobHandle,
@@ -779,7 +769,7 @@ fn apply_failure(error: MetadataWriteError) -> HarvestFailure {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use crate::harvest::target_path::DIGEST_SEGMENT_BYTES;
 

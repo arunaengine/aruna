@@ -1,28 +1,35 @@
+//! Tests that node usage snapshots publish to peers and add up to the realm total.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use std::sync::Arc;
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    REALM_CONFIG_KEYSPACE, USAGE_NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE,
-};
-use aruna_core::structs::{
-    Actor, BucketInfo, NODE_USAGE_DIRTY_GLOBAL_KEY, NodeUsageSnapshot, RealmConfigDocument,
-    RealmId, RealmNodeKind, UsageCounters, node_usage_global_key, usage_global_key_for_group,
+use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::usage::{
+    DIRTY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_group_key, usage_global_key,
     usage_group_key,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::replicate_documents::{
+use aruna_operations::node::usage_stats::{
+    RealmUsageScope, load_realm_usage, publish_usage_snapshots,
+};
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::task_incoming::initialize_task_incoming;
-use aruna_operations::usage_stats::{RealmUsageScope, load_realm_usage, publish_usage_snapshots};
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -37,18 +44,16 @@ struct TestNode {
     context: Arc<DriverContext>,
 }
 
-// Node A's usage counters must become visible in node B's realm-wide aggregate
-// via the real document sync apply path, while B's node-local counter keyspace
-// stays completely untouched by ingest.
+// Node A's usage counters must become visible in node B's realm-wide aggregate via the real
+// document sync apply path.
 #[tokio::test]
-async fn node_usage_snapshot_reaches_peer_realm_aggregate() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([37u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let node_a = &nodes[0];
     let node_b = &nodes[1];
     let group_id = Ulid::generate();
-    bootstrap_node_usage_genesis(node_a, node_b, realm_id).await?;
+    bootstrap_usage_genesis(node_a, node_b, realm_id).await?;
 
     drive(
         CreateBucketOperation::new(
@@ -65,9 +70,7 @@ async fn node_usage_snapshot_reaches_peer_realm_aggregate() -> Result<(), Box<dy
         ),
         node_a.context.as_ref(),
     )
-    .await?
-    .unwrap()
-    .unwrap();
+    .await?;
 
     publish_usage_snapshots(
         node_a.context.as_ref(),
@@ -79,7 +82,7 @@ async fn node_usage_snapshot_reaches_peer_realm_aggregate() -> Result<(), Box<dy
 
     // Node B receives A's snapshots over the sync layer and folds them into the
     // realm aggregate (global and per-group).
-    let a_snapshot_key = node_usage_global_key(node_a.net.node_id());
+    let a_snapshot_key = usage_global_key(node_a.net.node_id());
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "node B never observed A's usage snapshot",
         || async {
@@ -135,19 +138,15 @@ async fn node_usage_snapshot_reaches_peer_realm_aggregate() -> Result<(), Box<dy
     Ok(())
 }
 
-// A snapshot carrying every counter field (objects, blobs, stored/logical bytes)
-// is the real ingest hazard: apply must fold it into node B's realm-wide
-// aggregate (which lives in the node-usage keyspace) while leaving B's live
-// incremental counter keyspace (`USAGE_STATS_KEYSPACE`) completely empty.
+// Snapshot ingest updates realm aggregates without touching local incremental counters.
 #[tokio::test]
-async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
--> Result<(), Box<dyn std::error::Error>> {
+async fn snapshot_ingest_neutral() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([41u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let node_a = &nodes[0];
     let node_b = &nodes[1];
     let group_id = Ulid::generate();
-    bootstrap_node_usage_genesis(node_a, node_b, realm_id).await?;
+    bootstrap_usage_genesis(node_a, node_b, realm_id).await?;
 
     // Seed node A's live counters with a full, non-trivial usage total, then let
     // the real publisher distribute it as node-usage snapshot documents.
@@ -159,7 +158,7 @@ async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
         logical_bytes: 8192,
         referenced_bytes: 2048,
     };
-    write_usage_stat(node_a, usage_global_key_for_group(group_id), rich).await;
+    write_usage_stat(node_a, global_group_key(group_id), rich).await;
     write_usage_stat(node_a, usage_group_key(group_id), rich).await;
 
     publish_usage_snapshots(
@@ -170,7 +169,7 @@ async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
     )
     .await?;
 
-    let a_snapshot_key = node_usage_global_key(node_a.net.node_id());
+    let a_snapshot_key = usage_global_key(node_a.net.node_id());
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "node B never observed A's rich usage snapshot",
         || async {
@@ -232,13 +231,9 @@ async fn rich_node_usage_snapshot_ingest_is_counter_neutral()
     Ok(())
 }
 
-// A steady-state counter write on a long-running node (no restart) must lead to
-// a published node-usage snapshot within a bounded window. The only thing that
-// turns a durable dirty marker into a publish during steady state is the durable
-// re-arm loop, so this proves that loop closes the gap the marker write leaves.
+// A steady-state write must publish without relying on restart recovery.
 #[tokio::test]
-async fn steady_state_write_publishes_snapshot_without_restart()
--> Result<(), Box<dyn std::error::Error>> {
+async fn steady_write_publishes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([53u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 1).await?;
     let node = &nodes[0];
@@ -261,16 +256,14 @@ async fn steady_state_write_publishes_snapshot_without_restart()
         ),
         node.context.as_ref(),
     )
-    .await?
-    .unwrap()
-    .unwrap();
+    .await?;
 
-    let snapshot_key = node_usage_global_key(node.net.node_id());
+    let snapshot_key = usage_global_key(node.net.node_id());
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "steady-state write never published a snapshot",
         || async {
             let published = read_node_stats(node, snapshot_key.clone()).await.is_some();
-            let dirty_cleared = read_node_stats(node, NODE_USAGE_DIRTY_GLOBAL_KEY.to_vec())
+            let dirty_cleared = read_node_stats(node, DIRTY_GLOBAL_KEY.to_vec())
                 .await
                 .is_none();
             Ok(usize::from(!(published && dirty_cleared)))
@@ -299,13 +292,13 @@ async fn write_usage_stat(node: &TestNode, key: Vec<u8>, counters: UsageCounters
     }
 }
 
-async fn bootstrap_node_usage_genesis(
+async fn bootstrap_usage_genesis(
     publisher: &TestNode,
     subscriber: &TestNode,
     realm_id: RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node_id = publisher.net.node_id();
-    let snapshot_key = node_usage_global_key(node_id);
+    let snapshot_key = usage_global_key(node_id);
     let snapshot = NodeUsageSnapshot {
         node_id,
         counters: UsageCounters::default(),
@@ -314,7 +307,7 @@ async fn bootstrap_node_usage_genesis(
         .context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key_space: NODE_STATS_KEYSPACE.to_string(),
             key: snapshot_key.clone().into(),
             value: snapshot.to_bytes()?.into(),
             txn_id: None,
@@ -330,7 +323,7 @@ async fn bootstrap_node_usage_genesis(
             realm_id,
             local_node_id: node_id,
             excluded_peers: Vec::new(),
-            documents: vec![DocumentSyncTarget::NodeUsage {
+            documents: vec![DocumentTarget::NodeUsage {
                 realm_id,
                 node_id,
                 group_id: None,
@@ -358,7 +351,7 @@ async fn read_node_stats(node: &TestNode, key: Vec<u8>) -> Option<Vec<u8>> {
         .context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: aruna_core::keyspaces::USAGE_NODE_STATS_KEYSPACE.to_string(),
+            key_space: aruna_core::keyspaces::NODE_STATS_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: None,
         }))
@@ -441,11 +434,13 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         compute_handle: None,
     });
 
-    initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    initialize_incoming_fixture(context.clone());
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
 
@@ -487,12 +482,12 @@ async fn install_realm_config(
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             *realm_id,
             node.net.node_id(),

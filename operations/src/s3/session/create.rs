@@ -1,23 +1,27 @@
+//! Creates an S3 session credential and drops the oldest ones past the per group limit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     MAX_GROUP_SESSIONS, S3SessionCredentials, S3SessionError, build_session, decode_index,
     encode_index, expiry_key, owner_key, session_age,
 };
+use aruna_core::UserId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, S3_SESSION_OWNER_KEYSPACE,
-};
+use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{PathRestriction, S3_SESSION_MAX_TTL, S3Session};
-use aruna_core::types::{Effects, GroupId, UserId};
+use aruna_core::structs::identity::auth::PathRestriction;
+use aruna_core::structs::identity::s3_session::{S3Session, SESSION_MAX_TTL};
+use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
-pub struct CreateS3SessionConfig {
+pub struct CreateS3Config {
     pub user_identity: UserId,
     pub group_id: GroupId,
     pub now: SystemTime,
@@ -40,8 +44,8 @@ enum CreateSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CreateS3SessionOperation {
-    config: CreateS3SessionConfig,
+pub struct CreateS3Operation {
+    config: CreateS3Config,
     key_id: String,
     encryption_key: CredentialEncryptionKey,
     pending: Option<S3SessionCredentials>,
@@ -50,13 +54,13 @@ pub struct CreateS3SessionOperation {
     output: Result<S3SessionCredentials, S3SessionError>,
 }
 
-impl CreateS3SessionOperation {
-    pub fn new(config: CreateS3SessionConfig, encryption_key: CredentialEncryptionKey) -> Self {
+impl CreateS3Operation {
+    pub fn new(config: CreateS3Config, encryption_key: CredentialEncryptionKey) -> Self {
         Self::with_key(config, Ulid::generate().to_string(), encryption_key)
     }
 
     pub fn with_key(
-        config: CreateS3SessionConfig,
+        config: CreateS3Config,
         key_id: String,
         encryption_key: CredentialEncryptionKey,
     ) -> Self {
@@ -84,7 +88,7 @@ impl CreateS3SessionOperation {
         let Ok(ttl) = self.config.expiry.duration_since(self.config.now) else {
             return self.fail(S3SessionError::InvalidExpiry);
         };
-        if ttl.is_zero() || ttl > S3_SESSION_MAX_TTL {
+        if ttl.is_zero() || ttl > SESSION_MAX_TTL {
             return self.fail(S3SessionError::InvalidExpiry);
         }
         let access_key = match S3Session::build_access_key(&self.key_id) {
@@ -117,7 +121,7 @@ impl CreateS3SessionOperation {
         self.txn_id = Some(txn_id);
         self.state = CreateSessionState::ReadIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: SESSION_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.config.user_identity, self.config.group_id),
             txn_id: Some(txn_id),
         })]
@@ -231,7 +235,7 @@ impl CreateS3SessionOperation {
                 S3_SESSION_KEYSPACE.to_string(),
                 session.access_key.as_bytes().into(),
             ));
-            deletes.push((S3_SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key));
+            deletes.push((SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key));
         }
         self.state = CreateSessionState::DeleteSessions { index };
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
@@ -276,15 +280,11 @@ impl CreateS3SessionOperation {
                     session_bytes.into(),
                 ),
                 (
-                    S3_SESSION_OWNER_KEYSPACE.to_string(),
+                    SESSION_OWNER_KEYSPACE.to_string(),
                     owner_key.clone(),
                     index_bytes,
                 ),
-                (
-                    S3_SESSION_EXPIRY_KEYSPACE.to_string(),
-                    expiry_key,
-                    owner_key,
-                ),
+                (SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key, owner_key,),
             ],
             txn_id: Some(txn_id),
         })]
@@ -323,7 +323,7 @@ impl CreateS3SessionOperation {
     }
 }
 
-impl Operation for CreateS3SessionOperation {
+impl Operation for CreateS3Operation {
     type Output = S3SessionCredentials;
     type Error = S3SessionError;
 

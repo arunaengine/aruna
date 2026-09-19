@@ -1,10 +1,6 @@
-//! The pure execution planner.
-//!
-//! It hard-filters every scanned advertisement against authenticated
-//! membership, placement policy, and static capability, then ranks whatever
-//! survives by directed transfer cost and stale ranking hints and keeps the
-//! best of them. It performs no I/O, decides nothing about capacity the target
-//! owns, and covers every value it used with a plan digest.
+//! Owns the pure planner that screens, ranks and digests execution targets without any I/O.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod cost;
 mod digest;
@@ -24,7 +20,7 @@ pub use inputs::{
 pub use scan::Planner;
 
 use crate::compute::ExecutionTargetId;
-use crate::structs::RealmComputeConfig;
+use crate::structs::placement::compute_config::RealmComputeConfig;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -35,7 +31,7 @@ pub struct PlannedInput {
     pub version_id: Ulid,
     pub blake3: [u8; 32],
     pub bytes: u64,
-    pub policies: Vec<crate::structs::PlacementPolicyRef>,
+    pub policies: Vec<crate::structs::placement::policy::PlacementPolicyRef>,
     /// `None` when the target already holds the exact compliant copy.
     pub source_node_id: Option<crate::NodeId>,
     pub transfer_ms: u64,
@@ -62,7 +58,7 @@ pub struct Selection {
     pub subject_generation: u64,
     pub score: TargetScore,
     pub inputs: Vec<PlannedInput>,
-    pub output_policies: Vec<crate::structs::PlacementPolicyRef>,
+    pub output_policies: Vec<crate::structs::placement::policy::PlacementPolicyRef>,
     pub plan_digest: [u8; 32],
 }
 
@@ -146,12 +142,8 @@ impl ExecutionPlan {
     }
 }
 
-/// Plans one execution over already resolved inputs and one complete candidate
-/// set, paging it for the caller. Returns an error only when the request itself
-/// is unusable; an empty or fully rejected scan is a plan without a selection,
-/// not a failure, and stays retryable while a rejection may still resolve
-/// itself. A caller that discovers advertisements incrementally drives
-/// [`Planner`] itself.
+/// Plans resolved inputs across one complete paged candidate set. Invalid requests fail; no selection
+/// remains retryable. Incremental discovery drives `Planner` directly.
 pub fn plan_execution(
     request: &PlanRequest,
     candidates: &[TargetCandidate],

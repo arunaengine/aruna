@@ -1,3 +1,7 @@
+//! Writes a database snapshot file and imports such a snapshot into a new database.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
 use blake3::Hasher;
 use fjall::{
@@ -16,18 +20,18 @@ const RECORD_BEGIN_KEYSPACE: u8 = 1;
 const RECORD_ENTRY: u8 = 2;
 const RECORD_END_KEYSPACE: u8 = 3;
 const RECORD_FOOTER: u8 = 4;
-const IMPORT_TXN_ENTRY_LIMIT: usize = 1_000;
+const TXN_ENTRY_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotStats {
-    pub created_at_unix_seconds: u64,
+    pub created_unix_seconds: u64,
     pub keyspace_count: u64,
     pub entry_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportStats {
-    pub snapshot_created_at_unix_seconds: u64,
+    pub snapshot_created_unix: u64,
     pub keyspace_count: u64,
     pub entry_count: u64,
     pub target_path: PathBuf,
@@ -70,7 +74,7 @@ pub async fn snapshot(database_path: String, target_path: String) -> Result<(), 
 
     println!(
         "Snapshot created: keyspaces={}, entries={}, created_at={}",
-        stats.keyspace_count, stats.entry_count, stats.created_at_unix_seconds,
+        stats.keyspace_count, stats.entry_count, stats.created_unix_seconds,
     );
 
     Ok(())
@@ -80,11 +84,10 @@ pub async fn import(snapshot_path: String, target_path: String) -> Result<(), Cl
     let snapshot_path = PathBuf::from(snapshot_path);
     let target_path = PathBuf::from(target_path);
 
-    let stats = tokio::task::spawn_blocking(move || {
-        import_snapshot_into_new_database(&snapshot_path, &target_path)
-    })
-    .await
-    .map_err(std::io::Error::other)??;
+    let stats =
+        tokio::task::spawn_blocking(move || import_new_database(&snapshot_path, &target_path))
+            .await
+            .map_err(std::io::Error::other)??;
 
     println!(
         "Snapshot imported: keyspaces={}, entries={}, target={}",
@@ -110,7 +113,7 @@ pub fn snapshot_database(
     let mut keyspace_names = db.list_keyspace_names();
     keyspace_names.sort();
 
-    let created_at_unix_seconds = SystemTime::now()
+    let created_unix_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(std::io::Error::other)?
         .as_secs();
@@ -123,14 +126,14 @@ pub fn snapshot_database(
     let mut hasher = Hasher::new();
     let snapshot = db.read_tx();
 
-    write_header(&mut writer, created_at_unix_seconds)?;
+    write_header(&mut writer, created_unix_seconds)?;
 
     let mut keyspace_count = 0_u64;
     let mut entry_count = 0_u64;
 
     for keyspace_name in keyspace_names {
         let keyspace = db.keyspace(&keyspace_name, KeyspaceCreateOptions::default)?;
-        write_begin_keyspace_record(&mut writer, &mut hasher, &keyspace_name)?;
+        write_keyspace_begin(&mut writer, &mut hasher, &keyspace_name)?;
 
         let mut keyspace_entry_count = 0_u64;
         for entry in snapshot.iter(&keyspace) {
@@ -140,7 +143,7 @@ pub fn snapshot_database(
             entry_count += 1;
         }
 
-        write_end_keyspace_record(&mut writer, &mut hasher, keyspace_entry_count)?;
+        write_keyspace_end(&mut writer, &mut hasher, keyspace_entry_count)?;
         keyspace_count += 1;
     }
 
@@ -150,23 +153,23 @@ pub fn snapshot_database(
     writer.get_ref().sync_all()?;
 
     Ok(SnapshotStats {
-        created_at_unix_seconds,
+        created_unix_seconds,
         keyspace_count,
         entry_count,
     })
 }
 
-pub fn import_snapshot_into_new_database(
+pub fn import_new_database(
     snapshot_path: impl AsRef<Path>,
     target_db_path: impl AsRef<Path>,
 ) -> Result<ImportStats, SnapshotError> {
     let snapshot_path = snapshot_path.as_ref();
     let target_db_path = target_db_path.as_ref();
-    ensure_new_target_path(target_db_path)?;
+    ensure_target_path(target_db_path)?;
 
     let file = File::open(snapshot_path)?;
     let mut reader = BufReader::new(file);
-    let snapshot_created_at_unix_seconds = read_header(&mut reader)?;
+    let snapshot_created_unix = read_header(&mut reader)?;
 
     let db = OptimisticTxDatabase::builder(target_db_path)
         .manual_journal_persist(true)
@@ -195,7 +198,7 @@ pub fn import_snapshot_into_new_database(
                 }
 
                 hasher.update(&[tag]);
-                let name_bytes = read_length_prefixed_bytes_hashed(&mut reader, &mut hasher)?;
+                let name_bytes = read_hashed_bytes(&mut reader, &mut hasher)?;
                 let name = String::from_utf8(name_bytes)
                     .map_err(|_| SnapshotError::InvalidKeyspaceName)?;
 
@@ -204,7 +207,7 @@ pub fn import_snapshot_into_new_database(
                 }
 
                 let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
-                keyspace_state = Some(ImportKeyspaceState::new(name, keyspace));
+                keyspace_state = Some(ImportKeyspaceState::new(keyspace));
                 keyspace_count += 1;
             }
             RECORD_ENTRY => {
@@ -215,8 +218,8 @@ pub fn import_snapshot_into_new_database(
                 };
 
                 hasher.update(&[tag]);
-                let key = read_length_prefixed_bytes_hashed(&mut reader, &mut hasher)?;
-                let value = read_length_prefixed_bytes_hashed(&mut reader, &mut hasher)?;
+                let key = read_hashed_bytes(&mut reader, &mut hasher)?;
+                let value = read_hashed_bytes(&mut reader, &mut hasher)?;
 
                 state.insert(&db, key, value)?;
                 state.keyspace_entry_count += 1;
@@ -248,7 +251,7 @@ pub fn import_snapshot_into_new_database(
 
                 let expected_keyspace_count = read_u64_plain(&mut reader)?;
                 let expected_entry_count = read_u64_plain(&mut reader)?;
-                let expected_checksum = read_fixed_bytes_plain::<32>(&mut reader)?;
+                let expected_checksum = read_plain_bytes::<32>(&mut reader)?;
 
                 if keyspace_count != expected_keyspace_count {
                     return Err(SnapshotError::InvalidStructure(
@@ -269,7 +272,7 @@ pub fn import_snapshot_into_new_database(
                 ensure_reader_exhausted(&mut reader)?;
                 db.persist(PersistMode::Buffer)?;
                 return Ok(ImportStats {
-                    snapshot_created_at_unix_seconds,
+                    snapshot_created_unix,
                     keyspace_count,
                     entry_count,
                     target_path: target_db_path.to_path_buf(),
@@ -281,8 +284,6 @@ pub fn import_snapshot_into_new_database(
 }
 
 struct ImportKeyspaceState {
-    #[allow(dead_code)]
-    name: String,
     keyspace: OptimisticTxKeyspace,
     keyspace_entry_count: u64,
     pending_txn: Option<fjall::OptimisticWriteTx>,
@@ -290,9 +291,8 @@ struct ImportKeyspaceState {
 }
 
 impl ImportKeyspaceState {
-    fn new(name: String, keyspace: OptimisticTxKeyspace) -> Self {
+    fn new(keyspace: OptimisticTxKeyspace) -> Self {
         Self {
-            name,
             keyspace,
             keyspace_entry_count: 0,
             pending_txn: None,
@@ -315,7 +315,7 @@ impl ImportKeyspaceState {
             self.pending_txn_entries += 1;
         }
 
-        if self.pending_txn_entries >= IMPORT_TXN_ENTRY_LIMIT {
+        if self.pending_txn_entries >= TXN_ENTRY_LIMIT {
             self.commit_pending_txn()?;
         }
 
@@ -335,7 +335,7 @@ impl ImportKeyspaceState {
     }
 }
 
-fn ensure_new_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
+fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
     if target_db_path.exists() {
         return Err(SnapshotError::TargetPathExists(
             target_db_path.to_path_buf(),
@@ -354,11 +354,11 @@ fn ensure_new_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
 
 fn write_header(
     writer: &mut BufWriter<File>,
-    created_at_unix_seconds: u64,
+    created_unix_seconds: u64,
 ) -> Result<(), SnapshotError> {
     writer.write_all(SNAPSHOT_MAGIC)?;
     writer.write_all(&SNAPSHOT_VERSION.to_be_bytes())?;
-    writer.write_all(&created_at_unix_seconds.to_be_bytes())?;
+    writer.write_all(&created_unix_seconds.to_be_bytes())?;
     Ok(())
 }
 
@@ -377,14 +377,14 @@ fn read_header(reader: &mut BufReader<File>) -> Result<u64, SnapshotError> {
     read_u64_plain(reader)
 }
 
-fn write_begin_keyspace_record(
+fn write_keyspace_begin(
     writer: &mut BufWriter<File>,
     hasher: &mut Hasher,
     keyspace_name: &str,
 ) -> Result<(), SnapshotError> {
     let mut record = Vec::with_capacity(1 + 8 + keyspace_name.len());
     record.push(RECORD_BEGIN_KEYSPACE);
-    push_length_prefixed_bytes(&mut record, keyspace_name.as_bytes())?;
+    push_prefixed_bytes(&mut record, keyspace_name.as_bytes())?;
     write_payload_record(writer, hasher, &record)
 }
 
@@ -396,12 +396,12 @@ fn write_entry_record(
 ) -> Result<(), SnapshotError> {
     let mut record = Vec::with_capacity(1 + 16 + key.len() + value.len());
     record.push(RECORD_ENTRY);
-    push_length_prefixed_bytes(&mut record, key)?;
-    push_length_prefixed_bytes(&mut record, value)?;
+    push_prefixed_bytes(&mut record, key)?;
+    push_prefixed_bytes(&mut record, value)?;
     write_payload_record(writer, hasher, &record)
 }
 
-fn write_end_keyspace_record(
+fn write_keyspace_end(
     writer: &mut BufWriter<File>,
     hasher: &mut Hasher,
     entry_count: u64,
@@ -435,14 +435,14 @@ fn write_payload_record(
     Ok(())
 }
 
-fn push_length_prefixed_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SnapshotError> {
+fn push_prefixed_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SnapshotError> {
     let len = u64::try_from(bytes.len()).map_err(|_| SnapshotError::LengthOverflow(u64::MAX))?;
     buffer.extend_from_slice(&len.to_be_bytes());
     buffer.extend_from_slice(bytes);
     Ok(())
 }
 
-fn read_length_prefixed_bytes_hashed(
+fn read_hashed_bytes(
     reader: &mut BufReader<File>,
     hasher: &mut Hasher,
 ) -> Result<Vec<u8>, SnapshotError> {
@@ -461,12 +461,12 @@ fn read_u8_plain(reader: &mut BufReader<File>) -> Result<u8, std::io::Error> {
 }
 
 fn read_u16_plain(reader: &mut BufReader<File>) -> Result<u16, SnapshotError> {
-    let bytes = read_fixed_bytes_plain::<2>(reader)?;
+    let bytes = read_plain_bytes::<2>(reader)?;
     Ok(u16::from_be_bytes(bytes))
 }
 
 fn read_u64_plain(reader: &mut BufReader<File>) -> Result<u64, SnapshotError> {
-    let bytes = read_fixed_bytes_plain::<8>(reader)?;
+    let bytes = read_plain_bytes::<8>(reader)?;
     Ok(u64::from_be_bytes(bytes))
 }
 
@@ -474,12 +474,12 @@ fn read_u64_hashed(
     reader: &mut BufReader<File>,
     hasher: &mut Hasher,
 ) -> Result<u64, SnapshotError> {
-    let bytes = read_fixed_bytes_plain::<8>(reader)?;
+    let bytes = read_plain_bytes::<8>(reader)?;
     hasher.update(&bytes);
     Ok(u64::from_be_bytes(bytes))
 }
 
-fn read_fixed_bytes_plain<const N: usize>(
+fn read_plain_bytes<const N: usize>(
     reader: &mut BufReader<File>,
 ) -> Result<[u8; N], SnapshotError> {
     let mut bytes = [0_u8; N];
@@ -501,31 +501,30 @@ fn ensure_reader_exhausted(reader: &mut BufReader<File>) -> Result<(), SnapshotE
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyspaceCreateOptions, OptimisticTxDatabase, SnapshotError,
-        import_snapshot_into_new_database, snapshot_database,
+        KeyspaceCreateOptions, OptimisticTxDatabase, SnapshotError, import_new_database,
+        snapshot_database,
     };
-    use crate::test_support::env_lock;
+    use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::config::load;
-    use aruna_api::server_state::ServerState;
+    use aruna_api::server::state::ServerState;
     use aruna_blob::blob::BlobHandler;
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_STATE_KEYSPACE,
         REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::claim_initial_realm_admin::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-    };
-    use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
-    use aruna_operations::s3::create_bucket::CreateBucketOperation;
-    use aruna_operations::s3::create_user_access::{
-        CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
+    use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::s3::access::create::{
+        CreateUserConfig, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
     };
-    use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use aruna_operations::s3::bucket::create::CreateBucketOperation;
+    use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_tasks::TaskHandle;
     use fjall::Readable;
     use std::collections::BTreeMap;
@@ -535,42 +534,12 @@ mod tests {
     use tokio_util::io::ReaderStream;
     use ulid::Ulid;
 
-    struct TestEnvGuard {
-        previous: Vec<(String, Option<String>)>,
-    }
-
-    impl TestEnvGuard {
-        fn set(vars: &[(&str, String)]) -> Self {
-            let previous = vars
-                .iter()
-                .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-                .collect::<Vec<_>>();
-
-            for (key, value) in vars {
-                unsafe { std::env::set_var(key, value) };
-            }
-
-            Self { previous }
-        }
-    }
-
-    impl Drop for TestEnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.previous.drain(..) {
-                match value {
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-            }
-        }
-    }
-
     #[tokio::test]
-    async fn snapshot_round_trip_preserves_database_contents() {
+    async fn snapshot_preserves_data() {
         let _guard = env_lock().lock().await;
         let temp = tempdir().unwrap();
         let source_db_path = temp.path().join("source-db");
-        let snapshot_source_db_path = temp.path().join("snapshot-source-db");
+        let snapshot_db_path = temp.path().join("snapshot-source-db");
         let snapshot_path = temp.path().join("backup.aruna");
         let restored_db_path = temp.path().join("restored-db");
         let blob_root = temp.path().join("blob-root");
@@ -617,7 +586,7 @@ mod tests {
                 BackendConfig {
                     backend_type: Backend::FileSystem,
                     bucket_prefix: config.blob_bucket_prefix.clone(),
-                    max_bucket_size: config.blob_max_bucket_size,
+                    max_bucket_size: config.blob_bucket_size,
                     multipart_bucket: config.blob_multipart_bucket.clone(),
                     root: config.blob_root.clone(),
                     service_config: std::collections::HashMap::new(),
@@ -669,7 +638,7 @@ mod tests {
             .unwrap();
 
             drive(
-                ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                ClaimInitialOperation::new(ClaimInitialInput {
                     actor: Actor {
                         node_id: config.node_id,
                         user_id: realm_admin,
@@ -697,8 +666,8 @@ mod tests {
             .unwrap();
 
             let credentials = drive(
-                CreateUserAccessOperation::new(
-                    CreateUserAccessConfig {
+                CreateUserOperation::new(
+                    CreateUserConfig {
                         user_identity: realm_admin,
                         group_id: group.0.group_id,
                         expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
@@ -710,7 +679,6 @@ mod tests {
                 context.as_ref(),
             )
             .await
-            .unwrap()
             .unwrap();
             assert!(!credentials.0.is_empty());
             assert!(!credentials.1.expose().is_empty());
@@ -732,8 +700,6 @@ mod tests {
                 context.as_ref(),
             )
             .await
-            .unwrap()
-            .expect("bucket creation returned no result")
             .unwrap();
 
             let data = b"tiny snapshot object";
@@ -763,8 +729,6 @@ mod tests {
                 context.as_ref(),
             )
             .await
-            .unwrap()
-            .expect("put object returned no result")
             .unwrap();
             assert_eq!(upload.location.blob_size, data.len() as u64);
 
@@ -778,9 +742,9 @@ mod tests {
             drop(config);
         }
 
-        copy_dir_all(&source_db_path, &snapshot_source_db_path).unwrap();
+        copy_dir_all(&source_db_path, &snapshot_db_path).unwrap();
 
-        let before = read_database_contents(&snapshot_source_db_path).unwrap();
+        let before = read_database_contents(&snapshot_db_path).unwrap();
         assert!(before.contains_key(NODE_STATE_KEYSPACE));
         assert!(before.contains_key(API_STATE_KEYSPACE));
         assert!(before.contains_key(REALM_CONFIG_KEYSPACE));
@@ -789,12 +753,11 @@ mod tests {
         assert!(before.contains_key(USER_ACCESS_KEYSPACE));
         assert!(before.contains_key(S3_BUCKET_KEYSPACE));
 
-        let snapshot_stats = snapshot_database(&snapshot_source_db_path, &snapshot_path).unwrap();
+        let snapshot_stats = snapshot_database(&snapshot_db_path, &snapshot_path).unwrap();
         assert!(snapshot_stats.keyspace_count >= 10);
         assert!(snapshot_stats.entry_count >= 10);
 
-        let import_stats =
-            import_snapshot_into_new_database(&snapshot_path, &restored_db_path).unwrap();
+        let import_stats = import_new_database(&snapshot_path, &restored_db_path).unwrap();
         assert_eq!(import_stats.keyspace_count, snapshot_stats.keyspace_count);
         assert_eq!(import_stats.entry_count, snapshot_stats.entry_count);
 

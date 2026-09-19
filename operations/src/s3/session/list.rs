@@ -1,10 +1,15 @@
+//! Lists a user's S3 sessions by scanning the owner index in batches.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{S3SessionError, decode_index};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, S3_SESSION_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::S3Session;
-use aruna_core::types::{Effects, UserId};
+use aruna_core::structs::identity::s3_session::S3Session;
+use aruna_core::types::Effects;
 use smallvec::smallvec;
 use ulid::Ulid;
 
@@ -22,7 +27,7 @@ enum ListSessionsState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListS3SessionsOperation {
+pub struct ListSessionsOperation {
     user_identity: UserId,
     access_keys: Vec<String>,
     sessions: Vec<S3Session>,
@@ -31,7 +36,7 @@ pub struct ListS3SessionsOperation {
     output: Result<Vec<S3Session>, S3SessionError>,
 }
 
-impl ListS3SessionsOperation {
+impl ListSessionsOperation {
     pub fn new(user_identity: UserId) -> Self {
         Self {
             user_identity,
@@ -73,7 +78,7 @@ impl ListS3SessionsOperation {
         };
         self.state = ListSessionsState::ScanOwners;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: SESSION_OWNER_KEYSPACE.to_string(),
             prefix: Some(self.user_identity.to_storage_key().into()),
             start,
             limit: OWNER_SCAN_BATCH,
@@ -174,7 +179,7 @@ impl ListS3SessionsOperation {
     }
 }
 
-impl Operation for ListS3SessionsOperation {
+impl Operation for ListSessionsOperation {
     type Output = Vec<S3Session>;
     type Error = S3SessionError;
 

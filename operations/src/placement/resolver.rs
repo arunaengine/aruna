@@ -1,15 +1,17 @@
-//! Placement view assembly and holder resolution over the weighted
-//! two-level rendezvous primitives in [`crate::placement::selector`].
+//! Builds the placement view and resolves bucket holders with the weighted rendezvous ranking.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashSet};
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::structs::{
-    AffinityEffect, BindingScope, CandidateMapNode, CandidatePlacementMap, ClassStrategyError,
-    DocumentClass, LabelMatch, MetadataRegistryRecord, PlacementOverride, PlacementStrategy,
-    RealmConfigDocument, RealmId,
+use aruna_core::document::DocumentTarget;
+use aruna_core::structs::identity::realm::{ClassStrategyError, RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::record::{
+    AffinityEffect, BindingScope, DocumentClass, LabelMatch, PlacementOverride, PlacementStrategy,
 };
+use aruna_core::structs::placement::transition::{CandidateMapNode, CandidatePlacementMap};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 
 use crate::placement::selector::{ROLE_LOCATION, ROLE_NODE, rank_weighted};
@@ -30,13 +32,8 @@ pub struct PlacementResolutionContext<'a> {
 }
 
 /// Assembles one [`ResolvedNode`] per configured node with a parseable id.
-///
-/// Placement fields come from the matching `placement_map` entry; unmapped
-/// nodes fall back to [`DEFAULT_LOCATION`] / [`DEFAULT_NODE_WEIGHT`] and clear
-/// status flags. Labels are the entry's `labels`, overlaid by the derived
-/// read-only kind label (which always wins). The label input is the replicated
-/// class-1 placement-map entry, never the eventually-consistent `NodeInfo`, so
-/// holder sets stay a pure function of the placement map.
+/// Placement fields come from the matching `placement_map` entry (unmapped nodes
+/// use defaults); labels come from that entry, never eventually-consistent `NodeInfo`.
 pub fn build_view(config: &RealmConfigDocument) -> PlacementView {
     PlacementView {
         nodes: config.candidate_nodes(),
@@ -52,10 +49,8 @@ pub fn view_from_map(map: &CandidatePlacementMap) -> PlacementView {
 }
 
 /// Resolves holders for `subject` in rank order (downstream retry order).
-///
 /// Available pinned nodes lead (bypassing affinity filters), then the weighted
-/// two-level walk fills up to `strategy.replica_count` from the eligible nodes;
-/// `None` takes every eligible node.
+/// two-level walk fills up to `strategy.replica_count`; `None` takes every node.
 pub fn resolve_holders(
     view: &PlacementView,
     strategy: &PlacementStrategy,
@@ -131,14 +126,11 @@ pub fn resolve_holders(
 }
 
 /// Resolves the placement strategy and any subject override for `target`.
-///
-/// Precedence: override strategy id > longest matching metadata path prefix >
-/// group binding > class binding > realm binding > `default_strategy_id`,
-/// falling back to the first configured strategy only when no configured ref
-/// applies. Returns `None` when a configured ref points at no strategy.
+/// Precedence: override > longest metadata path prefix > group > class > realm >
+/// `default_strategy_id`, then the first strategy; `None` if a ref is dangling.
 pub fn strategy_for_target<'a>(
     config: &'a RealmConfigDocument,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     context: PlacementResolutionContext<'_>,
 ) -> Option<(&'a PlacementStrategy, Option<&'a PlacementOverride>)> {
     let subject = subject_bytes(target);
@@ -169,54 +161,51 @@ pub(super) fn strategy_for_class(
 }
 
 /// Coarse document class used for class-scoped strategy bindings.
-pub fn document_class(target: &DocumentSyncTarget) -> DocumentClass {
+pub fn document_class(target: &DocumentTarget) -> DocumentClass {
     match target {
-        DocumentSyncTarget::Group { .. } | DocumentSyncTarget::GroupAuthorization { .. } => {
+        DocumentTarget::Group { .. } | DocumentTarget::GroupAuthorization { .. } => {
             DocumentClass::Group
         }
-        DocumentSyncTarget::User { .. } => DocumentClass::User,
-        DocumentSyncTarget::MetadataRegistry { .. } => DocumentClass::MetadataRegistry,
-        DocumentSyncTarget::MetadataCreateEvent { .. }
-        | DocumentSyncTarget::MetadataDocumentLifecycle { .. }
-        | DocumentSyncTarget::MetadataGraphLifecycle { .. }
-        | DocumentSyncTarget::PersistentIdMapping { .. } => DocumentClass::Metadata,
-        DocumentSyncTarget::PlacementPolicy { .. } => DocumentClass::PlacementPolicy,
-        DocumentSyncTarget::RealmAuthorization { .. }
-        | DocumentSyncTarget::RealmConfig { .. }
-        | DocumentSyncTarget::NodeUsage { .. }
-        | DocumentSyncTarget::WatchInterest { .. }
-        | DocumentSyncTarget::WatchSubscription { .. }
-        | DocumentSyncTarget::NodeInfo { .. } => DocumentClass::Admin,
+        DocumentTarget::User { .. } => DocumentClass::User,
+        DocumentTarget::MetadataRegistry { .. } => DocumentClass::MetadataRegistry,
+        DocumentTarget::MetadataCreateEvent { .. }
+        | DocumentTarget::MetadataDocumentLifecycle { .. }
+        | DocumentTarget::MetadataGraphLifecycle { .. }
+        | DocumentTarget::PersistentIdMapping { .. } => DocumentClass::Metadata,
+        DocumentTarget::PlacementPolicy { .. } => DocumentClass::PlacementPolicy,
+        DocumentTarget::RealmAuthorization { .. }
+        | DocumentTarget::RealmConfig { .. }
+        | DocumentTarget::NodeUsage { .. }
+        | DocumentTarget::WatchInterest { .. }
+        | DocumentTarget::WatchSubscription { .. }
+        | DocumentTarget::NodeInfo { .. } => DocumentClass::Admin,
     }
 }
 
 /// Canonical grouping subject: all per-document metadata variants of one
 /// document collapse to its document id; realm-shared targets fall back to
 /// their storage key.
-pub fn subject_bytes(target: &DocumentSyncTarget) -> Vec<u8> {
+pub fn subject_bytes(target: &DocumentTarget) -> Vec<u8> {
     match target {
-        DocumentSyncTarget::Group { group_id }
-        | DocumentSyncTarget::GroupAuthorization { group_id } => group_id.to_bytes().to_vec(),
-        DocumentSyncTarget::User { user_id } => user_id.to_bytes(),
-        DocumentSyncTarget::MetadataRegistry { document_id, .. }
-        | DocumentSyncTarget::MetadataCreateEvent { document_id, .. }
-        | DocumentSyncTarget::MetadataDocumentLifecycle { document_id }
-        | DocumentSyncTarget::PersistentIdMapping { document_id } => {
-            document_id.to_bytes().to_vec()
+        DocumentTarget::Group { group_id } | DocumentTarget::GroupAuthorization { group_id } => {
+            group_id.to_bytes().to_vec()
         }
-        DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => graph_iri.as_bytes().to_vec(),
+        DocumentTarget::User { user_id } => user_id.to_bytes(),
+        DocumentTarget::MetadataRegistry { document_id, .. }
+        | DocumentTarget::MetadataCreateEvent { document_id, .. }
+        | DocumentTarget::MetadataDocumentLifecycle { document_id }
+        | DocumentTarget::PersistentIdMapping { document_id } => document_id.to_bytes().to_vec(),
+        DocumentTarget::MetadataGraphLifecycle { graph_iri } => graph_iri.as_bytes().to_vec(),
         // The policy id alone; the document's holders are unrelated to the
         // subjects its selectors allow.
-        DocumentSyncTarget::PlacementPolicy { policy_id } => policy_id.to_bytes().to_vec(),
+        DocumentTarget::PlacementPolicy { policy_id } => policy_id.to_bytes().to_vec(),
         _ => target.storage_key().as_ref().to_vec(),
     }
 }
 
-/// Canonical bucket-choice subject for a Meta Resource (spec 6.3.6): the byte
-/// serialization of `(realm_id, group_id, normalized_canonical_path)`. It is
-/// known before the MetaResourceId is generated, so bucket choice never
-/// substitutes the id and becomes circular. The fixed-width `realm_id ‖ group_id`
-/// prefix keeps the trailing path unambiguous.
+/// Canonical bucket-choice subject for a Meta Resource (spec 6.3.6): bytes of
+/// `(realm_id, group_id, normalized_canonical_path)`, known before the id exists
+/// so bucket choice is never circular. Fixed-width prefix keeps paths unambiguous.
 pub fn meta_bucket_subject(realm_id: RealmId, group_id: GroupId, normalized_path: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(32 + 16 + normalized_path.len());
     bytes.extend_from_slice(realm_id.as_bytes());
@@ -329,18 +318,18 @@ fn label_matches(labels: &BTreeMap<String, String>, matcher: &LabelMatch) -> boo
         .is_some_and(|value| value == &matcher.value)
 }
 
-fn group_id_of(target: &DocumentSyncTarget) -> Option<GroupId> {
+fn group_id_of(target: &DocumentTarget) -> Option<GroupId> {
     match target {
-        DocumentSyncTarget::Group { group_id }
-        | DocumentSyncTarget::GroupAuthorization { group_id }
-        | DocumentSyncTarget::MetadataRegistry { group_id, .. } => Some(*group_id),
+        DocumentTarget::Group { group_id }
+        | DocumentTarget::GroupAuthorization { group_id }
+        | DocumentTarget::MetadataRegistry { group_id, .. } => Some(*group_id),
         _ => None,
     }
 }
 
 fn resolve_strategy<'a>(
     config: &'a RealmConfigDocument,
-    target: &DocumentSyncTarget,
+    target: &DocumentTarget,
     context: PlacementResolutionContext<'_>,
     override_: Option<&PlacementOverride>,
 ) -> Result<Option<&'a PlacementStrategy>, ()> {
@@ -360,7 +349,7 @@ fn resolve_strategy<'a>(
             .iter()
             .filter_map(|binding| match &binding.scope {
                 BindingScope::MetadataPathPrefix(prefix) => {
-                    metadata_path_prefix_match_len(&path, prefix).map(|len| (len, binding))
+                    path_prefix_match(&path, prefix).map(|len| (len, binding))
                 }
                 _ => None,
             })
@@ -397,7 +386,9 @@ fn resolve_class_strategy(
     config.class_strategy(class)
 }
 
-fn metadata_path_prefix_match_len(normalized_path: &str, prefix: &str) -> Option<usize> {
+/// Length of the normalized prefix when it equals `normalized_path` or is one of
+/// its `/`-boundary ancestors; `None` otherwise.
+pub(crate) fn path_prefix_match(normalized_path: &str, prefix: &str) -> Option<usize> {
     let prefix = MetadataRegistryRecord::normalize_document_path(prefix);
     if prefix.is_empty()
         || normalized_path == prefix
@@ -424,17 +415,16 @@ fn binding_strategy<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
-    use aruna_core::admin_document_reducer::{
-        AdminDocumentReducerState, overlay_realm_config_placement_reducer_materialization,
-    };
+    use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentTarget;
-    use aruna_core::structs::{
-        AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, KIND_LABEL_KEY, LOCATION_LABEL_KEY,
-        NodePlacementEntry, RealmId, RealmNode, RealmNodeKind, StrategyBinding,
+    use aruna_core::reducer::{AdminDocumentState, overlay_placement};
+    use aruna_core::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
+    use aruna_core::structs::placement::record::{
+        AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, NodePlacementEntry, StrategyBinding,
     };
-    use aruna_core::types::UserId;
+    use aruna_core::structs::storage::node_info::{KIND_LABEL_KEY, LOCATION_LABEL_KEY};
     use proptest::prelude::*;
     use ulid::Ulid;
 
@@ -524,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn build_view_applies_defaults_labels_and_skips_unparseable() {
+    fn build_view_filters() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let mapped = node_id(1);
         let unmapped = node_id(2);
@@ -569,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_labels_from_config_drive_affinity_filter() {
+    fn config_labels_filter() {
         // The chain ARUNA_NODE_LABELS -> onboarding -> placement-map entry ->
         // build_view -> Filter selects only labeled nodes.
         let realm_id = RealmId::from_bytes([2u8; 32]);
@@ -597,10 +587,8 @@ mod tests {
     }
 
     #[test]
-    fn location_label_is_derived() {
-        // The location label is stamped from the configured location, so a rule
-        // matches a node whose label map was never written by hand. A node with
-        // no configured location carries no label rather than an invented one.
+    fn derives_location_label() {
+        // Derive the location label only from a configured location.
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let placed = node_id(1);
         let unplaced = node_id(2);
@@ -640,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_is_deterministic_and_order_independent() {
+    fn resolve_order_independent() {
         let nodes = vec![
             resolved(1, RealmNodeKind::Server, "a", 100),
             resolved(2, RealmNodeKind::Server, "a", 300),
@@ -665,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_locations_yields_pairwise_distinct_holders() {
+    fn locations_are_distinct() {
         let mut nodes = Vec::new();
         let mut seed = 1u8;
         for location in ["a", "b", "c"] {
@@ -687,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn rejection_stability_replaces_only_full_node() {
+    fn replaces_full_node() {
         let nodes: Vec<ResolvedNode> = (1..=5)
             .map(|seed| resolved(seed, RealmNodeKind::Server, "solo", 100))
             .collect();
@@ -714,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_weight_and_user_kind_never_selected() {
+    fn excludes_ineligible_nodes() {
         let nodes = vec![
             resolved(1, RealmNodeKind::Server, "x", 0),
             resolved(2, device(), "x", 100),
@@ -726,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn multiply_permille_zero_makes_node_ineligible() {
+    fn zero_affinity_excludes() {
         let mut zeroed = resolved(1, RealmNodeKind::Server, "x", 100);
         zeroed.labels.insert("tier".to_string(), "cold".to_string());
         let keep = resolved(2, RealmNodeKind::Server, "x", 100);
@@ -741,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_rules_are_conjunctive() {
+    fn filters_are_conjunctive() {
         let mut both = resolved(1, RealmNodeKind::Server, "x", 100);
         both.labels.insert("tier".to_string(), "hot".to_string());
         both.labels.insert("region".to_string(), "eu".to_string());
@@ -770,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_nodes_contribute_zero_to_location_weight() {
+    fn filtered_nodes_zero() {
         let mut hot_a = resolved(1, RealmNodeKind::Server, "a", 100);
         hot_a.labels.insert("tier".to_string(), "hot".to_string());
         let mut hot_b = resolved(2, RealmNodeKind::Server, "b", 100);
@@ -795,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_pins_are_skipped_and_eligible_pin_counts_toward_target() {
+    fn available_pins_count() {
         let mut pinned_full = resolved(3, RealmNodeKind::Server, "c", 100);
         pinned_full.full = true;
         let mut pinned_draining = resolved(4, RealmNodeKind::Server, "d", 100);
@@ -828,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_and_excluded_node_is_not_selected() {
+    fn exclusion_overrides_pin() {
         let view = PlacementView {
             nodes: vec![
                 resolved(1, RealmNodeKind::Server, "a", 100),
@@ -849,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn everywhere_strategy_returns_all_eligible() {
+    fn everywhere_returns_eligible() {
         let mut full = resolved(4, RealmNodeKind::Server, "b", 100);
         full.full = true;
         let view = PlacementView {
@@ -872,11 +860,11 @@ mod tests {
     }
 
     #[test]
-    fn strategy_for_target_precedence() {
+    fn target_strategy_precedence() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
         let document_id = sid(3);
-        let target = DocumentSyncTarget::MetadataRegistry {
+        let target = DocumentTarget::MetadataRegistry {
             group_id,
             document_id,
         };
@@ -947,10 +935,10 @@ mod tests {
     }
 
     #[test]
-    fn strategy_for_target_dangling_configured_refs_do_not_fallback() {
+    fn dangling_refs_fail() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
-        let target = DocumentSyncTarget::MetadataRegistry {
+        let target = DocumentTarget::MetadataRegistry {
             group_id,
             document_id: sid(3),
         };
@@ -1010,13 +998,13 @@ mod tests {
     }
 
     #[test]
-    fn reducer_materialization_repairs_dangling_refs_and_keeps_resolution_nonempty() {
+    fn materialization_repairs_refs() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let live = sid(10);
         let missing = sid(99);
         let holder = node_id(1);
         let excluded = node_id(2);
-        let target = DocumentSyncTarget::RealmConfig { realm_id };
+        let target = DocumentTarget::RealmConfig { realm_id };
         let subject = subject_bytes(&target);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config.ensure_node(holder, RealmNodeKind::Server);
@@ -1029,10 +1017,9 @@ mod tests {
             excluded: vec![excluded],
             strategy_id: Some(missing),
         }];
-        let reducer_state =
-            AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        let reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
 
-        overlay_realm_config_placement_reducer_materialization(&mut config, &reducer_state, 0);
+        overlay_placement(&mut config, &reducer_state, 0);
 
         assert_eq!(config.default_strategy_id, Some(live));
         assert_eq!(config.strategy_bindings[0].strategy_id, live);
@@ -1047,10 +1034,10 @@ mod tests {
     }
 
     #[test]
-    fn metadata_path_prefix_binding_requires_path_boundary() {
+    fn prefix_requires_boundary() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
-        let target = DocumentSyncTarget::MetadataRegistry {
+        let target = DocumentTarget::MetadataRegistry {
             group_id,
             document_id: sid(3),
         };
@@ -1086,10 +1073,10 @@ mod tests {
     }
 
     #[test]
-    fn metadata_lifecycle_uses_group_and_path_from_context() {
+    fn lifecycle_uses_context() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_id = sid(2);
-        let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: sid(3),
         };
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -1127,24 +1114,24 @@ mod tests {
     }
 
     #[test]
-    fn subject_bytes_groups_document_variants() {
+    fn subjects_group_variants() {
         let document_id = sid(4);
-        let registry = DocumentSyncTarget::MetadataRegistry {
+        let registry = DocumentTarget::MetadataRegistry {
             group_id: sid(5),
             document_id,
         };
-        let create = DocumentSyncTarget::MetadataCreateEvent {
+        let create = DocumentTarget::MetadataCreateEvent {
             document_id,
             event_id: sid(6),
         };
-        let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let lifecycle = DocumentTarget::MetadataDocumentLifecycle { document_id };
 
         let expected = document_id.to_bytes().to_vec();
         assert_eq!(subject_bytes(&registry), expected);
         assert_eq!(subject_bytes(&create), expected);
         assert_eq!(subject_bytes(&lifecycle), expected);
 
-        let other = DocumentSyncTarget::MetadataDocumentLifecycle {
+        let other = DocumentTarget::MetadataDocumentLifecycle {
             document_id: sid(7),
         };
         assert_ne!(subject_bytes(&other), expected);
@@ -1156,13 +1143,13 @@ mod tests {
         // policy is placed by its id alone.
         let policy_id = sid(9);
         assert_eq!(
-            subject_bytes(&DocumentSyncTarget::PlacementPolicy { policy_id }),
+            subject_bytes(&DocumentTarget::PlacementPolicy { policy_id }),
             policy_id.to_bytes().to_vec()
         );
     }
 
     #[test]
-    fn meta_bucket_subject_vector() {
+    fn meta_subject_vector() {
         // Portable 6.3.6 vector: fixed-width realm_id ‖ group_id, then the path.
         let subject = meta_bucket_subject(
             RealmId::from_bytes([1u8; 32]),
@@ -1176,20 +1163,20 @@ mod tests {
     }
 
     #[test]
-    fn all_document_variants_share_one_shard() {
-        use aruna_core::structs::shard_for_subject;
+    fn variants_share_shard() {
+        use aruna_core::structs::placement::record::shard_for_subject;
 
         let document_id = sid(4);
         let variants = [
-            DocumentSyncTarget::MetadataRegistry {
+            DocumentTarget::MetadataRegistry {
                 group_id: sid(5),
                 document_id,
             },
-            DocumentSyncTarget::MetadataCreateEvent {
+            DocumentTarget::MetadataCreateEvent {
                 document_id,
                 event_id: sid(6),
             },
-            DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+            DocumentTarget::MetadataDocumentLifecycle { document_id },
         ];
         let expected = shard_for_subject(&subject_bytes(&variants[0]), 64);
         for target in &variants {
@@ -1198,55 +1185,55 @@ mod tests {
     }
 
     #[test]
-    fn document_class_maps_variants() {
+    fn classes_map_variants() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let user_id = UserId::local(sid(2), realm_id);
         let targets = [
             (
-                DocumentSyncTarget::Group { group_id: sid(1) },
+                DocumentTarget::Group { group_id: sid(1) },
                 DocumentClass::Group,
             ),
             (
-                DocumentSyncTarget::GroupAuthorization { group_id: sid(1) },
+                DocumentTarget::GroupAuthorization { group_id: sid(1) },
                 DocumentClass::Group,
             ),
             (
-                DocumentSyncTarget::RealmAuthorization { realm_id },
+                DocumentTarget::RealmAuthorization { realm_id },
                 DocumentClass::Admin,
             ),
             (
-                DocumentSyncTarget::RealmConfig { realm_id },
+                DocumentTarget::RealmConfig { realm_id },
                 DocumentClass::Admin,
             ),
-            (DocumentSyncTarget::User { user_id }, DocumentClass::User),
+            (DocumentTarget::User { user_id }, DocumentClass::User),
             (
-                DocumentSyncTarget::MetadataRegistry {
+                DocumentTarget::MetadataRegistry {
                     group_id: sid(1),
                     document_id: sid(2),
                 },
                 DocumentClass::MetadataRegistry,
             ),
             (
-                DocumentSyncTarget::MetadataCreateEvent {
+                DocumentTarget::MetadataCreateEvent {
                     document_id: sid(2),
                     event_id: sid(3),
                 },
                 DocumentClass::Metadata,
             ),
             (
-                DocumentSyncTarget::MetadataDocumentLifecycle {
+                DocumentTarget::MetadataDocumentLifecycle {
                     document_id: sid(2),
                 },
                 DocumentClass::Metadata,
             ),
             (
-                DocumentSyncTarget::MetadataGraphLifecycle {
+                DocumentTarget::MetadataGraphLifecycle {
                     graph_iri: "https://example.test/graph".to_string(),
                 },
                 DocumentClass::Metadata,
             ),
             (
-                DocumentSyncTarget::NodeUsage {
+                DocumentTarget::NodeUsage {
                     realm_id,
                     node_id: node_id(1),
                     group_id: Some(sid(1)),
@@ -1254,25 +1241,25 @@ mod tests {
                 DocumentClass::Admin,
             ),
             (
-                DocumentSyncTarget::WatchInterest {
+                DocumentTarget::WatchInterest {
                     realm_id,
                     node_id: node_id(1),
                 },
                 DocumentClass::Admin,
             ),
             (
-                DocumentSyncTarget::WatchSubscription {
+                DocumentTarget::WatchSubscription {
                     owner: user_id,
                     watch_id: sid(4),
                 },
                 DocumentClass::Admin,
             ),
             (
-                DocumentSyncTarget::PlacementPolicy { policy_id: sid(5) },
+                DocumentTarget::PlacementPolicy { policy_id: sid(5) },
                 DocumentClass::PlacementPolicy,
             ),
             (
-                DocumentSyncTarget::NodeInfo {
+                DocumentTarget::NodeInfo {
                     realm_id,
                     node_id: node_id(1),
                 },
@@ -1287,7 +1274,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn location_order_ignores_status_flips(
+        fn location_order_stable(
             specs in prop::collection::vec((0u8..6, 1u32..1000, any::<bool>(), any::<bool>()), 1..12),
         ) {
             let build = |flip: bool| {
@@ -1320,7 +1307,7 @@ mod tests {
         }
 
         #[test]
-        fn location_weight_sum_excludes_non_sync_eligible(
+        fn location_weight_excludes(
             specs in prop::collection::vec((0u8..4, 1u32..1000, any::<bool>()), 1..12),
         ) {
             let nodes: Vec<ResolvedNode> = specs

@@ -1,3 +1,7 @@
+# Manifest of aruna-compute, with one feature per executor backend.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 [package]
 name = "aruna-compute"
 version.workspace = true
@@ -37,7 +41,5 @@ json-patch = { workspace = true, optional = true }
 [dev-dependencies]
 http = { workspace = true }
 iroh = { workspace = true }
-serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }

@@ -1,8 +1,12 @@
+//! Defines the replication control messages and encodes them as postcard frames on a stream.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::BlobLibError;
-use crate::framing::{MAX_CONTROL_PLANE_FRAME, read_frame, write_frame};
+use crate::framing::{MAX_CONTROL_FRAME, read_frame, write_frame};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
-use aruna_core::structs::BackendLocation;
+use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_net::streams::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -14,7 +18,8 @@ pub(crate) enum MessageType {
         root: blake3::Hash,
         location: BackendLocation,
     },
-    BaoTreeInfoReceived,
+    #[serde(rename = "BaoTreeInfoReceived")]
+    BaoTreeReceived,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,12 +35,12 @@ impl ReplicationMessage {
 
     pub async fn send(self, sender: &mut SendStream) -> Result<(), BlobLibError> {
         let request_buf = postcard::to_allocvec(&self)?;
-        write_frame(sender, &request_buf, MAX_CONTROL_PLANE_FRAME).await?;
+        write_frame(sender, &request_buf, MAX_CONTROL_FRAME).await?;
         Ok(())
     }
 
     pub async fn read(receiver: &mut RecvStream) -> Result<Self, BlobEvent> {
-        let buf = read_frame(receiver, MAX_CONTROL_PLANE_FRAME)
+        let buf = read_frame(receiver, MAX_CONTROL_FRAME)
             .await
             .map_err(|err| BlobEvent::Error(BlobError::ReadError(err.to_string())))?;
         postcard::from_bytes::<ReplicationMessage>(&buf)

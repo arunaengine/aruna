@@ -1,0 +1,1296 @@
+//! Copies an object to another key, checking the source conditions and handling references.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::driver::{
+    DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
+    routing_snapshot,
+};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::purge_fence::ensure_write_allowed;
+use crate::staging::reference::{
+    MaterializeReferenceError, ReferenceWrite, write_reference_version,
+};
+use aruna_core::UserId;
+use aruna_core::id::NodeId;
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::routing::resolve_backend;
+use aruna_core::types::GroupId;
+use futures_util::StreamExt;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use thiserror::Error;
+use ulid::Ulid;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CopySourceConditions {
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
+    pub if_modified_since: Option<SystemTime>,
+    pub if_unmodified_since: Option<SystemTime>,
+}
+
+/// What a copy does with a source whose bytes sit behind a reference.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CopyReferences {
+    /// The copy is a reference of its own; no byte moves and the connector is
+    /// not contacted.
+    #[default]
+    Preserve,
+    /// The bytes are pulled and stored as a snapshot.
+    Materialize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CopyObjectInput {
+    pub source_bucket: String,
+    pub source_key: String,
+    pub source_version_id: Option<Ulid>,
+    pub source_group_id: GroupId,
+    pub source_auth_context: AuthContext,
+    pub dest_bucket: String,
+    pub dest_key: String,
+    pub user_id: UserId,
+    pub group_id: GroupId,
+    pub realm_id: RealmId,
+    pub node_id: NodeId,
+    pub quota_ceiling: Option<u64>,
+    pub conditions: CopySourceConditions,
+    pub metadata: Option<HashMap<String, String>>,
+    pub restrictions: Option<Vec<PathRestriction>>,
+    pub references: CopyReferences,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct CopyResultData {
+    /// The stored bytes; `None` for a copy that stayed a reference.
+    pub location: Option<BackendLocation>,
+    pub size: u64,
+    /// The observation a kept reference carries.
+    pub source_metadata: Option<SourceMetadata>,
+    pub version_id: Ulid,
+    pub created_at: SystemTime,
+    pub source_version_id: Option<Ulid>,
+    pub source_last_modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum CopyObjectError {
+    #[error(transparent)]
+    Get(#[from] GetObjectError),
+    #[error(transparent)]
+    Put(#[from] PutObjectError),
+    #[error(transparent)]
+    Routing(#[from] RoutingInputsError),
+    #[error(transparent)]
+    Gate(#[from] GateContextError),
+    #[error(transparent)]
+    Reference(#[from] MaterializeReferenceError),
+    #[error("At least one of the preconditions you specified did not hold.")]
+    PreconditionFailed,
+}
+
+/// A description failure reads like the read it stands in for.
+fn head_error(error: HeadObjectError) -> CopyObjectError {
+    CopyObjectError::Get(match error {
+        HeadObjectError::StorageError(error) => GetObjectError::StorageError(error),
+        HeadObjectError::ConversionError(error) => GetObjectError::ConversionError(error),
+        HeadObjectError::NoSuchKey => GetObjectError::NoSuchKey,
+        HeadObjectError::NoSuchVersion => GetObjectError::NoSuchVersion,
+        HeadObjectError::DeleteMarker => GetObjectError::DeleteMarker,
+        HeadObjectError::ResolveReferenceError(error) => {
+            GetObjectError::ResolveReferenceError(error)
+        }
+        HeadObjectError::StagingSourceError(error) => GetObjectError::StagingSourceError(error),
+        HeadObjectError::ManagedCopyError(error) => GetObjectError::ManagedCopyError(error),
+        _ => GetObjectError::GetObjectFailed,
+    })
+}
+
+fn normalize_etag(etag: &str) -> &str {
+    etag.trim_matches('"')
+}
+
+fn etag_matches(expected: &str, actual: Option<&str>, source_exists: bool) -> bool {
+    if expected == "*" {
+        return source_exists;
+    }
+    actual.is_some_and(|actual| normalize_etag(actual) == normalize_etag(expected))
+}
+
+pub(crate) fn evaluate_source_conditions(
+    conditions: &CopySourceConditions,
+    etag: Option<&str>,
+    last_modified: Option<SystemTime>,
+    source_exists: bool,
+) -> Result<(), CopyObjectError> {
+    let last_modified = last_modified.map(|last_modified| {
+        last_modified
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| UNIX_EPOCH + Duration::from_secs(duration.as_secs()))
+            .unwrap_or(last_modified)
+    });
+
+    // AWS precedence: x-amz-copy-source-if-match overrides if-unmodified-since.
+    match conditions.if_match.as_deref() {
+        Some(expected) => {
+            if !etag_matches(expected, etag, source_exists) {
+                return Err(CopyObjectError::PreconditionFailed);
+            }
+        }
+        None => {
+            if let Some(threshold) = conditions.if_unmodified_since
+                && last_modified.is_some_and(|last_modified| last_modified > threshold)
+            {
+                return Err(CopyObjectError::PreconditionFailed);
+            }
+        }
+    }
+
+    // AWS precedence: x-amz-copy-source-if-none-match overrides if-modified-since.
+    match conditions.if_none_match.as_deref() {
+        Some(expected) => {
+            if etag_matches(expected, etag, source_exists) {
+                return Err(CopyObjectError::PreconditionFailed);
+            }
+        }
+        None => {
+            if let Some(threshold) = conditions.if_modified_since
+                && last_modified.is_some_and(|last_modified| last_modified <= threshold)
+            {
+                return Err(CopyObjectError::PreconditionFailed);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn copy_object(
+    context: &DriverContext,
+    input: CopyObjectInput,
+) -> Result<CopyResultData, CopyObjectError> {
+    copy_object_tracked(context, input, None).await
+}
+
+/// `copy_object` with the bytes pulled so far published on `progress`, so a
+/// job can report a long source read while it runs.
+pub async fn copy_object_tracked(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    progress: Option<Arc<AtomicU64>>,
+) -> Result<CopyResultData, CopyObjectError> {
+    ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
+        .await
+        .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
+    // The description touches no source, so a reference can be kept without
+    // contacting its connector.
+    let head = drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: input.source_bucket.clone(),
+            key: input.source_key.clone(),
+            version_id: input.source_version_id,
+        }),
+        context,
+    )
+    .await
+    .map_err(head_error)?;
+    let source_last_modified = head
+        .version_created_at
+        .or_else(|| head.location.as_ref().map(|location| location.created_at))
+        .or_else(|| {
+            head.source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.last_modified)
+        });
+    let source_etag = head
+        .location
+        .as_ref()
+        .and_then(|location| location.hashes.get(HASH_MD5))
+        .map(hex::encode)
+        .or_else(|| {
+            head.source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.etag.clone())
+        });
+    evaluate_source_conditions(
+        &input.conditions,
+        source_etag.as_deref(),
+        source_last_modified,
+        true,
+    )?;
+    if head.location.is_none() && input.references == CopyReferences::Preserve {
+        return preserve_reference(context, input, head, source_last_modified).await;
+    }
+
+    let source = drive(
+        GetObjectOperation::new(GetObjectInput {
+            bucket: input.source_bucket,
+            key: input.source_key,
+            version_id: input.source_version_id,
+            range: None,
+            group_id: input.source_group_id,
+            user_identity: input.source_auth_context.user_id,
+            node_id: input.node_id,
+        })
+        .with_restrictions(input.source_auth_context.path_restrictions.clone()),
+        context,
+    )
+    .await?;
+
+    let source_version_id = source.version_id;
+    let materialized = source.location.is_some();
+    let content_length = source.location.as_ref().map(|location| location.blob_size);
+    let version_source = if materialized {
+        source.source_binding.clone()
+    } else {
+        source
+            .source_binding
+            .clone()
+            .map(|binding| VersionSourceBinding {
+                strategy: StagingStrategy::Snapshot,
+                ..binding
+            })
+    };
+    let metadata = input.metadata.unwrap_or(source.metadata);
+    let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
+    // Bytes the destination's backend already holds are adopted, not streamed.
+    let adopt = source.location.clone().filter(|location| {
+        resolve_backend(&routing, &input.dest_bucket, &input.dest_key)
+            .is_ok_and(|resolved| resolved.backend == location.backend)
+    });
+    let body = match (adopt.is_some(), progress) {
+        (true, _) => None,
+        (false, Some(pulled)) => Some(BackendStream(Box::pin(source.blob.inspect(move |chunk| {
+            if let Ok(bytes) = chunk {
+                pulled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
+        })))),
+        (false, None) => Some(source.blob),
+    };
+
+    let gate = gate_context(context, input.realm_id, now_ms()).await?;
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: input.user_id,
+        group_id: input.group_id,
+        realm_id: input.realm_id,
+        node_id: input.node_id,
+        request: PutObjectInput {
+            bucket: input.dest_bucket,
+            key: input.dest_key,
+            content_length,
+            body,
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source,
+        preassigned_version_id: None,
+        quota_ceiling: input.quota_ceiling,
+        routing,
+    })
+    .with_metadata(metadata)
+    .with_inherited_policies(source.source_policies.clone())
+    .with_restrictions(input.restrictions.clone());
+    if let Some(location) = adopt {
+        operation = operation.with_adopted(location);
+    }
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    let put_result = drive(operation, context).await?;
+
+    // The new version time owns copy time when dedup reuses an older location.
+    let created_at = UNIX_EPOCH + Duration::from_millis(put_result.version_id.timestamp_ms());
+
+    Ok(CopyResultData {
+        size: put_result.location.blob_size,
+        location: Some(put_result.location),
+        source_metadata: None,
+        version_id: put_result.version_id,
+        created_at,
+        source_version_id,
+        source_last_modified,
+    })
+}
+
+/// Records a reference of the source's binding at the destination, carrying
+/// the source's refs. No byte moves.
+async fn preserve_reference(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    head: HeadObjectResult,
+    source_last_modified: Option<SystemTime>,
+) -> Result<CopyResultData, CopyObjectError> {
+    let (Some(binding), Some(metadata)) = (head.source_binding, head.source_metadata) else {
+        return Err(CopyObjectError::Get(GetObjectError::GetObjectFailed));
+    };
+    let (version_id, _changed) = write_reference_version(
+        context,
+        ReferenceWrite {
+            group_id: input.group_id,
+            user_id: input.user_id,
+            realm_id: input.realm_id,
+            node_id: input.node_id,
+            bucket: input.dest_bucket,
+            key: input.dest_key,
+            expected_bucket: None,
+            version_source: VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                ..binding
+            },
+            metadata: metadata.clone(),
+            inherited_policies: head.source_policies,
+            connector_guard: None,
+        },
+    )
+    .await?;
+    Ok(CopyResultData {
+        location: None,
+        size: metadata.content_length,
+        source_metadata: Some(metadata),
+        version_id,
+        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
+        source_version_id: head.version_id,
+        source_last_modified,
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod test {
+    use super::*;
+    use crate::s3::object::get::{GetObjectOperation, MAX_AUTO_ADVANCES};
+    use crate::tests::policy::{seed_gate, subject};
+    use aruna_blob::blob::BlobHandler;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::egress::EgressPolicy;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::PortableSourceDescriptor;
+    use aruna_core::structs::storage::blob::{
+        Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
+    };
+    use aruna_net::{NetConfig, NetHandle};
+    use aruna_storage::storage;
+    use axum::{Router, routing::get};
+    use futures_util::StreamExt;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tempfile::{TempDir, tempdir};
+    use tokio::net::TcpListener;
+
+    fn test_node_id() -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[7; 32]).public()
+    }
+
+    fn auth_context(user_id: UserId) -> AuthContext {
+        AuthContext {
+            user_id,
+            realm_id: user_id.realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    pub(crate) async fn full_context() -> (TempDir, DriverContext) {
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let blob_root = format!("{temp_root}/blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+        let blob_handle = BlobHandler::with_egress(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                bucket_prefix: Some("aruna_".to_string()),
+                max_bucket_size: Some(100000),
+                multipart_bucket: Some("multipart".to_string()),
+                root: blob_root,
+                service_config: HashMap::new(),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle.clone(),
+            EgressPolicy::loopback(),
+        )
+        .await
+        .unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        (temp_handle, context)
+    }
+
+    pub(crate) async fn spawn_reference_server(
+        body: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/folder/file.txt",
+            get(
+                move || async move { ([("content-type", "text/plain"), ("etag", "etag-1")], body) },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn put_config(
+        realm_id: RealmId,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: &str,
+        key: &str,
+        data: &'static [u8],
+    ) -> PutObjectConfig {
+        PutObjectConfig {
+            user_id: UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                content_length: Some(data.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(data))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: aruna_core::structs::storage::routing::RoutingSnapshot::single(group_id),
+        }
+    }
+
+    pub(crate) async fn write_version(
+        context: &DriverContext,
+        bucket: &str,
+        key: &str,
+        version: BlobVersion,
+    ) {
+        let version_id = Ulid::generate();
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            panic!("failed to start transaction");
+        };
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new(bucket, key).to_bytes().unwrap().into(),
+                value: CurrentVersionPointer::new(version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new(bucket, key, version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: version.to_bytes().unwrap().into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+    }
+
+    async fn read_dest_version(
+        context: &DriverContext,
+        bucket: &str,
+        key: &str,
+        version_id: Ulid,
+    ) -> BlobVersion {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new(bucket, key, version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing blob version entry");
+        };
+        BlobVersion::from_bytes(value.expect("missing blob version").as_ref()).unwrap()
+    }
+
+    /// A rule that admits exactly this node, so a governed write is allowed.
+    fn admits(node_id: NodeId, seed: u8) -> aruna_core::structs::placement::policy::VerifiedPolicy {
+        let policy = aruna_core::structs::placement::policy::PlacementPolicy::new(
+            Ulid::from_bytes([seed; 16]),
+            "residency".to_string(),
+            vec![aruna_core::structs::placement::policy::PlacementSelector {
+                node_id: Some(node_id),
+                location: None,
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        aruna_core::structs::placement::policy::VerifiedPolicy::verify(policy)
+            .expect("policy verifies")
+    }
+
+    pub(crate) async fn seed_bucket(
+        context: &DriverContext,
+        bucket: &str,
+        group_id: GroupId,
+        user_id: UserId,
+        policies: Vec<aruna_core::structs::placement::policy::PlacementPolicyRef>,
+    ) {
+        let info = aruna_core::structs::storage::blob::BucketInfo {
+            group_id,
+            created_at: std::time::UNIX_EPOCH,
+            created_by: user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: policies,
+            placement_policy_generation: 1,
+        };
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                value: info.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn copy_unions_refs() {
+        // Union tightens: the copy carries both its source's and its
+        // destination's refs.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let source = admits(node_id, 1);
+        let dest = admits(node_id, 2);
+        let (source_ref, dest_ref) = (source.policy_ref(), dest.policy_ref());
+        seed_gate(
+            &context,
+            realm_id,
+            user_id,
+            subject(node_id, "eu-west"),
+            &[source.clone(), dest.clone()],
+        )
+        .await;
+        seed_bucket(&context, "source", group_id, user_id, vec![source_ref]).await;
+        seed_bucket(&context, "dest", group_id, user_id, vec![dest_ref]).await;
+        let gate = gate_context(&context, realm_id, 1_000)
+            .await
+            .expect("subject reads")
+            .expect("gate present");
+        drive(
+            PutObjectOperation::new(put_config(
+                realm_id,
+                group_id,
+                node_id,
+                "source",
+                "object.txt",
+                b"payload",
+            ))
+            .with_gate(gate),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let result = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "source".to_string(),
+                source_key: "object.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "dest".to_string(),
+                dest_key: "copy.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+        )
+        .await
+        .unwrap();
+
+        let copied = read_dest_version(&context, "dest", "copy.txt", result.version_id).await;
+        assert_eq!(copied.placement_policies, vec![source_ref, dest_ref]);
+    }
+
+    #[tokio::test]
+    async fn materialized_copy_deduplicates() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+
+        let source = drive(
+            PutObjectOperation::new(put_config(
+                realm_id,
+                group_id,
+                node_id,
+                "bucket",
+                "source.txt",
+                b"hello, world!",
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let copy_started_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let result = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "source.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+        )
+        .await
+        .unwrap();
+
+        let source_version =
+            read_dest_version(&context, "bucket", "source.txt", source.version_id).await;
+        assert_eq!(result.location, Some(source.location));
+        assert_eq!(result.source_version_id, Some(source.version_id));
+        assert_eq!(result.source_last_modified, Some(source_version.created_at));
+        // The copy dedups onto the source location, but its last-modified must
+        // come from the fresh destination version, not the source's timestamp.
+        assert_eq!(
+            result.created_at,
+            UNIX_EPOCH + Duration::from_millis(result.version_id.timestamp_ms())
+        );
+        assert!(result.version_id.timestamp_ms() >= copy_started_ms);
+
+        let dest_version =
+            read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
+        assert!(dest_version.is_materialized());
+        assert_eq!(dest_version.created_at, result.created_at);
+    }
+
+    #[tokio::test]
+    async fn reference_copy_materializes() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+
+        let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::generate()),
+        };
+        write_version(
+            &context,
+            "bucket",
+            "ref.txt",
+            BlobVersion::reference(
+                source,
+                SourceMetadata {
+                    content_length: 15,
+                    content_type: Some("text/plain".to_string()),
+                    etag: Some("etag-1".to_string()),
+                    last_modified: Some(SystemTime::UNIX_EPOCH),
+                    source_version: None,
+                },
+                SystemTime::UNIX_EPOCH,
+                UserId::local(Ulid::generate(), realm_id),
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .await;
+
+        let result = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "ref.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+        )
+        .await
+        .unwrap();
+
+        let dest_version =
+            read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
+        assert!(dest_version.is_materialized());
+        assert_eq!(
+            dest_version
+                .source_binding()
+                .map(|binding| binding.strategy.clone()),
+            Some(StagingStrategy::Snapshot)
+        );
+
+        server.abort();
+        let _ = server.await;
+
+        let mut blob = drive(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: "bucket".to_string(),
+                key: "dest.txt".to_string(),
+                version_id: None,
+                range: None,
+                group_id,
+                user_identity: UserId::local(Ulid::generate(), realm_id),
+                node_id: test_node_id(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap()
+        .blob;
+        let mut read_buffer = Vec::new();
+        while let Some(Ok(bytes)) = blob.next().await {
+            read_buffer.extend_from_slice(&bytes);
+        }
+        assert_eq!(read_buffer, b"reference-bytes");
+    }
+
+    // A copy reading a capped reference must surface the exact variant, so the
+    // caller learns that only an explicit rebind heals it.
+    #[tokio::test]
+    async fn copy_preserves_reference() {
+        // A kept reference is cloned from the source version alone: the
+        // connector is never contacted, so the source may be unreachable.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        seed_bucket(&context, "bucket", group_id, user_id, Vec::new()).await;
+        let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
+        server.abort();
+        let _ = server.await;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: None,
+        };
+        write_version(
+            &context,
+            "bucket",
+            "ref.txt",
+            BlobVersion::reference(
+                source.clone(),
+                SourceMetadata {
+                    content_length: 15,
+                    content_type: Some("text/plain".to_string()),
+                    etag: Some("etag-1".to_string()),
+                    last_modified: Some(SystemTime::UNIX_EPOCH),
+                    source_version: None,
+                },
+                SystemTime::UNIX_EPOCH,
+                user_id,
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .await;
+
+        let result = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "ref.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Preserve,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.location.is_none());
+        assert_eq!(result.size, 15);
+        assert!(result.source_version_id.is_some());
+
+        let dest_version =
+            read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
+        assert!(!dest_version.is_materialized());
+        let binding = dest_version.source_binding().expect("a reference binding");
+        assert_eq!(binding.strategy, StagingStrategy::Reference);
+        assert_eq!(binding.descriptor, source.descriptor);
+    }
+
+    #[tokio::test]
+    async fn backend_copy_adopts() {
+        // Bytes the destination's backend already holds are adopted without a
+        // stream: nothing passes the progress counter and the location is shared.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        seed_bucket(&context, "bucket", group_id, user_id, Vec::new()).await;
+        let data: &'static [u8] = b"adopt these bytes";
+        let source = drive(
+            PutObjectOperation::new(put_config(
+                realm_id, group_id, node_id, "bucket", "src.txt", data,
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let pulled = Arc::new(AtomicU64::new(0));
+        let result = copy_object_tracked(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "src.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+            Some(pulled.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pulled.load(Ordering::Relaxed), 0, "no byte streamed");
+        assert_eq!(result.location, Some(source.location.clone()));
+        assert_eq!(result.size, data.len() as u64);
+        let dest_version =
+            read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
+        assert!(dest_version.is_materialized());
+    }
+
+    #[tokio::test]
+    async fn copy_reports_exhausted() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+
+        let (endpoint, server) = spawn_reference_server(b"reference-bytes").await;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::generate()),
+        };
+        write_version(
+            &context,
+            "bucket",
+            "capped.txt",
+            BlobVersion::reference(
+                source,
+                SourceMetadata {
+                    content_length: 1,
+                    content_type: Some("text/plain".to_string()),
+                    etag: Some("stale-etag".to_string()),
+                    last_modified: Some(SystemTime::UNIX_EPOCH),
+                    source_version: None,
+                },
+                SystemTime::UNIX_EPOCH,
+                UserId::local(Ulid::generate(), realm_id),
+                SystemTime::UNIX_EPOCH,
+            )
+            .with_advance_count(MAX_AUTO_ADVANCES),
+        )
+        .await;
+
+        let error = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "capped.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            error,
+            CopyObjectError::Get(GetObjectError::ReferenceAdvanceExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_marker_errors() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+
+        let version_id = Ulid::generate();
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            panic!("failed to start transaction");
+        };
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new("bucket", "gone.txt", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: BlobVersion::deleted(
+                    SystemTime::now(),
+                    UserId::local(Ulid::generate(), realm_id),
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+
+        let error = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "gone.txt".to_string(),
+                source_version_id: Some(version_id),
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, CopyObjectError::Get(GetObjectError::DeleteMarker));
+    }
+
+    #[test]
+    fn matching_etag_required() {
+        let conditions = CopySourceConditions {
+            if_match: Some("abc".to_string()),
+            ..Default::default()
+        };
+        assert!(evaluate_source_conditions(&conditions, Some("abc"), None, true).is_ok());
+        assert!(evaluate_source_conditions(&conditions, Some("\"abc\""), None, true).is_ok());
+        assert_eq!(
+            evaluate_source_conditions(&conditions, Some("def"), None, true),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert_eq!(
+            evaluate_source_conditions(&conditions, None, None, true),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+    }
+
+    #[test]
+    fn wildcard_uses_existence() {
+        let if_match = CopySourceConditions {
+            if_match: Some("*".to_string()),
+            ..Default::default()
+        };
+        assert!(evaluate_source_conditions(&if_match, None, None, true).is_ok());
+        assert_eq!(
+            evaluate_source_conditions(&if_match, None, None, false),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+
+        let if_none_match = CopySourceConditions {
+            if_none_match: Some("*".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_source_conditions(&if_none_match, None, None, true),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert!(evaluate_source_conditions(&if_none_match, None, None, false).is_ok());
+    }
+
+    #[test]
+    fn matching_etag_rejected() {
+        let conditions = CopySourceConditions {
+            if_none_match: Some("abc".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_source_conditions(&conditions, Some("abc"), None, true),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert!(evaluate_source_conditions(&conditions, Some("def"), None, true).is_ok());
+    }
+
+    #[test]
+    fn checks_unmodified_precision() {
+        let threshold = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let conditions = CopySourceConditions {
+            if_unmodified_since: Some(threshold),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_source_conditions(
+                &conditions,
+                None,
+                Some(threshold + Duration::from_secs(1)),
+                true,
+            ),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert!(evaluate_source_conditions(&conditions, None, Some(threshold), true).is_ok());
+        assert!(
+            evaluate_source_conditions(
+                &conditions,
+                None,
+                Some(threshold + Duration::from_millis(500)),
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn checks_modified_precision() {
+        let threshold = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let conditions = CopySourceConditions {
+            if_modified_since: Some(threshold),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_source_conditions(&conditions, None, Some(threshold), true),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert_eq!(
+            evaluate_source_conditions(
+                &conditions,
+                None,
+                Some(threshold + Duration::from_millis(500)),
+                true,
+            ),
+            Err(CopyObjectError::PreconditionFailed)
+        );
+        assert!(
+            evaluate_source_conditions(
+                &conditions,
+                None,
+                Some(threshold + Duration::from_secs(1)),
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn precondition_preserves_versions() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+
+        drive(
+            PutObjectOperation::new(put_config(
+                realm_id,
+                group_id,
+                node_id,
+                "bucket",
+                "source.txt",
+                b"payload",
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let error = copy_object(
+            &context,
+            CopyObjectInput {
+                source_bucket: "bucket".to_string(),
+                source_key: "source.txt".to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: auth_context(user_id),
+                dest_bucket: "bucket".to_string(),
+                dest_key: "dest.txt".to_string(),
+                user_id,
+                group_id,
+                realm_id,
+                node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions {
+                    if_none_match: Some("*".to_string()),
+                    ..Default::default()
+                },
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, CopyObjectError::PreconditionFailed);
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new("bucket", "dest.txt")
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage read result");
+        };
+        assert!(value.is_none());
+    }
+}

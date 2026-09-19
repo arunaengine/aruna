@@ -1,19 +1,26 @@
+//! Lists draft files an anonymous reader could not fetch once the document is public.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeSet;
 
+use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::{AuthContext, Permission, RealmId, blob_object_permission_path};
-use aruna_core::types::{GroupId, NodeId};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::types::GroupId;
 use serde_json::Value as JsonValue;
 
-use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use crate::blob_holders::GetBlobHoldersOperation;
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::blob::holders::GetHoldersOperation;
+use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{DriverContext, drive, drive_until};
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::export::{EntityIdentity, entity_identity};
-use crate::replication::location_summary::LocationSummaryOperation;
+use crate::realm::get_config::GetConfigOperation;
+use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::LocationSummaryRequest;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 
 const FILE_TYPES: [&str; 4] = [
     "File",
@@ -57,9 +64,8 @@ struct ResolvedPaths {
 }
 
 /// Lists the draft's Aruna data entities that anonymous READ would not reach,
-/// so a dataset about to be published as public can warn about them. Resolution
-/// only follows paths the caller may read; nothing about a foreign object other
-/// than "not publicly readable" is disclosed.
+/// so a public publish can warn about them. Only paths the caller may read are
+/// resolved; nothing beyond "not publicly readable" about a foreign object leaks.
 pub async fn restricted_files(
     context: &DriverContext,
     realm_id: RealmId,
@@ -71,7 +77,7 @@ pub async fn restricted_files(
     let files = draft_files(rocrate);
     let mut complete = files.len() <= MAX_DRAFT_FILES;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let remote_possible = drive(GetRealmConfigOperation::new(realm_id), context)
+    let remote_possible = drive(GetConfigOperation::new(realm_id), context)
         .await
         .map_or(true, |config| {
             !config.has_node(node_id)
@@ -130,7 +136,7 @@ pub async fn restricted_files(
         }
         if remote_possible && let Some(hash) = identity.hash {
             checked &= matches!(
-                drive_until(GetBlobHoldersOperation::new(hash, realm_id, node_id), context, deadline).await,
+                drive_until(GetHoldersOperation::new(hash, realm_id, node_id), context, deadline).await,
                 Ok(holders) if holders.is_empty()
             );
         }
@@ -192,13 +198,8 @@ async fn entity_paths(
                 && summary.summary.blob_size.is_some()
                 && let Some(group_id) = summary.summary.group_id
             {
-                let path = blob_object_permission_path(
-                    realm_id,
-                    group_id,
-                    node_id,
-                    &exact.bucket,
-                    &exact.key,
-                );
+                let path =
+                    object_permission_path(realm_id, group_id, node_id, &exact.bucket, &exact.key);
                 seen.insert(path.clone());
                 paths.push(ObjectPath {
                     group_id,
@@ -226,7 +227,7 @@ async fn entity_paths(
     let Some(hash) = hash else {
         return Ok(ResolvedPaths { paths, complete });
     };
-    let aliases = drive(ResolveBlobPermissionPathsOperation::new(hash), context)
+    let aliases = drive(ResolvePathsOperation::new(hash), context)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     for alias in aliases.iter().filter(|alias| alias.realm_id == realm_id) {
@@ -330,13 +331,16 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        AUTH_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::structs::{
-        ARUNA_DATA_PREFIX, Actor, BucketInfo, Group, GroupAuthorizationDocument, HashPathIndexKey,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind, Role,
+    use aruna_core::structs::identity::auth::{Actor, Role};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
     };
+    use aruna_core::structs::storage::blob::{BucketInfo, HashIndex};
+    use aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
@@ -355,7 +359,7 @@ mod tests {
     }
 
     async fn fixture(anonymous_read: bool) -> Fixture {
-        let staging = crate::staging::test_utils::setup_driver_context().await;
+        let staging = crate::tests::staging::setup_driver_context().await;
         let context = staging.driver_context;
         let realm_id = RealmId::from_bytes([61; 32]);
         let owner = UserId::local(Ulid::from_bytes([62; 16]), realm_id);
@@ -370,7 +374,7 @@ mod tests {
         };
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.ensure_node(node_id, RealmNodeKind::Server);
-        let mut realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let mut realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
         if anonymous_read {
             let role_id = Ulid::from_bytes([67; 16]);
             realm_auth.roles.insert(
@@ -386,8 +390,7 @@ mod tests {
                 },
             );
         }
-        let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(owner, realm_id, group_id);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
         let group = Group {
             display_name: "preview".to_string(),
             group_id,
@@ -404,8 +407,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
         };
-        let alias =
-            HashPathIndexKey::new(hash, version_id, realm_id, group_id, node_id, BUCKET, KEY);
+        let alias = HashIndex::new(hash, version_id, realm_id, group_id, node_id, BUCKET, KEY);
         let writes = vec![
             (
                 REALM_CONFIG_KEYSPACE.to_string(),
@@ -433,7 +435,7 @@ mod tests {
                 bucket.to_bytes().unwrap().into(),
             ),
             (
-                HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                PATHS_INDEX_KEYSPACE.to_string(),
                 alias.to_bytes().unwrap().into(),
                 Vec::new().into(),
             ),
@@ -459,7 +461,7 @@ mod tests {
                 session: None,
             },
             hash,
-            permission_path: blob_object_permission_path(realm_id, group_id, node_id, BUCKET, KEY),
+            permission_path: object_permission_path(realm_id, group_id, node_id, BUCKET, KEY),
             _tempdir: staging._tempdir,
         }
     }
@@ -563,7 +565,7 @@ mod tests {
     }
 
     async fn add_alias(fixture: &Fixture, group_id: GroupId, key: &str) {
-        let alias = HashPathIndexKey::new(
+        let alias = HashIndex::new(
             fixture.hash,
             Ulid::generate(),
             fixture.realm_id,
@@ -576,7 +578,7 @@ mod tests {
             .context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
+                key_space: PATHS_INDEX_KEYSPACE.to_string(),
                 key: alias.to_bytes().unwrap().into(),
                 value: Vec::<u8>::new().into(),
                 txn_id: None,
@@ -680,7 +682,7 @@ mod tests {
     async fn marks_remote_exact() {
         let fixture = fixture(true).await;
         let remote = iroh::SecretKey::from_bytes(&[99; 32]).public();
-        let exact = aruna_core::structs::VersionedObjectArn::new(
+        let exact = aruna_core::structs::storage::replication::VersionedObjectArn::new(
             fixture.realm_id,
             remote,
             BUCKET.to_string(),
@@ -706,10 +708,11 @@ mod tests {
     async fn checks_anonymous_first() {
         let fixture = fixture(true).await;
         let mut caller = fixture.owner.clone();
-        caller.path_restrictions = Some(vec![aruna_core::structs::PathRestriction {
-            pattern: format!("/{}/g/*/meta/**", fixture.realm_id),
-            permission: Permission::READ,
-        }]);
+        caller.path_restrictions =
+            Some(vec![aruna_core::structs::identity::auth::PathRestriction {
+                pattern: format!("/{}/g/*/meta/**", fixture.realm_id),
+                permission: Permission::READ,
+            }]);
         let preview = restricted_files(
             &fixture.context,
             fixture.realm_id,
@@ -744,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn marks_missing_version() {
         let fixture = fixture(false).await;
-        let exact = aruna_core::structs::VersionedObjectArn::new(
+        let exact = aruna_core::structs::storage::replication::VersionedObjectArn::new(
             fixture.realm_id,
             fixture.node_id,
             BUCKET,

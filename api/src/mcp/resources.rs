@@ -1,3 +1,7 @@
+//! Serves the MCP resources: the metadata documentation pages and Profile documents by URI.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::metadata::{IdInput, load_raw, request_bearer};
 use super::{McpServer, request_auth};
 use rmcp::model::{

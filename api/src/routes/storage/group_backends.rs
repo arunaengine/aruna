@@ -1,0 +1,800 @@
+//! Serves the group routes that manage tenant write backends and their cleanup policy.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::auth::{parse_group_id, require_realm_auth};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::storage::routing::ensure_group_admin;
+use crate::server::state::ServerState;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::structs::storage::cleanup::CleanupStrategy;
+use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+use aruna_operations::blob::reclaim::backend_status;
+use aruna_operations::driver::drive;
+use aruna_operations::groups::backends::create::{
+    CreateBackendError, CreateBackendInput, CreateBackendOperation,
+};
+use aruna_operations::groups::backends::disable::{SetDisabledError, SetDisabledOperation};
+use aruna_operations::groups::backends::query::{GetBackendOperation, ListBackendsOperation};
+use aruna_operations::groups::backends::replace::ReplaceBackendOperation;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::{Extension, Json};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use ulid::Ulid;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+#[derive(OpenApi)]
+#[openapi(
+    tags((
+        name = "data/storage",
+        description = "Tenant-registered write backends on a group's own object storage"
+    ))
+)]
+pub struct GroupBackendsDoc;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(GroupBackendsDoc::openapi())
+        .routes(routes!(create_group_backend, list_group_backends))
+        .routes(routes!(
+            get_group_backend,
+            replace_group_backend,
+            delete_group_backend
+        ))
+        .routes(routes!(enable_group_backend))
+        .routes(routes!(backend_reclaim_status))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[schema(as = CreateGroupBackendRequest)]
+pub struct CreateBackendRequest {
+    pub name: String,
+    /// One of `s3`, `gcs`, `azblob`, `azdls`, `b2`.
+    pub kind: String,
+    #[serde(default)]
+    pub public_config: HashMap<String, String>,
+    /// Credentials. Stored separately and never returned.
+    #[serde(default)]
+    pub secret_config: HashMap<String, String>,
+    /// Omitted means `retain`: tenant storage is never reclaimed by default.
+    #[serde(default)]
+    pub cleanup: Option<CleanupPolicy>,
+}
+
+/// Wire form of the cleanup strategy. Durations cross the API as seconds so no
+/// client has to parse a duration syntax.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct CleanupPolicy {
+    /// `retain` or `reclaim`.
+    pub mode: String,
+    /// Grace before an unreferenced copy is deleted. Reclaim only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_secs: Option<u64>,
+}
+
+impl CleanupPolicy {
+    fn resolve(policy: Option<Self>) -> ServerResult<CleanupStrategy> {
+        let Some(policy) = policy else {
+            return Ok(CleanupStrategy::Retain);
+        };
+        match (policy.mode.as_str(), policy.after_secs) {
+            ("retain", None) => Ok(CleanupStrategy::Retain),
+            ("reclaim", None) => Ok(CleanupStrategy::Reclaim {
+                after: CleanupStrategy::DEFAULT_RECLAIM_AFTER,
+            }),
+            ("reclaim", Some(after)) if after > 0 => Ok(CleanupStrategy::Reclaim {
+                after: Duration::from_secs(after),
+            }),
+            _ => Err(ServerError::BadRequestMessage(
+                "cleanup must be `retain`, or `reclaim` with a positive after_secs".to_string(),
+            )),
+        }
+    }
+}
+
+impl From<CleanupStrategy> for CleanupPolicy {
+    fn from(value: CleanupStrategy) -> Self {
+        match value {
+            CleanupStrategy::Retain => Self {
+                mode: "retain".to_string(),
+                after_secs: None,
+            },
+            CleanupStrategy::Reclaim { after } => Self {
+                mode: "reclaim".to_string(),
+                after_secs: Some(after.as_secs()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct GroupBackendResponse {
+    pub backend_id: String,
+    pub group_id: String,
+    pub name: String,
+    pub kind: String,
+    pub public_config: HashMap<String, String>,
+    /// Writes are refused while this is set; reads keep working.
+    pub disabled: bool,
+    pub cleanup: CleanupPolicy,
+}
+
+/// Reclaim queue depth for one backend, computed from the queues on each call.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ReclaimStatusResponse {
+    pub pending_candidates: usize,
+    /// Physical deletes still owed to this backend. The drain runs on its own
+    /// timer, so a non-zero count is normal; reclaim is blocked when
+    /// `oldest_enqueued_at` stops moving forward.
+    pub queued_cleanups: usize,
+    /// When the oldest item in either queue was enqueued, so a stalled physical
+    /// delete still dates itself once its candidate row is gone.
+    pub oldest_enqueued_at: Option<String>,
+    /// A scan hit its cap, so the counts are lower bounds.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[schema(as = ListGroupBackendsResponse)]
+pub struct ListBackendsResponse {
+    pub backends: Vec<GroupBackendResponse>,
+}
+
+impl From<GroupStorage> for GroupBackendResponse {
+    fn from(value: GroupStorage) -> Self {
+        Self {
+            backend_id: value.backend_id.to_string(),
+            group_id: value.group_id.to_string(),
+            name: value.name,
+            kind: value.kind.to_string(),
+            public_config: value.public_config,
+            disabled: value.disabled,
+            cleanup: value.cleanup.into(),
+        }
+    }
+}
+
+fn map_create_error(error: CreateBackendError) -> ServerError {
+    match error {
+        CreateBackendError::NotFound => ServerError::NotFound,
+        CreateBackendError::Invalid(error) => ServerError::BadRequestMessage(error.to_string()),
+        CreateBackendError::Unreachable(error) => ServerError::BadRequestMessage(error.to_string()),
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+async fn admin_of_group(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    group_id: &str,
+) -> ServerResult<(Ulid, AuthContext)> {
+    let auth = require_realm_auth(state, auth)?;
+    let group_id = parse_group_id(group_id)?;
+    ensure_group_admin(state, &auth, group_id).await?;
+    Ok((group_id, auth))
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/groups/{group_id}/storage/backends",
+    tag = "data/storage",
+    summary = "Register a storage backend for a group",
+    description = r#"Registers a write backend on the group's own object storage after proving its credentials.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path. A backend receives the
+group's data, so the group write rights that suffice for objects are not enough.
+
+**Behavior**
+- Registration probes the endpoint first, writing a sentinel object and deleting it again, so the
+  credentials need delete rights as well as write rights; a failed probe registers nothing.
+- `secret_config` is write-only: credentials are stored apart from the record, are never returned,
+  and no field reports whether they are set.
+- `cleanup` defaults to `retain`, which never deletes from tenant storage.
+- The backend is registered enabled, and the record is node-local: it stays on the node that served
+  the request instead of replicating to the realm.
+
+**Limits**
+- `kind` is one of `s3`, `gcs`, `azblob`, `azdls` and `b2`, matched case-insensitively.
+- Config keys are a closed allowlist per kind, are lowercased before matching, and may not be given
+  twice.
+- `s3` needs `endpoint` and `bucket` plus the secrets `access_key_id` and `secret_access_key`, and
+  also accepts `region`, `root` and `force_path_style`.
+- `gcs` needs `bucket` plus the secret `credential`, and also accepts `root` and `endpoint`.
+- `azblob` needs `endpoint`, `container` and `account_name`; `azdls` needs `endpoint`, `filesystem`
+  and `account_name`; both accept `root` and take either `account_key` or `sas_token`.
+- `b2` needs `bucket` and `bucket_id` plus the secrets `application_key_id` and `application_key`.
+- An endpoint must be an `https` URL and `root` a relative path that stays below itself."#,
+    params(("group_id" = String, Path, description = "Group that will own the backend, as a 26-character ULID")),
+    request_body(
+        content = CreateBackendRequest,
+        description = "Backend name, kind, the public configuration for that kind, the write-only credentials and an optional cleanup policy",
+        example = json!({
+            "name": "institute-archive",
+            "kind": "s3",
+            "public_config": {
+                "endpoint": "https://s3.example.test",
+                "bucket": "institute-archive",
+                "region": "eu-central-1",
+                "root": "aruna/"
+            },
+            "secret_config": {
+                "access_key_id": "EXAMPLE-KEY-ID-PLACEHOLDER",
+                "secret_access_key": "EXAMPLE-SECRET-PLACEHOLDER"
+            },
+            "cleanup": {
+                "mode": "reclaim",
+                "after_secs": 86400
+            }
+        })
+    ),
+    responses(
+        (
+            status = 201,
+            description = "Backend registered and proved writable; credentials excluded",
+            body = GroupBackendResponse,
+            example = json!({
+                "backend_id": "01JBCKND0123456789ABCDEFGH",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "name": "institute-archive",
+                "kind": "s3",
+                "public_config": {
+                    "endpoint": "https://s3.example.test",
+                    "bucket": "institute-archive",
+                    "region": "eu-central-1",
+                    "root": "aruna/"
+                },
+                "disabled": false,
+                "cleanup": {
+                    "mode": "reclaim",
+                    "after_secs": 86400
+                }
+            })
+        ),
+        (
+            status = 400,
+            description = "Invalid group id, unknown kind, rejected configuration or cleanup policy, or a failed probe, including when the store was merely unreachable",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_group_backend(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    Json(request): Json<CreateBackendRequest>,
+) -> ServerResult<(StatusCode, Json<GroupBackendResponse>)> {
+    let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
+    let kind = GroupBackendKind::from_str(&request.kind)
+        .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
+    let cleanup = CleanupPolicy::resolve(request.cleanup)?;
+
+    let record = drive(
+        CreateBackendOperation::new(CreateBackendInput {
+            group_id,
+            created_by: auth.user_id,
+            name: request.name,
+            kind,
+            public_config: request.public_config,
+            secret_config: request.secret_config,
+            cleanup,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
+
+    Ok((StatusCode::CREATED, Json(record.into())))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/storage/backends",
+    tag = "data/storage",
+    summary = "List a group's storage backends",
+    description = r#"Lists every storage backend the group has registered on this node.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path, the same group
+administrator right that registration takes.
+
+**Behavior**
+- Disabled backends are listed too, ordered by backend id and therefore by registration time, in a
+  single response without paging or a cursor.
+- Credentials are never included and no field states whether any are stored.
+- This is the node's own view: a backend registered against another node of the realm is not listed
+  here."#,
+    params(("group_id" = String, Path, description = "Group whose backends are listed, as a 26-character ULID")),
+    responses(
+        (
+            status = 200,
+            description = "Every backend the group has registered on this node, enabled and disabled alike, credentials excluded",
+            body = ListBackendsResponse,
+            example = json!({
+                "backends": [
+                    {
+                        "backend_id": "01JBCKND0123456789ABCDEFGH",
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "name": "institute-archive",
+                        "kind": "s3",
+                        "public_config": {
+                            "endpoint": "https://s3.example.test",
+                            "bucket": "institute-archive",
+                            "root": "aruna/"
+                        },
+                        "disabled": false,
+                        "cleanup": {
+                            "mode": "retain"
+                        }
+                    }
+                ]
+            })
+        ),
+        (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_group_backends(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+) -> ServerResult<Json<ListBackendsResponse>> {
+    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+
+    let backends = drive(ListBackendsOperation::new(group_id), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+
+    Ok(Json(ListBackendsResponse {
+        backends: backends.into_iter().map(Into::into).collect(),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}",
+    tag = "data/storage",
+    summary = "Read one registered storage backend",
+    description = r#"Returns one storage backend registration as stored on this node.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path.
+
+**Behavior**
+- The credentials are never returned and no field reports whether they are set."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the backend, as a 26-character ULID"),
+        ("backend_id" = String, Path, description = "Backend to read, as a 26-character ULID")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The stored backend registration, credentials excluded",
+            body = GroupBackendResponse,
+            example = json!({
+                "backend_id": "01JBCKND0123456789ABCDEFGH",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "name": "institute-archive",
+                "kind": "s3",
+                "public_config": {
+                    "endpoint": "https://s3.example.test",
+                    "bucket": "institute-archive",
+                    "region": "eu-central-1",
+                    "root": "aruna/"
+                },
+                "disabled": false,
+                "cleanup": {"mode": "reclaim", "after_secs": 86400}
+            })
+        ),
+        (
+            status = 400,
+            description = "The group id or the backend id is not a ULID",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No backend with that id belongs to this group on this node; a backend owned by another group reads as not found rather than forbidden",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_group_backend(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, backend_id)): Path<(String, String)>,
+) -> ServerResult<Json<GroupBackendResponse>> {
+    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+    let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
+
+    let record = drive(GetBackendOperation::new(backend_id), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .filter(|record| record.group_id == group_id)
+        .ok_or(ServerError::NotFound)?;
+
+    Ok(Json(record.into()))
+}
+
+#[utoipa::path(
+    put,
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}",
+    tag = "data/storage",
+    summary = "Replace a storage backend registration",
+    description = r#"Replaces a backend record whole, credentials included, after proving the new credentials.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path.
+
+**Behavior**
+- Every field must be sent again, credentials included: nothing is carried over from the stored
+  record, and an omitted `cleanup` falls back to `retain` instead of keeping the stored policy.
+- The `disabled` flag is preserved, and a disabled backend still accepts the call, so a leaked
+  credential can be rotated without opening the backend for writes first.
+- The new credentials are proved with the same sentinel probe as registration, and a failed probe
+  leaves the stored record untouched.
+
+**Limits**
+- The kind and the keys that name the store, `endpoint`, `bucket`, `container`, `filesystem`,
+  `account_name`, `bucket_id` and `root` as they apply to the kind, must be repeated exactly as
+  registered: stored copies record only the path below `root`, so a change would silently redirect
+  them. Register a second backend to move data."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the backend, as a 26-character ULID"),
+        ("backend_id" = String, Path, description = "Backend to replace, as a 26-character ULID")
+    ),
+    request_body(
+        content = CreateBackendRequest,
+        description = "The complete new definition. The kind and the store-naming keys must match the registered ones, and an omitted `cleanup` resets the policy to `retain`.",
+        example = json!({
+            "name": "institute-archive",
+            "kind": "s3",
+            "public_config": {
+                "endpoint": "https://s3.example.test",
+                "bucket": "institute-archive",
+                "region": "eu-central-1",
+                "root": "aruna/"
+            },
+            "secret_config": {
+                "access_key_id": "EXAMPLE-ROTATED-KEY-ID-PLACEHOLDER",
+                "secret_access_key": "EXAMPLE-ROTATED-SECRET-PLACEHOLDER"
+            },
+            "cleanup": {
+                "mode": "retain"
+            }
+        })
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The backend as stored after the replacement, credentials excluded",
+            body = GroupBackendResponse,
+            example = json!({
+                "backend_id": "01JBCKND0123456789ABCDEFGH",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "name": "institute-archive",
+                "kind": "s3",
+                "public_config": {
+                    "endpoint": "https://s3.example.test",
+                    "bucket": "institute-archive",
+                    "region": "eu-central-1",
+                    "root": "aruna/"
+                },
+                "disabled": false,
+                "cleanup": {
+                    "mode": "retain"
+                }
+            })
+        ),
+        (
+            status = 400,
+            description = "An id is not a ULID, the configuration or cleanup policy failed validation, the request would move the backend to another store, or the probe failed, including when the store was merely unreachable",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No backend with that id belongs to this group on this node",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn replace_group_backend(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, backend_id)): Path<(String, String)>,
+    Json(request): Json<CreateBackendRequest>,
+) -> ServerResult<Json<GroupBackendResponse>> {
+    let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
+    let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
+    let kind = GroupBackendKind::from_str(&request.kind)
+        .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
+    let cleanup = CleanupPolicy::resolve(request.cleanup)?;
+
+    let record = drive(
+        ReplaceBackendOperation::new(
+            backend_id,
+            CreateBackendInput {
+                group_id,
+                created_by: auth.user_id,
+                name: request.name,
+                kind,
+                public_config: request.public_config,
+                secret_config: request.secret_config,
+                cleanup,
+            },
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
+
+    Ok(Json(record.into()))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}",
+    tag = "data/storage",
+    summary = "Disable a group's storage backend",
+    description = r#"Marks a group's storage backend disabled for new writes.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path.
+
+**Behavior**
+- Despite the method this deletes neither the data nor the registration: it marks the backend
+  disabled, and that is all a 204 promises.
+- Write routing no longer chooses the backend, and a writer that resolved it just before the call
+  is fenced by the same record and loses its commit rather than landing bytes afterwards.
+- Reads of the copies already on the backend keep working, and the record stays listed with
+  `disabled` set.
+- Disabling an already disabled backend commits nothing and answers 204 again.
+- Under `retain` the copies and the registration stay indefinitely. Under `reclaim` unreferenced
+  copies are deleted once their grace has passed, and once nothing holds the backend any more a
+  background sweep deletes the record together with its credentials.
+- Until that sweep runs the backend can be enabled again, and its progress can be followed through
+  the reclaim status of the same backend."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the backend, as a 26-character ULID"),
+        ("backend_id" = String, Path, description = "Backend to disable, as a 26-character ULID")
+    ),
+    responses(
+        (
+            status = 204,
+            description = "The backend is disabled for new writes; nothing was deleted"
+        ),
+        (
+            status = 400,
+            description = "The group id or the backend id is not a ULID",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No backend with that id belongs to this group on this node, including one already drained and removed by the sweep",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_group_backend(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, backend_id)): Path<(String, String)>,
+) -> ServerResult<StatusCode> {
+    set_disabled(&state, auth, &group_id, &backend_id, true).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}/enable",
+    tag = "data/storage",
+    summary = "Re-enable a disabled storage backend",
+    description = r#"Clears a backend's `disabled` flag so write routing may choose it again.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path.
+
+**Behavior**
+- Nothing is contacted: unlike registration and replacement this does not probe the endpoint, so a
+  backend whose credentials expired while it was disabled enables successfully and only fails at
+  the next write; replace it to rotate them.
+- Enabling an already enabled backend commits nothing and returns the stored record unchanged.
+- A 200 says the flag is cleared on this node, not that a copy already reclaimed under a `reclaim`
+  policy has come back."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the backend, as a 26-character ULID"),
+        ("backend_id" = String, Path, description = "Backend to enable, as a 26-character ULID")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The backend as stored with `disabled` cleared; credentials excluded",
+            body = GroupBackendResponse,
+            example = json!({
+                "backend_id": "01JBCKND0123456789ABCDEFGH",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "name": "institute-archive",
+                "kind": "s3",
+                "public_config": {
+                    "endpoint": "https://s3.example.test",
+                    "bucket": "institute-archive",
+                    "root": "aruna/"
+                },
+                "disabled": false,
+                "cleanup": {
+                    "mode": "retain"
+                }
+            })
+        ),
+        (
+            status = 400,
+            description = "The group id or the backend id is not a ULID",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No backend with that id belongs to this group on this node, including one already drained and removed by the sweep",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn enable_group_backend(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, backend_id)): Path<(String, String)>,
+) -> ServerResult<Json<GroupBackendResponse>> {
+    let record = set_disabled(&state, auth, &group_id, &backend_id, false).await?;
+
+    Ok(Json(record.into()))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/storage/backends/{backend_id}/reclaim/status",
+    tag = "data/storage",
+    summary = "Read a backend's pending reclaim work",
+    description = r#"Counts the reclaim and cleanup work this node still owes one storage backend.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path.
+
+**Behavior**
+- The counts are read from the queues of the node serving the request, at the moment of the call,
+  and describe that node only. `oldest_enqueued_at` is an RFC 3339 timestamp.
+- Both sweeps run on their own timers, so non-zero counts are normal and mean work is pending
+  rather than stuck; reclaim is blocked only when `oldest_enqueued_at` stops moving forward across
+  calls.
+- Candidates are queued whatever the cleanup policy says, so a backend on `retain` can report
+  pending candidates that the sweep then drops without deleting anything.
+
+**Limits**
+- A scan stops at ten thousand candidates or one thousand cleanup rows, after which `truncated`
+  reports both counts as lower bounds."#,
+    params(
+        ("group_id" = String, Path, description = "Group that owns the backend, as a 26-character ULID"),
+        ("backend_id" = String, Path, description = "Backend whose reclaim queues are counted, as a 26-character ULID")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "A point-in-time count of this node's reclaim and cleanup queues for the backend",
+            body = ReclaimStatusResponse,
+            example = json!({
+                "pending_candidates": 3,
+                "queued_cleanups": 1,
+                "oldest_enqueued_at": "2026-04-09T14:23:11.123456789+00:00",
+                "truncated": false
+            })
+        ),
+        (
+            status = 400,
+            description = "The group id or the backend id is not a ULID",
+            body = ErrorResponse
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
+            body = ErrorResponse
+        ),
+        (
+            status = 404,
+            description = "No backend with that id belongs to this group on this node",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn backend_reclaim_status(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, backend_id)): Path<(String, String)>,
+) -> ServerResult<Json<ReclaimStatusResponse>> {
+    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+    let backend_id = Ulid::from_str(&backend_id).map_err(|_| ServerError::BadRequest)?;
+    let context = state.get_ctx();
+
+    drive(GetBackendOperation::new(backend_id), &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .filter(|record| record.group_id == group_id)
+        .ok_or(ServerError::NotFound)?;
+    let status = backend_status(&context, &BackendRef::Group(backend_id))
+        .await
+        .map_err(ServerError::InternalError)?;
+
+    Ok(Json(ReclaimStatusResponse {
+        pending_candidates: status.pending_candidates,
+        queued_cleanups: status.queued_cleanups,
+        oldest_enqueued_at: status
+            .oldest_enqueued_at
+            .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()),
+        truncated: status.truncated,
+    }))
+}
+
+async fn set_disabled(
+    state: &Arc<ServerState>,
+    auth: Option<AuthContext>,
+    group_id: &str,
+    backend_id: &str,
+    disabled: bool,
+) -> ServerResult<GroupStorage> {
+    let (group_id, _) = admin_of_group(state, auth, group_id).await?;
+    let backend_id = Ulid::from_str(backend_id).map_err(|_| ServerError::BadRequest)?;
+
+    drive(
+        SetDisabledOperation::new(group_id, backend_id, disabled),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        SetDisabledError::NotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })
+}
+
+#[cfg(test)]
+#[path = "group_backends_tests.rs"]
+mod tests;

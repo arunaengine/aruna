@@ -1,4 +1,6 @@
-//! What this device still owes its realm node, and what it still has to fetch.
+//! Serves the uploads this device still owes and the downloads it has yet to fetch.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,8 +11,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerResult};
-use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, EntryState, SyncedFolder};
+use crate::server::state::ServerState;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::{EntryState, SyncedFolder};
 use aruna_operations::device::sync::folders::{
     list_entries, list_folders, list_transfers as read_uploads,
 };
@@ -18,7 +21,7 @@ use ulid::Ulid;
 
 use super::dto::{DeviceTransfer, DeviceTransferList, download_view, transfer_view};
 use super::folders::map_folder_error;
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(list_device_transfers))

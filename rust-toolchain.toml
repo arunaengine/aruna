@@ -1,3 +1,7 @@
+# Pins the stable Rust toolchain that builds this workspace.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 [toolchain]
 channel = "1.97.1"
 profile = "minimal"

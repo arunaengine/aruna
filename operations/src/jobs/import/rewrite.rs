@@ -1,3 +1,7 @@
+//! Validates a RO-Crate document and rewrites its file identifiers to the stored objects.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, HashSet};
 
 use aruna_core::metadata::MetadataValidationViolation;
@@ -56,10 +60,8 @@ pub struct RewriteOutcome {
 }
 
 /// Validates a crate and returns it with every identifier IRI-encoded.
-///
-/// Normalization happens on the document itself: an identifier that only a
-/// normalized copy makes valid would be dropped by the JSON-LD parser once the
-/// crate reaches the create path, orphaning everything behind it.
+/// Normalization edits the document itself, because the JSON-LD parser would
+/// otherwise drop an identifier only a normalized copy makes valid.
 pub fn validate_document(jsonld: &str) -> Result<ValidatedDocument, CrateValidationError> {
     let mut value: Value = serde_json::from_str(jsonld)
         .map_err(|error| CrateValidationError::Invalid(error.to_string()))?;
@@ -398,7 +400,7 @@ fn validation_issue(violation: CrateViolation) -> MetadataValidationViolation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn crate_json(version: &str) -> String {

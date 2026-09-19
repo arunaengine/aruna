@@ -1,20 +1,20 @@
-//! Evidence is read by exact key or by paging one whole kind, never from a
-//! bounded prefix of the family.
+//! Tests that evidence is read by exact key or by paging one whole record kind.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::JOB_FAMILY_RECORD_KEYSPACE;
+use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, RealmNodeKind,
+    PhysicalExecutionState,
 };
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use super::fixture::context as fixture;
-use super::fixture::{Family, REALM, actor, node, secret};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::keys::record_key;
@@ -23,6 +23,8 @@ use crate::jobs::records::verify::EvidencePlan;
 use crate::jobs::records::{
     AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError,
 };
+use crate::tests::records::context as fixture;
+use crate::tests::records::{Family, REALM, actor, node, secret};
 
 /// Rows past the 256-record prefix the append used to read.
 const OVERFLOW: u16 = 260;
@@ -55,7 +57,7 @@ async fn seed(context: &DriverContext, records: &[JobRecordEnvelope]) {
         .iter()
         .map(|envelope| {
             (
-                JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                FAMILY_RECORD_KEYSPACE.to_string(),
                 record_key(&envelope.key()),
                 Value::from(to_bytes(envelope).expect("record encodes").as_slice()),
             )
@@ -220,9 +222,8 @@ async fn admits_late_output() {
 
 #[tokio::test]
 async fn pages_receipt_kind() {
-    // A launch whose scheduler this view no longer ranks as a holder is
-    // authentic only through the receipt that stored it, and that receipt lies
-    // on a later page of its own kind.
+    // A launch whose scheduler this view no longer ranks is authentic only through
+    // its receipt, which lies on a later page of its own kind.
     let mut family = Family::new([25u8; 32]);
     family.config.ensure_node(node(7), RealmNodeKind::Server);
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;

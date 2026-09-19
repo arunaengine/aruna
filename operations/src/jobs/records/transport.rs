@@ -1,9 +1,7 @@
-//! Adapter I/O for the job-record and launch-offer effects.
-//!
-//! The transport peer is authenticated as a sync-eligible node of this realm.
-//! That authority is separate from, and never a substitute for, the publisher
-//! signature inside each envelope: a holder that relays a record satisfies no
-//! author rule, and a record keeps its original publisher end to end.
+//! Sends and serves job record and launch offer messages between realm nodes.
+//! A relaying peer is authenticated on its own and is never treated as the record author.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
@@ -14,10 +12,12 @@ use aruna_core::effects::{
 use aruna_core::events::{
     JobRecordEvent, JobRecordPage, JobRecordRejection, LaunchDecline, LaunchOfferEvent,
 };
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
-    PhysicalExecutionState, PlacementRef, RealmConfigDocument, RealmId, SubmissionId,
+    PhysicalExecutionState, SubmissionId,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::record::PlacementRef;
 use futures_util::future::join_all;
 use tokio::time::timeout_at;
 use tracing::warn;
@@ -27,11 +27,11 @@ use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use super::load_kind_complete;
 use super::rows::PendingNeed;
-use crate::dashboard::notify_dashboard_change;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
-use crate::metadata::protocol::{JobRecordPageReply, MetadataTransportMessage};
+use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
+use crate::node::dashboard::notify_dashboard_change;
 use crate::placement::holds_placement;
 
 /// Publishes one record to the family holders, or reads a bounded page back.
@@ -158,7 +158,7 @@ async fn fetch_records(
     };
     let deadline = tokio::time::Instant::now() + deadline;
     for holder in holders {
-        let message = MetadataTransportMessage::ForwardJobRecordPage {
+        let message = MetadataTransportMessage::ForwardRecordPage {
             placement: request.placement,
             submission_id: request.submission_id,
             request_digest: request.request_digest,
@@ -175,8 +175,8 @@ async fn fetch_records(
                 Err(_) => break,
             };
         match reply {
-            MetadataTransportMessage::ForwardedJobRecordPage {
-                result: Ok(JobRecordPageReply { page, next }),
+            MetadataTransportMessage::ForwardedRecordPage {
+                result: Ok(JobPageReply { page, next }),
             } => {
                 return JobRecordEvent::Fetched {
                     holder: *holder,
@@ -184,7 +184,7 @@ async fn fetch_records(
                     next_cursor: next,
                 };
             }
-            MetadataTransportMessage::ForwardedJobRecordPage {
+            MetadataTransportMessage::ForwardedRecordPage {
                 result: Err(reason),
             } => {
                 warn!(peer = %holder, reason = ?reason, "Job record holder refused the fetch");
@@ -273,7 +273,7 @@ pub async fn serve_job_record(
                 Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
             }
         }
-        MetadataTransportMessage::ForwardJobRecordPage {
+        MetadataTransportMessage::ForwardRecordPage {
             placement,
             submission_id,
             request_digest,
@@ -288,12 +288,10 @@ pub async fn serve_job_record(
                 limit,
             };
             match serve_page(context, peer, request).await {
-                Ok(reply) => MetadataTransportMessage::ForwardedJobRecordPage { result: Ok(reply) },
-                Err(ServeError::Refused(reason)) => {
-                    MetadataTransportMessage::ForwardedJobRecordPage {
-                        result: Err(reason),
-                    }
-                }
+                Ok(reply) => MetadataTransportMessage::ForwardedRecordPage { result: Ok(reply) },
+                Err(ServeError::Refused(reason)) => MetadataTransportMessage::ForwardedRecordPage {
+                    result: Err(reason),
+                },
                 Err(ServeError::Unavailable) => MetadataTransportMessage::ForwardedWriteUnavailable,
             }
         }
@@ -331,7 +329,7 @@ async fn holder_view(
         .await
         .ok_or(ServeError::Unavailable)?;
     let eligible = config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .is_ok_and(|nodes| nodes.contains(&peer));
     if !eligible {
         return Err(ServeError::Refused(JobRecordRejection::Unauthorized));
@@ -364,7 +362,7 @@ async fn accept_record(
         return Err(ServeError::Refused(JobRecordRejection::Invalid));
     }
     let rearms = rearms_witness(record.envelope());
-    let now_ms = aruna_core::util::unix_timestamp_millis();
+    let now_ms = aruna_core::time::unix_timestamp_millis();
     let outcome = drive(
         AppendRecordOperation::new(AppendRecordConfig {
             realm_id: authority.realm_id,
@@ -429,7 +427,7 @@ async fn serve_page(
     context: &Arc<DriverContext>,
     peer: NodeId,
     request: PageRequest,
-) -> Result<JobRecordPageReply, ServeError> {
+) -> Result<JobPageReply, ServeError> {
     let authority = holder_view(context, peer, request.placement).await?;
     let derived = authority
         .config
@@ -467,16 +465,15 @@ async fn serve_page(
         warn!(error = %error, "Job record page exceeds its bound");
         ServeError::Unavailable
     })?;
-    Ok(JobRecordPageReply {
+    Ok(JobPageReply {
         page,
         next: audit.next,
     })
 }
 
 /// Serves one inbound launch offer. The offer is bounded and kind-checked at
-/// decode; exact admission, the capacity reservation, and the signed receipt
-/// are the target's own decision. An undecidable offer is answered as
-/// unavailable, never as a refusal: the scheduler must be free to retry it.
+/// decode; admission, reservation, and receipt are the target's own decision.
+/// An undecidable offer is answered as unavailable so the scheduler can retry.
 pub async fn serve_launch_offer(
     context: &Arc<DriverContext>,
     peer: NodeId,
@@ -490,7 +487,7 @@ pub async fn serve_launch_offer(
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     if !config
-        .sync_eligible_node_ids()
+        .sync_eligible_nodes()
         .is_ok_and(|nodes| nodes.contains(&peer))
     {
         return MetadataTransportMessage::ForwardedLaunchOffer {
@@ -509,10 +506,10 @@ pub async fn serve_launch_offer(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::Family;
-    use aruna_core::structs::JobRecordBody;
+    use crate::tests::records::Family;
+    use aruna_core::structs::execution::job::JobRecordBody;
 
     #[test]
     fn error_rearms_family() {

@@ -1,3 +1,7 @@
+# Builds the Python session image with conda, ipykernel and the session helper.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 FROM condaforge/miniforge3:25.3.1-0
 
 RUN pip install --no-cache-dir \

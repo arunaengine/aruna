@@ -1,11 +1,16 @@
+//! Builds the portable source descriptor and version binding from a connector and metadata.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::NodeId;
-use aruna_core::structs::{
-    PortableSourceDescriptor, SourceConnector, SourceMetadata, StagingStrategy,
-    VersionSourceBinding,
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
 use ulid::Ulid;
 
-pub fn build_portable_source_descriptor(
+pub fn build_source_descriptor(
     connector: &SourceConnector,
     metadata: &SourceMetadata,
     source_path: String,
@@ -21,7 +26,7 @@ pub fn build_portable_source_descriptor(
     }
 }
 
-pub fn build_version_source_binding(
+pub fn build_source_binding(
     strategy: StagingStrategy,
     connector: &SourceConnector,
     metadata: &SourceMetadata,
@@ -31,12 +36,7 @@ pub fn build_version_source_binding(
 ) -> VersionSourceBinding {
     VersionSourceBinding {
         strategy,
-        descriptor: build_portable_source_descriptor(
-            connector,
-            metadata,
-            source_path,
-            origin_node_id,
-        ),
+        descriptor: build_source_descriptor(connector, metadata, source_path, origin_node_id),
         connector_id,
     }
 }
@@ -70,7 +70,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -92,7 +92,7 @@ mod tests {
         )
     }
 
-    use aruna_core::structs::SourceConnectorKind;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 
     fn sample_metadata() -> SourceMetadata {
         SourceMetadata {
@@ -105,9 +105,9 @@ mod tests {
     }
 
     #[test]
-    fn build_descriptor_copies_public_config_and_source_path() {
+    fn descriptor_copies_config() {
         let metadata = sample_metadata();
-        let descriptor = build_portable_source_descriptor(
+        let descriptor = build_source_descriptor(
             &sample_connector(),
             &metadata,
             "run-1/file.txt".to_string(),
@@ -124,9 +124,9 @@ mod tests {
     }
 
     #[test]
-    fn build_binding_wraps_descriptor_with_strategy() {
+    fn binding_wraps_descriptor() {
         let metadata = sample_metadata();
-        let binding = build_version_source_binding(
+        let binding = build_source_binding(
             StagingStrategy::Snapshot,
             &sample_connector(),
             &metadata,
@@ -141,11 +141,11 @@ mod tests {
     }
 
     #[test]
-    fn build_descriptor_records_observed_source_version_and_capabilities() {
+    fn descriptor_records_source() {
         let mut metadata = sample_metadata();
         metadata.source_version = Some("v42".to_string());
 
-        let descriptor = build_portable_source_descriptor(
+        let descriptor = build_source_descriptor(
             &sample_connector(),
             &metadata,
             "run-1/file.txt".to_string(),

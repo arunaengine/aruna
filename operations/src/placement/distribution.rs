@@ -1,13 +1,14 @@
-//! Deterministic statistical distribution gates for the weighted resolver.
-//!
-//! Subjects are drawn from a blake3 counter stream (no RNG) so the observed
-//! shares are reproducible on every run and platform.
+//! Tests that weighted resolution spreads subjects across nodes in proportion to weight.
+//! Subjects come from a blake3 counter stream, so the shares repeat on every run and platform.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::structs::{
-    AffinityEffect, AffinityRule, LabelMatch, PlacementStrategy, RealmNodeKind,
+use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::placement::record::{
+    AffinityEffect, AffinityRule, LabelMatch, PlacementStrategy,
 };
 use ulid::Ulid;
 
@@ -85,7 +86,7 @@ fn multiply_rule(key: &str, value: &str, permille: u32) -> AffinityRule {
 }
 
 #[test]
-fn uniform_weights_balance_within_binomial_band() {
+fn uniform_weights_balance() {
     // 5 uniform nodes, replica 1: each expects 20%. σ = √(n·p·(1-p)) = 40 over
     // 10_000, so 3σ ≈ 0.012; a ±2pp band clears it comfortably.
     let seeds = [1u8, 2, 3, 4, 5];
@@ -98,7 +99,7 @@ fn uniform_weights_balance_within_binomial_band() {
 }
 
 #[test]
-fn weighted_shares_track_weight_within_band() {
+fn weighted_shares_track() {
     // Weights 100/200/300 ⇒ expected shares 1/6, 2/6, 3/6.
     let view = view(&[(1, 100), (2, 200), (3, 300)]);
     let strategy = replica_one();
@@ -112,10 +113,8 @@ fn weighted_shares_track_weight_within_band() {
 }
 
 #[test]
-fn reweight_moves_only_toward_bumped_node() {
-    // Bump one of 5 uniform nodes 100 → 150 (total 500 → 550). Its replica-1
-    // share grows from 100/500 to 150/550, and only those keys move — all of
-    // them onto the reweighted node, none reshuffled between the others.
+fn reweight_moves_toward() {
+    // Raising one node's weight moves keys only to it, without reshuffling the other nodes.
     let seeds = [1u8, 2, 3, 4, 5];
     let before = view(&seeds.map(|seed| (seed, 100)));
     let mut after_weights = seeds.map(|seed| (seed, 100));
@@ -142,7 +141,7 @@ fn reweight_moves_only_toward_bumped_node() {
 }
 
 #[test]
-fn multiply_affinity_changes_cross_location_distribution() {
+fn affinity_changes_distribution() {
     let mut boosted = located_node(1, "a", 100);
     boosted
         .labels

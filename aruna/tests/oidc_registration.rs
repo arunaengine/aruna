@@ -1,27 +1,32 @@
+//! Tests OIDC user registration against a fake provider, checking the user and subject index.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use aruna_api::auth::OidcValidator;
 use aruna_api::routes::users::RegisterUserResponse;
+use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
-use aruna_api::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::keyspaces::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
-use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, User, oidc_subject_key};
+use aruna_core::keyspaces::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, oidc_subject_key};
+use aruna_core::structs::identity::realm::OidcProviderConfig;
+use aruna_core::structs::identity::user::User;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
-use aruna_operations::claim_initial_realm_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
-use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Json;
@@ -166,7 +171,7 @@ async fn read_subject_index(context: &DriverContext, subject_key: &str) -> UserI
     match context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+            key_space: SUBJECT_INDEX_KEYSPACE.to_string(),
             key: ByteView::from(subject_key.as_bytes().to_vec()),
             txn_id: None,
         }))
@@ -202,17 +207,20 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
-    initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    initialize_incoming_fixture(context.clone());
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
 
     let realm_signing_key = generate_signing_key();
-    let realm_id =
-        aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+    let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes(
+        realm_signing_key.verifying_key().to_bytes(),
+    );
     let bootstrap_user = UserId::local(Ulid::generate(), realm_id);
     drive(
         CreateRealmOperation::new(CreateRealmConfig {
@@ -232,7 +240,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     .await
     .unwrap();
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: Actor {
                 node_id: net.node_id(),
                 user_id: bootstrap_user,
@@ -244,7 +252,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     .await
     .unwrap();
     drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id,
             node_id: net.node_id(),
             schedule_refresh: false,
@@ -273,7 +281,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         state,
         ServerConfig {
             http_addr: addr,
-            max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+            max_body_size: aruna_api::server::MAX_BODY_SIZE,
             cors: aruna_api::cors::CorsConfig::default(),
         },
     )
@@ -297,7 +305,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
 }
 
 #[tokio::test]
-async fn oidc_registration_route_creates_user_indexes_and_token() {
+async fn registration_creates_token() {
     let issuer = "https://issuer.example";
     let kid = "main-key";
     let signing_key = generate_signing_key();

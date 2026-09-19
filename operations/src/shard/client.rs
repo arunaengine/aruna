@@ -1,9 +1,14 @@
+//! Fetches a co-holder's paged shard manifest over the shard ALPN and assembles it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::ShardManifest;
-use aruna_core::structs::{PlacementRef, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use tokio::time::{Instant, timeout};
@@ -110,7 +115,7 @@ pub(crate) async fn close_stream(stream: &mut BiStream) {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn node_id(seed: u8) -> NodeId {
@@ -136,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_response_rejects_wrong_placement() {
+    fn response_rejects_placement() {
         let holder = node_id(1);
         let requested = placement(7);
         let received = manifest(holder, placement(8));
@@ -151,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_response_rejects_wrong_holder() {
+    fn response_rejects_holder() {
         let requested_holder = node_id(1);
         let placement = placement(7);
         let received = manifest(node_id(2), placement);

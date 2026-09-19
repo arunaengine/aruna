@@ -1,0 +1,20 @@
+//! Groups the realm operations: config, authorization, roles, placement and presence.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod add_role;
+pub mod announce_presence;
+pub mod assign_role;
+pub mod claim_admin;
+pub mod create_realm;
+pub mod ensure_config;
+pub mod forward;
+pub mod get_config;
+pub mod get_nodes;
+pub mod mutate_placement;
+pub mod peer_trust;
+pub mod read_authorization;
+pub mod recover_admin;
+pub mod set_compute;
+pub mod set_policies;
+pub mod set_quota;

@@ -1,7 +1,14 @@
+//! Declares the operation and sub operation traits the runner drives with effects and events.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::any::Any;
 
 use crate::{events::Event, types::Effects};
 
+/// One driven operation: `start` returns the first effects, `step` consumes each
+/// dispatched event, `is_complete` ends the stream, `finalize` reads the outcome,
+/// `abort` requests cleanup. Effects are requests the runner dispatches.
 pub trait Operation: Send + std::fmt::Debug + PartialEq {
     type Output: Send + std::fmt::Debug;
     type Error: Send + std::fmt::Debug;
@@ -9,7 +16,13 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     fn start(&mut self) -> Effects;
     fn step(&mut self, events: Event) -> Effects;
     fn is_complete(&self) -> bool;
+    /// Consumes the operation once the runner stops and reads its outcome. The
+    /// loop calls it even after an early stop, so a nonterminal state must return
+    /// an error rather than a successful default.
     fn finalize(self) -> Result<Self::Output, Self::Error>;
+    /// Requests cleanup effects for a run that stops before completion. They are
+    /// requests the runner may drop, time out, or hand to storage, so returning
+    /// them is not proof that cleanup finished.
     fn abort(&mut self) -> Effects;
 
     /// Whether an error is an ordinary client-visible outcome (not found, denied)

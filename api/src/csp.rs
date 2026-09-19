@@ -1,6 +1,10 @@
-use crate::server_state::ServerState;
+//! Builds the portal content security policy and adds baseline security headers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::server::state::ServerState;
 use aruna_operations::driver::drive;
-use aruna_operations::get_realm_config::GetRealmConfigOperation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
@@ -29,8 +33,7 @@ const BASELINE_CSP: &str = "frame-ancestors 'none'";
 const OIDC_ORIGIN_TTL: Duration = Duration::from_secs(60);
 const OIDC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-const CROSS_ORIGIN_OPENER_POLICY: HeaderName =
-    HeaderName::from_static("cross-origin-opener-policy");
+const ORIGIN_OPENER_POLICY: HeaderName = HeaderName::from_static("cross-origin-opener-policy");
 
 /// Extra origins the portal document may connect to, on top of this node's own
 /// REST origin, its S3 interface and the realm's OIDC providers. Needed when a
@@ -157,7 +160,7 @@ impl PortalSecurity {
         }
 
         match drive(
-            GetRealmConfigOperation::new(self.state.get_realm_id()),
+            GetConfigOperation::new(self.state.get_realm_id()),
             &self.state.get_ctx(),
         )
         .await
@@ -236,7 +239,7 @@ pub(crate) async fn portal_security_headers(
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_SECURITY_POLICY, policy);
     headers.insert(
-        CROSS_ORIGIN_OPENER_POLICY,
+        ORIGIN_OPENER_POLICY,
         HeaderValue::from_static("same-origin"),
     );
     response
@@ -459,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn img_src_allows_s3() {
+    fn allows_s3_images() {
         let policy = content_security_policy(&origins(&["https://s3.test"], &["https://s3.test"]));
 
         assert!(policy.contains("img-src 'self' data: blob: https://s3.test"));

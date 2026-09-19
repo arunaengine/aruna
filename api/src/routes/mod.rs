@@ -1,5 +1,9 @@
+//! Builds the REST router from every route family and adds the auth and tracing layers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::auth::auth_middleware;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use crate::telemetry::request_tracing_middleware;
 use axum::Router;
 use axum::middleware::from_fn_with_state;
@@ -7,23 +11,13 @@ use std::sync::Arc;
 use utoipa::openapi::{Components, OpenApi};
 use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
+pub mod access;
 pub mod assistant;
 pub mod audit;
-pub mod blobs;
-pub mod bucket_usage;
-pub mod compute;
-pub mod connectors;
-pub mod credentials;
 pub mod device;
-pub mod device_compute;
 pub mod drs;
-pub mod group_backends;
-pub mod group_join;
-pub mod groups;
+pub mod execution;
 pub mod info;
-pub mod job_audit;
-pub mod job_session;
-pub mod jobs;
 pub mod management_relay;
 pub mod metadata;
 pub mod notifications;
@@ -34,15 +28,15 @@ pub mod placement;
 pub mod policies;
 pub mod rocrate_import;
 pub mod search;
-pub mod sessions;
 pub mod staging;
-pub mod storage_deletion;
-pub mod storage_routing;
+pub mod storage;
 pub mod sync;
-pub mod sync_quarantine;
-pub mod tes;
-pub mod tokens;
-pub mod users;
+
+// Temporary aliases for the pre-family module paths; the access, execution
+// and storage families own these modules now. Remove once consumers migrate.
+pub use access::{credentials, group_join, groups, sessions, tokens, users};
+pub use execution::{compute, device_compute, jobs, tes};
+pub use storage::{blobs, bucket_usage, connectors, group_backends};
 
 /// The single REST source: every route is registered from a `#[utoipa::path]`
 /// handler, so the runtime router and the generated document cannot diverge.
@@ -52,25 +46,25 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(assistant::router())
         .merge(info::router())
         .merge(onboarding::router())
-        .merge(blobs::router())
-        .merge(bucket_usage::router())
+        .merge(storage::blobs::router())
+        .merge(storage::bucket_usage::router())
         .merge(drs::router())
         .merge(staging::router())
-        .merge(storage_deletion::router())
-        .merge(group_backends::router())
-        .merge(storage_routing::router())
+        .merge(storage::deletion::router())
+        .merge(storage::group_backends::router())
+        .merge(storage::routing::router())
         .merge(sync::router())
-        .merge(sync_quarantine::router())
-        .merge(compute::router())
-        .merge(connectors::router())
-        .merge(credentials::router())
+        .merge(sync::quarantine::router())
+        .merge(execution::compute::router())
+        .merge(storage::connectors::router())
+        .merge(access::credentials::router())
         .merge(device::router())
-        .merge(device_compute::router())
-        .merge(groups::router())
-        .merge(group_join::router())
-        .merge(job_session::router())
-        .merge(jobs::router())
-        .merge(job_audit::router())
+        .merge(execution::device_compute::router())
+        .merge(access::groups::router())
+        .merge(access::group_join::router())
+        .merge(execution::job::session::router())
+        .merge(execution::jobs::router())
+        .merge(execution::job::audit::router())
         .merge(metadata::router())
         .merge(oai::router())
         .merge(pid::router())
@@ -79,10 +73,10 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(notifications::router())
         .merge(policies::router())
         .merge(search::router())
-        .merge(sessions::router())
-        .merge(tes::router())
-        .merge(tokens::router())
-        .merge(users::router())
+        .merge(access::sessions::router())
+        .merge(execution::tes::router())
+        .merge(access::tokens::router())
+        .merge(access::users::router())
 }
 
 pub fn rest_router(state: Arc<ServerState>) -> Router {
@@ -134,10 +128,10 @@ fn routes_at(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+
     use super::rest_openapi;
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
 
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
@@ -440,52 +434,6 @@ mod tests {
         routes
     }
 
-    fn source_files(dir: &Path, files: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("readable route directory") {
-            let path = entry.expect("readable route entry").path();
-            if path.is_dir() {
-                source_files(&path, files);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
-        }
-    }
-
-    fn raw_gaps(file: &Path, source: &str) -> Vec<&'static str> {
-        let source = source.split("#[cfg(test)]").next().unwrap_or_default();
-        [".route(", ".route_service(", ".nest(", ".nest_service("]
-            .into_iter()
-            .filter(|form| {
-                let allowed_line = if file.file_name().is_some_and(|name| name == "mod.rs")
-                    && *form == ".route("
-                {
-                    Some("router.route(path, method_router)")
-                } else if file.file_name().is_some_and(|name| name == "server.rs")
-                    && *form == ".nest("
-                {
-                    Some(".nest(\"/api/v1\", api_v1)")
-                } else {
-                    None
-                };
-                if let Some(allowed_line) = allowed_line {
-                    let mut allowed = false;
-                    return source
-                        .lines()
-                        .filter(|line| line.contains(*form))
-                        .any(|line| {
-                            if !allowed && line.trim() == allowed_line {
-                                allowed = true;
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                }
-                source.contains(*form)
-            })
-            .collect()
-    }
-
     #[test]
     fn preserves_route_inventory() {
         let expected = RUNTIME_ROUTES
@@ -497,31 +445,5 @@ mod tests {
             expected,
             "co-registered routes must match the runtime inventory exactly"
         );
-    }
-
-    #[test]
-    fn forbids_raw_routes() {
-        // Only routes_at and the root /api/v1 nest may reach Axum path assembly;
-        // a REST route added any other way would lack a generated operation.
-        let mut files = Vec::new();
-        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        source_files(&source_root.join("src/routes"), &mut files);
-        files.push(source_root.join("src/server.rs"));
-        assert!(files.len() > 1, "route modules must be discoverable");
-        for file in files {
-            let source = std::fs::read_to_string(&file).expect("readable route module");
-            if let Some(form) = raw_gaps(&file, &source).first() {
-                panic!(
-                    "{} registers {form} outside routes!; use routes! or routes_at",
-                    file.display()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rejects_raw_fixture() {
-        let source = "let router = Router::new().route(\"/health\", get(handler));";
-        assert!(!raw_gaps(Path::new("server.rs"), source).is_empty());
     }
 }

@@ -1,0 +1,1420 @@
+#!/usr/bin/env python3
+"""Style checks for folders, shared prefixes, names, comments and file headers.
+EXTERNAL_NAMES, SMALL_DOMAINS and HEADER_EXCEPTIONS hold the reviewed exceptions."""
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+import argparse
+import bisect
+import io
+import keyword
+import os
+import re
+import subprocess
+import sys
+import tokenize
+
+SKIP_PARTS = frozenset(
+    {"target", "vendor", "node_modules", ".git", ".github", ".cargo", ".config", ".claude"}
+)
+ASSET_PARTS = frozenset({"fixtures", "snapshots", "testdata"})
+LICENSE_MARKS = ("spdx-license-identifier", "copyright", "licensed under", "license")
+STRUCT_NAMES = frozenset({"bin", "benches", "examples"})
+GENERIC_PREFIXES = frozenset({("get",), ("set",), ("test",), ("tests",)})
+EXTERNAL_NAMES = {}
+SMALL_DOMAINS = {
+    "api/src/metadata": "grouped shared-prefix domain",
+    "api/src/routes/access/credentials": "grouped shared-prefix domain",
+    "api/src/routes/access/users": "grouped shared-prefix domain",
+    "api/src/routes/device/folders": "grouped shared-prefix domain",
+    "api/src/routes/execution/job": "grouped shared-prefix domain",
+    "api/src/routes/placement": "grouped shared-prefix domain",
+    "api/src/routes/sync": "grouped shared-prefix domain",
+    "api/src/server": "grouped shared-prefix domain",
+    "api/src/tests": "coherent ownership scope",
+    "aruna-doctor/src/explorer": "grouped shared-prefix domain",
+    "aruna/src/compute_setup": "coherent ownership scope",
+    "compute/src/executor/apptainer": "grouped shared-prefix domain",
+    "compute/src/executor/docker": "grouped shared-prefix domain",
+    "compute/src/executor/kubernetes": "grouped shared-prefix domain",
+    "compute/src/session": "grouped shared-prefix domain",
+    "core/src/compute": "grouped shared-prefix domain",
+    "core/src/structs/identity": "identity record scope; hoisting recreates identity_*",
+    "core/src/structs/identity/user": "grouped shared-prefix domain",
+    "core/src/structs/placement/policy": "grouped shared-prefix domain",
+    "core/src/structured_id": "grouped shared-prefix domain",
+    "core/src/user": "grouped shared-prefix domain",
+    "operations/src/assistant": "coherent ownership scope",
+    "operations/src/forward": "coherent ownership scope",
+    "operations/src/harvest": "harvest operation scope; hoisting recreates harvest_*",
+    "operations/src/harvest/oai_pmh": "grouped shared-prefix domain",
+    "operations/src/jobs/export": "grouped shared-prefix domain",
+    "operations/src/jobs/store": "coherent ownership scope",
+    "operations/src/metadata/forward": "grouped shared-prefix domain",
+    "operations/src/metadata/profile": "grouped shared-prefix domain",
+    "operations/src/replication/incoming": "grouped shared-prefix domain",
+    "operations/src/s3": "coherent ownership scope",
+    "operations/src/s3/object/delete": "grouped shared-prefix domain",
+    "operations/src/s3/policy": "coherent ownership scope",
+    "operations/src/session": "coherent ownership scope",
+    "operations/src/shard": "coherent ownership scope",
+    "operations/src/tasks": "coherent ownership scope",
+}
+FOLDER_MIN = 5
+TERM_MAX = 3
+COMMENT_MAX = 3
+HEADER_MAX = 2
+HEADER_NOTICES = (
+    "Copyright (c) 2026 The Aruna Contributors",
+    "SPDX-License-Identifier: MIT or Apache-2.0",
+)
+HEADER_SKIP = frozenset({"target", "vendor", "node_modules", ".git", ".claude"})
+HEADER_HASH_NAMES = frozenset({".dockerignore", ".gitignore", "Dockerfile", "justfile"})
+HEADER_HASH_SUFFIXES = (".env", ".example", ".sh", ".toml", ".ttl", ".yaml", ".yml")
+HEADER_EXCEPTIONS = {
+    "CODE_OF_CONDUCT.md": "Contributor Covenant text with its own attribution",
+    "Cargo.lock": "generated lockfile; Cargo rewrites it",
+    "api/src/mcp/dataset_authoring.md": "resource text served verbatim to MCP clients",
+    "api/src/mcp/metadata_profiles.md": "resource text served verbatim to MCP clients",
+    "blob/tests/fixtures/apache_pre.html": "copied index page; the parser test needs its bytes",
+    "blob/tests/fixtures/apache_table.html": "copied index page; the parser test needs its bytes",
+    "blob/tests/fixtures/autoindex_nginx.html": "copied index page; the parser test needs its bytes",
+    "blob/tests/fixtures/non_index.html": "copied page; the rejection test needs its bytes",
+    "operations/tests/fixtures/ELN_README.md": "copied fixture; its bytes must stay unchanged",
+}
+
+WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+CHAR_RE = re.compile(r"'(?:\\.|\\u\{[0-9A-Fa-f_]+\}|[^'\\])'")
+SCAN_RE = re.compile(r"//|/\*|\"|'|[A-Za-z_]|[()[\]{}]")
+IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+BLANK_RE = re.compile(r"[^\n]")
+TEST_ATTR_RE = re.compile(r"\b(?:test|rstest)\b")
+MARK_RE = re.compile(r"^\s*(///|//!|/\*+|//|\*+/|\*)\s?")
+PREFIXES = ("b", "c", "r", "br", "rb", "cr")
+DECL_KEYWORDS = frozenset(
+    {"fn", "struct", "enum", "trait", "type", "mod", "const", "static", "union", "macro_rules"}
+)
+PATTERN_SKIP = frozenset(
+    {"mut", "ref", "self", "crate", "super", "dyn", "impl", "const", "in", "move", "as", "true", "false"}
+)
+CLOSURE_PUNCT = frozenset("=([{,;:&?>")
+CLOSURE_WORDS = frozenset({"move", "async", "return"})
+TYPE_KEYWORDS = frozenset({"struct", "enum", "trait", "type", "union"})
+RESTATE_KEYWORDS = frozenset({"fn", "struct", "enum", "trait", "type", "union", "mod"})
+PAIR_OPEN = {"(": ")", "[": "]", "{": "}"}
+
+
+def string_prefix(text, start, end):
+    return end - start <= 2 and text[start:end].lower() in PREFIXES and text[end : end + 1] in ('"', "#")
+
+
+def split_terms(name):
+    # Underscores and CamelCase boundaries split terms; an acronym counts once.
+    terms = []
+    for part in name.split("_"):
+        terms.extend(WORD_RE.findall(part))
+    merged = []
+    for term in terms:
+        if merged:
+            prev, low = merged[-1].lower(), term.lower()
+            if (prev == "ro" and low == "crate") or (prev.isalpha() and low.isdigit()):
+                merged[-1] = merged[-1] + term
+                continue
+        merged.append(term)
+    return merged
+
+
+def scan_block(text, start):
+    depth, i, n = 1, start + 2, len(text)
+    while i < n:
+        if text.startswith("/*", i):
+            depth, i = depth + 1, i + 2
+        elif text.startswith("*/", i):
+            depth, i = depth - 1, i + 2
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return n
+
+
+def string_end(text, start):
+    i, n, prefix = start, len(text), ""
+    while i < n and text[i] in "rbcu":
+        prefix, i = prefix + text[i], i + 1
+    if "r" in prefix:
+        hashes = 0
+        while i < n and text[i] == "#":
+            hashes, i = hashes + 1, i + 1
+        if i >= n or text[i] != '"':
+            return None
+        close = '"' + "#" * hashes
+        end = text.find(close, i + 1)
+        return n if end < 0 else end + len(close)
+    if i >= n or text[i] != '"':
+        return None
+    i += 1
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+        elif text[i] == '"':
+            return i + 1
+        else:
+            i += 1
+    return n
+
+
+def record_comment(text, start, end, comments):
+    block = text.startswith("/*", start)
+    body = text[start + 2 : max(start + 2, end - 2)] if block else text[start + 2 : end]
+    comments.append({"kind": "block" if block else "line", "start": start, "end": end, "body": body})
+
+
+def balanced_end(text, start, open_ch, close_ch, comments=None):
+    depth, i, n = 0, start, len(text)
+    while i < n:
+        match = SCAN_RE.search(text, i)
+        if not match:
+            return n
+        i = match.start()
+        ch = text[i]
+        if ch in "()[]{}":
+            if ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            if comments is not None:
+                record_comment(text, i, end, comments)
+            i = end
+        elif text.startswith("/*", i):
+            end = scan_block(text, i)
+            if comments is not None:
+                record_comment(text, i, end, comments)
+            i = end
+        elif ch == '"':
+            i = string_end(text, i)
+        elif ch == "'":
+            match = CHAR_RE.match(text, i)
+            i = match.end() if match else i + 1
+        else:
+            end = IDENT_RE.match(text, i).end()
+            if string_prefix(text, i, end):
+                skip = string_end(text, i)
+                i = skip if skip is not None else end
+            else:
+                i = end
+    return n
+
+
+def macro_body_start(text, start):
+    i, n = start, len(text)
+    while i < n and text[i] in " \t\r\n":
+        i += 1
+    if text[i : i + 1] != "!":
+        return None
+    i += 1
+    while i < n and text[i] in " \t\r\n":
+        i += 1
+    named = IDENT_RE.match(text, i)
+    if not named:
+        return None
+    name_end = named.end()
+    j = name_end
+    while j < n and text[j] in " \t\r\n":
+        j += 1
+    if text[j : j + 1] not in "([{":
+        return None
+    return named.group(0), named.start(), name_end, j
+
+
+def mask_source(text):
+    """Return (masked, comments, attrs, tokens); strings, chars, comments and
+    attributes are blanked, macro_rules bodies are skipped after their name, other
+    macro token trees keep their tokens so handwritten declarations are seen."""
+    n = len(text)
+    masked = list(text)
+    comments, attrs, tokens = [], [], []
+
+    def blank(start, end):
+        masked[start:end] = BLANK_RE.sub(" ", text[start:end])
+
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n":
+            i += 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            record_comment(text, i, end, comments)
+            blank(i, end)
+            i = end
+        elif text.startswith("/*", i):
+            end = scan_block(text, i)
+            record_comment(text, i, end, comments)
+            blank(i, end)
+            i = end
+        elif ch == '"':
+            end = string_end(text, i)
+            blank(i, end)
+            i = end
+        elif ch == "'":
+            match = CHAR_RE.match(text, i)
+            if match:
+                end = match.end()
+            else:
+                end = i + 1
+                while end < n and (text[end].isalnum() or text[end] == "_"):
+                    end += 1
+            blank(i, end)
+            i = end
+        elif ch == "#" and (
+            text[i + 1 : i + 2] == "[" or (text[i + 1 : i + 2] == "!" and text[i + 2 : i + 3] == "[")
+        ):
+            start = i + 1 if text[i + 1 : i + 2] == "[" else i + 2
+            end = balanced_end(text, start, "[", "]", comments)
+            attrs.append({"start": i, "end": end, "body": text[i:end]})
+            blank(i, end)
+            i = end
+        elif ch.isalpha() or ch == "_":
+            j = IDENT_RE.match(text, i).end()
+            if string_prefix(text, i, j):
+                end = string_end(text, i)
+                if end is not None:
+                    blank(i, end)
+                    i = end
+                    continue
+            if text[i:j] == "macro_rules":
+                info = macro_body_start(text, j)
+                if info is not None:
+                    name, name_start, name_end, d = info
+                    tokens.append(("ident", text[i:j], i, j))
+                    tokens.append(("ident", name, name_start, name_end))
+                    end = balanced_end(text, d, text[d], PAIR_OPEN[text[d]], comments)
+                    blank(i, end)
+                    i = end
+                    continue
+            tokens.append(("ident", text[i:j], i, j))
+            i = j
+        else:
+            tokens.append(("punct", ch, i, i + 1))
+            i += 1
+    return "".join(masked), comments, attrs, tokens
+
+
+def matching_punct(tokens, open_index):
+    depth = 0
+    for index in range(open_index, len(tokens)):
+        if tokens[index][0] == "punct":
+            if tokens[index][1] in PAIR_OPEN:
+                depth += 1
+            elif tokens[index][1] in ")]}":
+                depth -= 1
+                if depth == 0:
+                    return index
+    return len(tokens) - 1
+
+
+def member_fields(tokens, open_index):
+    close = matching_punct(tokens, open_index)
+    depth, members = 0, []
+    for index in range(open_index + 1, close):
+        kind, word, start, _end = tokens[index]
+        if kind == "punct":
+            if word in PAIR_OPEN:
+                depth += 1
+            elif word in ")]}":
+                depth -= 1
+            continue
+        if depth != 0 or index + 1 >= len(tokens):
+            continue
+        nxt = tokens[index + 1]
+        prev = tokens[index - 1]
+        if nxt[0] != "punct" or nxt[1] != ":" or prev[1] == ":":
+            continue
+        if index + 2 < len(tokens) and tokens[index + 2][0] == "punct" and tokens[index + 2][1] == ":":
+            continue
+        members.append((word, start))
+    return members
+
+
+def member_variants(tokens, open_index):
+    close = matching_punct(tokens, open_index)
+    depth, expect, members = 0, True, []
+    index = open_index + 1
+    while index < close:
+        kind, word, start, _end = tokens[index]
+        if kind == "punct":
+            if word in PAIR_OPEN:
+                if word == "{" and depth == 0 and not expect:
+                    members.extend(("field", name, offset) for name, offset in member_fields(tokens, index))
+                    index = matching_punct(tokens, index) + 1
+                    continue
+                depth += 1
+            elif word in ")]}":
+                depth -= 1
+            elif word == "," and depth == 0:
+                expect = True
+            index += 1
+            continue
+        if depth == 0 and expect:
+            members.append(("variant", word, start))
+            expect = False
+        index += 1
+    return members
+
+
+def find_body(tokens, start):
+    depth = 0
+    for index in range(start, len(tokens)):
+        kind, word, _start, _end = tokens[index]
+        if kind != "punct":
+            continue
+        if word in "([":
+            depth += 1
+        elif word in ")]":
+            depth = max(0, depth - 1)
+        elif word == "<":
+            depth += 1
+        elif word == ">" and depth > 0 and tokens[index - 1][1] != "-":
+            depth -= 1
+        elif depth == 0 and word in "{;":
+            return index if word == "{" else None
+    return None
+
+
+def param_open(tokens, start):
+    angle = 0
+    for index in range(start, len(tokens)):
+        kind, word, _start, _end = tokens[index]
+        if kind != "punct":
+            continue
+        if word == "<":
+            angle += 1
+        elif word == ">" and angle > 0 and tokens[index - 1][1] != "-":
+            angle -= 1
+        elif angle == 0 and word == "(":
+            return index
+        elif angle == 0 and word in ")]};{":
+            return None
+    return None
+
+
+def pattern_names(tokens, start, stop):
+    names = []
+    for index in range(start, stop):
+        kind, word, offset, _end = tokens[index]
+        if kind != "ident" or word in PATTERN_SKIP:
+            continue
+        prev = tokens[index - 1] if index else None
+        nxt = tokens[index + 1] if index + 1 < len(tokens) else None
+        if nxt and index + 1 < stop and nxt[1] == ":":
+            continue
+        if prev and prev[1] == ":" and index - 2 >= 0 and tokens[index - 2][1] == ":":
+            continue
+        stripped = word.lstrip("_")
+        if not stripped or stripped[0].isupper():
+            continue
+        names.append((word, offset))
+    return names
+
+
+def segment_names(tokens, start, stop):
+    names = []
+    depth, angle = 0, 0
+    in_pattern, seg_start = True, start
+    for index in range(start, stop):
+        kind, word, _start, _end = tokens[index]
+        if kind != "punct":
+            continue
+        if word in PAIR_OPEN:
+            depth += 1
+        elif word in ")]}":
+            depth -= 1
+        elif word == "<":
+            angle += 1
+        elif word == ">" and angle > 0 and tokens[index - 1][1] != "-":
+            angle -= 1
+        elif depth == 0 and angle == 0 and word in ",:=":
+            if in_pattern:
+                names.extend(pattern_names(tokens, seg_start, index))
+            in_pattern = word == ","
+            seg_start = index + 1
+    if in_pattern:
+        names.extend(pattern_names(tokens, seg_start, stop))
+    return names
+
+
+def param_names(tokens, open_index):
+    return segment_names(tokens, open_index + 1, matching_punct(tokens, open_index))
+
+
+def pattern_join(tokens, start, stop_words):
+    depth = 0
+    for index in range(start, len(tokens)):
+        kind, word, _start, _end = tokens[index]
+        if kind == "punct":
+            if word in PAIR_OPEN:
+                depth += 1
+            elif word in ")]}":
+                if depth == 0:
+                    return None
+                depth -= 1
+        elif depth == 0 and word in stop_words:
+            return index
+    return None
+
+
+def match_names(tokens, open_index):
+    close = matching_punct(tokens, open_index)
+    names = []
+    depth = 0
+    seg_start = open_index + 1
+    guard = None
+    after_arrow = False
+    for index in range(open_index + 1, close):
+        kind, word, _start, _end = tokens[index]
+        if kind == "punct":
+            if word in PAIR_OPEN:
+                depth += 1
+            elif word in ")]}":
+                depth -= 1
+                if depth == 0 and word == "}" and after_arrow:
+                    seg_start, guard, after_arrow = index + 1, None, False
+            elif depth == 0 and word == "=" and index + 1 < close and tokens[index + 1][1] == ">":
+                stop = guard if guard is not None else index
+                names.extend(pattern_names(tokens, seg_start, stop))
+                after_arrow = True
+            elif depth == 0 and word == ",":
+                seg_start, guard, after_arrow = index + 1, None, False
+        elif depth == 0 and not after_arrow and word == "if" and guard is None:
+            guard = index
+    return names
+
+
+def closure_start(tokens, index, closes):
+    if index == 0:
+        return True
+    kind, word, _start, _end = tokens[index - 1]
+    if kind == "punct":
+        if word in CLOSURE_PUNCT:
+            return True
+        if word == "|":
+            return index - 1 in closes
+        return False
+    return word in CLOSURE_WORDS
+
+
+def closure_end(tokens, start):
+    depth = 0
+    for index in range(start + 1, len(tokens)):
+        kind, word, _start, _end = tokens[index]
+        if kind != "punct":
+            continue
+        if word in PAIR_OPEN:
+            depth += 1
+        elif word in ")]}":
+            if depth == 0:
+                return None
+            depth -= 1
+        elif depth == 0 and word == "|":
+            return index
+        elif depth == 0 and word in ";{":
+            return None
+        elif depth == 0 and word == "=" and index + 1 < len(tokens) and tokens[index + 1][1] == ">":
+            return None
+    return None
+
+
+def local_names(tokens, index):
+    names = []
+    depth = 0
+    seg_start = index + 1
+    for position in range(index + 1, len(tokens)):
+        kind, word, _start, _end = tokens[position]
+        if kind != "punct":
+            continue
+        if word in PAIR_OPEN:
+            depth += 1
+        elif word in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and word in ":;=":
+            names.extend(pattern_names(tokens, seg_start, position))
+            return names
+    return names
+
+
+def iter_declarations(tokens, masked, attrs):
+    total = len(tokens)
+    closure_closes = set()
+    for index in range(total):
+        kind, word, start, _end = tokens[index]
+        if kind == "punct" and word == "|":
+            if closure_start(tokens, index, closure_closes):
+                close = closure_end(tokens, index)
+                if close is not None:
+                    closure_closes.add(close)
+                    for name, offset in segment_names(tokens, index + 1, close):
+                        yield ("closure", name, "closure param", offset)
+            continue
+        if kind != "ident":
+            continue
+        if word == "let":
+            for name, offset in local_names(tokens, index):
+                yield ("let", name, "let", offset)
+            continue
+        if word == "for":
+            nxt = tokens[index + 1] if index + 1 < total else None
+            if nxt is None or nxt[0] != "punct" or nxt[1] != "<":
+                stop = pattern_join(tokens, index + 1, ("in",))
+                if stop is not None:
+                    for name, offset in pattern_names(tokens, index + 1, stop):
+                        yield ("for", name, "for", offset)
+            continue
+        if word == "match":
+            open_index = find_body(tokens, index + 1)
+            if open_index is not None:
+                for name, offset in match_names(tokens, open_index):
+                    yield ("match", name, "match arm", offset)
+            continue
+        if word not in DECL_KEYWORDS:
+            continue
+        nxt = tokens[index + 1] if index + 1 < total else None
+        if word == "const" and nxt and nxt[0] == "ident" and nxt[1] == "fn":
+            continue
+        if word == "static":
+            offset = index + 1
+            while offset < total and tokens[offset][0] == "ident" and tokens[offset][1] in ("mut", "ref"):
+                offset += 1
+            nxt = tokens[offset] if offset < total else None
+        if not nxt or nxt[0] != "ident":
+            continue
+        name, name_start = nxt[1], nxt[2]
+        if word == "fn":
+            chain = attrs_before(attrs, start, masked)
+            category = "testfn" if any(TEST_ATTR_RE.search(attr["body"]) for attr in chain) else "fn"
+            open_index = param_open(tokens, index + 2)
+            if open_index is not None:
+                for param_name, offset in param_names(tokens, open_index):
+                    yield ("param", param_name, "param", offset)
+        elif word in TYPE_KEYWORDS:
+            category = "type"
+            body = find_body(tokens, index + 2)
+            if body is not None and tokens[body][1] == "{" and word in ("struct", "enum"):
+                if word == "struct":
+                    for member, offset in member_fields(tokens, body):
+                        yield ("field", member, "field", offset)
+                else:
+                    for member_kind, member, offset in member_variants(tokens, body):
+                        yield (member_kind, member, member_kind, offset)
+        elif word == "mod":
+            category = "mod"
+        elif word == "macro_rules":
+            category = "macro"
+        else:
+            category = "const"
+        yield (category, name, word, name_start)
+
+
+def read_source(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def iter_rust_files(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_PARTS]
+        for name in sorted(filenames):
+            if name.endswith(".rs"):
+                yield os.path.join(dirpath, name)
+
+
+def src_roots(root):
+    for base, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_PARTS]
+        if "Cargo.toml" in filenames:
+            src = os.path.join(base, "src")
+            if os.path.isdir(src):
+                yield src
+
+
+def direct_files(files):
+    return [f for f in files if not f.startswith(".") and f != "mod.rs"]
+
+
+def direct_stems(files):
+    return [f[:-3] for f in direct_files(files) if f.endswith(".rs")]
+
+
+def shared_prefix(stems):
+    counts = {}
+    for stem in stems:
+        terms = split_terms(stem)
+        for size in range(1, len(terms) + 1):
+            prefix = tuple(terms[:size])
+            counts[prefix] = counts.get(prefix, 0) + 1
+    best, best_count = None, 0
+    for prefix, count in counts.items():
+        if count < 3 or prefix in GENERIC_PREFIXES:
+            continue
+        if best is None or len(prefix) > len(best):
+            best, best_count = prefix, count
+    return (best, best_count) if best else None
+
+
+def prefix_findings(rel, dirpath, files):
+    stems = direct_stems(files)
+    found = shared_prefix(stems)
+    if found is None:
+        return
+    prefix, count = found
+    text = "_".join(prefix)
+    if tuple(split_terms(os.path.basename(dirpath))) == prefix:
+        continuing = 0
+        for stem in stems:
+            terms = split_terms(stem)
+            if tuple(terms[: len(prefix)]) == prefix and len(terms) > len(prefix):
+                continuing += 1
+        if continuing >= 3:
+            yield ("prefix", rel, 0, f"{continuing} children repeat prefix '{text}'; drop it from their names")
+        return
+    yield ("prefix", rel, 0, f"{count} siblings share prefix '{text}'; group them into '{text}/'")
+
+
+def check_folders(root):
+    seen = set()
+    for src in src_roots(root):
+        pkg = os.path.dirname(src)
+        for dirpath, dirs, files in os.walk(src):
+            dirs[:] = [d for d in dirs if d not in SKIP_PARTS]
+            rel = os.path.relpath(dirpath, root)
+            if os.path.basename(dirpath) in STRUCT_NAMES and os.path.dirname(dirpath) == src:
+                dirs[:] = []
+                continue
+            if os.path.basename(dirpath) == "tests" and os.path.dirname(dirpath) == pkg:
+                dirs[:] = []
+                continue
+            if (
+                os.path.basename(dirpath) in ASSET_PARTS
+                and rel not in SMALL_DOMAINS
+                and not any(f.endswith(".rs") for f in files)
+            ):
+                dirs[:] = []
+                continue
+            yield from prefix_findings(rel, dirpath, files)
+            if dirpath == src:
+                continue
+            real = direct_files(files)
+            if (
+                os.path.basename(dirpath) == "tests"
+                and os.path.dirname(dirpath) == src
+                and "mod.rs" in files
+                and len(real) >= 2
+            ):
+                seen.add(rel)
+                continue
+            if not real and not any(f.endswith(".rs") for f in files):
+                continue
+            if rel in SMALL_DOMAINS:
+                seen.add(rel)
+                if len(real) >= 2:
+                    continue
+                yield ("folder", rel, 0, f"{len(real)} of {FOLDER_MIN} direct files besides mod.rs; the SMALL_DOMAINS entry no longer qualifies")
+                continue
+            if len(real) < FOLDER_MIN:
+                yield ("folder", rel, 0, f"{len(real)} of {FOLDER_MIN} direct files besides mod.rs")
+    for rel in sorted(set(SMALL_DOMAINS) - seen):
+        yield ("folder", rel, 0, "SMALL_DOMAINS entry does not exist; remove it")
+
+
+def decl_terms(name):
+    return len(split_terms(name))
+
+
+def attrs_before(attrs, offset, masked):
+    chain = []
+    for attr in reversed(attrs):
+        if attr["end"] > offset:
+            continue
+        gap = offset if not chain else chain[-1]["start"]
+        if masked[attr["end"] : gap].strip():
+            break
+        chain.append(attr)
+    return chain
+
+
+def check_sources(root):
+    for path in iter_rust_files(root):
+        rel = os.path.relpath(path, root)
+        text = read_source(path)
+        masked, comments, attrs, tokens = mask_source(text)
+        yield from name_findings(rel, path, text, masked, attrs, tokens)
+        yield from comment_findings(rel, text, masked, comments, tokens)
+
+
+def name_findings(rel, path, text, masked, attrs, tokens):
+    stem = os.path.basename(path)[:-3]
+    if stem not in EXTERNAL_NAMES and decl_terms(stem) > TERM_MAX:
+        yield ("file", rel, 0, f"filename '{stem}' has {decl_terms(stem)} terms")
+    for category, name, keyword, offset in iter_declarations(tokens, masked, attrs):
+        if name in EXTERNAL_NAMES:
+            continue
+        terms = decl_terms(name)
+        if terms <= TERM_MAX:
+            continue
+        line = 1 + text.count("\n", 0, offset)
+        yield (category, rel, line, f"{keyword} '{name}' has {terms} terms")
+
+
+def clean_comment(body):
+    parts = [MARK_RE.sub("", line) for line in body.splitlines()]
+    return re.sub(r"[^a-z0-9]", "", " ".join(parts).lower())
+
+
+def notice_parts(group):
+    """Split a comment run around the header notices so each part counts alone."""
+    if group["kind"] != "line":
+        return None
+    lines = group["body"].split("\n")
+    present = {line.strip() for line in lines}
+    if not all(notice in present for notice in HEADER_NOTICES):
+        return None
+    parts, span, first = [], 0, group["start_line"]
+    for offset, line in enumerate(lines):
+        if line.strip() in HEADER_NOTICES:
+            if span:
+                parts.append((first, span))
+            span, first = 0, group["start_line"] + offset + 1
+            continue
+        if not span:
+            first = group["start_line"] + offset
+        span += 1
+    if span:
+        parts.append((first, span))
+    return parts
+
+
+def comment_findings(rel, text, masked, comments, tokens):
+    if not comments:
+        return
+    line_starts = [0] + [i + 1 for i, ch in enumerate(text) if ch == "\n"]
+    groups = []
+    for comment in comments:
+        comment["start_line"] = bisect.bisect_right(line_starts, comment["start"])
+        comment["end_line"] = bisect.bisect_right(line_starts, max(comment["start"], comment["end"] - 1))
+        last = groups[-1] if groups else None
+        if last and last["kind"] == "line" and comment["kind"] == "line" and comment["start_line"] == last["end_line"] + 1:
+            last["end_line"] = comment["end_line"]
+            last["body"] += "\n" + comment["body"]
+        else:
+            groups.append(dict(comment))
+    decls = {}
+    for index, (kind, word, start, _end) in enumerate(tokens):
+        if kind != "ident" or word not in RESTATE_KEYWORDS:
+            continue
+        nxt = tokens[index + 1] if index + 1 < len(tokens) else None
+        if nxt and nxt[0] == "ident":
+            decls.setdefault(1 + text.count("\n", 0, start), nxt[1])
+    lines = masked.split("\n")
+    for group in groups:
+        parts = notice_parts(group)
+        if parts is not None:
+            for start_line, span in parts:
+                if span > COMMENT_MAX:
+                    yield ("comment", rel, start_line, f"comment spans {span} lines")
+        elif not any(mark in group["body"].lower() for mark in LICENSE_MARKS):
+            span = group["end_line"] - group["start_line"] + 1
+            if span > COMMENT_MAX:
+                yield ("comment", rel, group["start_line"], f"comment spans {span} lines")
+        row = group["end_line"]
+        while row < len(lines) and not lines[row].strip():
+            row += 1
+        name = decls.get(row + 1)
+        if name and clean_comment(group["body"]) == re.sub(r"[^a-z0-9]", "", name.lower()):
+            yield ("restates", rel, group["start_line"], f"comment repeats '{name}'")
+
+
+def header_marks(kind):
+    """The description marker and the two notice lines of the file header."""
+    if kind == "rust":
+        return "//!", tuple(f"// {notice}" for notice in HEADER_NOTICES)
+    if kind == "markdown":
+        return "<!--", tuple(f"<!-- {notice} -->" for notice in HEADER_NOTICES)
+    return "#", tuple(f"# {notice}" for notice in HEADER_NOTICES)
+
+
+def header_kind(rel, path):
+    name = os.path.basename(rel)
+    for suffix, kind in ((".rs", "rust"), (".py", "python"), (".md", "markdown")):
+        if name.endswith(suffix):
+            return kind
+    if name in HEADER_HASH_NAMES or name.endswith(HEADER_HASH_SUFFIXES):
+        return "hash"
+    if "." in name.lstrip("."):
+        return None
+    with open(path, "rb") as handle:
+        first = handle.readline().decode("utf-8", "replace")
+    if not first.startswith("#!"):
+        return None
+    return "python" if "python" in first else "hash"
+
+
+def header_text(kind, line):
+    """The comment text of a header line, or None when the line is not one."""
+    mark = header_marks(kind)[0]
+    stripped = line.strip()
+    if not stripped.startswith(mark):
+        return None
+    body = stripped[len(mark) :]
+    if kind == "markdown":
+        if not body.endswith("-->"):
+            return None
+        body = body[:-3]
+    return body.strip()
+
+
+def notice_findings(rel, lines, index, notices):
+    for offset, notice in enumerate(notices):
+        row = index + offset
+        found = lines[row].rstrip() if row < len(lines) else ""
+        if found != notice:
+            yield ("header", rel, row + 1, f"line must read '{notice}'")
+
+
+def comment_header(rel, kind, lines, start):
+    mark, notices = header_marks(kind)
+    index, described = start, []
+    while index < len(lines) and lines[index].rstrip() not in notices:
+        body = header_text(kind, lines[index])
+        if not body:
+            break
+        described.append((index, body))
+        index += 1
+    if not described:
+        first = lines[start].strip() if start < len(lines) else ""
+        if first in notices:
+            yield ("header", rel, start + 1, "the description must come before the notices")
+        elif header_text(kind, first) == "":
+            yield ("header", rel, start + 1, "the description line is empty")
+        elif kind == "rust" and first.startswith("//"):
+            yield ("header", rel, start + 1, f"the description must use '{mark}', not a plain comment")
+        else:
+            yield ("header", rel, start + 1, "missing file header")
+            return
+    for row, body in described:
+        if body.startswith(HEADER_NOTICES):
+            yield ("header", rel, row + 1, f"the notices must not use '{mark}'")
+    if len(described) > HEADER_MAX:
+        yield ("header", rel, start + 1, f"description spans {len(described)} lines")
+    yield from notice_findings(rel, lines, index, notices)
+
+
+def docstring_end(lines, start):
+    quote = lines[start].lstrip()[:3]
+    rest = lines[start].lstrip()[3:]
+    row = start
+    while quote not in rest:
+        row += 1
+        if row >= len(lines):
+            return None
+        rest = lines[row]
+    return row
+
+
+def python_header(rel, lines, start):
+    notices = header_marks("python")[1]
+    if start >= len(lines) or not lines[start].lstrip().startswith(('"""', "'''")):
+        yield ("header", rel, start + 1, "missing module docstring above the notices")
+        yield from notice_findings(rel, lines, start, notices)
+        return
+    end = docstring_end(lines, start)
+    if end is None:
+        yield ("header", rel, start + 1, "unterminated module docstring")
+        return
+    span = end - start + 1
+    if span > HEADER_MAX:
+        yield ("header", rel, start + 1, f"description spans {span} lines")
+    yield from notice_findings(rel, lines, end + 1, notices)
+
+
+def repo_files(root):
+    """Repository-owned paths: the tracked files, or a plain walk without Git."""
+    try:
+        listed = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z"], capture_output=True, text=True, check=True
+        ).stdout
+        names = [name for name in listed.split("\0") if name]
+        if names:
+            return names
+    except (OSError, subprocess.SubprocessError):
+        pass
+    names = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in HEADER_SKIP]
+        for name in sorted(filenames):
+            names.append(os.path.relpath(os.path.join(dirpath, name), root))
+    return sorted(names)
+
+
+def check_headers(root):
+    excused = set()
+    for rel in repo_files(root):
+        if any(part in HEADER_SKIP for part in rel.split("/")):
+            continue
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            continue
+        if rel in HEADER_EXCEPTIONS:
+            excused.add(rel)
+            continue
+        kind = header_kind(rel, path)
+        if kind is None:
+            continue
+        text = read_source(path)
+        if not text.strip():
+            continue
+        lines = text.split("\n")
+        start = 1 if kind in ("python", "hash") and lines[0].startswith("#!") else 0
+        if kind == "hash" and start < len(lines) and lines[start].lower().startswith("# syntax="):
+            start += 1
+        if kind == "python":
+            yield from python_header(rel, lines, start)
+        else:
+            yield from comment_header(rel, kind, lines, start)
+    for rel in sorted(set(HEADER_EXCEPTIONS) - excused):
+        yield ("header", rel, 0, "HEADER_EXCEPTIONS entry does not exist; remove it")
+
+
+def iter_python_files(root):
+    base = os.path.join(root, "scripts")
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_PARTS and d != "__pycache__"]
+        for name in sorted(filenames):
+            if name.endswith(".py"):
+                yield os.path.join(dirpath, name)
+
+
+def python_findings(root):
+    for path in iter_python_files(root):
+        rel = os.path.relpath(path, root)
+        text = read_source(path)
+        try:
+            tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+        except (tokenize.TokenError, SyntaxError):
+            continue
+        yield from python_file_findings(rel, path)
+        yield from python_name_findings(rel, tokens)
+        yield from python_param_findings(rel, tokens)
+        yield from python_binding_findings(rel, tokens)
+        yield from python_comment_findings(rel, text, tokens)
+        yield from python_docstring_findings(rel, tokens)
+
+
+def python_file_findings(rel, path):
+    stem = os.path.basename(path)[:-3]
+    if stem not in EXTERNAL_NAMES and decl_terms(stem) > TERM_MAX:
+        yield ("pyfile", rel, 0, f"filename '{stem}' has {decl_terms(stem)} terms")
+
+
+def python_lines(tokens):
+    line = []
+    for token in tokens:
+        if token.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+            if line:
+                yield line
+            line = []
+        else:
+            line.append(token)
+    if line:
+        yield line
+
+
+def python_statements(line):
+    statements = []
+    current = []
+    depth = 0
+    for token in line:
+        if token.type == tokenize.OP:
+            if token.string in "([{":
+                depth += 1
+            elif token.string in ")]}":
+                depth -= 1
+            elif token.string == ";" and depth == 0:
+                statements.append(current)
+                current = []
+                continue
+        current.append(token)
+    statements.append(current)
+    return statements
+
+
+def python_significant(statement):
+    return [
+        token
+        for token in statement
+        if token.type not in (tokenize.COMMENT, tokenize.NL, tokenize.INDENT, tokenize.DEDENT)
+    ]
+
+
+def python_param_open(tokens, index):
+    depth = 0
+    for position in range(index + 1, len(tokens)):
+        token = tokens[position]
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            if token.string == "(" and depth == 0:
+                return position
+            depth += 1
+        elif token.string in ")]}":
+            depth -= 1
+    return None
+
+
+def python_param_close(tokens, open_index):
+    depth = 0
+    for position in range(open_index, len(tokens)):
+        token = tokens[position]
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            depth += 1
+        elif token.string in ")]}":
+            depth -= 1
+            if depth == 0:
+                return position
+    return None
+
+
+def python_lambda_stop(tokens, index):
+    depth = 0
+    for position in range(index + 1, len(tokens)):
+        token = tokens[position]
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            depth += 1
+        elif token.string in ")]}":
+            depth -= 1
+        elif token.string == ":" and depth == 0:
+            return position
+    return None
+
+
+def python_param_names(tokens, start, stop):
+    names = []
+    segments, seg_start, depth = [], start, 0
+    for position in range(start, stop):
+        token = tokens[position]
+        if token.type == tokenize.OP:
+            if token.string in "([{":
+                depth += 1
+            elif token.string in ")]}":
+                depth -= 1
+            elif token.string == "," and depth == 0:
+                segments.append(tokens[seg_start:position])
+                seg_start = position + 1
+    segments.append(tokens[seg_start:stop])
+    for segment in segments:
+        for token in segment:
+            if token.type == tokenize.OP and token.string in (":", "="):
+                break
+            if token.type == tokenize.NAME and not keyword.iskeyword(token.string):
+                names.append((token.string, token.start[0]))
+                break
+    return names
+
+
+def python_param_findings(rel, tokens):
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.NAME or token.string not in ("def", "lambda"):
+            continue
+        if token.string == "def":
+            open_index = python_param_open(tokens, index)
+            if open_index is None:
+                continue
+            stop = python_param_close(tokens, open_index)
+            start = open_index + 1
+        else:
+            start = index + 1
+            stop = python_lambda_stop(tokens, index)
+        if stop is None:
+            continue
+        for name, row in python_param_names(tokens, start, stop):
+            terms = decl_terms(name)
+            if terms > TERM_MAX:
+                yield ("pyparam", rel, row, f"param '{name}' has {terms} terms")
+
+
+def python_target_names(region):
+    cut, brackets = len(region), []
+    for index, token in enumerate(region):
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            brackets.append(token.string)
+        elif token.string in ")]}":
+            if brackets:
+                brackets.pop()
+        elif token.string == ":" and not brackets:
+            cut = min(cut, index)
+    names, brackets = [], []
+    for index, token in enumerate(region[:cut]):
+        if token.type == tokenize.OP:
+            if token.string in "([{":
+                brackets.append(token.string)
+            elif token.string in ")]}":
+                if brackets:
+                    brackets.pop()
+            continue
+        if token.type != tokenize.NAME or keyword.iskeyword(token.string):
+            continue
+        if "[" in brackets:
+            continue
+        prev = region[index - 1] if index else None
+        nxt = region[index + 1] if index + 1 < len(region) else None
+        if prev is not None and prev.type == tokenize.OP and prev.string == ".":
+            continue
+        if nxt is not None and nxt.type == tokenize.OP and nxt.string in ".([":
+            continue
+        names.append((token.string, token.start[0]))
+    return names
+
+
+def python_separators(tokens):
+    separators, depth = [], 0
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.OP:
+            continue
+        if token.string in "([{":
+            depth += 1
+        elif token.string in ")]}":
+            depth -= 1
+        elif token.string == "=" and depth == 0:
+            separators.append(index)
+    return separators
+
+
+def python_binding(rel, name, row):
+    terms = decl_terms(name)
+    if terms <= TERM_MAX:
+        return None
+    core = name.strip("_")
+    if core and core.upper() == core:
+        return ("pyconst", rel, row, f"constant '{name}' has {terms} terms")
+    return ("pylet", rel, row, f"binding '{name}' has {terms} terms")
+
+
+def python_binding_findings(rel, tokens):
+    for line in python_lines(tokens):
+        for statement in python_statements(line):
+            tokens_in = python_significant(statement)
+            if not tokens_in:
+                continue
+            first = tokens_in[0]
+            if first.type == tokenize.NAME and (
+                keyword.iskeyword(first.string) or first.string in ("match", "case")
+            ):
+                continue
+            separators = python_separators(tokens_in)
+            if separators:
+                previous = 0
+                for index in separators:
+                    for name, row in python_target_names(tokens_in[previous:index]):
+                        finding = python_binding(rel, name, row)
+                        if finding:
+                            yield finding
+                    previous = index + 1
+                continue
+            colon = None
+            depth = 0
+            for index, token in enumerate(tokens_in):
+                if token.type != tokenize.OP:
+                    continue
+                if token.string in "([{":
+                    depth += 1
+                elif token.string in ")]}":
+                    depth -= 1
+                elif token.string == ":" and depth == 0:
+                    colon = index
+                    break
+            if colon is None:
+                continue
+            for name, row in python_target_names(tokens_in[:colon]):
+                finding = python_binding(rel, name, row)
+                if finding:
+                    yield finding
+
+
+def python_docstring_findings(rel, tokens):
+    last = None
+    at_start = True
+    for token in tokens:
+        if token.type in (
+            tokenize.COMMENT,
+            tokenize.NL,
+            tokenize.NEWLINE,
+            tokenize.INDENT,
+            tokenize.DEDENT,
+            tokenize.ENCODING,
+        ):
+            if token.type in (tokenize.NEWLINE, tokenize.INDENT):
+                at_start = True
+            continue
+        if at_start and token.type == tokenize.STRING and (
+            last is None or (last.type == tokenize.OP and last.string == ":")
+        ):
+            span = token.end[0] - token.start[0] + 1
+            if span > COMMENT_MAX:
+                yield ("pycomment", rel, token.start[0], f"docstring spans {span} lines")
+        last = token
+        at_start = False
+
+
+def python_name_findings(rel, tokens):
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.NAME or token.string not in ("def", "class"):
+            continue
+        for following in tokens[index + 1 : index + 3]:
+            if following.type != tokenize.NAME:
+                continue
+            terms = decl_terms(following.string)
+            if terms > TERM_MAX:
+                yield ("pydecl", rel, following.start[0], f"{token.string} '{following.string}' has {terms} terms")
+            break
+
+
+def python_comment_findings(rel, text, tokens):
+    lines = text.split("\n")
+    groups = []
+    for token in tokens:
+        if token.type != tokenize.COMMENT:
+            continue
+        row, column = token.start
+        if lines[row - 1][:column].strip():
+            continue
+        if groups and groups[-1][1] + 1 == row:
+            groups[-1] = (groups[-1][0], row)
+        else:
+            groups.append((row, row))
+    for start_row, end_row in groups:
+        span = end_row - start_row + 1
+        if span > COMMENT_MAX:
+            yield ("pycomment", rel, start_row, f"comment spans {span} lines")
+
+
+def report(findings, limit):
+    order = [
+        "folder",
+        "prefix",
+        "file",
+        "fn",
+        "testfn",
+        "param",
+        "closure",
+        "let",
+        "for",
+        "match",
+        "type",
+        "mod",
+        "const",
+        "macro",
+        "field",
+        "variant",
+        "comment",
+        "header",
+        "pyfile",
+        "pydecl",
+        "pyparam",
+        "pylet",
+        "pyconst",
+        "pycomment",
+        "restates",
+    ]
+    labels = {
+        "folder": "folder",
+        "prefix": "prefix",
+        "file": "file",
+        "fn": "fn",
+        "testfn": "test fn",
+        "param": "param",
+        "closure": "closure param",
+        "let": "let",
+        "for": "for",
+        "match": "match arm",
+        "type": "type",
+        "mod": "mod",
+        "const": "const",
+        "macro": "macro",
+        "field": "field",
+        "variant": "variant",
+        "comment": "comment",
+        "header": "header",
+        "pyfile": "python file",
+        "pydecl": "python decl",
+        "pyparam": "python param",
+        "pylet": "python binding",
+        "pyconst": "python const",
+        "pycomment": "python comment",
+        "restates": "warning",
+    }
+    counts = {key: 0 for key in order}
+    shown = {key: 0 for key in order}
+    for category, path, line, message in findings:
+        counts[category] += 1
+        if limit and shown[category] >= limit:
+            continue
+        shown[category] += 1
+        where = path if not line else f"{path}:{line}"
+        print(f"{labels[category]}: {where}: {message}")
+    for category in order:
+        if limit and counts[category] > shown[category]:
+            print(f"{labels[category]}: ... {counts[category] - shown[category]} more")
+    print("-- summary --")
+    for category in order:
+        print(f"{labels[category]}: {counts[category]}")
+    errors = sum(counts[key] for key in order if key != "restates")
+    print(f"errors: {errors}, warnings: {counts['restates']}")
+    return 1 if errors else 0
+
+
+def without_reason(table):
+    return [name for name, reason in table.items() if not isinstance(reason, str) or not reason.strip()]
+
+
+def external_without_reason():
+    return without_reason(EXTERNAL_NAMES)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description="Aruna development style checks")
+    parser.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    parser.add_argument("--limit", type=int, default=0, help="max entries per category (0 = all)")
+    args = parser.parse_args(argv)
+    root = os.path.abspath(args.root)
+    missing = external_without_reason()
+    if missing:
+        print(f"EXTERNAL_NAMES needs a reason for: {', '.join(sorted(missing))}", file=sys.stderr)
+        return 2
+    missing = without_reason(HEADER_EXCEPTIONS)
+    if missing:
+        print(f"HEADER_EXCEPTIONS needs a reason for: {', '.join(sorted(missing))}", file=sys.stderr)
+        return 2
+    findings = []
+    findings.extend(check_folders(root))
+    findings.extend(check_sources(root))
+    findings.extend(check_headers(root))
+    findings.extend(python_findings(root))
+    return report(findings, args.limit)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

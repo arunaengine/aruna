@@ -1,4 +1,6 @@
-//! The metadata documents this device keeps available offline.
+//! Routes that list this device's document replicas and set which ones stay offline.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,12 +14,12 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::server_state::ServerState;
-use aruna_core::structs::AuthContext;
+use crate::server::state::ServerState;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::replica::{ReplicaOrigin, ReplicaRecord, list_replicas};
 use aruna_operations::device::selection::{SelectionError, deselect_document, select_document};
 
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()

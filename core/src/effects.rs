@@ -1,21 +1,29 @@
+//! Declares the effects operations hand to adapters for blob, storage, network and task work.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::{Duration, Instant};
 
+use crate::UserId;
 use crate::alpn::Alpn;
 use crate::audit::AuditPageRequest;
 use crate::compute::ExecutionTargetId;
-use crate::document::DocumentSyncEffect;
+use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::{
-    BackendLocation, GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey,
-    JobRecordEnvelope, JobRecordKind, PlacementPolicyRef, PlacementRef, PolicyPublicationClaim,
-    RealmId, ResolvedBackend, ResolvedSourceAccess, SubmissionId, WriteGuard,
-};
+use crate::structs::WriteGuard;
+use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind, SubmissionId};
+use crate::structs::execution::source_access::ResolvedSourceAccess;
+use crate::structs::identity::realm::RealmId;
+use crate::structs::placement::policy::PlacementPolicyRef;
+use crate::structs::placement::policy::document::PolicyPublicationClaim;
+use crate::structs::placement::record::PlacementRef;
+use crate::structs::storage::blob::{BackendLocation, HiddenBlobKey, ResolvedBackend};
+use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::task::TaskEffect;
-use crate::types::UserId;
 use crate::types::{Key, KeySpace, TxnId, Value};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -148,8 +156,8 @@ pub enum BlobEffect {
     /// Create-time reachability proof for a tenant backend: build the guarded
     /// operator and round-trip a sentinel object.
     CheckGroupBackend {
-        record: GroupStorageBackend,
-        secret: GroupStorageBackendSecret,
+        record: GroupStorage,
+        secret: GroupStorageSecret,
     },
 }
 
@@ -174,10 +182,9 @@ pub enum StagingSourceEffect {
     },
 }
 
-/// Writes into a folder the owner bound on their own machine. Every variant is
-/// non-destructive by construction: a write only lands through a guard the
-/// adapter re-verifies at rename time, a conflicted copy never replaces
-/// anything, and a removal moves the file aside instead of unlinking it.
+/// Writes into a folder the owner bound on their own machine. Every variant is non-destructive by
+/// construction: a write only lands through a guard the adapter re-verifies at rename time, a
+/// conflicted copy never replaces anything, and a removal moves the file aside instead of unlinking it.
 #[derive(Debug)]
 pub enum LocalFileEffect {
     Write {
@@ -304,12 +311,8 @@ pub enum StorageEffect {
     },
     /// Persist all pending storage data with `SyncAll` durability.
     SyncAll,
-    /// Iterate over keys in a keyspace with optional prefix and pagination.
-    ///
-    /// Iteration order is lexicographic by key bytes.
-    /// - `prefix`: restricts results to keys with this prefix
-    /// - `start`: lower bound for the first returned key
-    /// - `limit`: maximum number of entries to return
+    /// Iterates keys lexicographically with optional prefix and lower-bound start.
+    /// `limit` caps the returned entries.
     Iter {
         key_space: KeySpace,
         prefix: Option<Key>,
@@ -354,7 +357,7 @@ impl IterStart {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
     Dht(DhtEffect),
-    DocumentSync(DocumentSyncEffect),
+    DocumentSync(DocumentEffect),
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
     AuditPage(Box<AuditPageEffect>),
@@ -368,23 +371,23 @@ pub enum NetEffect {
 
 /// Holders one policy fetch may consult. The operation resolves them from its
 /// local placement view; a longer list would turn a cache miss into a fan-out.
-pub const MAX_POLICY_FETCH_HOLDERS: usize = 8;
+pub const MAX_FETCH_HOLDERS: usize = 8;
 
 /// Holders one job-record publish or fetch may consult.
-pub const MAX_JOB_RECORD_HOLDERS: usize = 8;
+pub const MAX_RECORD_HOLDERS: usize = 8;
 
 /// Job-family records one fetch may return, so a family with many executions is
 /// always read as bounded pages.
-pub const MAX_JOB_RECORD_PAGE: usize = 64;
+pub const MAX_RECORD_PAGE: usize = 64;
 
 /// Bytes of one opaque page cursor: it carries a holder's record key only.
-pub const MAX_JOB_RECORD_CURSOR_BYTES: usize = 128;
+pub const MAX_CURSOR_BYTES: usize = 128;
 
 /// Encoded bytes of one immutable job-family record.
-pub const MAX_JOB_RECORD_BYTES: usize = 1024 * 1024;
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 /// Encoded bytes of one fetched record page.
-pub const MAX_JOB_RECORD_PAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const JOB_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Why a bounded policy-fetch or job-record frame was refused. Every bound holds
 /// at construction and again at decode, because a peer supplies bytes.
@@ -392,17 +395,17 @@ pub const MAX_JOB_RECORD_PAGE_BYTES: usize = 4 * 1024 * 1024;
 pub enum FrameBoundsError {
     #[error("holder list must name 1..={max} nodes")]
     HolderCount { max: usize },
-    #[error("cursor must be at most {MAX_JOB_RECORD_CURSOR_BYTES} bytes")]
+    #[error("cursor must be at most {MAX_CURSOR_BYTES} bytes")]
     CursorBytes,
-    #[error("page limit must be 1..={MAX_JOB_RECORD_PAGE}")]
+    #[error("page limit must be 1..={MAX_RECORD_PAGE}")]
     PageLimit,
-    #[error("page must carry at most {MAX_JOB_RECORD_PAGE} records")]
+    #[error("page must carry at most {MAX_RECORD_PAGE} records")]
     RecordCount,
-    #[error("record must encode to at most {MAX_JOB_RECORD_BYTES} bytes")]
+    #[error("record must encode to at most {MAX_RECORD_BYTES} bytes")]
     RecordBytes,
     #[error("frame must carry the one record kind it is defined for")]
     RecordKind,
-    #[error("page must encode to at most {MAX_JOB_RECORD_PAGE_BYTES} bytes")]
+    #[error("page must encode to at most {JOB_PAGE_BYTES} bytes")]
     PageBytes,
     #[error(transparent)]
     Encoding(#[from] postcard::Error),
@@ -446,7 +449,7 @@ pub struct FetchCursor(Vec<u8>);
 
 impl FetchCursor {
     pub fn new(cursor: Vec<u8>) -> Result<Self, FrameBoundsError> {
-        if cursor.is_empty() || cursor.len() > MAX_JOB_RECORD_CURSOR_BYTES {
+        if cursor.is_empty() || cursor.len() > MAX_CURSOR_BYTES {
             return Err(FrameBoundsError::CursorBytes);
         }
         Ok(Self(cursor))
@@ -473,7 +476,7 @@ pub struct PageLimit(usize);
 
 impl PageLimit {
     pub fn new(limit: usize) -> Self {
-        Self(limit.clamp(1, MAX_JOB_RECORD_PAGE))
+        Self(limit.clamp(1, MAX_RECORD_PAGE))
     }
 
     pub fn get(self) -> usize {
@@ -483,7 +486,7 @@ impl PageLimit {
 
 impl Default for PageLimit {
     fn default() -> Self {
-        Self(MAX_JOB_RECORD_PAGE)
+        Self(MAX_RECORD_PAGE)
     }
 }
 
@@ -491,7 +494,7 @@ impl TryFrom<usize> for PageLimit {
     type Error = FrameBoundsError;
 
     fn try_from(limit: usize) -> Result<Self, Self::Error> {
-        if limit == 0 || limit > MAX_JOB_RECORD_PAGE {
+        if limit == 0 || limit > MAX_RECORD_PAGE {
             return Err(FrameBoundsError::PageLimit);
         }
         Ok(Self(limit))
@@ -507,7 +510,7 @@ pub struct JobRecordFrame(JobRecordEnvelope);
 
 impl JobRecordFrame {
     pub fn new(envelope: JobRecordEnvelope) -> Result<Self, FrameBoundsError> {
-        if encoded_len(&envelope)? > MAX_JOB_RECORD_BYTES {
+        if encoded_len(&envelope)? > MAX_RECORD_BYTES {
             return Err(FrameBoundsError::RecordBytes);
         }
         Ok(Self(envelope))
@@ -542,7 +545,7 @@ impl LaunchFrame {
         if envelope.kind() != JobRecordKind::Launch {
             return Err(FrameBoundsError::RecordKind);
         }
-        if encoded_len(&envelope)? > MAX_JOB_RECORD_BYTES {
+        if encoded_len(&envelope)? > MAX_RECORD_BYTES {
             return Err(FrameBoundsError::RecordBytes);
         }
         Ok(Self(envelope))
@@ -577,7 +580,7 @@ impl ReceiptFrame {
         if envelope.kind() != JobRecordKind::Receipt {
             return Err(FrameBoundsError::RecordKind);
         }
-        if encoded_len(&envelope)? > MAX_JOB_RECORD_BYTES {
+        if encoded_len(&envelope)? > MAX_RECORD_BYTES {
             return Err(FrameBoundsError::RecordBytes);
         }
         Ok(Self(envelope))
@@ -606,7 +609,7 @@ impl TryFrom<JobRecordEnvelope> for ReceiptFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyFetchEffect {
     pub realm_id: RealmId,
-    pub holders: HolderList<MAX_POLICY_FETCH_HOLDERS>,
+    pub holders: HolderList<MAX_FETCH_HOLDERS>,
     pub policy_ref: PlacementPolicyRef,
     pub deadline: Duration,
 }
@@ -619,14 +622,14 @@ pub enum JobRecordEffect {
         realm_id: RealmId,
         /// Family placement derived from the submission id, never from an alias.
         placement: PlacementRef,
-        holders: HolderList<MAX_JOB_RECORD_HOLDERS>,
+        holders: HolderList<MAX_RECORD_HOLDERS>,
         record: Box<JobRecordFrame>,
         deadline: Duration,
     },
     Fetch {
         realm_id: RealmId,
         placement: PlacementRef,
-        holders: HolderList<MAX_JOB_RECORD_HOLDERS>,
+        holders: HolderList<MAX_RECORD_HOLDERS>,
         submission_id: SubmissionId,
         /// `None` reads every request family under this submission.
         request_digest: Option<[u8; 32]>,
@@ -750,104 +753,11 @@ pub enum StreamEffect {
     Close { stream_id: u64 },
 }
 
-/// Test fixture shared with the event frames: one signed output record whose
-/// encoded size grows with the output count and key width.
 #[cfg(test)]
-pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::{
-        ExecutionOutputRecord, JobFamilyRecord, JobId, OutputObject, OutputSet, SubmissionId,
-    };
-
-    let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
-    let execution_id = Ulid::from_bytes([7u8; 16]);
-    let outputs = (0..objects)
-        .map(|index| OutputObject {
-            node_id: secret.public(),
-            bucket: "bucket".to_string(),
-            key: format!("{index:08}-{}", "k".repeat(key_bytes)),
-            version_id: Ulid::from_bytes([9u8; 16]),
-            execution_id,
-            container_path: "/out".to_string(),
-            size: 1,
-            digest: None,
-        })
-        .collect();
-    let record = JobFamilyRecord::Output(Box::new(ExecutionOutputRecord {
-        execution_id,
-        submission_id: SubmissionId([1u8; 32]),
-        request_digest: [2u8; 32],
-        job_id: JobId::from_bytes([5u8; 16]),
-        executor_node_id: secret.public(),
-        spec_digest: [3u8; 32],
-        receipt_digest: [4u8; 32],
-        outputs: OutputSet::canonical(outputs).expect("canonical outputs"),
-        committed_at_ms: 1,
-    }));
-    JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
-}
-
-/// One signed launch whose encoded size grows with the executor-kind width.
-#[cfg(test)]
-fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::{JobFamilyRecord, JobId, LaunchIntent, PlacementRef, SubmissionId};
-
-    let secret = iroh::SecretKey::from_bytes(&[4u8; 32]);
-    let record = JobFamilyRecord::Launch(Box::new(LaunchIntent {
-        launch_id: Ulid::from_bytes([8u8; 16]),
-        submission_id: SubmissionId([1u8; 32]),
-        request_digest: [2u8; 32],
-        job_id: JobId::from_bytes([5u8; 16]),
-        scheduler_node_id: secret.public(),
-        scheduler_seq: 0,
-        witness_placement: PlacementRef {
-            strategy_id: Ulid::from_bytes([9u8; 16]),
-            shard: 2,
-        },
-        holder_generation: 3,
-        target: ExecutionTargetId {
-            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
-            executor_kind: "d".repeat(kind_bytes),
-        },
-        inputs: Vec::new(),
-        output_policies: Vec::new(),
-        plan_digest: [6u8; 32],
-        spec_digest: [7u8; 32],
-        created_at_ms: 1,
-    }));
-    JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
-}
-
-/// One signed receipt whose encoded size grows with the executor-kind width.
-#[cfg(test)]
-pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::{ExecutionReceipt, JobFamilyRecord, JobId, SubmissionId};
-
-    let secret = iroh::SecretKey::from_bytes(&[6u8; 32]);
-    let record = JobFamilyRecord::Receipt(Box::new(ExecutionReceipt {
-        execution_id: Ulid::from_bytes([8u8; 16]),
-        physical_job_id: JobId::from_bytes([14u8; 16]),
-        launch_id: Ulid::from_bytes([9u8; 16]),
-        launch_digest: [1u8; 32],
-        submission_id: SubmissionId([1u8; 32]),
-        request_digest: [2u8; 32],
-        job_id: JobId::from_bytes([5u8; 16]),
-        executor_node_id: secret.public(),
-        target: ExecutionTargetId {
-            node_id: secret.public(),
-            executor_kind: "d".repeat(kind_bytes),
-        },
-        spec_digest: [7u8; 32],
-        membership_generation: 4,
-        subject_generation: 5,
-        subject_digest: [8u8; 32],
-        accepted_at_ms: 1,
-    }));
-    JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
-}
-
-#[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    use crate::tests::effects::*;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -857,7 +767,7 @@ mod tests {
     fn bounds_receipt_reply() {
         // A launch reply is bounded and kind-checked before the scheduler acts.
         assert_eq!(
-            ReceiptFrame::new(sized_receipt(MAX_JOB_RECORD_BYTES)),
+            ReceiptFrame::new(sized_receipt(MAX_RECORD_BYTES)),
             Err(FrameBoundsError::RecordBytes)
         );
         assert_eq!(
@@ -877,22 +787,22 @@ mod tests {
 
     #[test]
     fn rejects_wide_holders() {
-        let holders: Vec<NodeId> = (0..=MAX_JOB_RECORD_HOLDERS as u8).map(node).collect();
+        let holders: Vec<NodeId> = (0..=MAX_RECORD_HOLDERS as u8).map(node).collect();
         assert_eq!(
-            HolderList::<MAX_JOB_RECORD_HOLDERS>::new(holders),
+            HolderList::<MAX_RECORD_HOLDERS>::new(holders),
             Err(FrameBoundsError::HolderCount {
-                max: MAX_JOB_RECORD_HOLDERS
+                max: MAX_RECORD_HOLDERS
             })
         );
         assert_eq!(
-            HolderList::<MAX_POLICY_FETCH_HOLDERS>::new(Vec::new()),
+            HolderList::<MAX_FETCH_HOLDERS>::new(Vec::new()),
             Err(FrameBoundsError::HolderCount {
-                max: MAX_POLICY_FETCH_HOLDERS
+                max: MAX_FETCH_HOLDERS
             })
         );
         let holders = vec![node(1), node(2)];
         assert_eq!(
-            HolderList::<MAX_POLICY_FETCH_HOLDERS>::new(holders.clone())
+            HolderList::<MAX_FETCH_HOLDERS>::new(holders.clone())
                 .expect("bounded holders")
                 .as_slice(),
             holders.as_slice()
@@ -901,7 +811,7 @@ mod tests {
 
     #[test]
     fn rejects_long_cursor() {
-        let cursor = vec![9u8; MAX_JOB_RECORD_CURSOR_BYTES + 1];
+        let cursor = vec![9u8; MAX_CURSOR_BYTES + 1];
         assert_eq!(
             FetchCursor::new(cursor.clone()),
             Err(FrameBoundsError::CursorBytes)
@@ -919,23 +829,23 @@ mod tests {
 
     #[test]
     fn clamps_page_limit() {
-        assert_eq!(PageLimit::new(usize::MAX).get(), MAX_JOB_RECORD_PAGE);
+        assert_eq!(PageLimit::new(usize::MAX).get(), MAX_RECORD_PAGE);
         assert_eq!(PageLimit::new(0).get(), 1);
         assert_eq!(PageLimit::new(8).get(), 8);
-        assert_eq!(PageLimit::default().get(), MAX_JOB_RECORD_PAGE);
+        assert_eq!(PageLimit::default().get(), MAX_RECORD_PAGE);
     }
 
     #[test]
     fn rejects_decoded_limit() {
         // A requester clamps its own limit; a peer's frame is refused instead.
-        let over = postcard::to_allocvec(&(MAX_JOB_RECORD_PAGE + 1)).expect("limit encodes");
+        let over = postcard::to_allocvec(&(MAX_RECORD_PAGE + 1)).expect("limit encodes");
         assert!(postcard::from_bytes::<PageLimit>(&over).is_err());
         let zero = postcard::to_allocvec(&0usize).expect("limit encodes");
         assert!(postcard::from_bytes::<PageLimit>(&zero).is_err());
-        let valid = postcard::to_allocvec(&MAX_JOB_RECORD_PAGE).expect("limit encodes");
+        let valid = postcard::to_allocvec(&MAX_RECORD_PAGE).expect("limit encodes");
         assert_eq!(
             postcard::from_bytes::<PageLimit>(&valid),
-            Ok(PageLimit::new(MAX_JOB_RECORD_PAGE))
+            Ok(PageLimit::new(MAX_RECORD_PAGE))
         );
     }
 
@@ -955,7 +865,7 @@ mod tests {
     fn bounds_launch_offer() {
         // An offer is refused for size or kind before any admission work runs.
         assert_eq!(
-            LaunchFrame::new(sized_launch(MAX_JOB_RECORD_BYTES)),
+            LaunchFrame::new(sized_launch(MAX_RECORD_BYTES)),
             Err(FrameBoundsError::RecordBytes)
         );
         assert_eq!(
@@ -969,7 +879,7 @@ mod tests {
         let encoded = postcard::to_allocvec(&sized_envelope(1, 8)).expect("record encodes");
         assert!(postcard::from_bytes::<LaunchFrame>(&encoded).is_err());
         let oversized =
-            postcard::to_allocvec(&sized_launch(MAX_JOB_RECORD_BYTES)).expect("record encodes");
+            postcard::to_allocvec(&sized_launch(MAX_RECORD_BYTES)).expect("record encodes");
         assert!(postcard::from_bytes::<LaunchFrame>(&oversized).is_err());
     }
 

@@ -1,6 +1,9 @@
+# Build context exclusions for the node image.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 .git
 target
-.env
 **/.env
 .compose-data
 docker/

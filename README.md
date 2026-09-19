@@ -1,3 +1,7 @@
+<!-- Project readme: what Aruna is, how to run a node, and where the guides are. -->
+<!-- Copyright (c) 2026 The Aruna Contributors -->
+<!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
+
 [![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-APACHE)
 [![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-MIT)
@@ -8,8 +12,8 @@ ___
 
 <p align="center">
     <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./img/aruna_white_font.png">
-    <img alt="Aruna logo" src="./img/aruna_dark_font.png" width="70%">
+    <source media="(prefers-color-scheme: dark)" srcset="./img/logo_white.png">
+    <img alt="Aruna logo" src="./img/logo_dark.png" width="70%">
     </picture>
 </p>
 
@@ -98,6 +102,12 @@ The default example configuration exposes:
 
 - the REST API and Swagger UI on `http://127.0.0.1:3000/swagger-ui`
 - the S3 endpoint on `http://127.0.0.1:1337`
+
+The repository also tracks a `.env` holding a demonstration profile whose keys are
+published. A node refuses to start while `REALM_PUBLIC_KEY`, `NODE_PUBLIC_KEY`,
+`REALM_PRIVATE_KEY` or `NODE_PRIVATE_KEY` still holds one of those published keys, and
+names it. Replace them with your own, or pass `--dangerously-use-default-env` (or set
+`ARUNA_DANGEROUSLY_USE_DEFAULT_ENV=1`) to start anyway, which logs a warning per key.
 
 ### Evaluate a local cluster
 
@@ -202,6 +212,11 @@ and Cilium treats that traffic as its reserved `ingress` entity, which no `ipBlo
 CiliumNetworkPolicy with `toEntities: [ingress]` on the S3 port, selecting pods labelled
 `aruna-engine.org/network: s3`, opens it. DNS egress is allowed by port with no peer, because a
 node-local resolver runs on a host address that is neither a pod nor a CIDR peer.
+
+Kubernetes workspaces and sessions need a pod-reachable endpoint in `ARUNA_COMPUTE_S3_URL`
+or `S3_PUBLIC_URL`. `ARUNA_COMPUTE_K8S_S3_PORT` defaults to that URL's explicit or known
+scheme port, falling back to 443. `ARUNA_COMPUTE_LOCAL_ONLY` disables workspaces and
+sessions for that executor.
 
 The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
 the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names

@@ -1,26 +1,23 @@
-//! The sans-I/O append of one immutable job record.
-//!
-//! Every check runs before the record becomes visible: frame bounds at decode,
-//! the publisher signature, the record kind's author rule against this node's
-//! own holder view, the family placement derived from the submission, the
-//! dependency evidence already stored here, and the canonical digest. The
-//! writes of one append commit in a single transaction.
+//! Appends one immutable job record after checking its frame, signature, and evidence.
+//! All writes of one append commit together or not at all.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
-    JOB_FAMILY_PENDING_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+    FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
+    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
-    RealmConfigDocument, RealmId,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use tracing::debug;
@@ -153,7 +150,7 @@ impl AppendRecordOperation {
     /// unrelated to this family and must not conflict every append.
     fn read_config(&mut self) -> Effects {
         self.state = AppendState::ReadConfig;
-        let config = DocumentSyncTarget::RealmConfig {
+        let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
         smallvec![Effect::Storage(StorageEffect::Read {
@@ -176,11 +173,11 @@ impl AppendRecordOperation {
         self.state = AppendState::ReadRow { txn_id };
         let reads = vec![
             (
-                JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                FAMILY_RECORD_KEYSPACE.to_string(),
                 record_key(&self.envelope().key()),
             ),
             (
-                JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+                FAMILY_PROJECTION_KEYSPACE.to_string(),
                 family_prefix(&self.family()),
             ),
         ];
@@ -193,7 +190,7 @@ impl AppendRecordOperation {
     fn scan_pending(&mut self, txn_id: TxnId) -> Effects {
         self.state = AppendState::ScanPending { txn_id };
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_FAMILY_PENDING_KEYSPACE.to_string(),
+            key_space: FAMILY_PENDING_KEYSPACE.to_string(),
             prefix: Some(family_prefix(&self.family())),
             start: None,
             limit: MAX_PENDING_RECORDS,
@@ -208,7 +205,7 @@ impl AppendRecordOperation {
             .retained
             .iter()
             .filter(|(key, _)| !self.stored.contains_key(key))
-            .map(|(key, _)| (JOB_FAMILY_RECORD_KEYSPACE.to_string(), record_key(key)))
+            .map(|(key, _)| (FAMILY_RECORD_KEYSPACE.to_string(), record_key(key)))
             .collect();
         if reads.is_empty() {
             return self.read_evidence(txn_id);
@@ -234,7 +231,7 @@ impl AppendRecordOperation {
             .keys
             .iter()
             .filter(|key| !self.stored.contains_key(key))
-            .map(|key| (JOB_FAMILY_RECORD_KEYSPACE.to_string(), record_key(key)))
+            .map(|key| (FAMILY_RECORD_KEYSPACE.to_string(), record_key(key)))
             .collect();
         if reads.is_empty() {
             return self.scan_kind(txn_id);
@@ -255,7 +252,7 @@ impl AppendRecordOperation {
         };
         self.state = AppendState::ScanKind { txn_id };
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             prefix: Some(kind_prefix(&self.family(), kind)),
             start: self.cursor.clone().map(IterStart::After),
             limit: RECORD_PAGE_SIZE,
@@ -347,21 +344,21 @@ impl AppendRecordOperation {
         for admitted in &plan.admitted {
             let key = admitted.envelope.key();
             writes.push((
-                JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                FAMILY_RECORD_KEYSPACE.to_string(),
                 record_key(&key),
                 Value::from(to_bytes(&admitted.envelope)?.as_slice()),
             ));
         }
         for (claim_key, job_id) in admitted_aliases(plan) {
             writes.push((
-                JOB_FAMILY_ALIAS_KEYSPACE.to_string(),
+                FAMILY_ALIAS_KEYSPACE.to_string(),
                 alias_key(job_id, &claim_key.family),
                 Value::from(claim_key.to_bytes().as_slice()),
             ));
         }
         for key in relayable(plan, self.config.local_node_id) {
             writes.push((
-                JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+                FAMILY_OUTBOX_KEYSPACE.to_string(),
                 record_key(&key),
                 Value::from(
                     to_bytes(&OutboxEntry {
@@ -376,21 +373,21 @@ impl AppendRecordOperation {
         }
         for (key, row) in &plan.pending {
             writes.push((
-                JOB_FAMILY_PENDING_KEYSPACE.to_string(),
+                FAMILY_PENDING_KEYSPACE.to_string(),
                 record_key(key),
                 Value::from(to_bytes(row)?.as_slice()),
             ));
         }
         for (key, row) in &plan.conflicts {
             writes.push((
-                JOB_FAMILY_CONFLICT_KEYSPACE.to_string(),
+                FAMILY_CONFLICT_KEYSPACE.to_string(),
                 conflict_key(key, &row.envelope.digest()?),
                 Value::from(to_bytes(row)?.as_slice()),
             ));
         }
         if !plan.admitted.is_empty() {
             writes.push((
-                JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+                FAMILY_PROJECTION_KEYSPACE.to_string(),
                 family_prefix(&self.family()),
                 Value::from(
                     to_bytes(&ProjectionCache::invalidated(self.cache.as_ref()))?.as_slice(),
@@ -407,7 +404,7 @@ impl AppendRecordOperation {
             .map(|plan| {
                 plan.cleared
                     .iter()
-                    .map(|key| (JOB_FAMILY_PENDING_KEYSPACE.to_string(), record_key(key)))
+                    .map(|key| (FAMILY_PENDING_KEYSPACE.to_string(), record_key(key)))
                     .collect()
             })
             .unwrap_or_default();

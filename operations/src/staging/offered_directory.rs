@@ -1,26 +1,34 @@
-//! Offering a directory as a read-only bucket on the device that holds it.
-//!
-//! The bucket's objects are observations: a reference version per file, bound
-//! to the device-local registration and never to a path. Writes to such a
-//! bucket are refused; the files change only on the owner's own filesystem.
+//! Offers a local directory as a read-only bucket of reference versions on this device.
+//! Writes are refused; the files change only on the owner's own filesystem.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, build_head_transition_effects, write_blob_version_effect,
-};
+use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};
-use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
-    OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory, PortableSourceDescriptor,
-    RealmId, ResolvedSourceAccess, SourceConnectorKind, SourceEntry, SourceMetadata,
-    StagingStrategy, UsageDelta, VersionKey, VersionSourceBinding,
+use aruna_core::structs::execution::offered_directory::{
+    OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
-use aruna_core::types::{GroupId, Key, NodeId, TxnId, UserId};
+use aruna_core::structs::execution::source_access::{
+    ResolvedSourceAccess, SourceEntry, SourceMetadata,
+};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
+};
+use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::types::{GroupId, Key, TxnId};
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -67,7 +75,7 @@ pub struct ObservedFile {
     pub version_id: Ulid,
     /// The stat the listing read, for the decisions that need more than the
     /// fingerprint it was folded into.
-    pub stat: Option<aruna_core::structs::FileStat>,
+    pub stat: Option<aruna_core::structs::execution::offered_directory::FileStat>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,17 +146,14 @@ pub async fn guard_bucket_write(
 }
 
 /// Registers `root` as a read-only bucket and mints one reference version per
-/// file it currently holds. Re-offering the same bucket refreshes the inventory:
-/// unchanged files keep their version, changed ones gain a successor and files
-/// that vanished are tombstoned.
+/// file. Re-offering refreshes the inventory: unchanged files keep their version,
+/// changed ones gain a successor, and vanished files are tombstoned.
 pub async fn offer_directory(
     context: &DriverContext,
     input: OfferDirectoryInput,
 ) -> Result<OfferDirectoryResult, OfferedDirectoryError> {
     check_root(context, &input.root).await?;
-    // The whole walk happens before anything is written, so an offer over the
-    // file cap is refused whole instead of leaving a bucket and half an
-    // inventory behind.
+    // Finish the walk before writes so exceeding the cap cannot leave a partial inventory.
     let entries = walk_root(context, &input.root).await?;
     register_bucket(context, &input).await?;
 
@@ -215,12 +220,9 @@ pub async fn list_offers(
     }
 }
 
-/// Withdraws one offer: the registration goes first, then every observation it
-/// made becomes a delete marker. Answers how many live objects it removed.
-///
-/// The registration is what a read resolves the root through, so an interrupted
-/// sweep still leaves the bucket unservable rather than half-offered. A realm
-/// node that references an offered version can no longer resolve it.
+/// Withdraws one offer: registration first, then observations become delete
+/// markers (returning the live count removed). An interrupted sweep leaves the
+/// bucket unservable, and referencing realm nodes can no longer resolve versions.
 pub async fn withdraw_offer(
     context: &DriverContext,
     input: WithdrawOfferInput,
@@ -304,9 +306,12 @@ fn millis_since_epoch(time: SystemTime) -> Option<u64> {
 /// an incomplete fingerprint, which never stands in for reading the bytes.
 fn entry_fingerprint(entry: &SourceEntry) -> String {
     let stat = entry.stat.unwrap_or_else(|| {
-        aruna_core::structs::FileStat::partial(entry.size.unwrap_or_default(), entry.modified)
+        aruna_core::structs::execution::offered_directory::FileStat::partial(
+            entry.size.unwrap_or_default(),
+            entry.modified,
+        )
     });
-    aruna_core::structs::weak_fingerprint(&stat)
+    aruna_core::structs::execution::offered_directory::weak_fingerprint(&stat)
 }
 
 fn entry_metadata(entry: &SourceEntry) -> SourceMetadata {
@@ -375,7 +380,7 @@ async fn send_source_effect(
         .blob_handle
         .as_ref()
         .ok_or(OfferedDirectoryError::HandleMissing)?;
-    match blob_handle.send_staging_source_effect(effect).await {
+    match blob_handle.send_staging_effect(effect).await {
         Event::StagingSource(event) => Ok(event),
         _ => Err(StagingSourceError::InvalidEffect.into()),
     }
@@ -406,14 +411,9 @@ async fn register_bucket(
             },
         );
         match drive(operation, context).await {
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(error))) | Err(error) => {
+            Ok(_) => {}
+            Err(error) => {
                 return Err(OfferedDirectoryError::Bucket(error));
-            }
-            Ok(None) => {
-                return Err(
-                    StorageError::WriteError("bucket creation did not finish".to_string()).into(),
-                );
             }
         }
     }
@@ -488,7 +488,7 @@ async fn observe(
     let version_id = Ulid::generate();
     let now = SystemTime::now();
     let next = CurrentVersionPointer::next_for(pointer.as_ref(), version_id)?;
-    for effect in build_head_transition_effects(
+    for effect in build_transition_effects(
         &HeadAliasContext::new(
             input.realm_id,
             input.group_id,
@@ -504,7 +504,7 @@ async fn observe(
     }
     apply(
         context,
-        write_blob_version_effect(
+        write_version_effect(
             &VersionKey::new(&input.bucket, &entry.path, version_id),
             &BlobVersion::reference(binding.clone(), metadata.clone(), now, input.user_id, now),
             Some(txn_id),
@@ -512,9 +512,7 @@ async fn observe(
     )
     .await?;
 
-    // An offered bucket charges what it currently offers: the observation this
-    // one replaces describes content the file no longer has, so its bytes are
-    // released instead of staying charged.
+    // Charge the current observation and release bytes from the replaced content.
     let live = existing.filter(|version| !version.is_deleted());
     let mut usage = UsageCounterUpdate::for_group(
         input.group_id,
@@ -643,7 +641,7 @@ async fn tombstone(
     let version_id = Ulid::generate();
     let now = SystemTime::now();
     let next = CurrentVersionPointer::next_for(pointer.as_ref(), version_id)?;
-    for effect in build_head_transition_effects(
+    for effect in build_transition_effects(
         &HeadAliasContext::new(
             scope.realm_id,
             scope.group_id,
@@ -659,7 +657,7 @@ async fn tombstone(
     }
     apply(
         context,
-        write_blob_version_effect(
+        write_version_effect(
             &VersionKey::new(&scope.bucket, key, version_id),
             &BlobVersion::deleted(now, scope.user_id),
             Some(txn_id),
@@ -838,9 +836,9 @@ async fn commit(context: &DriverContext, txn_id: TxnId) -> Result<(), OfferedDir
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
-    use crate::staging::test_utils::setup_driver_context;
-    use aruna_core::structs::{UsageCounters, usage_group_key};
+    use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
+    use crate::tests::staging::setup_driver_context;
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
     use futures_util::StreamExt;
 
     fn input(bucket: &str, root: &str) -> OfferDirectoryInput {
@@ -883,9 +881,7 @@ mod tests {
             context,
         )
         .await
-        .expect("get must run")
-        .expect("get must finish")
-        .expect("get must succeed");
+        .expect("get must run");
 
         let mut body = Vec::new();
         let mut blob = read.blob.0;
@@ -919,13 +915,8 @@ mod tests {
         let context = &fixture.driver_context;
         let root = tempfile::tempdir().expect("root must be created");
         let offer = input("taken", root.path().to_str().expect("utf-8 root"));
-        crate::staging::test_utils::create_test_bucket(
-            context,
-            offer.group_id,
-            offer.user_id,
-            "taken",
-        )
-        .await;
+        crate::tests::staging::create_test_bucket(context, offer.group_id, offer.user_id, "taken")
+            .await;
 
         assert_eq!(
             offer_directory(context, offer).await,

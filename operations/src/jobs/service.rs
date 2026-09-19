@@ -1,19 +1,30 @@
+//! Provides the job service calls that submit, list, read, and delete jobs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::UserId;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    ArtifactRef, AuthContext, CopyJobSpec, DEFAULT_SHARD_COUNT, ExecutionSpec, ExportRoCrateSpec,
-    FIRST_GRANTABLE_HANDLE, ImportRoCrateSpec, JobId, JobOwnerError, JobPayload, JobRecord,
-    JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, MintPersistentIdSpec, OutputDestination,
-    Permission, RealmId, RunCrateStatus, SessionReportDetail, SessionReportRow,
-    StagingJobCheckpoint, StagingJobSpec, StoragePurgeSpec, WorkspaceMode, pid_dedup_key,
-    shard_for_subject, user_dedup_key,
+use aruna_core::structs::MintPersistentSpec;
+use aruna_core::structs::execution::job::{
+    ArtifactRef, CopyJobSpec, ExecutionSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId,
+    JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
+    RunCrateStatus, SessionReportDetail, SessionReportRow, StagingJobCheckpoint, StagingJobSpec,
+    WorkspaceMode, pid_dedup_key, user_dedup_key,
 };
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::{JobOwnerError, RealmId};
+use aruna_core::structs::placement::record::{
+    DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
+};
+use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{NodeId, UserId, Value};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::Value;
 use bytes::Bytes;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
@@ -22,26 +33,26 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 
-use super::JOB_REPORT_MAX_ROWS;
+use super::REPORT_MAX_ROWS;
 use super::protocol::{JobRequest, JobResponse, JobRouteError, WireRange, send_job_request};
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
 use super::store::{
     CancelRequestOutcome, JobMutationError, RunDelete, delete_finished_run, find_dedup_plan,
-    list_job_entries, list_jobs_for_user, read_artifact_tombstone, read_job_record,
-    read_run_crate_status, set_cancel_requested,
+    list_job_entries, list_user_jobs, read_artifact_tombstone, read_crate_status, read_job_record,
+    set_cancel_requested,
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
-    schedule_job_drain_effect,
+    schedule_drain_effect,
 };
-use super::workflow::finalize_followups;
+use super::workflow::finalize::finalize_followups;
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::get_metadata_document::load_metadata_record_by_document;
 use crate::metadata::api::load_realm_config;
+use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
-use crate::request_authorization::{AuthorizeError, authorize};
-use crate::request_policy::PolicyRequestExtras;
 
 use super::lifecycle::cancel::cancel_family;
 use super::lifecycle::ids::session_of;
@@ -77,14 +88,14 @@ pub(crate) async fn mint_local_job(
     let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
-    mint_local_job_from_config(&config, owner_node_id, subject)
+    mint_configured_job(&config, owner_node_id, subject)
 }
 
 /// Synchronous form used by producer transactions that already fenced and read
 /// the realm config. The resulting job id and dedup shard can therefore be
 /// written atomically with the producer's own records.
-pub(crate) fn mint_local_job_from_config(
-    config: &aruna_core::structs::RealmConfigDocument,
+pub(crate) fn mint_configured_job(
+    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     owner_node_id: NodeId,
     subject: &[u8],
 ) -> Result<JobId, SubmitJobError> {
@@ -126,15 +137,16 @@ pub(crate) async fn submit_local_job(
 
 /// Normalizes one execution request and enforces every bound that holds
 /// regardless of where the job runs: composition, the shared output bound, and
-/// the workspace rules. It is the single gate both the local and the
-/// distributed submission path pass through.
+/// the workspace rules. The single gate both submission paths pass through.
 pub(crate) fn validate_execution(
     spec: &mut ExecutionSpec,
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<&str>,
 ) -> Result<(), SubmitJobError> {
-    spec.inputs =
-        aruna_core::structs::plan_composition(spec.inputs.clone(), spec.collision_policy)?;
+    spec.inputs = aruna_core::structs::execution::job::plan_composition(
+        spec.inputs.clone(),
+        spec.collision_policy,
+    )?;
     // Nothing copies an input into a bucket any more, so one that names no
     // container path would reach nobody.
     if let Some(input) = spec
@@ -204,11 +216,9 @@ pub(crate) fn validate_execution(
     Ok(())
 }
 
-/// Submit a container execution job on behalf of `created_by`. The drain claims it
+/// Submit a container execution job on behalf of `created_by`; the drain claims it
 /// and drives the fenced external attempt lifecycle. The idempotency key is
-/// namespaced per user, disjoint from internal obligation keys. `active_cap`
-/// bounds the user's unfinished execution jobs on this node inside the
-/// admitting transaction.
+/// user-namespaced, and `active_cap` is enforced inside the admitting transaction.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_execution_job(
     context: &DriverContext,
@@ -301,7 +311,7 @@ pub async fn submit_copy_job(
     .await
 }
 
-pub async fn submit_storage_purge_job(
+pub async fn submit_purge_job(
     context: &DriverContext,
     spec: StoragePurgeSpec,
     owner_node_id: NodeId,
@@ -336,18 +346,16 @@ pub async fn submit_storage_purge_job(
 }
 
 /// Register a w3id PID for a document as a fenced job on the document's PID
-/// authority. The dedup key names the document and is indexed without the
-/// submitting user, so a concurrent re-mint by another authorized user joins the
-/// same job; routing it to the one authority is what makes that hold across
-/// ingress nodes. The job record still carries the real requester.
+/// authority. The dedup key names the document without the submitting user, so a
+/// concurrent re-mint by another user joins the same job across ingress nodes.
 pub async fn submit_mint_pid(
     context: &Arc<DriverContext>,
-    spec: MintPersistentIdSpec,
+    spec: MintPersistentSpec,
     local_node_id: NodeId,
     retention_ms: u64,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    let (job_id, created) = crate::metadata::forward::submit_pid_routed(
+    let (job_id, created) = crate::metadata::persistent_id::forward::submit_pid_routed(
         context,
         spec.document_id,
         spec.minted_by,
@@ -375,7 +383,7 @@ fn pid_submit_error(error: crate::metadata::api::MetadataApiError) -> SubmitJobE
 /// job-control binding, so the dedup row and the execution share one owner.
 pub(crate) async fn submit_mint_local(
     context: &DriverContext,
-    spec: MintPersistentIdSpec,
+    spec: MintPersistentSpec,
     owner_node_id: NodeId,
     retention_ms: u64,
 ) -> Result<SubmitJobResult, SubmitJobError> {
@@ -507,11 +515,11 @@ pub async fn submit_export_job(
 }
 
 /// Read the run-crate obligation status surfaced alongside an execution job.
-pub async fn read_job_run_crate_status(
+pub async fn read_crate_obligation(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<RunCrateStatus>, String> {
-    read_run_crate_status(&context.storage_handle, job_id).await
+    read_crate_status(&context.storage_handle, job_id).await
 }
 
 /// Node-local listing: returns only jobs owned by the serving node (every job
@@ -524,7 +532,7 @@ pub async fn list_owned_jobs(
     limit: usize,
     filter: impl Fn(&JobRecord) -> bool,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    list_jobs_for_user(&context.storage_handle, user_id, cursor, limit, filter).await
+    list_user_jobs(&context.storage_handle, user_id, cursor, limit, filter).await
 }
 
 /// Removes the caller's finished run from this node's lists; see [`delete_finished_run`].
@@ -558,7 +566,7 @@ pub async fn read_record_routed(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<Option<JobRecord>, JobRouteError> {
     Ok(route_record(context, user_id, job_id, auth_token)
         .await?
@@ -570,7 +578,7 @@ pub async fn read_staging_routed(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<Option<(JobRecord, Option<StagingJobCheckpoint>)>, JobRouteError> {
     route_record(context, user_id, job_id, auth_token).await
 }
@@ -594,7 +602,7 @@ async fn route_record(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<Option<(JobRecord, Option<StagingJobCheckpoint>)>, JobRouteError> {
     let Some(net) = context.net_handle.as_ref() else {
         return read_record_data(context, user_id, job_id)
@@ -629,9 +637,8 @@ async fn route_record(
     }
 }
 
-/// Derives the immutable owner from the JobId alone: replicated placement
-/// state is the only input, so resolution never asks another node and can
-/// never be stranded by a placement rebalance. A missing or unsynced binding is
+/// Derives the immutable owner from the JobId alone using replicated placement
+/// state, so resolution never asks another node. A missing or unsynced binding is
 /// `Unavailable` (503); only a provably invalid id maps to `NotFound`.
 pub(crate) async fn resolve_job_owner(
     context: &DriverContext,
@@ -675,7 +682,7 @@ pub(crate) async fn local_status(
         .await
         .map_err(JobRouteError::Internal)?
         .ok_or(JobRouteError::NotFound)?;
-    let run_crate = read_job_run_crate_status(context, job_id)
+    let run_crate = read_crate_obligation(context, job_id)
         .await
         .map_err(JobRouteError::Internal)?
         .map(|status| status.to_public_json());
@@ -686,7 +693,7 @@ pub(crate) async fn local_status(
 }
 
 /// The caller's own job, or the PID mint job it joined. A joined job is served as
-/// the caller's own — the record is rewritten onto the caller — so the handle the
+/// the caller's own (its record is rewritten onto the caller), so the handle the
 /// mint route returned is inspectable without disclosing the first submitter.
 async fn readable_job(
     context: &DriverContext,
@@ -713,7 +720,7 @@ async fn joined_pid_job(
     let JobPayload::MintPersistentId(spec) = &record.payload else {
         return Ok(None);
     };
-    let Some(document) = load_metadata_record_by_document(context, spec.document_id)
+    let Some(document) = load_document_record(context, spec.document_id)
         .await
         .map_err(|error| format!("{error:?}"))?
     else {
@@ -743,7 +750,7 @@ pub async fn read_job_routed(
     context: &DriverContext,
     auth: &AuthContext,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<RoutedJobStatus, JobRouteError> {
     let user_id = auth.user_id;
     // An external job is answered from the family projection, which any node
@@ -824,7 +831,7 @@ pub async fn read_owned_report(
     if expected_digest.is_some_and(|expected| expected != report_digest) {
         return Ok(JobReportLookup::CursorConflict);
     }
-    let limit = limit.clamp(1, usize::from(JOB_REPORT_MAX_ROWS));
+    let limit = limit.clamp(1, usize::from(REPORT_MAX_ROWS));
     let (rows, next_key) =
         list_job_entries(&context.storage_handle, job_id, last_key, limit).await?;
     Ok(JobReportLookup::Ready {
@@ -875,7 +882,7 @@ pub async fn read_report_routed(
     expected_digest: Option<[u8; 32]>,
     last_key: Option<Vec<u8>>,
     limit: usize,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<JobReportLookup, JobRouteError> {
     let job_id = if family_of_alias(context, job_id).await?.is_some() {
         match super::lifecycle::routing::session_job(context, user_id, job_id).await {
@@ -892,7 +899,7 @@ pub async fn read_report_routed(
             .await
             .map_err(JobRouteError::Internal);
     };
-    let wire_limit = u16::try_from(limit.min(usize::from(JOB_REPORT_MAX_ROWS)))
+    let wire_limit = u16::try_from(limit.min(usize::from(REPORT_MAX_ROWS)))
         .map_err(|error| JobRouteError::Internal(error.to_string()))?;
     let request = auth_token.map(|auth_token| JobRequest::Report {
         auth_token,
@@ -1013,7 +1020,7 @@ pub async fn read_owned_artifact(
         return Err("artifact record does not match its blob location".to_string());
     }
     let document_path =
-        crate::get_metadata_document::load_metadata_record_by_document(context, spec.document_id)
+        crate::metadata::get_document::load_document_record(context, spec.document_id)
             .await
             .map_err(|error| match error {
                 StorageReadError::Storage(error) => error.to_string(),
@@ -1036,7 +1043,7 @@ pub async fn read_artifact_routed(
     job_id: JobId,
     now_ms: u64,
     range: Option<Range<u64>>,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<(ArtifactLookup, Option<ArtifactRead>), JobRouteError> {
     if context.net_handle.is_none() {
         let lookup = read_owned_artifact(context, user_id, job_id, now_ms)
@@ -1239,7 +1246,7 @@ async fn family_cancel(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Option<Result<RoutedCancelOutcome, JobRouteError>> {
     let auth = AuthContext {
         user_id,
@@ -1270,7 +1277,7 @@ pub async fn cancel_job_routed(
     runtime: &JobsRuntime,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::MetadataAuthToken>,
+    auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<RoutedCancelOutcome, JobRouteError> {
     let Some(net) = context.net_handle.as_ref() else {
         return cancel_owned_job(context, runtime, user_id, job_id)
@@ -1357,7 +1364,7 @@ fn artifact_job_matches(artifact: &OwnedArtifact, user_id: UserId, job_id: JobId
 pub(crate) async fn kick_drain(context: &DriverContext) {
     if let Some(task_handle) = context.task_handle.as_ref()
         && let Event::Task(TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(schedule_job_drain_effect()).await
+            task_handle.send_effect(schedule_drain_effect()).await
     {
         warn!(message = %message, "Failed to kick job drain");
     }
@@ -1367,10 +1374,12 @@ pub(crate) async fn kick_drain(context: &DriverContext) {
 mod tests {
     use super::super::store::{insert_job, preserve_artifact_tombstone, read_job_record};
     use super::*;
-    use aruna_core::structs::{
-        AuthContext, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-        ImportRoCrateTarget, JobState, RealmId, RoCrateLimits,
+    use aruna_core::structs::execution::job::{
+        ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
+        JobState, RoCrateLimits,
     };
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -1409,10 +1418,12 @@ mod tests {
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: (0..=MAX_EXECUTION_OUTPUTS)
-                .map(|index| aruna_core::structs::WorkspaceOutput {
-                    container_path: format!("/out/{index}"),
-                    dest_key: format!("out/{index}"),
-                })
+                .map(
+                    |index| aruna_core::structs::execution::job::WorkspaceOutput {
+                        container_path: format!("/out/{index}"),
+                        dest_key: format!("out/{index}"),
+                    },
+                )
                 .collect(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
@@ -1477,15 +1488,15 @@ mod tests {
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
-            inputs: vec![aruna_core::structs::InputSelection {
-                source: aruna_core::structs::InputSource::S3 {
+            inputs: vec![aruna_core::structs::execution::job::InputSelection {
+                source: aruna_core::structs::execution::job::InputSource::S3 {
                     bucket: "data".to_string(),
                     key: "in.txt".to_string(),
                     version_id: None,
                 },
                 source_node_id: None,
                 dest_key: "in.txt".to_string(),
-                mode: aruna_core::structs::InputMode::Snapshot,
+                mode: aruna_core::structs::execution::job::InputMode::Snapshot,
                 container_path: None,
                 name: None,
                 description: None,
@@ -1522,7 +1533,7 @@ mod tests {
             resources: Default::default(),
             executor_constraint: None,
             inputs: Vec::new(),
-            file_outputs: vec![aruna_core::structs::OutputSelection {
+            file_outputs: vec![aruna_core::structs::execution::job::OutputSelection {
                 container_path: "/out/result.txt".to_string(),
                 path_prefix: None,
                 destination: OutputDestination::S3 {
@@ -1533,7 +1544,7 @@ mod tests {
                 name: None,
                 description: None,
             }],
-            workspace_outputs: vec![aruna_core::structs::WorkspaceOutput {
+            workspace_outputs: vec![aruna_core::structs::execution::job::WorkspaceOutput {
                 container_path: "/result.txt".to_string(),
                 dest_key: "result.txt".to_string(),
             }],

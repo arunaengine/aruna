@@ -1,12 +1,16 @@
-//! Directed network cost and ranking. An unknown value makes a target rank
-//! worse; it never becomes capacity the target did not advertise.
+//! Routes each pinned input to a candidate and scores it from directed link bandwidth.
+//! An unknown link makes a target rank worse, never adds capacity it did not advertise.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::NodeId;
 use crate::compute::ExecutorCapability;
 use crate::compute::ResourceEnvelope;
 use crate::scheduling::eligibility::allows;
 use crate::scheduling::inputs::{PlanRequest, ResolvedInput, TargetCandidate, TargetScore};
-use crate::structs::{DEFAULT_LOCATION, PlacementSubject, RealmComputeConfig};
+use crate::structs::placement::compute_config::RealmComputeConfig;
+use crate::structs::placement::policy::PlacementSubject;
+use crate::structs::placement::record::DEFAULT_LOCATION;
 use std::collections::BTreeMap;
 
 /// Rank value of an unknown or stale ranking hint: as bad as a fully loaded
@@ -47,15 +51,10 @@ impl<'a> LinkIndex<'a> {
             links: config
                 .links
                 .iter()
-                .map(|link| {
-                    (
-                        (link.from.trim(), link.to.trim()),
-                        link.bandwidth_bytes_per_sec,
-                    )
-                })
+                .map(|link| ((link.from.trim(), link.to.trim()), link.bandwidth_per_sec))
                 .collect(),
-            pessimistic: config.pessimistic_bandwidth_bytes_per_sec.max(1),
-            stale_after_ms: config.availability_stale_after_ms,
+            pessimistic: config.pessimistic_per_sec.max(1),
+            stale_after_ms: config.availability_stale_ms,
         }
     }
 

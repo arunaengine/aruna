@@ -1,4 +1,6 @@
-//! Storage shape of the device-local synced folders.
+//! Holds the storage shape and row helpers for the device-local synced folder state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
@@ -6,14 +8,15 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    SYNC_ACTION_LOG_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE,
-    SYNCED_FOLDER_KEYSPACE,
+    SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::structs::{SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Key, TxnId, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+
+use crate::device::backlog::RetryView;
 
 /// Folders one device may bind. A device serves one person's machine, so this
 /// is a human-sized list rather than an inventory.
@@ -70,17 +73,11 @@ impl SyncUpload {
     }
 
     pub fn is_due(&self, now_ms: u64) -> bool {
-        match &self.state {
-            UploadState::Pending { due_at_ms, .. } => *due_at_ms <= now_ms,
-            UploadState::Failed { .. } => false,
-        }
+        self.state.is_due(now_ms)
     }
 
     pub fn attempts(&self) -> u32 {
-        match &self.state {
-            UploadState::Pending { attempts, .. } => *attempts,
-            UploadState::Failed { .. } => 0,
-        }
+        self.state.attempts()
     }
 }
 
@@ -130,7 +127,7 @@ pub fn base_entry(
 
 pub fn upload_entry(upload: &SyncUpload) -> Result<(String, Key, Value), ConversionError> {
     Ok((
-        SYNC_UPLOAD_OUTBOX_KEYSPACE.to_string(),
+        SYNC_UPLOAD_KEYSPACE.to_string(),
         base_key(upload.folder_id, &upload.relative),
         ByteView::from(upload.to_bytes()?),
     ))
@@ -142,18 +139,10 @@ pub fn action_entry(record: &SyncActionRecord) -> Result<(String, Key, Value), C
     let mut key = record.folder_id.to_bytes().to_vec();
     key.extend_from_slice(&record.action_id.to_bytes());
     Ok((
-        SYNC_ACTION_LOG_KEYSPACE.to_string(),
+        SYNC_LOG_KEYSPACE.to_string(),
         ByteView::from(key),
         ByteView::from(record.to_bytes()?),
     ))
-}
-
-pub fn read_folder(folder_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: SYNCED_FOLDER_KEYSPACE.to_string(),
-        key: folder_key(folder_id),
-        txn_id,
-    })
 }
 
 pub fn scan_folders(start_after: Option<Key>, txn_id: Option<TxnId>) -> Effect {
@@ -279,7 +268,7 @@ pub(crate) async fn abort_txn(context: &Arc<crate::driver::DriverContext>, txn_i
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{base_key, key_path};
     use ulid::Ulid;
 

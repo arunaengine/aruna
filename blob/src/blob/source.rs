@@ -1,9 +1,13 @@
+//! Runs staging source effects: check, head, read and list against a resolved source access.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::BlobHandler;
 use crate::opendal::{
     check_staging_source, head_staging_source, list_staging_source, read_staging_source,
 };
 use aruna_core::events::StagingSourceEvent;
-use aruna_core::structs::ResolvedSourceAccess;
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 
 impl BlobHandler {
     pub(crate) async fn check_staging_source(

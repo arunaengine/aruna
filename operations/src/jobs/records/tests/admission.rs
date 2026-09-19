@@ -1,15 +1,17 @@
-//! Admission is decided against this node's own view and evidence only.
+//! Tests that admission decides only from this node's stored evidence and holder view.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
 };
 
-use super::fixture::{Family, node, secret};
 use crate::jobs::records::admit::{Admission, FamilyState, plan_append, relayable};
 use crate::jobs::records::rows::{PendingNeed, PendingRecord};
 use crate::jobs::records::verify::FamilyView;
+use crate::tests::records::{Family, node, secret};
 
 type Stored = BTreeMap<JobRecordKey, JobRecordEnvelope>;
 
@@ -156,9 +158,10 @@ fn retains_non_holder() {
     // Holder authority is view-relative: a member this view does not rank is
     // retained and judged again, never projected and never dropped.
     let mut family = Family::new([5u8; 32]);
-    family
-        .config
-        .ensure_node(node(7), aruna_core::structs::RealmNodeKind::Server);
+    family.config.ensure_node(
+        node(7),
+        aruna_core::structs::identity::realm::RealmNodeKind::Server,
+    );
     let view = family.view();
     assert!(view.is_member(node(7)) && !view.holds(node(7)));
     let member = secret(7);
@@ -262,7 +265,7 @@ fn waits_for_predecessor() {
         &receipt,
         1,
         [9u8; 32],
-        aruna_core::structs::PhysicalExecutionState::Running,
+        aruna_core::structs::execution::job::PhysicalExecutionState::Running,
         None,
     );
     let candidate = family.sign(&family.target, JobFamilyRecord::Update(Box::new(update)));

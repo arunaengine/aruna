@@ -1,10 +1,16 @@
+//! Adopts a lost external attempt by name and resolves it from backend evidence.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::{Arc, Weak};
 
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, ExecutorKind, FenceContext, ReconcileEvidence,
 };
-use aruna_core::structs::{ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::structs::execution::job::{
+    ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState,
+};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -12,14 +18,14 @@ use tracing::{info, warn};
 use super::super::reconcile::ExternalReconciler;
 use super::super::runtime::JobsRuntime;
 use super::super::store::{
-    AdoptOutcome, adopt_external_attempt, handoff_external_attempt, read_job_record,
-    record_attempt_started, record_attempt_tombstone, release_job, transition_external_to_running,
+    AdoptOutcome, adopt_external_attempt, begin_external_running, handoff_external_attempt,
+    read_job_record, record_attempt_started, record_attempt_tombstone, release_job,
 };
-use super::{
-    DEFAULT_WALLTIME, build_task_spec, fail_and_crate, finalize_attempt, finalize_cancel,
-    job_bucket, park_attempt, prepare_inputs, requeue_after_tombstone, supervise_and_finalize,
-    with_execution_heartbeat,
-};
+use super::DEFAULT_WALLTIME;
+use super::finalize::{fail_and_crate, finalize_attempt, finalize_cancel};
+use super::prepare::{build_task_spec, job_bucket, prepare_inputs};
+use super::recovery::{park_attempt, requeue_after_tombstone};
+use super::supervise::{supervise_and_finalize, with_execution_heartbeat};
 use crate::driver::DriverContext;
 
 /// The real Stage-0 reconcile seam: a lost external attempt is adopted by name and
@@ -84,9 +90,8 @@ impl ExternalReconciler for ComputeReconciler {
             .and_then(|registry| registry.get(&kind))
             .cloned()
         else {
-            // A node without this backend cannot observe the attempt: charging here
-            // would terminalize a healthy container it can never see. Hand it back
-            // with an expired lease so a node that has the backend can reconcile it.
+            // A node without this backend cannot observe the attempt, so charging would
+            // terminalize a healthy container: hand it back with an expired lease instead.
             warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; handing back");
             if let Err(error) =
                 handoff_external_attempt(storage, job_id, token, unix_timestamp_millis()).await
@@ -164,7 +169,7 @@ impl ExternalReconciler for ComputeReconciler {
                 if !matches!(evidence.status.phase, AttemptPhase::Submitted)
         ) && matches!(adopted.state, JobState::Indeterminate | JobState::Ready)
         {
-            let running = match transition_external_to_running(
+            let running = match begin_external_running(
                 storage,
                 job_id,
                 token,
@@ -323,7 +328,7 @@ impl ComputeReconciler {
     #[allow(clippy::too_many_arguments)]
     async fn resume(
         &self,
-        job_id: aruna_core::structs::JobId,
+        job_id: aruna_core::structs::execution::job::JobId,
         token: ulid::Ulid,
         backend: Arc<dyn aruna_compute::ExecutorBackend>,
         fence: FenceContext,
@@ -366,7 +371,7 @@ impl ComputeReconciler {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn resume_attempt(
     context: Arc<DriverContext>,
-    job_id: aruna_core::structs::JobId,
+    job_id: aruna_core::structs::execution::job::JobId,
     token: ulid::Ulid,
     backend: Arc<dyn aruna_compute::ExecutorBackend>,
     fence: FenceContext,
@@ -471,7 +476,7 @@ pub(super) async fn resume_attempt(
                 {
                     return false;
                 }
-                let running = match transition_external_to_running(
+                let running = match begin_external_running(
                     &context.storage_handle,
                     job_id,
                     token,
@@ -506,7 +511,7 @@ pub(super) async fn resume_attempt(
 
 async fn fail_or_park(
     context: &Arc<DriverContext>,
-    job_id: aruna_core::structs::JobId,
+    job_id: aruna_core::structs::execution::job::JobId,
     token: ulid::Ulid,
     record: &JobRecord,
     error: JobError,
@@ -518,7 +523,7 @@ async fn fail_or_park(
     }
 }
 
-fn holder(context: &DriverContext) -> aruna_core::types::NodeId {
+fn holder(context: &DriverContext) -> aruna_core::id::NodeId {
     context
         .net_handle
         .as_ref()
@@ -531,11 +536,13 @@ mod tests {
     use super::*;
     use crate::jobs::JOB_MAX_ATTEMPTS;
     use crate::jobs::store::{insert_job, record_attempt_intent};
-    use crate::jobs::workflow::tests::{execution_spec, node_id};
+    use crate::tests::workflow::{execution_spec, node_id};
     use aruna_compute::ExecutorRegistry;
-    use aruna_core::structs::{AttemptIntent, FIRST_GRANTABLE_HANDLE, JobClaim, JobId, RealmId};
+    use aruna_core::UserId;
+    use aruna_core::structs::execution::job::{AttemptIntent, JobClaim, JobId};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
-    use aruna_core::types::UserId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -578,7 +585,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(7),
             claim_token: token,
-            lease_expires_at_ms: 1,
+            lease_expires_ms: 1,
         });
         insert_job(&storage, &record).await.unwrap();
         record_attempt_intent(

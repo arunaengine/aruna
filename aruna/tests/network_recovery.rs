@@ -1,3 +1,7 @@
+//! Tests that a realm survives a peer outage and recovers its connections and metadata.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![recursion_limit = "256"]
 
 mod shared;
@@ -7,17 +11,17 @@ use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::realm_presence_key;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_tasks::TaskHandle;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
-    TestResult, create_bearer_token, create_group_via_http, create_onboarding_secret_via_http,
-    shutdown_pair, spawn_full_joiner_node, spawn_full_seed_node, wait_for_realm_nodes, wait_until,
+    TestResult, create_bearer_token, create_group_http, create_onboarding_secret, shutdown_pair,
+    spawn_complete_joiner, spawn_complete_seed, wait_realm_nodes, wait_until,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,9 +80,9 @@ async fn rejoin_peer(
         temporary_bootstrap_active: false,
         discovery_method: DiscoveryMethod::None,
         relay_method: RelayMethod::None,
-        max_concurrent_uni_streams: joiner.config.max_concurrent_uni_streams,
-        max_concurrent_bidi_streams: joiner.config.max_concurrent_bidi_streams,
-        document_sync_storage_path: Some(directory.path().join("document-sync")),
+        max_uni_streams: joiner.config.max_uni_streams,
+        max_bidi_streams: joiner.config.max_bidi_streams,
+        sync_storage_path: Some(directory.path().join("document-sync")),
         document_sync_runtime: Some(joiner.config.document_sync_runtime),
         fjall_persist_policy: joiner.config.fjall_persist_policy,
     };
@@ -105,7 +109,7 @@ async fn rejoin_peer(
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });
-    initialize_net_incoming(context.clone());
+    initialize_incoming_fixture(context.clone());
     peer.add_peer_addr(seed.net.endpoint_addr()).await;
     seed.net.add_peer_addr(peer.endpoint_addr()).await;
     Ok(RejoinedPeer {
@@ -231,11 +235,10 @@ async fn check_recovery(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn realm_outage_recovers() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+    let seed = spawn_complete_seed().await?;
     let onboarding =
-        create_onboarding_secret_via_http(&seed, aruna_core::onboarding::OnboardingMode::Server)
-            .await?;
-    let joiner = spawn_full_joiner_node(&seed, onboarding).await?;
+        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server).await?;
+    let joiner = spawn_complete_joiner(&seed, onboarding).await?;
     let result = async {
         let token = create_bearer_token(
             seed.context.as_ref(),
@@ -244,13 +247,13 @@ async fn realm_outage_recovers() -> TestResult<()> {
             seed.capabilities.clone(),
         )
         .await?;
-        wait_for_realm_nodes(
+        wait_realm_nodes(
             &[seed.context.as_ref(), joiner.context.as_ref()],
             &seed.realm_id,
             2,
         )
         .await?;
-        let group = create_group_via_http(&seed.base_url, &token, "network-recovery").await?;
+        let group = create_group_http(&seed.base_url, &token, "network-recovery").await?;
         check_healthy(&seed, &token).await?;
 
         let created = reqwest::Client::new()

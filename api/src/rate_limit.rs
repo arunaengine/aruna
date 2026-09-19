@@ -1,12 +1,12 @@
-//! Per-IP and per-principal token buckets shared by a request plane. Limits
-//! bound abuse, not normal use: quotas are generous and identical for every
-//! caller, and a denied request reports when to retry.
+//! Per-IP and per-principal request limits and local slot permits, with a retry time on denial.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::ErrorResponse;
 use crate::forwarded::client_ip;
-use crate::server_state::ServerState;
+use crate::server::state::ServerState;
 use aruna_core::UserId;
-use aruna_core::structs::AuthContext;
+use aruna_core::structs::identity::auth::AuthContext;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const IP_REQUESTS_PER_MINUTE: u32 = 6_000;
+const IP_REQUESTS_MINUTE: u32 = 6_000;
 const IP_BURST: u32 = 1_000;
-const PRINCIPAL_REQUESTS_PER_MINUTE: u32 = 3_000;
+const PRINCIPAL_REQUESTS_MINUTE: u32 = 3_000;
 const PRINCIPAL_BURST: u32 = 500;
 /// Every N checks the keyed stores drop entries that are fully replenished.
 const MAINTENANCE_INTERVAL: u64 = 4_096;
@@ -161,9 +161,9 @@ pub struct ApiRateLimits {
 impl Default for ApiRateLimits {
     fn default() -> Self {
         Self::new(
-            IP_REQUESTS_PER_MINUTE,
+            IP_REQUESTS_MINUTE,
             IP_BURST,
-            PRINCIPAL_REQUESTS_PER_MINUTE,
+            PRINCIPAL_REQUESTS_MINUTE,
             PRINCIPAL_BURST,
         )
     }
@@ -308,7 +308,7 @@ fn too_many_requests(retry_after: u64) -> Response {
 mod tests {
     use super::{ApiRateLimits, LOCAL_PERMITS, LOCAL_TABLE_LIMIT, LocalKey, LocalLease};
     use aruna_core::UserId;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use std::net::IpAddr;
     use std::str::FromStr;
     use ulid::Ulid;

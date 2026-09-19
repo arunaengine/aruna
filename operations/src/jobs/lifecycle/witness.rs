@@ -1,10 +1,7 @@
-//! Leaderless witness scheduling.
-//!
-//! Every current holder of a submission family is a witness. Each computes the
-//! same rank from the immutable identity, so the admitting node plans at once
-//! and later ranks only step in after their own persisted delay. No witness
-//! holds a lease, and a partition may therefore produce one execution per
-//! participating witness.
+//! Runs leaderless witness scheduling: every family holder ranks itself and may offer a launch.
+//! No witness holds a lease, so a partition can produce one execution per witness.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -13,17 +10,20 @@ use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, LaunchOfferEffect, NetEffect};
 use aruna_core::events::{Event, LaunchDecline, LaunchOfferEvent, NetEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    JOB_PLAN_EXPLAIN_KEYSPACE, JOB_WITNESS_DEADLINE_INDEX_KEYSPACE, JOB_WITNESS_DEADLINE_KEYSPACE,
+    DEADLINE_INDEX_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    PhysicalExecutionState, PlacementDecision, RealmConfigDocument, WitnessBudgetRecord,
+    PhysicalExecutionState, WitnessBudgetRecord,
 };
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::policy::PlacementDecision;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, Key, NodeId, TxnId};
+use aruna_core::types::{Effects, Key, TxnId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use tracing::{debug, info, warn};
@@ -41,7 +41,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
-use crate::node_info::read_node_info_document;
+use crate::node::node_info::read_info_document;
 
 /// Domain of the stable witness order.
 pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
@@ -79,15 +79,14 @@ pub struct WitnessExplain {
 /// Kicks the witness queue without persisting a timer of its own.
 pub fn schedule_witness_drain(after: Duration) -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::DrainJobWitnessQueue,
+        key: TaskKey::DrainWitnessQueue,
         after,
     })
 }
 
 /// Position of `node` in the witness order. The admitting node ranks first,
-/// because it already holds the request and every input decision it made; the
-/// remaining witnesses follow the domain-separated digest of the immutable
-/// identity, which is identical on every node and unbiasable by any publisher.
+/// because it already holds the request; remaining witnesses follow the
+/// domain-separated digest of the immutable identity, identical on every node.
 pub fn witness_rank(
     holders: &[NodeId],
     family: &JobFamilyId,
@@ -154,7 +153,7 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
         debug!(?family, "Node is not a witness for this family");
         return;
     };
-    let base = config.compute.witness_base_delay_ms;
+    let base = config.compute.witness_delay_ms;
     let due_at_ms = match rank {
         0 => now_ms,
         rank => now_ms + base * u64::from(rank) + jitter_ms(&family, local, base),
@@ -204,7 +203,7 @@ async fn admitting_node(context: &DriverContext, family: JobFamilyId) -> Option<
 pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bool {
     let (rows, mut remaining) = match iter_prefix_page(
         &context.storage_handle,
-        JOB_WITNESS_DEADLINE_KEYSPACE,
+        WITNESS_DEADLINE_KEYSPACE,
         None,
         None,
         WITNESS_DRAIN_BATCH,
@@ -267,7 +266,7 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, context, node};
+    use crate::tests::records::{Family, context, node};
 
     #[tokio::test]
     async fn keeps_later_deadlines() {
@@ -276,7 +275,7 @@ mod tests {
         let (_dir, ctx) = context(&fixture.config, fixture.holder.public()).await;
         for index in 0..=WITNESS_DRAIN_BATCH {
             let family = JobFamilyId {
-                submission_id: aruna_core::structs::SubmissionId([index as u8; 32]),
+                submission_id: aruna_core::structs::execution::job::SubmissionId([index as u8; 32]),
                 request_digest: [index as u8; 32],
             };
             assert!(
@@ -296,7 +295,7 @@ mod tests {
         assert!(drain_witness_deadlines(&ctx, 1).await);
         let (rows, _) = iter_prefix_page(
             &ctx.storage_handle,
-            JOB_WITNESS_DEADLINE_KEYSPACE,
+            WITNESS_DEADLINE_KEYSPACE,
             None,
             None,
             WITNESS_DRAIN_BATCH,
@@ -331,7 +330,7 @@ mod tests {
         );
         let (rows, _) = iter_prefix_page(
             &ctx.storage_handle,
-            JOB_WITNESS_DEADLINE_KEYSPACE,
+            WITNESS_DEADLINE_KEYSPACE,
             None,
             None,
             WITNESS_DRAIN_BATCH,
@@ -350,14 +349,14 @@ mod tests {
         else {
             panic!("expected shortened witness timer")
         };
-        assert_eq!(key, TaskKey::DrainJobWitnessQueue);
+        assert_eq!(key, TaskKey::DrainWitnessQueue);
         assert_eq!(after, Duration::from_secs(1));
     }
 
     #[test]
     fn deadlines_ordered() {
         let family = JobFamilyId {
-            submission_id: aruna_core::structs::SubmissionId([1; 32]),
+            submission_id: aruna_core::structs::execution::job::SubmissionId([1; 32]),
             request_digest: [2; 32],
         };
         assert!(deadline_key(&family, 1) < deadline_key(&family, 2));
@@ -443,17 +442,16 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     let Some(config) = load_realm_config(context, realm_id).await else {
         return RoundOutcome::Retry { after_ms: 1_000 };
     };
-    let base = config.compute.witness_base_delay_ms;
-    let window = config.compute.catch_up_after_ms;
+    let base = config.compute.witness_delay_ms;
+    let window = config.compute.catch_up_ms;
     let Some(view) = FamilyView::resolve(&config, realm_id, family) else {
         return RoundOutcome::Retry { after_ms: base };
     };
     if !view.holds(local) {
         return RoundOutcome::Done;
     }
-    // An incomplete family read is undecided evidence: a suppression, a
-    // cancellation, or an earlier launch may be in the part that did not load,
-    // so this round stores no budget and offers no launch.
+    // An incomplete family read is undecided evidence: a suppression, cancel or
+    // earlier launch may be in the unloaded part, so no budget and no offer.
     let records = match load_family_complete(context, family).await {
         Ok(records) => records,
         Err(error) => {
@@ -480,19 +478,16 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         })
         .collect();
     let sequence = mine.len() as u32;
-    let mut explain = read_row::<WitnessExplain>(
-        context,
-        JOB_PLAN_EXPLAIN_KEYSPACE,
-        &explain_key(&family, local),
-    )
-    .await
-    .unwrap_or(WitnessExplain {
-        sequence,
-        plan: empty_plan(),
-        declined: Vec::new(),
-        overlapping: false,
-        stored_at_ms: now_ms,
-    });
+    let mut explain =
+        read_row::<WitnessExplain>(context, PLAN_EXPLAIN_KEYSPACE, &explain_key(&family, local))
+            .await
+            .unwrap_or(WitnessExplain {
+                sequence,
+                plan: empty_plan(),
+                declined: Vec::new(),
+                overlapping: false,
+                stored_at_ms: now_ms,
+            });
     if let Some(envelope) = mine.iter().max_by_key(|envelope| match &envelope.record {
         JobFamilyRecord::Launch(launch) => launch.scheduler_seq,
         _ => 0,
@@ -560,7 +555,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     // has an auditable reason even if this node dies right after sending it.
     if write_row(
         context,
-        JOB_PLAN_EXPLAIN_KEYSPACE,
+        PLAN_EXPLAIN_KEYSPACE,
         &explain_key(&family, local),
         &explain,
     )
@@ -614,7 +609,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
 /// One launch offer round: the durable launch, its target, and the delays this
 /// witness answers with.
 struct Offer {
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     local: NodeId,
     family: JobFamilyId,
     frame: JobRecordFrame,
@@ -693,21 +688,19 @@ async fn record_decline(
     target: ExecutionTargetId,
 ) {
     let key = explain_key(family, local);
-    let Some(mut explain) =
-        read_row::<WitnessExplain>(context, JOB_PLAN_EXPLAIN_KEYSPACE, &key).await
+    let Some(mut explain) = read_row::<WitnessExplain>(context, PLAN_EXPLAIN_KEYSPACE, &key).await
     else {
         return;
     };
     if !explain.declined.contains(&target) && explain.declined.len() < MAX_DECLINED_TARGETS {
         explain.declined.push(target);
     }
-    let _ = write_row(context, JOB_PLAN_EXPLAIN_KEYSPACE, &key, &explain).await;
+    let _ = write_row(context, PLAN_EXPLAIN_KEYSPACE, &key, &explain).await;
 }
 
-/// Whether a launch is suppressed by a success, cancellation, permanent
-/// failure, or an execution that may still finish. An unfinished execution on a
-/// node in `silent` no longer suppresses: that node stopped reporting, so its
-/// execution is no longer evidence that the work is still under way.
+/// Whether a launch is suppressed by a success, cancellation, permanent failure,
+/// or an execution that may still finish. An unfinished execution on a `silent`
+/// node no longer suppresses: that node stopped reporting.
 pub(crate) fn suppressed(
     family: JobFamilyId,
     records: &[JobRecordEnvelope],
@@ -746,7 +739,7 @@ async fn silent_nodes(
         .map(|execution| execution.executor_node_id)
         .collect();
     for node in running {
-        if let Ok(Some(document)) = read_node_info_document(&context.storage_handle, node).await
+        if let Ok(Some(document)) = read_info_document(&context.storage_handle, node).await
             && now_ms.saturating_sub(document.utilization.heartbeat_at_ms) > window_ms
         {
             silent.insert(node);
@@ -786,7 +779,7 @@ async fn stored_budget(
         request_digest: spec.request_digest,
         scheduler_node_id: local,
         source_spec_digest: spec.spec_digest,
-        max_launches: spec.retry.max_launches_per_witness,
+        max_launches: spec.retry.launches_per_witness,
     };
     let frame = sign_record(context, config.realm_id, JobFamilyRecord::Budget(budget))?;
     match append_local(context, config.realm_id, local, frame, now_ms).await {
@@ -806,7 +799,7 @@ fn holder_generation(config: &RealmConfigDocument, view: &FamilyView) -> u64 {
 
 fn sign_record(
     context: &DriverContext,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     record: JobFamilyRecord,
 ) -> Option<JobRecordFrame> {
     let net = context.net_handle.as_ref()?;
@@ -819,7 +812,7 @@ fn sign_record(
 
 async fn append_local(
     context: &DriverContext,
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     local: NodeId,
     record: JobRecordFrame,
     now_ms: u64,
@@ -872,7 +865,7 @@ fn deadline_family(key: &[u8]) -> Option<JobFamilyId> {
     let submission: [u8; 32] = key.get(8..40)?.try_into().ok()?;
     let request_digest: [u8; 32] = key.get(40..72)?.try_into().ok()?;
     Some(JobFamilyId {
-        submission_id: aruna_core::structs::SubmissionId(submission),
+        submission_id: aruna_core::structs::execution::job::SubmissionId(submission),
         request_digest,
     })
 }
@@ -894,7 +887,7 @@ async fn clear_deadline(
     };
     let current: Result<Option<WitnessDeadline>, LifecycleError> = read_row_txn(
         context,
-        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE,
+        DEADLINE_INDEX_KEYSPACE,
         &deadline_index_key(family),
         Some(txn_id),
     )
@@ -908,9 +901,9 @@ async fn clear_deadline(
         return false;
     }
     let deletes = vec![
-        (JOB_WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone()),
+        (WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone()),
         (
-            JOB_WITNESS_DEADLINE_INDEX_KEYSPACE.to_string(),
+            DEADLINE_INDEX_KEYSPACE.to_string(),
             deadline_index_key(family),
         ),
     ];
@@ -930,7 +923,7 @@ async fn remove_stale(context: &DriverContext, family: &JobFamilyId, key: &Key) 
     };
     let current: Result<Option<WitnessDeadline>, LifecycleError> = read_row_txn(
         context,
-        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE,
+        DEADLINE_INDEX_KEYSPACE,
         &deadline_index_key(family),
         Some(txn_id),
     )
@@ -947,7 +940,7 @@ async fn remove_stale(context: &DriverContext, family: &JobFamilyId, key: &Key) 
     if current.is_err()
         || batch_delete(
             &context.storage_handle,
-            vec![(JOB_WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone())],
+            vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone())],
             Some(txn_id),
         )
         .await
@@ -970,7 +963,7 @@ async fn replace_deadline(
     };
     let current = read_row_txn(
         context,
-        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE,
+        DEADLINE_INDEX_KEYSPACE,
         &deadline_index_key(family),
         Some(txn_id),
     )
@@ -985,7 +978,7 @@ async fn replace_deadline(
     }
     if write_row_txn(
         context,
-        JOB_WITNESS_DEADLINE_KEYSPACE,
+        WITNESS_DEADLINE_KEYSPACE,
         &deadline_key(family, next.due_at_ms),
         &next,
         Some(txn_id),
@@ -994,7 +987,7 @@ async fn replace_deadline(
     .is_err()
         || write_row_txn(
             context,
-            JOB_WITNESS_DEADLINE_INDEX_KEYSPACE,
+            DEADLINE_INDEX_KEYSPACE,
             &deadline_index_key(family),
             &next,
             Some(txn_id),
@@ -1010,7 +1003,7 @@ async fn replace_deadline(
         if previous_key != deadline_key(family, next.due_at_ms)
             && batch_delete(
                 &context.storage_handle,
-                vec![(JOB_WITNESS_DEADLINE_KEYSPACE.to_string(), previous_key)],
+                vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), previous_key)],
                 Some(txn_id),
             )
             .await
@@ -1077,7 +1070,7 @@ async fn read_deadline_index(
 ) -> Result<Option<WitnessDeadline>, LifecycleError> {
     read_row_txn(
         context,
-        JOB_WITNESS_DEADLINE_INDEX_KEYSPACE,
+        DEADLINE_INDEX_KEYSPACE,
         &deadline_index_key(family),
         None,
     )

@@ -1,20 +1,22 @@
+//! Chat head and turn records the node keeps per user, with the live chat and byte limits.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::UserId;
 use crate::errors::ConversionError;
-use crate::types::UserId;
 use serde::{Deserialize, Serialize};
 
 /// Live chats one user may keep on the node.
 pub const MAX_ASSISTANT_CHATS: usize = 20;
 /// Live turns one chat keeps; an append past this drops the oldest turns.
-pub const MAX_ASSISTANT_CHAT_TURNS: u32 = 120;
+pub const MAX_ASSISTANT_TURNS: u32 = 120;
 /// Bytes one turn payload may hold.
-pub const MAX_ASSISTANT_TURN_BYTES: usize = 256 * 1024;
+pub const MAX_TURN_BYTES: usize = 256 * 1024;
 /// Bytes all live turns of one user may hold together.
-pub const MAX_ASSISTANT_CHAT_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_ASSISTANT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// One assistant chat of a user without its turns.
-///
-/// The head is held on the node that received it and is not replicated. A
-/// deleted chat keeps its head as a tombstone, so the id is never reused.
+/// One assistant chat of a user without its turns. The head is held on the node that received it and is
+/// not replicated. A deleted chat keeps its head as a tombstone, so the id is never reused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantChatHead {
     pub user_id: UserId,

@@ -1,30 +1,37 @@
+//! Resolves a connector reference and source path into usable source access details.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::path::{Component, Path};
 
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::SourceConnectorResolutionError;
+use aruna_core::errors::SourceResolutionError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::OFFERED_DIRECTORY_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{
-    OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory, ResolvedSourceAccess,
-    ResolvedSourceConnector, SourceConnector, SourceConnectorKind, StagingStrategy,
-    VersionSourceBinding,
+use aruna_core::structs::execution::offered_directory::{
+    OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
+use aruna_core::structs::execution::source_access::{
+    ResolvedSourceAccess, ResolvedSourceConnector,
+};
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    StorageReadError, parse_connector_read, parse_connector_secret_read, read_connector_effect,
-    read_connector_secret_effect,
+    StorageReadError, parse_connector_read, parse_secret_read, read_connector_effect,
+    read_secret_effect,
 };
 
-pub(crate) const ARUNA_NATIVE_RELATIONSHIP_ID: &str = "relationship_id";
-pub(crate) const ARUNA_NATIVE_ORIGIN_NODE_ID: &str = "origin_node_id";
+pub(crate) const NATIVE_RELATIONSHIP_ID: &str = "relationship_id";
+pub(crate) const ORIGIN_NODE_ID: &str = "origin_node_id";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolveSourceConnectorInput {
+pub struct ResolveConnectorInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
     pub source_path: String,
@@ -32,12 +39,12 @@ pub struct ResolveSourceConnectorInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolveVersionSourceBindingInput {
+pub struct ResolveBindingInput {
     pub source: VersionSourceBinding,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ResolveSourceConnectorState {
+enum ResolveConnectorState {
     Init,
     ReadConnector,
     ReadSecret,
@@ -46,7 +53,7 @@ enum ResolveSourceConnectorState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ResolveVersionSourceBindingState {
+enum ResolveBindingState {
     Init,
     ReadSecret,
     ReadOfferedDirectory,
@@ -54,7 +61,7 @@ enum ResolveVersionSourceBindingState {
     Error,
 }
 
-impl From<StorageReadError> for SourceConnectorResolutionError {
+impl From<StorageReadError> for SourceResolutionError {
     fn from(value: StorageReadError) -> Self {
         match value {
             StorageReadError::Storage(error) => Self::StorageError(error),
@@ -64,32 +71,32 @@ impl From<StorageReadError> for SourceConnectorResolutionError {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ResolveSourceConnectorOperation {
-    input: ResolveSourceConnectorInput,
-    state: ResolveSourceConnectorState,
+pub struct ResolveConnectorOperation {
+    input: ResolveConnectorInput,
+    state: ResolveConnectorState,
     connector: Option<SourceConnector>,
-    output: Option<Result<ResolvedSourceConnector, SourceConnectorResolutionError>>,
+    output: Option<Result<ResolvedSourceConnector, SourceResolutionError>>,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ResolveVersionSourceBindingOperation {
-    input: ResolveVersionSourceBindingInput,
-    state: ResolveVersionSourceBindingState,
-    output: Option<Result<ResolvedSourceAccess, SourceConnectorResolutionError>>,
+pub struct ResolveBindingOperation {
+    input: ResolveBindingInput,
+    state: ResolveBindingState,
+    output: Option<Result<ResolvedSourceAccess, SourceResolutionError>>,
 }
 
-impl ResolveSourceConnectorOperation {
-    pub fn new(input: ResolveSourceConnectorInput) -> Self {
+impl ResolveConnectorOperation {
+    pub fn new(input: ResolveConnectorInput) -> Self {
         Self {
             input,
-            state: ResolveSourceConnectorState::Init,
+            state: ResolveConnectorState::Init,
             connector: None,
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: SourceConnectorResolutionError) -> Effects {
-        self.state = ResolveSourceConnectorState::Error;
+    fn emit_error(&mut self, error: SourceResolutionError) -> Effects {
+        self.state = ResolveConnectorState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -99,7 +106,7 @@ impl ResolveSourceConnectorOperation {
             return self.emit_error(error);
         }
 
-        self.state = ResolveSourceConnectorState::ReadConnector;
+        self.state = ResolveConnectorState::ReadConnector;
         smallvec![read_connector_effect(
             self.input.group_id,
             self.input.connector_id,
@@ -111,22 +118,22 @@ impl ResolveSourceConnectorOperation {
         match parse_connector_read(event) {
             Ok(Some(connector)) => {
                 self.connector = Some(connector);
-                self.state = ResolveSourceConnectorState::ReadSecret;
-                smallvec![read_connector_secret_effect(self.input.connector_id, None)]
+                self.state = ResolveConnectorState::ReadSecret;
+                smallvec![read_secret_effect(self.input.connector_id, None)]
             }
-            Ok(None) => self.emit_error(SourceConnectorResolutionError::NotFound),
+            Ok(None) => self.emit_error(SourceResolutionError::NotFound),
             Err(error) => self.emit_error(error.into()),
         }
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
-        let secret = match parse_connector_secret_read(event) {
+        let secret = match parse_secret_read(event) {
             Ok(secret) => secret,
             Err(error) => return self.emit_error(error.into()),
         };
 
         let Some(connector) = self.connector.clone() else {
-            return self.emit_error(SourceConnectorResolutionError::ResolveFailed);
+            return self.emit_error(SourceResolutionError::ResolveFailed);
         };
 
         let access = match build_source_access(
@@ -141,7 +148,7 @@ impl ResolveSourceConnectorOperation {
             Err(error) => return self.emit_error(error),
         };
 
-        self.state = ResolveSourceConnectorState::Finish;
+        self.state = ResolveConnectorState::Finish;
         let secret_fingerprint = secret.as_ref().map(secret_fingerprint);
 
         self.output = Some(Ok(ResolvedSourceConnector {
@@ -153,28 +160,28 @@ impl ResolveSourceConnectorOperation {
     }
 }
 
-impl ResolveVersionSourceBindingOperation {
-    pub fn new(input: ResolveVersionSourceBindingInput) -> Self {
+impl ResolveBindingOperation {
+    pub fn new(input: ResolveBindingInput) -> Self {
         Self {
             input,
-            state: ResolveVersionSourceBindingState::Init,
+            state: ResolveBindingState::Init,
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: SourceConnectorResolutionError) -> Effects {
-        self.state = ResolveVersionSourceBindingState::Error;
+    fn emit_error(&mut self, error: SourceResolutionError) -> Effects {
+        self.state = ResolveBindingState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn handle_init(&mut self) -> Effects {
         if self.input.source.descriptor.kind == SourceConnectorKind::ArunaNative {
-            let access = match build_source_access_from_binding(&self.input.source, None) {
+            let access = match build_binding_access(&self.input.source, None) {
                 Ok(access) => access,
                 Err(error) => return self.emit_error(error),
             };
-            self.state = ResolveVersionSourceBindingState::Finish;
+            self.state = ResolveBindingState::Finish;
             self.output = Some(Ok(access));
             return smallvec![];
         }
@@ -184,26 +191,26 @@ impl ResolveVersionSourceBindingOperation {
                 Ok(effect) => effect,
                 Err(error) => return self.emit_error(error),
             };
-            self.state = ResolveVersionSourceBindingState::ReadOfferedDirectory;
+            self.state = ResolveBindingState::ReadOfferedDirectory;
             return smallvec![effect];
         }
 
-        let effect = match read_source_binding_secret_effect(&self.input.source, None) {
+        let effect = match binding_secret_effect(&self.input.source, None) {
             Ok(effect) => effect,
             Err(error) => return self.emit_error(error),
         };
 
-        self.state = ResolveVersionSourceBindingState::ReadSecret;
+        self.state = ResolveBindingState::ReadSecret;
         smallvec![effect]
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
-        let access = match resolve_source_binding_access(&self.input.source, event) {
+        let access = match resolve_binding_access(&self.input.source, event) {
             Ok(access) => access,
             Err(error) => return self.emit_error(error),
         };
 
-        self.state = ResolveVersionSourceBindingState::Finish;
+        self.state = ResolveBindingState::Finish;
         self.output = Some(Ok(access));
         smallvec![]
     }
@@ -214,15 +221,15 @@ impl ResolveVersionSourceBindingOperation {
             Err(error) => return self.emit_error(error),
         };
 
-        self.state = ResolveVersionSourceBindingState::Finish;
+        self.state = ResolveBindingState::Finish;
         self.output = Some(Ok(access));
         smallvec![]
     }
 }
 
-impl Operation for ResolveSourceConnectorOperation {
+impl Operation for ResolveConnectorOperation {
     type Output = ResolvedSourceConnector;
-    type Error = SourceConnectorResolutionError;
+    type Error = SourceResolutionError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -230,31 +237,30 @@ impl Operation for ResolveSourceConnectorOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ResolveSourceConnectorState::Init => self.handle_init(),
-            ResolveSourceConnectorState::ReadConnector => self.handle_connector_read(event),
-            ResolveSourceConnectorState::ReadSecret => self.handle_secret_read(event),
-            ResolveSourceConnectorState::Finish => smallvec![],
-            ResolveSourceConnectorState::Error => self.abort(),
+            ResolveConnectorState::Init => self.handle_init(),
+            ResolveConnectorState::ReadConnector => self.handle_connector_read(event),
+            ResolveConnectorState::ReadSecret => self.handle_secret_read(event),
+            ResolveConnectorState::Finish => smallvec![],
+            ResolveConnectorState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ResolveSourceConnectorState::Finish | ResolveSourceConnectorState::Error
+            ResolveConnectorState::Finish | ResolveConnectorState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ResolveSourceConnectorState::Error {
+        if self.state == ResolveConnectorState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(SourceConnectorResolutionError::ResolveFailed);
+            return Err(SourceResolutionError::ResolveFailed);
         }
 
-        self.output
-            .ok_or(SourceConnectorResolutionError::ResolveFailed)?
+        self.output.ok_or(SourceResolutionError::ResolveFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -262,9 +268,9 @@ impl Operation for ResolveSourceConnectorOperation {
     }
 }
 
-impl Operation for ResolveVersionSourceBindingOperation {
+impl Operation for ResolveBindingOperation {
     type Output = ResolvedSourceAccess;
-    type Error = SourceConnectorResolutionError;
+    type Error = SourceResolutionError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -272,33 +278,30 @@ impl Operation for ResolveVersionSourceBindingOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ResolveVersionSourceBindingState::Init => self.handle_init(),
-            ResolveVersionSourceBindingState::ReadSecret => self.handle_secret_read(event),
-            ResolveVersionSourceBindingState::ReadOfferedDirectory => {
-                self.handle_offered_read(event)
-            }
-            ResolveVersionSourceBindingState::Finish => smallvec![],
-            ResolveVersionSourceBindingState::Error => self.abort(),
+            ResolveBindingState::Init => self.handle_init(),
+            ResolveBindingState::ReadSecret => self.handle_secret_read(event),
+            ResolveBindingState::ReadOfferedDirectory => self.handle_offered_read(event),
+            ResolveBindingState::Finish => smallvec![],
+            ResolveBindingState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ResolveVersionSourceBindingState::Finish | ResolveVersionSourceBindingState::Error
+            ResolveBindingState::Finish | ResolveBindingState::Error
         )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ResolveVersionSourceBindingState::Error {
+        if self.state == ResolveBindingState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(SourceConnectorResolutionError::ResolveFailed);
+            return Err(SourceResolutionError::ResolveFailed);
         }
 
-        self.output
-            .ok_or(SourceConnectorResolutionError::ResolveFailed)?
+        self.output.ok_or(SourceResolutionError::ResolveFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -306,9 +309,9 @@ impl Operation for ResolveVersionSourceBindingOperation {
     }
 }
 
-pub fn resolve_source_connector_suboperation(input: ResolveSourceConnectorInput) -> Effect {
+pub fn resolve_connector_effect(input: ResolveConnectorInput) -> Effect {
     Effect::SubOperation(boxed_suboperation(
-        ResolveSourceConnectorOperation::new(input),
+        ResolveConnectorOperation::new(input),
         |result| {
             Event::SubOperation(SubOperationEvent::SourceConnectorResolved {
                 result: Box::new(result),
@@ -317,12 +320,10 @@ pub fn resolve_source_connector_suboperation(input: ResolveSourceConnectorInput)
     ))
 }
 
-pub fn resolve_version_source_binding_suboperation(
-    input: ResolveVersionSourceBindingInput,
-) -> Effect {
+pub fn resolve_binding_effect(input: ResolveBindingInput) -> Effect {
     Effect::SubOperation(boxed_suboperation(
-        ResolveVersionSourceBindingOperation::new(input),
-        |result| Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved { result }),
+        ResolveBindingOperation::new(input),
+        |result| Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }),
     ))
 }
 
@@ -333,11 +334,11 @@ pub(crate) fn build_source_access(
     source_path: &str,
     version: Option<String>,
     allow_root: bool,
-) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
+) -> Result<ResolvedSourceAccess, SourceResolutionError> {
     validate_source_path(source_path, allow_root)?;
 
     if kind == SourceConnectorKind::ArunaNative {
-        return Err(SourceConnectorResolutionError::UnsupportedConnectorKind(
+        return Err(SourceResolutionError::UnsupportedConnectorKind(
             SourceConnectorKind::ArunaNative,
         ));
     }
@@ -359,11 +360,13 @@ pub fn resolve_inline_access(
     kind: SourceConnectorKind,
     public_config: &HashMap<String, String>,
     secret_config: HashMap<String, String>,
-) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
+) -> Result<ResolvedSourceAccess, SourceResolutionError> {
     build_source_access(kind, public_config, Some(secret_config), "", None, true)
 }
 
-pub(crate) fn secret_fingerprint(secret: &aruna_core::structs::SourceConnectorSecret) -> [u8; 16] {
+pub(crate) fn secret_fingerprint(
+    secret: &aruna_core::structs::execution::source_connector::SourceConnectorSecret,
+) -> [u8; 16] {
     let mut entries = secret.secret_config.iter().collect::<Vec<_>>();
     entries.sort_unstable_by_key(|(key, _)| *key);
 
@@ -381,17 +384,17 @@ pub(crate) fn secret_fingerprint(secret: &aruna_core::structs::SourceConnectorSe
     fingerprint
 }
 
-pub(crate) fn build_source_access_from_binding(
+pub(crate) fn build_binding_access(
     source: &VersionSourceBinding,
     secret_config: Option<HashMap<String, String>>,
-) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
+) -> Result<ResolvedSourceAccess, SourceResolutionError> {
     if source.descriptor.kind == SourceConnectorKind::ArunaNative {
         return build_native_access(source);
     }
     // An offered directory resolves only against this device's own registration,
     // which needs a storage read, so the operation owns that path.
     if source.descriptor.kind == SourceConnectorKind::LocalDirectory {
-        return Err(SourceConnectorResolutionError::UnsupportedConnectorKind(
+        return Err(SourceResolutionError::UnsupportedConnectorKind(
             SourceConnectorKind::LocalDirectory,
         ));
     }
@@ -408,9 +411,9 @@ pub(crate) fn build_source_access_from_binding(
 
 fn build_native_access(
     source: &VersionSourceBinding,
-) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
+) -> Result<ResolvedSourceAccess, SourceResolutionError> {
     if source.strategy != StagingStrategy::Reference || source.connector_id.is_some() {
-        return Err(SourceConnectorResolutionError::ResolveFailed);
+        return Err(SourceResolutionError::ResolveFailed);
     }
     validate_source_path(&source.descriptor.source_path, false)?;
     let (bucket, key) = source
@@ -418,38 +421,35 @@ fn build_native_access(
         .source_path
         .split_once('/')
         .filter(|(bucket, key)| !bucket.is_empty() && !key.is_empty())
-        .ok_or(SourceConnectorResolutionError::InvalidSourcePath)?;
+        .ok_or(SourceResolutionError::InvalidSourcePath)?;
     if bucket.contains('/') || key.trim().is_empty() {
-        return Err(SourceConnectorResolutionError::InvalidSourcePath);
+        return Err(SourceResolutionError::InvalidSourcePath);
     }
 
     let relationship_id = source
         .descriptor
         .public_config
-        .get(ARUNA_NATIVE_RELATIONSHIP_ID)
+        .get(NATIVE_RELATIONSHIP_ID)
         .and_then(|value| Ulid::from_string(value).ok())
-        .ok_or(SourceConnectorResolutionError::ResolveFailed)?;
+        .ok_or(SourceResolutionError::ResolveFailed)?;
     let origin_node_id = source
         .descriptor
         .origin_node_id
-        .ok_or(SourceConnectorResolutionError::ResolveFailed)?;
+        .ok_or(SourceResolutionError::ResolveFailed)?;
     let version = source
         .descriptor
         .version_selector
         .as_deref()
         .and_then(|selector| selector.strip_prefix("version:"))
         .and_then(|value| Ulid::from_string(value.trim()).ok())
-        .ok_or(SourceConnectorResolutionError::ResolveFailed)?;
+        .ok_or(SourceResolutionError::ResolveFailed)?;
 
     let mut config = source.descriptor.public_config.clone();
     config.insert(
-        ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+        NATIVE_RELATIONSHIP_ID.to_string(),
         relationship_id.to_string(),
     );
-    config.insert(
-        ARUNA_NATIVE_ORIGIN_NODE_ID.to_string(),
-        origin_node_id.to_string(),
-    );
+    config.insert(ORIGIN_NODE_ID.to_string(), origin_node_id.to_string());
     Ok(ResolvedSourceAccess::OpenDal {
         kind: SourceConnectorKind::ArunaNative,
         config,
@@ -462,9 +462,9 @@ fn build_native_access(
 /// binding carries the offered bucket, never a path: the root exists only here.
 pub(crate) fn read_offered_effect(
     source: &VersionSourceBinding,
-) -> Result<Effect, SourceConnectorResolutionError> {
+) -> Result<Effect, SourceResolutionError> {
     if source.strategy != StagingStrategy::Reference || source.connector_id.is_some() {
-        return Err(SourceConnectorResolutionError::ResolveFailed);
+        return Err(SourceResolutionError::ResolveFailed);
     }
     validate_source_path(&source.descriptor.source_path, false)?;
     let bucket = source
@@ -472,7 +472,7 @@ pub(crate) fn read_offered_effect(
         .public_config
         .get(OFFERED_DIRECTORY_BUCKET)
         .filter(|bucket| !bucket.is_empty())
-        .ok_or(SourceConnectorResolutionError::ResolveFailed)?;
+        .ok_or(SourceResolutionError::ResolveFailed)?;
     Ok(Effect::Storage(StorageEffect::Read {
         key_space: OFFERED_DIRECTORY_KEYSPACE.to_string(),
         key: bucket.as_bytes().into(),
@@ -483,12 +483,12 @@ pub(crate) fn read_offered_effect(
 fn resolve_offered_access(
     source: &VersionSourceBinding,
     event: Event,
-) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
+) -> Result<ResolvedSourceAccess, SourceResolutionError> {
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-        return Err(SourceConnectorResolutionError::ResolveFailed);
+        return Err(SourceResolutionError::ResolveFailed);
     };
     let Some(value) = value else {
-        return Err(SourceConnectorResolutionError::NotFound);
+        return Err(SourceResolutionError::NotFound);
     };
     let record = OfferedDirectory::from_bytes(&value)?;
     Ok(ResolvedSourceAccess::OpenDal {
@@ -501,7 +501,7 @@ fn resolve_offered_access(
 
 fn source_binding_version(
     source: &VersionSourceBinding,
-) -> Result<Option<String>, SourceConnectorResolutionError> {
+) -> Result<Option<String>, SourceResolutionError> {
     let Some(selector) = source
         .descriptor
         .version_selector
@@ -515,46 +515,42 @@ fn source_binding_version(
     if let Some(version) = selector.strip_prefix("version:").map(str::trim) {
         return (!version.is_empty())
             .then(|| Some(version.to_string()))
-            .ok_or(SourceConnectorResolutionError::ResolveFailed);
+            .ok_or(SourceResolutionError::ResolveFailed);
     }
 
     if selector.contains(':') {
-        return Err(SourceConnectorResolutionError::ResolveFailed);
+        return Err(SourceResolutionError::ResolveFailed);
     }
 
     Ok(Some(selector.to_string()))
 }
 
-pub(crate) fn read_source_binding_secret_effect(
+pub(crate) fn binding_secret_effect(
     source: &VersionSourceBinding,
     txn_id: Option<TxnId>,
-) -> Result<Effect, SourceConnectorResolutionError> {
+) -> Result<Effect, SourceResolutionError> {
     let Some(connector_id) = source.connector_id else {
-        return Err(SourceConnectorResolutionError::ResolveFailed);
+        return Err(SourceResolutionError::ResolveFailed);
     };
 
-    Ok(read_connector_secret_effect(connector_id, txn_id))
+    Ok(read_secret_effect(connector_id, txn_id))
 }
 
-pub(crate) fn resolve_source_binding_access(
+pub(crate) fn resolve_binding_access(
     source: &VersionSourceBinding,
     event: Event,
-) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
-    let secret =
-        parse_connector_secret_read(event).map_err(SourceConnectorResolutionError::from)?;
+) -> Result<ResolvedSourceAccess, SourceResolutionError> {
+    let secret = parse_secret_read(event).map_err(SourceResolutionError::from)?;
 
-    build_source_access_from_binding(source, secret.map(|secret| secret.secret_config))
+    build_binding_access(source, secret.map(|secret| secret.secret_config))
 }
 
-pub fn validate_source_path(
-    path: &str,
-    allow_root: bool,
-) -> Result<(), SourceConnectorResolutionError> {
+pub fn validate_source_path(path: &str, allow_root: bool) -> Result<(), SourceResolutionError> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return allow_root
             .then_some(())
-            .ok_or(SourceConnectorResolutionError::InvalidSourcePath);
+            .ok_or(SourceResolutionError::InvalidSourcePath);
     }
 
     let mut has_normal_component = false;
@@ -565,25 +561,23 @@ pub fn validate_source_path(
             | Component::ParentDir
             | Component::RootDir
             | Component::Prefix(_) => {
-                return Err(SourceConnectorResolutionError::InvalidSourcePath);
+                return Err(SourceResolutionError::InvalidSourcePath);
             }
         }
     }
 
     has_normal_component
         .then_some(())
-        .ok_or(SourceConnectorResolutionError::InvalidSourcePath)
+        .ok_or(SourceResolutionError::InvalidSourcePath)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::create_source_connector::{
-        CreateSourceConnectorInput, CreateSourceConnectorOperation,
-    };
+    use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     use crate::connectors::repository::delete_connector_effect;
     use crate::driver::{DriverContext, drive};
-    use crate::staging::descriptor::build_version_source_binding;
+    use crate::staging::descriptor::build_source_binding;
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_storage::storage;
@@ -591,7 +585,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn resolve_source_connector_merges_public_and_secret_config() {
+    async fn merges_public_secret() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
@@ -605,7 +599,7 @@ mod tests {
         let group_id = Ulid::generate();
 
         let created = drive(
-            CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+            SourceConnectorOperation::new(SourceConnectorInput {
                 group_id,
                 created_by: Default::default(),
                 name: "dav-source".to_string(),
@@ -628,7 +622,7 @@ mod tests {
         .unwrap();
 
         let resolved = drive(
-            ResolveSourceConnectorOperation::new(ResolveSourceConnectorInput {
+            ResolveConnectorOperation::new(ResolveConnectorInput {
                 group_id,
                 connector_id: created.connector.connector_id,
                 source_path: "run-1/data.txt".to_string(),
@@ -653,10 +647,10 @@ mod tests {
     }
 
     #[test]
-    fn build_source_access_from_binding_merges_descriptor_and_secret_config() {
+    fn merges_descriptor_secret() {
         let source = VersionSourceBinding {
-            strategy: aruna_core::structs::StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::Ftp,
                 public_config: HashMap::from([
                     (
@@ -673,7 +667,7 @@ mod tests {
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
 
-        let access = build_source_access_from_binding(
+        let access = build_binding_access(
             &source,
             Some(HashMap::from([
                 ("user".to_string(), "alice".to_string()),
@@ -696,10 +690,10 @@ mod tests {
     }
 
     #[test]
-    fn build_source_access_from_binding_rejects_invalid_version_selector() {
+    fn rejects_invalid_selector() {
         let source = VersionSourceBinding {
-            strategy: aruna_core::structs::StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::Http,
                 public_config: HashMap::from([(
                     "endpoint".to_string(),
@@ -714,16 +708,16 @@ mod tests {
         };
 
         assert_eq!(
-            build_source_access_from_binding(&source, None),
-            Err(SourceConnectorResolutionError::ResolveFailed)
+            build_binding_access(&source, None),
+            Err(SourceResolutionError::ResolveFailed)
         );
     }
 
     #[test]
-    fn build_source_access_from_binding_accepts_raw_persisted_version_selector() {
+    fn accepts_persisted_selector() {
         let source = VersionSourceBinding {
-            strategy: aruna_core::structs::StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::Http,
                 public_config: HashMap::from([(
                     "endpoint".to_string(),
@@ -737,16 +731,16 @@ mod tests {
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
 
-        let access = build_source_access_from_binding(&source, None).unwrap();
+        let access = build_binding_access(&source, None).unwrap();
         let ResolvedSourceAccess::OpenDal { version, .. } = access;
         assert_eq!(version.as_deref(), Some("v42"));
     }
 
     #[test]
-    fn read_source_binding_secret_effect_requires_exact_connector_id() {
+    fn requires_connector_id() {
         let source = VersionSourceBinding {
-            strategy: aruna_core::structs::StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::Http,
                 public_config: HashMap::from([(
                     "endpoint".to_string(),
@@ -761,14 +755,13 @@ mod tests {
         };
 
         assert_eq!(
-            read_source_binding_secret_effect(&source, None),
-            Err(SourceConnectorResolutionError::ResolveFailed)
+            binding_secret_effect(&source, None),
+            Err(SourceResolutionError::ResolveFailed)
         );
     }
 
     #[tokio::test]
-    async fn resolve_version_source_binding_uses_stored_descriptor_without_public_connector_lookup()
-    {
+    async fn uses_stored_descriptor() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
@@ -782,7 +775,7 @@ mod tests {
         let group_id = Ulid::generate();
 
         let created = drive(
-            CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+            SourceConnectorOperation::new(SourceConnectorInput {
                 group_id,
                 created_by: Default::default(),
                 name: "dav-source".to_string(),
@@ -817,10 +810,10 @@ mod tests {
             Event::Storage(StorageEvent::DeleteResult { .. })
         ));
 
-        let source = build_version_source_binding(
-            aruna_core::structs::StagingStrategy::Reference,
+        let source = build_source_binding(
+            aruna_core::structs::execution::staging::StagingStrategy::Reference,
             &created.connector,
-            &aruna_core::structs::SourceMetadata {
+            &aruna_core::structs::execution::source_access::SourceMetadata {
                 content_length: 42,
                 content_type: Some("text/plain".to_string()),
                 etag: None,
@@ -833,7 +826,7 @@ mod tests {
         );
 
         let access = drive(
-            ResolveVersionSourceBindingOperation::new(ResolveVersionSourceBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput { source }),
             &context,
         )
         .await
@@ -857,13 +850,13 @@ mod tests {
     }
 
     #[test]
-    fn reject_absolute_source_paths() {
+    fn rejects_absolute_paths() {
         assert!(validate_source_path("/absolute/file.txt", false).is_err());
         assert!(validate_source_path("nested/file.txt", false).is_ok());
     }
 
     #[test]
-    fn reject_non_normal_relative_source_paths() {
+    fn rejects_dot_paths() {
         assert!(validate_source_path("", false).is_err());
         assert!(validate_source_path("   ", false).is_err());
         assert!(validate_source_path("./file.txt", false).is_err());
@@ -871,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_aruna_native_in_phase_three() {
+    fn rejects_aruna_native() {
         let error = build_source_access(
             SourceConnectorKind::ArunaNative,
             &HashMap::from([(
@@ -886,9 +879,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            SourceConnectorResolutionError::UnsupportedConnectorKind(
-                SourceConnectorKind::ArunaNative
-            )
+            SourceResolutionError::UnsupportedConnectorKind(SourceConnectorKind::ArunaNative)
         );
     }
 
@@ -899,10 +890,10 @@ mod tests {
         let origin = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::ArunaNative,
                 public_config: HashMap::from([(
-                    ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+                    NATIVE_RELATIONSHIP_ID.to_string(),
                     relationship_id.to_string(),
                 )]),
                 source_path: "source-bucket/nested/data.txt".to_string(),
@@ -913,8 +904,7 @@ mod tests {
             connector_id: None,
         };
 
-        let mut operation =
-            ResolveVersionSourceBindingOperation::new(ResolveVersionSourceBindingInput { source });
+        let mut operation = ResolveBindingOperation::new(ResolveBindingInput { source });
         assert!(operation.start().is_empty());
         assert!(operation.is_complete());
         assert_eq!(
@@ -923,10 +913,10 @@ mod tests {
                 kind: SourceConnectorKind::ArunaNative,
                 config: HashMap::from([
                     (
-                        ARUNA_NATIVE_RELATIONSHIP_ID.to_string(),
+                        NATIVE_RELATIONSHIP_ID.to_string(),
                         relationship_id.to_string(),
                     ),
-                    (ARUNA_NATIVE_ORIGIN_NODE_ID.to_string(), origin.to_string()),
+                    (ORIGIN_NODE_ID.to_string(), origin.to_string()),
                 ]),
                 path: "source-bucket/nested/data.txt".to_string(),
                 version: Some(version_id.to_string()),
@@ -939,7 +929,7 @@ mod tests {
         let origin = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::ArunaNative,
                 public_config: HashMap::new(),
                 source_path: "source-bucket/data.txt".to_string(),
@@ -951,15 +941,15 @@ mod tests {
         };
 
         assert_eq!(
-            build_source_access_from_binding(&source, None),
-            Err(SourceConnectorResolutionError::ResolveFailed)
+            build_binding_access(&source, None),
+            Err(SourceResolutionError::ResolveFailed)
         );
     }
 
     fn offered_binding(bucket: &str, connector_id: Option<Ulid>) -> VersionSourceBinding {
         VersionSourceBinding {
             strategy: StagingStrategy::Reference,
-            descriptor: aruna_core::structs::PortableSourceDescriptor {
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
                 kind: SourceConnectorKind::LocalDirectory,
                 public_config: HashMap::from([(
                     OFFERED_DIRECTORY_BUCKET.to_string(),
@@ -979,8 +969,8 @@ mod tests {
     #[test]
     fn offered_needs_registration() {
         assert_eq!(
-            build_source_access_from_binding(&offered_binding("photos", None), None),
-            Err(SourceConnectorResolutionError::UnsupportedConnectorKind(
+            build_binding_access(&offered_binding("photos", None), None),
+            Err(SourceResolutionError::UnsupportedConnectorKind(
                 SourceConnectorKind::LocalDirectory
             ))
         );
@@ -1004,7 +994,7 @@ mod tests {
                     value: None,
                 })
             ),
-            Err(SourceConnectorResolutionError::NotFound)
+            Err(SourceResolutionError::NotFound)
         );
     }
 }

@@ -1,6 +1,11 @@
+//! Node status snapshot types for connections, requests, network, backends and blobs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::NodeId;
 use crate::alpn::Alpn;
-use crate::structs::{Backend, BlobTimeoutConfig, RealmId};
+use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::blob::{Backend, BlobTimeoutConfig};
 use iroh::EndpointAddr;
 
 #[derive(Debug, Clone)]
@@ -77,7 +82,7 @@ pub struct PeerConnectionState {
     pub status: PeerConnectionStatus,
     pub active_addresses: Vec<ConnectionAddressState>,
     pub last_error: Option<String>,
-    pub next_retry_in_secs: Option<u64>,
+    pub retry_in_secs: Option<u64>,
 }
 
 pub struct NetState {
@@ -113,12 +118,6 @@ pub struct BlobState {
     pub timeouts: BlobTimeoutConfig,
     pub status: Status,
     pub backends: Vec<BackendState>,
-}
-
-pub struct InterfaceState {
-    pub s3_status: Status,
-    pub rest_status: Status,
-    pub db_status: Status,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

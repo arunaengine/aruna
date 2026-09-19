@@ -1,0 +1,1458 @@
+//! Validates documents against their Profile and records the validation verdict.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
+
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::VALIDATION_STATUS_KEYSPACE;
+use aruna_core::metadata::{
+    MetadataError, MetadataRawRevision, MetadataValidationViolation, ProfileValidationCompleteness,
+    ProfileValidationFinding, ProfileValidationSeverity, ProfileValidationState,
+    ProfileValidationStatus, is_rocrate_specification,
+};
+use aruna_core::storage_entries::{profile_validation_entry, profile_validation_key};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::time::unix_timestamp_millis as now_ms;
+use aruna_core::types::{GroupId, TxnId};
+use craqle::{CrateViolation, ShaclValidationResult};
+use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxttl::NQuadsParser;
+use ulid::Ulid;
+
+use crate::driver::DriverContext;
+use crate::metadata::MetadataHandle;
+use crate::metadata::api::ExportMetadataResult;
+use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
+use crate::metadata::forward::export_profile_routed;
+use crate::metadata::profile::shacl::{
+    ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
+};
+use crate::metadata::raw_revision::load_raw_revision;
+use crate::metadata::repository::{StorageReadError, parse_registry_read, read_document_registry};
+
+const SH: &str = "http://www.w3.org/ns/shacl#";
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const DCTERMS_CONFORMS_TO: &str = "http://purl.org/dc/terms/conformsTo";
+const SCHEMA_CONFORMS_TO: &str = "http://schema.org/conformsTo";
+const SCHEMA_HTTPS_CONFORMS: &str = "https://schema.org/conformsTo";
+const SCHEMA_ABOUT: &str = "http://schema.org/about";
+const SCHEMA_HTTPS_ABOUT: &str = "https://schema.org/about";
+const SCHEMA_ENCODING_FORMAT: &str = "http://schema.org/encodingFormat";
+const HTTPS_ENCODING_FORMAT: &str = "https://schema.org/encodingFormat";
+const SCHEMA_TEXT: &str = "http://schema.org/text";
+const SCHEMA_HTTPS_TEXT: &str = "https://schema.org/text";
+const DX_PROFILE: &str = "http://www.w3.org/ns/dx/prof/Profile";
+const PROFILE_PUBLIC_PREFIX: &str = "https://w3id.org/aruna/profile/";
+const EVALUATOR_NAME: &str = "craqle-shacl-core/0.2";
+
+/// Authoritative backend SHACL support for Profile validation: craqle's native
+/// SHACL Core Subset v1 engine. Anything outside it (SHACL-SPARQL/JS/AF, custom
+/// targets, recursion, RDF-star, remote `owl:imports`) fails closed with `unsupported_constraint`.
+pub const SUPPORTED_PROFILE_CONSTRAINTS: &[&str] = &[
+    "sh:targetClass",
+    "sh:targetNode",
+    "sh:targetSubjectsOf",
+    "sh:targetObjectsOf",
+    "implicit class target",
+    "sh:property",
+    "sh:path (predicate)",
+    "sh:path (sh:inversePath)",
+    "sh:path (sequence)",
+    "sh:path (sh:alternativePath)",
+    "sh:path (sh:zeroOrOnePath)",
+    "sh:path (sh:zeroOrMorePath)",
+    "sh:path (sh:oneOrMorePath)",
+    "sh:class",
+    "sh:datatype",
+    "sh:nodeKind",
+    "sh:minCount",
+    "sh:maxCount",
+    "sh:minExclusive",
+    "sh:minInclusive",
+    "sh:maxExclusive",
+    "sh:maxInclusive",
+    "sh:minLength",
+    "sh:maxLength",
+    "sh:pattern",
+    "sh:flags",
+    "sh:uniqueLang",
+    "sh:languageIn",
+    "sh:equals",
+    "sh:disjoint",
+    "sh:lessThan",
+    "sh:lessThanOrEquals",
+    "sh:or",
+    "sh:and",
+    "sh:not",
+    "sh:xone",
+    "sh:node",
+    "sh:hasValue",
+    "sh:in",
+    "sh:qualifiedValueShape",
+    "sh:qualifiedMinCount",
+    "sh:qualifiedMaxCount",
+    "sh:qualifiedValueShapesDisjoint",
+    "sh:closed",
+    "sh:ignoredProperties",
+    "sh:severity",
+    "sh:deactivated",
+    "sh:message (annotation)",
+    "sh:name (annotation)",
+    "sh:description (annotation)",
+    "sh:order (annotation)",
+    "sh:group (annotation)",
+];
+
+#[derive(Debug)]
+struct ResolvedProfile {
+    /// Absent for a built-in Profile, which no registry row defines.
+    id: Option<Ulid>,
+    requested_iri: String,
+    revision: String,
+    /// Graph the shapes are installed under, unique per Profile revision.
+    shapes_graph_iri: String,
+    shapes: Vec<String>,
+}
+
+/// Which registered Profiles a validation may resolve.
+/// Usability follows the registry row alone: group-mates, then everyone once
+/// public. The caller already proved WRITE or READ, so identity takes no part.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileScope {
+    /// Datasets of this group, so its own Profiles resolve as well.
+    Group(GroupId),
+    /// No group is known, so only public Profiles resolve.
+    PublicOnly,
+}
+
+impl ProfileScope {
+    fn may_use(self, record: &MetadataRegistryRecord) -> bool {
+        record.public
+            || matches!(self, ProfileScope::Group(group_id) if group_id == record.group_id)
+    }
+}
+
+impl From<Option<GroupId>> for ProfileScope {
+    fn from(group_id: Option<GroupId>) -> Self {
+        group_id.map_or(ProfileScope::PublicOnly, ProfileScope::Group)
+    }
+}
+
+pub fn evaluator_name() -> &'static str {
+    EVALUATOR_NAME
+}
+
+pub fn profile_public_iri(profile_id: Ulid) -> String {
+    format!("{PROFILE_PUBLIC_PREFIX}{profile_id}")
+}
+
+pub fn equivalent_profile_iris(iri: &str) -> Vec<String> {
+    profile_from_iri(iri).map_or_else(
+        || vec![iri.to_string()],
+        |profile_id| vec![profile_public_iri(profile_id)],
+    )
+}
+
+pub(crate) fn submission_profile_tag(jsonld: &str) -> bool {
+    data_graph(jsonld)
+        .map(|(data, root)| !profile_tags(&data, &root).is_empty())
+        .unwrap_or(true)
+}
+
+pub async fn validate_submission(
+    context: &DriverContext,
+    document_id: Ulid,
+    group_id: GroupId,
+    jsonld: &str,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    match assess_write(context, document_id, ProfileScope::Group(group_id), jsonld).await {
+        Ok(verdict) => write_verdict(verdict),
+        // An untagged crate never depended on the evaluator, so a node without
+        // one keeps accepting it instead of refusing every write.
+        Err(error) if untagged_without_evaluator(&error, jsonld) => {
+            Ok(not_profiled_status(document_id))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn untagged_without_evaluator(error: &MetadataError, jsonld: &str) -> bool {
+    matches!(
+        error,
+        MetadataError::ProfileValidation(findings)
+            if findings
+                .iter()
+                .any(|finding| finding.code == "validator_unavailable")
+    ) && !submission_profile_tag(jsonld)
+}
+
+/// A write refuses exactly what the preview reports: structural violations
+/// first, since a malformed crate makes the Profile findings secondary.
+fn write_verdict(
+    verdict: MetadataProfilePreview,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    if !verdict.structural_violations.is_empty() {
+        return Err(MetadataError::Validation(verdict.structural_violations));
+    }
+    if verdict.status.state == ProfileValidationState::Invalid {
+        return Err(MetadataError::ProfileValidation(verdict.status.findings));
+    }
+    Ok(verdict.status)
+}
+
+/// Profile verdict only. The write path uses `assess_write`, which also carries
+/// the structural findings; a render is never rejected and skips them.
+async fn assess_submission(
+    context: &DriverContext,
+    document_id: Ulid,
+    scope: ProfileScope,
+    jsonld: &str,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    let (data, root) = data_graph(jsonld)?;
+    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
+        return Ok(not_profiled_status(document_id));
+    };
+    Ok(
+        evaluate_tagged(context, document_id, scope, &requested_iri, jsonld)
+            .await?
+            .status,
+    )
+}
+
+/// The full verdict a create or replace enforces: Profile findings plus the
+/// structural findings, which an untagged crate only gets from a bare
+/// structural pass.
+async fn assess_write(
+    context: &DriverContext,
+    document_id: Ulid,
+    scope: ProfileScope,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    let (data, root) = data_graph(jsonld)?;
+    let Some(requested_iri) = single_profile_tag(&data, &root)? else {
+        let metadata = evaluator_handle(context, None)?;
+        let structural = metadata
+            .preview_crate_structure(jsonld.to_string())
+            .await
+            .map_err(|error| shacl_failure(error, None))?;
+        return Ok(MetadataProfilePreview {
+            status: not_profiled_status(document_id),
+            structural_violations: structural.into_iter().map(structural_violation).collect(),
+        });
+    };
+    evaluate_tagged(context, document_id, scope, &requested_iri, jsonld).await
+}
+
+async fn evaluate_tagged(
+    context: &DriverContext,
+    document_id: Ulid,
+    scope: ProfileScope,
+    requested_iri: &str,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    let profile = resolve_profile(context, requested_iri, scope).await?;
+    let metadata = evaluator_handle(context, Some(&profile.revision))?;
+    let assessment = evaluate_profile(metadata, &profile, jsonld).await?;
+    Ok(MetadataProfilePreview {
+        status: profiled_status(document_id, &profile, assessment.findings),
+        structural_violations: assessment.structural,
+    })
+}
+
+/// Profile verdict for a merged render. A merge is never rejected, so an
+/// evaluator that cannot answer reports stale rather than failing the job.
+pub(crate) async fn assess_render(
+    context: &DriverContext,
+    document_id: Ulid,
+    group_id: GroupId,
+    jsonld: &str,
+) -> ProfileValidationStatus {
+    match assess_submission(context, document_id, ProfileScope::Group(group_id), jsonld).await {
+        Ok(status) => status,
+        Err(MetadataError::ProfileValidation(findings)) => {
+            let mut status = stale_status(document_id, "profile_unavailable");
+            status.findings = findings;
+            status
+        }
+        Err(error) => stale_status(document_id, &error.to_string()),
+    }
+}
+
+/// Findings that make a document invalid, and so keep the render undisplayed.
+pub(crate) fn violation_count(status: &ProfileValidationStatus) -> u32 {
+    if status.state != ProfileValidationState::Invalid {
+        return 0;
+    }
+    u32::try_from(
+        status
+            .findings
+            .iter()
+            .filter(|finding| finding.severity == ProfileValidationSeverity::Violation)
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+}
+
+/// The verdict a create or replace would enforce for an unsaved draft.
+#[derive(Debug)]
+pub struct MetadataProfilePreview {
+    pub status: ProfileValidationStatus,
+    pub structural_violations: Vec<MetadataValidationViolation>,
+}
+
+impl MetadataProfilePreview {
+    pub fn accepted(&self) -> bool {
+        self.structural_violations.is_empty()
+            && self.status.state != ProfileValidationState::Invalid
+    }
+}
+
+/// Validates a draft without reading or writing any stored document. Without a
+/// group only public Profiles resolve, exactly as a foreign group's write would.
+pub async fn preview_submission(
+    context: &DriverContext,
+    group_id: Option<GroupId>,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    assess_write(context, Ulid::nil(), group_id.into(), jsonld).await
+}
+
+struct ProfileAssessment {
+    findings: Vec<ProfileValidationFinding>,
+    structural: Vec<MetadataValidationViolation>,
+}
+
+async fn evaluate_profile(
+    metadata: &MetadataHandle,
+    profile: &ResolvedProfile,
+    jsonld: &str,
+) -> Result<ProfileAssessment, MetadataError> {
+    let shapes = ProfileShapes {
+        graph_iri: profile.shapes_graph_iri.clone(),
+        sources: profile.shapes.clone(),
+    };
+    match metadata
+        .evaluate_profile_shapes(shapes, jsonld.to_string())
+        .await
+    {
+        Ok(report) => Ok(shacl_assessment(report, &profile.revision)),
+        Err(ProfileShaclError::Unsupported { rule, message }) => Ok(ProfileAssessment {
+            findings: vec![unsupported_finding(&rule, message, Some(&profile.revision))],
+            structural: Vec::new(),
+        }),
+        Err(ProfileShaclError::Limit { message }) => Ok(ProfileAssessment {
+            findings: vec![limit_finding(message, &profile.revision)],
+            structural: Vec::new(),
+        }),
+        Err(error) => Err(shacl_failure(error, Some(&profile.revision))),
+    }
+}
+
+fn shacl_assessment(report: ProfileShaclReport, profile_revision: &str) -> ProfileAssessment {
+    ProfileAssessment {
+        findings: report
+            .results
+            .iter()
+            .map(|result| constraint_finding(result, profile_revision))
+            .collect(),
+        structural: report
+            .structural
+            .into_iter()
+            .map(structural_violation)
+            .collect(),
+    }
+}
+
+fn constraint_finding(
+    result: &ShaclValidationResult,
+    profile_revision: &str,
+) -> ProfileValidationFinding {
+    let component = constraint_term(&result.source_constraint_component);
+    ProfileValidationFinding {
+        code: "constraint_violation".to_string(),
+        severity: finding_severity(&result.severity.0),
+        focus_node: Some(crate_local(&result.focus_node.0)),
+        path: result.result_path.as_deref().map(crate_local),
+        rule: component.as_ref().map_or_else(
+            || result.source_constraint_component.clone(),
+            |component| format!("{SH}{component}"),
+        ),
+        message: result.messages.first().map_or_else(
+            || default_message(component.as_deref().unwrap_or_default()).to_string(),
+            |message| message.text.clone(),
+        ),
+        profile_revision: Some(profile_revision.to_string()),
+        completeness: ProfileValidationCompleteness::Complete,
+    }
+}
+
+/// `sh:MinCountConstraintComponent` reports as the `sh:minCount` rule.
+fn constraint_term(component: &str) -> Option<String> {
+    let local = component
+        .strip_prefix(SH)?
+        .strip_suffix("ConstraintComponent")?;
+    let mut characters = local.chars();
+    let first = characters.next()?;
+    Some(format!("{}{}", first.to_lowercase(), characters.as_str()))
+}
+
+fn finding_severity(severity: &str) -> ProfileValidationSeverity {
+    match decode_term(severity).strip_prefix(SH) {
+        Some("Warning") => ProfileValidationSeverity::Warning,
+        Some("Info" | "Debug" | "Trace") => ProfileValidationSeverity::Info,
+        _ => ProfileValidationSeverity::Violation,
+    }
+}
+
+/// Craqle reports terms in N-Triples form; IRIs arrive in angle brackets.
+fn decode_term(term: &str) -> String {
+    term.strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or(term)
+        .to_string()
+}
+
+/// Reports the crate root as `./` so a caller can locate the entity in the
+/// document it submitted rather than in the validation store.
+fn crate_local(term: &str) -> String {
+    let decoded = decode_term(term);
+    if decoded == VALIDATION_GRAPH_IRI {
+        "./".to_string()
+    } else {
+        decoded
+    }
+}
+
+fn structural_violation(violation: CrateViolation) -> MetadataValidationViolation {
+    MetadataValidationViolation {
+        code: violation.code.to_string(),
+        message: violation.message,
+        pointer: violation.pointer,
+        entity_id: violation.entity_id,
+    }
+}
+
+fn single_profile_tag(
+    data: &Dataset,
+    root: &NamedOrBlankNode,
+) -> Result<Option<String>, MetadataError> {
+    let mut tags = profile_tags(data, root);
+    match tags.len() {
+        0 => Ok(None),
+        1 => Ok(tags.pop()),
+        _ => Err(MetadataError::ProfileValidation(vec![unsupported_finding(
+            "multiple_profile_tags",
+            "multiple root conformsTo Profile tags are not supported by the revision-bound status contract"
+                .to_string(),
+            None,
+        )])),
+    }
+}
+
+fn evaluator_handle<'a>(
+    context: &'a DriverContext,
+    profile_revision: Option<&str>,
+) -> Result<&'a MetadataHandle, MetadataError> {
+    match context.metadata_handle.as_ref() {
+        Some(metadata) if metadata.profile_validation_available() => Ok(metadata),
+        _ => Err(unavailable_error(
+            "validator_unavailable",
+            "the profile evaluator is unavailable; retry or remove the Profile tag",
+            profile_revision,
+        )),
+    }
+}
+
+fn shacl_failure(error: ProfileShaclError, profile_revision: Option<&str>) -> MetadataError {
+    match error {
+        ProfileShaclError::InvalidInput { message } => MetadataError::InvalidInput(message),
+        other => unavailable_error(
+            "validator_unavailable",
+            &other.to_string(),
+            profile_revision,
+        ),
+    }
+}
+
+fn profiled_status(
+    document_id: Ulid,
+    profile: &ResolvedProfile,
+    findings: Vec<ProfileValidationFinding>,
+) -> ProfileValidationStatus {
+    let invalid = findings
+        .iter()
+        .any(|finding| finding.severity == ProfileValidationSeverity::Violation);
+    let completeness = if findings
+        .iter()
+        .any(|finding| finding.completeness == ProfileValidationCompleteness::Incomplete)
+    {
+        ProfileValidationCompleteness::Incomplete
+    } else {
+        ProfileValidationCompleteness::Complete
+    };
+    ProfileValidationStatus {
+        document_id,
+        dataset_revision: Ulid::nil(),
+        state: if invalid {
+            ProfileValidationState::Invalid
+        } else {
+            ProfileValidationState::Valid
+        },
+        profile_id: profile.id,
+        profile_iri: Some(profile.requested_iri.clone()),
+        profile_revision: Some(profile.revision.clone()),
+        evaluator: EVALUATOR_NAME.to_string(),
+        validated_at_ms: Some(now_ms()),
+        findings,
+        completeness,
+        stale_reason: None,
+        dataset_digest: None,
+    }
+}
+
+pub fn not_profiled_status(document_id: Ulid) -> ProfileValidationStatus {
+    ProfileValidationStatus {
+        document_id,
+        dataset_revision: Ulid::nil(),
+        state: ProfileValidationState::NotProfiled,
+        profile_id: None,
+        profile_iri: None,
+        profile_revision: None,
+        evaluator: EVALUATOR_NAME.to_string(),
+        validated_at_ms: Some(now_ms()),
+        findings: Vec::new(),
+        completeness: ProfileValidationCompleteness::Complete,
+        stale_reason: None,
+        dataset_digest: None,
+    }
+}
+
+pub fn stale_status(document_id: Ulid, reason: &str) -> ProfileValidationStatus {
+    ProfileValidationStatus {
+        document_id,
+        dataset_revision: Ulid::nil(),
+        state: ProfileValidationState::Stale,
+        profile_id: None,
+        profile_iri: None,
+        profile_revision: None,
+        evaluator: EVALUATOR_NAME.to_string(),
+        validated_at_ms: None,
+        findings: Vec::new(),
+        completeness: ProfileValidationCompleteness::Incomplete,
+        stale_reason: Some(reason.to_string()),
+        dataset_digest: None,
+    }
+}
+
+pub async fn load_validation_status(
+    context: &DriverContext,
+    document_id: Ulid,
+    txn_id: Option<TxnId>,
+) -> Result<Option<ProfileValidationStatus>, MetadataError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: VALIDATION_STATUS_KEYSPACE.to_string(),
+            key: profile_validation_key(document_id),
+            txn_id,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| {
+                postcard::from_bytes(&value)
+                    .map_err(aruna_core::errors::ConversionError::from)
+                    .map_err(|error| MetadataError::Backend(error.to_string()))
+            })
+            .transpose(),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataError::Backend(format!(
+            "unexpected profile validation status read: {other:?}"
+        ))),
+    }
+}
+
+pub async fn current_validation_status(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    let Some(mut status) = load_validation_status(context, record.document_id, None).await? else {
+        return Ok(stale_status(
+            record.document_id,
+            "validation_status_missing",
+        ));
+    };
+    if !validation_is_current(context, record, &status).await? {
+        status.state = ProfileValidationState::Stale;
+        status.completeness = ProfileValidationCompleteness::Incomplete;
+        status.stale_reason = Some("dataset_revision_changed".to_string());
+        return Ok(status);
+    }
+    // A built-in Profile carries no id, so no registry row can age it out.
+    let pinned = status.profile_id.zip(status.profile_revision.clone());
+    if let Some((profile_id, validated_revision)) = pinned {
+        match read_registry(context, profile_id).await {
+            Ok(Some(profile)) if profile.last_event_id.to_string() == validated_revision => {}
+            Ok(Some(_)) => {
+                status.state = ProfileValidationState::Stale;
+                status.completeness = ProfileValidationCompleteness::Incomplete;
+                status.stale_reason = Some("profile_revision_changed".to_string());
+            }
+            Ok(None) => {
+                status.state = ProfileValidationState::Stale;
+                status.completeness = ProfileValidationCompleteness::Incomplete;
+                status.stale_reason = Some("profile_not_registered".to_string());
+            }
+            Err(_) => {
+                status.state = ProfileValidationState::Stale;
+                status.completeness = ProfileValidationCompleteness::Incomplete;
+                status.stale_reason = Some("profile_unavailable".to_string());
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// A merged document's status is bound to the render it validated, because a
+/// merge can leave the displayed revision behind the newest event. A status
+/// written before the first merge still carries only its event id.
+async fn validation_is_current(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+    status: &ProfileValidationStatus,
+) -> Result<bool, MetadataError> {
+    let Some(digest) = status.dataset_digest else {
+        return Ok(status.dataset_revision == record.last_event_id);
+    };
+    let current = crate::metadata::raw_revision::load_raw_digest(context, record.document_id)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    Ok(current == Some(digest))
+}
+
+pub async fn revalidate_current(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    let raw = load_raw_revision(context, record.document_id, None)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?
+        .ok_or(MetadataError::GraphNotFound)?;
+    let Some(digest) = raw.dataset_digest else {
+        return Err(MetadataError::Backend(
+            "metadata raw revision has no dataset digest to fence on".to_string(),
+        ));
+    };
+    let merged = merged_jsonld(&raw).map(str::to_owned);
+    let mut status = match merged.as_deref() {
+        Some(jsonld) => assess_render(context, record.document_id, record.group_id, jsonld).await,
+        None => {
+            assess_submission(
+                context,
+                record.document_id,
+                ProfileScope::Group(record.group_id),
+                &raw.jsonld,
+            )
+            .await?
+        }
+    };
+    status.dataset_revision = raw.winning_event_id;
+    status.dataset_digest = Some(digest);
+    let mut owner = context
+        .storage_handle
+        .start_transaction(false)
+        .await
+        .map_err(MetadataError::Storage)?;
+    let txn_id = owner.id().ok_or_else(|| {
+        MetadataError::Backend("profile revalidation transaction is missing".to_string())
+    })?;
+    let fenced = parse_registry_read(
+        context
+            .storage_handle
+            .send_effect(read_document_registry(record.document_id, Some(txn_id)))
+            .await,
+    )
+    .map_err(map_registry_error)?;
+    let fenced_raw = load_raw_revision(context, record.document_id, Some(txn_id))
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let fenced_digest = fenced_raw.as_ref().and_then(|raw| raw.dataset_digest);
+    let fenced_merged = fenced_raw.as_ref().and_then(merged_jsonld);
+    if fenced.is_none() || fenced_digest != Some(digest) || fenced_merged != merged.as_deref() {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        owner.finish();
+        return Err(MetadataError::Backend(
+            "metadata revision changed during profile revalidation; retry".to_string(),
+        ));
+    }
+    let (key_space, key, value) = profile_validation_entry(&status)
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(MetadataError::Backend(format!(
+                "unexpected profile validation status write: {other:?}"
+            )));
+        }
+    }
+    owner.unknown();
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+            owner.finish();
+            Ok(status)
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataError::Backend(format!(
+            "unexpected profile revalidation commit: {other:?}"
+        ))),
+    }
+}
+
+fn merged_jsonld(raw: &MetadataRawRevision) -> Option<&str> {
+    raw.merged.as_ref().map(|merged| merged.jsonld.as_str())
+}
+
+/// A built-in Profile answers from the embedded shapes; everything else has to
+/// be registered in the realm.
+async fn resolve_profile(
+    context: &DriverContext,
+    requested_iri: &str,
+    scope: ProfileScope,
+) -> Result<ResolvedProfile, MetadataError> {
+    match builtin_shapes(requested_iri) {
+        Some(shapes) => Ok(ResolvedProfile {
+            id: None,
+            requested_iri: requested_iri.to_string(),
+            revision: BUILTIN_REVISION.to_string(),
+            shapes_graph_iri: format!("{requested_iri}#shapes/{BUILTIN_REVISION}"),
+            shapes: vec![shapes.to_string()],
+        }),
+        None => resolve_registered_profile(context, requested_iri, scope).await,
+    }
+}
+
+async fn resolve_registered_profile(
+    context: &DriverContext,
+    requested_iri: &str,
+    scope: ProfileScope,
+) -> Result<ResolvedProfile, MetadataError> {
+    let Some(profile_id) = profile_from_iri(requested_iri) else {
+        return Err(profile_not_registered(requested_iri));
+    };
+    let record = match read_registry(context, profile_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return Err(profile_not_registered(requested_iri)),
+        Err(_) => {
+            return Err(unavailable_error(
+                "profile_unavailable",
+                "the registered Profile is temporarily unavailable; retry or remove the Profile tag",
+                None,
+            ));
+        }
+    };
+    if record.graph_iri != MetadataRegistryRecord::graph_iri_for(profile_id)
+        || !scope.may_use(&record)
+    {
+        return Err(profile_not_registered(requested_iri));
+    }
+    let revision = record.last_event_id;
+    let resolved = |shapes: Vec<String>| ResolvedProfile {
+        id: Some(profile_id),
+        requested_iri: requested_iri.to_string(),
+        revision: revision.to_string(),
+        shapes_graph_iri: format!("{}#shapes/{revision}", record.graph_iri),
+        shapes,
+    };
+    let pinned = revision.to_string();
+    if let Some(shapes) = cached_shapes(context, profile_id, revision) {
+        return Ok(resolved(shapes.as_ref().clone()));
+    }
+    let exported = export_profile_routed(&Arc::new(context.clone()), record.realm_id, profile_id, revision)
+        .await
+        .map_err(|_| {
+            unavailable_error(
+                "profile_unavailable",
+                "the registered Profile revision is temporarily unavailable; retry or remove the Profile tag",
+                Some(&pinned),
+            )
+        })?;
+    let ExportMetadataResult::Raw {
+        record: holder_record,
+        raw,
+        ..
+    } = exported
+    else {
+        return Err(unavailable_error(
+            "profile_unavailable",
+            "the registered Profile revision cannot be read; retry or remove the Profile tag",
+            Some(&pinned),
+        ));
+    };
+    // Usability was decided from the registry row above, so the holder copy is
+    // only fenced on identity and revision here.
+    if holder_record.document_id != record.document_id
+        || holder_record.last_event_id != revision
+        || raw.revision.winning_event_id != revision
+    {
+        return Err(unavailable_error(
+            "profile_unavailable",
+            "the registered Profile revision is changing; retry or remove the Profile tag",
+            Some(&pinned),
+        ));
+    }
+    let raw = raw.revision;
+    let (profile_data, profile_root) = data_graph(&raw.jsonld).map_err(|_| {
+        unavailable_error(
+            "profile_unavailable",
+            "the registered Profile cannot be read; retry or remove the Profile tag",
+            Some(&pinned),
+        )
+    })?;
+    if !has_type(&profile_data, &profile_root, DX_PROFILE) {
+        return Err(profile_not_registered(requested_iri));
+    }
+    let shapes = profile_shapes(&profile_data)
+        .map_err(|message| unavailable_error("profile_unavailable", &message, Some(&pinned)))?;
+    cache_shapes(context, profile_id, revision, &shapes);
+    Ok(resolved(shapes))
+}
+
+fn cached_shapes(
+    context: &DriverContext,
+    profile_id: Ulid,
+    revision: Ulid,
+) -> Option<Arc<Vec<String>>> {
+    context
+        .metadata_handle
+        .as_ref()?
+        .profile_cache()
+        .get(profile_id, revision)
+}
+
+fn cache_shapes(context: &DriverContext, profile_id: Ulid, revision: Ulid, shapes: &[String]) {
+    if let Some(metadata) = context.metadata_handle.as_ref() {
+        metadata
+            .profile_cache()
+            .insert(profile_id, revision, Arc::new(shapes.to_vec()));
+    }
+}
+
+async fn read_registry(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<Option<MetadataRegistryRecord>, MetadataError> {
+    parse_registry_read(
+        context
+            .storage_handle
+            .send_effect(read_document_registry(document_id, None))
+            .await,
+    )
+    .map_err(map_registry_error)
+}
+
+fn map_registry_error(error: StorageReadError) -> MetadataError {
+    match error {
+        StorageReadError::Storage(error) => error.into(),
+        StorageReadError::Conversion(error) => MetadataError::Backend(error.to_string()),
+    }
+}
+
+fn profile_from_iri(iri: &str) -> Option<Ulid> {
+    let value = iri.strip_prefix(PROFILE_PUBLIC_PREFIX)?;
+    if value.is_empty() || value.contains('/') {
+        return None;
+    }
+    let id = Ulid::from_string(value).ok()?;
+    aruna_core::MetaResourceId::from_bytes(id.to_bytes()).ok()?;
+    Some(id)
+}
+
+fn data_graph(jsonld: &str) -> Result<(Dataset, NamedOrBlankNode), MetadataError> {
+    let canonical = craqle::canonicalize_jsonld(jsonld)
+        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
+    let mut dataset = Dataset::new();
+    for quad in NQuadsParser::new().for_slice(canonical.nquads.as_bytes()) {
+        let quad = quad.map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
+        dataset.insert(&quad);
+        if !quad.graph_name.is_default_graph() {
+            dataset.insert(&Quad::new(
+                quad.subject,
+                quad.predicate,
+                quad.object,
+                GraphName::DefaultGraph,
+            ));
+        }
+    }
+    let root = crate_root(&dataset).ok_or_else(|| {
+        MetadataError::InvalidInput(
+            "RO-Crate descriptor does not identify a root entity".to_string(),
+        )
+    })?;
+    Ok((dataset, root))
+}
+
+fn crate_root(dataset: &Dataset) -> Option<NamedOrBlankNode> {
+    for predicate in [SCHEMA_ABOUT, SCHEMA_HTTPS_ABOUT] {
+        let predicate = NamedNode::new_unchecked(predicate);
+        for quad in dataset.quads_for_predicate(&predicate) {
+            if !quad.graph_name.is_default_graph() {
+                continue;
+            }
+            if let Some(root) = term_as_node(quad.object.into_owned()) {
+                return Some(root);
+            }
+        }
+    }
+    None
+}
+
+fn profile_tags(dataset: &Dataset, root: &NamedOrBlankNode) -> Vec<String> {
+    let mut tags = BTreeSet::new();
+    for predicate in [
+        DCTERMS_CONFORMS_TO,
+        SCHEMA_CONFORMS_TO,
+        SCHEMA_HTTPS_CONFORMS,
+    ] {
+        for object in objects(dataset, root, predicate) {
+            if let Term::NamedNode(iri) = object
+                && !is_rocrate_specification(iri.as_str())
+            {
+                tags.insert(iri.as_str().to_string());
+            }
+        }
+    }
+    tags.into_iter().collect()
+}
+
+fn profile_shapes(dataset: &Dataset) -> Result<Vec<String>, String> {
+    let mut candidates = HashSet::new();
+    for predicate in [SCHEMA_ENCODING_FORMAT, HTTPS_ENCODING_FORMAT] {
+        let predicate = NamedNode::new_unchecked(predicate);
+        for quad in dataset.quads_for_predicate(&predicate) {
+            if quad.graph_name.is_default_graph()
+                && matches!(quad.object, oxrdf::TermRef::Literal(value) if value.value() == "text/turtle")
+            {
+                candidates.insert(quad.subject.into_owned());
+            }
+        }
+    }
+    let mut shapes = Vec::new();
+    for candidate in candidates {
+        let mut text = None;
+        for predicate in [SCHEMA_TEXT, SCHEMA_HTTPS_TEXT] {
+            for object in objects(dataset, &candidate, predicate) {
+                if let Term::Literal(value) = object {
+                    text = Some(value.value().to_string());
+                    break;
+                }
+            }
+        }
+        match text {
+            Some(text) => shapes.push(text),
+            None => {
+                return Err(
+                    "the registered Profile's SHACL artifact is not locally available; retry or remove the Profile tag"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(shapes)
+}
+
+fn objects(dataset: &Dataset, subject: &NamedOrBlankNode, predicate: &str) -> Vec<Term> {
+    let predicate = NamedNode::new_unchecked(predicate);
+    dataset
+        .quads_for_subject(subject)
+        .filter(|quad| quad.graph_name.is_default_graph() && quad.predicate == predicate.as_ref())
+        .map(|quad| quad.object.into_owned())
+        .collect()
+}
+
+fn has_type(dataset: &Dataset, subject: &NamedOrBlankNode, class: &str) -> bool {
+    objects(dataset, subject, RDF_TYPE)
+        .iter()
+        .any(|term| matches!(term, Term::NamedNode(value) if value.as_str() == class))
+}
+
+fn term_as_node(term: Term) -> Option<NamedOrBlankNode> {
+    match term {
+        Term::NamedNode(node) => Some(NamedOrBlankNode::NamedNode(node)),
+        Term::BlankNode(node) => Some(NamedOrBlankNode::BlankNode(node)),
+        _ => None,
+    }
+}
+
+fn default_message(component: &str) -> &'static str {
+    match component {
+        "minCount" => "fewer values are present than the Profile requires",
+        "maxCount" => "more values are present than the Profile allows",
+        "datatype" => "a value has the wrong RDF datatype",
+        "class" => "a value is not an instance of the required class",
+        "nodeKind" => "a value has the wrong RDF node kind",
+        "pattern" => "a value does not match the required pattern",
+        "in" => "a value is outside the allowed set",
+        "hasValue" => "the required value is missing",
+        "closed" => "a closed shape contains a property that is not allowed",
+        _ => "the submitted crate does not satisfy the Profile constraint",
+    }
+}
+
+fn limit_finding(message: String, profile_revision: &str) -> ProfileValidationFinding {
+    ProfileValidationFinding {
+        code: "validation_limit".to_string(),
+        severity: ProfileValidationSeverity::Violation,
+        focus_node: None,
+        path: None,
+        rule: "validation_limit".to_string(),
+        message,
+        profile_revision: Some(profile_revision.to_string()),
+        completeness: ProfileValidationCompleteness::Incomplete,
+    }
+}
+
+fn unsupported_finding(
+    rule: &str,
+    message: String,
+    profile_revision: Option<&str>,
+) -> ProfileValidationFinding {
+    ProfileValidationFinding {
+        code: "unsupported_constraint".to_string(),
+        severity: ProfileValidationSeverity::Violation,
+        focus_node: None,
+        path: None,
+        rule: rule.to_string(),
+        message,
+        profile_revision: profile_revision.map(str::to_string),
+        completeness: ProfileValidationCompleteness::Incomplete,
+    }
+}
+
+fn profile_not_registered(iri: &str) -> MetadataError {
+    MetadataError::ProfileValidation(vec![ProfileValidationFinding {
+        code: "profile_not_registered".to_string(),
+        severity: ProfileValidationSeverity::Violation,
+        focus_node: None,
+        path: Some(DCTERMS_CONFORMS_TO.to_string()),
+        rule: DCTERMS_CONFORMS_TO.to_string(),
+        message: format!("Profile `{iri}` is not registered; remove the Profile tag before saving"),
+        profile_revision: None,
+        completeness: ProfileValidationCompleteness::Incomplete,
+    }])
+}
+
+fn unavailable_error(code: &str, message: &str, revision: Option<&str>) -> MetadataError {
+    MetadataError::ProfileValidation(vec![ProfileValidationFinding {
+        code: code.to_string(),
+        severity: ProfileValidationSeverity::Violation,
+        focus_node: None,
+        path: Some(DCTERMS_CONFORMS_TO.to_string()),
+        rule: code.to_string(),
+        message: message.to_string(),
+        profile_revision: revision.map(str::to_string),
+        completeness: ProfileValidationCompleteness::Incomplete,
+    }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::metadata::CRATE_PROFILE_IRI;
+    use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
+    use craqle::{EncodedTerm, ShaclMessage};
+
+    fn result(component: &str, severity: &str, path: Option<&str>) -> ShaclValidationResult {
+        ShaclValidationResult {
+            focus_node: EncodedTerm("<https://example.test/dataset>".to_string()),
+            value: None,
+            result_path: path.map(str::to_string),
+            source_shape: EncodedTerm("<urn:shape>".to_string()),
+            source_constraint_component: component.to_string(),
+            severity: EncodedTerm(format!("<{SH}{severity}>")),
+            messages: Vec::new(),
+        }
+    }
+
+    fn violation() -> MetadataValidationViolation {
+        MetadataValidationViolation {
+            code: "incomplete_root".to_string(),
+            message: "the root data entity needs a description".to_string(),
+            pointer: "/@graph/1".to_string(),
+            entity_id: Some("./".to_string()),
+        }
+    }
+
+    #[test]
+    fn refuses_untagged_structure() {
+        // The preview reports these for an untagged crate; the write must too.
+        let error = write_verdict(MetadataProfilePreview {
+            status: not_profiled_status(Ulid::nil()),
+            structural_violations: vec![violation()],
+        })
+        .expect_err("a structural violation must refuse the write");
+        let MetadataError::Validation(violations) = error else {
+            panic!("expected structural violations");
+        };
+        assert_eq!(violations, vec![violation()]);
+    }
+
+    #[test]
+    fn refuses_profiled_structure() {
+        // A Profile-scoped evaluation reports structure alongside its findings.
+        let mut status = not_profiled_status(Ulid::nil());
+        status.state = ProfileValidationState::Valid;
+        let error = write_verdict(MetadataProfilePreview {
+            status,
+            structural_violations: vec![violation()],
+        })
+        .expect_err("a valid Profile verdict must not hide broken structure");
+        assert!(matches!(error, MetadataError::Validation(_)));
+    }
+
+    #[test]
+    fn refuses_invalid_profile() {
+        let mut status = not_profiled_status(Ulid::nil());
+        status.state = ProfileValidationState::Invalid;
+        status.findings = vec![limit_finding("budget".to_string(), "01REV")];
+        let error = write_verdict(MetadataProfilePreview {
+            status,
+            structural_violations: Vec::new(),
+        })
+        .expect_err("an invalid Profile verdict must refuse the write");
+        assert!(matches!(error, MetadataError::ProfileValidation(_)));
+        let accepted = write_verdict(MetadataProfilePreview {
+            status: not_profiled_status(Ulid::nil()),
+            structural_violations: Vec::new(),
+        })
+        .expect("a clean verdict is accepted");
+        assert_eq!(accepted.state, ProfileValidationState::NotProfiled);
+    }
+
+    fn crate_with_tag(tag: Option<&str>) -> String {
+        let mut root = serde_json::json!({
+            "@id": "https://example.test/dataset",
+            "@type": "Dataset",
+            "name": "Fixture"
+        });
+        if let Some(tag) = tag {
+            root["conformsTo"] = serde_json::json!({"@id": tag});
+        }
+        serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {
+                    "@id": "ro-crate-metadata.json",
+                    "@type": "CreativeWork",
+                    "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                    "about": {"@id": "https://example.test/dataset"}
+                },
+                root
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn keeps_untagged_writable() {
+        // A node without an evaluator must still accept an untagged crate.
+        let untagged = crate_with_tag(None);
+        let tagged = crate_with_tag(Some(
+            "https://w3id.org/aruna/profile/01J00000000000000000000000",
+        ));
+        let unavailable = unavailable_error("validator_unavailable", "no evaluator", None);
+        assert!(untagged_without_evaluator(&unavailable, &untagged));
+        assert!(!untagged_without_evaluator(&unavailable, &tagged));
+        assert!(!untagged_without_evaluator(
+            &MetadataError::InvalidInput("broken".to_string()),
+            &untagged
+        ));
+    }
+
+    #[test]
+    fn selects_merged_candidate() {
+        let mut raw = MetadataRawRevision {
+            jsonld: "displayed".to_string(),
+            winning_event_id: Ulid::nil(),
+            context_digest: [0u8; 32],
+            dataset_digest: Some([1u8; 32]),
+            merged: None,
+        };
+        assert!(merged_jsonld(&raw).is_none());
+        raw.merged = Some(aruna_core::metadata::MetadataMergedRevision {
+            jsonld: "candidate".to_string(),
+            findings: 1,
+        });
+        assert_eq!(merged_jsonld(&raw), Some("candidate"));
+    }
+
+    #[test]
+    fn maps_component_rules() {
+        assert_eq!(
+            constraint_term(&format!("{SH}MinCountConstraintComponent")).as_deref(),
+            Some("minCount")
+        );
+        assert_eq!(
+            constraint_term(&format!("{SH}QualifiedMinCountConstraintComponent")).as_deref(),
+            Some("qualifiedMinCount")
+        );
+        assert_eq!(constraint_term("urn:custom:component"), None);
+    }
+
+    #[test]
+    fn decodes_term_forms() {
+        assert_eq!(
+            decode_term("<https://example.test/a>"),
+            "https://example.test/a"
+        );
+        assert_eq!(decode_term("_:b0"), "_:b0");
+        assert_eq!(decode_term("\"value\""), "\"value\"");
+    }
+
+    #[test]
+    fn maps_shacl_severities() {
+        let revision = "01REV";
+        let finding = constraint_finding(
+            &result(&format!("{SH}MinCountConstraintComponent"), "Warning", None),
+            revision,
+        );
+        assert_eq!(finding.severity, ProfileValidationSeverity::Warning);
+        assert_eq!(finding.rule, format!("{SH}minCount"));
+        assert_eq!(
+            finding.message,
+            "fewer values are present than the Profile requires"
+        );
+        for (severity, expected) in [
+            ("Trace", ProfileValidationSeverity::Info),
+            ("Debug", ProfileValidationSeverity::Info),
+            ("Info", ProfileValidationSeverity::Info),
+            ("Violation", ProfileValidationSeverity::Violation),
+            ("Custom", ProfileValidationSeverity::Violation),
+        ] {
+            let finding = constraint_finding(
+                &result(&format!("{SH}MinCountConstraintComponent"), severity, None),
+                revision,
+            );
+            assert_eq!(finding.severity, expected);
+        }
+    }
+
+    #[test]
+    fn prefers_shape_message() {
+        let mut input = result(
+            &format!("{SH}DatatypeConstraintComponent"),
+            "Violation",
+            Some("<http://schema.org/name>"),
+        );
+        input.messages.push(ShaclMessage {
+            language: None,
+            text: "name must be a string".to_string(),
+        });
+        let finding = constraint_finding(&input, "01REV");
+        assert_eq!(finding.message, "name must be a string");
+        assert_eq!(finding.path.as_deref(), Some("http://schema.org/name"));
+        assert_eq!(
+            finding.focus_node.as_deref(),
+            Some("https://example.test/dataset")
+        );
+    }
+
+    #[test]
+    fn limits_are_incomplete() {
+        let finding = limit_finding("budget exhausted".to_string(), "01REV");
+        assert_eq!(finding.code, "validation_limit");
+        assert_eq!(
+            finding.completeness,
+            ProfileValidationCompleteness::Incomplete
+        );
+    }
+
+    #[test]
+    fn canonical_profile_iri() {
+        let id = MetaResourceId::from_parts(
+            1,
+            PlacementHandle::new(1).unwrap(),
+            BucketId::new(1).unwrap(),
+            1,
+        )
+        .unwrap()
+        .as_ulid();
+        assert_eq!(profile_from_iri(&profile_public_iri(id)), Some(id));
+        assert_eq!(
+            profile_from_iri(&MetadataRegistryRecord::graph_iri_for(id)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_status_digest() {
+        // A merge can leave the displayed revision behind the newest event, so
+        // freshness follows the render's digest, not the event id.
+        use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::placement::record::PlacementRef;
+        use aruna_storage::FjallStorage;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let group_id = Ulid::from_parts(1, 1);
+        let document_id = Ulid::from_parts(1, 2);
+        let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: "datasets/digest".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                "datasets/digest",
+                document_id,
+            ),
+            placement: PlacementRef::NIL,
+            holder_node_ids: vec![node_id],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            establishing_event_id: Ulid::from_parts(1, 3),
+            last_event_id: Ulid::from_parts(2, 3),
+        };
+        let event = MetadataEventRecord {
+            event_id: record.last_event_id,
+            record: record.clone(),
+            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 4), realm_id),
+            node_id,
+            payload: MetadataEventPayload::UpsertDataEntity {
+                jsonld: "{}".to_string(),
+            },
+            occurred_at_ms: 1,
+        };
+        let render = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [{ "@id": "./", "@type": "Dataset", "name": "merged" }]
+        })
+        .to_string();
+
+        // A status written before the first merge still keys on its event id.
+        let mut status = not_profiled_status(document_id);
+        status.dataset_revision = record.last_event_id;
+        assert!(
+            validation_is_current(&context, &record, &status)
+                .await
+                .unwrap()
+        );
+        status.dataset_digest = Some([9u8; 32]);
+        assert!(
+            !validation_is_current(&context, &record, &status)
+                .await
+                .unwrap()
+        );
+
+        let plan = crate::metadata::raw_revision::prepare_merged_event(
+            &context,
+            &event,
+            render,
+            0,
+            &mut crate::metadata::raw_revision::RawStateCache::default(),
+        )
+        .await
+        .expect("merged raw state");
+        let (key_space, key, value) = plan.state_write.clone();
+        assert!(matches!(
+            storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space,
+                    key,
+                    value,
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        status.dataset_digest = plan
+            .revision
+            .as_ref()
+            .and_then(|revision| revision.dataset_digest);
+        assert!(status.dataset_digest.is_some());
+        assert!(
+            validation_is_current(&context, &record, &status)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn spec_tags_ignored() {
+        for version in ["1.2", "1.3"] {
+            let specification = format!("https://w3id.org/ro/crate/{version}");
+            let document = serde_json::json!({
+                "@context": format!("{specification}/context"),
+                "@graph": [
+                    {
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "conformsTo": {"@id": specification},
+                        "about": {"@id": "https://example.test/dataset"}
+                    },
+                    {
+                        "@id": "https://example.test/dataset",
+                        "@type": "Dataset",
+                        "name": "Versioned crate",
+                        "description": "Specification IRIs are not Profiles",
+                        "datePublished": "2026-08-19",
+                        "conformsTo": [
+                            {"@id": specification},
+                            {"@id": "https://w3id.org/ro/wfrun/workflow/0.5"}
+                        ]
+                    }
+                ]
+            })
+            .to_string();
+            let (data, root) = data_graph(&document).unwrap();
+            assert!(profile_tags(&data, &root).is_empty());
+        }
+    }
+
+    #[test]
+    fn builtin_tag_resolves() {
+        // The built-in Profile must survive the specification-marker filter.
+        let document = crate_with_tag(Some(CRATE_PROFILE_IRI));
+        let (data, root) = data_graph(&document).unwrap();
+        assert_eq!(
+            single_profile_tag(&data, &root).unwrap().as_deref(),
+            Some(CRATE_PROFILE_IRI)
+        );
+        assert!(builtin_shapes(CRATE_PROFILE_IRI).is_some());
+    }
+}

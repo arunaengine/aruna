@@ -1,17 +1,20 @@
+//! Revokes one S3 session and deletes its session, expiry and owner index rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{S3SessionError, decode_index, encode_index, expiry_key, owner_key};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, S3_SESSION_OWNER_KEYSPACE,
-};
+use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::S3Session;
-use aruna_core::types::{Effects, Key, UserId};
+use aruna_core::structs::identity::s3_session::S3Session;
+use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
-pub struct RevokeS3SessionConfig {
+pub struct RevokeS3Config {
     pub access_key: String,
     pub user_identity: UserId,
     pub issued_by: [u8; 32],
@@ -31,8 +34,8 @@ enum RevokeSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RevokeS3SessionOperation {
-    config: RevokeS3SessionConfig,
+pub struct RevokeS3Operation {
+    config: RevokeS3Config,
     owner_key: Option<Key>,
     deletes: Vec<(String, Key)>,
     txn_id: Option<Ulid>,
@@ -40,8 +43,8 @@ pub struct RevokeS3SessionOperation {
     output: Result<(), S3SessionError>,
 }
 
-impl RevokeS3SessionOperation {
-    pub fn new(config: RevokeS3SessionConfig) -> Self {
+impl RevokeS3Operation {
+    pub fn new(config: RevokeS3Config) -> Self {
         Self {
             config,
             owner_key: None,
@@ -113,7 +116,7 @@ impl RevokeS3SessionOperation {
                 S3_SESSION_KEYSPACE.to_string(),
                 session.access_key.as_bytes().into(),
             ),
-            (S3_SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key),
+            (SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key),
         ];
         let owner_key = owner_key(session.user_identity, session.group_id);
         self.owner_key = Some(owner_key.clone());
@@ -122,7 +125,7 @@ impl RevokeS3SessionOperation {
         };
         self.state = RevokeSessionState::ReadIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: SESSION_OWNER_KEYSPACE.to_string(),
             key: owner_key,
             txn_id: Some(txn_id),
         })]
@@ -142,7 +145,7 @@ impl RevokeS3SessionOperation {
         };
         if index.is_empty() {
             self.deletes
-                .push((S3_SESSION_OWNER_KEYSPACE.to_string(), owner_key));
+                .push((SESSION_OWNER_KEYSPACE.to_string(), owner_key));
             return self.delete_rows();
         }
         let index_bytes = match encode_index(&index) {
@@ -151,7 +154,7 @@ impl RevokeS3SessionOperation {
         };
         self.state = RevokeSessionState::WriteIndex;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: SESSION_OWNER_KEYSPACE.to_string(),
             key: owner_key,
             value: index_bytes,
             txn_id: Some(txn_id),
@@ -206,7 +209,7 @@ impl RevokeS3SessionOperation {
     }
 }
 
-impl Operation for RevokeS3SessionOperation {
+impl Operation for RevokeS3Operation {
     type Output = ();
     type Error = S3SessionError;
 

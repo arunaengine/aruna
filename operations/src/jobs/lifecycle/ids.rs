@@ -1,21 +1,21 @@
-//! Request normalization and the identities derived from it.
-//!
-//! The same bytes must produce the same identity on every node, so nothing
-//! assigned locally enters a digest: no job id, no origin, no timestamp, no
-//! resolved server default and no current topology.
+//! Normalizes a submission request and derives the identities that follow from it.
+//! The same bytes must give the same identity on every node, so nothing local enters a digest.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::UserId;
 use aruna_core::compute::SessionMount;
 use aruna_core::compute::runtimes::{
-    SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_MOUNT_PATH_TAG, SESSION_MOUNT_PREFIX_TAG,
-    SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK,
+    MOUNT_PATH_TAG, MOUNT_PREFIX_TAG, SESSION_EXPIRY_TAG, SESSION_IDLE_TAG, SESSION_RUNTIME_TAG,
+    SESSION_TAG, SESSION_TAG_NOTEBOOK,
 };
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{
-    CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, LabelMatch, MAX_SELECTOR_LABELS,
-    PlacementPolicyRef, SubmissionId, WorkspaceMode,
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::{
+    CapturedInput, EffectiveResources, ExecutionSpec, JobFamilyId, SubmissionId, WorkspaceMode,
 };
-use aruna_core::types::NodeId;
-use aruna_core::types::UserId;
+use aruna_core::structs::placement::policy::{MAX_SELECTOR_LABELS, PlacementPolicyRef};
+use aruna_core::structs::placement::record::LabelMatch;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -178,17 +178,10 @@ pub fn session_of(spec: &ExecutionSpec) -> Option<SessionSpec> {
     if spec.tags.get(SESSION_TAG).map(String::as_str) != Some(SESSION_TAG_NOTEBOOK) {
         return None;
     }
-    let mount = spec
-        .tags
-        .get(SESSION_MOUNT_PATH_TAG)
-        .map(|path| SessionMount {
-            prefix: spec
-                .tags
-                .get(SESSION_MOUNT_PREFIX_TAG)
-                .cloned()
-                .unwrap_or_default(),
-            path: path.clone(),
-        });
+    let mount = spec.tags.get(MOUNT_PATH_TAG).map(|path| SessionMount {
+        prefix: spec.tags.get(MOUNT_PREFIX_TAG).cloned().unwrap_or_default(),
+        path: path.clone(),
+    });
     Some(SessionSpec {
         runtime: spec
             .tags
@@ -245,7 +238,7 @@ pub fn effective_resources(spec: &ExecutionSpec) -> EffectiveResources {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::ComputeResources;
+    use aruna_core::structs::execution::job::ComputeResources;
 
     use super::*;
 
@@ -284,7 +277,7 @@ mod tests {
         assert_eq!(session_of(&spec).unwrap().mount, None);
 
         spec.tags
-            .insert(SESSION_MOUNT_PATH_TAG.to_string(), "/work/raw".to_string());
+            .insert(MOUNT_PATH_TAG.to_string(), "/work/raw".to_string());
         assert_eq!(
             session_of(&spec).unwrap().mount,
             Some(SessionMount {
@@ -293,10 +286,8 @@ mod tests {
             })
         );
 
-        spec.tags.insert(
-            SESSION_MOUNT_PREFIX_TAG.to_string(),
-            "raw/2024/".to_string(),
-        );
+        spec.tags
+            .insert(MOUNT_PREFIX_TAG.to_string(), "raw/2024/".to_string());
         assert_eq!(
             session_of(&spec).unwrap().mount.unwrap().prefix,
             "raw/2024/"

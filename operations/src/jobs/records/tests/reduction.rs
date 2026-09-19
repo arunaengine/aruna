@@ -1,12 +1,14 @@
-//! The reducer must be a function of the record set alone.
+//! Tests that the reducer produces the same projection from any order of the same records.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ExecutionRole, JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope,
     LogicalJobState, PhysicalExecutionState, canonical_execution_key,
 };
 
-use super::fixture::Family;
 use crate::jobs::records::reduce::{canonical_binding, reduce_family, submission_families};
+use crate::tests::records::Family;
 
 /// Deterministic shuffle: an index rotation plus every record duplicated once,
 /// so replay and batching are covered without unseeded randomness.

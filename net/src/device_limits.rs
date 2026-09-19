@@ -1,10 +1,7 @@
-//! Per-device inbound limits.
-//!
-//! A user device is the one realm key whose request volume is not implicitly
-//! bounded by realm responsibility: it holds nothing, serves nothing, and only
-//! asks. Its inbound streams are therefore charged against a per-node budget the
-//! realm configuration publishes, at the same admission point that already
-//! applies the ALPN by kind boundary. Realm nodes are never charged here.
+//! Charges inbound device streams against per-node rate and concurrency budgets.
+//! Only user devices are charged here, never realm nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use governor::clock::{Clock, DefaultClock};

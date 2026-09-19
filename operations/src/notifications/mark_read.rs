@@ -1,21 +1,25 @@
+//! Runs the operation that marks inbox records read by id or up to a timestamp.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::notification_inbox_update_entry;
-use aruna_core::structs::{
-    NotificationRecord, invert_timestamp_ms, notification_inbox_prefix,
-    parse_notification_inbox_key,
+use aruna_core::storage_entries::inbox_update_entry;
+use aruna_core::structs::execution::notification::{
+    NotificationRecord, invert_timestamp_ms, notification_inbox_prefix, parse_inbox_key,
 };
-use aruna_core::types::{Effects, Key, KeySpace, UserId, Value};
+use aruna_core::types::{Effects, Key, KeySpace, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-pub const MARK_READ_SCAN_PAGE_SIZE: usize = 512;
-pub const MARK_READ_MAX_IDS: usize = 512;
+pub const MARK_PAGE_SIZE: usize = 512;
+pub const MARK_MAX_IDS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkReadInput {
@@ -70,7 +74,7 @@ pub enum MarkReadError {
 
 impl MarkReadOperation {
     pub fn new(mut input: MarkReadInput) -> Self {
-        let too_many_ids = input.ids.len() > MARK_READ_MAX_IDS;
+        let too_many_ids = input.ids.len() > MARK_MAX_IDS;
         if !too_many_ids {
             input.ids.sort_unstable();
             input.ids.dedup();
@@ -93,7 +97,7 @@ impl MarkReadOperation {
         smallvec![]
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn storage_error_fails(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -113,7 +117,7 @@ impl MarkReadOperation {
             key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
             prefix: Some(notification_inbox_prefix(self.input.recipient)),
             start,
-            limit: MARK_READ_SCAN_PAGE_SIZE,
+            limit: MARK_PAGE_SIZE,
             txn_id: None,
         })
     }
@@ -138,11 +142,10 @@ impl MarkReadOperation {
 
         let mut writes: Vec<(KeySpace, Key, Value)> = Vec::new();
         for (key, value) in values {
-            let (recipient, created_at_ms, notification_id) =
-                match parse_notification_inbox_key(&key) {
-                    Ok(identity) => identity,
-                    Err(error) => return self.fail(error.into()),
-                };
+            let (recipient, created_at_ms, notification_id) = match parse_inbox_key(&key) {
+                Ok(identity) => identity,
+                Err(error) => return self.fail(error.into()),
+            };
             let mut record = match NotificationRecord::from_bytes(&value) {
                 Ok(record) => record,
                 Err(error) => return self.fail(error.into()),
@@ -176,7 +179,7 @@ impl MarkReadOperation {
                 .is_some_and(|up_to_ms| record.created_at_ms <= up_to_ms);
             if record.read_at_ms.is_none() && (by_id || by_time) {
                 record.read_at_ms = Some(self.input.now_ms);
-                match notification_inbox_update_entry(&record) {
+                match inbox_update_entry(&record) {
                     Ok(entry) => writes.push(entry),
                     Err(error) => return self.fail(error.into()),
                 }
@@ -227,9 +230,7 @@ impl Operation for MarkReadOperation {
 
     fn start(&mut self) -> Effects {
         if self.too_many_ids {
-            return self.fail(MarkReadError::TooManyIds {
-                max: MARK_READ_MAX_IDS,
-            });
+            return self.fail(MarkReadError::TooManyIds { max: MARK_MAX_IDS });
         }
         if self.input.ids.is_empty() && self.input.up_to_ms.is_none() {
             return self.finish();
@@ -249,7 +250,7 @@ impl Operation for MarkReadOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.storage_error_fails(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -278,49 +279,13 @@ impl Operation for MarkReadOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::notifications::inbox::upsert_inbox_records;
-    use aruna_core::keyspaces::NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE;
-    use aruna_core::structs::{
-        NotificationClass, NotificationKind, RealmId, notification_inbox_key,
-    };
-    use aruna_storage::storage::{FjallStorage, StorageHandle};
-    use tempfile::{TempDir, tempdir};
-
-    fn context_with_storage() -> (TempDir, DriverContext) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        (tempdir, context)
-    }
-
-    fn user(realm: u8, seed: u8) -> UserId {
-        UserId::new(Ulid::from_bytes([seed; 16]), RealmId([realm; 32]))
-    }
+    use crate::tests::notifications::{context_with_storage, seed, user};
+    use aruna_core::keyspaces::PRUNE_INDEX_KEYSPACE;
+    use aruna_core::structs::execution::notification::{NotificationClass, notification_inbox_key};
+    use aruna_storage::storage::StorageHandle;
 
     fn record(recipient: UserId, created_at_ms: u64) -> NotificationRecord {
-        NotificationRecord::new(
-            recipient,
-            NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::generate(),
-                actor_user_id: user(recipient.realm_id.0[0], 200),
-            },
-            created_at_ms,
-        )
-    }
-
-    async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
-        assert_eq!(
-            upsert_inbox_records(storage, records).await,
-            Ok(records.len())
-        );
+        crate::tests::notifications::record(recipient, NotificationClass::Direct, created_at_ms)
     }
 
     async fn read_all(storage: &StorageHandle, recipient: UserId) -> Vec<NotificationRecord> {
@@ -345,7 +310,7 @@ mod tests {
     async fn read_prune_index(storage: &StorageHandle) -> Vec<(Vec<u8>, Vec<u8>)> {
         match storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE.to_string(),
+                key_space: PRUNE_INDEX_KEYSPACE.to_string(),
                 prefix: None,
                 start: None,
                 limit: 4096,
@@ -369,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_by_ids_is_idempotent() {
+    async fn mark_ids_idempotent() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let records: Vec<_> = (1..=3).map(|ts| record(recipient, ts * 10)).collect();
@@ -417,7 +382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_up_to_timestamp() {
+    async fn mark_through_timestamp() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let records: Vec<_> = [10, 20, 30]
@@ -451,7 +416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_ids_and_up_to_combined() {
+    async fn mark_filters_combine() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let records: Vec<_> = [10, 20, 30, 40]
@@ -488,7 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_unknown_ids_is_noop() {
+    async fn unknown_ids_noop() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         seed(
@@ -515,9 +480,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_too_many_ids() {
+    fn rejects_id_limit() {
         let recipient = user(1, 1);
-        let ids = (0..=MARK_READ_MAX_IDS).map(|_| Ulid::generate()).collect();
+        let ids = (0..=MARK_MAX_IDS).map(|_| Ulid::generate()).collect();
         let mut operation = MarkReadOperation::new(MarkReadInput {
             recipient,
             ids,
@@ -528,14 +493,12 @@ mod tests {
         assert!(operation.start().is_empty());
         assert_eq!(
             operation.finalize(),
-            Err(MarkReadError::TooManyIds {
-                max: MARK_READ_MAX_IDS
-            })
+            Err(MarkReadError::TooManyIds { max: MARK_MAX_IDS })
         );
     }
 
     #[tokio::test]
-    async fn mark_is_recipient_scoped() {
+    async fn recipient_scoped() {
         let (_tempdir, context) = context_with_storage();
         let alice = user(1, 1);
         let bob = user(1, 2);
@@ -567,7 +530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_rejects_key_payload_identity_mismatch() {
+    async fn identity_mismatch_rejected() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let original = record(recipient, 10);
@@ -606,7 +569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_does_not_touch_prune_index() {
+    async fn prune_index_untouched() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let records: Vec<_> = [10, 20, 30]

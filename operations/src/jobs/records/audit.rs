@@ -1,15 +1,14 @@
-//! Paginated audit of the immutable log.
-//!
-//! Pages are ordered by the stable record key, never by arrival, so a cursor is
-//! a position in the log rather than a snapshot of one responder. Every claim,
-//! budget, launch, receipt, update, output, and cancellation of the scope is
-//! returned, together with the conflict rows that were refused under a key.
+//! Pages the immutable job record log in stable key order, including refused conflict rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, FetchCursor, IterStart, PageLimit, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_FAMILY_CONFLICT_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_CONFLICT_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{JobFamilyId, JobRecordEnvelope, JobRecordKey, SubmissionId};
+use aruna_core::structs::execution::job::{
+    JobFamilyId, JobRecordEnvelope, JobRecordKey, SubmissionId,
+};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 
@@ -135,7 +134,7 @@ impl Operation for FamilyAuditOperation {
         };
         self.state = AuditState::Page;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             prefix: Some(self.config.scope.prefix()),
             start,
             limit: self.config.limit.get(),
@@ -153,7 +152,7 @@ impl Operation for FamilyAuditOperation {
                     }
                     self.state = AuditState::Conflicts;
                     smallvec![Effect::Storage(StorageEffect::Iter {
-                        key_space: JOB_FAMILY_CONFLICT_KEYSPACE.to_string(),
+                        key_space: FAMILY_CONFLICT_KEYSPACE.to_string(),
                         prefix: Some(self.config.scope.prefix()),
                         start: None,
                         limit: MAX_CONFLICT_ROWS,

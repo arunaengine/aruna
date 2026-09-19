@@ -1,13 +1,18 @@
-//! Pinned scheduling inputs. Every value here is exact and already resolved:
-//! the planner performs no I/O and never invents a missing value.
+//! Holds the pinned request, input and target values a plan is built from, with bounds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
-use crate::structs::{
-    ComputeConfigError, EffectiveResources, LabelMatch, MAX_SELECTOR_LABELS, PlacementPolicyError,
-    PlacementPolicyRef, PlacementSubject, PolicyResolution, RealmNodeKind, SubmissionId,
-    VersionedObjectArn,
+use crate::structs::execution::job::{EffectiveResources, SubmissionId};
+use crate::structs::identity::realm::RealmNodeKind;
+use crate::structs::placement::compute_config::ComputeConfigError;
+use crate::structs::placement::policy::{
+    MAX_SELECTOR_LABELS, PlacementPolicyError, PlacementPolicyRef, PlacementSubject,
+    PolicyResolution,
 };
+use crate::structs::placement::record::LabelMatch;
+use crate::structs::storage::replication::VersionedObjectArn;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -225,7 +230,7 @@ pub struct TargetScore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduling::tests::{node, request, resolved_input};
+    use crate::tests::scheduling::{node, request, resolved_input};
 
     #[test]
     fn canonical_sorts_inputs() {

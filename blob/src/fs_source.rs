@@ -1,20 +1,17 @@
-//! Read-only access to a directory the owner offers or syncs from their own
-//! device. The guarded write half lives in `fs_write`.
-//!
-//! Jail guarantee: the offered root and every requested entry are fully
-//! resolved with `canonicalize`, and an entry is refused unless its resolved
-//! path is inside the resolved root. A symlink is therefore followed only while
-//! it stays inside the offered directory; a link, or a link component, leaving
-//! it is refused. The check is not atomic with the open that follows it, so
-//! this is a resolve-and-verify guarantee, not a kernel-enforced no-follow
-//! open: only regular files are opened.
-//!
+//! Reads a directory the owner offers: lists entries, stats files and streams file contents.
+//! Paths must resolve inside the canonical root, but the check is not a no-follow open.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::errors::StagingSourceError;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    FileStat, OFFERED_DIRECTORY_ROOT, ResolvedSourceAccess, SourceConnectorKind, SourceEntry,
-    SourceEntryKind, SourceMetadata, weak_fingerprint,
+use aruna_core::structs::execution::offered_directory::{
+    FileStat, OFFERED_DIRECTORY_ROOT, weak_fingerprint,
 };
+use aruna_core::structs::execution::source_access::{
+    ResolvedSourceAccess, SourceEntry, SourceEntryKind, SourceMetadata,
+};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use bytes::Bytes;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -117,9 +114,8 @@ pub(crate) async fn list_local(
             let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
-            // This node's own bookkeeping lives in the reserved directory and
-            // nowhere else, so a file the owner named `.aruna-notes` stays
-            // theirs whatever it is called.
+            // This node's bookkeeping lives only in the reserved directory,
+            // so a file the owner named `.aruna-notes` stays theirs.
             if name == RESERVED_DIR {
                 continue;
             }

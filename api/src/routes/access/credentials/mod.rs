@@ -1,0 +1,786 @@
+//! Routes for listing, creating, and revoking S3 credentials, plus the session subroutes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::auth::require_unrestricted_auth;
+use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::server::state::ServerState;
+use aruna_core::errors::AuthorizationError;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::{UserAccess, group_permission_path};
+use aruna_operations::driver::drive;
+use aruna_operations::s3::access::create::{
+    CreateUserConfig, CreateUserError, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
+};
+use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
+use aruna_operations::s3::access::list::{ListUserInput, ListUserOperation};
+use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::{Extension, Json};
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime};
+use std::{str::FromStr, sync::Arc};
+use ulid::Ulid;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+mod sessions;
+
+#[derive(OpenApi)]
+#[openapi(
+    tags((name = "access/credentials", description = "User credential management"))
+)]
+pub struct CredentialsApiDoc;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(CredentialsApiDoc::openapi())
+        .routes(routes!(list_s3_credentials, create_s3_credentials))
+        .routes(routes!(revoke_s3_credentials))
+        .merge(sessions::router())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = CreateS3PathRestriction)]
+pub struct CreatePathRestriction {
+    pub pattern: String,
+    pub permission: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = CreateS3CredentialsRequest)]
+pub struct CreateS3Request {
+    pub group_id: String,
+    #[schema(default = 31536000)]
+    pub expires_in_seconds: Option<u64>,
+    pub path_restrictions: Option<Vec<CreatePathRestriction>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = CreateS3CredentialsResponse)]
+pub struct CreateS3Response {
+    pub access_key_id: String,
+    pub access_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = S3PathRestrictionResponse)]
+pub struct S3RestrictionResponse {
+    pub pattern: String,
+    pub permission: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStatusResponse {
+    Active,
+    Expired,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = S3CredentialSummaryResponse)]
+pub struct S3CredentialResponse {
+    pub access_key_id: String,
+    pub group_id: String,
+    pub expires_at: String,
+    pub revoked_at: Option<String>,
+    pub issued_by: String,
+    pub path_restrictions: Vec<S3RestrictionResponse>,
+    pub status: CredentialStatusResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = ListS3CredentialsResponse)]
+pub struct ListS3Response {
+    pub credentials: Vec<S3CredentialResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DelegationScope {
+    root: String,
+    recursive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedRestriction {
+    scope: DelegationScope,
+    permission: Permission,
+}
+
+impl DelegationScope {
+    fn exact(root: String) -> Self {
+        Self {
+            root,
+            recursive: false,
+        }
+    }
+
+    fn descendants(root: String) -> Self {
+        Self {
+            root,
+            recursive: true,
+        }
+    }
+
+    fn parse_supported(pattern: &str) -> Option<Self> {
+        if !pattern.starts_with('/')
+            || pattern
+                .chars()
+                .any(|ch| matches!(ch, '?' | '[' | ']' | '{' | '}'))
+        {
+            return None;
+        }
+
+        if let Some(root) = pattern.strip_suffix("/**") {
+            if root.is_empty() || root.contains('*') {
+                return None;
+            }
+            return Some(Self::descendants(root.to_string()));
+        }
+
+        if pattern.contains('*') {
+            return None;
+        }
+
+        Some(Self::exact(pattern.to_string()))
+    }
+
+    fn is_within(&self, root: &str) -> bool {
+        path_within(&self.root, root)
+    }
+
+    fn intersect_group_root(&self, group_root: &str) -> Option<Self> {
+        if path_within(&self.root, group_root) {
+            return Some(self.clone());
+        }
+
+        if self.recursive && path_within(group_root, &self.root) {
+            Some(Self::descendants(group_root.to_string()))
+        } else {
+            None
+        }
+    }
+
+    fn authorization_probe_path(&self) -> String {
+        if !self.recursive {
+            return self.root.clone();
+        }
+
+        if self.root == "/" {
+            "/.aruna-delegation-probe".to_string()
+        } else {
+            format!("{}/.aruna-delegation-probe", self.root)
+        }
+    }
+
+    fn to_pattern(&self) -> String {
+        if self.recursive {
+            format!("{}/**", self.root)
+        } else {
+            self.root.clone()
+        }
+    }
+}
+
+impl NormalizedRestriction {
+    fn to_path_restriction(&self) -> PathRestriction {
+        PathRestriction {
+            pattern: self.scope.to_pattern(),
+            permission: self.permission.clone(),
+        }
+    }
+}
+
+fn parse_normalized_restriction(
+    pattern: &str,
+    permission: Permission,
+) -> Option<NormalizedRestriction> {
+    DelegationScope::parse_supported(pattern)
+        .map(|scope| NormalizedRestriction { scope, permission })
+}
+
+fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRestriction> {
+    restrictions
+        .iter()
+        .map(NormalizedRestriction::to_path_restriction)
+        .collect()
+}
+
+#[utoipa::path(
+    get,
+    path = "/access/credentials",
+    tag = "access/credentials",
+    summary = "List the caller's S3 credentials",
+    description = r#"Lists the caller's own S3 credentials held by the node serving the request.
+
+**Authentication**: realm bearer token without path restrictions.
+
+**Behavior**
+- The response only ever contains credentials issued to the calling user, and never a secret access
+  key.
+- Only credentials held by the serving node are listed, so a credential issued on another node of
+  the realm does not appear here.
+- `status` is derived from the timestamps as `active`, `expired` or `revoked`.
+
+**Limits**
+- The listing is not paginated and covers at most 16 active credentials per user, ordered by access
+  key id."#,
+    responses(
+        (
+            status = 200,
+            description = "The caller's credentials held by this node, with every secret access key omitted",
+            body = ListS3Response,
+            example = json!({
+                "credentials": [
+                    {
+                        "access_key_id": "01JAKEY0123456789ABCDEFGHJ",
+                        "group_id": "01JGRP00123456789ABCDEFGHJ",
+                        "expires_at": "2027-04-09T14:23:11Z",
+                        "revoked_at": null,
+                        "issued_by": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
+                        "path_restrictions": [
+                            {
+                                "pattern": "/YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA/g/01JGRP00123456789ABCDEFGHJ/data/1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978/shared/**",
+                                "permission": "Read"
+                            }
+                        ],
+                        "status": "active"
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_s3_credentials(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<(StatusCode, Json<ListS3Response>)> {
+    let auth = require_unrestricted_auth(&state, auth)?;
+
+    let credentials = drive(
+        ListUserOperation::new(ListUserInput {
+            user_identity: auth.user_id,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ListS3Response {
+            credentials: credentials.into_iter().map(map_redacted_access).collect(),
+        }),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/access/credentials",
+    tag = "access/credentials",
+    summary = "Create an S3 credential for a group",
+    description = r#"Issues an S3 access key and a one-time secret bound to a group, for the calling user.
+
+**Authentication**: realm bearer token with READ or WRITE on the group's data path, or on a part of
+it. A path-restricted token may be used: the credential inherits the caller's restrictions narrowed
+to the group data root and can never widen them.
+
+**Behavior**
+- The credential is always issued to the calling user, so no caller can mint one for somebody else.
+- The secret access key is returned in this response only: it is stored encrypted, later listings show
+  only the access key id, and a lost secret means creating a new credential.
+- The credential is stored on the node that served the request and is accepted by that node's S3
+  endpoint.
+
+**Limits**
+- The optional lifetime is given in seconds between 60 and 31536000 and defaults to 31536000.
+- A restriction pattern is relative to the group data root or an absolute path inside it, may name
+  an exact path or a subtree with a trailing `/**`, and takes `READ`, `WRITE` or `DENY` case
+  insensitively; at most 50 restrictions are accepted.
+- A user holds at most 16 active credentials."#,
+    request_body(
+        content = CreateS3Request,
+        description = "Group the credential is bound to, an optional lifetime in seconds, and optional path restrictions",
+        example = json!({
+            "group_id": "01JGRP00123456789ABCDEFGHJ",
+            "expires_in_seconds": 86400,
+            "path_restrictions": [
+                {
+                    "pattern": "shared/**",
+                    "permission": "READ"
+                }
+            ]
+        })
+    ),
+    responses(
+        (
+            status = 201,
+            description = "Credential created; `access_secret` is the plaintext secret access key and is shown only here",
+            body = CreateS3Response,
+            example = json!({
+                "access_key_id": "01JAKEY0123456789ABCDEFGHJ",
+                "access_secret": "<one-time-secret-shown-only-in-this-response>"
+            })
+        ),
+        (status = 400, description = "The group id is not a ULID, the lifetime is out of range, or a restriction is malformed or exceeds the count limit", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, the caller may read no part of the group data path, or a restriction reaches outside the group root or the caller's own grant", body = ErrorResponse),
+        (status = 409, description = "The caller already holds 16 active credentials; revoke or let one expire first", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_s3_credentials(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<CreateS3Request>,
+) -> ServerResult<(StatusCode, Json<CreateS3Response>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let realm_id = state.get_realm_id();
+    let node_id = state.get_node_id();
+
+    if auth.realm_id != realm_id {
+        return Err(ServerError::Forbidden);
+    }
+
+    let user_identity = auth.user_id;
+    let group_id = Ulid::from_str(&request.group_id).map_err(|_| ServerError::BadRequest)?;
+    if request
+        .path_restrictions
+        .as_ref()
+        .is_some_and(|restrictions| {
+            restrictions.len() > aruna_core::permission_path::MAX_TOKEN_RESTRICTIONS
+        })
+    {
+        return Err(ServerError::BadRequest);
+    }
+    let path_restrictions =
+        build_credential_restrictions(&auth, &state, group_id, request.path_restrictions.clone())
+            .await?;
+    authorize_credential_issuance(&auth, &state, group_id, path_restrictions.as_deref()).await?;
+    let path_restrictions = path_restrictions.as_deref().map(serialize_restrictions);
+    if let Some(restrictions) = path_restrictions.as_deref()
+        && aruna_core::permission_path::validate_restriction_limits(restrictions).is_err()
+    {
+        return Err(ServerError::BadRequest);
+    }
+    let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
+    let result = drive(
+        CreateUserOperation::new(
+            CreateUserConfig {
+                user_identity,
+                group_id,
+                expiry,
+                path_restrictions,
+                issued_by: *node_id.as_bytes(),
+            },
+            state.credential_encryption_key().clone(),
+        ),
+        &state.get_ctx(),
+    )
+    .await;
+
+    match result {
+        Ok((access_key_id, access_secret, _)) => Ok((
+            StatusCode::CREATED,
+            Json(CreateS3Response {
+                access_key_id,
+                access_secret: access_secret.expose().to_string(),
+            }),
+        )),
+        Err(CreateUserError::LimitReached) => Err(ServerError::Conflict(
+            "active credential limit reached".to_string(),
+        )),
+        Err(err) => Err(ServerError::InternalError(err.to_string())),
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/access/credentials/{access_key_id}",
+    tag = "access/credentials",
+    summary = "Revoke an S3 credential",
+    description = r#"Revokes an S3 credential held by the node serving the request.
+
+**Authentication**: realm bearer token without path restrictions. Revoking one's own credential is
+self-service; revoking another user's needs WRITE on that user's realm administration path, so
+WRITE on the group the credential is bound to is deliberately not enough.
+
+**Behavior**
+- Only credentials held by the node that serves the request can be revoked here.
+- The record is not deleted: it keeps appearing in the owner's listing with a revocation timestamp
+  and the `revoked` status, and the node stops accepting the key for new S3 requests."#,
+    params(("access_key_id" = String, Path, description = "Access key id of the credential to revoke, as returned when it was created or listed")),
+    responses(
+        (status = 204, description = "Credential revoked"),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, is path-restricted, or lacks WRITE on the owning user's administration path", body = ErrorResponse),
+        (status = 404, description = "This node holds no credential with that access key id", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn revoke_s3_credentials(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(access_key_id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = require_unrestricted_auth(&state, auth)?;
+
+    let credential = match drive(
+        GetAccessOperation::new(access_key_id.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(credential) => credential,
+        Err(GetAccessError::NotFound) => return Err(ServerError::NotFound),
+        Err(err) => return Err(ServerError::InternalError(err.to_string())),
+    };
+
+    // Group write cannot revoke another member's credential without user administration.
+    if credential.user_identity != auth.user_id {
+        crate::auth::ensure_permission(
+            &state,
+            &auth,
+            format!(
+                "/{}/admin/u/{}",
+                state.get_realm_id(),
+                credential.user_identity
+            ),
+            Permission::WRITE,
+        )
+        .await?;
+    }
+
+    match drive(RevokeUserOperation::new(access_key_id), &state.get_ctx()).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(RevokeUserError::NotFound) => Err(ServerError::NotFound),
+        Err(err) => Err(ServerError::InternalError(err.to_string())),
+    }
+}
+
+fn map_redacted_access(access: UserAccess) -> S3CredentialResponse {
+    let now = SystemTime::now();
+    let status = credential_status(&access, now);
+    let expires_at = format_system_time(access.expiry);
+    let revoked_at = access.revoked_at.map(format_system_time);
+    S3CredentialResponse {
+        access_key_id: access.access_key,
+        group_id: access.group_id.to_string(),
+        expires_at,
+        revoked_at,
+        issued_by: format_node_id(access.issued_by),
+        path_restrictions: access
+            .path_restrictions
+            .unwrap_or_default()
+            .into_iter()
+            .map(|restriction| S3RestrictionResponse {
+                pattern: restriction.pattern,
+                permission: restriction.permission.to_string(),
+            })
+            .collect(),
+        status,
+    }
+}
+
+fn credential_status(access: &UserAccess, now: SystemTime) -> CredentialStatusResponse {
+    if access.is_revoked() {
+        CredentialStatusResponse::Revoked
+    } else if access.is_expired(now) {
+        CredentialStatusResponse::Expired
+    } else {
+        CredentialStatusResponse::Active
+    }
+}
+
+fn format_system_time(value: SystemTime) -> String {
+    DateTime::<Utc>::from(value).to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn format_node_id(bytes: [u8; 32]) -> String {
+    iroh::PublicKey::from_bytes(&bytes)
+        .map(|node_id| node_id.to_string())
+        .unwrap_or_else(|_| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn credential_expiry(now: SystemTime, expires_in_seconds: Option<u64>) -> ServerResult<SystemTime> {
+    const MIN_TTL: u64 = 60;
+    const MAX_TTL: u64 = DEFAULT_CREDENTIAL_TTL.as_secs();
+
+    let ttl = expires_in_seconds.unwrap_or(MAX_TTL);
+    if !(MIN_TTL..=MAX_TTL).contains(&ttl) {
+        return Err(ServerError::BadRequest);
+    }
+
+    now.checked_add(Duration::from_secs(ttl))
+        .ok_or(ServerError::BadRequest)
+}
+
+async fn build_credential_restrictions(
+    auth: &AuthContext,
+    state: &ServerState,
+    group_id: Ulid,
+    requested_restrictions: Option<Vec<CreatePathRestriction>>,
+) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
+    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
+    let auth_restrictions = normalize_auth_restrictions(auth, &group_root)?;
+    let requested_restrictions =
+        normalize_requested_restrictions(requested_restrictions, &group_root)?;
+
+    validate_requested_restrictions(auth, state, requested_restrictions.as_deref()).await?;
+
+    Ok(merge_effective_restrictions(
+        auth_restrictions.as_deref(),
+        requested_restrictions.as_deref(),
+    ))
+}
+
+fn normalize_auth_restrictions(
+    auth: &AuthContext,
+    group_root: &str,
+) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
+    let Some(restrictions) = auth.path_restrictions.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut normalized = Vec::new();
+    for restriction in restrictions {
+        if let Some(restriction) =
+            parse_normalized_restriction(&restriction.pattern, restriction.permission.clone())
+        {
+            if let Some(scope) = restriction.scope.intersect_group_root(group_root) {
+                normalized.push(NormalizedRestriction {
+                    scope,
+                    permission: restriction.permission,
+                });
+            }
+            continue;
+        }
+
+        if pattern_reaches_group(&restriction.pattern, group_root) {
+            return Err(ServerError::Forbidden);
+        }
+    }
+
+    Ok(Some(normalized))
+}
+
+fn normalize_requested_restrictions(
+    requested_restrictions: Option<Vec<CreatePathRestriction>>,
+    group_root: &str,
+) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
+    let Some(requested_restrictions) = requested_restrictions else {
+        return Ok(None);
+    };
+
+    let mut normalized = Vec::with_capacity(requested_restrictions.len());
+    for restriction in requested_restrictions {
+        let permission = parse_permission(&restriction.permission)?;
+        let pattern = if restriction.pattern.starts_with('/') {
+            restriction.pattern
+        } else if restriction.pattern.is_empty() {
+            group_root.to_string()
+        } else {
+            format!(
+                "{group_root}/{}",
+                restriction.pattern.trim_start_matches('/')
+            )
+        };
+        let Some(restriction) = parse_normalized_restriction(&pattern, permission) else {
+            return Err(ServerError::BadRequest);
+        };
+
+        if !restriction.scope.is_within(group_root) {
+            return Err(ServerError::Forbidden);
+        }
+
+        normalized.push(restriction);
+    }
+
+    Ok(Some(normalized))
+}
+
+async fn validate_requested_restrictions(
+    auth: &AuthContext,
+    state: &ServerState,
+    requested_restrictions: Option<&[NormalizedRestriction]>,
+) -> ServerResult<()> {
+    let Some(requested_restrictions) = requested_restrictions else {
+        return Ok(());
+    };
+
+    for restriction in requested_restrictions {
+        if restriction.permission == Permission::DENY {
+            continue;
+        }
+
+        crate::auth::ensure_permission(
+            state,
+            auth,
+            restriction.scope.authorization_probe_path(),
+            restriction.permission.clone(),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn merge_effective_restrictions(
+    auth_restrictions: Option<&[NormalizedRestriction]>,
+    requested_restrictions: Option<&[NormalizedRestriction]>,
+) -> Option<Vec<NormalizedRestriction>> {
+    // Requested allow rules replace inherited allows, while deny rules from both sides are kept.
+    match (auth_restrictions, requested_restrictions) {
+        (None, None) => None,
+        (Some(auth_restrictions), None) => Some(auth_restrictions.to_vec()),
+        (None, Some(requested_restrictions)) => Some(requested_restrictions.to_vec()),
+        (Some(auth_restrictions), Some(requested_restrictions)) => {
+            let auth_allows = auth_restrictions
+                .iter()
+                .filter(|restriction| restriction.permission != Permission::DENY)
+                .cloned()
+                .collect::<Vec<_>>();
+            let requested_allows = requested_restrictions
+                .iter()
+                .filter(|restriction| restriction.permission != Permission::DENY)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let mut effective = if requested_allows.is_empty() {
+                auth_allows
+            } else {
+                requested_allows
+            };
+
+            for restriction in auth_restrictions
+                .iter()
+                .chain(requested_restrictions.iter())
+            {
+                if restriction.permission != Permission::DENY || effective.contains(restriction) {
+                    continue;
+                }
+
+                effective.push(restriction.clone());
+            }
+            Some(effective)
+        }
+    }
+}
+
+/// A credential never exceeds the caller's own grant, so any member who may
+/// read part of the group data may take one; only a caller left without an
+/// allowed scope is refused.
+async fn authorize_credential_issuance(
+    auth: &AuthContext,
+    state: &ServerState,
+    group_id: Ulid,
+    effective_restrictions: Option<&[NormalizedRestriction]>,
+) -> ServerResult<()> {
+    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
+    let effective_auth = AuthContext {
+        path_restrictions: effective_restrictions.map(serialize_restrictions),
+        ..auth.clone()
+    };
+
+    let Some(effective_restrictions) = effective_restrictions else {
+        for permission in [Permission::WRITE, Permission::READ] {
+            match crate::auth::ensure_permission(
+                state,
+                &effective_auth,
+                group_root.to_string(),
+                permission,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(ServerError::Forbidden) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // A member whose roles reach only part of the group data may still take
+        // a credential: authorization uses the derived roots, while probing the
+        // bare directory would ask a `/**` grant to match the directory itself.
+        let roots = aruna_operations::auth::permission_rules::reachable_roots(
+            &state.get_ctx(),
+            &effective_auth,
+            &group_root,
+        )
+        .await
+        .map_err(|error| match error {
+            // An unknown or deleted group is a refusal, not a server fault.
+            AuthorizationError::DocNotFound
+            | AuthorizationError::GroupNotFound
+            | AuthorizationError::InvalidRealmId
+            | AuthorizationError::InvalidGroupId => ServerError::Forbidden,
+            _ => ServerError::InternalError(error.to_string()),
+        })?;
+        if roots.is_empty() {
+            return Err(ServerError::Forbidden);
+        }
+        return Ok(());
+    };
+
+    for restriction in effective_restrictions {
+        if restriction.permission == Permission::DENY {
+            continue;
+        }
+
+        match crate::auth::ensure_permission(
+            state,
+            &effective_auth,
+            restriction.scope.authorization_probe_path(),
+            restriction.permission.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(ServerError::Forbidden) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(ServerError::Forbidden)
+}
+
+fn pattern_reaches_group(pattern: &str, group_root: &str) -> bool {
+    if pattern.starts_with(group_root) {
+        return true;
+    }
+
+    let literal_prefix = pattern
+        .split(['*', '?', '[', ']', '{', '}'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+
+    if literal_prefix.is_empty() {
+        return true;
+    }
+
+    path_within(group_root, literal_prefix) || path_within(literal_prefix, group_root)
+}
+
+fn path_within(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn parse_permission(permission: &str) -> ServerResult<Permission> {
+    match permission.to_ascii_uppercase().as_str() {
+        "READ" => Ok(Permission::READ),
+        "WRITE" => Ok(Permission::WRITE),
+        "DENY" => Ok(Permission::DENY),
+        _ => Err(ServerError::BadRequest),
+    }
+}
+
+#[cfg(test)]
+mod tests;

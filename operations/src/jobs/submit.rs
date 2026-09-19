@@ -1,29 +1,35 @@
+//! Submits one new job record, minting its id and honoring the dedup index.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_ACTIVE_USER_KEYSPACE, JOB_DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::{ACTIVE_USER_KEYSPACE, DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ActiveJobKind, JobId, JobPayload, JobRecord, WorkspaceMode, job_active_prefix, job_record_key,
-    parse_job_dedup_value,
+    parse_dedup_value,
 };
 use aruna_core::structured_id::{
     BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredIdGenerator,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, NodeId, TxnId, UserId};
+use aruna_core::types::{Effects, TxnId};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use super::store::{decode_job_record, job_dedup_index_key, job_insert_entries};
+use super::store::{decode_job_record, dedup_index_key, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
-pub fn schedule_job_drain_effect() -> Effect {
+pub fn schedule_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainJobQueue,
         after: Duration::ZERO,
@@ -90,9 +96,9 @@ pub enum SubmitJobError {
     TooManyOutputs { limit: usize },
     /// Standing compute quota refused the new logical admission.
     #[error("compute quota denied: {0}")]
-    QuotaDenied(#[from] aruna_core::compute_quota::QuotaDenied),
+    QuotaDenied(#[from] aruna_core::compute::quota::QuotaDenied),
     #[error(transparent)]
-    Composition(#[from] aruna_core::structs::CompositionError),
+    Composition(#[from] aruna_core::structs::execution::job::CompositionError),
     #[error("active RO-Crate job limit reached ({limit})")]
     ActiveJobLimit { limit: u32 },
     #[error("unexpected event while submitting job: {0}")]
@@ -127,13 +133,7 @@ enum SubmitState {
 
 /// Effect-driven submit; a live `job_dedup_index` entry short-circuits to the
 /// existing id (matching plan digest) or raises `JobPlanConflict` (differing
-/// digest), in both cases only after verifying that job's record still exists
-/// and decodes. A dangling entry (record quarantined or gone) falls through to a
-/// fresh create whose transactional batch write repoints the dedup row, so a ghost
-/// row can neither poison its key nor conflict against a dead job. Concurrent
-/// creates are serialized by the storage transaction.
-/// Execution is at-least-once: consumers must be idempotent (`Probe`'s marker file is
-/// the example).
+/// digest), a dangling entry creates fresh; at-least-once, so consumers must be idempotent.
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,
@@ -215,12 +215,11 @@ impl SubmitJobOperation {
             return self.check_active(txn_id);
         };
         self.state = SubmitState::ReadDedup { txn_id };
-        // Must go through the same index-key builder `job_insert_entries` uses, which
-        // decides per key whether the owner prefixes it, or the reservation read never
-        // finds the row it is meant to be reserving against.
+        // Must use the same index-key builder `job_insert_entries` uses, which decides
+        // owner prefixing per key, or the reservation read misses its own row.
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_DEDUP_INDEX_KEYSPACE.to_string(),
-            key: job_dedup_index_key(self.record.created_by, &dedup_key),
+            key_space: DEDUP_INDEX_KEYSPACE.to_string(),
+            key: dedup_index_key(self.record.created_by, &dedup_key),
             txn_id: Some(txn_id),
         })]
     }
@@ -238,7 +237,7 @@ impl SubmitJobOperation {
             return self.fail(SubmitJobError::ActiveJobLimit { limit });
         }
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_ACTIVE_USER_KEYSPACE.to_string(),
+            key_space: ACTIVE_USER_KEYSPACE.to_string(),
             prefix: Some(job_active_prefix(self.record.created_by, kind)),
             start: None,
             limit: limit as usize,
@@ -273,7 +272,7 @@ impl SubmitJobOperation {
 
     fn schedule_drain(&mut self) -> Effects {
         self.state = SubmitState::ScheduleDrain;
-        smallvec![schedule_job_drain_effect()]
+        smallvec![schedule_drain_effect()]
     }
 
     fn after_write(&mut self) -> Effects {
@@ -341,10 +340,9 @@ impl Operation for SubmitJobOperation {
             SubmitState::ReadDedup { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
-                }) => match parse_job_dedup_value(value.as_ref()) {
-                    // Same key + same plan is idempotent; a different plan is a
-                    // conflict. Either way the target record is verified first so
-                    // a ghost row never answers for a dead job.
+                }) => match parse_dedup_value(value.as_ref()) {
+                    // Same key and plan is idempotent; a different plan is a conflict. Either way
+                    // the target record is verified first so no ghost row answers for a dead job.
                     Ok((existing_job_id, existing_digest)) => {
                         let digest_matches =
                             self.record.plan_digest.unwrap_or_default() == existing_digest;
@@ -460,14 +458,14 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::store::read_job_record;
-    use aruna_core::keyspaces::{
-        JOB_KEYSPACE, JOB_OWNER_INDEX_KEYSPACE, JOB_SCHEDULE_INDEX_KEYSPACE,
+    use aruna_core::keyspaces::{JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
+    use aruna_core::structs::execution::job::{
+        ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
+        ImportRoCrateSpec, ImportRoCrateTarget, JobState, RoCrateLimits, encode_dedup_value,
     };
-    use aruna_core::structs::{
-        AuthContext, ComputeResources, ExecutionSpec, FIRST_GRANTABLE_HANDLE, ImportMetadataTarget,
-        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobState, RealmId,
-        RoCrateLimits, encode_job_dedup_value,
-    };
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use byteview::ByteView;
@@ -513,7 +511,7 @@ mod tests {
             owner_node_id: node_id(7),
             dedup_key,
             now_ms: 1_000,
-            retention_ms: aruna_core::structs::DEFAULT_JOB_RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
             workspace_mode: WorkspaceMode::None,
             workspace_bucket: None,
             active_cap: None,
@@ -689,12 +687,9 @@ mod tests {
             .unwrap()
             .expect("job persisted");
         assert_eq!(record.state, JobState::Queued);
-        assert_eq!(
-            count_keyspace(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await,
-            1
-        );
-        assert_eq!(count_keyspace(&storage, JOB_OWNER_INDEX_KEYSPACE).await, 1);
-        assert_eq!(count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&storage, JOB_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
@@ -707,7 +702,7 @@ mod tests {
             .await
             .unwrap();
         assert!(first.created);
-        assert_eq!(count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 1);
 
         let second = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await
@@ -803,7 +798,7 @@ mod tests {
         assert!(first.created);
         assert!(second.created);
         assert_ne!(second.job_id, first.job_id);
-        assert_eq!(count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await, 2);
+        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 2);
     }
 
     // Same idempotency key + a different plan is a JobPlanConflict, not a silent reuse.
@@ -857,9 +852,9 @@ mod tests {
         );
 
         let keys = count_keyspace(&storage, JOB_KEYSPACE).await
-            + count_keyspace(&storage, JOB_SCHEDULE_INDEX_KEYSPACE).await
-            + count_keyspace(&storage, JOB_OWNER_INDEX_KEYSPACE).await
-            + count_keyspace(&storage, JOB_DEDUP_INDEX_KEYSPACE).await;
+            + count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await
+            + count_keyspace(&storage, JOB_INDEX_KEYSPACE).await
+            + count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await;
         assert!(keys <= 4, "submit writes at most four keys, got {keys}");
     }
 
@@ -875,9 +870,9 @@ mod tests {
         let digest = submission.payload.plan_digest();
         write_raw(
             &storage,
-            JOB_DEDUP_INDEX_KEYSPACE,
-            job_dedup_index_key(created_by, b"k"),
-            ByteView::from(encode_job_dedup_value(ghost, digest)),
+            DEDUP_INDEX_KEYSPACE,
+            dedup_index_key(created_by, b"k"),
+            ByteView::from(encode_dedup_value(ghost, digest)),
         )
         .await;
 
@@ -904,9 +899,9 @@ mod tests {
         let created_by = submission.created_by;
         write_raw(
             &storage,
-            JOB_DEDUP_INDEX_KEYSPACE,
-            job_dedup_index_key(created_by, b"k"),
-            ByteView::from(encode_job_dedup_value(ghost, [0xAB; 32])),
+            DEDUP_INDEX_KEYSPACE,
+            dedup_index_key(created_by, b"k"),
+            ByteView::from(encode_dedup_value(ghost, [0xAB; 32])),
         )
         .await;
 
@@ -942,9 +937,9 @@ mod tests {
         .await;
         write_raw(
             &storage,
-            JOB_DEDUP_INDEX_KEYSPACE,
-            job_dedup_index_key(created_by, b"k"),
-            ByteView::from(encode_job_dedup_value(ghost, digest)),
+            DEDUP_INDEX_KEYSPACE,
+            dedup_index_key(created_by, b"k"),
+            ByteView::from(encode_dedup_value(ghost, digest)),
         )
         .await;
 

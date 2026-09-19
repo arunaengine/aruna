@@ -1,14 +1,16 @@
+//! Purges expired S3 sessions in batches and clears their expiry and owner index rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::{
     PURGE_BATCH, S3SessionError, decode_index, encode_index, expiry_key, expiry_parts, expiry_secs,
     owner_key,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    S3_SESSION_EXPIRY_KEYSPACE, S3_SESSION_KEYSPACE, S3_SESSION_OWNER_KEYSPACE,
-};
+use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::S3Session;
+use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,7 +25,7 @@ struct ExpiryCandidate {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PurgeS3SessionsResult {
+pub struct PurgeSessionsResult {
     pub scanned: usize,
     pub purged: usize,
     pub removed: usize,
@@ -44,19 +46,19 @@ enum PurgeSessionState {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct PurgeS3SessionsOperation {
+pub struct PurgeSessionsOperation {
     now: SystemTime,
     candidates: Vec<ExpiryCandidate>,
     removals: BTreeMap<Vec<u8>, BTreeSet<String>>,
     writes: Vec<(String, Key, aruna_core::types::Value)>,
     deletes: Vec<(String, Key)>,
-    result: PurgeS3SessionsResult,
+    result: PurgeSessionsResult,
     txn_id: Option<Ulid>,
     state: PurgeSessionState,
-    output: Result<PurgeS3SessionsResult, S3SessionError>,
+    output: Result<PurgeSessionsResult, S3SessionError>,
 }
 
-impl PurgeS3SessionsOperation {
+impl PurgeSessionsOperation {
     pub fn new(now: SystemTime) -> Self {
         Self {
             now,
@@ -64,7 +66,7 @@ impl PurgeS3SessionsOperation {
             removals: BTreeMap::new(),
             writes: Vec::new(),
             deletes: Vec::new(),
-            result: PurgeS3SessionsResult::default(),
+            result: PurgeSessionsResult::default(),
             txn_id: None,
             state: PurgeSessionState::Init,
             output: Err(S3SessionError::NotFinished),
@@ -97,7 +99,7 @@ impl PurgeS3SessionsOperation {
         self.txn_id = Some(txn_id);
         self.state = PurgeSessionState::ScanExpiry;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_SESSION_EXPIRY_KEYSPACE.to_string(),
+            key_space: SESSION_EXPIRY_KEYSPACE.to_string(),
             prefix: None,
             start: None,
             limit: PURGE_BATCH,
@@ -218,7 +220,7 @@ impl PurgeS3SessionsOperation {
             reads: self
                 .removals
                 .keys()
-                .map(|key| (S3_SESSION_OWNER_KEYSPACE.to_string(), key.clone().into()))
+                .map(|key| (SESSION_OWNER_KEYSPACE.to_string(), key.clone().into()))
                 .collect(),
             txn_id: Some(txn_id),
         })]
@@ -241,15 +243,14 @@ impl PurgeS3SessionsOperation {
                 index.remove(&access_key);
             }
             if index.is_empty() {
-                self.deletes
-                    .push((S3_SESSION_OWNER_KEYSPACE.to_string(), key));
+                self.deletes.push((SESSION_OWNER_KEYSPACE.to_string(), key));
             } else {
                 let value = match encode_index(&index) {
                     Ok(value) => value,
                     Err(error) => return self.fail(error),
                 };
                 self.writes
-                    .push((S3_SESSION_OWNER_KEYSPACE.to_string(), key, value));
+                    .push((SESSION_OWNER_KEYSPACE.to_string(), key, value));
             }
         }
         self.write_owners()
@@ -317,7 +318,7 @@ impl PurgeS3SessionsOperation {
 
     fn delete_index(&mut self, index_key: Key) {
         self.deletes
-            .push((S3_SESSION_EXPIRY_KEYSPACE.to_string(), index_key));
+            .push((SESSION_EXPIRY_KEYSPACE.to_string(), index_key));
         self.result.removed += 1;
     }
 
@@ -346,8 +347,8 @@ impl PurgeS3SessionsOperation {
     }
 }
 
-impl Operation for PurgeS3SessionsOperation {
-    type Output = PurgeS3SessionsResult;
+impl Operation for PurgeSessionsOperation {
+    type Output = PurgeSessionsResult;
     type Error = S3SessionError;
 
     fn start(&mut self) -> Effects {

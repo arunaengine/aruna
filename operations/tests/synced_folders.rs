@@ -1,7 +1,9 @@
+//! Tests device folder sync in both directions, plus conflicts and refused remote bindings.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Two-node proof of the synced-folder contract: a device and the realm node it
-//! binds to. Every assertion here is about local data winning locally.
 
 mod topology;
 
@@ -11,9 +13,11 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::{
-    ActionKind, ActionOutcome, ActionScope, BucketInfo, EntryState, FolderMode, RemoteBinding,
-    RoutingSnapshot, SyncBase, SyncRefusal,
+    ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, RemoteBinding, SyncBase,
+    SyncRefusal,
 };
 use aruna_core::types::GroupId;
 use aruna_operations::device::sync::ReconcileFolderError;
@@ -25,12 +29,12 @@ use aruna_operations::device::sync::outbox::drain_sync_outbox;
 use aruna_operations::device::sync::reconcile_folder;
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
-use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_operations::s3::get_bucket_info::GetBucketInfoOperation;
-use aruna_operations::s3::get_object::{GetObjectInput, GetObjectOperation};
-use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
+use aruna_operations::s3::bucket::get::GetBucketOperation;
+use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, wait_for_convergence};
@@ -46,10 +50,6 @@ fn body(bytes: &'static [u8]) -> BackendStream<Result<bytes::Bytes, StreamError>
 }
 
 /// Waits until the realm has pulled every queued upload.
-///
-/// The drain is a timer task the reconciliation arms, so it runs concurrently
-/// with an explicit pass and may hold the row this one wanted. Publishing is
-/// therefore complete when the outbox is empty, never after one call.
 async fn await_uploads(realm: &Topology) -> TestResult<()> {
     let device = realm.user_node();
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
@@ -82,8 +82,7 @@ async fn create_bucket(
         ),
         context,
     )
-    .await?
-    .ok_or("bucket creation did not finish")??;
+    .await?;
     Ok(())
 }
 
@@ -121,8 +120,7 @@ async fn put_object(
         }),
         context,
     )
-    .await?
-    .ok_or("the put did not finish")??;
+    .await?;
     Ok(result.version_id)
 }
 
@@ -149,8 +147,7 @@ async fn read_object(
         }),
         context,
     )
-    .await?
-    .ok_or("the get did not finish")??;
+    .await?;
     let mut bytes = Vec::new();
     let mut blob = result.blob.0;
     while let Some(chunk) = blob.next().await {
@@ -182,8 +179,7 @@ async fn delete_object(
         }),
         context,
     )
-    .await?
-    .ok_or("the delete did not finish")??;
+    .await?;
     Ok(())
 }
 
@@ -314,11 +310,10 @@ async fn creates_remote_bucket() -> TestResult<()> {
     )
     .await?;
     let bucket = drive(
-        GetBucketInfoOperation::new(REMOTE_BUCKET.to_string()),
+        GetBucketOperation::new(REMOTE_BUCKET.to_string()),
         &server.context,
     )
-    .await?
-    .ok_or("bucket lookup did not finish")??;
+    .await?;
     assert_eq!(bucket.group_id, group_id);
 
     let plan = reconcile_folder(&device.context, &folder).await?;
@@ -530,8 +525,7 @@ async fn recovers_missing_bucket() -> TestResult<()> {
         DeleteBucketOperation::new(REMOTE_BUCKET.to_string()),
         &server.context,
     )
-    .await?
-    .ok_or("bucket deletion did not finish")??;
+    .await?;
     let error = reconcile_folder(&device.context, &folder)
         .await
         .expect_err("the missing bucket is reported");
@@ -547,7 +541,7 @@ async fn recovers_missing_bucket() -> TestResult<()> {
             .as_deref()
             .is_some_and(|m| m.contains(REMOTE_BUCKET))
     );
-    assert!(failed.last_error_at_ms.is_some());
+    assert!(failed.last_error_ms.is_some());
     assert_eq!(failed.observed_files, 1);
     assert_eq!(failed.last_reconcile_ms, folder.last_reconcile_ms);
 
@@ -599,7 +593,7 @@ async fn recovers_missing_bucket() -> TestResult<()> {
     assert_eq!(plan.uploads, 1);
     let recovered = read_bound(&device.context, folder.folder_id).await?;
     assert_eq!(recovered.last_error, None);
-    assert_eq!(recovered.last_error_at_ms, None);
+    assert_eq!(recovered.last_error_ms, None);
     assert_eq!(recovered.observed_files, 1);
     await_uploads(&realm).await?;
     assert_eq!(

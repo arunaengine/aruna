@@ -1,3 +1,7 @@
+//! Caches metadata query results per caller scope with entry, byte and time bounds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -6,16 +10,17 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_core::structs::{AuthContext, RealmId};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
 use lru::LruCache;
 
 use super::api::MetadataFanoutStats;
 
 /// Backstop staleness of a cached result. Matches the visibility cache TTL so
 /// a query never promises fresher data than the listing path does.
-pub(super) const METADATA_QUERY_CACHE_TTL: Duration = Duration::from_secs(30);
-pub(super) const METADATA_QUERY_CACHE_MAX_ENTRIES: usize = 512;
-pub(super) const METADATA_QUERY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const QUERY_CACHE_TTL: Duration = Duration::from_secs(30);
+pub(super) const CACHE_MAX_ENTRIES: usize = 512;
+pub(super) const CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 const TAG_EAGER: u8 = 1;
 const TAG_LAZY: u8 = 2;
@@ -198,11 +203,7 @@ impl Default for MetadataQueryCache {
 
 impl MetadataQueryCache {
     pub(super) fn new() -> Self {
-        Self::with_limits(
-            METADATA_QUERY_CACHE_MAX_ENTRIES,
-            METADATA_QUERY_CACHE_MAX_BYTES,
-            METADATA_QUERY_CACHE_TTL,
-        )
+        Self::with_limits(CACHE_MAX_ENTRIES, CACHE_MAX_BYTES, QUERY_CACHE_TTL)
     }
 
     pub(super) fn with_limits(max_entries: usize, max_bytes: usize, ttl: Duration) -> Self {
@@ -256,8 +257,7 @@ impl MetadataQueryCache {
         now: Instant,
     ) -> bool {
         // A mutation that landed while the query ran already invalidated this
-        // result; storing it would only evict a fresher entry. The generation
-        // is checked too, because entries are shared across callers.
+        // result, and shared entries make the generation check mandatory.
         if stamp != self.stamp(generation) {
             return false;
         }
@@ -272,7 +272,7 @@ impl MetadataQueryCache {
             bytes,
         };
         let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
-        if let Some(replaced) = state.entries.put(key, entry) {
+        if let Some((_, replaced)) = state.entries.push(key, entry) {
             state.bytes = state.bytes.saturating_sub(replaced.bytes);
         }
         state.bytes = state.bytes.saturating_add(bytes);
@@ -356,7 +356,7 @@ fn results_bytes(results: &MetadataQueryResults) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use std::collections::BTreeMap;
 
     use super::*;
@@ -506,6 +506,28 @@ mod tests {
         assert!(cache.get(&key("q0"), stamp, now).is_none());
         // A result larger than the whole budget is never admitted.
         assert!(!cache.insert(key("huge"), cached(rows(4096)), stamp, 1, now));
+    }
+
+    #[test]
+    fn capacity_evicts_bytes() {
+        let entry_bytes = ENTRY_OVERHEAD + results_bytes(&rows(4));
+        let cache = MetadataQueryCache::with_limits(2, 2 * entry_bytes, TTL);
+        let stamp = cache.stamp(1);
+        let now = Instant::now();
+        for index in 0..3 {
+            assert!(cache.insert(key(&format!("q{index}")), cached(rows(4)), stamp, 1, now));
+        }
+        // The capacity eviction must release the evicted bytes; if they leak,
+        // the byte budget evicts a second, still live entry.
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&key("q0"), stamp, now).is_none());
+        assert!(cache.get(&key("q1"), stamp, now).is_some());
+        assert!(cache.get(&key("q2"), stamp, now).is_some());
+        // Replacing a key subtracts the old entry's bytes exactly once.
+        assert!(cache.insert(key("q1"), cached(rows(4)), stamp, 1, now));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&key("q1"), stamp, now).is_some());
+        assert!(cache.get(&key("q2"), stamp, now).is_some());
     }
 
     #[test]

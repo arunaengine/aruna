@@ -1,16 +1,19 @@
-//! The logical admission quota seam, wired to the replicated demand view.
+//! Checks one submission against the group compute quota using the replicated demand view.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
 use crate::jobs::records::rows::from_bytes;
-use crate::node_info::group_demand;
+use crate::node::node_info::group_demand;
 use aruna_core::NodeId;
-use aruna_core::compute_quota::{
+use aruna_core::compute::quota::{
     ComputeQuota, QuotaDenied, ResourceTotals, admits, understated_denial,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::JOB_ADMISSION_QUOTA_KEYSPACE;
-use aruna_core::structs::{EffectiveResources, RealmConfigDocument};
+use aruna_core::keyspaces::ADMISSION_QUOTA_KEYSPACE;
+use aruna_core::structs::execution::job::EffectiveResources;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{GroupId, Key};
 use tracing::{info, warn};
 
@@ -18,14 +21,9 @@ use tracing::{info, warn};
 /// group whose revision keeps moving under it.
 const QUOTA_ATTEMPTS: usize = 3;
 
-/// Standing-quota decision before one submission is logically admitted.
-/// `Ok((Some(reason), _))` is a denial applied only to a FRESH claim;
-/// `Err` means the quota or demand view is unavailable and admission fails
-/// closed. An overshoot observed after convergence cancels nothing.
-///
-/// A group whose merged view is understated is denied rather than admitted: the
-/// cap cannot be shown to hold, and a refusal is a quota decision about that
-/// group, never an availability failure of the node.
+/// Standing-quota decision before one submission is admitted. A denial applies
+/// only to a FRESH claim and an overshoot after convergence cancels nothing;
+/// `Err` (view unavailable) fails admission closed; understated views are denied.
 pub async fn quota_refusal(
     context: &DriverContext,
     config: &RealmConfigDocument,
@@ -90,7 +88,7 @@ async fn quota_revision(context: &DriverContext, group_id: GroupId) -> Result<u6
     match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            key_space: ADMISSION_QUOTA_KEYSPACE.to_string(),
             key: Key::from(group_id.to_bytes().as_slice()),
             txn_id: None,
         })
@@ -106,9 +104,9 @@ async fn quota_revision(context: &DriverContext, group_id: GroupId) -> Result<u6
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
-    use aruna_core::compute_quota::{QuotaDimension, QuotaScope};
+    use aruna_core::compute::quota::{QuotaDimension, QuotaScope};
     use ulid::Ulid;
 
     fn resources() -> EffectiveResources {
@@ -153,7 +151,7 @@ mod tests {
             None
         );
         let per_job = ComputeQuota {
-            max_job_cpu_cores: Some(2),
+            job_cpu_cores: Some(2),
             ..Default::default()
         };
         assert_eq!(

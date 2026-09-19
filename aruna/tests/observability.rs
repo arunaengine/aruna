@@ -1,11 +1,16 @@
+//! Tests the ops endpoints and node process behavior: readiness, metrics, restart and signals.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 mod shared;
 
 use reqwest::StatusCode;
 use shared::{
-    TestResult, create_bearer_token, create_group_via_http, create_s3_credentials_via_http,
-    s3_client, spawn_full_seed_node, spawn_seed_node, wait_for_group_via_http,
+    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
+    spawn_complete_seed, spawn_seed_node, wait_group_http,
 };
 
 async fn scrape(ops_url: &str) -> TestResult<String> {
@@ -22,7 +27,7 @@ fn gauge_value(body: &str, series: &str) -> Option<f64> {
 }
 
 #[tokio::test]
-async fn readyz_reflects_startup_gate() -> TestResult<()> {
+async fn readyz_reflects_gate() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let result = async {
         let client = reqwest::Client::new();
@@ -74,7 +79,7 @@ async fn readyz_reflects_startup_gate() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn metrics_expose_rest_storage_and_queue_series() -> TestResult<()> {
+async fn metrics_expose_series() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let result = async {
         let client = reqwest::Client::new();
@@ -151,8 +156,8 @@ async fn metrics_absent_public() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn metrics_expose_s3_operation_label() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+async fn metrics_s3_label() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
     let result = async {
         let bearer_token = create_bearer_token(
             seed.context.as_ref(),
@@ -161,11 +166,10 @@ async fn metrics_expose_s3_operation_label() -> TestResult<()> {
             seed.capabilities.clone(),
         )
         .await?;
-        let group =
-            create_group_via_http(&seed.base_url, &bearer_token, "obs-metrics-group").await?;
-        wait_for_group_via_http(&seed.base_url, &bearer_token, &group.group_id).await?;
+        let group = create_group_http(&seed.base_url, &bearer_token, "obs-metrics-group").await?;
+        wait_group_http(&seed.base_url, &bearer_token, &group.group_id).await?;
         let credentials =
-            create_s3_credentials_via_http(&seed.base_url, &bearer_token, &group.group_id).await?;
+            create_s3_credentials(&seed.base_url, &bearer_token, &group.group_id).await?;
 
         let endpoint = seed
             .s3
@@ -208,7 +212,7 @@ async fn metrics_expose_s3_operation_label() -> TestResult<()> {
 mod process {
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_storage::{FjallStorage, StorageHandle};
     use std::io::{Read, Seek, SeekFrom};
     use std::net::{TcpListener, UdpSocket};
@@ -437,7 +441,7 @@ mod process {
         /// Exact document-sync outbox rows of the stopped node.
         pub async fn outbox_rows(
             &self,
-        ) -> Vec<(Vec<u8>, aruna_core::document::DocumentSyncOutboxRecord)> {
+        ) -> Vec<(Vec<u8>, aruna_core::document::DocumentOutboxRecord)> {
             let storage = self.open_storage().await;
             let rows = read_outbox(&storage).await;
             // close() waits for the lock release a plain drop only schedules;
@@ -449,13 +453,13 @@ mod process {
 
     pub async fn read_outbox(
         storage: &StorageHandle,
-    ) -> Vec<(Vec<u8>, aruna_core::document::DocumentSyncOutboxRecord)> {
+    ) -> Vec<(Vec<u8>, aruna_core::document::DocumentOutboxRecord)> {
         let mut start: Option<aruna_core::types::Key> = None;
         let mut rows = Vec::new();
         loop {
             let event = storage
                 .send_storage_effect(StorageEffect::Iter {
-                    key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                    key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
                     prefix: None,
                     start: start.take().map(IterStart::After),
                     limit: 1024,
@@ -637,6 +641,16 @@ mod process {
             self.wait_path(path, expected).await;
         }
 
+        /// Releases the pinned outbox drain, which then joins on its own.
+        pub fn release_outbox(&self) {
+            let path = self
+                .paths
+                .outbox
+                .as_ref()
+                .expect("outbox barrier path is present");
+            std::fs::write(path, b"release").expect("release the outbox barrier");
+        }
+
         async fn wait_path(&mut self, path: PathBuf, expected: &str) {
             let deadline = Instant::now() + HANG_GUARD;
             let reached = |path: &PathBuf| {
@@ -761,9 +775,10 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::structs::{
-        PlacementStrategy, RealmConfigDocument, RealmDiscoveryConfig, RealmNodeKind,
+    use aruna_core::structs::identity::realm::{
+        RealmConfigDocument, RealmDiscoveryConfig, RealmNodeKind,
     };
+    use aruna_core::structs::placement::record::PlacementStrategy;
 
     let storage = env.open_storage().await;
     let event = storage
@@ -825,7 +840,7 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
 
 async fn load_state(
     storage: &aruna_storage::StorageHandle,
-) -> TestResult<aruna::config::PersistedNodeState> {
+) -> TestResult<aruna::identity::PersistedNodeState> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
@@ -840,7 +855,7 @@ async fn load_state(
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => Ok(postcard::from_bytes::<aruna::config::PersistedNodeState>(
+        }) => Ok(postcard::from_bytes::<aruna::identity::PersistedNodeState>(
             &value,
         )?),
         other => Err(format!("unexpected node state event: {other:?}").into()),
@@ -849,11 +864,11 @@ async fn load_state(
 
 async fn load_realm(
     storage: &aruna_storage::StorageHandle,
-) -> TestResult<aruna_core::structs::RealmConfigDocument> {
+) -> TestResult<aruna_core::structs::identity::realm::RealmConfigDocument> {
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::structs::RealmConfigDocument;
+    use aruna_core::structs::identity::realm::RealmConfigDocument;
 
     match storage
         .send_storage_effect(StorageEffect::Iter {
@@ -916,17 +931,17 @@ async fn clear_space(storage: &aruna_storage::StorageHandle, key_space: &str) ->
 /// Leaves one valid document-sync row for the first post-start drain.
 async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     use aruna_core::document::{
-        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncRevision,
-        DocumentSyncTarget,
+        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision,
+        DocumentTarget,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
-    use aruna_core::structs::PlacementRef;
-    use aruna_operations::document_sync_outbox::{new_outbox_record, outbox_write_entry};
+    use aruna_core::keyspaces::{SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
+    use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_operations::sync::document_outbox::{new_outbox_record, outbox_write_entry};
 
     let storage = env.open_storage().await;
-    clear_space(&storage, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await?;
+    clear_space(&storage, SYNC_OUTBOX_KEYSPACE).await?;
     clear_space(&storage, TASK_TIMER_KEYSPACE).await?;
     let state = load_state(&storage).await?;
     let config = load_realm(&storage).await?;
@@ -934,14 +949,14 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     let placement = PlacementRef::NIL;
     let record = new_outbox_record(
         node_id,
-        DocumentSyncTarget::NodeInfo {
+        DocumentTarget::NodeInfo {
             realm_id: config.realm_id,
             node_id,
         },
         Vec::new(),
-        DocumentSyncOutboxEvent::Upsert {
+        DocumentOutboxEvent::Upsert {
             bytes: Vec::new(),
-            change: DocumentSyncChange {
+            change: DocumentChange {
                 base: None,
                 current: DocumentSyncRevision {
                     generation: 1,
@@ -949,7 +964,7 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
                     actor: node_id,
                     updated_at_ms: 1,
                 },
-                kind: DocumentSyncChangeKind::Upsert,
+                kind: DocumentChangeKind::Upsert,
                 placement,
             },
         },
@@ -1221,6 +1236,8 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
     // Readiness closes before the children join, so sample it first; waiting for
     // the joins would leave only the last instant before exit to observe it in.
     let body = node.wait_draining().await;
+    // Released only once draining is observable, so the join order stays checkable.
+    node.release_outbox();
     wait_children(&mut node).await;
     let ready: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(ready["ready"], serde_json::json!(false));
@@ -1249,8 +1266,8 @@ async fn sigterm_drains_recovery() -> TestResult<()> {
 async fn second_signal_exits() -> TestResult<()> {
     use std::os::unix::process::ExitStatusExt;
 
-    // The pinned recovery and outbox children keep the drain active until the
-    // second signal lands; without them shutdown can win the /readyz probe.
+    // This test never releases the outbox barrier, so the pinned children keep
+    // the drain active until the second signal; else shutdown wins the probes.
     let env = process::NodeEnv::new();
     let mut node = prepare_shutdown(&env).await?;
 

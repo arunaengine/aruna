@@ -1,16 +1,13 @@
-//! Aruna Structured ULID codec (spec Appendix A.1, section 6.3.4).
-//!
-//! A `MetaResourceId`/`JobId` is a 26-character Crockford Base32 ULID whose
-//! 80-bit entropy field is partitioned into a 20-bit placement handle, a 12-bit
-//! bucket, and a 48-bit nonce. All raw bit knowledge lives in [`layout`]; this
-//! module exposes only typed fields so downstream code never touches raw bits.
+//! Defines the structured ULID type and parses, formats and validates its fields.
+//! Its entropy splits into a placement handle, a placement bucket and a nonce.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 mod generator;
 mod layout;
 
 pub use generator::{
-    ClockHealthError, DEFAULT_MAX_ID_CLOCK_SKEW_MS, IdEnvironment, StructuredIdGenerator,
-    SystemEnvironment,
+    ClockHealthError, IdEnvironment, MAX_ID_SKEW, StructuredIdGenerator, SystemEnvironment,
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,25 +18,21 @@ use ulid::{DecodeError, Ulid};
 
 /// Highest allocatable placement handle; handle zero is reserved.
 pub const MAX_PLACEMENT_HANDLE: u32 = layout::MAX_HANDLE;
-/// Highest bucket value the 12-bit field can hold.
-pub const MAX_BUCKET_ID: u16 = layout::MAX_BUCKET;
 /// Maximum `bucket_count` a strategy may declare (the 12-bit field cap).
 pub const MAX_BUCKET_COUNT: u16 = layout::MAX_BUCKET_COUNT;
-/// Number of allocatable handles (20 bits, handle zero reserved).
-pub const ALLOCATABLE_HANDLES: u32 = layout::MAX_HANDLE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum FieldError {
     #[error("placement handle 0 is reserved and must not be allocated")]
     ReservedHandle,
     #[error("placement handle {0} exceeds the 20-bit range")]
-    HandleOutOfRange(u32),
+    HandleRangeError(u32),
     #[error("bucket {0} exceeds the 12-bit range")]
-    BucketOutOfRange(u16),
+    OutOfRange(u16),
     #[error("timestamp {0} exceeds the 48-bit range")]
-    TimestampOutOfRange(u64),
+    TimestampRange(u64),
     #[error("nonce {0} exceeds the 48-bit range")]
-    NonceOutOfRange(u64),
+    NonceRange(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -56,7 +49,7 @@ pub enum ParseError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("bucket {bucket} is not less than bucket_count {bucket_count}")]
-pub struct BucketNotInRange {
+pub struct BucketRangeError {
     pub bucket: u16,
     pub bucket_count: u16,
 }
@@ -70,7 +63,7 @@ impl PlacementHandle {
         if value == layout::RESERVED_HANDLE {
             Err(FieldError::ReservedHandle)
         } else if value > layout::MAX_HANDLE {
-            Err(FieldError::HandleOutOfRange(value))
+            Err(FieldError::HandleRangeError(value))
         } else {
             Ok(Self(value))
         }
@@ -94,14 +87,14 @@ impl<'de> Deserialize<'de> for PlacementHandle {
     }
 }
 
-/// A 12-bit bucket carried inside the id (REQ-META-ID-FORMAT-001).
+/// A 12-bit placement bucket carried inside the id (REQ-META-ID-FORMAT-001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BucketId(u16);
 
 impl BucketId {
     pub const fn new(value: u16) -> Result<Self, FieldError> {
         if value > layout::MAX_BUCKET {
-            Err(FieldError::BucketOutOfRange(value))
+            Err(FieldError::OutOfRange(value))
         } else {
             Ok(Self(value))
         }
@@ -113,11 +106,11 @@ impl BucketId {
 
     /// Fail-closed `bucket < bucket_count` check (REQ-META-ID-FORMAT-001): an id
     /// whose bucket reaches the strategy's `bucket_count` is invalid.
-    pub const fn in_strategy_range(self, bucket_count: u16) -> Result<(), BucketNotInRange> {
+    pub const fn in_strategy_range(self, bucket_count: u16) -> Result<(), BucketRangeError> {
         if bucket_count <= layout::MAX_BUCKET_COUNT && self.0 < bucket_count {
             Ok(())
         } else {
-            Err(BucketNotInRange {
+            Err(BucketRangeError {
                 bucket: self.0,
                 bucket_count,
             })
@@ -169,10 +162,10 @@ pub trait StructuredId: Sized + Copy + private::Private {
         nonce: u64,
     ) -> Result<Self, FieldError> {
         if timestamp_ms > layout::MAX_TIMESTAMP_MS {
-            return Err(FieldError::TimestampOutOfRange(timestamp_ms));
+            return Err(FieldError::TimestampRange(timestamp_ms));
         }
         if nonce > layout::MAX_NONCE {
-            return Err(FieldError::NonceOutOfRange(nonce));
+            return Err(FieldError::NonceRange(nonce));
         }
         Ok(Self::from_ulid(
             Ulid(layout::pack(
@@ -220,7 +213,7 @@ pub trait StructuredId: Sized + Copy + private::Private {
     }
 
     /// Fail-closed `bucket < bucket_count` check for this id.
-    fn validate_bucket(&self, bucket_count: u16) -> Result<(), BucketNotInRange> {
+    fn validate_bucket(&self, bucket_count: u16) -> Result<(), BucketRangeError> {
         self.bucket().in_strategy_range(bucket_count)
     }
 }
@@ -391,12 +384,9 @@ mod tests {
     fn width_overflow_rejected() {
         assert_eq!(
             PlacementHandle::new(0x100000),
-            Err(FieldError::HandleOutOfRange(0x100000))
+            Err(FieldError::HandleRangeError(0x100000))
         );
-        assert_eq!(
-            BucketId::new(0x1000),
-            Err(FieldError::BucketOutOfRange(0x1000))
-        );
+        assert_eq!(BucketId::new(0x1000), Err(FieldError::OutOfRange(0x1000)));
     }
 
     #[test]
@@ -404,7 +394,7 @@ mod tests {
         assert!(BucketId::new(63).unwrap().in_strategy_range(64).is_ok());
         assert_eq!(
             BucketId::new(64).unwrap().in_strategy_range(64),
-            Err(BucketNotInRange {
+            Err(BucketRangeError {
                 bucket: 64,
                 bucket_count: 64,
             })
@@ -493,9 +483,8 @@ mod tests {
 
     #[test]
     fn serde_matches_ulid() {
-        // The typed id must serialize to the exact same bytes a raw `Ulid` would,
-        // so migrating a `document_id` field never changes the on-the-wire or
-        // on-disk record layout (postcard is the record codec; JSON the API one).
+        // Match a raw `Ulid` byte-for-byte so the wire and on-disk record
+        // layout never changes (postcard is the record codec; JSON the API one).
         let id = MetaResourceId::parse(KAT_STRING).unwrap();
         let ulid = id.as_ulid();
         assert_eq!(
@@ -517,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn job_id_shares_codec() {
+    fn job_id_roundtrip() {
         let job = JobId::from_parts(
             0x0123456789ab,
             PlacementHandle::new(0x0beef).unwrap(),

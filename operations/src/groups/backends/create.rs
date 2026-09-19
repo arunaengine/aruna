@@ -1,0 +1,337 @@
+//! Registers a new tenant storage backend for a group after probing its credentials.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::validation::{GroupBackendError, validate_backend_input};
+use super::{RecordReadError, backend_key, record_writes};
+use aruna_core::UserId;
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::keyspaces::BACKEND_SECRET_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::structs::storage::cleanup::CleanupStrategy;
+use aruna_core::structs::storage::group_backend::{
+    GroupBackendKind, GroupStorage, GroupStorageSecret,
+};
+use aruna_core::types::{Effects, GroupId};
+use smallvec::smallvec;
+use std::collections::HashMap;
+use std::time::SystemTime;
+use thiserror::Error;
+use ulid::Ulid;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateBackendInput {
+    pub group_id: GroupId,
+    pub created_by: UserId,
+    pub name: String,
+    pub kind: GroupBackendKind,
+    pub public_config: HashMap<String, String>,
+    pub secret_config: HashMap<String, String>,
+    pub cleanup: CleanupStrategy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CreateState {
+    Init,
+    Probe,
+    WriteRecords,
+    Finish,
+    Error,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum CreateBackendError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    Invalid(#[from] GroupBackendError),
+    #[error(transparent)]
+    Read(#[from] RecordReadError),
+    #[error("storage backend not found")]
+    NotFound,
+    #[error("backend is not usable: {0}")]
+    Unreachable(#[from] BlobError),
+    #[error("CreateGroupBackend failed")]
+    Failed,
+    #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
+    InvalidStateEvent {
+        state: &'static str,
+        expected: &'static str,
+        received: Event,
+    },
+}
+
+/// Registers a tenant write backend. The credentials are proved against the
+/// endpoint before either record is stored, so a broken backend never lands.
+#[derive(Debug, PartialEq)]
+pub struct CreateBackendOperation {
+    input: CreateBackendInput,
+    state: CreateState,
+    record: Option<GroupStorage>,
+    secret: Option<GroupStorageSecret>,
+    output: Option<Result<GroupStorage, CreateBackendError>>,
+}
+
+impl CreateBackendOperation {
+    pub fn new(input: CreateBackendInput) -> Self {
+        Self {
+            input,
+            state: CreateState::Init,
+            record: None,
+            secret: None,
+            output: None,
+        }
+    }
+
+    fn fail(&mut self, error: CreateBackendError) -> Effects {
+        self.state = CreateState::Error;
+        self.output = Some(Err(error));
+        smallvec![]
+    }
+
+    fn handle_init(&mut self) -> Effects {
+        let normalized = match validate_backend_input(
+            &self.input.name,
+            self.input.kind,
+            &self.input.public_config,
+            &self.input.secret_config,
+        ) {
+            Ok(normalized) => normalized,
+            Err(error) => return self.fail(error.into()),
+        };
+
+        let now = SystemTime::now();
+        let backend_id = Ulid::generate();
+        let record = GroupStorage {
+            backend_id,
+            group_id: self.input.group_id,
+            name: self.input.name.trim().to_string(),
+            kind: self.input.kind,
+            public_config: normalized.public,
+            created_at: now,
+            updated_at: now,
+            created_by: self.input.created_by,
+            disabled: false,
+            cleanup: self.input.cleanup,
+        };
+        let secret = GroupStorageSecret {
+            backend_id,
+            secret_config: normalized.secret,
+            updated_at: now,
+        };
+
+        self.state = CreateState::Probe;
+        let effect = Effect::Blob(BlobEffect::CheckGroupBackend {
+            record: record.clone(),
+            secret: secret.clone(),
+        });
+        self.record = Some(record);
+        self.secret = Some(secret);
+        smallvec![effect]
+    }
+
+    fn handle_probe(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::GroupBackendChecked) => {}
+            Event::Blob(BlobEvent::Error(error)) => {
+                return self.fail(CreateBackendError::Unreachable(error));
+            }
+            received => {
+                return self.fail(CreateBackendError::InvalidStateEvent {
+                    state: "Probe",
+                    expected: "Event::Blob(BlobEvent::GroupBackendChecked)",
+                    received,
+                });
+            }
+        }
+
+        let (Some(record), Some(secret)) = (self.record.as_ref(), self.secret.as_ref()) else {
+            return self.fail(CreateBackendError::Failed);
+        };
+        let mut writes = match record_writes(record) {
+            Ok(writes) => writes,
+            Err(error) => return self.fail(error.into()),
+        };
+        let secret_bytes = match secret.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return self.fail(error.into()),
+        };
+        writes.push((
+            BACKEND_SECRET_KEYSPACE.to_string(),
+            backend_key(record.backend_id),
+            secret_bytes.into(),
+        ));
+
+        self.state = CreateState::WriteRecords;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })]
+    }
+
+    fn handle_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self.fail(CreateBackendError::InvalidStateEvent {
+                state: "WriteRecords",
+                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                received: event,
+            });
+        };
+        let Some(record) = self.record.clone() else {
+            return self.fail(CreateBackendError::Failed);
+        };
+        self.state = CreateState::Finish;
+        self.output = Some(Ok(record));
+        smallvec![]
+    }
+}
+
+impl Operation for CreateBackendOperation {
+    type Output = GroupStorage;
+    type Error = CreateBackendError;
+
+    fn start(&mut self) -> Effects {
+        self.handle_init()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match self.state {
+            CreateState::Init => self.handle_init(),
+            CreateState::Probe => self.handle_probe(event),
+            CreateState::WriteRecords => self.handle_written(event),
+            CreateState::Finish | CreateState::Error => smallvec![],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, CreateState::Finish | CreateState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        match self.output {
+            Some(result) => result,
+            None => Err(CreateBackendError::Failed),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::{CreateBackendError, CreateBackendInput, CreateBackendOperation};
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::errors::BlobError;
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        BACKEND_INDEX_KEYSPACE, BACKEND_SECRET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    };
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::storage::cleanup::CleanupStrategy;
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+    use std::collections::HashMap;
+    use ulid::Ulid;
+
+    fn input() -> CreateBackendInput {
+        CreateBackendInput {
+            group_id: Ulid::from_bytes([1u8; 16]),
+            created_by: aruna_core::UserId::default(),
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::from([
+                ("endpoint".to_string(), "https://s3.example.com".to_string()),
+                ("bucket".to_string(), "data".to_string()),
+            ]),
+            secret_config: HashMap::from([
+                ("access_key_id".to_string(), "id".to_string()),
+                ("secret_access_key".to_string(), "key".to_string()),
+            ]),
+            cleanup: CleanupStrategy::Retain,
+        }
+    }
+
+    #[test]
+    fn probes_before_writing() {
+        // A backend that cannot be written to must never reach storage.
+        let mut operation = CreateBackendOperation::new(input());
+
+        let effects = operation.start();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::CheckGroupBackend { .. })]
+        ));
+
+        let effects = operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}")
+        };
+        assert_eq!(
+            writes
+                .iter()
+                .map(|(key_space, ..)| key_space.as_str())
+                .collect::<Vec<_>>(),
+            [
+                STORAGE_BACKEND_KEYSPACE,
+                BACKEND_INDEX_KEYSPACE,
+                BACKEND_SECRET_KEYSPACE
+            ]
+        );
+        assert_eq!(writes[0].1, writes[2].1);
+        let stored = GroupStorage::from_bytes(writes[0].2.as_ref()).unwrap();
+        assert!(!stored.public_config.contains_key("access_key_id"));
+    }
+
+    #[test]
+    fn probe_failure_aborts() {
+        let mut operation = CreateBackendOperation::new(input());
+        operation.start();
+
+        let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::WriteError(
+            "denied".to_string(),
+        ))));
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateBackendError::Unreachable(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_config() {
+        let mut input = input();
+        input.secret_config.remove("secret_access_key");
+        let mut operation = CreateBackendOperation::new(input);
+
+        let effects = operation.start();
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateBackendError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_unexpected_event() {
+        let mut operation = CreateBackendOperation::new(input());
+        operation.start();
+
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"x".to_vec().into(),
+        }));
+
+        assert!(matches!(
+            operation.finalize(),
+            Err(CreateBackendError::InvalidStateEvent { .. })
+        ));
+    }
+}

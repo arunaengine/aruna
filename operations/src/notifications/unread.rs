@@ -1,15 +1,20 @@
+//! Runs the operation that counts a user's unread notifications up to a cap.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{NotificationRecord, notification_inbox_prefix};
-use aruna_core::types::{Effects, Key, UserId};
+use aruna_core::structs::execution::notification::{NotificationRecord, notification_inbox_prefix};
+use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 
 pub const UNREAD_COUNT_CAP: usize = 100;
-pub const UNREAD_SCAN_MAX_ROWS: usize = 2_000;
+pub const SCAN_MAX_ROWS: usize = 2_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnreadCountInput {
@@ -72,7 +77,7 @@ impl UnreadCountOperation {
         smallvec![]
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+    fn storage_error_fails(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -131,7 +136,7 @@ impl UnreadCountOperation {
             }
         }
 
-        if self.examined >= UNREAD_SCAN_MAX_ROWS && next_start_after.is_some() {
+        if self.examined >= SCAN_MAX_ROWS && next_start_after.is_some() {
             return self.finish(true);
         }
         match next_start_after {
@@ -150,7 +155,7 @@ impl Operation for UnreadCountOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage_error(event) {
+        let event = match self.storage_error_fails(event) {
             Ok(event) => event,
             Err(effects) => return effects,
         };
@@ -183,52 +188,20 @@ impl Operation for UnreadCountOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::notifications::inbox::upsert_inbox_records;
-    use aruna_core::structs::{NotificationClass, NotificationKind, RealmId};
-    use aruna_storage::storage::{FjallStorage, StorageHandle};
+    use crate::tests::notifications::{context_with_storage, seed, user};
+    use aruna_core::structs::execution::notification::NotificationClass;
     use std::collections::VecDeque;
-    use tempfile::{TempDir, tempdir};
-    use ulid::Ulid;
-
-    fn context_with_storage() -> (TempDir, DriverContext) {
-        let tempdir = tempdir().unwrap();
-        let storage_handle = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        (tempdir, context)
-    }
-
-    fn user(realm: u8, seed: u8) -> UserId {
-        UserId::new(Ulid::from_bytes([seed; 16]), RealmId([realm; 32]))
-    }
 
     fn record(recipient: UserId, created_at_ms: u64, read: bool) -> NotificationRecord {
-        let mut record = NotificationRecord::new(
+        let mut record = crate::tests::notifications::record(
             recipient,
             NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::generate(),
-                actor_user_id: user(recipient.realm_id.0[0], 200),
-            },
             created_at_ms,
         );
         if read {
             record.read_at_ms = Some(1);
         }
         record
-    }
-
-    async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
-        assert_eq!(
-            upsert_inbox_records(storage, records).await,
-            Ok(records.len())
-        );
     }
 
     async fn count(context: &DriverContext, recipient: UserId) -> UnreadCountOutput {
@@ -241,7 +214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_counts_only_unread() {
+    async fn counts_only_unread() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let mut records = Vec::new();
@@ -263,7 +236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_caps_at_100() {
+    async fn caps_at_limit() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let records: Vec<_> = (0..130).map(|ts| record(recipient, ts, false)).collect();
@@ -279,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_exactly_100_is_not_capped() {
+    async fn limit_not_capped() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let records: Vec<_> = (0..100).map(|ts| record(recipient, ts, false)).collect();
@@ -295,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_exactly_100_with_older_read_rows_is_not_capped() {
+    async fn read_rows_uncapped() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let mut records: Vec<_> = (100..200).map(|ts| record(recipient, ts, false)).collect();
@@ -312,7 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_scans_across_pages() {
+    async fn scans_across_pages() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
         let alternating: Vec<_> = (0..250)
@@ -344,10 +317,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_scan_work_is_bounded() {
+    async fn scan_work_bounded() {
         let (_tempdir, context) = context_with_storage();
         let recipient = user(1, 1);
-        let total = UNREAD_SCAN_MAX_ROWS + 100;
+        let total = SCAN_MAX_ROWS + 100;
         let records: Vec<_> = (0..total)
             .map(|ts| record(recipient, ts as u64, ts + 5 < total))
             .collect();
@@ -384,6 +357,6 @@ mod tests {
                 capped: true
             }
         );
-        assert!(iters <= UNREAD_SCAN_MAX_ROWS / UNREAD_COUNT_CAP);
+        assert!(iters <= SCAN_MAX_ROWS / UNREAD_COUNT_CAP);
     }
 }

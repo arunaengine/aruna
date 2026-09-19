@@ -1,6 +1,6 @@
-//! Client-facing base URLs for absolute links in API responses. `x-forwarded-*`
-//! headers are unauthenticated input, so they are honored only when the direct
-//! peer is a configured trusted proxy.
+//! Reads x-forwarded headers only from trusted proxies to find the client base URL and IP.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use axum::http::HeaderMap;
 use ipnet::IpNet;

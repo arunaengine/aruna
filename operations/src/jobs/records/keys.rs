@@ -1,23 +1,21 @@
-//! Storage keys of the append-only job-record store. Every key is built from
-//! the record's own signed identity, so a relay can never place a record under
-//! another family, kind, or subject.
+//! Builds the storage keys and prefixes of the append-only job record store.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::effects::{FetchCursor, FrameBoundsError};
-use aruna_core::structs::{
-    JOB_RECORD_KEY_BYTES, JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind,
-    SubmissionId,
+use aruna_core::structs::execution::job::{
+    JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind, RECORD_KEY_BYTES, SubmissionId,
 };
 use aruna_core::types::Key;
 
 /// Encoded width of a conflict row key: record key plus the rejected digest.
-pub const CONFLICT_KEY_BYTES: usize = JOB_RECORD_KEY_BYTES + 32;
+pub const CONFLICT_KEY_BYTES: usize = RECORD_KEY_BYTES + 32;
 
 pub fn record_key(key: &JobRecordKey) -> Key {
     Key::from(key.to_bytes().as_slice())
 }
 
-/// Prefix of every record of one request family.
 pub fn family_prefix(family: &JobFamilyId) -> Key {
     Key::from(family.to_bytes().as_slice())
 }
@@ -104,7 +102,7 @@ pub fn cursor_key(cursor: &FetchCursor) -> Result<JobRecordKey, JobRecordError> 
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use ulid::Ulid;
 

@@ -1,16 +1,19 @@
-//! Local inventory of the logical version copies this node exposes. Every
-//! registration and removal joins the transaction that makes the copy visible,
-//! so an interrupted write can never leave a serveable unregistered copy.
+//! Keeps the local inventory of the version copies this node may serve.
+//! Every registration and removal joins the transaction that makes the copy visible.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
-use aruna_core::structs::{
-    BackendLocation, CopyOrigin, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState,
-    NODE_SUBJECT_KEY, NodeSubjectRecord, PlacementPolicyError, PlacementPolicyRef, VersionKey,
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, CopyOrigin, ManagedCopyKey, ManagedCopyRecord, ManagedCopyState, VersionKey,
 };
-use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -367,20 +370,22 @@ impl ManagedCopyRemoval {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{
         CopyRequest, ManagedCopyError, ManagedCopyPage, ManagedCopyRemoval, check_serveable,
         register_effect, scan_effect, split_serve_reads, transition_effect, validate_registration,
     };
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
-    use aruna_core::structs::CopyOrigin;
-    use aruna_core::structs::{
+    use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
+    use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
+    use aruna_core::structs::storage::blob::CopyOrigin;
+    use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord,
-        ManagedCopyState, NodeSubjectRecord, PlacementPolicyRef, PlacementSubject, VersionKey,
+        ManagedCopyState, VersionKey,
     };
-    use aruna_core::types::NodeId;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
@@ -607,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_node_serves_nothing() {
+    fn rejects_blocked_serving() {
         // A rejoin blocks every governed serve until the inventory is revalidated,
         // even for rows that still read as registered.
         let registered = record(ManagedCopyState::Registered);
@@ -812,26 +817,31 @@ mod tests {
 mod driver_tests {
     use super::{CopyRegistration, ManagedCopyError, register_effect, scan_effect, version_scope};
     use crate::driver::{DriverContext, drive};
-    use crate::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-    use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-    use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-    use crate::s3::put_object::{
+    use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+    use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+    use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+    use crate::s3::object::put::{
         PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
     };
     use aruna_blob::blob::BlobHandler;
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+    use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
+    use aruna_core::structs::storage::blob::{
         Backend, BackendConfig, BackendRef, BlobVersion, ManagedCopyKey, ManagedCopyQuarantine,
-        ManagedCopyRecord, ManagedCopyState, NODE_SUBJECT_KEY, NodeSubjectRecord,
-        PlacementPolicyRef, PlacementSubject, RealmId, RoutingSnapshot, VersionKey,
+        ManagedCopyRecord, ManagedCopyState, VersionKey,
     };
-    use aruna_core::types::{GroupId, NodeId, UserId};
+    use aruna_core::structs::storage::routing::RoutingSnapshot;
+    use aruna_core::types::GroupId;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::{HashMap, VecDeque};
@@ -1031,8 +1041,6 @@ mod driver_tests {
         )
         .await
         .expect("put drives")
-        .expect("put succeeds")
-        .expect("put returns a result")
         .version_id
     }
 
@@ -1210,9 +1218,7 @@ mod driver_tests {
                 &context,
             )
             .await
-            .expect("put drives")
-            .expect("put succeeds")
-            .expect("put returns a result");
+            .expect("put drives");
         }
 
         assert_eq!(count_copies(&context, version_id).await, 1);
@@ -1271,9 +1277,7 @@ mod driver_tests {
             &context,
         )
         .await
-        .expect("delete drives")
-        .expect("delete succeeds")
-        .expect("delete returns a result");
+        .expect("delete drives");
 
         assert!(read_version(&context, version_id).await.is_none());
         assert_eq!(count_copies(&context, version_id).await, 0);

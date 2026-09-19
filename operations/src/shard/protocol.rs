@@ -1,8 +1,13 @@
+//! Defines the shard manifest wire messages and reads or writes them in size bounded frames.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::ops::Range;
 
 use aruna_core::NodeId;
 use aruna_core::document::{ShardManifest, ShardManifestEntry};
-use aruna_core::structs::{PlacementRef, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_net::streams::BiStream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -13,11 +18,11 @@ use crate::shard::manifest_entry_digest;
 /// A manifest request has only fixed-size identifiers and integer fields. This
 /// small envelope leaves encoding headroom without permitting a large body to
 /// be allocated before peer authorization.
-pub const SHARD_MAX_REQUEST_SIZE: usize = 128;
+pub const MAX_REQUEST_SIZE: usize = 128;
 
 /// A shard manifest can carry one entry per document held in the shard; 16 MiB
 /// bounds a large response while still refusing a hostile oversized frame.
-pub const SHARD_MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
 
 /// New-holder request: give me your paged manifest for this shard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -56,15 +61,15 @@ pub(crate) struct ManifestPagePlan {
     ranges: Vec<Range<usize>>,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize)]
-enum BorrowedShardTransportResponse<'a> {
+enum BorrowedTransportResponse<'a> {
+    #[allow(dead_code)]
     Reject,
-    ManifestPage(BorrowedShardManifestPage<'a>),
+    ManifestPage(BorrowedManifestPage<'a>),
 }
 
 #[derive(Serialize)]
-struct BorrowedShardManifestPage<'a> {
+struct BorrowedManifestPage<'a> {
     placement: PlacementRef,
     holder: NodeId,
     cursor: &'a [u8],
@@ -180,7 +185,7 @@ pub(crate) async fn write_manifest_pages(
             index + 1 == plan.ranges.len(),
             &manifest.entries[range.clone()],
         );
-        write_frame(stream, &response, SHARD_MAX_RESPONSE_SIZE).await?;
+        write_frame(stream, &response, MAX_RESPONSE_SIZE).await?;
     }
     Ok(())
 }
@@ -192,8 +197,8 @@ fn borrowed_page_response<'a>(
     page_index: u32,
     last: bool,
     entries: &'a [ShardManifestEntry],
-) -> BorrowedShardTransportResponse<'a> {
-    BorrowedShardTransportResponse::ManifestPage(BorrowedShardManifestPage {
+) -> BorrowedTransportResponse<'a> {
+    BorrowedTransportResponse::ManifestPage(BorrowedManifestPage {
         placement: manifest.placement,
         holder: manifest.holder,
         cursor: &manifest.cursor,
@@ -381,22 +386,22 @@ pub async fn write_shard_request(
     stream: &mut BiStream,
     message: &ShardTransportMessage,
 ) -> Result<(), String> {
-    write_frame(stream, message, SHARD_MAX_REQUEST_SIZE).await
+    write_frame(stream, message, MAX_REQUEST_SIZE).await
 }
 
 pub async fn read_shard_request(stream: &mut BiStream) -> Result<ShardTransportMessage, String> {
-    read_frame(stream, SHARD_MAX_REQUEST_SIZE).await
+    read_frame(stream, MAX_REQUEST_SIZE).await
 }
 
 pub async fn write_shard_response(
     stream: &mut BiStream,
     message: &ShardTransportResponse,
 ) -> Result<(), String> {
-    write_frame(stream, message, SHARD_MAX_RESPONSE_SIZE).await
+    write_frame(stream, message, MAX_RESPONSE_SIZE).await
 }
 
 pub async fn read_shard_response(stream: &mut BiStream) -> Result<ShardTransportResponse, String> {
-    read_frame(stream, SHARD_MAX_RESPONSE_SIZE).await
+    read_frame(stream, MAX_RESPONSE_SIZE).await
 }
 
 async fn write_frame<T: Serialize>(
@@ -449,7 +454,7 @@ async fn read_frame<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use aruna_core::document::{
-        DocumentSyncRevision, DocumentSyncTarget, ShardManifest, ShardManifestEntry,
+        DocumentSyncRevision, DocumentTarget, ShardManifest, ShardManifestEntry,
     };
     use aruna_core::{NodeId, alpn::Alpn};
     use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
@@ -478,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_request_round_trips() {
+    fn request_round_trips() {
         let mut placement = placement();
         placement.shard = u32::MAX;
         let message = ShardTransportMessage::ManifestRequest {
@@ -486,7 +491,7 @@ mod tests {
             placement,
         };
         let bytes = postcard::to_allocvec(&message).unwrap();
-        assert!(bytes.len() <= SHARD_MAX_REQUEST_SIZE);
+        assert!(bytes.len() <= MAX_REQUEST_SIZE);
         assert_eq!(
             postcard::from_bytes::<ShardTransportMessage>(&bytes).unwrap(),
             message
@@ -494,13 +499,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_response_round_trips() {
+    fn response_round_trips() {
         let holder = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let manifest = ShardManifest {
             placement: placement(),
             holder,
             entries: vec![ShardManifestEntry {
-                target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                target: DocumentTarget::MetadataDocumentLifecycle {
                     document_id: Ulid::from_bytes([4; 16]),
                 },
                 revision: DocumentSyncRevision {
@@ -522,7 +527,7 @@ mod tests {
             reject
         );
 
-        let page = partition_manifest(&manifest, SHARD_MAX_RESPONSE_SIZE)
+        let page = partition_manifest(&manifest, MAX_RESPONSE_SIZE)
             .unwrap()
             .remove(0);
         let response = ShardTransportResponse::ManifestPage(Box::new(page));
@@ -539,7 +544,7 @@ mod tests {
         let holder = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let entries = (1..=4)
             .map(|seed| ShardManifestEntry {
-                target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                target: DocumentTarget::MetadataDocumentLifecycle {
                     document_id: Ulid::from_bytes([seed; 16]),
                 },
                 revision: DocumentSyncRevision {
@@ -614,7 +619,7 @@ mod tests {
         let other_holder = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let entries = (1..=2)
             .map(|seed| ShardManifestEntry {
-                target: DocumentSyncTarget::MetadataDocumentLifecycle {
+                target: DocumentTarget::MetadataDocumentLifecycle {
                     document_id: Ulid::from_bytes([seed; 16]),
                 },
                 revision: DocumentSyncRevision {

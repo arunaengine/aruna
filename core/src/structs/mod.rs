@@ -1,89 +1,57 @@
+//! Owns the persisted and wire records, grouped into domain modules.
+//! Callers name a record through its domain, such as structs::storage::blob::BlobVersion.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod execution;
+pub mod identity;
+pub mod placement;
+pub mod storage;
+
 mod assistant_chat;
 mod assistant_provider;
-mod backends;
-mod binding_directory;
-mod blob;
-mod blob_delete_audit;
 pub mod checksum;
-mod cleanup;
-mod compute_config;
-mod group;
-mod group_backend;
-mod handle_allocation;
-mod harvest;
 mod info;
-mod job;
-mod metadata_registry;
-mod multipart;
-mod node_info;
-mod node_subject;
-mod notification;
-mod notification_watch;
-mod offered_directory;
 mod path_claim;
 mod persistent_id;
-mod placement;
-mod placement_policy;
-mod placement_policy_document;
-mod placement_transition;
-mod policy_attachment;
-mod realm;
-mod replication;
-mod routing;
-mod s3_session;
-mod source_access;
-mod source_connector;
-mod staging;
-mod storage_purge;
-#[allow(clippy::module_inception)]
-mod structs;
 mod sync_quarantine;
 mod sync_relationship;
 mod synced_folder;
-mod usage;
-mod user_session;
-mod user_vault;
 
-pub use assistant_chat::*;
-pub use assistant_provider::*;
-pub use backends::*;
-pub use binding_directory::*;
-pub use blob::*;
-pub use blob_delete_audit::*;
-pub use cleanup::*;
-pub use compute_config::*;
-pub use group::*;
-pub use group_backend::*;
-pub use handle_allocation::*;
-pub use harvest::*;
-pub use info::*;
-pub use job::*;
-pub use metadata_registry::*;
-pub use multipart::*;
-pub use node_info::*;
-pub use node_subject::*;
-pub use notification::*;
-pub use notification_watch::*;
-pub use offered_directory::*;
-pub use path_claim::*;
-pub use persistent_id::*;
-pub use placement::*;
-pub use placement_policy::*;
-pub use placement_policy_document::*;
-pub use placement_transition::*;
-pub use policy_attachment::*;
-pub use realm::*;
-pub use replication::*;
-pub use routing::*;
-pub use s3_session::*;
-pub use source_access::*;
-pub use source_connector::*;
-pub use staging::*;
-pub use storage_purge::*;
-pub use structs::*;
-pub use sync_quarantine::*;
-pub use sync_relationship::*;
-pub use synced_folder::*;
-pub use usage::*;
-pub use user_session::*;
-pub use user_vault::*;
+pub use assistant_chat::{
+    AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS,
+    MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
+};
+pub use assistant_provider::{
+    AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
+    AssistantProviderStatus, AssistantSecretError,
+};
+pub use info::{
+    BackendState, BlobState, ConnectionAddressState, ConnectionAddressStatus,
+    ConnectionMonitorState, NetState, NetworkDiagnosticsState, OpenConnection, PeerConnectionState,
+    PeerConnectionStatus, ProtocolConnectionState, RequestSummaryState, Status,
+};
+pub use path_claim::{PathClaimRecord, PathResolution, resolve_path_claim};
+pub use persistent_id::{
+    MintPersistentSpec, PersistentIdFailure, PersistentIdKind, PersistentIdMapping,
+    PersistentIdProvider, PersistentIdRevision, PersistentIdStatus, persistent_id_change,
+    persistent_id_key, persistent_id_target,
+};
+pub use sync_quarantine::{
+    QUARANTINE_MAX_BYTES, QUARANTINE_MAX_RECORDS, QUARANTINE_USAGE_KEY, SyncQuarantineCapacity,
+    SyncQuarantineError, SyncQuarantineEvidence, SyncQuarantineFamily, SyncQuarantineIdentity,
+    SyncQuarantineInput, SyncQuarantineRecord, SyncQuarantineUsage, SyncQuarantineWrite,
+    build_quarantine_entries, check_quarantine_capacity, quarantine_row_entry,
+    quarantine_usage_entry, sync_quarantine_key,
+};
+pub use sync_relationship::{
+    ReferenceHandling, SyncCounters, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
+    sync_relationship_key, sync_relationship_prefix, sync_state_key,
+};
+pub use synced_folder::{
+    ActionKind, ActionOutcome, ActionScope, EntrySide, EntryState, FolderMode, FolderState,
+    MAX_SYNC_PAGE, Observed, PendingMark, RemoteBinding, RemoteHead, ReplaceReason, SYNC_TRASH_DIR,
+    SYNC_VERSION_TAG, SyncAction, SyncActionRecord, SyncBase, SyncListCursor, SyncPageLimit,
+    SyncPolicy, SyncPullAck, SyncRefusal, SyncVersionPage, SyncedBytes, SyncedFolder, WriteGuard,
+    decide,
+};

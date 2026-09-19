@@ -1,3 +1,8 @@
+//! Pools outbound connections per peer and ALPN with idle timeout, caps and failure cooldown.
+//! Also hooks the endpoint to report connection monitor state.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
@@ -24,7 +29,8 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{Instrument, debug, info_span, trace, warn};
 
 const MONITOR_CHANNEL_CAPACITY: usize = 4096;
-const PARKED_IDLE_TIMER_SECS: u64 = 365 * 24 * 60 * 60;
+const CONNECTION_QUEUE_CAPACITY: usize = 128;
+const IDLE_TIMER_SECS: u64 = 365 * 24 * 60 * 60;
 // Matches the initial peer retry interval, so a cooled peer is re-probed on the
 // same cadence the connectivity manager already uses.
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
@@ -314,7 +320,13 @@ impl FailureCache {
 
 struct RequestLease {
     key: ConnectionKey,
-    tx: oneshot::Sender<std::result::Result<ConnectionLease, PoolConnectError>>,
+    tx: oneshot::Sender<LeaseReply>,
+}
+
+enum LeaseReply {
+    Done(std::result::Result<ConnectionLease, PoolConnectError>),
+    /// The connection queue was full, so the requester waits for space itself.
+    Enqueue(Sender<RequestLease>),
 }
 
 struct PoolContext {
@@ -358,9 +370,7 @@ impl PoolContext {
         }
 
         let counter = ConnectionCounter::new();
-        let mut idle_timer = Box::pin(tokio::time::sleep(Duration::from_secs(
-            PARKED_IDLE_TIMER_SECS,
-        )));
+        let mut idle_timer = Box::pin(tokio::time::sleep(Duration::from_secs(IDLE_TIMER_SECS)));
         let mut idle_timer_active = false;
 
         let mut close_fut = state.as_ref().ok().map(|connection| {
@@ -386,10 +396,10 @@ impl PoolContext {
                                 active_leases = counter.current(),
                                 "handing out pooled connection lease"
                             );
-                            let _ = request.tx.send(Ok(lease));
+                            let _ = request.tx.send(LeaseReply::Done(Ok(lease)));
                         }
                         Err(error) => {
-                            let _ = request.tx.send(Err(error.clone()));
+                            let _ = request.tx.send(LeaseReply::Done(Err(error.clone())));
                         }
                     }
                 }
@@ -474,7 +484,7 @@ impl Actor {
     async fn run(mut self) {
         while let Some(message) = self.rx.recv().await {
             match message {
-                ActorMessage::RequestLease(request) => self.handle_request(request).await,
+                ActorMessage::RequestLease(request) => self.handle_request(request),
                 ActorMessage::ConnectionIdle { key } => self.add_idle(key),
                 ActorMessage::ConnectionClosed { key } => self.remove_connection(key),
                 ActorMessage::ConnectionFailed { key, error } => {
@@ -500,15 +510,20 @@ impl Actor {
         self.failures.entries.clear();
     }
 
-    async fn handle_request(&mut self, mut request: RequestLease) {
+    /// Never waits on a connection queue, whose task may be waiting to post to this actor.
+    fn handle_request(&mut self, mut request: RequestLease) {
         let key = request.key;
         self.remove_idle(key);
 
         if let Some(connection_tx) = self.connections.get(&key) {
-            match connection_tx.send(request).await {
+            match connection_tx.try_send(request) {
                 Ok(()) => return,
-                Err(error) => {
-                    request = error.0;
+                Err(TrySendError::Full(request)) => {
+                    let _ = request.tx.send(LeaseReply::Enqueue(connection_tx.clone()));
+                    return;
+                }
+                Err(TrySendError::Closed(returned)) => {
+                    request = returned;
                     self.remove_connection(key);
                 }
             }
@@ -521,7 +536,7 @@ impl Actor {
                 outcome = "cooldown_hit",
                 "suppressing dial to a recently unreachable peer"
             );
-            let _ = request.tx.send(Err(error));
+            let _ = request.tx.send(LeaseReply::Done(Err(error)));
             return;
         }
 
@@ -534,12 +549,14 @@ impl Actor {
                 );
                 self.remove_connection(idle);
             } else {
-                let _ = request.tx.send(Err(PoolConnectError::TooManyConnections));
+                let _ = request
+                    .tx
+                    .send(LeaseReply::Done(Err(PoolConnectError::TooManyConnections)));
                 return;
             }
         }
 
-        let (connection_tx, connection_rx) = mpsc::channel(128);
+        let (connection_tx, connection_rx) = mpsc::channel(CONNECTION_QUEUE_CAPACITY);
         self.connections.insert(key, connection_tx.clone());
 
         let context = self.context.clone();
@@ -547,7 +564,7 @@ impl Actor {
             context.run_connection_actor(key, connection_rx).await;
         });
 
-        if connection_tx.send(request).await.is_err() {
+        if connection_tx.try_send(request).is_err() {
             self.remove_connection(key);
         }
     }
@@ -626,13 +643,26 @@ impl ConnectionPool {
         alpn: Alpn,
     ) -> std::result::Result<ConnectionLease, PoolConnectError> {
         let key = ConnectionKey { node_id, alpn };
-        let (tx, rx) = oneshot::channel();
         match tokio::time::timeout(self.request_timeout, async {
+            let (tx, rx) = oneshot::channel();
             self.tx
                 .send(ActorMessage::RequestLease(RequestLease { key, tx }))
                 .await
                 .map_err(|_| PoolConnectError::Shutdown)?;
-            rx.await.map_err(|_| PoolConnectError::Shutdown)?
+            let mut reply = rx.await.map_err(|_| PoolConnectError::Shutdown)?;
+            // Only the actor answers `Enqueue`, so this loop runs at most twice.
+            loop {
+                let connection_tx = match reply {
+                    LeaseReply::Done(result) => return result,
+                    LeaseReply::Enqueue(connection_tx) => connection_tx,
+                };
+                let (tx, rx) = oneshot::channel();
+                connection_tx
+                    .send(RequestLease { key, tx })
+                    .await
+                    .map_err(|_| PoolConnectError::Shutdown)?;
+                reply = rx.await.map_err(|_| PoolConnectError::Shutdown)?;
+            }
         })
         .await
         {
@@ -687,34 +717,20 @@ impl ConnectionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{make_repeated_node, test_endpoint, unseeded_endpoint};
 
-    fn node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
+    // Deadlock detector only: a healthy run finishes these waits far sooner.
+    const HANG_CAP: Duration = Duration::from_secs(60);
 
     fn key(seed: u8, alpn: Alpn) -> ConnectionKey {
         ConnectionKey {
-            node_id: node(seed),
+            node_id: make_repeated_node(seed),
             alpn,
         }
     }
 
     fn cache(cooldown: Duration, capacity: usize) -> FailureCache {
         FailureCache::new(cooldown, capacity, Arc::new(PoolCounters::default()))
-    }
-
-    async fn test_endpoint() -> Endpoint {
-        Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .relay_mode(iroh::RelayMode::Disabled)
-            .bind_addr(
-                "127.0.0.1:0"
-                    .parse::<std::net::SocketAddr>()
-                    .expect("valid bind addr"),
-            )
-            .expect("valid bind addr")
-            .bind()
-            .await
-            .expect("endpoint binds")
     }
 
     async fn pending_endpoint(peer: NodeId) -> (Endpoint, tokio::net::UdpSocket) {
@@ -793,8 +809,150 @@ mod tests {
         assert!(full, "pool actor mailbox did not saturate");
     }
 
+    /// Holds the dial to one peer until the test opens the gate. Other dials fail at once.
+    #[derive(Clone, Debug)]
+    struct DialGate {
+        peer: NodeId,
+        accept: bool,
+        entered: Arc<Notify>,
+        open: Arc<Notify>,
+    }
+
+    impl EndpointHooks for DialGate {
+        async fn before_connect(
+            &self,
+            remote_addr: &iroh::EndpointAddr,
+            _alpn: &[u8],
+        ) -> BeforeConnectOutcome {
+            if remote_addr.id != self.peer {
+                return BeforeConnectOutcome::Reject;
+            }
+            self.entered.notify_one();
+            self.open.notified().await;
+            if self.accept {
+                BeforeConnectOutcome::Accept
+            } else {
+                BeforeConnectOutcome::Reject
+            }
+        }
+    }
+
+    async fn accept_all(endpoint: Endpoint) {
+        let mut connections = Vec::new();
+        while let Some(incoming) = endpoint.accept().await {
+            if let Ok(connection) = incoming.await {
+                connections.push(connection);
+            }
+        }
+    }
+
+    /// Polls a lease request once, so its queue position is fixed before it is spawned.
+    /// Unconstrained keeps the task budget from turning that poll into a no-op.
+    async fn queue_request(
+        requests: &mut JoinSet<std::result::Result<(), PoolConnectError>>,
+        pool: &ConnectionPool,
+        key: ConnectionKey,
+    ) {
+        let pool = pool.clone();
+        let mut request = Box::pin(tokio::task::unconstrained(async move {
+            pool.get_or_connect(key.node_id, key.alpn).await.map(drop)
+        }));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        requests.spawn(request);
+    }
+
+    /// Fills the actor queue and one connection queue while that connection's dial is gated.
+    /// The actor must not wait on that queue while its connection task waits on the actor queue.
+    async fn saturated_dial(accept: bool) {
+        let peer = test_endpoint(30).await;
+        tokio::spawn(accept_all(peer.clone()));
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        lookup.add_endpoint_info(iroh::EndpointAddr::from_parts(
+            peer.id(),
+            peer.bound_sockets().into_iter().map(TransportAddr::Ip),
+        ));
+        let gate = DialGate {
+            peer: peer.id(),
+            accept,
+            entered: Arc::new(Notify::new()),
+            open: Arc::new(Notify::new()),
+        };
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .address_lookup(lookup)
+            .hooks(gate.clone())
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("valid bind addr"),
+            )
+            .expect("valid bind addr")
+            .bind()
+            .await
+            .expect("endpoint binds");
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ConnectionPoolOptions {
+                connect_timeout: Duration::from_secs(600),
+                ..ConnectionPoolOptions::default()
+            },
+        );
+        let key = ConnectionKey {
+            node_id: peer.id(),
+            alpn: Alpn::DocumentSync,
+        };
+
+        let mut requests = JoinSet::new();
+        queue_request(&mut requests, &pool, key).await;
+        gate.entered.notified().await;
+        let release = hold_actor(&pool).await;
+        while pool.tx.capacity() > 0 {
+            queue_request(&mut requests, &pool, key).await;
+        }
+        // Blocked senders get freed slots in order, so these take every slot the actor
+        // frees before the connection task can report its dial.
+        for _ in 0..CONNECTION_QUEUE_CAPACITY {
+            queue_request(&mut requests, &pool, key).await;
+        }
+        gate.open.notify_one();
+        release.send(()).expect("release pool actor");
+
+        tokio::time::timeout(HANG_CAP, actor_barrier(&pool))
+            .await
+            .expect("pool actor progressed");
+        let unrelated = tokio::time::timeout(
+            HANG_CAP,
+            pool.get_or_connect(make_repeated_node(31), key.alpn),
+        )
+        .await
+        .expect("unrelated request progressed");
+        assert!(matches!(unrelated, Err(PoolConnectError::Connection(_))));
+        let outcomes = tokio::time::timeout(HANG_CAP, requests.join_all())
+            .await
+            .expect("lease requests progressed");
+        if accept {
+            assert!(outcomes.iter().all(std::result::Result::is_ok));
+        } else {
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, Err(PoolConnectError::Connection(_))))
+            );
+            actor_barrier(&pool).await;
+            assert_eq!(pool.counts_for(key.node_id, key.alpn).cooldown_records, 1);
+        }
+        assert_eq!(pool.counts_for(key.node_id, key.alpn).dials, 1);
+
+        tokio::time::timeout(HANG_CAP, pool.shutdown())
+            .await
+            .expect("shutdown progressed")
+            .expect("pool shutdown");
+        endpoint.close().await;
+        peer.close().await;
+    }
+
     #[tokio::test]
-    async fn lease_request_times_out_when_actor_does_not_reply() {
+    async fn lease_actor_timeout() {
         let (tx, _rx) = mpsc::channel(1);
         let pool = ConnectionPool {
             tx,
@@ -802,7 +960,7 @@ mod tests {
             counters: Arc::new(PoolCounters::default()),
         };
 
-        let result = pool.get_or_connect(node(1), Alpn::Bao).await;
+        let result = pool.get_or_connect(make_repeated_node(1), Alpn::Bao).await;
 
         assert!(matches!(result, Err(PoolConnectError::Timeout)));
     }
@@ -897,7 +1055,7 @@ mod tests {
         cache.record(key(1, Alpn::Metadata), PoolConnectError::Timeout, now);
         cache.record(key(2, Alpn::Bao), PoolConnectError::Timeout, now);
 
-        cache.clear_node(node(1));
+        cache.clear_node(make_repeated_node(1));
 
         assert!(cache.hit(&key(1, Alpn::Bao), now).is_none());
         assert!(cache.hit(&key(1, Alpn::Metadata), now).is_none());
@@ -909,13 +1067,13 @@ mod tests {
         // An unreachable peer must cost one dial for the whole cooldown, and the
         // suppressed calls must return the same retryable error class.
         let pool = ConnectionPool::new(
-            test_endpoint().await,
+            unseeded_endpoint().await,
             ConnectionPoolOptions {
                 failure_cooldown: Duration::from_secs(30),
                 ..ConnectionPoolOptions::default()
             },
         );
-        let peer = node(9);
+        let peer = make_repeated_node(9);
 
         let first = pool.get_or_connect(peer, Alpn::Bao).await;
         assert!(first.is_err());
@@ -942,8 +1100,8 @@ mod tests {
 
     #[tokio::test]
     async fn clear_after_pressure() {
-        let blocked = node(20);
-        let target = node(21);
+        let blocked = make_repeated_node(20);
+        let target = make_repeated_node(21);
         let (endpoint, _blackhole) = pending_endpoint(blocked).await;
         tokio::time::pause();
         let options = ConnectionPoolOptions {
@@ -1017,8 +1175,8 @@ mod tests {
     #[tokio::test]
     async fn clear_waits_capacity() {
         let (tx, mut rx) = mpsc::channel(1);
-        let first = node(1);
-        let second = node(2);
+        let first = make_repeated_node(1);
+        let second = make_repeated_node(2);
         tx.send(ActorMessage::ClearFailures { node_id: first })
             .await
             .unwrap();
@@ -1045,13 +1203,13 @@ mod tests {
     #[tokio::test]
     async fn coalesces_requests() {
         let pool = ConnectionPool::new(
-            test_endpoint().await,
+            unseeded_endpoint().await,
             ConnectionPoolOptions {
                 failure_cooldown: Duration::from_secs(30),
                 ..ConnectionPoolOptions::default()
             },
         );
-        let peer = node(10);
+        let peer = make_repeated_node(10);
 
         let mut requests = JoinSet::new();
         for _ in 0..8 {
@@ -1063,6 +1221,16 @@ mod tests {
         }
 
         assert_eq!(pool.counts().dials, 1);
+    }
+
+    #[tokio::test]
+    async fn ready_under_saturation() {
+        saturated_dial(true).await;
+    }
+
+    #[tokio::test]
+    async fn failure_under_saturation() {
+        saturated_dial(false).await;
     }
 }
 
@@ -1247,7 +1415,7 @@ impl Monitor {
                 let selected_path = paths.iter().find(|path| path.is_selected());
                 let selected_address = selected_path
                     .as_ref()
-                    .map(|path| transport_addr_to_string(path.remote_addr()));
+                    .map(|path| format_transport_addr(path.remote_addr()));
                 let rtt_ms = selected_path
                     .as_ref()
                     .map(|path| path.rtt())
@@ -1278,7 +1446,7 @@ impl Default for Monitor {
     }
 }
 
-fn transport_addr_to_string(addr: &TransportAddr) -> String {
+fn format_transport_addr(addr: &TransportAddr) -> String {
     match addr {
         TransportAddr::Ip(addr) => addr.to_string(),
         TransportAddr::Relay(url) => url.to_string(),

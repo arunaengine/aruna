@@ -1,10 +1,15 @@
-use crate::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
+//! Revokes a user session together with its token and rewrites the stored session row.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::auth::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::USER_SESSION_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, UserSession};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -278,10 +283,11 @@ impl Operation for RevokeSessionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
-    use aruna_core::structs::{RealmId, SessionKind};
-    use aruna_core::types::UserId;
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::auth::SessionKind;
+    use aruna_core::structs::identity::realm::RealmId;
 
     #[test]
     fn revoke_is_idempotent() {
@@ -300,7 +306,7 @@ mod tests {
         };
         let mut operation = RevokeSessionOperation::new(
             Actor {
-                node_id: iroh::SecretKey::generate().public(),
+                node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
                 user_id,
                 realm_id,
             },

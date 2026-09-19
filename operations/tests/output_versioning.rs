@@ -1,5 +1,10 @@
+//! Tests that job inputs stage a pinned blob version and that replays reuse that version.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -11,31 +16,39 @@ use aruna_core::compute::{
     LogTails, NOBODY, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec, UserSpec,
 };
 use aruna_core::effects::StorageEffect;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    Actor, AttemptControl, AttemptIntent, Backend, BackendConfig, BucketInfo, CapturedInput,
-    ExecutionSpec, FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, InputMode,
-    InputSelection, InputSource, JobClaim, JobId, JobPayload, JobRecord, JobState,
-    OutputDestination, OutputSelection, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    RoutingSnapshot, WorkspaceMode, checksum::HASH_BLAKE3,
+use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::structs::execution::job::{
+    AttemptControl, AttemptIntent, CapturedInput, ExecutionSpec, InputMode, InputSelection,
+    InputSource, JobClaim, JobId, JobPayload, JobRecord, JobState, OutputDestination,
+    OutputSelection, WorkspaceMode,
 };
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+};
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_core::types::{GroupId, NodeId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::store::{insert_job, record_attempt_intent, reserve_output_commits};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::jobs::workflow::workspace::{capture_outputs, load_direct_inputs};
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
-use aruna_operations::s3::list_buckets::{ListBucketsInput, ListBucketsOperation};
-use aruna_operations::s3::list_object_versions::{
-    ListObjectVersionsInput, ListObjectVersionsItem, ListObjectVersionsOperation,
-};
-use aruna_operations::s3::put_object::{
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
+use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
+use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
+use aruna_operations::s3::object::versions::{
+    ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
 use aruna_storage::storage;
 use futures_util::StreamExt;
@@ -124,8 +137,6 @@ async fn create_bucket(harness: &Harness, bucket: &str) {
         &harness.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 }
 
@@ -174,7 +185,7 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
     record.claim = Some(JobClaim {
         holder_node_id: harness.node_id,
         claim_token: token,
-        lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+        lease_expires_ms: unix_timestamp_millis() + 60_000,
     });
     insert_job(&harness.driver.storage_handle, &record)
         .await
@@ -266,8 +277,6 @@ async fn put_version(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 async fn head_object(harness: &Harness, version_id: Option<Ulid>) -> HeadObjectResult {
@@ -281,13 +290,11 @@ async fn head_object(harness: &Harness, version_id: Option<Ulid>) -> HeadObjectR
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 async fn list_versions(harness: &Harness) -> Vec<Ulid> {
     let result = drive(
-        ListObjectVersionsOperation::new(ListObjectVersionsInput {
+        ListVersionsOperation::new(ListVersionsInput {
             bucket: BUCKET.to_string(),
             prefix: Some(KEY.to_string()),
             delimiter: None,
@@ -298,15 +305,13 @@ async fn list_versions(harness: &Harness) -> Vec<Ulid> {
         &harness.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
     result
         .items
         .into_iter()
         .filter_map(|item| match item {
-            ListObjectVersionsItem::Version { version_id, .. } => Some(version_id),
-            ListObjectVersionsItem::DeleteMarker { .. } => None,
+            ListVersionsItem::Version { version_id, .. } => Some(version_id),
+            ListVersionsItem::DeleteMarker { .. } => None,
         })
         .collect()
 }
@@ -318,8 +323,8 @@ async fn seed_auth(harness: &Harness) {
         user_id: harness.created_by,
         realm_id: harness.realm_id,
     };
-    let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(harness.realm_id);
-    let group_auth = GroupAuthorizationDocument::new_default_group_doc(
+    let realm_auth = RealmAuthorizationDocument::default_realm_doc(harness.realm_id);
+    let group_auth = GroupAuthorizationDocument::default_group_doc(
         harness.created_by,
         harness.realm_id,
         harness.group_id,
@@ -650,8 +655,6 @@ async fn list_buckets(harness: &Harness) -> Vec<String> {
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
     .buckets
     .into_iter()
     .map(|(name, _)| name)
@@ -665,7 +668,7 @@ async fn run_capture(
     mode: InputMode,
     key: &str,
     workspace: Option<&str>,
-) -> Vec<aruna_core::structs::OutputObject> {
+) -> Vec<aruna_core::structs::execution::job::OutputObject> {
     let pinned = put_version(harness, b"input-bytes", None).await;
     let mut spec = pinned_spec(harness, pinned.version_id, mode);
     spec.file_outputs.push(OutputSelection {
@@ -711,18 +714,16 @@ async fn run_capture(
 
 /// Whether the object exists at all, at any version.
 async fn object_exists(harness: &Harness, bucket: &str, key: &str) -> bool {
-    matches!(
-        drive(
-            HeadObjectOperation::new(HeadObjectInput {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: None,
-            }),
-            &harness.driver,
-        )
-        .await,
-        Ok(Some(Ok(_)))
+    drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: None,
+        }),
+        &harness.driver,
     )
+    .await
+    .is_ok()
 }
 
 #[tokio::test]

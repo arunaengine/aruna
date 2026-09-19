@@ -1,28 +1,38 @@
+//! Tests harvest jobs against a local OAI provider, covering cursors, deletes and failures.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "512"]
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use aruna_blob::blob::BlobHandler;
+use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::structs::FIRST_GRANTABLE_HANDLE;
-use aruna_core::structs::{
-    Actor, AuthContext, Backend, BackendConfig, Group, GroupAuthorizationDocument, HarvestJobSpec,
-    HarvestProvenance, HarvestRecordState, HarvestSelector, HarvestSource, JobError, JobErrorKind,
-    JobProgress, JobResultPayload, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    RealmNodeKind, RepositoryConnector, RepositoryConnectorKind,
+use aruna_core::structs::execution::harvest::{
+    HarvestJobSpec, HarvestProvenance, HarvestRecordState, HarvestSelector, HarvestSource,
+    RepositoryConnector, RepositoryConnectorKind,
 };
+use aruna_core::structs::execution::job::{JobError, JobErrorKind, JobProgress, JobResultPayload};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+};
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::storage::blob::{Backend, BackendConfig};
 use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
-use aruna_core::types::{GroupId, UserId};
+use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::get_metadata_document::load_metadata_record_by_document;
 use aruna_operations::harvest::repository::{
     connector_writes, parse_provenance_read, parse_source_read, read_provenance_effect,
     read_source_effect, write_source_effect,
@@ -30,10 +40,11 @@ use aruna_operations::harvest::repository::{
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::harvest::run_harvest_job;
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::metadata::forward::delete_metadata_document_routed;
-use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
-use aruna_operations::metadata::{MetadataAuthToken, MetadataHandle};
+use aruna_operations::metadata::forward::route_metadata_delete;
+use aruna_operations::metadata::get_document::load_document_record;
+use aruna_operations::metadata::materialization_queue::process_materialization_batch;
+use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::metadata::{AuthToken, MetadataHandle};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use axum::Router;
@@ -51,8 +62,6 @@ const ALPHA: &str = "oai:ex:alpha";
 const BETA: &str = "oai:ex:beta";
 
 type BoxError = Box<dyn std::error::Error>;
-
-// ---------------------------------------------------------------- fixture
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -176,9 +185,9 @@ async fn seed_auth(
     actor: &Actor,
     group_id: GroupId,
 ) -> Result<(), BoxError> {
-    let realm = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+    let realm = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
     let group =
-        GroupAuthorizationDocument::new_default_group_doc(actor.user_id, actor.realm_id, group_id);
+        GroupAuthorizationDocument::default_group_doc(actor.user_id, actor.realm_id, group_id);
     write_value(
         storage,
         AUTH_KEYSPACE,
@@ -432,10 +441,10 @@ async fn seed_source(fixture: &Fixture, endpoint: &str) -> Result<HarvestSource,
 /// loops would, so a later harvest sees the documents an earlier one created.
 async fn drain(fixture: &Fixture) -> Result<(), BoxError> {
     for _ in 0..8 {
-        replay_metadata_event_log(fixture.context.as_ref())
+        replay_event_log(fixture.context.as_ref())
             .await
             .map_err(|error| format!("{error:?}"))?;
-        process_metadata_materialization_batch(fixture.context.as_ref())
+        process_materialization_batch(fixture.context.as_ref())
             .await
             .map_err(|error| format!("{error:?}"))?;
     }
@@ -445,7 +454,7 @@ async fn drain(fixture: &Fixture) -> Result<(), BoxError> {
 /// Project the registry without materializing any graph, so a run sees a
 /// durable record whose graph is not readable yet.
 async fn project_only(fixture: &Fixture) -> Result<(), BoxError> {
-    replay_metadata_event_log(fixture.context.as_ref())
+    replay_event_log(fixture.context.as_ref())
         .await
         .map_err(|error| format!("{error:?}"))?;
     Ok(())
@@ -483,27 +492,25 @@ async fn restore_config(fixture: &Fixture, saved: Vec<u8>) -> Result<(), BoxErro
 }
 
 async fn record_present(fixture: &Fixture, document_id: Ulid) -> Result<bool, BoxError> {
-    Ok(
-        load_metadata_record_by_document(&fixture.context, document_id)
-            .await
-            .map_err(|error| format!("{error:?}"))?
-            .is_some(),
-    )
+    Ok(load_document_record(&fixture.context, document_id)
+        .await
+        .map_err(|error| format!("{error:?}"))?
+        .is_some())
 }
 
 /// Withdraw the document the way an owner would, straight through the metadata
 /// delete path, leaving the harvest provenance behind untouched.
 async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), BoxError> {
-    let record = load_metadata_record_by_document(&fixture.context, document_id)
+    let record = load_document_record(&fixture.context, document_id)
         .await
         .map_err(|error| format!("{error:?}"))?
         .ok_or("document missing before the delete")?;
-    delete_metadata_document_routed(
+    route_metadata_delete(
         &fixture.context,
         fixture.actor.clone(),
         Some(&record),
         document_id,
-        Some(MetadataAuthToken::internal(AuthContext {
+        Some(AuthToken::internal(AuthContext {
             user_id: fixture.actor.user_id,
             realm_id: fixture.actor.realm_id,
             path_restrictions: None,
@@ -670,7 +677,7 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
 
     // Run 3: alpha changes upstream, beta is withdrawn.
     assert!(
-        load_metadata_record_by_document(&fixture.context, beta_id)
+        load_document_record(&fixture.context, beta_id)
             .await
             .map_err(|error| format!("{error:?}"))?
             .is_some(),
@@ -697,7 +704,7 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
         .ok_or("beta provenance missing")?;
     assert_eq!(beta.state, HarvestRecordState::Tombstoned);
     assert!(
-        load_metadata_record_by_document(&fixture.context, beta_id)
+        load_document_record(&fixture.context, beta_id)
             .await
             .map_err(|error| format!("{error:?}"))?
             .is_none(),
@@ -723,7 +730,7 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
     assert_ne!(revived.meta_resource_id, beta_id);
     assert_eq!(revived.predecessors, vec![beta_id]);
     assert!(
-        load_metadata_record_by_document(&fixture.context, beta_id)
+        load_document_record(&fixture.context, beta_id)
             .await
             .map_err(|error| format!("{error:?}"))?
             .is_none(),
@@ -742,7 +749,7 @@ async fn fixture_harvest_converges() -> Result<(), BoxError> {
 
     // One current document per source generation.
     for id in [alpha.meta_resource_id, revived.meta_resource_id] {
-        let record = load_metadata_record_by_document(&fixture.context, id)
+        let record = load_document_record(&fixture.context, id)
             .await
             .map_err(|error| format!("{error:?}"))?
             .ok_or("current document missing")?;
@@ -1005,10 +1012,9 @@ async fn deletion_awaits_confirmation() -> Result<(), BoxError> {
     Ok(())
 }
 
-/// A document deleted out of band while its provenance stays live must not wedge
-/// the source: an update can never land on what is gone, so the next upstream
-/// change retires that identity and mints a successor. A create still queued for
-/// projection is not the same condition and only waits.
+/// A document deleted out of band while its provenance stays live must not wedge the source: an
+/// update can never land on what is gone, so the next upstream change retires that identity and
+/// mints a successor.
 #[tokio::test]
 async fn deleted_document_revives() -> Result<(), BoxError> {
     let fixture = build_fixture().await?;

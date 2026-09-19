@@ -1,5 +1,10 @@
+//! Tests the S3 object attributes route for simple uploads and for multipart checksums.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 mod shared;
 
 use aws_sdk_s3::primitives::ByteStream;
@@ -11,8 +16,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
 use shared::{
-    TestResult, create_bearer_token, create_group_via_http, create_s3_credentials_via_http,
-    s3_client, spawn_full_seed_node,
+    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
+    spawn_complete_seed,
 };
 
 fn sha256_base64(bytes: &[u8]) -> String {
@@ -20,8 +25,8 @@ fn sha256_base64(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn get_object_attributes_reports_simple_object() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+async fn attributes_report_simple() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
 
     let result = async {
         let bearer = create_bearer_token(
@@ -31,13 +36,12 @@ async fn get_object_attributes_reports_simple_object() -> TestResult<()> {
             seed.capabilities.clone(),
         )
         .await?;
-        let group = create_group_via_http(&seed.base_url, &bearer, "s3-attributes-simple").await?;
+        let group = create_group_http(&seed.base_url, &bearer, "s3-attributes-simple").await?;
         let endpoint = seed
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-        let credentials =
-            create_s3_credentials_via_http(&seed.base_url, &bearer, &group.group_id).await?;
+        let credentials = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
         let s3 = s3_client(endpoint, &credentials);
 
         let bucket = "s3-attributes-simple";
@@ -85,8 +89,8 @@ async fn get_object_attributes_reports_simple_object() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn get_object_attributes_reports_composite_multipart_object() -> TestResult<()> {
-    let seed = spawn_full_seed_node().await?;
+async fn attributes_report_multipart() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
 
     let result = async {
         let bearer = create_bearer_token(
@@ -96,14 +100,12 @@ async fn get_object_attributes_reports_composite_multipart_object() -> TestResul
             seed.capabilities.clone(),
         )
         .await?;
-        let group =
-            create_group_via_http(&seed.base_url, &bearer, "s3-attributes-multipart").await?;
+        let group = create_group_http(&seed.base_url, &bearer, "s3-attributes-multipart").await?;
         let endpoint = seed
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-        let credentials =
-            create_s3_credentials_via_http(&seed.base_url, &bearer, &group.group_id).await?;
+        let credentials = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
         let s3 = s3_client(endpoint, &credentials);
 
         let bucket = "s3-attributes-multipart";

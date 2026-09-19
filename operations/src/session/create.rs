@@ -1,14 +1,21 @@
+//! Creates a user session with a fresh token and drops stale sessions past the user limit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
-use crate::create_token::{CreateTokenConfig, CreateTokenError, mint_token};
+use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_token};
+use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::compute::Secret;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_SESSION_KEYSPACE, USER_SESSION_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{NodeCapabilities, RealmId, SessionKind, SessionRef, UserSession};
-use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::structs::identity::auth::{NodeCapabilities, SessionKind, SessionRef};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::user::session::UserSession;
+use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -169,7 +176,7 @@ impl CreateSessionOperation {
         self.txn_id = Some(txn_id);
         self.state = CreateSessionState::ReadOwnerIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: USER_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.config.user_id),
             txn_id: Some(txn_id),
         })]
@@ -297,7 +304,7 @@ impl CreateSessionOperation {
                     session_bytes.into(),
                 ),
                 (
-                    USER_SESSION_OWNER_KEYSPACE.to_string(),
+                    USER_OWNER_KEYSPACE.to_string(),
                     owner_key(self.config.user_id),
                     index_bytes,
                 ),
@@ -385,7 +392,7 @@ impl Operation for CreateSessionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::keys::generate_signing_key;
 
@@ -495,7 +502,7 @@ mod tests {
         };
         let stored_index = writes
             .iter()
-            .find(|(key_space, _, _)| key_space == USER_SESSION_OWNER_KEYSPACE)
+            .find(|(key_space, _, _)| key_space == USER_OWNER_KEYSPACE)
             .map(|(_, _, value)| value)
             .unwrap();
         assert_eq!(

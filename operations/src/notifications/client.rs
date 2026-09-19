@@ -1,11 +1,16 @@
+//! Sends notification requests to a remote holder node over a notification stream.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
-use aruna_core::structs::{
-    NotificationRecord, WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
+use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::execution::notification_watch::{
+    WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
-use aruna_core::types::UserId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -166,7 +171,7 @@ pub async fn delete_watch_remote(
     }
 }
 
-pub async fn deliver_watch_events_remote(
+pub async fn deliver_events_remote(
     net_handle: &NetHandle,
     holder: NodeId,
     events: Vec<WatchEvent>,

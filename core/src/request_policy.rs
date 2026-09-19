@@ -1,6 +1,9 @@
-//! CEL policies narrow authorized requests: `Deny` rejects matches, `Require`
-//! rejects non-matches, and `when` guards applicability; compile/evaluation/
-//! non-boolean failures deny (fail-closed), and pure evaluation reads no streaming body.
+//! Compiles and evaluates CEL request policies that narrow an already authorized request.
+//! Deny rejects matches, Require rejects non-matches, and any failure denies, fail closed.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+// Evaluation is pure: it reads an already parsed body, never a streaming body.
 
 use cel_interpreter::{Context, Program, Value};
 use serde::{Deserialize, Serialize};
@@ -8,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 
 /// Maximum number of policies one scope may carry.
-pub const MAX_POLICIES_PER_SCOPE: usize = 64;
+pub const POLICIES_PER_SCOPE: usize = 64;
 /// Maximum byte length of a single policy expression or guard.
-pub const MAX_POLICY_EXPRESSION_BYTES: usize = 4 * 1024;
+pub const MAX_EXPRESSION_BYTES: usize = 4 * 1024;
 
 /// Request variables a policy expression may reference.
 pub const KNOWN_POLICY_VARIABLES: &[&str] = &[
@@ -480,10 +483,8 @@ fn trace_entry(
 
 /// Compile-checks one expression without evaluating it.
 pub fn validate_expression(expression: &str) -> Result<(), String> {
-    if expression.len() > MAX_POLICY_EXPRESSION_BYTES {
-        return Err(format!(
-            "expression exceeds {MAX_POLICY_EXPRESSION_BYTES} bytes"
-        ));
+    if expression.len() > MAX_EXPRESSION_BYTES {
+        return Err(format!("expression exceeds {MAX_EXPRESSION_BYTES} bytes"));
     }
     Program::compile(expression)
         .map(|_| ())
@@ -492,9 +493,9 @@ pub fn validate_expression(expression: &str) -> Result<(), String> {
 
 /// Set-level limits enforced at policy administration time.
 pub fn validate_policy_set(policies: &[RequestPolicy]) -> Result<(), String> {
-    if policies.len() > MAX_POLICIES_PER_SCOPE {
+    if policies.len() > POLICIES_PER_SCOPE {
         return Err(format!(
-            "more than {MAX_POLICIES_PER_SCOPE} policies in one scope"
+            "more than {POLICIES_PER_SCOPE} policies in one scope"
         ));
     }
     for policy in policies {
@@ -526,10 +527,8 @@ pub fn analyze_policy_source(when: Option<&str>, expression: &str) -> PolicyAnal
     let mut unknown_functions = BTreeSet::new();
     for (label, source) in [("guard", when), ("expression", Some(expression))] {
         let Some(source) = source else { continue };
-        if source.len() > MAX_POLICY_EXPRESSION_BYTES {
-            errors.push(format!(
-                "{label} exceeds {MAX_POLICY_EXPRESSION_BYTES} bytes"
-            ));
+        if source.len() > MAX_EXPRESSION_BYTES {
+            errors.push(format!("{label} exceeds {MAX_EXPRESSION_BYTES} bytes"));
             continue;
         }
         match Program::compile(source) {
@@ -592,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_partial_policy_json() {
+    fn rejects_partial_json() {
         // A missing kind is predecessor tolerance and must refuse; a missing
         // `when` is a valid current value (serde fills an Option with None).
         let current = serde_json::to_string(&policy("permission == 'write'")).unwrap();
@@ -813,7 +812,7 @@ mod tests {
         assert!(validate_expression("path.startsWith(").is_err());
         assert!(validate_expression(&"x".repeat(5000)).is_err());
 
-        let set = vec![policy("true"); MAX_POLICIES_PER_SCOPE + 1];
+        let set = vec![policy("true"); POLICIES_PER_SCOPE + 1];
         assert!(validate_policy_set(&set).is_err());
         assert!(validate_policy_set(&[policy("true")]).is_ok());
 

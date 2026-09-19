@@ -1,4 +1,6 @@
-//! Erasing this device and stopping the node.
+//! Serves the owner route that erases this device's data and stops the node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
@@ -11,15 +13,14 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::server_state::ServerState;
-use aruna_core::structs::AuthContext;
+use crate::server::state::ServerState;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::wipe::{
-    WIPE_INCOMPLETE_EXIT_CODE, WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError,
-    WipeDeviceOperation,
+    INCOMPLETE_EXIT_CODE, WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation,
 };
 use aruna_operations::driver::drive;
 
-use super::require_owner;
+use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(wipe_device))
@@ -120,7 +121,7 @@ async fn wipe_device(
         )
     });
     let exit_code = match incomplete_reason {
-        Some(_) => WIPE_INCOMPLETE_EXIT_CODE,
+        Some(_) => INCOMPLETE_EXIT_CODE,
         None => WIPED_EXIT_CODE,
     };
     Ok((

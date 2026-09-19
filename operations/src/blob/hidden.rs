@@ -1,3 +1,7 @@
+//! Sweeps hidden blobs, upload cleanup rows and abandoned RO-Crate uploads on a timer.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -5,15 +9,15 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    JOB_KEYSPACE, NODE_STATE_KEYSPACE, ROCRATE_UPLOAD_CLEANUP_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
+    JOB_KEYSPACE, NODE_STATE_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE,
 };
-use aruna_core::structs::{
-    BackendLocation, HiddenBlobEntry, HiddenBlobKey, JobId, JobRecord, JobResultPayload,
-    RoCrateUploadCleanup, RoCrateUploadRecord, job_record_key,
+use aruna_core::structs::execution::job::{
+    JobId, JobRecord, JobResultPayload, RoCrateUploadCleanup, RoCrateUploadRecord, job_record_key,
 };
+use aruna_core::structs::storage::blob::{BackendLocation, HiddenBlobEntry, HiddenBlobKey};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, TxnId};
-use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -23,7 +27,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::jobs::store::iter_prefix_page;
-use crate::task_persistence::persist_task_effect;
+use crate::tasks::task_persistence::persist_task_effect;
 
 const SWEEP_PAGE_SIZE: usize = 128;
 const SWEEP_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -203,7 +207,7 @@ async fn sweep_upload_cleanups(
         time_left(deadline),
         iter_prefix_page(
             &context.storage_handle,
-            ROCRATE_UPLOAD_CLEANUP_KEYSPACE,
+            UPLOAD_CLEANUP_KEYSPACE,
             None,
             start_after,
             SWEEP_PAGE_SIZE,
@@ -683,7 +687,7 @@ async fn delete_cleanup(
     let event = tokio::time::timeout(
         time_left(deadline),
         storage.send_storage_effect(StorageEffect::Delete {
-            key_space: ROCRATE_UPLOAD_CLEANUP_KEYSPACE.to_string(),
+            key_space: UPLOAD_CLEANUP_KEYSPACE.to_string(),
             key,
             txn_id: None,
         }),
@@ -750,11 +754,14 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{
-        ArtifactRef, AuthContext, BackendRef, ExportRoCrateResult, ExportRoCrateSpec, JobPayload,
-        JobState, RealmId, RoCrateCheckpointRefs, RoCrateLimits, RoCrateMediaType,
+    use aruna_core::UserId;
+    use aruna_core::structs::execution::job::{
+        ArtifactRef, ExportRoCrateResult, ExportRoCrateSpec, JobPayload, JobState,
+        RoCrateCheckpointRefs, RoCrateLimits, RoCrateMediaType,
     };
-    use aruna_core::types::UserId;
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::BackendRef;
     use aruna_storage::FjallStorage;
     use serde::Serialize;
     use std::collections::HashMap;

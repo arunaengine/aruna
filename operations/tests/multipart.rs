@@ -1,41 +1,44 @@
+//! Tests multipart upload completion, abort, deduplication and cleanup of stored parts.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::{
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    COMPLETION_LEASE_MS, CurrentVersionPointer, HashPathIndexKey, MultipartChecksumType,
-    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
-    MultipartUploadChecksumHint, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
-    RoutingSnapshot, VersionKey,
+    CurrentVersionPointer, HashIndex, VersionKey,
 };
+use aruna_core::structs::storage::multipart::{
+    COMPLETION_LEASE_MS, MultipartChecksumHint, MultipartChecksumType, MultipartObjectKey,
+    MultipartObjectPart, MultipartObjectSummary, MultipartPartKey, MultipartUpload,
+    MultipartUploadStatus,
+};
+use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
 use aruna_operations::driver::{DriverContext, drive, now_ms};
-use aruna_operations::s3::abort_multipart_upload::{
-    AbortMultipartUploadInput, AbortMultipartUploadOperation,
+use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
+use aruna_operations::s3::multipart::complete::{
+    CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
-use aruna_operations::s3::complete_multipart_upload::{
-    CompleteMultipartPart, CompleteMultipartUploadError, CompleteMultipartUploadInput,
-    CompleteMultipartUploadOperation,
-};
-use aruna_operations::s3::create_multipart_upload::{
-    CreateMultipartUploadInput, CreateMultipartUploadOperation,
-};
-use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation};
+use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+use aruna_operations::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
+use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_storage::storage;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{create_dir_all, exists, read_dir};
@@ -49,7 +52,7 @@ struct TestContext {
     driver: DriverContext,
 }
 
-const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 
 async fn setup_context() -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -145,9 +148,9 @@ async fn create_upload(
     key: &str,
     group_id: Ulid,
     created_by: UserId,
-) -> aruna_core::structs::MultipartUpload {
+) -> aruna_core::structs::storage::multipart::MultipartUpload {
     drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
             group_id,
@@ -158,8 +161,6 @@ async fn create_upload(
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
     .record
 }
@@ -172,7 +173,7 @@ async fn upload_part_bytes(
     part_number: u16,
     bytes: &[u8],
     created_by: UserId,
-) -> aruna_operations::s3::upload_part::UploadPartResult {
+) -> aruna_operations::s3::multipart::part_upload::UploadPartResult {
     drive(
         UploadPartOperation::new(UploadPartInput {
             bucket: bucket.to_string(),
@@ -190,8 +191,6 @@ async fn upload_part_bytes(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -201,14 +200,14 @@ async fn complete_upload(
     key: &str,
     upload_id: Ulid,
     realm_id: RealmId,
-    node_id: aruna_core::types::NodeId,
-    uploaded_parts: &[aruna_operations::s3::upload_part::UploadPartResult],
+    node_id: aruna_core::id::NodeId,
+    uploaded_parts: &[aruna_operations::s3::multipart::part_upload::UploadPartResult],
     checksum_type: MultipartChecksumType,
     object_size: Option<u64>,
     created_by: UserId,
-) -> aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadResult {
+) -> aruna_operations::s3::multipart::complete::CompleteUploadResult {
     drive(
-        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+        CompleteUploadOperation::new(CompleteUploadInput {
             bucket: bucket.to_string(),
             key: key.to_string(),
             upload_id,
@@ -236,24 +235,22 @@ async fn complete_upload(
     )
     .await
     .unwrap()
-    .unwrap()
-    .unwrap()
 }
 
 #[tokio::test]
-async fn completes_multipart_upload_and_persists_object_part_metadata() {
+async fn completion_persists_parts() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
     let group_id = Ulid::generate();
     let created = drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: "bucket-a".to_string(),
             key: "big.bin".to_string(),
             group_id,
             created_by,
-            checksum_hint: Some(MultipartUploadChecksumHint {
+            checksum_hint: Some(MultipartChecksumHint {
                 algorithm: Some(ChecksumAlgorithm::Sha256),
                 checksum_type: MultipartChecksumType::Composite,
             }),
@@ -262,12 +259,10 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload_id = created.record.upload_id;
-    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
+    let part1 = vec![b'h'; MIN_PART_SIZE];
     let part2 = b"world";
 
     let uploaded_part1 = drive(
@@ -286,8 +281,6 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let uploaded_part2 = drive(
@@ -306,12 +299,10 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let complete = drive(
-        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+        CompleteUploadOperation::new(CompleteUploadInput {
             bucket: "bucket-a".to_string(),
             key: "big.bin".to_string(),
             upload_id,
@@ -361,8 +352,6 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert!(exists(complete.location.get_full_path().unwrap()).unwrap());
@@ -379,7 +368,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
         .await
         .expect("missing blob location entry");
     assert_eq!(
-        aruna_core::structs::BackendLocation::from_bytes(blob_location.as_ref()).unwrap(),
+        aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref())
+            .unwrap(),
         complete.location.clone()
     );
 
@@ -410,8 +400,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
 
     let hash_path = read_value(
         &context.driver,
-        HASH_PATHS_INDEX_KEYSPACE,
-        HashPathIndexKey::new(
+        PATHS_INDEX_KEYSPACE,
+        HashIndex::new(
             blob_hash,
             complete.version_id,
             realm_id,
@@ -430,7 +420,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     assert!(
         read_value(
             &context.driver,
-            S3_MULTIPART_UPLOAD_KEYSPACE,
+            UPLOAD_KEYSPACE,
             upload_id.to_bytes().to_vec(),
         )
         .await
@@ -439,10 +429,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     assert!(
         read_value(
             &context.driver,
-            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-            MultipartUploadPartKey::new(upload_id, 1)
-                .to_bytes()
-                .unwrap(),
+            UPLOAD_PART_KEYSPACE,
+            MultipartPartKey::new(upload_id, 1).to_bytes().unwrap(),
         )
         .await
         .is_none()
@@ -450,10 +438,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     assert!(
         read_value(
             &context.driver,
-            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-            MultipartUploadPartKey::new(upload_id, 2)
-                .to_bytes()
-                .unwrap(),
+            UPLOAD_PART_KEYSPACE,
+            MultipartPartKey::new(upload_id, 2).to_bytes().unwrap(),
         )
         .await
         .is_none()
@@ -468,8 +454,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     let summary = MultipartObjectSummary::from_bytes(
         read_value(
             &context.driver,
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-            MultipartObjectMetadataKey::summary(complete.version_id)
+            OBJECT_METADATA_KEYSPACE,
+            MultipartObjectKey::summary(complete.version_id)
                 .to_bytes()
                 .unwrap(),
         )
@@ -484,8 +470,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     let object_part_1 = MultipartObjectPart::from_bytes(
         read_value(
             &context.driver,
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-            MultipartObjectMetadataKey::part(complete.version_id, 1)
+            OBJECT_METADATA_KEYSPACE,
+            MultipartObjectKey::part(complete.version_id, 1)
                 .to_bytes()
                 .unwrap(),
         )
@@ -499,8 +485,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     let object_part_2 = MultipartObjectPart::from_bytes(
         read_value(
             &context.driver,
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-            MultipartObjectMetadataKey::part(complete.version_id, 2)
+            OBJECT_METADATA_KEYSPACE,
+            MultipartObjectKey::part(complete.version_id, 2)
                 .to_bytes()
                 .unwrap(),
         )
@@ -541,12 +527,12 @@ async fn rejects_missing_checksum() {
     let created_by = UserId::local(Ulid::generate(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
     let created = drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: "bucket-a".to_string(),
             key: "contract.bin".to_string(),
             group_id: Ulid::generate(),
             created_by,
-            checksum_hint: Some(MultipartUploadChecksumHint {
+            checksum_hint: Some(MultipartChecksumHint {
                 algorithm: Some(ChecksumAlgorithm::Sha256),
                 checksum_type: MultipartChecksumType::Composite,
             }),
@@ -555,8 +541,6 @@ async fn rejects_missing_checksum() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
     let upload_id = created.record.upload_id;
     let uploaded_part = upload_part_bytes(
@@ -571,7 +555,7 @@ async fn rejects_missing_checksum() {
     .await;
 
     let err = drive(
-        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+        CompleteUploadOperation::new(CompleteUploadInput {
             bucket: "bucket-a".to_string(),
             key: "contract.bin".to_string(),
             upload_id,
@@ -598,15 +582,15 @@ async fn rejects_missing_checksum() {
     .await
     .unwrap_err();
 
-    assert_eq!(err, CompleteMultipartUploadError::ChecksumContractMismatch);
+    assert_eq!(err, CompleteUploadError::ChecksumContractMismatch);
 }
 
 #[tokio::test]
-async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
+async fn overwrite_cleans_blob() {
     let context = setup_context().await;
     let created_by = UserId::local(Ulid::generate(), RealmId::from_bytes([7u8; 32]));
     let upload_id = drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: "bucket-a".to_string(),
             key: "overwrite.bin".to_string(),
             group_id: Ulid::generate(),
@@ -617,8 +601,6 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
     .record
     .upload_id;
@@ -639,8 +621,6 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let second = drive(
@@ -659,8 +639,6 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert_ne!(first.location.backend_path, second.location.backend_path);
@@ -671,7 +649,7 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
 }
 
 #[tokio::test]
-async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
+async fn completion_retains_path() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
@@ -701,12 +679,10 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let created = drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: "bucket-a".to_string(),
             key: "replace.bin".to_string(),
             group_id,
@@ -717,12 +693,10 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload_id = created.record.upload_id;
-    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
+    let part1 = vec![b'h'; MIN_PART_SIZE];
     let part2 = b"world";
 
     let uploaded_part1 = drive(
@@ -741,8 +715,6 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let uploaded_part2 = drive(
@@ -761,12 +733,10 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let complete = drive(
-        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+        CompleteUploadOperation::new(CompleteUploadInput {
             bucket: "bucket-a".to_string(),
             key: "replace.bin".to_string(),
             upload_id,
@@ -800,8 +770,6 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let initial_hash: [u8; 32] = initial.location.get_blake3().unwrap().try_into().unwrap();
@@ -824,8 +792,8 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
     // Verify that the old hash path entry still exists (historical access preserved)
     let old_hash_path = read_value(
         &context.driver,
-        HASH_PATHS_INDEX_KEYSPACE,
-        HashPathIndexKey::new(
+        PATHS_INDEX_KEYSPACE,
+        HashIndex::new(
             initial_hash,
             initial.version_id,
             realm_id,
@@ -843,8 +811,8 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
 
     let new_hash_path = read_value(
         &context.driver,
-        HASH_PATHS_INDEX_KEYSPACE,
-        HashPathIndexKey::new(
+        PATHS_INDEX_KEYSPACE,
+        HashIndex::new(
             complete_hash,
             complete.version_id,
             realm_id,
@@ -862,13 +830,13 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
 }
 
 #[tokio::test]
-async fn multipart_completion_deduplicates_against_existing_multipart_object() {
+async fn completion_deduplicates_multipart() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
     let group_id = Ulid::generate();
-    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
+    let part1 = vec![b'h'; MIN_PART_SIZE];
     let part2 = b"world";
 
     let first_upload = create_upload(&context, "bucket-a", "first.bin", group_id, created_by).await;
@@ -966,19 +934,20 @@ async fn multipart_completion_deduplicates_against_existing_multipart_object() {
         .await
         .expect("missing blob location entry");
     assert_eq!(
-        aruna_core::structs::BackendLocation::from_bytes(blob_location.as_ref()).unwrap(),
+        aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref())
+            .unwrap(),
         first_complete.location
     );
 }
 
 #[tokio::test]
-async fn multipart_completion_deduplicates_against_existing_put_object() {
+async fn completion_deduplicates_put() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
     let group_id = Ulid::generate();
-    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
+    let part1 = vec![b'h'; MIN_PART_SIZE];
     let part2 = b"world";
     let content = [part1.as_slice(), part2].concat();
 
@@ -1005,8 +974,6 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload = create_upload(&context, "bucket-a", "multipart.bin", group_id, created_by).await;
@@ -1069,13 +1036,13 @@ async fn multipart_completion_deduplicates_against_existing_put_object() {
 }
 
 #[tokio::test]
-async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_location() {
+async fn completion_reuses_location() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
     let group_id = Ulid::generate();
-    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
+    let part1 = vec![b'h'; MIN_PART_SIZE];
     let part2 = b"world";
 
     let initial_upload =
@@ -1196,11 +1163,11 @@ async fn multipart_completion_same_key_same_content_bumps_generation_and_reuses_
 }
 
 #[tokio::test]
-async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
+async fn abort_removes_parts() {
     let context = setup_context().await;
     let created_by = UserId::local(Ulid::generate(), RealmId::from_bytes([7u8; 32]));
     let created = drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: "bucket-a".to_string(),
             key: "abort.bin".to_string(),
             group_id: Ulid::generate(),
@@ -1211,8 +1178,6 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload_id = created.record.upload_id;
@@ -1232,12 +1197,10 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     drive(
-        AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+        AbortUploadOperation::new(AbortUploadInput {
             bucket: "bucket-a".to_string(),
             key: "abort.bin".to_string(),
             upload_id,
@@ -1246,14 +1209,12 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert!(
         read_value(
             &context.driver,
-            S3_MULTIPART_UPLOAD_KEYSPACE,
+            UPLOAD_KEYSPACE,
             upload_id.to_bytes().to_vec(),
         )
         .await
@@ -1262,10 +1223,8 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
     assert!(
         read_value(
             &context.driver,
-            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-            MultipartUploadPartKey::new(upload_id, 1)
-                .to_bytes()
-                .unwrap(),
+            UPLOAD_PART_KEYSPACE,
+            MultipartPartKey::new(upload_id, 1).to_bytes().unwrap(),
         )
         .await
         .is_none()
@@ -1274,11 +1233,11 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
 }
 
 #[tokio::test]
-async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
+async fn checksum_mismatch_cleans() {
     let context = setup_context().await;
     let created_by = UserId::local(Ulid::generate(), RealmId::from_bytes([7u8; 32]));
     let upload_id = drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: "bucket-a".to_string(),
             key: "checksum.bin".to_string(),
             group_id: Ulid::generate(),
@@ -1289,8 +1248,6 @@ async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap()
     .record
     .upload_id;
@@ -1318,15 +1275,15 @@ async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
 
     assert!(matches!(
         err,
-        aruna_operations::s3::upload_part::UploadPartError::ChecksumMismatch("SHA256")
+        aruna_operations::s3::multipart::part_upload::UploadPartError::ChecksumMismatch("SHA256")
     ));
 
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
         .driver
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
-            key: MultipartUploadPartKey::new(upload_id, 1)
+            key_space: UPLOAD_PART_KEYSPACE.to_string(),
+            key: MultipartPartKey::new(upload_id, 1)
                 .to_bytes()
                 .unwrap()
                 .into(),
@@ -1340,14 +1297,14 @@ async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
 }
 
 #[tokio::test]
-async fn delete_object_removes_completed_multipart_metadata() {
+async fn delete_removes_metadata() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::generate(), realm_id);
     let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
 
     let created = drive(
-        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+        CreateMultipartOperation::new(CreateMultipartInput {
             bucket: "bucket-a".to_string(),
             key: "delete-me.bin".to_string(),
             group_id: Ulid::generate(),
@@ -1358,12 +1315,10 @@ async fn delete_object_removes_completed_multipart_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let upload_id = created.record.upload_id;
-    let part1 = vec![b'h'; MIN_MULTIPART_PART_SIZE];
+    let part1 = vec![b'h'; MIN_PART_SIZE];
     let part2 = b"world";
 
     let uploaded_part1 = drive(
@@ -1382,8 +1337,6 @@ async fn delete_object_removes_completed_multipart_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let uploaded_part2 = drive(
@@ -1402,12 +1355,10 @@ async fn delete_object_removes_completed_multipart_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     let complete = drive(
-        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+        CompleteUploadOperation::new(CompleteUploadInput {
             bucket: "bucket-a".to_string(),
             key: "delete-me.bin".to_string(),
             upload_id,
@@ -1441,8 +1392,6 @@ async fn delete_object_removes_completed_multipart_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     drive(
@@ -1458,15 +1407,13 @@ async fn delete_object_removes_completed_multipart_metadata() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert!(
         read_value(
             &context.driver,
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-            MultipartObjectMetadataKey::summary(complete.version_id)
+            OBJECT_METADATA_KEYSPACE,
+            MultipartObjectKey::summary(complete.version_id)
                 .to_bytes()
                 .unwrap(),
         )
@@ -1476,8 +1423,8 @@ async fn delete_object_removes_completed_multipart_metadata() {
     assert!(
         read_value(
             &context.driver,
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-            MultipartObjectMetadataKey::part(complete.version_id, 1)
+            OBJECT_METADATA_KEYSPACE,
+            MultipartObjectKey::part(complete.version_id, 1)
                 .to_bytes()
                 .unwrap(),
         )
@@ -1487,8 +1434,8 @@ async fn delete_object_removes_completed_multipart_metadata() {
     assert!(
         read_value(
             &context.driver,
-            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-            MultipartObjectMetadataKey::part(complete.version_id, 2)
+            OBJECT_METADATA_KEYSPACE,
+            MultipartObjectKey::part(complete.version_id, 2)
                 .to_bytes()
                 .unwrap(),
         )
@@ -1501,9 +1448,9 @@ async fn delete_object_removes_completed_multipart_metadata() {
 // dropped request future does: the record stays `Completing`.
 async fn stall_completion(
     context: &TestContext,
-    input: CompleteMultipartUploadInput,
-) -> CompleteMultipartUploadOperation {
-    let mut operation = CompleteMultipartUploadOperation::new(input);
+    input: CompleteUploadInput,
+) -> CompleteUploadOperation {
+    let mut operation = CompleteUploadOperation::new(input);
     let mut queue: VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = queue.pop_front() {
         let Effect::Storage(effect) = effect else {
@@ -1524,7 +1471,7 @@ async fn stall_completion(
 
 // Runs the effects a deadline's abort emits, so the record is left as production
 // would leave it.
-async fn run_abort(context: &TestContext, operation: &mut CompleteMultipartUploadOperation) {
+async fn run_abort(context: &TestContext, operation: &mut CompleteUploadOperation) {
     let mut queue: VecDeque<Effect> = operation.abort().into_iter().collect();
     while let Some(effect) = queue.pop_front() {
         let Effect::Storage(effect) = effect else {
@@ -1545,7 +1492,7 @@ async fn run_abort(context: &TestContext, operation: &mut CompleteMultipartUploa
 async fn read_upload(context: &TestContext, upload_id: Ulid) -> Option<MultipartUpload> {
     read_value(
         &context.driver,
-        S3_MULTIPART_UPLOAD_KEYSPACE,
+        UPLOAD_KEYSPACE,
         upload_id.to_bytes().to_vec(),
     )
     .await
@@ -1554,13 +1501,13 @@ async fn read_upload(context: &TestContext, upload_id: Ulid) -> Option<Multipart
 
 fn completion_input(
     upload_id: Ulid,
-    part: &aruna_operations::s3::upload_part::UploadPartResult,
+    part: &aruna_operations::s3::multipart::part_upload::UploadPartResult,
     realm_id: RealmId,
-    node_id: aruna_core::types::NodeId,
+    node_id: aruna_core::id::NodeId,
     created_by: UserId,
     now: u64,
-) -> CompleteMultipartUploadInput {
-    CompleteMultipartUploadInput {
+) -> CompleteUploadInput {
+    CompleteUploadInput {
         bucket: "bucket-a".to_string(),
         key: "stalled.bin".to_string(),
         upload_id,
@@ -1598,7 +1545,7 @@ async fn abort_reopens_upload() {
         "stalled.bin",
         upload.upload_id,
         1,
-        &vec![7u8; MIN_MULTIPART_PART_SIZE],
+        &vec![7u8; MIN_PART_SIZE],
         created_by,
     )
     .await;
@@ -1636,7 +1583,7 @@ async fn dropped_completion_retries() {
         "stalled.bin",
         upload.upload_id,
         1,
-        &vec![5u8; MIN_MULTIPART_PART_SIZE],
+        &vec![5u8; MIN_PART_SIZE],
         created_by,
     )
     .await;
@@ -1652,7 +1599,7 @@ async fn dropped_completion_retries() {
     );
 
     let retried = drive(
-        CompleteMultipartUploadOperation::new(completion_input(
+        CompleteUploadOperation::new(completion_input(
             upload.upload_id,
             &part,
             realm_id,
@@ -1663,8 +1610,6 @@ async fn dropped_completion_retries() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert_eq!(retried.part_count, 1);
@@ -1687,7 +1632,7 @@ async fn abort_refuses_lease() {
         "stalled.bin",
         upload.upload_id,
         1,
-        &vec![1u8; MIN_MULTIPART_PART_SIZE],
+        &vec![1u8; MIN_PART_SIZE],
         created_by,
     )
     .await;
@@ -1699,7 +1644,7 @@ async fn abort_refuses_lease() {
     .await;
 
     let refused = drive(
-        AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+        AbortUploadOperation::new(AbortUploadInput {
             bucket: "bucket-a".to_string(),
             key: "stalled.bin".to_string(),
             upload_id: upload.upload_id,
@@ -1711,12 +1656,12 @@ async fn abort_refuses_lease() {
 
     assert!(matches!(
         refused,
-        Err(aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError::CompletionInProgress)
+        Err(aruna_operations::s3::multipart::abort::AbortUploadError::CompletionInProgress)
     ));
 
     // Once the lease lapses the same abort reclaims the record and its part.
     drive(
-        AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+        AbortUploadOperation::new(AbortUploadInput {
             bucket: "bucket-a".to_string(),
             key: "stalled.bin".to_string(),
             upload_id: upload.upload_id,
@@ -1725,16 +1670,14 @@ async fn abort_refuses_lease() {
         &context.driver,
     )
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
 
     assert!(read_upload(&context, upload.upload_id).await.is_none());
     assert!(
         read_value(
             &context.driver,
-            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-            MultipartUploadPartKey::new(upload.upload_id, 1)
+            UPLOAD_PART_KEYSPACE,
+            MultipartPartKey::new(upload.upload_id, 1)
                 .to_bytes()
                 .unwrap(),
         )
@@ -1761,7 +1704,7 @@ async fn sweep_reclaims_upload() {
         "stalled.bin",
         upload.upload_id,
         1,
-        &vec![3u8; MIN_MULTIPART_PART_SIZE],
+        &vec![3u8; MIN_PART_SIZE],
         created_by,
     )
     .await;
@@ -1789,7 +1732,7 @@ async fn write_upload(context: &TestContext, record: &MultipartUpload) {
         .driver
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            key_space: UPLOAD_KEYSPACE.to_string(),
             key: record.upload_id.to_bytes().to_vec().into(),
             value: record.to_bytes().unwrap().into(),
             txn_id: None,

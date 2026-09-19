@@ -1,13 +1,16 @@
+# Prometheus scrape and rule configuration for a locally deployed node.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 global:
   scrape_interval: 15s
   scrape_timeout: 5s
 
-# Only the application-native rules whose inputs this scrape actually ingests.
-# No-ready, restart-loop, and forced-shutdown alerts need Kubernetes or log
-# telemetry that is not scraped here; they stay manual checks rather than
-# inert rules.
+# Only the application-native rules whose inputs this scrape actually ingests:
+# no-ready, restart-loop, and forced-shutdown alerts need unscraped Kubernetes
+# or log telemetry, so they stay manual checks rather than inert rules.
 rule_files:
-  - aruna-alerts.yml
+  - alerts.yml
 
 scrape_configs:
   - job_name: aruna

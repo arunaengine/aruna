@@ -1,19 +1,19 @@
-//! External reads answered from the family projection.
-//!
-//! An external job has no single owner: any node that reduced the family can
-//! answer for it, and the user-facing alias stays the stable handle. Reads of
-//! bytes one node produced still route to that node, but the responder is
-//! chosen from the projection rather than from the alias's origin.
+//! Answers external job reads from the family projection, with the alias as the stable handle.
+//! Any node that reduced the family can answer; byte reads still route to the producing node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::UserId;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobKind, JobStatusView};
-use aruna_core::keyspaces::JOB_FAMILY_ALIAS_KEYSPACE;
-use aruna_core::structs::{
-    AuthContext, ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobPayload,
-    JobProgress, JobProjection, JobRecord, JobResultPayload, JobState, LogicalJobSpec,
-    LogicalJobState, PhysicalExecutionState, ResultMessage, WorkspaceMode,
+use aruna_core::keyspaces::FAMILY_ALIAS_KEYSPACE;
+use aruna_core::structs::execution::job::{
+    ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobProgress,
+    JobProjection, JobRecord, JobResultPayload, JobState, LogicalJobSpec, LogicalJobState,
+    PhysicalExecutionState, ResultMessage, WorkspaceMode,
 };
-use aruna_core::types::{NodeId, UserId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::time::unix_timestamp_millis;
 
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::{RoutedJobStatus, read_owned_job};
 use crate::jobs::store::iter_prefix_page;
-use crate::jobs::{JOB_MUTATE_MAX_ATTEMPTS, JobRouteError};
+use crate::jobs::{JobRouteError, MUTATE_MAX_ATTEMPTS};
 
 /// Families one alias may resolve to. Two families claiming one id is an
 /// anomaly that stays visible instead of rebinding the first one.
@@ -57,7 +57,7 @@ pub async fn family_of_alias(
 ) -> Result<Option<JobFamilyId>, JobRouteError> {
     let (rows, _) = iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_ALIAS_KEYSPACE,
+        FAMILY_ALIAS_KEYSPACE,
         Some(alias_prefix(job_id)),
         None,
         MAX_ALIAS_FAMILIES,
@@ -74,7 +74,7 @@ async fn project_alias(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<ProjectedFamily>, JobRouteError> {
-    for attempt in 0..JOB_MUTATE_MAX_ATTEMPTS {
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
         match drive(
             ProjectFamilyOperation::new(ProjectFamilyConfig {
                 family: FamilyRef::Alias(job_id),
@@ -370,8 +370,8 @@ fn local_state(state: LogicalJobState) -> JobState {
 }
 
 #[cfg(test)]
-mod tests {
-    use aruna_core::structs::SubmissionId;
+mod pure_tests {
+    use aruna_core::structs::execution::job::SubmissionId;
 
     use super::*;
 

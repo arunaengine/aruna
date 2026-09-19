@@ -1,7 +1,11 @@
+//! Prints the node's local configuration together with its info endpoint response.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
 use aruna_api::routes::info::InfoResponse;
-use aruna_api::server_state::client_base_url_from_bind_address;
-use aruna_core::structs::BackendsFile;
+use aruna_api::server::state::client_bind_url;
+use aruna_core::structs::storage::backends::BackendsFile;
 use reqwest::Client;
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -22,18 +26,27 @@ struct ConfigView {
     /// single filesystem backend rooted at `blob_root`.
     blob_backends: Vec<BackendView>,
     blob_bucket_prefix: Option<String>,
-    blob_max_bucket_size: Option<u64>,
+    #[serde(rename = "blob_max_bucket_size")]
+    blob_bucket_size: Option<u64>,
     blob_multipart_bucket: Option<String>,
-    blob_control_plane_connect_timeout_secs: u64,
-    blob_control_plane_io_timeout_secs: u64,
-    blob_transfer_idle_timeout_secs: u64,
+    #[serde(rename = "blob_control_plane_connect_timeout_secs")]
+    connect_timeout_secs: u64,
+    #[serde(rename = "blob_control_plane_io_timeout_secs")]
+    io_timeout_secs: u64,
+    #[serde(rename = "blob_transfer_idle_timeout_secs")]
+    transfer_idle_secs: u64,
     http_socket_addr: String,
     http_base_url: String,
-    p2p_socket_addr: String,
-    max_concurrent_uni_streams: Option<u64>,
-    max_concurrent_bidi_streams: Option<u64>,
-    p2p_additional_relay_urls: Vec<String>,
-    default_metadata_replication_factor: u32,
+    #[serde(rename = "p2p_socket_addr")]
+    p2p_addr: String,
+    #[serde(rename = "max_concurrent_uni_streams")]
+    max_uni_streams: Option<u64>,
+    #[serde(rename = "max_concurrent_bidi_streams")]
+    max_bidi_streams: Option<u64>,
+    #[serde(rename = "p2p_additional_relay_urls")]
+    additional_urls: Vec<String>,
+    #[serde(rename = "default_metadata_replication_factor")]
+    metadata_replication_factor: u32,
     s3_host: String,
     api_public_url: Option<String>,
     s3_public_url: Option<String>,
@@ -106,7 +119,7 @@ pub(crate) fn resolve_token(token: Option<String>) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-pub(crate) fn default_info_url_from_env() -> Result<String, CliError> {
+pub(crate) fn default_info_url() -> Result<String, CliError> {
     let http_socket_addr: SocketAddr = dotenvy::var("SOCKET_ADDRESS")?.parse()?;
     Ok(info_url(http_socket_addr))
 }
@@ -115,10 +128,10 @@ pub(crate) async fn fetch_info(
     http_socket_addr: SocketAddr,
     token: Option<&str>,
 ) -> Result<InfoResponse, CliError> {
-    fetch_info_url_with_timeout(&info_url(http_socket_addr), Duration::from_secs(10), token).await
+    fetch_info_url(&info_url(http_socket_addr), Duration::from_secs(10), token).await
 }
 
-pub(crate) async fn fetch_info_url_with_timeout(
+pub(crate) async fn fetch_info_url(
     url: &str,
     timeout: Duration,
     token: Option<&str>,
@@ -156,7 +169,7 @@ pub(crate) async fn fetch_info_url_with_timeout(
 }
 
 fn http_base_url(addr: SocketAddr) -> String {
-    client_base_url_from_bind_address(addr)
+    client_bind_url(addr)
 }
 
 fn info_url(addr: SocketAddr) -> String {
@@ -190,29 +203,27 @@ impl ConfigView {
             blob_root: blob_root.unwrap_or_default(),
             blob_backends: backend_views()?,
             blob_bucket_prefix: dotenvy::var("BLOB_BUCKET_PREFIX").ok(),
-            blob_max_bucket_size: parse_optional_env("BLOB_MAX_BUCKET_SIZE")?,
+            blob_bucket_size: parse_optional_env("BLOB_MAX_BUCKET_SIZE")?.or(Some(100_000)),
             blob_multipart_bucket: dotenvy::var("BLOB_MULTIPART_BUCKET")
                 .ok()
-                .filter(|value| !value.trim().is_empty()),
-            blob_control_plane_connect_timeout_secs: parse_optional_env(
-                "BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS",
-            )?
-            .unwrap_or(30),
-            blob_control_plane_io_timeout_secs: parse_optional_env(
-                "BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS",
-            )?
-            .unwrap_or(30),
-            blob_transfer_idle_timeout_secs: parse_optional_env("BLOB_TRANSFER_IDLE_TIMEOUT_SECS")?
+                .filter(|value| !value.trim().is_empty())
+                .or(Some("uploaded-parts".to_string())),
+            connect_timeout_secs: parse_optional_env("BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS")?
+                .unwrap_or(30),
+            io_timeout_secs: parse_optional_env("BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS")?
+                .unwrap_or(30),
+            transfer_idle_secs: parse_optional_env("BLOB_TRANSFER_IDLE_TIMEOUT_SECS")?
                 .unwrap_or(30 * 60),
             http_socket_addr: http_socket_addr.to_string(),
             http_base_url: http_base_url(http_socket_addr),
-            p2p_socket_addr: dotenvy::var("P2P_SOCKET_ADDRESS")
+            p2p_addr: dotenvy::var("P2P_SOCKET_ADDRESS")
                 .unwrap_or_else(|_| http_socket_addr.to_string()),
-            max_concurrent_uni_streams: parse_optional_env("MAX_CONCURRENT_UNI_STREAMS")?,
-            max_concurrent_bidi_streams: parse_optional_env("MAX_CONCURRENT_BIDI_STREAMS")?,
-            p2p_additional_relay_urls: parse_list_env("P2P_ADDITIONAL_RELAY_URLS"),
-            default_metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
-                .unwrap_or(3),
+            max_uni_streams: parse_optional_env("MAX_CONCURRENT_UNI_STREAMS")?,
+            max_bidi_streams: parse_optional_env("MAX_CONCURRENT_BIDI_STREAMS")?,
+            additional_urls: parse_list_env("P2P_ADDITIONAL_RELAY_URLS"),
+            metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
+                .unwrap_or(3)
+                .max(1),
             s3_host: dotenvy::var("S3_HOST").unwrap_or_default(),
             api_public_url: optional_nonempty_env("API_PUBLIC_URL"),
             s3_public_url: optional_nonempty_env("S3_PUBLIC_URL"),
@@ -273,53 +284,26 @@ fn env_key(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ConfigView, fetch_info, http_base_url};
-    use crate::test_support::env_lock;
+    use crate::tests::fixtures::{TestEnvGuard, env_lock};
     use aruna::config::load;
+    use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
-    use aruna_api::server_state::ServerState;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::structs::{NodeCapabilities, RealmId};
+    use aruna_core::structs::identity::auth::NodeCapabilities;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::announce_realm_presence::{
-        AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-    };
-    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::driver::{DriverContext, drive};
-    use aruna_operations::incoming::initialize_net_incoming;
-    use aruna_operations::task_incoming::initialize_task_incoming;
+    use aruna_operations::realm::announce_presence::{
+        AnnouncePresenceConfig, AnnouncePresenceOperation,
+    };
+    use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::sync::incoming::initialize_net_holder;
+    use aruna_operations::tasks::incoming::start_task_queues;
     use aruna_tasks::TaskHandle;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::net::TcpListener;
     use ulid::Ulid;
-
-    struct TestEnvGuard {
-        previous: Vec<(String, Option<String>)>,
-    }
-
-    impl TestEnvGuard {
-        fn set(vars: &[(&str, String)]) -> Self {
-            let previous = vars
-                .iter()
-                .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-                .collect::<Vec<_>>();
-            for (key, value) in vars {
-                unsafe { std::env::set_var(key, value) };
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for TestEnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.previous.drain(..) {
-                match value {
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-            }
-        }
-    }
 
     struct TestNode {
         _temp_dir: tempfile::TempDir,
@@ -378,13 +362,15 @@ mod tests {
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });
-        initialize_net_incoming(context.clone());
-        initialize_task_incoming(
+        let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
+        let shutdown = aruna_core::shutdown::Shutdown::new();
+        initialize_net_holder(
             context.clone(),
-            task_handle,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
-        )
-        .await;
+            aruna_core::structs::execution::job::RoCrateLimits::default(),
+            jobs_runtime.clone(),
+            &shutdown,
+        );
+        start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
         let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
@@ -392,7 +378,7 @@ mod tests {
         let bootstrap_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
-                actor: aruna_core::structs::Actor {
+                actor: aruna_core::structs::identity::auth::Actor {
                     node_id: net.node_id(),
                     user_id: bootstrap_user,
                     realm_id,
@@ -408,7 +394,7 @@ mod tests {
         .await
         .unwrap();
         drive(
-            AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
                 realm_id,
                 node_id: net.node_id(),
                 schedule_refresh: false,
@@ -437,7 +423,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: addr,
-                max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+                max_body_size: aruna_api::server::MAX_BODY_SIZE,
                 cors: aruna_api::cors::CorsConfig::default(),
             },
         );
@@ -483,6 +469,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn doctor_matches_defaults() {
+        let _env_lock = env_lock().lock().await;
+        let _guard = TestEnvGuard::set(&[
+            ("STORAGE_PATH", "/tmp/aruna-doctor-defaults".to_string()),
+            ("BLOB_ROOT", "/tmp/aruna-doctor-defaults/blobs".to_string()),
+            ("METADATA_REPLICATION_FACTOR", "0".to_string()),
+        ]);
+        let _unset = TestEnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+        let settings = aruna::settings::read_settings().unwrap();
+
+        assert_eq!(view.blob_bucket_size, Some(100_000));
+        assert_eq!(
+            view.blob_multipart_bucket.as_deref(),
+            Some("uploaded-parts")
+        );
+        assert_eq!(view.metadata_replication_factor, 1);
+        assert_eq!(view.blob_bucket_size, settings.blob_bucket_size);
+        assert_eq!(view.blob_multipart_bucket, settings.blob_multipart_bucket);
+        assert_eq!(
+            view.metadata_replication_factor,
+            settings.metadata_replication_factor
+        );
+    }
+
+    #[tokio::test]
     async fn doctor_relays() {
         let _env_lock = env_lock().lock().await;
         let _guard = TestEnvGuard::set(&[(
@@ -493,7 +506,7 @@ mod tests {
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
 
         assert_eq!(
-            view.p2p_additional_relay_urls,
+            view.additional_urls,
             vec![
                 "https://relay-a.example".to_string(),
                 "https://relay-b.example".to_string(),
@@ -502,7 +515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doctor_reports_public_urls_without_fallbacks() {
+    async fn reports_public_urls() {
         let _env_lock = env_lock().lock().await;
         let _guard = TestEnvGuard::set(&[
             ("API_PUBLIC_URL", "https://api.example.test".to_string()),

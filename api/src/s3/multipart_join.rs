@@ -1,27 +1,22 @@
-//! Node-local join point for CompleteMultipartUpload.
-//!
-//! Completion is long and expensive, and the request future that starts it may
-//! be dropped by a client or an intermediary at any moment. The completion
-//! therefore runs detached under its upload key; a concurrent or later request
-//! joins the same run and receives the same answer.
+//! Joins concurrent complete multipart requests for one upload onto one shared run.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadResult;
+use aruna_operations::s3::multipart::complete::CompleteUploadResult;
 use aruna_tasks::join_registry::{JoinRegistry, JoinWatch, await_joined};
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use ulid::Ulid;
 
-/// How long a finished completion stays joinable. A retry that arrives after
-/// the connection was cut still sees the ETag and version of the object that
-/// was created, instead of a `NoSuchUpload` for an upload that is already gone.
+/// Retention lets a retry recover the completed object's ETag and version.
 const COMPLETION_RETENTION: Duration = Duration::from_secs(600);
 
 /// Bucket, object key and upload id: an upload id alone would let a request
 /// for another key join this completion and skip its own target validation.
 pub type CompletionKey = (String, String, Ulid);
-pub type CompletionOutcome = Arc<Result<CompleteMultipartUploadResult, CompletionFailure>>;
+pub type CompletionOutcome = Arc<Result<CompleteUploadResult, CompletionFailure>>;
 pub type CompletionRegistry = JoinRegistry<CompletionKey, CompletionOutcome>;
 
 pub fn completion_registry() -> CompletionRegistry {
@@ -66,5 +61,41 @@ pub async fn await_completion(watch: JoinWatch<CompletionOutcome>) -> Completion
             InternalError,
             "The multipart completion did not produce a result."
         )))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(code: S3ErrorCode) -> CompletionOutcome {
+        Arc::new(Err(CompletionFailure::new(&S3Error::new(code))))
+    }
+
+    fn failure_code(outcome: &CompletionOutcome) -> Option<S3ErrorCode> {
+        outcome
+            .as_ref()
+            .as_ref()
+            .err()
+            .map(|failure| failure.code.clone())
+    }
+
+    // A refused or vanished completion must not answer a retry of the same upload.
+    #[tokio::test]
+    async fn retry_runs_again() {
+        let registry = completion_registry();
+        let key: CompletionKey = ("bucket".to_string(), "key".to_string(), Ulid::nil());
+
+        let refusal = registry.join(key.clone(), async { refused(S3ErrorCode::NoSuchUpload) });
+        let outcome = await_completion(refusal).await;
+        assert_eq!(failure_code(&outcome), Some(S3ErrorCode::NoSuchUpload));
+
+        let vanished = registry.join(key.clone(), async { panic!("completion failed") });
+        let outcome = await_completion(vanished).await;
+        assert_eq!(failure_code(&outcome), Some(S3ErrorCode::InternalError));
+
+        let retried = registry.join(key, async { refused(S3ErrorCode::InvalidPart) });
+        let outcome = await_completion(retried).await;
+        assert_eq!(failure_code(&outcome), Some(S3ErrorCode::InvalidPart));
     }
 }

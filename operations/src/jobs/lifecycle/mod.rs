@@ -1,27 +1,15 @@
-//! The decentralized submission-to-completion lifecycle.
-//!
-//! Every round here is local authority over replicated immutable records: no
-//! leader, no quorum, no global scheduler. A submission is admitted by one
-//! family holder, planned independently by every witness, accepted by the
-//! target that signs its own receipt, and reduced by whoever is asked.
-//!
-//! * [`ingress`] normalizes and authorizes a request, derives its identity, and
-//!   either admits it here or forwards it one hop to an observed holder.
-//! * [`admit`] commits the claim and the immutable spec in one transaction.
-//! * [`outbox`] replicates locally published records to the other holders.
-//! * [`witness`] ranks holders, stores budgets, plans, and offers launches.
-//! * [`target`] reserves exact local capacity and signs the receipt.
-//! * [`stage`] moves the stored input versions to the target.
-//! * [`updates`] publishes the monotonic execution chain and its outputs.
-//! * [`cancel`] publishes the append-only cancellation intent.
-//! * [`routing`] answers external reads from the family projection.
+//! Owns the decentralized submission lifecycle: no leader, no quorum, no global scheduler.
+//! One family holder admits a submission, every witness plans it, and its target receipts it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
-use aruna_core::compute_quota::QuotaDenied;
+use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::handle::Handle;
-use aruna_core::structs::{JobFamilyError, JobId, JobRecordError};
+use aruna_core::structs::execution::job::{JobId, JobRecordError};
+use aruna_core::structs::identity::realm::JobFamilyError;
 use aruna_core::task::TaskEvent;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
@@ -101,7 +89,7 @@ mod tests;
 pub async fn restore_lifecycle_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
     let pending = crate::jobs::store::iter_prefix_page(
         storage,
-        aruna_core::keyspaces::JOB_WITNESS_DEADLINE_KEYSPACE,
+        aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE,
         None,
         None,
         1,

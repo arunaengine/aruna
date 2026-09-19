@@ -1,5 +1,10 @@
+//! Owns job execution: the submodules plus the lease, retry, concurrency and pruning constants.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
+pub mod command;
 pub mod copy;
 pub mod drain;
 pub mod executor;
@@ -34,28 +39,28 @@ pub const JOB_HEARTBEAT_MS: u64 = 20_000;
 pub const JOB_CONCURRENCY_CAP: usize = 8;
 /// External-attempt supervision slots. Supervising a remote container is IO-trivial,
 /// so it gets its own bounded budget and never starves in-process jobs (or vice versa).
-pub const JOB_EXTERNAL_CONCURRENCY_CAP: usize = 64;
+pub const EXTERNAL_CONCURRENCY_CAP: usize = 64;
 /// Attempts before a retryable failure becomes terminal `Failed`.
 pub const JOB_MAX_ATTEMPTS: u32 = 5;
 /// Default terminal-state retention before pruning.
-pub const JOB_RETENTION_MS: u64 = aruna_core::structs::DEFAULT_JOB_RETENTION_MS;
+pub const JOB_RETENTION_MS: u64 = aruna_core::structs::execution::job::RETENTION_MS;
 /// Minimum spacing between throttled progress flushes.
-pub const JOB_PROGRESS_FLUSH_INTERVAL_MS: u64 = 500;
+pub const FLUSH_INTERVAL_MS: u64 = 500;
 /// Bounded OCC retries when a job mutation transaction conflicts.
-pub const JOB_MUTATE_MAX_ATTEMPTS: u32 = 8;
-pub const JOB_REPORT_MAX_ROWS: u16 = 1000;
+pub const MUTATE_MAX_ATTEMPTS: u32 = 8;
+pub const REPORT_MAX_ROWS: u16 = 1000;
 /// Report rows scanned to recover why a session stopped.
 pub const SESSION_REPORT_ROWS: usize = 64;
 /// How long a shutdown lets in-flight jobs wind down before handing their leases back.
 pub const JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-pub const JOB_DRAIN_BATCH_SIZE: usize = 128;
-pub const JOB_DRAIN_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub const DRAIN_BATCH_SIZE: usize = 128;
+pub const DRAIN_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Re-arm floor for the lease head after routing an external attempt to reconcile:
 /// its expired lease row stays in place by design, so a zero re-arm would busy-loop
 /// the drain.
 pub const JOB_RECONCILE_REARM: Duration = Duration::from_millis(JOB_HEARTBEAT_MS);
 
-pub const JOB_PRUNE_SCAN_PAGE_SIZE: usize = 512;
-pub const JOB_PRUNE_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
-pub const JOB_PRUNE_RETRY_AFTER: Duration = Duration::from_secs(30);
+pub const JOB_PRUNE_PAGE: usize = 512;
+pub const PRUNE_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
+pub const PRUNE_RETRY_AFTER: Duration = Duration::from_secs(30);

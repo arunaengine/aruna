@@ -1,0 +1,29 @@
+//! Applies realm events that add or remove realm roles and their user assignments.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+
+impl AdminDocumentState {
+    pub(super) fn apply_realm(
+        &mut self,
+        event: &AdminDocumentEvent,
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
+        match &event.op {
+            AdminDocumentOperation::RealmRoleAdded { role_id } => {
+                self.apply_realm_role(event, role_id, role_id.to_string());
+            }
+            AdminDocumentOperation::RealmRoleCreated { role } => {
+                self.apply_realm_role(event, &role.role_id, role_definition_value(role));
+            }
+            AdminDocumentOperation::RealmAssignmentAdded { role_id, user_id } => {
+                self.apply_realm_assignment(event, role_id, user_id, Some(user_id.to_string()));
+            }
+            AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id } => {
+                self.apply_realm_assignment(event, role_id, user_id, None);
+            }
+            _ => return Err(AdminDocumentError::UnsupportedTarget),
+        }
+        Ok(AdminApplyStatus::Applied)
+    }
+}

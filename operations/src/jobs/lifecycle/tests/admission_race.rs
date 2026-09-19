@@ -1,13 +1,14 @@
-//! Two admissions racing one target: the storage conflict that stops the second
-//! commit must be answered from the receipt that won, never as a drain.
+//! Tests two admissions racing one target, so the loser answers from the winning receipt.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{JobRecordFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
-use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
-use aruna_core::structs::{
+use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
+use aruna_core::structs::execution::job::{
     EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordKind, LaunchIntent,
 };
 use aruna_core::types::Key;
@@ -17,9 +18,9 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
 use crate::jobs::lifecycle::target::commit_receipt;
 use crate::jobs::records::keys::kind_prefix;
-use crate::jobs::records::tests::fixture::{Family, REALM, context};
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::{iter_prefix_page, read_job_record};
+use crate::tests::records::{Family, REALM, context};
 
 pub(super) fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {
@@ -138,7 +139,7 @@ pub(super) async fn rows(ctx: &DriverContext, key_space: &str, prefix: Option<Ke
 
 pub(super) async fn receipts(ctx: &DriverContext, family: &Family) -> usize {
     let prefix = kind_prefix(&family.family(), JobRecordKind::Receipt);
-    rows(ctx, JOB_FAMILY_RECORD_KEYSPACE, Some(prefix)).await
+    rows(ctx, FAMILY_RECORD_KEYSPACE, Some(prefix)).await
 }
 
 /// Whether exactly one of the two minted physical jobs became durable.

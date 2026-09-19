@@ -1,3 +1,7 @@
+//! Reads a hidden blob in ranges and presents it as a seekable stream for the ZIP reader.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::future::Future;
 use std::io;
 use std::ops::Range;
@@ -7,7 +11,7 @@ use std::task::{Context, Poll};
 use aruna_blob::blob::BlobHandle;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::structs::BackendLocation;
+use aruna_core::structs::storage::blob::BackendLocation;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf, SeekFrom};
@@ -185,7 +189,7 @@ pub(super) async fn read_hidden_range(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]

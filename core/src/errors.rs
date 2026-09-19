@@ -1,4 +1,9 @@
-use crate::structs::{BackendLocation, SourceConnectorKind};
+//! Declares the shared error enums for authorization, blob, staging, storage, DHT and streams.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::structs::execution::source_connector::SourceConnectorKind;
+use crate::structs::storage::blob::BackendLocation;
 use std::array::TryFromSliceError;
 use thiserror::Error;
 
@@ -21,7 +26,7 @@ pub enum AuthorizationError {
     #[error("No group found")]
     GroupNotFound,
     #[error("Authorization document not found")]
-    AuthDocNotFound,
+    DocNotFound,
     #[error("Creating Group did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -121,7 +126,7 @@ pub enum StagingSourceError {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum SourceConnectorResolutionError {
+pub enum SourceResolutionError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -175,10 +180,9 @@ pub enum StorageError {
 }
 
 impl StorageError {
-    /// Whether a failed `CommitTransaction` proves the transaction's writes
-    /// were discarded: refused by the conflict check, or never handed to the
-    /// storage actor at all. Every other failure leaves the commit either
-    /// already applied or unknown, so its records may exist.
+    /// Whether a failed `CommitTransaction` proves the transaction's writes were discarded: refused by the
+    /// conflict check, or never handed to the storage actor at all. Every other failure leaves the commit
+    /// either already applied or unknown, so its records may exist.
     pub fn proves_no_commit(&self) -> bool {
         matches!(
             self,
@@ -240,19 +244,19 @@ pub enum ConversionError {
     #[error(transparent)]
     FromSliceError(#[from] TryFromSliceError),
     #[error(transparent)]
-    PublicKeyConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
+    PublicConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
     #[error(transparent)]
-    PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
+    PrivateConversionError(#[from] ed25519_dalek::pkcs8::Error),
     #[error("Invalid string `{0}` for Operation")]
     InvalidOperationConversion(String),
     #[error("RO-Crate conversion error: {0}")]
     RoCrateError(String),
     #[error(transparent)]
-    PlacementPolicyError(#[from] crate::structs::PlacementPolicyError),
+    PlacementPolicyError(#[from] crate::structs::placement::policy::PlacementPolicyError),
     #[error(transparent)]
     AdvertisementError(#[from] crate::compute::AdvertisementError),
     #[error("policy refs must be sorted and deduplicated")]
-    NonCanonicalPolicyRefs,
+    NonCanonicalRefs,
     /// A monotonic head generation must never wrap: a wrapped pointer would
     /// compare equal to an older one and silently win the convergent order.
     #[error("object head generation is exhausted")]
@@ -261,6 +265,43 @@ pub enum ConversionError {
 
 impl PartialEq for ConversionError {
     fn eq(&self, other: &Self) -> bool {
-        self.to_string() == other.to_string()
+        match (self, other) {
+            (Self::UlidDecodeError(left), Self::UlidDecodeError(right)) => left == right,
+            (Self::Base64DecodeError(left), Self::Base64DecodeError(right)) => left == right,
+            (Self::InvalidLength(left), Self::InvalidLength(right)) => left == right,
+            (Self::InvalidUserId, Self::InvalidUserId) => true,
+            (Self::InvalidSessionClaim, Self::InvalidSessionClaim) => true,
+            (Self::PostcardError(left), Self::PostcardError(right)) => left == right,
+            (Self::FromUtf8Error(left), Self::FromUtf8Error(right)) => left == right,
+            (Self::FromStrError(left), Self::FromStrError(right)) => left == right,
+            (Self::OsStringError, Self::OsStringError) => true,
+            (Self::UnsafePath(left), Self::UnsafePath(right)) => left == right,
+            (Self::ParseIntError(left), Self::ParseIntError(right)) => left == right,
+            // serde_json, signature and slice errors lack PartialEq, so compare renderings.
+            (Self::SerdeJsonError(left), Self::SerdeJsonError(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::PublicKeyError(left), Self::PublicKeyError(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::FromSliceError(left), Self::FromSliceError(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::PublicConversionError(left), Self::PublicConversionError(right)) => {
+                left == right
+            }
+            (Self::PrivateConversionError(left), Self::PrivateConversionError(right)) => {
+                left == right
+            }
+            (Self::InvalidOperationConversion(left), Self::InvalidOperationConversion(right)) => {
+                left == right
+            }
+            (Self::RoCrateError(left), Self::RoCrateError(right)) => left == right,
+            (Self::PlacementPolicyError(left), Self::PlacementPolicyError(right)) => left == right,
+            (Self::AdvertisementError(left), Self::AdvertisementError(right)) => left == right,
+            (Self::NonCanonicalRefs, Self::NonCanonicalRefs) => true,
+            (Self::HeadGenerationExhausted, Self::HeadGenerationExhausted) => true,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
     }
 }

@@ -1,13 +1,10 @@
-//! The deterministic reducer.
-//!
-//! It reads only immutable authentic records. Arrival order, arrival batching,
-//! duplication, the responder's clock, its local tasks, and its reachability are
-//! never inputs, so every replica holding the same record set produces the same
-//! projection.
+//! Reduces one family's immutable records to a single projection, the same way on every node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionRole, ExecutionUpdate, JobFamilyId,
     JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope, JobRecordError,
     LogicalJobState, OutputSet, PhysicalExecutionState, ProjectedExecution, SubmissionClaim,

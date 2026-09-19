@@ -1,8 +1,12 @@
+//! Holds the enabled executor backends and picks one for each execution job.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
-use aruna_core::structs::{PlacementPolicyError, PlacementSubject};
+use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
 
 use crate::executor::{BackendCaps, ExecutorBackend};
 use crate::session::SessionRegistry;
@@ -166,7 +170,7 @@ fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
         },
         (false, Some(site)) => {
             let mut labels = site.labels.clone();
-            aruna_core::structs::stamp_location(&mut labels, &site.location);
+            aruna_core::structs::storage::node_info::stamp_location(&mut labels, &site.location);
             PlacementSubject {
                 local_to_controller: false,
                 location: site.location.clone(),
@@ -192,7 +196,7 @@ mod tests {
         LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
         TombstoneSpec, UserSpec,
     };
-    use aruna_core::structs::LOCATION_LABEL_KEY;
+    use aruna_core::structs::storage::node_info::LOCATION_LABEL_KEY;
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
 
@@ -289,9 +293,6 @@ mod tests {
             unimplemented!()
         }
         async fn cleanup(&self, _context: &FenceContext) -> Result<(), BackendError> {
-            Ok(())
-        }
-        async fn sweep_orphans(&self, _grace: std::time::Duration) -> Result<(), BackendError> {
             Ok(())
         }
     }

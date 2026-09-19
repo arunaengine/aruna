@@ -1,7 +1,11 @@
+//! Provider settings for the assistant: kind, default endpoint and encrypted API secret.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::UserId;
 use crate::compute::Secret;
 use crate::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret, EncryptionError};
 use crate::errors::ConversionError;
-use crate::types::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;

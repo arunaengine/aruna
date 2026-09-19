@@ -1,3 +1,7 @@
+//! Derives a title, types and a matching snippet for a metadata search hit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use oxrdf::Term;
 
 // Schema.org predicates craqle indexes into its full-text field. Enrichment
@@ -181,7 +185,7 @@ fn prefix_snippet(text: &str, max_len: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     use oxrdf::{Literal, NamedNode};
@@ -201,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn title_prefers_schema_name_literal() {
+    fn title_prefers_schema() {
         let properties = vec![literal(SCHEMA_NAME, "Public Dataset")];
         assert_eq!(
             hit_title(&properties, "datasets/public", "./"),
@@ -210,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn title_falls_back_to_document_path_for_root_subject() {
+    fn title_uses_path() {
         let properties = vec![named(SCHEMA_NAME, "https://example.org/thing")];
         assert_eq!(
             hit_title(&properties, "datasets/public", "./"),
@@ -219,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn title_falls_back_to_subject_segment() {
+    fn title_uses_segment() {
         let properties = Vec::new();
         assert_eq!(
             hit_title(&properties, "datasets/public", "./data/file-7.txt"),
@@ -236,13 +240,13 @@ mod tests {
     }
 
     #[test]
-    fn title_is_never_empty() {
+    fn title_never_empty() {
         assert_eq!(hit_title(&[], "", ""), "");
         assert_eq!(hit_title(&[], "datasets/x", ""), "datasets/x");
     }
 
     #[test]
-    fn types_list_named_rdf_types() {
+    fn types_list_named() {
         // A file entity must be distinguishable from the dataset it belongs to.
         let properties = vec![
             named(RDF_TYPE, "http://schema.org/MediaObject"),
@@ -263,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn types_skip_literals_and_cap() {
+    fn types_skip_literals() {
         let properties = vec![literal(RDF_TYPE, "Dataset"), literal(SCHEMA_NAME, "x")];
         assert!(hit_types(&properties).is_empty());
 
@@ -274,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn snippet_windows_around_first_match() {
+    fn snippet_windows_around() {
         let text = "alpha ".repeat(40) + "needle tail content here";
         let properties = vec![literal(SCHEMA_DESCRIPTION, &text)];
         let snippet = hit_snippet(&properties, "needle").unwrap();
@@ -284,14 +288,14 @@ mod tests {
     }
 
     #[test]
-    fn snippet_match_at_start_has_no_leading_ellipsis() {
+    fn snippet_match_start() {
         let properties = vec![literal(SCHEMA_NAME, "Public Dataset about climate")];
         let snippet = hit_snippet(&properties, "Public").unwrap();
         assert!(snippet.starts_with("Public"));
     }
 
     #[test]
-    fn snippet_is_char_boundary_safe() {
+    fn snippet_char_boundary() {
         let text = "☃".repeat(120) + "needle";
         let properties = vec![literal(SCHEMA_DESCRIPTION, &text)];
         let snippet = hit_snippet(&properties, "needle").unwrap();
@@ -301,14 +305,14 @@ mod tests {
     }
 
     #[test]
-    fn snippet_strips_query_syntax_tokens() {
+    fn snippet_strips_query() {
         let properties = vec![literal(SCHEMA_DESCRIPTION, "the quick brown fox jumps")];
         let snippet = hit_snippet(&properties, "\"brown\" AND fox").unwrap();
         assert!(snippet.contains("brown"));
     }
 
     #[test]
-    fn snippet_without_match_returns_prefix() {
+    fn snippet_returns_prefix() {
         let text = "unrelated ".repeat(40);
         let properties = vec![literal(SCHEMA_DESCRIPTION, &text)];
         let snippet = hit_snippet(&properties, "needle").unwrap();
@@ -317,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn snippet_without_literals_is_none() {
+    fn snippet_literals_none() {
         let properties = vec![named(SCHEMA_NAME, "https://example.org/x")];
         assert_eq!(hit_snippet(&properties, "needle"), None);
     }

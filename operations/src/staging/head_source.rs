@@ -1,31 +1,36 @@
-use crate::connectors::{ResolveSourceConnectorInput, resolve_source_connector_suboperation};
+//! Resolves a connector and heads one staging source path to get its metadata.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
 use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
-use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
+use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{SourceConnector, SourceMetadata};
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HeadStagingSourceInput {
+pub struct HeadSourceInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
     pub source_path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HeadStagingSourceResult {
+pub struct HeadSourceResult {
     pub connector: SourceConnector,
     pub secret_fingerprint: Option<[u8; 16]>,
     pub metadata: SourceMetadata,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeadStagingSourceState {
+pub enum HeadSourceState {
     Init,
     ResolveConnector,
     HeadSource,
@@ -34,49 +39,49 @@ pub enum HeadStagingSourceState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum HeadStagingSourceError {
+pub enum HeadSourceError {
     #[error(transparent)]
-    Resolve(#[from] SourceConnectorResolutionError),
+    Resolve(#[from] SourceResolutionError),
     #[error(transparent)]
     Staging(#[from] StagingSourceError),
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: HeadStagingSourceState,
+        state: HeadSourceState,
         expected: &'static str,
         got: String,
     },
     #[error("Head staging source failed")]
-    HeadStagingSourceFailed,
+    HeadSourceFailed,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct HeadStagingSourceOperation {
-    input: HeadStagingSourceInput,
-    state: HeadStagingSourceState,
+pub struct HeadSourceOperation {
+    input: HeadSourceInput,
+    state: HeadSourceState,
     connector: Option<SourceConnector>,
     secret_fingerprint: Option<[u8; 16]>,
-    output: Option<Result<HeadStagingSourceResult, HeadStagingSourceError>>,
+    output: Option<Result<HeadSourceResult, HeadSourceError>>,
 }
 
-impl HeadStagingSourceOperation {
-    pub fn new(input: HeadStagingSourceInput) -> Self {
+impl HeadSourceOperation {
+    pub fn new(input: HeadSourceInput) -> Self {
         Self {
             input,
-            state: HeadStagingSourceState::Init,
+            state: HeadSourceState::Init,
             connector: None,
             secret_fingerprint: None,
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: HeadStagingSourceError) -> Effects {
-        self.state = HeadStagingSourceState::Error;
+    fn emit_error(&mut self, error: HeadSourceError) -> Effects {
+        self.state = HeadSourceState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn emit_unexpected(&mut self, expected: &'static str, event: &Event) -> Effects {
-        self.emit_error(HeadStagingSourceError::UnexpectedEvent {
+        self.emit_error(HeadSourceError::UnexpectedEvent {
             state: self.state.clone(),
             expected,
             got: describe_event(event),
@@ -84,15 +89,13 @@ impl HeadStagingSourceOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = HeadStagingSourceState::ResolveConnector;
-        smallvec![resolve_source_connector_suboperation(
-            ResolveSourceConnectorInput {
-                group_id: self.input.group_id,
-                connector_id: self.input.connector_id,
-                source_path: self.input.source_path.clone(),
-                allow_root: false,
-            }
-        )]
+        self.state = HeadSourceState::ResolveConnector;
+        smallvec![resolve_connector_effect(ResolveConnectorInput {
+            group_id: self.input.group_id,
+            connector_id: self.input.connector_id,
+            source_path: self.input.source_path.clone(),
+            allow_root: false,
+        })]
     }
 
     fn handle_resolved_connector(&mut self, event: Event) -> Effects {
@@ -102,7 +105,7 @@ impl HeadStagingSourceOperation {
                     Ok(resolved) => {
                         self.connector = Some(resolved.connector);
                         self.secret_fingerprint = resolved.secret_fingerprint;
-                        self.state = HeadStagingSourceState::HeadSource;
+                        self.state = HeadSourceState::HeadSource;
                         smallvec![Effect::StagingSource(StagingSourceEffect::Head {
                             access: resolved.access,
                         })]
@@ -121,11 +124,11 @@ impl HeadStagingSourceOperation {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
                 let Some(connector) = self.connector.clone() else {
-                    return self.emit_error(HeadStagingSourceError::HeadStagingSourceFailed);
+                    return self.emit_error(HeadSourceError::HeadSourceFailed);
                 };
 
-                self.state = HeadStagingSourceState::Finish;
-                self.output = Some(Ok(HeadStagingSourceResult {
+                self.state = HeadSourceState::Finish;
+                self.output = Some(Ok(HeadSourceResult {
                     connector,
                     secret_fingerprint: self.secret_fingerprint,
                     metadata,
@@ -143,9 +146,9 @@ impl HeadStagingSourceOperation {
     }
 }
 
-impl Operation for HeadStagingSourceOperation {
-    type Output = HeadStagingSourceResult;
-    type Error = HeadStagingSourceError;
+impl Operation for HeadSourceOperation {
+    type Output = HeadSourceResult;
+    type Error = HeadSourceError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -153,31 +156,27 @@ impl Operation for HeadStagingSourceOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            HeadStagingSourceState::Init => self.handle_init(),
-            HeadStagingSourceState::ResolveConnector => self.handle_resolved_connector(event),
-            HeadStagingSourceState::HeadSource => self.handle_head_result(event),
-            HeadStagingSourceState::Finish => smallvec![],
-            HeadStagingSourceState::Error => self.abort(),
+            HeadSourceState::Init => self.handle_init(),
+            HeadSourceState::ResolveConnector => self.handle_resolved_connector(event),
+            HeadSourceState::HeadSource => self.handle_head_result(event),
+            HeadSourceState::Finish => smallvec![],
+            HeadSourceState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            HeadStagingSourceState::Finish | HeadStagingSourceState::Error
-        )
+        matches!(self.state, HeadSourceState::Finish | HeadSourceState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == HeadStagingSourceState::Error {
+        if self.state == HeadSourceState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(HeadStagingSourceError::HeadStagingSourceFailed);
+            return Err(HeadSourceError::HeadSourceFailed);
         }
 
-        self.output
-            .ok_or(HeadStagingSourceError::HeadStagingSourceFailed)?
+        self.output.ok_or(HeadSourceError::HeadSourceFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -189,13 +188,16 @@ impl Operation for HeadStagingSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::staging::test_utils::{create_http_connector, setup_driver_context};
-    use aruna_core::structs::{ResolvedSourceAccess, ResolvedSourceConnector, SourceConnectorKind};
+    use crate::tests::staging::{create_http_connector, setup_driver_context};
+    use aruna_core::structs::execution::source_access::{
+        ResolvedSourceAccess, ResolvedSourceConnector,
+    };
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use std::collections::HashMap;
     use std::time::SystemTime;
 
-    fn sample_input() -> HeadStagingSourceInput {
-        HeadStagingSourceInput {
+    fn sample_input() -> HeadSourceInput {
+        HeadSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
             source_path: "folder/file.txt".to_string(),
@@ -239,18 +241,18 @@ mod tests {
     }
 
     #[test]
-    fn start_emits_resolve_connector_suboperation() {
-        let mut operation = HeadStagingSourceOperation::new(sample_input());
+    fn start_emits_resolve() {
+        let mut operation = HeadSourceOperation::new(sample_input());
 
         let effects = operation.start();
 
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        assert_eq!(operation.state, HeadStagingSourceState::ResolveConnector);
+        assert_eq!(operation.state, HeadSourceState::ResolveConnector);
     }
 
     #[test]
-    fn resolved_connector_emits_head_effect() {
-        let mut operation = HeadStagingSourceOperation::new(sample_input());
+    fn resolved_emits_head() {
+        let mut operation = HeadSourceOperation::new(sample_input());
         operation.start();
         let resolved = sample_resolved_connector();
         let expected_access = resolved.access.clone();
@@ -267,33 +269,31 @@ mod tests {
             [Effect::StagingSource(StagingSourceEffect::Head { access })]
                 if access == &expected_access
         ));
-        assert_eq!(operation.state, HeadStagingSourceState::HeadSource);
+        assert_eq!(operation.state, HeadSourceState::HeadSource);
         assert_eq!(operation.connector, Some(expected_connector));
     }
 
     #[test]
-    fn resolve_error_is_exposed() {
-        let mut operation = HeadStagingSourceOperation::new(sample_input());
+    fn exposes_resolve_error() {
+        let mut operation = HeadSourceOperation::new(sample_input());
         operation.start();
 
         let effects = operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Err(SourceConnectorResolutionError::NotFound)),
+                result: Box::new(Err(SourceResolutionError::NotFound)),
             },
         ));
 
         assert!(effects.is_empty());
         assert_eq!(
             operation.finalize(),
-            Err(HeadStagingSourceError::Resolve(
-                SourceConnectorResolutionError::NotFound,
-            )),
+            Err(HeadSourceError::Resolve(SourceResolutionError::NotFound,)),
         );
     }
 
     #[test]
-    fn head_result_finishes_operation() {
-        let mut operation = HeadStagingSourceOperation::new(sample_input());
+    fn head_finishes_operation() {
+        let mut operation = HeadSourceOperation::new(sample_input());
         operation.start();
         let expected_connector = sample_connector();
         let expected_metadata = sample_metadata();
@@ -309,10 +309,10 @@ mod tests {
         }));
 
         assert!(effects.is_empty());
-        assert_eq!(operation.state, HeadStagingSourceState::Finish);
+        assert_eq!(operation.state, HeadSourceState::Finish);
         assert_eq!(
             operation.finalize(),
-            Ok(HeadStagingSourceResult {
+            Ok(HeadSourceResult {
                 connector: expected_connector,
                 secret_fingerprint: None,
                 metadata: expected_metadata,
@@ -321,8 +321,8 @@ mod tests {
     }
 
     #[test]
-    fn staging_error_is_exposed() {
-        let mut operation = HeadStagingSourceOperation::new(sample_input());
+    fn exposes_staging_error() {
+        let mut operation = HeadSourceOperation::new(sample_input());
         operation.start();
         operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
@@ -337,15 +337,13 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(
             operation.finalize(),
-            Err(HeadStagingSourceError::Staging(
-                StagingSourceError::NotFound,
-            )),
+            Err(HeadSourceError::Staging(StagingSourceError::NotFound,)),
         );
     }
 
     #[test]
-    fn unexpected_event_uses_event_description() {
-        let mut operation = HeadStagingSourceOperation::new(sample_input());
+    fn unexpected_describes_event() {
+        let mut operation = HeadSourceOperation::new(sample_input());
         operation.start();
 
         let effects = operation.step(Event::Search());
@@ -353,8 +351,8 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(
             operation.finalize(),
-            Err(HeadStagingSourceError::UnexpectedEvent {
-                state: HeadStagingSourceState::ResolveConnector,
+            Err(HeadSourceError::UnexpectedEvent {
+                state: HeadSourceState::ResolveConnector,
                 expected: "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
                 got: "Event::Search".to_string(),
             })
@@ -362,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_operation_resolves_connector_and_hits_runtime() {
+    async fn head_hits_runtime() {
         let test_context = setup_driver_context().await;
         let group_id = Ulid::generate();
         let connector =
@@ -370,7 +368,7 @@ mod tests {
                 .await;
 
         let result = drive(
-            HeadStagingSourceOperation::new(HeadStagingSourceInput {
+            HeadSourceOperation::new(HeadSourceInput {
                 group_id,
                 connector_id: connector.connector_id,
                 source_path: "folder/file.txt".to_string(),
@@ -379,6 +377,6 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(HeadStagingSourceError::Staging(_))));
+        assert!(matches!(result, Err(HeadSourceError::Staging(_))));
     }
 }

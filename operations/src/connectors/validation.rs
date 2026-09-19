@@ -1,11 +1,16 @@
+//! Validates connector names and the public and secret config keys allowed per kind.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{HashMap, HashSet};
 
-use crate::endpoint;
-use aruna_core::structs::{OFFERED_DIRECTORY_BUCKET, SourceConnectorKind};
+use crate::endpoint_screening;
+use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceConnectorValidationRules {
+pub struct SourceConnectorRules {
     pub required_public_keys: &'static [&'static str],
     pub allowed_public_keys: &'static [&'static str],
     pub allowed_secret_keys: &'static [&'static str],
@@ -18,7 +23,7 @@ pub enum ValidationError {
     #[error("connector kind `{kind}` is not supported")]
     UnsupportedConnectorKind { kind: SourceConnectorKind },
     #[error("missing required public config key `{key}` for connector kind `{kind}`")]
-    MissingRequiredPublicKey {
+    PublicKeyMissing {
         kind: SourceConnectorKind,
         key: String,
     },
@@ -43,7 +48,7 @@ pub enum ValidationError {
     #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
     UnsafeBucket(String),
     #[error("credentials must not be set when `skip_signature` is enabled")]
-    CredentialsWithSkipSignature,
+    CredentialsSkipSignature,
     #[error("signed s3 connectors require `{ACCESS_KEY_ID}` and `{SECRET_ACCESS_KEY}`")]
     MissingCredentials,
 }
@@ -109,7 +114,7 @@ pub fn validate_connector_input(
 
     for key in rules.required_public_keys {
         if !public_config.contains_key(*key) {
-            return Err(ValidationError::MissingRequiredPublicKey {
+            return Err(ValidationError::PublicKeyMissing {
                 kind,
                 key: (*key).to_string(),
             });
@@ -117,12 +122,12 @@ pub fn validate_connector_input(
     }
 
     if let Some(endpoint) = public_config.get("endpoint")
-        && !endpoint::is_canonical(endpoint)
+        && !endpoint_screening::is_canonical(endpoint)
     {
         return Err(ValidationError::AmbiguousEndpoint(endpoint.clone()));
     }
     if let Some(bucket) = public_config.get("bucket")
-        && endpoint::breaks_authority(bucket)
+        && endpoint_screening::breaks_authority(bucket)
     {
         return Err(ValidationError::UnsafeBucket(bucket.clone()));
     }
@@ -136,7 +141,7 @@ pub fn validate_connector_input(
         }
         anonymous = value == "true";
         if anonymous && !secret_config.is_empty() {
-            return Err(ValidationError::CredentialsWithSkipSignature);
+            return Err(ValidationError::CredentialsSkipSignature);
         }
     }
 
@@ -153,34 +158,34 @@ pub fn validate_connector_input(
     Ok(())
 }
 
-pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidationRules {
+pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorRules {
     match kind {
-        SourceConnectorKind::Http => SourceConnectorValidationRules {
+        SourceConnectorKind::Http => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["username", "password", "token"],
         },
-        SourceConnectorKind::S3 => SourceConnectorValidationRules {
+        SourceConnectorKind::S3 => SourceConnectorRules {
             required_public_keys: &["bucket", "endpoint"],
             allowed_public_keys: &["bucket", "endpoint", "region", "root", S3_SKIP_SIGNATURE],
             allowed_secret_keys: &["access_key_id", "secret_access_key"],
         },
-        SourceConnectorKind::Webdav => SourceConnectorValidationRules {
+        SourceConnectorKind::Webdav => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["username", "password", "token"],
         },
-        SourceConnectorKind::Ftp => SourceConnectorValidationRules {
+        SourceConnectorKind::Ftp => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["user", "password"],
         },
-        SourceConnectorKind::ArunaNative => SourceConnectorValidationRules {
+        SourceConnectorKind::ArunaNative => SourceConnectorRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "realm_id", "default_node_id"],
             allowed_secret_keys: &["bearer_token", "access_key", "secret_key"],
         },
-        SourceConnectorKind::LocalDirectory => SourceConnectorValidationRules {
+        SourceConnectorKind::LocalDirectory => SourceConnectorRules {
             required_public_keys: &[OFFERED_DIRECTORY_BUCKET],
             allowed_public_keys: &[OFFERED_DIRECTORY_BUCKET],
             allowed_secret_keys: &[],
@@ -189,7 +194,7 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidat
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     #[test]
@@ -206,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_public_key() {
+    fn unknown_public_rejected() {
         let err = validate_connector_input(
             "http",
             SourceConnectorKind::Http,
@@ -228,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_required_public_key() {
+    fn missing_public_rejected() {
         let err = validate_connector_input(
             "s3",
             SourceConnectorKind::S3,
@@ -239,7 +244,7 @@ mod tests {
 
         assert_eq!(
             err,
-            ValidationError::MissingRequiredPublicKey {
+            ValidationError::PublicKeyMissing {
                 kind: SourceConnectorKind::S3,
                 key: "endpoint".to_string(),
             }
@@ -247,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_secret_key() {
+    fn unknown_secret_rejected() {
         let err = validate_connector_input(
             "webdav",
             SourceConnectorKind::Webdav,
@@ -330,7 +335,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(err, ValidationError::CredentialsWithSkipSignature);
+        assert_eq!(err, ValidationError::CredentialsSkipSignature);
     }
 
     #[test]
@@ -460,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_aruna_native_connector_kind() {
+    fn unsupported_native_rejected() {
         let err = validate_connector_input(
             "native",
             SourceConnectorKind::ArunaNative,

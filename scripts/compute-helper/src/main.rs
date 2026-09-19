@@ -1,3 +1,7 @@
+//! Runs the in-container helper that stages inputs, fetches outputs and lists files.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -148,10 +152,9 @@ fn fetch_archive(workspace: &Path, path: &str, writer: impl Write) -> io::Result
     archive.finish()
 }
 
-/// Emit every regular file below `prefix` as a NUL-terminated absolute
-/// container path, then an empty record and the decimal path count. The
-/// terminator lets the caller reject a listing that was cut short; symlinks are
-/// skipped, so a listing stays inside the workspace.
+/// Emit every regular file below `prefix` as NUL-terminated absolute container
+/// paths, then an empty record and the count, so the caller can reject a
+/// truncated listing. Symlinks are skipped to stay inside the workspace.
 fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 

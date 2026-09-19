@@ -1,8 +1,13 @@
+//! Reads, takes and releases the per bucket write fence that a permanent purge holds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::S3_PURGE_FENCE_KEYSPACE;
-use aruna_core::structs::{JobId, StoragePurgeFence, StoragePurgeScope};
+use aruna_core::keyspaces::PURGE_FENCE_KEYSPACE;
+use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
 use aruna_core::types::{Key, TxnId};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -30,7 +35,7 @@ pub fn fence_key(bucket: &str) -> Key {
 
 pub fn write_fence_read(bucket: &str, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
-        key_space: S3_PURGE_FENCE_KEYSPACE.to_string(),
+        key_space: PURGE_FENCE_KEYSPACE.to_string(),
         key: fence_key(bucket),
         txn_id,
     })
@@ -114,7 +119,7 @@ pub async fn acquire_purge_fence(
         .map_err(|_| PurgeFenceError::Invalid)?;
         let write = storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_PURGE_FENCE_KEYSPACE.to_string(),
+                key_space: PURGE_FENCE_KEYSPACE.to_string(),
                 key: fence_key(scope.bucket()),
                 value,
                 txn_id: Some(txn_id),
@@ -147,7 +152,7 @@ pub async fn acquire_purge_fence(
 /// Read the bucket fence in a job-terminal transaction and return its delete only
 /// when the terminal job still owns it. A cancelled waiter must never clear the
 /// fence held by the purge that beat it to acquisition.
-pub async fn owned_terminal_fence_delete(
+pub async fn delete_owned_terminal(
     storage: &StorageHandle,
     txn_id: TxnId,
     job_id: JobId,
@@ -155,7 +160,7 @@ pub async fn owned_terminal_fence_delete(
 ) -> Result<Option<(String, Key)>, PurgeFenceError> {
     match read_fence(storage, scope.bucket(), Some(txn_id)).await? {
         Some(fence) if fence.job_id == job_id && fence.scope == *scope => Ok(Some((
-            S3_PURGE_FENCE_KEYSPACE.to_string(),
+            PURGE_FENCE_KEYSPACE.to_string(),
             fence_key(scope.bucket()),
         ))),
         Some(fence) if fence.job_id == job_id => Err(PurgeFenceError::Invalid),
@@ -170,7 +175,7 @@ async fn read_fence(
 ) -> Result<Option<StoragePurgeFence>, PurgeFenceError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
-            key_space: S3_PURGE_FENCE_KEYSPACE.to_string(),
+            key_space: PURGE_FENCE_KEYSPACE.to_string(),
             key: fence_key(bucket),
             txn_id,
         })

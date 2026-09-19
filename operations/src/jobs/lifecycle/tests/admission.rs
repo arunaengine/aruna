@@ -1,14 +1,17 @@
-//! Local admission, idempotent replay, conflict visibility, and the reads the
-//! family projection answers afterwards.
+//! Tests local admission: replayed claims, conflict reporting and the reads by alias after it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE};
-use aruna_core::structs::{
-    AuthContext, CapturedInput, InputMode, InputSelection, InputSource, JobFamilyRecord, JobId,
-    JobState, LogicalJobSpec, RealmConfigDocument, RealmNodeKind, SubmissionClaim, WorkspaceMode,
+use aruna_core::keyspaces::{ADMISSION_QUOTA_KEYSPACE, FAMILY_OUTBOX_KEYSPACE};
+use aruna_core::structs::execution::job::{
+    CapturedInput, InputMode, InputSelection, InputSource, JobFamilyRecord, JobId, JobState,
+    LogicalJobSpec, SubmissionClaim, WorkspaceMode,
 };
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -20,10 +23,10 @@ use crate::jobs::lifecycle::admit::{
 use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
 use crate::jobs::lifecycle::routing::{family_of_alias, family_status};
 use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
-use crate::jobs::records::tests::fixture::{Family, REALM, context, node, payload, secret, user};
 use crate::jobs::store::iter_prefix_page;
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::MetadataAuthToken;
+use crate::metadata::AuthToken;
+use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
 
 fn frame(record: JobFamilyRecord, family: &Family) -> JobRecordFrame {
     JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
@@ -71,7 +74,7 @@ async fn rejects_stale_quota() {
     let event = ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            key_space: ADMISSION_QUOTA_KEYSPACE.to_string(),
             key: spec.group_id.to_bytes().as_slice().into(),
             value: postcard::to_allocvec(&1u64)
                 .expect("revision encodes")
@@ -130,7 +133,7 @@ async fn admits_local_claim() {
     assert_eq!(record.retention_ms, family.spec().retention_ms);
     let (queued, _) = iter_prefix_page(
         &ctx.storage_handle,
-        JOB_FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_OUTBOX_KEYSPACE,
         None,
         None,
         8,
@@ -212,7 +215,7 @@ async fn refuses_undeliverable_submit() {
     ));
     let (queued, _) = iter_prefix_page(
         &ctx.storage_handle,
-        JOB_FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_OUTBOX_KEYSPACE,
         None,
         None,
         8,
@@ -245,7 +248,7 @@ async fn answers_by_alias() {
     assert_eq!(status.job.job_id, family.job_id);
 
     let stranger = AuthContext {
-        user_id: aruna_core::types::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
+        user_id: aruna_core::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
         realm_id: REALM,
         path_restrictions: None,
         session: None,
@@ -354,9 +357,8 @@ fn absent_input() -> InputSelection {
 
 #[tokio::test]
 async fn device_skips_materialization() {
-    // A device references its inputs instead of resolving them: an object absent
-    // here still reaches forwarding, and nothing is admitted locally. The same
-    // request on a realm node is refused because that node must hold the input.
+    // A device references inputs instead of resolving them: an absent object still
+    // reaches forwarding. A realm node refuses because it must hold the input.
     let mut spec = payload();
     spec.inputs.push(absent_input());
 
@@ -369,7 +371,7 @@ async fn device_skips_materialization() {
         WorkspaceMode::None,
         None,
         60_000,
-        Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
+        Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
     .expect_err("a device admits nothing locally");
@@ -377,7 +379,7 @@ async fn device_skips_materialization() {
     assert!(matches!(error, SubmitJobError::PlacementUnavailable(_)));
     let (queued, _) = iter_prefix_page(
         &device.storage_handle,
-        JOB_FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_OUTBOX_KEYSPACE,
         None,
         None,
         8,
@@ -396,14 +398,13 @@ async fn device_skips_materialization() {
         WorkspaceMode::None,
         None,
         60_000,
-        Some(MetadataAuthToken::bearer("token").expect("bearer fits")),
+        Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
     .expect_err("the input is not materialized here");
 
-    // The realm node resolves the input against its own objects, so it stops at
-    // the absent one instead of reaching forwarding. A definitive miss is the
-    // submitter's error, not a retryable placement failure.
+    // The realm node resolves against its own objects and stops at the absent one;
+    // a definitive miss is the submitter's error, not a retryable placement one.
     let SubmitJobError::InvalidWorkspace(reason) = refused else {
         panic!("a realm node must refuse an input it does not hold");
     };

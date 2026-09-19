@@ -1,0 +1,190 @@
+//! Expands placement when a node joins, without taking buckets away from current holders.
+//! Only buckets whose target set contains the current set get a transition.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::transition::{CandidatePlacementMap, TransitionLimits};
+use aruna_core::time::unix_timestamp_millis;
+use ulid::Ulid;
+
+use crate::driver::{DriverContext, drive};
+use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
+use crate::realm::get_config::GetConfigOperation;
+use crate::realm::mutate_placement::{
+    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
+};
+
+/// Publishes the realm's first candidate map and initializes every strategy's
+/// activations through the reducer; this must run before a second node registers,
+/// and only reducer-initialized activations advance when a transition completes.
+pub async fn ensure_activated_map(
+    context: &DriverContext,
+    actor: &Actor,
+) -> Result<RealmConfigDocument, MutatePlacementError> {
+    let mut config = read_config(context, actor).await?;
+    let epoch = match config.newest_map_epoch() {
+        Some(epoch) => epoch,
+        None => {
+            let (epoch, map) = next_map(&config);
+            config = mutate(
+                context,
+                actor,
+                RealmPlacementMutation::PublishCandidateMap(map),
+            )
+            .await?;
+            epoch
+        }
+    };
+    // Bucket zero stands for the strategy: activations are initialized for all
+    // of its buckets in one reduced event.
+    let uninitialized: Vec<Ulid> = config
+        .strategies
+        .iter()
+        .map(|strategy| strategy.strategy_id)
+        .filter(|strategy_id| config.activation(strategy_id, 0).is_none())
+        .collect();
+    for strategy_id in uninitialized {
+        config = mutate(
+            context,
+            actor,
+            RealmPlacementMutation::InitializeActivations {
+                strategy_id,
+                candidate_map_epoch: epoch,
+            },
+        )
+        .await?;
+    }
+    Ok(config)
+}
+
+/// Publishes the current view and starts a transition onto it for every bucket
+/// whose holder set only grows. Returns the transitions it started; an empty
+/// result means the view already matches the newest map or nothing expands.
+pub async fn expand_realm_placement(
+    context: &DriverContext,
+    actor: &Actor,
+) -> Result<Vec<Ulid>, MutatePlacementError> {
+    let config = ensure_activated_map(context, actor).await?;
+    let (next_epoch, map) = next_map(&config);
+    // Reuse the durable pending view without skipping its unfinished transition work.
+    let reuse = config
+        .newest_map_epoch()
+        .and_then(|epoch| config.candidate_map(epoch))
+        .is_some_and(|newest| {
+            newest.nodes == map.nodes
+                && newest.selectors == map.selectors
+                && newest.shard_overrides == map.shard_overrides
+        });
+    let (epoch, mut config) = if reuse {
+        (config.newest_map_epoch().unwrap_or(next_epoch), config)
+    } else {
+        let config = mutate(
+            context,
+            actor,
+            RealmPlacementMutation::PublishCandidateMap(map),
+        )
+        .await?;
+        (next_epoch, config)
+    };
+
+    let strategy_ids: Vec<Ulid> = config
+        .strategies
+        .iter()
+        .map(|strategy| strategy.strategy_id)
+        .collect();
+    let mut started = Vec::new();
+    for strategy_id in strategy_ids {
+        if let Some(transition) = config.placement_transitions.iter().find(|transition| {
+            transition.plan.strategy_id == strategy_id && !transition.is_terminal()
+        }) {
+            // The joiner stays out of the holder sets until the successor
+            // expansion in `process_transitions` runs for it.
+            tracing::debug!(
+                %strategy_id,
+                transition_id = %transition.plan.transition_id,
+                "Expansion deferred behind an in-flight transition"
+            );
+            continue;
+        }
+        let buckets = expansion_buckets(&config, strategy_id, epoch).map_err(invalid)?;
+        if buckets.is_empty() {
+            continue;
+        }
+        let transition_id = Ulid::generate();
+        let plan = plan_transition(
+            &config,
+            TransitionRequest {
+                transition_id,
+                strategy_id,
+                buckets,
+                target_map_epoch: epoch,
+                // Expansion moves nothing off a holder, so every bucket may run
+                // at once: there is no window in which authority is in doubt.
+                limits: TransitionLimits {
+                    max_incomplete_buckets: u32::MAX,
+                    ..TransitionLimits::default()
+                },
+                created_by: actor.node_id,
+                created_at_ms: unix_timestamp_millis(),
+            },
+        )
+        .map_err(invalid)?;
+        match mutate(
+            context,
+            actor,
+            RealmPlacementMutation::StartTransition(plan),
+        )
+        .await
+        {
+            Ok(next) => {
+                config = next;
+                started.push(transition_id);
+            }
+            // Another driver won the start race; its transition covers the
+            // strategy, so this one follows instead of failing onboarding.
+            Err(MutatePlacementError::TransitionInFlight { transition_id }) => {
+                tracing::debug!(%strategy_id, %transition_id, "Expansion start race lost");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(started)
+}
+
+/// The next epoch and the map that freezes the current view into it.
+fn next_map(config: &RealmConfigDocument) -> (u64, CandidatePlacementMap) {
+    let epoch = config.newest_map_epoch().unwrap_or(0) + 1;
+    (epoch, config.freeze_map(epoch))
+}
+
+fn invalid(error: crate::placement::transition::TransitionPlanError) -> MutatePlacementError {
+    MutatePlacementError::InvalidInput(error.to_string())
+}
+
+async fn read_config(
+    context: &DriverContext,
+    actor: &Actor,
+) -> Result<RealmConfigDocument, MutatePlacementError> {
+    drive(GetConfigOperation::new(actor.realm_id), context)
+        .await
+        .map_err(|_| MutatePlacementError::ConfigMissing)
+}
+
+/// Drives one placement mutation with the shared conflict re-drive.
+pub(crate) async fn mutate(
+    context: &DriverContext,
+    actor: &Actor,
+    mutation: RealmPlacementMutation,
+) -> Result<RealmConfigDocument, MutatePlacementError> {
+    drive_placement_mutation(
+        MutatePlacementConfig {
+            actor: actor.clone(),
+            mutation,
+        },
+        None,
+        context,
+    )
+    .await
+}

@@ -1,6 +1,9 @@
-// net/src/dht/kbucket.rs
+//! Holds the Kademlia routing table of k-buckets that track peers by XOR distance.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::id::xor_distance_32;
 use aruna_core::id::{NodeId, NodeIdExt};
-use aruna_core::util::xor_distance_32;
 use std::collections::VecDeque;
 
 /// Maximum entries per bucket (standard Kademlia k value)
@@ -89,17 +92,14 @@ impl KBucket {
         self.peers.pop_front()
     }
 
-    /// Get all peers in this bucket
     pub fn peers(&self) -> impl Iterator<Item = &PeerInfo> {
         self.peers.iter()
     }
 
-    /// Check if a peer exists in this bucket
     pub fn contains(&self, node_id: &NodeId) -> bool {
         self.peers.iter().any(|p| &p.node_id == node_id)
     }
 
-    /// Remove a specific peer
     pub fn remove(&mut self, node_id: &NodeId) -> Option<PeerInfo> {
         if let Some(pos) = self.peers.iter().position(|p| &p.node_id == node_id) {
             self.peers.remove(pos)
@@ -149,7 +149,6 @@ impl RoutingTable {
         &self.local_id
     }
 
-    /// Get the bucket index for a given node
     fn bucket_index(&self, node_id: &NodeId) -> Option<usize> {
         let idx = self.local_id.bucket_index(node_id);
         if idx >= NUM_BUCKETS {
@@ -159,7 +158,6 @@ impl RoutingTable {
         }
     }
 
-    /// Try to insert or update a peer in the routing table
     pub fn insert(&mut self, peer: PeerInfo) -> InsertResult {
         if peer.node_id == self.local_id {
             return InsertResult::Updated; // Ignore self
@@ -172,7 +170,6 @@ impl RoutingTable {
         self.buckets[idx].insert(peer)
     }
 
-    /// Remove a peer from the routing table
     pub fn remove(&mut self, node_id: &NodeId) -> Option<PeerInfo> {
         let idx = self.bucket_index(node_id)?;
         self.buckets[idx].remove(node_id)
@@ -183,7 +180,6 @@ impl RoutingTable {
         self.buckets[idx].remove_seen(node_id, last_seen)
     }
 
-    /// Evict the oldest peer from a specific bucket
     pub fn evict_oldest(&mut self, bucket_idx: usize) -> Option<PeerInfo> {
         self.buckets
             .get_mut(bucket_idx)
@@ -232,14 +228,7 @@ impl RoutingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_node(seed: u8) -> NodeId {
-        // Generate deterministic keys from seed
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[0] = seed;
-        let secret = iroh::SecretKey::from_bytes(&seed_bytes);
-        secret.public()
-    }
+    use crate::test_support::make_node;
 
     #[test]
     fn test_kbucket_insert() {
@@ -291,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn test_routing_table_closest() {
+    fn routing_table_closest() {
         let local = make_node(0);
         let mut table = RoutingTable::new(local);
 

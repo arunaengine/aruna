@@ -1,3 +1,7 @@
+//! Signs, parses and merges the cursors that page metadata search results.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -5,20 +9,21 @@ use aruna_core::NodeId;
 use aruna_core::metadata::MetadataSearchHit;
 use aruna_core::types::GroupId;
 use base64::Engine;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::api::MetadataApiQueryMode;
+use super::api::ApiQueryMode;
 
-pub const METADATA_SEARCH_DEFAULT_PAGE_SIZE: usize = 25;
-pub const METADATA_SEARCH_MAX_PAGE_SIZE: usize = 100;
-pub const METADATA_SEARCH_MAX_PAGINATION_DEPTH: usize = 1000;
+pub const SEARCH_PAGE_SIZE: usize = 25;
+pub const SEARCH_MAX_PAGE: usize = 100;
+pub const MAX_PAGINATION_DEPTH: usize = 1000;
 
 const SEARCH_CURSOR_VERSION: u8 = 2;
-const SEARCH_CURSOR_SIGNATURE_CONTEXT: &[u8] = b"aruna.metadata.search.cursor.v2";
+const SIGNATURE_CONTEXT: &[u8] = b"aruna.metadata.search.cursor.v2";
 // Cursors are signed, but keep a resume cap to bound fan-out if a trusted signer
 // issues an unexpectedly large continuation.
-const SEARCH_CURSOR_MAX_RESUME_NODES: usize = 64;
+const MAX_RESUME_NODES: usize = 64;
 
 /// Sort key of the last hit emitted on a page, used as the exact resume point in
 /// the merged, deduplicated ordering.
@@ -29,26 +34,127 @@ pub struct SearchWatermark {
     pub subject_iri: String,
 }
 
-/// Opaque, query-bound continuation token. Serialized with postcard and base64url
-/// so it stays compact and URL-safe.
+/// Signed, query-bound continuation envelope. Serialized with postcard and
+/// base64url so it stays compact and URL-safe; `payload` holds query fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SearchCursor {
-    pub version: u8,
-    pub signer: [u8; 32],
-    pub fingerprint: [u8; 32],
-    pub watermark: SearchWatermark,
-    pub resume: Vec<([u8; 32], u32)>,
-    pub signature: iroh::Signature,
+pub(crate) struct SignedCursor<P> {
+    pub(crate) version: u8,
+    pub(crate) signer: [u8; 32],
+    pub(crate) fingerprint: [u8; 32],
+    pub(crate) payload: P,
+    pub(crate) signature: iroh::Signature,
 }
 
-#[derive(Serialize)]
-struct SearchCursorSignaturePayload<'a> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum CursorEnvelopeError {
+    #[error("invalid cursor")]
+    Invalid,
+    #[error("cursor does not match query")]
+    QueryMismatch,
+}
+
+impl<P: Serialize> SignedCursor<P> {
+    pub(crate) fn encode(&self) -> Result<String, postcard::Error> {
+        let bytes = postcard::to_allocvec(self)?;
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    pub(crate) fn build_signed(
+        version: u8,
+        context: &[u8],
+        fingerprint: [u8; 32],
+        payload: P,
+        signer: NodeId,
+        sign: impl FnOnce(&[u8]) -> iroh::Signature,
+    ) -> Result<Self, postcard::Error> {
+        let signer = *signer.as_bytes();
+        let signing_bytes = cursor_signing_bytes(context, version, signer, fingerprint, &payload)?;
+        let signature = sign(&signing_bytes);
+        Ok(Self {
+            version,
+            signer,
+            fingerprint,
+            payload,
+            signature,
+        })
+    }
+
+    fn signing_bytes(&self, context: &[u8]) -> Result<Vec<u8>, postcard::Error> {
+        cursor_signing_bytes(
+            context,
+            self.version,
+            self.signer,
+            self.fingerprint,
+            &self.payload,
+        )
+    }
+}
+
+impl<P: Serialize + DeserializeOwned> SignedCursor<P> {
+    pub(crate) fn decode_verified<F>(
+        raw: &str,
+        context: &[u8],
+        authorized_signers: &[NodeId],
+        check: F,
+    ) -> Result<Self, CursorEnvelopeError>
+    where
+        F: FnOnce(&Self) -> Result<(), CursorEnvelopeError>,
+    {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .map_err(|_| CursorEnvelopeError::Invalid)?;
+        let cursor: Self =
+            postcard::from_bytes(&bytes).map_err(|_| CursorEnvelopeError::Invalid)?;
+        check(&cursor)?;
+        let signer =
+            NodeId::from_bytes(&cursor.signer).map_err(|_| CursorEnvelopeError::Invalid)?;
+        if !authorized_signers.contains(&signer) {
+            return Err(CursorEnvelopeError::Invalid);
+        }
+        let signing_bytes = cursor
+            .signing_bytes(context)
+            .map_err(|_| CursorEnvelopeError::Invalid)?;
+        signer
+            .verify(&signing_bytes, &cursor.signature)
+            .map_err(|_| CursorEnvelopeError::Invalid)?;
+        Ok(cursor)
+    }
+}
+
+fn cursor_signing_bytes<P: Serialize>(
+    context: &[u8],
     version: u8,
     signer: [u8; 32],
     fingerprint: [u8; 32],
-    watermark: &'a SearchWatermark,
-    resume: &'a [([u8; 32], u32)],
+    payload: &P,
+) -> Result<Vec<u8>, postcard::Error> {
+    #[derive(Serialize)]
+    struct SigningPayload<'a, P> {
+        version: u8,
+        signer: [u8; 32],
+        fingerprint: [u8; 32],
+        payload: &'a P,
+    }
+    let payload = postcard::to_allocvec(&SigningPayload {
+        version,
+        signer,
+        fingerprint,
+        payload,
+    })?;
+    let mut bytes = Vec::with_capacity(context.len() + 1 + payload.len());
+    bytes.extend_from_slice(context);
+    bytes.push(0);
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SearchCursorPayload {
+    pub(crate) watermark: SearchWatermark,
+    pub(crate) resume: Vec<([u8; 32], u32)>,
+}
+
+pub(crate) type SearchCursor = SignedCursor<SearchCursorPayload>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SearchCursorError {
@@ -58,81 +164,59 @@ pub enum SearchCursorError {
     QueryMismatch,
 }
 
-impl SearchCursor {
+impl From<CursorEnvelopeError> for SearchCursorError {
+    fn from(error: CursorEnvelopeError) -> Self {
+        match error {
+            CursorEnvelopeError::Invalid => Self::Invalid,
+            CursorEnvelopeError::QueryMismatch => Self::QueryMismatch,
+        }
+    }
+}
+
+impl SignedCursor<SearchCursorPayload> {
     pub fn new_signed(
         fingerprint: [u8; 32],
         watermark: SearchWatermark,
         resume: Vec<(NodeId, u32)>,
         signer: NodeId,
         sign: impl FnOnce(&[u8]) -> iroh::Signature,
-    ) -> Self {
-        let signer = *signer.as_bytes();
+    ) -> Result<Self, postcard::Error> {
         let mut resume: Vec<_> = resume
             .into_iter()
             .map(|(node_id, position)| (*node_id.as_bytes(), position))
             .collect();
         // Never emit more resume entries than decode accepts, or the served
         // cursor 400s on replay; keep the deepest-progress nodes on overflow.
-        if resume.len() > SEARCH_CURSOR_MAX_RESUME_NODES {
+        if resume.len() > MAX_RESUME_NODES {
             resume.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
-            resume.truncate(SEARCH_CURSOR_MAX_RESUME_NODES);
+            resume.truncate(MAX_RESUME_NODES);
         }
-        let signing_bytes = cursor_signing_bytes(
+        Self::build_signed(
             SEARCH_CURSOR_VERSION,
-            signer,
+            SIGNATURE_CONTEXT,
             fingerprint,
-            &watermark,
-            &resume,
-        );
-        let signature = sign(&signing_bytes);
-        Self {
-            version: SEARCH_CURSOR_VERSION,
+            SearchCursorPayload { watermark, resume },
             signer,
-            fingerprint,
-            watermark,
-            resume,
-            signature,
-        }
-    }
-
-    pub fn encode(&self) -> String {
-        let bytes = postcard::to_allocvec(self).expect("search cursor serializes");
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    }
-
-    pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(raw)
-            .map_err(|_| SearchCursorError::Invalid)?;
-        let cursor: SearchCursor =
-            postcard::from_bytes(&bytes).map_err(|_| SearchCursorError::Invalid)?;
-        if cursor.version != SEARCH_CURSOR_VERSION
-            || cursor.resume.len() > SEARCH_CURSOR_MAX_RESUME_NODES
-        {
-            return Err(SearchCursorError::Invalid);
-        }
-        let signer = NodeId::from_bytes(&cursor.signer).map_err(|_| SearchCursorError::Invalid)?;
-        if !authorized_signers.contains(&signer) {
-            return Err(SearchCursorError::Invalid);
-        }
-        signer
-            .verify(&cursor.signing_bytes(), &cursor.signature)
-            .map_err(|_| SearchCursorError::Invalid)?;
-        Ok(cursor)
-    }
-
-    fn signing_bytes(&self) -> Vec<u8> {
-        cursor_signing_bytes(
-            self.version,
-            self.signer,
-            self.fingerprint,
-            &self.watermark,
-            &self.resume,
+            sign,
         )
     }
 
+    pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
+        Self::decode_verified(raw, SIGNATURE_CONTEXT, authorized_signers, |cursor| {
+            if cursor.version != SEARCH_CURSOR_VERSION
+                || cursor.payload.resume.len() > MAX_RESUME_NODES
+            {
+                Err(CursorEnvelopeError::Invalid)
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(SearchCursorError::from)
+    }
+
     pub fn resume_positions(&self) -> HashMap<NodeId, u32> {
-        self.resume
+        self.payload
+            .resume
             .iter()
             .filter_map(|(bytes, position)| {
                 NodeId::from_bytes(bytes)
@@ -143,34 +227,12 @@ impl SearchCursor {
     }
 }
 
-fn cursor_signing_bytes(
-    version: u8,
-    signer: [u8; 32],
-    fingerprint: [u8; 32],
-    watermark: &SearchWatermark,
-    resume: &[([u8; 32], u32)],
-) -> Vec<u8> {
-    let payload = SearchCursorSignaturePayload {
-        version,
-        signer,
-        fingerprint,
-        watermark,
-        resume,
-    };
-    let payload = postcard::to_allocvec(&payload).expect("search cursor payload serializes");
-    let mut bytes = Vec::with_capacity(SEARCH_CURSOR_SIGNATURE_CONTEXT.len() + 1 + payload.len());
-    bytes.extend_from_slice(SEARCH_CURSOR_SIGNATURE_CONTEXT);
-    bytes.push(0);
-    bytes.extend_from_slice(&payload);
-    bytes
-}
-
 /// Binds a cursor to the query that produced it. Recomputed on every continuation
 /// request; a mismatch rejects the cursor. The query string itself is not stored.
 pub fn query_fingerprint(
     query: &str,
     graph_iris: Option<&[String]>,
-    mode: Option<MetadataApiQueryMode>,
+    mode: Option<ApiQueryMode>,
     conforms_to: Option<&str>,
     group_id: Option<GroupId>,
 ) -> [u8; 32] {
@@ -209,11 +271,11 @@ pub fn query_fingerprint(
     *hasher.finalize().as_bytes()
 }
 
-fn mode_byte(mode: Option<MetadataApiQueryMode>) -> u8 {
+fn mode_byte(mode: Option<ApiQueryMode>) -> u8 {
     match mode {
         None => 0,
-        Some(MetadataApiQueryMode::Local) => 1,
-        Some(MetadataApiQueryMode::Distributed) => 2,
+        Some(ApiQueryMode::Local) => 1,
+        Some(ApiQueryMode::Distributed) => 2,
     }
 }
 
@@ -236,10 +298,9 @@ pub struct SearchPage {
     pub truncated: bool,
 }
 
-/// Deduplicate hits on `(graph_iri, subject_iri)` keeping the highest quantized
-/// score (smallest `document_id` on ties), preserving title, snippet and subject
-/// types from whichever copy carries them, and order by score descending with a
-/// `(graph_iri, subject_iri)` tie-break for a stable total order.
+/// Deduplicate hits on `(graph_iri, subject_iri)`, keeping the highest
+/// quantized score (smallest `document_id` on ties) and any title, snippet or
+/// subject types; final order is score descending, then graph and subject IRI.
 pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit> {
     let mut deduped: HashMap<(String, String), MetadataSearchHit> = HashMap::new();
     for hit in hits {
@@ -279,12 +340,8 @@ pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit>
     hits
 }
 
-// Must mirror craqle's limit_search_hits ordering exactly (quantized score key,
-// then graph and subject IRIs) so each node's returned list is a prefix of the
-// merged order; a mismatch would let the watermark permanently skip hits at
-// fetch boundaries. Accepted best-effort gap: exact BM25 ties truncated inside
-// Tantivy's per-graph top-k can still exclude a doc that later resurfaces above
-// the watermark.
+// Must mirror craqle's quantized-score ordering or watermarks can skip hits
+// at fetch boundaries; truncated BM25 ties may resurface later.
 fn score_key(score: f32) -> i64 {
     (score as f64 * 1_000_000.0) as i64
 }
@@ -297,12 +354,8 @@ pub(super) fn compare_hits(left: &MetadataSearchHit, right: &MetadataSearchHit) 
 }
 
 /// Turn merged node results into one page plus an optional continuation.
-///
-/// The `watermark` is the resume point in the merged, deduplicated order: every
-/// hit at or above it was already emitted, so it is dropped here (coordinator-side
-/// dedup-then-filter). Per-node resume positions size the next fetch. A page still
-/// continues when a node was saturated even if this page added nothing, and paging
-/// stops once the deepest resume reaches `max_depth`.
+/// `watermark` drops hits already emitted in merged order; a page continues
+/// while any node is saturated, and paging stops at `max_depth`.
 pub fn paginate(
     node_results: Vec<NodeSearchResult>,
     watermark: Option<SearchWatermark>,
@@ -343,9 +396,8 @@ pub fn paginate(
                 let resume: Vec<(NodeId, u32)> = node_results
                     .iter()
                     .map(|node| {
-                        // Count hits at or above the watermark, plus a saturated
-                        // node's below-watermark duplicates that will not re-emit,
-                        // so a duplicate-only prefix advances instead of stalling.
+                        // Count hits at or above the watermark plus saturated below-watermark
+                        // duplicates that will not re-emit, so a duplicate-only prefix advances.
                         let position = node
                             .hits
                             .iter()
@@ -421,7 +473,7 @@ fn watermark_of(hit: &MetadataSearchHit) -> SearchWatermark {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     fn secret_key(seed: u8) -> iroh::SecretKey {
@@ -442,6 +494,7 @@ mod tests {
         SearchCursor::new_signed(fingerprint, watermark, resume, secret.public(), |bytes| {
             secret.sign(bytes)
         })
+        .expect("search cursor signs")
     }
 
     fn hit(graph: &str, subject: &str, score: f32) -> MetadataSearchHit {
@@ -459,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_roundtrips_with_node_keys_and_exact_scores() {
+    fn cursor_roundtrips() {
         let signer = node_id(9);
         let cursor = signed_cursor(
             [7u8; 32],
@@ -471,16 +524,16 @@ mod tests {
             vec![(node_id(1), 3), (node_id(2), 0)],
             9,
         );
-        let decoded = SearchCursor::decode(&cursor.encode(), &[signer]).unwrap();
+        let decoded = SearchCursor::decode(&cursor.encode().unwrap(), &[signer]).unwrap();
         assert_eq!(decoded, cursor);
-        assert_eq!(decoded.watermark.score.to_bits(), 0.8f32.to_bits());
+        assert_eq!(decoded.payload.watermark.score.to_bits(), 0.8f32.to_bits());
         let positions = decoded.resume_positions();
         assert_eq!(positions.get(&node_id(1)), Some(&3));
         assert_eq!(positions.get(&node_id(2)), Some(&0));
     }
 
     #[test]
-    fn cursor_decode_rejects_garbage_and_wrong_version() {
+    fn decode_rejects_garbage() {
         assert_eq!(
             SearchCursor::decode("not*base64", &[node_id(1)]),
             Err(SearchCursorError::Invalid)
@@ -502,13 +555,13 @@ mod tests {
         );
         cursor.version = 1;
         assert_eq!(
-            SearchCursor::decode(&cursor.encode(), &[node_id(1)]),
+            SearchCursor::decode(&cursor.encode().unwrap(), &[node_id(1)]),
             Err(SearchCursorError::Invalid)
         );
     }
 
     #[test]
-    fn cursor_decode_rejects_tampering_and_untrusted_signers() {
+    fn decode_rejects_tampering() {
         let signer = node_id(1);
         let cursor = signed_cursor(
             [0u8; 32],
@@ -522,20 +575,20 @@ mod tests {
         );
 
         assert_eq!(
-            SearchCursor::decode(&cursor.encode(), &[node_id(9)]),
+            SearchCursor::decode(&cursor.encode().unwrap(), &[node_id(9)]),
             Err(SearchCursorError::Invalid)
         );
 
         let mut forged = cursor;
-        forged.resume[0].1 = 99;
+        forged.payload.resume[0].1 = 99;
         assert_eq!(
-            SearchCursor::decode(&forged.encode(), &[signer]),
+            SearchCursor::decode(&forged.encode().unwrap(), &[signer]),
             Err(SearchCursorError::Invalid)
         );
     }
 
     #[test]
-    fn cursor_decode_caps_resume_entries() {
+    fn decode_caps_resume() {
         let watermark = || SearchWatermark {
             score: 1.0,
             graph_iri: "g".to_string(),
@@ -544,36 +597,40 @@ mod tests {
         let at_cap = signed_cursor(
             [0u8; 32],
             watermark(),
-            (0..SEARCH_CURSOR_MAX_RESUME_NODES)
+            (0..MAX_RESUME_NODES)
                 .map(|index| (node_id(index as u8), 0))
                 .collect(),
             1,
         );
-        assert!(SearchCursor::decode(&at_cap.encode(), &[node_id(1)]).is_ok());
+        assert!(SearchCursor::decode(&at_cap.encode().unwrap(), &[node_id(1)]).is_ok());
 
         // A cursor forged past the cap (bypassing issuance) is still rejected.
         let secret = secret_key(1);
-        let resume: Vec<_> = (0..=SEARCH_CURSOR_MAX_RESUME_NODES)
+        let resume: Vec<_> = (0..=MAX_RESUME_NODES)
             .map(|index| (*node_id(index as u8).as_bytes(), 0u32))
             .collect();
         let mark = watermark();
+        let payload = SearchCursorPayload {
+            watermark: mark,
+            resume,
+        };
         let signing_bytes = cursor_signing_bytes(
+            SIGNATURE_CONTEXT,
             SEARCH_CURSOR_VERSION,
             *secret.public().as_bytes(),
             [0u8; 32],
-            &mark,
-            &resume,
-        );
+            &payload,
+        )
+        .unwrap();
         let forged = SearchCursor {
             version: SEARCH_CURSOR_VERSION,
             signer: *secret.public().as_bytes(),
             fingerprint: [0u8; 32],
-            watermark: mark,
-            resume,
+            payload,
             signature: secret.sign(&signing_bytes),
         };
         assert_eq!(
-            SearchCursor::decode(&forged.encode(), &[secret.public()]),
+            SearchCursor::decode(&forged.encode().unwrap(), &[secret.public()]),
             Err(SearchCursorError::Invalid)
         );
     }
@@ -588,64 +645,46 @@ mod tests {
                 graph_iri: "g".to_string(),
                 subject_iri: "s".to_string(),
             },
-            (0..=SEARCH_CURSOR_MAX_RESUME_NODES)
+            (0..=MAX_RESUME_NODES)
                 .map(|index| (node_id(index as u8), index as u32))
                 .collect(),
             1,
         );
-        assert_eq!(over.resume.len(), SEARCH_CURSOR_MAX_RESUME_NODES);
-        assert!(SearchCursor::decode(&over.encode(), &[node_id(1)]).is_ok());
+        assert_eq!(over.payload.resume.len(), MAX_RESUME_NODES);
+        assert!(SearchCursor::decode(&over.encode().unwrap(), &[node_id(1)]).is_ok());
     }
 
     #[test]
-    fn fingerprint_binds_query_graphs_and_mode() {
-        let base = query_fingerprint(
-            "alpha",
-            None,
-            Some(MetadataApiQueryMode::Distributed),
-            None,
-            None,
-        );
+    fn fingerprint_binds_query() {
+        let base = query_fingerprint("alpha", None, Some(ApiQueryMode::Distributed), None, None);
         assert_eq!(
             base,
-            query_fingerprint(
-                "alpha",
-                None,
-                Some(MetadataApiQueryMode::Distributed),
-                None,
-                None
-            )
+            query_fingerprint("alpha", None, Some(ApiQueryMode::Distributed), None, None)
         );
         assert_ne!(
             base,
-            query_fingerprint(
-                "beta",
-                None,
-                Some(MetadataApiQueryMode::Distributed),
-                None,
-                None
-            )
+            query_fingerprint("beta", None, Some(ApiQueryMode::Distributed), None, None)
         );
         assert_ne!(
             base,
             query_fingerprint(
                 "alpha",
                 Some(&["g".to_string()]),
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 None,
                 None
             )
         );
         assert_ne!(
             base,
-            query_fingerprint("alpha", None, Some(MetadataApiQueryMode::Local), None, None)
+            query_fingerprint("alpha", None, Some(ApiQueryMode::Local), None, None)
         );
         assert_ne!(
             base,
             query_fingerprint(
                 "alpha",
                 None,
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 Some("https://w3id.org/ro/crate/1.2"),
                 None
             )
@@ -656,7 +695,7 @@ mod tests {
             query_fingerprint(
                 "alpha",
                 None,
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 None,
                 Some(group)
             )
@@ -665,14 +704,14 @@ mod tests {
             query_fingerprint(
                 "alpha",
                 None,
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 None,
                 Some(group)
             ),
             query_fingerprint(
                 "alpha",
                 None,
-                Some(MetadataApiQueryMode::Distributed),
+                Some(ApiQueryMode::Distributed),
                 None,
                 Some(GroupId::from_bytes([8u8; 16]))
             )
@@ -680,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_keeps_max_score_and_enriched_snippet() {
+    fn merge_keeps_snippet() {
         let mut bare = hit("01A", "./file.txt", 0.5);
         bare.snippet = None;
         let mut enriched = hit("01A", "./file.txt", 0.8);
@@ -702,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_keeps_subject_types() {
+    fn merge_keeps_types() {
         // Only the node that described the subject knows its rdf:type IRIs.
         let types = vec!["http://schema.org/MediaObject".to_string()];
         let bare = hit("01A", "./file.txt", 0.9);
@@ -724,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_orders_by_score_then_keys() {
+    fn merge_orders_keys() {
         let merged = merge_search_hits(vec![
             hit("01B", "./file-b.txt", 0.7),
             hit("01A", "./file-b.txt", 0.7),
@@ -747,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_retains_deterministic_copy_on_quantized_ties() {
+    fn merge_quantized_ties() {
         let make = |document_id: &str, score: f32, title: &str| {
             let mut copy = hit("01A", "./file.txt", score);
             copy.document_id = document_id.to_string();
@@ -768,10 +807,9 @@ mod tests {
     }
 
     #[test]
-    fn paginate_does_not_skip_hits_within_a_score_quantization_bucket() {
-        // Raw f32 order (b above a) opposes the IRI tie-break inside one 1e-6
-        // score bucket; the coordinator must follow craqle's quantized ordering
-        // or page one's watermark would silently drop b forever.
+    fn paginate_keeps_bucket() {
+        // Raw f32 order opposes the IRI tie-break inside one 1e-6 score bucket;
+        // the coordinator must follow craqle's quantized ordering or page one drops b.
         let a = hit("01A", "./a", 0.100_000_1);
         let b = hit("01B", "./b", 0.100_000_4);
         assert_eq!(score_key(a.score), score_key(b.score));
@@ -786,7 +824,7 @@ mod tests {
             }],
             None,
             1,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            MAX_PAGINATION_DEPTH,
         );
         assert_eq!(page1.hits.len(), 1);
         assert_eq!(page1.hits[0].subject_iri, "./a");
@@ -801,7 +839,7 @@ mod tests {
             }],
             Some(next.watermark),
             1,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
+            MAX_PAGINATION_DEPTH,
         );
         let subjects: Vec<_> = page2
             .hits
@@ -812,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn paginate_first_page_sets_watermark_and_resume() {
+    fn paginate_first_page() {
         let node = NodeSearchResult {
             node_id: node_id(1),
             hits: vec![
@@ -822,7 +860,7 @@ mod tests {
             ],
             saturated: true,
         };
-        let page = paginate(vec![node], None, 2, METADATA_SEARCH_MAX_PAGINATION_DEPTH);
+        let page = paginate(vec![node], None, 2, MAX_PAGINATION_DEPTH);
         assert_eq!(page.hits.len(), 2);
         assert_eq!(page.hits[0].subject_iri, "./a");
         assert_eq!(page.hits[1].subject_iri, "./b");
@@ -833,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn paginate_second_page_drops_already_emitted_and_terminates() {
+    fn paginate_second_page() {
         let hits = vec![
             hit("01A", "./a", 0.9),
             hit("01B", "./b", 0.8),
@@ -849,19 +887,14 @@ mod tests {
             hits,
             saturated: false,
         };
-        let page = paginate(
-            vec![node],
-            Some(watermark),
-            2,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
-        );
+        let page = paginate(vec![node], Some(watermark), 2, MAX_PAGINATION_DEPTH);
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].subject_iri, "./c");
         assert!(page.next.is_none());
     }
 
     #[test]
-    fn paginate_dedups_hit_present_on_two_nodes() {
+    fn paginate_dedups_hits() {
         let left = NodeSearchResult {
             node_id: node_id(1),
             hits: vec![hit("01A", "./shared", 0.9), hit("01B", "./l", 0.6)],
@@ -872,26 +905,20 @@ mod tests {
             hits: vec![hit("01A", "./shared", 0.5), hit("01C", "./r", 0.7)],
             saturated: false,
         };
-        let page = paginate(
-            vec![left, right],
-            None,
-            1,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
-        );
+        let page = paginate(vec![left, right], None, 1, MAX_PAGINATION_DEPTH);
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].subject_iri, "./shared");
         assert_eq!(page.hits[0].score, 0.9);
         let next = page.next.unwrap();
         let resume: HashMap<_, _> = next.resume.into_iter().collect();
-        // Resume counts each node's raw hits at or above the watermark by their
-        // local score. Node 1 owns the winning 0.9 copy, so it resumes past it;
-        // node 2's 0.5 copy sorts below the merged 0.9 watermark and counts zero.
+        // Resume counts each node's raw hits at or above the watermark by local
+        // score: node 1 owns the 0.9 copy, node 2's 0.5 sorts below and counts zero.
         assert_eq!(resume.get(&node_id(1)), Some(&1));
         assert_eq!(resume.get(&node_id(2)), Some(&0));
     }
 
     #[test]
-    fn paginate_continues_when_a_node_is_saturated_without_new_hits() {
+    fn paginate_saturated_node() {
         let watermark = SearchWatermark {
             score: 0.9,
             graph_iri: "https://w3id.org/aruna/01A".to_string(),
@@ -902,12 +929,7 @@ mod tests {
             hits: vec![hit("01A", "./a", 0.9)],
             saturated: true,
         };
-        let page = paginate(
-            vec![node],
-            Some(watermark.clone()),
-            2,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
-        );
+        let page = paginate(vec![node], Some(watermark.clone()), 2, MAX_PAGINATION_DEPTH);
         assert!(page.hits.is_empty());
         let next = page.next.expect("saturation keeps paging");
         assert_eq!(next.watermark, watermark);
@@ -929,7 +951,7 @@ mod tests {
         let mut emitted = Vec::new();
 
         for _ in 0..4 {
-            let depth = METADATA_SEARCH_MAX_PAGINATION_DEPTH;
+            let depth = MAX_PAGINATION_DEPTH;
             let a_limit = resume_fetch_limit(&resume, node_id(1), 1, depth);
             let b_limit = resume_fetch_limit(&resume, node_id(2), 1, depth);
             let a_page: Vec<_> = a_hits.iter().take(a_limit).cloned().collect();
@@ -964,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn paginate_churn_does_not_re_emit_or_duplicate() {
+    fn paginate_churn() {
         let watermark = SearchWatermark {
             score: 0.8,
             graph_iri: "https://w3id.org/aruna/01B".to_string(),
@@ -981,18 +1003,13 @@ mod tests {
             ],
             saturated: false,
         };
-        let page = paginate(
-            vec![node],
-            Some(watermark),
-            5,
-            METADATA_SEARCH_MAX_PAGINATION_DEPTH,
-        );
+        let page = paginate(vec![node], Some(watermark), 5, MAX_PAGINATION_DEPTH);
         let subjects: Vec<_> = page.hits.iter().map(|h| h.subject_iri.as_str()).collect();
         assert_eq!(subjects, vec!["./c"]);
     }
 
     #[test]
-    fn paginate_stops_at_depth_cap() {
+    fn paginate_stops_depth() {
         let node = NodeSearchResult {
             node_id: node_id(1),
             hits: vec![hit("01A", "./a", 0.9), hit("01B", "./b", 0.8)],
@@ -1007,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_fetch_limit_defaults_unknown_nodes_to_deepest() {
+    fn resume_defaults_deepest() {
         let mut resume = HashMap::new();
         resume.insert(node_id(1), 4);
         resume.insert(node_id(2), 7);

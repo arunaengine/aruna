@@ -1,20 +1,18 @@
-//! Decides one page of a synced folder, without touching the network or the
-//! filesystem beyond the strong hashes the decision itself needs.
-//!
-//! The operation only ever writes device-local rows. Bytes reach the disk
-//! through the guarded local-file effects the plan it answers with names, and
-//! reach the realm through the upload rows it queues.
+//! Decides one page of a synced folder without any network, writing only device-local rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
-use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_OUTBOX_KEYSPACE};
+use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::offered_directory::fingerprint_complete;
 use aruna_core::structs::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
-    SyncedFolder, WriteGuard, decide, fingerprint_complete,
+    SyncedFolder, WriteGuard, decide,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -537,7 +535,7 @@ impl Operation for ReconcileFolderOperation {
             })
             .chain(paths.iter().map(|relative| {
                 (
-                    SYNC_UPLOAD_OUTBOX_KEYSPACE.to_string(),
+                    SYNC_UPLOAD_KEYSPACE.to_string(),
                     base_key(folder_id, relative),
                 )
             }))
@@ -586,9 +584,8 @@ impl Operation for ReconcileFolderOperation {
                     })
                     .collect();
                 let eligible = self.hash_batch();
-                // A page that cannot hash every moved file decides only what it
-                // read: the rest waits for the next pass, which is asked for
-                // promptly instead of after the idle wait.
+                // A page that cannot hash every moved file decides only what it read:
+                // the rest waits for the next pass, which is asked for promptly.
                 self.plan.truncated |= eligible.len() > MAX_HASH_BATCH;
                 self.deferred = eligible.iter().copied().skip(MAX_HASH_BATCH).collect();
                 self.hashing = eligible.into_iter().take(MAX_HASH_BATCH).collect();
@@ -775,10 +772,12 @@ fn fail(operation: &mut ReconcileFolderOperation, error: ReconcileError) -> Effe
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
-    use aruna_core::structs::{FileStat, FolderMode, FolderState, RealmId, RemoteBinding};
-    use aruna_core::types::UserId;
+    use aruna_core::UserId;
+    use aruna_core::structs::execution::offered_directory::FileStat;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::{FolderMode, FolderState, RemoteBinding};
     use byteview::ByteView;
 
     fn folder() -> SyncedFolder {
@@ -800,7 +799,7 @@ mod tests {
             created_at_ms: 1,
             last_reconcile_ms: None,
             last_error: None,
-            last_error_at_ms: None,
+            last_error_ms: None,
             observed_files: 0,
             list_cursor: None,
         }
@@ -991,9 +990,8 @@ mod tests {
 
     #[test]
     fn holds_queued_upload() {
-        // The owner kept their copy and the realm has not answered yet. Until it
-        // does, the entry must not be decided again: a second pass would write
-        // another conflicted copy of a file that is already on its way.
+        // The owner kept their copy and the realm has not answered: deciding again
+        // would write another conflicted copy of a file already on its way.
         let version = Ulid::from_bytes([3u8; 16]);
         let queued = SyncUpload {
             folder_id: folder().folder_id,
@@ -1096,9 +1094,8 @@ mod tests {
 
     #[test]
     fn hashes_young_file() {
-        // A rewrite can restore the size, the inode and the modification time,
-        // so a file that changed moments ago is read rather than trusted; one
-        // that has been still keeps the hash the base recorded for it.
+        // A rewrite can restore size, inode and modification time, so a file that
+        // changed moments ago is hashed rather than trusted; a still one keeps the base hash.
         let settled = base("5-1-1-1", Some(Ulid::from_bytes([4u8; 16])));
         assert!(hashes_first(
             observed_now("5-1-1-1", OBSERVED_AT_MS),

@@ -1,24 +1,26 @@
-use aruna_core::structs::{
-    AuthContext, JobError, JobResultPayload, MintPersistentIdSpec, PersistentIdFailure,
-};
-use aruna_core::util::unix_timestamp_millis;
+//! Runs the job that mints a w3id persistent identifier for a metadata document.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::MetadataAuthToken;
+use aruna_core::structs::execution::job::{JobError, JobResultPayload};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::{MintPersistentSpec, PersistentIdFailure};
+use aruna_core::time::unix_timestamp_millis;
+
+use crate::metadata::AuthToken;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::forward::{fail_pid_routed, mint_pid_routed};
+use crate::metadata::persistent_id::forward::{fail_pid_routed, mint_pid_routed};
 
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 
 /// Register a w3id PID for a document. The mint is a compare-and-set on the
-/// document's authority, so a job that lost the race — or ran after a withdrawal —
-/// reports the authoritative mapping with `newly_minted: false` instead of
-/// overwriting it. Runs from wherever the job was claimed and routes; it never
-/// mints into the claiming node's own store.
-pub async fn run_mint_pid(ctx: &JobContext, spec: &MintPersistentIdSpec) -> JobRunOutcome {
+/// document's authority, so a lost race or post-withdrawal run reports the
+/// authoritative mapping with `newly_minted: false`; routing never mints locally.
+pub async fn run_mint_pid(ctx: &JobContext, spec: &MintPersistentSpec) -> JobRunOutcome {
     let realm_id = spec.minted_by.realm_id;
     // The submitting route requires an unrestricted realm token, so the internal
     // principal the authority re-checks carries no path restrictions to drop.
-    let auth_token = MetadataAuthToken::internal(AuthContext {
+    let auth_token = AuthToken::internal(AuthContext {
         user_id: spec.minted_by,
         realm_id,
         path_restrictions: None,
@@ -58,8 +60,8 @@ pub async fn run_mint_pid(ctx: &JobContext, spec: &MintPersistentIdSpec) -> JobR
 
 async fn record_failure(
     ctx: &JobContext,
-    spec: &MintPersistentIdSpec,
-    auth_token: &MetadataAuthToken,
+    spec: &MintPersistentSpec,
+    auth_token: &AuthToken,
     message: String,
     retryable: bool,
 ) {

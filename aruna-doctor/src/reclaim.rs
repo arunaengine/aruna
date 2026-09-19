@@ -1,12 +1,16 @@
+//! Seeds blob reclaim candidates for one backend and prints the reclaim queue status.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
 };
-use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, ReclaimCandidate,
-    ReclaimCandidateKey,
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey,
 };
+use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use chrono::{DateTime, Utc};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
 use serde::Serialize;
@@ -165,7 +169,7 @@ fn status_output(database_path: &str) -> Result<ReclaimStatusOutput, ExplorerErr
 mod tests {
     use super::{seed_output, status_output};
     use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE};
-    use aruna_core::structs::{BackendLocation, BackendRef, BlobLocationKey};
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BlobLocationKey};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::HashMap;
     use std::path::Path;

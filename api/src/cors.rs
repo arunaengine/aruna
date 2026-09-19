@@ -1,3 +1,7 @@
+//! Builds the CORS layers and preflight headers for the REST and S3 interfaces.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use axum::http::Method;
 use http::HeaderMap;
 use http::HeaderName;
@@ -8,7 +12,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 const CORS_MAX_AGE: Duration = Duration::from_secs(3600);
 const S3_ALLOWED_METHODS: &str = "GET,HEAD,PUT,POST,DELETE,OPTIONS";
-const S3_DEFAULT_ALLOWED_HEADERS: &str = "authorization,content-type,content-md5,range,\
+const S3_ALLOWED_HEADERS: &str = "authorization,content-type,content-md5,range,\
      x-amz-content-sha256,x-amz-date,x-amz-security-token,x-amz-user-agent";
 const S3_EXPOSED_HEADERS: &str = "etag,content-range,accept-ranges,content-length,last-modified,\
      x-amz-request-id,x-amz-version-id,x-amz-delete-marker,aruna-source-content-type,\
@@ -24,15 +28,9 @@ pub(crate) const S3_PREFLIGHT_VARY: &[HeaderName] = &[
 /// on the platform webview.
 pub const DESKTOP_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
 
-/// Allowed cross-origin request origins, shared by the REST and S3 interfaces.
-/// An empty configuration denies all cross-origin access to S3 (no CORS headers
-/// are emitted); a literal `*` entry allows every origin.
-///
-/// The REST API additionally admits [`DESKTOP_ORIGINS`], including when nothing
-/// is configured, so the desktop app reaches realms it did not deploy itself.
-/// That is safe because REST authenticates by bearer token and never by cookie,
-/// which makes the origin allowlist defense in depth rather than the
-/// authorization boundary; operators can still opt out with `DESKTOP_CORS=off`.
+/// Cross-origin origins shared by REST and S3; empty denies S3 and `*` allows all.
+/// REST also permits desktop origins because bearer tokens, not cookies, authorize requests.
+/// Operators can disable the desktop exception with `DESKTOP_CORS=off`.
 #[derive(Clone, Debug)]
 pub struct CorsConfig {
     allowed_origins: Vec<String>,
@@ -192,7 +190,7 @@ impl CorsConfig {
             header::ACCESS_CONTROL_ALLOW_HEADERS,
             requested_headers
                 .cloned()
-                .unwrap_or_else(|| HeaderValue::from_static(S3_DEFAULT_ALLOWED_HEADERS)),
+                .unwrap_or_else(|| HeaderValue::from_static(S3_ALLOWED_HEADERS)),
         );
         headers.insert(
             header::ACCESS_CONTROL_MAX_AGE,
@@ -204,7 +202,7 @@ impl CorsConfig {
 
     /// Adds CORS headers to a normal (non-preflight) S3 response when the
     /// request origin is allowed.
-    pub fn apply_s3_response_headers(&self, origin: Option<&HeaderValue>, headers: &mut HeaderMap) {
+    pub fn apply_s3_headers(&self, origin: Option<&HeaderValue>, headers: &mut HeaderMap) {
         let Some(origin) = origin else {
             return;
         };
@@ -378,7 +376,7 @@ mod tests {
         assert!(!config.allows(&origin));
         assert!(config.s3_preflight_headers(&origin, None).is_none());
         let mut headers = HeaderMap::new();
-        config.apply_s3_response_headers(Some(&origin), &mut headers);
+        config.apply_s3_headers(Some(&origin), &mut headers);
         assert!(headers.is_empty());
     }
 
@@ -393,7 +391,7 @@ mod tests {
                 .is_none()
         );
         let mut headers = HeaderMap::new();
-        config.apply_s3_response_headers(
+        config.apply_s3_headers(
             Some(&HeaderValue::from_static("http://portal.test")),
             &mut headers,
         );
@@ -401,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn listed_origin_is_allowed_and_reflected() {
+    fn listed_origin_reflected() {
         let config = CorsConfig::new(vec!["http://portal.test".to_string()]);
         let origin = HeaderValue::from_static("http://portal.test");
         assert!(config.allows(&origin));
@@ -414,7 +412,7 @@ mod tests {
         );
 
         let mut response_headers = HeaderMap::new();
-        config.apply_s3_response_headers(Some(&origin), &mut response_headers);
+        config.apply_s3_headers(Some(&origin), &mut response_headers);
         assert_eq!(
             response_headers
                 .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
@@ -432,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_allows_any_origin() {
+    fn wildcard_allows_origin() {
         let config = CorsConfig::new(vec!["*".to_string()]);
         let origin = HeaderValue::from_static("http://anywhere.test");
         assert!(config.allows(&origin));
@@ -444,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_echoes_requested_headers() {
+    fn preflight_echoes_headers() {
         let config = CorsConfig::new(vec!["http://portal.test".to_string()]);
         let requested = HeaderValue::from_static("authorization,x-amz-meta-custom");
         let headers = config

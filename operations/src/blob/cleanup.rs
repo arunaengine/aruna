@@ -1,18 +1,26 @@
+//! Works off the blob cleanup backlog and sweeps multipart uploads that went stale.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::time::Duration;
 
-use crate::replication::util::dht_registration_effect;
+use crate::replication::dht_registration::dht_registration_effect;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, GROUP_STORAGE_BACKEND_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, COMPLETION_DEADLINE_MS,
-    GroupStorageBackend, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey,
-    MultipartUploadStatus, RealmId, RoCrateLimits, WriteOwner,
+use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
+};
+use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::storage::multipart::{
+    COMPLETION_DEADLINE_MS, MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
@@ -20,9 +28,9 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::group_backends::{backend_key, parse_read};
+use crate::groups::backends::{backend_key, parse_read};
 use crate::jobs::store::iter_prefix_page;
-use crate::s3::abort_multipart_upload::{AbortMultipartUploadInput, AbortMultipartUploadOperation};
+use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -30,11 +38,10 @@ const CLEANUP_PAGE_SIZE: usize = 128;
 const MAX_CLEANUP_RETRIES: u8 = 3;
 /// An `Open` upload nobody added to or aborted is abandoned; S3 lifecycle rules
 /// use the same order of magnitude.
-const UPLOAD_OPEN_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const OPEN_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// A `Completing` upload past the completion deadline lost the request that
 /// owned it; the margin keeps the sweep off a completion still running.
-const UPLOAD_COMPLETING_TTL_MS: u64 =
-    COMPLETION_DEADLINE_MS + BLOB_CLEANUP_AFTER.as_millis() as u64;
+const COMPLETING_TTL_MS: u64 = COMPLETION_DEADLINE_MS + BLOB_CLEANUP_AFTER.as_millis() as u64;
 /// Aborts are transactional, so one run reclaims a bounded slice of the backlog.
 const UPLOAD_SWEEP_BATCH: usize = 32;
 
@@ -115,9 +122,9 @@ fn cleanup_row_write(work: &BlobCleanupWork, key: &Key) -> Option<Effect> {
     }
 }
 
-pub fn schedule_blob_cleanup_effect() -> Effect {
+pub fn schedule_cleanup_effect() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::DrainBlobCleanupQueue,
+        key: TaskKey::DrainCleanupQueue,
         after: Duration::ZERO,
     })
 }
@@ -200,11 +207,11 @@ fn stale_upload(record: &MultipartUpload, now_ms: u64) -> bool {
         .map(|since| now_ms.saturating_sub(since.as_millis() as u64))
         .unwrap_or_default();
     match record.status {
-        MultipartUploadStatus::Open => age >= UPLOAD_OPEN_TTL_MS,
+        MultipartUploadStatus::Open => age >= OPEN_TTL_MS,
         MultipartUploadStatus::Completing => record
             .completing_since_ms
-            .map(|since| now_ms.saturating_sub(since) >= UPLOAD_COMPLETING_TTL_MS)
-            .unwrap_or(age >= UPLOAD_COMPLETING_TTL_MS),
+            .map(|since| now_ms.saturating_sub(since) >= COMPLETING_TTL_MS)
+            .unwrap_or(age >= COMPLETING_TTL_MS),
         MultipartUploadStatus::Aborting => false,
     }
 }
@@ -223,7 +230,7 @@ pub async fn sweep_stale_uploads(
     while stale.len() < UPLOAD_SWEEP_BATCH {
         let (values, next) = iter_prefix_page(
             &context.storage_handle,
-            S3_MULTIPART_UPLOAD_KEYSPACE,
+            UPLOAD_KEYSPACE,
             None,
             start_after,
             CLEANUP_PAGE_SIZE,
@@ -249,7 +256,7 @@ pub async fn sweep_stale_uploads(
     for record in stale {
         let upload_id = record.upload_id;
         match drive(
-            AbortMultipartUploadOperation::new(AbortMultipartUploadInput {
+            AbortUploadOperation::new(AbortUploadInput {
                 bucket: record.bucket,
                 key: record.key,
                 upload_id,
@@ -287,12 +294,12 @@ async fn is_removed_backend(context: &DriverContext, backend: &BackendRef) -> bo
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
             key: backend_key(*backend_id),
             txn_id: None,
         })
         .await;
-    matches!(parse_read(event, GroupStorageBackend::from_bytes), Ok(None))
+    matches!(parse_read(event, GroupStorage::from_bytes), Ok(None))
 }
 
 async fn delete_cleanup_rows(
@@ -424,8 +431,8 @@ async fn owns_write(
             upload_id,
             part_number,
         } => (
-            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
-            MultipartUploadPartKey::new(*upload_id, *part_number)
+            UPLOAD_PART_KEYSPACE,
+            MultipartPartKey::new(*upload_id, *part_number)
                 .to_bytes()
                 .ok()?
                 .into(),
@@ -448,7 +455,7 @@ async fn owns_write(
     };
     let owned = match owner {
         WriteOwner::Blob { .. } => BackendLocation::from_bytes(&value).ok()?,
-        WriteOwner::UploadPart { .. } => MultipartUploadPart::from_bytes(&value).ok()?.location,
+        WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
     };
     Some(owned.same_object(location))
 }
@@ -458,13 +465,14 @@ mod tests {
     use super::{CLEANUP_PAGE_SIZE, MAX_CLEANUP_RETRIES, PendingCleanup, process_cleanup_batch};
     use crate::driver::DriverContext;
     use crate::jobs::store::iter_prefix_page;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
-    use aruna_core::structs::{
-        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, RoCrateLimits, WriteOwner,
+    use aruna_core::structs::execution::job::RoCrateLimits;
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
     };
-    use aruna_core::types::UserId;
     use aruna_storage::storage::{FjallStorage, StorageHandle};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -486,7 +494,7 @@ mod tests {
     }
 
     fn delete_work() -> Vec<u8> {
-        let realm_id = aruna_core::structs::RealmId::from_bytes([3u8; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([3u8; 32]);
         BlobCleanupWork::DeleteBlob {
             location: BackendLocation {
                 backend: BackendRef::node_default(),
@@ -681,9 +689,8 @@ mod tests {
 
     #[tokio::test]
     async fn unowned_write_deletes() {
-        // Without a location row naming this copy the commit never landed, so
-        // the bytes have to go; this context has no blob handle, so the delete
-        // fails and the row stays for the next drain.
+        // Without a location row the commit never landed, so the bytes must
+        // go; no blob handle here, so the delete fails and the row waits.
         let (_dir, storage, context) = setup_context();
         let BlobCleanupWork::DeleteBlob { location } =
             BlobCleanupWork::from_bytes(&delete_work()).unwrap()

@@ -1,3 +1,7 @@
+//! Builds the Kubernetes objects an attempt needs, from Job to volumes and policies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 

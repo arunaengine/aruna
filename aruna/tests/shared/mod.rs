@@ -1,50 +1,53 @@
+//! Shared test harness: spawns seed and joiner nodes and builds tokens, groups and S3 clients.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 #![allow(dead_code)]
 
 use aruna::bootstrap::{
-    fetch_core_onboarding_documents, prepare_core_documents, publish_core_documents,
-    realm_bootstrap_exists, wait_for_onboarding_placement,
+    fetch_core_documents, prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
+    wait_for_placement,
 };
-use aruna::config::{
-    Config, mark_node_state_complete, mark_onboarding_phase, read_settings, resolve_settings,
-};
+use aruna::config::{Config, resolve_settings};
+use aruna::identity::{mark_onboarding_phase, mark_state_complete};
+use aruna::settings::read_settings_from;
 use aruna_api::cors::CorsConfig;
-use aruna_api::ops::{OpsState, Readiness, serve_ops};
-use aruna_api::routes::credentials::{
-    CreateS3CredentialsRequest, CreateS3CredentialsResponse, CreateS3PathRestriction,
-};
+use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
+use aruna_api::routes::credentials::{CreatePathRestriction, CreateS3Request, CreateS3Response};
 use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupInfoResponse};
-use aruna_api::s3::s3_server::{S3Server, S3ServerTimeouts};
+use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
+use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
-use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{
-    CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
+    CreateSecretRequest, CreateSecretResponse, OnboardingMode, OnboardingPhase,
 };
-use aruna_core::structs::{
-    Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, ManagedCopyQuarantine,
-    NodeCapabilities, NodeUrls, PathRestriction, RealmId, TokenClaims, UserAccess,
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction, TokenClaims};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BlobTimeoutConfig, ManagedCopyQuarantine, UserAccess,
 };
+use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::announce_realm_presence::{
-    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
-};
-use aruna_operations::claim_initial_realm_admin::{
-    ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-};
-use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
-use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::node_info::seed_node_info_document;
-use aruna_operations::placement_policy::{SubjectScanMode, sync_subject};
-use aruna_operations::s3::get_user_access::GetUserAccessOperation;
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::node::node_info::seed_info_document;
+use aruna_operations::placement::policy::{SubjectScanMode, sync_subject};
+use aruna_operations::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
+use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::realm::get_nodes::GetNodesOperation;
+use aruna_operations::s3::access::get::GetAccessOperation;
+use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
@@ -54,11 +57,10 @@ use reqwest::StatusCode;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout as time_limit};
 use ulid::Ulid;
@@ -100,23 +102,23 @@ enum NodeServiceMode {
 }
 
 #[derive(Clone, Debug)]
-struct FullNodeStorageConfig {
+struct FullStorageConfig {
     metadata_storage_path: String,
     blob_root: String,
     blob_bucket_prefix: Option<String>,
-    blob_max_bucket_size: Option<u64>,
+    blob_bucket_size: Option<u64>,
     blob_multipart_bucket: Option<String>,
     blob_timeouts: BlobTimeoutConfig,
 }
 
-impl FullNodeStorageConfig {
+impl FullStorageConfig {
     fn for_temp_dir(temp_dir: &TempDir) -> Self {
         let root = temp_dir.path();
         Self {
             metadata_storage_path: root.join("craqle").display().to_string(),
             blob_root: root.join("blobstore").display().to_string(),
             blob_bucket_prefix: None,
-            blob_max_bucket_size: Some(100_000),
+            blob_bucket_size: Some(100_000),
             blob_multipart_bucket: Some("uploaded-parts".to_string()),
             blob_timeouts: BlobTimeoutConfig::default(),
         }
@@ -127,7 +129,7 @@ impl FullNodeStorageConfig {
             metadata_storage_path: config.metadata_storage_path.clone(),
             blob_root: config.blob_root.clone(),
             blob_bucket_prefix: config.blob_bucket_prefix.clone(),
-            blob_max_bucket_size: config.blob_max_bucket_size,
+            blob_bucket_size: config.blob_bucket_size,
             blob_multipart_bucket: config.blob_multipart_bucket.clone(),
             blob_timeouts: config.blob_timeout_config(),
         }
@@ -139,7 +141,7 @@ impl FullNodeStorageConfig {
             root: self.blob_root.clone(),
             service_config: HashMap::new(),
             bucket_prefix: self.blob_bucket_prefix.clone(),
-            max_bucket_size: self.blob_max_bucket_size,
+            max_bucket_size: self.blob_bucket_size,
             multipart_bucket: self.blob_multipart_bucket.clone(),
             timeouts: self.blob_timeouts,
         }
@@ -165,7 +167,7 @@ pub(crate) struct SeedNode {
     pub(crate) readiness: Readiness,
     pub(crate) s3: Option<S3Endpoint>,
     server_task: JoinHandle<()>,
-    s3_task: Option<JoinHandle<()>>,
+    s3_task: Option<S3ServerHandle>,
     ops_task: JoinHandle<()>,
 }
 
@@ -180,7 +182,7 @@ impl SeedNode {
         let _ = self.server_task.await;
         let _ = self.ops_task.await;
         if let Some(s3_task) = self.s3_task {
-            let _ = s3_task.await;
+            s3_task.wait().await;
         }
         hang_cap("seed net shutdown", self.net.shutdown()).await;
     }
@@ -195,7 +197,7 @@ pub(crate) struct JoinerNode {
     pub(crate) base_url: String,
     pub(crate) s3: Option<S3Endpoint>,
     server_task: JoinHandle<()>,
-    s3_task: Option<JoinHandle<()>>,
+    s3_task: Option<S3ServerHandle>,
 }
 
 impl JoinerNode {
@@ -207,7 +209,7 @@ impl JoinerNode {
         }
         let _ = self.server_task.await;
         if let Some(s3_task) = self.s3_task {
-            let _ = s3_task.await;
+            s3_task.wait().await;
         }
         hang_cap("joiner net shutdown", self.net.shutdown()).await;
     }
@@ -237,26 +239,6 @@ where
 /// sequential network shutdowns.
 pub(crate) async fn shutdown_pair(joiner: JoinerNode, seed: SeedNode) {
     tokio::join!(joiner.shutdown(), seed.shutdown());
-}
-
-struct EnvVarGuard {
-    previous: Vec<(String, Option<String>)>,
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.drain(..) {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-    }
-}
-
-pub(crate) fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub(crate) async fn wait_until<F, Fut>(
@@ -289,7 +271,7 @@ where
     }
 }
 
-pub(crate) async fn wait_for_realm_nodes(
+pub(crate) async fn wait_realm_nodes(
     contexts: &[&DriverContext],
     realm_id: &RealmId,
     expected: usize,
@@ -300,7 +282,7 @@ pub(crate) async fn wait_for_realm_nodes(
         Duration::from_millis(100),
         || async {
             for context in contexts {
-                match drive(GetRealmNodesOperation::new(*realm_id), context).await {
+                match drive(GetNodesOperation::new(*realm_id), context).await {
                     Ok(nodes) if nodes.len() == expected => {}
                     _ => return false,
                 }
@@ -334,7 +316,7 @@ pub(crate) async fn create_bearer_token(
     .await?)
 }
 
-pub(crate) fn sign_scoped_bearer_token(
+pub(crate) fn sign_scoped_token(
     seed: &SeedNode,
     user_id: UserId,
     path_restrictions: Vec<PathRestriction>,
@@ -370,18 +352,12 @@ pub(crate) async fn get_user_access(
     context: &DriverContext,
     access_key_id: &str,
 ) -> TestResult<UserAccess> {
-    let access = drive(
-        GetUserAccessOperation::new(access_key_id.to_string()),
-        context,
-    )
-    .await?
-    .ok_or_else(|| std::io::Error::other("user access not found"))?
-    .map_err(|err| std::io::Error::other(err.to_string()))?;
+    let access = drive(GetAccessOperation::new(access_key_id.to_string()), context).await?;
 
     Ok(access)
 }
 
-pub(crate) async fn create_group_via_http(
+pub(crate) async fn create_group_http(
     base_url: &str,
     bearer_token: &str,
     name: &str,
@@ -406,7 +382,7 @@ pub(crate) async fn create_group_via_http(
     Ok(response.json().await?)
 }
 
-pub(crate) async fn get_group_via_http(
+pub(crate) async fn get_group_http(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
@@ -428,7 +404,7 @@ pub(crate) async fn get_group_via_http(
     Ok(response.json().await?)
 }
 
-pub(crate) async fn wait_for_group_via_http(
+pub(crate) async fn wait_group_http(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
@@ -438,31 +414,31 @@ pub(crate) async fn wait_for_group_via_http(
         WAIT_CAP,
         Duration::from_millis(100),
         || async {
-            get_group_via_http(base_url, bearer_token, group_id)
+            get_group_http(base_url, bearer_token, group_id)
                 .await
                 .is_ok()
         },
     )
     .await?;
 
-    get_group_via_http(base_url, bearer_token, group_id).await
+    get_group_http(base_url, bearer_token, group_id).await
 }
 
-pub(crate) async fn create_s3_credentials_via_http(
+pub(crate) async fn create_s3_credentials(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
 ) -> TestResult<S3Credentials> {
-    create_s3_credentials_with_restrictions_via_http(base_url, bearer_token, group_id, None).await
+    create_restricted_credentials(base_url, bearer_token, group_id, None).await
 }
 
-pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
+pub(crate) async fn create_restricted_credentials(
     base_url: &str,
     bearer_token: &str,
     group_id: &str,
-    path_restrictions: Option<Vec<CreateS3PathRestriction>>,
+    path_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> TestResult<S3Credentials> {
-    wait_for_group_via_http(base_url, bearer_token, group_id).await?;
+    wait_group_http(base_url, bearer_token, group_id).await?;
 
     let client = reqwest::Client::new();
     let deadline = Instant::now() + WAIT_CAP;
@@ -471,7 +447,7 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
         let response = client
             .post(format!("{base_url}/api/v1/access/credentials"))
             .bearer_auth(bearer_token)
-            .json(&CreateS3CredentialsRequest {
+            .json(&CreateS3Request {
                 group_id: group_id.to_string(),
                 expires_in_seconds: Some(600),
                 path_restrictions: path_restrictions.clone(),
@@ -479,7 +455,7 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
             .send()
             .await?;
         if response.status() == StatusCode::CREATED {
-            let response: CreateS3CredentialsResponse = response.json().await?;
+            let response: CreateS3Response = response.json().await?;
             return Ok(S3Credentials {
                 access_key_id: response.access_key_id,
                 access_secret: response.access_secret,
@@ -500,7 +476,7 @@ pub(crate) async fn create_s3_credentials_with_restrictions_via_http(
 }
 
 #[allow(dead_code)]
-pub(crate) async fn revoke_s3_credentials_via_http(
+pub(crate) async fn revoke_s3_credentials(
     base_url: &str,
     bearer_token: &str,
     access_key_id: &str,
@@ -524,17 +500,17 @@ pub(crate) async fn revoke_s3_credentials_via_http(
 }
 
 pub(crate) fn s3_client(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {
-    s3_client_with_retries(endpoint, credentials, true)
+    s3_client_retries(endpoint, credentials, true)
 }
 
 /// Builds a client with SDK retries disabled so deterministic rejections (for
 /// example a 501 for unsupported SSE) surface immediately instead of retrying.
 #[allow(dead_code)]
-pub(crate) fn s3_client_no_retry(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {
-    s3_client_with_retries(endpoint, credentials, false)
+pub(crate) fn s3_client_once(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S3Client {
+    s3_client_retries(endpoint, credentials, false)
 }
 
-fn s3_client_with_retries(
+fn s3_client_retries(
     endpoint: &S3Endpoint,
     credentials: &S3Credentials,
     retries: bool,
@@ -566,12 +542,12 @@ pub(crate) fn bucket_arn(realm_id: &RealmId, node_id: iroh::PublicKey, bucket: &
 
 #[allow(dead_code)]
 pub(crate) async fn spawn_seed_node() -> TestResult<SeedNode> {
-    spawn_seed_node_with_mode(NodeServiceMode::Minimal, None).await
+    spawn_seed_mode(NodeServiceMode::Minimal, None).await
 }
 
 #[allow(dead_code)]
-pub(crate) async fn spawn_full_seed_node() -> TestResult<SeedNode> {
-    spawn_seed_node_with_mode(NodeServiceMode::Full, None).await
+pub(crate) async fn spawn_complete_seed() -> TestResult<SeedNode> {
+    spawn_seed_mode(NodeServiceMode::Full, None).await
 }
 
 /// A full node whose own runtime can launch and run executions: the registry is
@@ -579,10 +555,10 @@ pub(crate) async fn spawn_full_seed_node() -> TestResult<SeedNode> {
 /// backend a launch is admitted against.
 #[allow(dead_code)]
 pub(crate) async fn spawn_compute_seed(compute: Arc<ExecutorRegistry>) -> TestResult<SeedNode> {
-    spawn_seed_node_with_mode(NodeServiceMode::Full, Some(compute)).await
+    spawn_seed_mode(NodeServiceMode::Full, Some(compute)).await
 }
 
-pub(crate) async fn create_onboarding_secret_via_http(
+pub(crate) async fn create_onboarding_secret(
     seed: &SeedNode,
     mode: OnboardingMode,
 ) -> TestResult<String> {
@@ -600,7 +576,7 @@ pub(crate) async fn create_onboarding_secret_via_http(
             seed.base_url
         ))
         .bearer_auth(token)
-        .json(&CreateOnboardingSecretRequest {
+        .json(&CreateSecretRequest {
             seed_url: seed.base_url.clone(),
             mode: mode.into(),
             expires_in_seconds: Some(600),
@@ -614,8 +590,16 @@ pub(crate) async fn create_onboarding_secret_via_http(
         ))
         .into());
     }
-    let response: CreateOnboardingSecretResponse = response.json().await?;
+    let response: CreateSecretResponse = response.json().await?;
     Ok(response.onboarding_secret)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn spawn_complete_joiner(
+    seed: &SeedNode,
+    onboarding_secret: String,
+) -> TestResult<JoinerNode> {
+    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Full).await
 }
 
 #[allow(dead_code)]
@@ -623,18 +607,10 @@ pub(crate) async fn spawn_joiner_node(
     seed: &SeedNode,
     onboarding_secret: String,
 ) -> TestResult<JoinerNode> {
-    spawn_joiner_node_with_mode(seed, onboarding_secret, NodeServiceMode::Minimal).await
+    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Minimal).await
 }
 
-#[allow(dead_code)]
-pub(crate) async fn spawn_full_joiner_node(
-    seed: &SeedNode,
-    onboarding_secret: String,
-) -> TestResult<JoinerNode> {
-    spawn_joiner_node_with_mode(seed, onboarding_secret, NodeServiceMode::Full).await
-}
-
-async fn spawn_seed_node_with_mode(
+async fn spawn_seed_mode(
     mode: NodeServiceMode,
     compute: Option<Arc<ExecutorRegistry>>,
 ) -> TestResult<SeedNode> {
@@ -659,7 +635,7 @@ async fn spawn_seed_node_with_mode(
     )
     .await?;
     let full_storage_config =
-        (mode == NodeServiceMode::Full).then(|| FullNodeStorageConfig::for_temp_dir(&temp_dir));
+        (mode == NodeServiceMode::Full).then(|| FullStorageConfig::for_temp_dir(&temp_dir));
     let compute_enabled = compute.is_some();
     let context =
         initialize_context(storage, net.clone(), full_storage_config.as_ref(), compute).await?;
@@ -693,7 +669,7 @@ async fn spawn_seed_node_with_mode(
         .await
         .map_err(std::io::Error::other)?;
     }
-    seed_node_info_document(
+    seed_info_document(
         context.as_ref(),
         net.node_id(),
         realm_id,
@@ -707,17 +683,15 @@ async fn spawn_seed_node_with_mode(
     let documents =
         prepare_core_documents(context.as_ref(), net.node_id(), realm_id, true, true).await?;
     publish_core_documents(context.as_ref(), net.node_id(), realm_id, true, documents).await?;
-    // Mirrors the startup path in main.rs: the seed is rank-0 holder of every
-    // shard in its single-node realm and must create the shard topic geneses
-    // eagerly, or its first shard-classed writes defer forever.
-    aruna_operations::process_placements::process_shard_placements(
+    // The single-node seed owns rank zero and creates shard geneses before writes.
+    aruna_operations::placement::process_placements::process_shard_placements(
         &context,
         realm_id,
         net.node_id(),
     )
     .await;
     drive(
-        ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+        ClaimInitialOperation::new(ClaimInitialInput {
             actor: Actor {
                 node_id: net.node_id(),
                 user_id,
@@ -738,7 +712,7 @@ async fn spawn_seed_node_with_mode(
     )
     .await?;
     let metrics = state.metrics();
-    let (s3, s3_task) = spawn_optional_s3_server(
+    let (s3, s3_task) = spawn_optional_s3(
         mode,
         context.clone(),
         realm_id,
@@ -765,17 +739,17 @@ async fn spawn_seed_node_with_mode(
     })
 }
 
-async fn spawn_joiner_node_with_mode(
+async fn spawn_joiner_mode(
     seed: &SeedNode,
     onboarding_secret: String,
     mode: NodeServiceMode,
 ) -> TestResult<JoinerNode> {
     let joiner_dir = tempfile::tempdir()?;
-    let (config, storage_handle) = load_config_with_env(&joiner_dir, onboarding_secret).await?;
+    let (config, storage_handle) = load_env_config(&joiner_dir, onboarding_secret).await?;
 
     let joiner_net = NetHandle::new(
         NetConfig {
-            bind_addr: config.p2p_socket_addr,
+            bind_addr: config.p2p_addr,
             secret_key: Some(config.net_secret_key.clone()),
             realm_id: config.realm_id,
             peer_nodes: config.peer_nodes.clone(),
@@ -783,9 +757,9 @@ async fn spawn_joiner_node_with_mode(
             temporary_bootstrap_active: config.temporary_bootstrap_active,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
-            max_concurrent_uni_streams: config.max_concurrent_uni_streams,
-            max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
-            document_sync_storage_path: Some(config.document_sync_storage_path.clone()),
+            max_uni_streams: config.max_uni_streams,
+            max_bidi_streams: config.max_bidi_streams,
+            sync_storage_path: Some(config.sync_storage_path.clone()),
             document_sync_runtime: Some(config.document_sync_runtime),
             fjall_persist_policy: config.fjall_persist_policy,
         },
@@ -793,7 +767,7 @@ async fn spawn_joiner_node_with_mode(
     )
     .await?;
     let full_storage_config =
-        (mode == NodeServiceMode::Full).then(|| FullNodeStorageConfig::from_config(&config));
+        (mode == NodeServiceMode::Full).then(|| FullStorageConfig::from_config(&config));
     let joiner_context = initialize_context(
         storage_handle,
         joiner_net.clone(),
@@ -804,7 +778,7 @@ async fn spawn_joiner_node_with_mode(
     seed.net.add_peer_addr(joiner_net.endpoint_addr()).await;
     announce_realm_presence(seed.context.as_ref(), &seed.realm_id, seed.net.node_id()).await?;
 
-    fetch_core_onboarding_documents(
+    fetch_core_documents(
         &joiner_context,
         &config.node_state,
         &config.realm_id,
@@ -813,7 +787,7 @@ async fn spawn_joiner_node_with_mode(
     )
     .await?;
     assert!(realm_bootstrap_exists(joiner_context.as_ref(), &config.realm_id).await?);
-    wait_for_onboarding_placement(
+    wait_for_placement(
         &joiner_context,
         config.realm_id,
         config.node_id,
@@ -828,7 +802,7 @@ async fn spawn_joiner_node_with_mode(
         OnboardingPhase::CoreDocumentsFetched,
     )
     .await?;
-    seed_node_info_document(
+    seed_info_document(
         joiner_context.as_ref(),
         config.node_id,
         config.realm_id,
@@ -855,17 +829,16 @@ async fn spawn_joiner_node_with_mode(
         documents,
     )
     .await?;
-    mark_node_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
-    // Mirrors the startup path in main.rs: join the held shard topics from
-    // co-holders, then create the geneses of shards this node is now rank-0
-    // holder of (join-before-create adopts geneses the seed already made).
-    aruna_operations::startup::restore_shard_subscriptions(
+    mark_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
+    // Join co-holder shard topics before creating rank-zero geneses.
+    // This ordering adopts geneses already created by the seed.
+    aruna_operations::node::startup::restore_shard_subscriptions(
         &joiner_context,
         config.node_id,
         config.realm_id,
     )
     .await;
-    aruna_operations::process_placements::reconcile_shard_topics(
+    aruna_operations::placement::process_placements::reconcile_shard_topics(
         &joiner_context,
         config.realm_id,
         config.node_id,
@@ -880,7 +853,7 @@ async fn spawn_joiner_node_with_mode(
         config.node_capabilities.clone(),
     )
     .await?;
-    let (s3, s3_task) = spawn_optional_s3_server(
+    let (s3, s3_task) = spawn_optional_s3(
         mode,
         joiner_context.clone(),
         config.realm_id,
@@ -904,7 +877,7 @@ async fn spawn_joiner_node_with_mode(
 async fn initialize_context(
     storage_handle: StorageHandle,
     net: NetHandle,
-    full_storage_config: Option<&FullNodeStorageConfig>,
+    full_storage_config: Option<&FullStorageConfig>,
     compute: Option<Arc<ExecutorRegistry>>,
 ) -> TestResult<Arc<DriverContext>> {
     let task_handle = TaskHandle::new();
@@ -941,11 +914,13 @@ async fn initialize_context(
         task_handle: Some(task_handle.clone()),
         compute_handle: compute,
     });
-    initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    initialize_incoming_fixture(context.clone());
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    start_task_queues(
         context.clone(),
         task_handle,
         aruna_operations::jobs::runtime::JobsRuntime::new(),
+        &shutdown,
     )
     .await;
     Ok(context)
@@ -957,7 +932,7 @@ async fn announce_realm_presence(
     node_id: iroh::PublicKey,
 ) -> TestResult<()> {
     drive(
-        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
             realm_id: *realm_id,
             node_id,
             schedule_refresh: true,
@@ -999,7 +974,7 @@ async fn spawn_rest_server(
         state.clone(),
         ServerConfig {
             http_addr: addr,
-            max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+            max_body_size: aruna_api::server::MAX_BODY_SIZE,
             cors: test_cors_config(),
         },
     );
@@ -1020,7 +995,7 @@ async fn spawn_ops_server(
     metrics: Arc<NodeMetrics>,
 ) -> TestResult<(String, Readiness, JoinHandle<()>)> {
     let readiness = Readiness::new();
-    let ops_state = OpsState::new(context, metrics, readiness.clone()).await;
+    let ops_state = MonitoringState::new(context, metrics, readiness.clone()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {
@@ -1029,13 +1004,13 @@ async fn spawn_ops_server(
     Ok((format!("http://{addr}"), readiness, task))
 }
 
-async fn spawn_optional_s3_server(
+async fn spawn_optional_s3(
     mode: NodeServiceMode,
     context: Arc<DriverContext>,
     realm_id: RealmId,
     node_id: iroh::PublicKey,
     metrics: Arc<NodeMetrics>,
-) -> TestResult<(Option<S3Endpoint>, Option<JoinHandle<()>>)> {
+) -> TestResult<(Option<S3Endpoint>, Option<S3ServerHandle>)> {
     if mode != NodeServiceMode::Full {
         return Ok((None, None));
     }
@@ -1049,7 +1024,7 @@ async fn spawn_s3_server(
     realm_id: RealmId,
     node_id: iroh::PublicKey,
     metrics: Arc<NodeMetrics>,
-) -> TestResult<(S3Endpoint, JoinHandle<()>)> {
+) -> TestResult<(S3Endpoint, S3ServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let bind_addr = listener.local_addr()?;
     let address = bind_addr.to_string();
@@ -1083,50 +1058,44 @@ async fn spawn_s3_server(
     ))
 }
 
-async fn load_config_with_env(
+async fn load_env_config(
     joiner_dir: &TempDir,
     onboarding_secret: String,
 ) -> TestResult<(Config, StorageHandle)> {
-    let vars = [
+    let env: std::collections::BTreeMap<String, String> = [
         (
-            "STORAGE_PATH",
+            "STORAGE_PATH".to_string(),
             joiner_dir.path().to_str().unwrap().to_string(),
         ),
-        ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
-        ("P2P_SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
-        ("S3_HOST", "127.0.0.1:0".to_string()),
+        ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+        ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+        ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
         (
-            "API_PUBLIC_URL",
+            "API_PUBLIC_URL".to_string(),
             "https://api.joiner.example.test".to_string(),
         ),
         (
-            "S3_PUBLIC_URL",
+            "S3_PUBLIC_URL".to_string(),
             "https://s3.joiner.example.test".to_string(),
         ),
-        ("S3_ADDRESS", "127.0.0.1:0".to_string()),
-        ("ONBOARDING_SECRET", onboarding_secret),
-        ("ARUNA_NODE_LABELS", "fixture=joiner".to_string()),
-        ("ONBOARDING_BOOTSTRAP_TIMEOUT_SECS", "600".to_string()),
-        ("ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS", "600".to_string()),
-    ];
+        ("S3_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
+        ("ONBOARDING_SECRET".to_string(), onboarding_secret),
+        (
+            "ARUNA_NODE_LABELS".to_string(),
+            "fixture=joiner".to_string(),
+        ),
+        (
+            "ONBOARDING_BOOTSTRAP_TIMEOUT_SECS".to_string(),
+            "600".to_string(),
+        ),
+        (
+            "ONBOARDING_DOCUMENT_SYNC_TIMEOUT_SECS".to_string(),
+            "600".to_string(),
+        ),
+    ]
+    .into_iter()
+    .collect();
 
-    // The lock covers the env read only: opening storage and the bootstrap
-    // round trip must not serialize every joiner spawn in the binary.
-    let settings = {
-        let _lock = env_lock().lock().await;
-        let _guard = set_env_vars(&vars);
-        read_settings()?
-    };
+    let settings = read_settings_from(&env)?;
     Ok(resolve_settings(settings).await?)
-}
-
-fn set_env_vars(vars: &[(&str, String)]) -> EnvVarGuard {
-    let previous = vars
-        .iter()
-        .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-        .collect::<Vec<_>>();
-    for (key, value) in vars {
-        unsafe { std::env::set_var(key, value) };
-    }
-    EnvVarGuard { previous }
 }

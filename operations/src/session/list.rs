@@ -1,11 +1,16 @@
+//! Lists a user's sessions by reading the owner index and then each session row.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::index::{decode_index, owner_key};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_SESSION_KEYSPACE, USER_SESSION_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::UserSession;
-use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::structs::identity::user::session::UserSession;
+use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -82,7 +87,7 @@ impl ListSessionOperation {
         self.txn_id = Some(txn_id);
         self.state = ListSessionState::ReadOwnerIndex;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_SESSION_OWNER_KEYSPACE.to_string(),
+            key_space: USER_OWNER_KEYSPACE.to_string(),
             key: owner_key(self.user_id),
             txn_id: Some(txn_id),
         })]
@@ -205,9 +210,10 @@ impl Operation for ListSessionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
-    use aruna_core::structs::{RealmId, SessionKind};
+    use aruna_core::structs::identity::auth::SessionKind;
+    use aruna_core::structs::identity::realm::RealmId;
     use byteview::ByteView;
     use std::collections::BTreeSet;
     use ulid::Ulid;

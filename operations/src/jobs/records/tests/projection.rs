@@ -1,17 +1,18 @@
-//! Truncation, cache completeness, and corrupt rows of one family projection.
+//! Tests family projection truncation, cache reuse, and corrupt or outdated cache rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_FAMILY_PROJECTION_KEYSPACE, JOB_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobPayload, JobRecord, JobRecordEnvelope, JobState, LogicalJobState, PhysicalExecutionState,
 };
 use aruna_core::types::{Key, TxnId, Value};
 
-use super::fixture::{Family, payload, user};
 use crate::jobs::records::keys::record_key;
 use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
@@ -20,6 +21,7 @@ use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::rows::{PROJECTION_CACHE_VERSION, ProjectionCache, to_bytes};
 use crate::jobs::records::{MAX_PROJECTION_RECORDS, RecordStoreError};
 use crate::jobs::store::JobWrites;
+use crate::tests::records::{Family, payload, user};
 
 /// What one sans-I/O run of the projection did, with no storage behind it.
 struct Run {
@@ -38,7 +40,7 @@ impl Run {
     fn cache_row(&self) -> Option<ProjectionCache> {
         self.writes
             .iter()
-            .find(|(key_space, _, _)| key_space.as_str() == JOB_FAMILY_PROJECTION_KEYSPACE)
+            .find(|(key_space, _, _)| key_space.as_str() == FAMILY_PROJECTION_KEYSPACE)
             .and_then(|(_, _, value)| ProjectionCache::decode(value))
     }
 

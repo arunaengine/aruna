@@ -1,10 +1,12 @@
-//! Hard eligibility. Every rule here can only remove a target: stale telemetry
-//! and free capacity are ranking inputs, and exact admission happens at the
-//! target itself.
+//! Applies the hard rules that remove a target from a plan and names why it was rejected.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::compute::NetworkAccess;
 use crate::scheduling::inputs::{PlanRequest, TargetCandidate};
-use crate::structs::{PlacementDecision, PlacementPolicyRef, PlacementSubject, evaluate_placement};
+use crate::structs::placement::policy::{
+    PlacementDecision, PlacementPolicyRef, PlacementSubject, evaluate_placement,
+};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

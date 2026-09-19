@@ -1,7 +1,7 @@
-//! Automatic typed w3id lifecycle and landing resolution. Ordinary documents
-//! use `https://w3id.org/aruna/{document_id}`; Profiles use only
-//! `https://w3id.org/aruna/profile/{document_id}`. Every lifecycle read and
-//! transition routes to the document's single PID authority.
+//! Routes typed w3id lifecycle and landing resolution to each document's PID authority.
+//! Documents use /aruna/{document_id} and profiles use /aruna/profile/{document_id}.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
@@ -16,24 +16,24 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{
-    AuthContext, MetadataRegistryRecord, Permission, PersistentIdFailure, PersistentIdKind,
-    PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
+    PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
+    PersistentIdStatus,
 };
-use aruna_core::util::unix_timestamp_millis;
-use aruna_operations::get_metadata_document::load_metadata_record_by_document;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::forward::{
+use aruna_operations::metadata::get_document::load_document_record;
+use aruna_operations::metadata::persistent_id::forward::{
     read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
 
-use crate::auth::{
-    ValidatedArunaBearerTokenCarrier, ensure_permission, require_unrestricted_realm_auth,
-};
+use crate::auth::{ValidatedBearer, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::metadata::{forwarded_auth_token, map_metadata_api_error};
-use crate::server_state::ServerState;
+use crate::metadata::{forwarded_auth_token, map_api_error};
+use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -172,7 +172,8 @@ fn gone(pid: &str) -> Response {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
-enum PersistentIdStateView {
+#[schema(as = PersistentIdStateView)]
+enum PersistentStateView {
     Requested,
     Processing,
     Active,
@@ -183,36 +184,38 @@ enum PersistentIdStateView {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-struct PersistentIdFailureView {
+#[schema(as = PersistentIdFailureView)]
+struct PersistentFailureView {
     message: String,
     retryable: bool,
     recorded_at_ms: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-struct PersistentIdView {
+#[schema(as = PersistentIdView)]
+struct PersistentView {
     kind: String,
     provider: String,
     value: Option<String>,
-    state: PersistentIdStateView,
+    state: PersistentStateView,
     document_id: String,
     job_id: Option<String>,
-    failure: Option<PersistentIdFailureView>,
+    failure: Option<PersistentFailureView>,
     requested_at_ms: Option<u64>,
     minted_at_ms: Option<u64>,
     withdrawn_at_ms: Option<u64>,
 }
 
-fn status_view(mapping: &PersistentIdMapping) -> PersistentIdView {
+fn status_view(mapping: &PersistentIdMapping) -> PersistentView {
     let state = match mapping.status {
-        PersistentIdStatus::Requested => PersistentIdStateView::Requested,
-        PersistentIdStatus::Processing => PersistentIdStateView::Processing,
-        PersistentIdStatus::Active => PersistentIdStateView::Active,
-        PersistentIdStatus::Failed => PersistentIdStateView::Failed,
-        PersistentIdStatus::AdminWithdrawn => PersistentIdStateView::AdminWithdrawn,
-        PersistentIdStatus::Tombstoned => PersistentIdStateView::Tombstoned,
+        PersistentIdStatus::Requested => PersistentStateView::Requested,
+        PersistentIdStatus::Processing => PersistentStateView::Processing,
+        PersistentIdStatus::Active => PersistentStateView::Active,
+        PersistentIdStatus::Failed => PersistentStateView::Failed,
+        PersistentIdStatus::AdminWithdrawn => PersistentStateView::AdminWithdrawn,
+        PersistentIdStatus::Tombstoned => PersistentStateView::Tombstoned,
     };
-    PersistentIdView {
+    PersistentView {
         kind: match mapping.kind {
             PersistentIdKind::Conceptual => "conceptual".to_string(),
         },
@@ -228,7 +231,7 @@ fn status_view(mapping: &PersistentIdMapping) -> PersistentIdView {
                  message,
                  retryable,
                  recorded_at_ms,
-             }| PersistentIdFailureView {
+             }| PersistentFailureView {
                 message: message.clone(),
                 retryable: *retryable,
                 recorded_at_ms: *recorded_at_ms,
@@ -243,9 +246,9 @@ fn status_view(mapping: &PersistentIdMapping) -> PersistentIdView {
 fn synthetic_status_view(
     document_id: Ulid,
     value: Option<String>,
-    state: PersistentIdStateView,
-) -> PersistentIdView {
-    PersistentIdView {
+    state: PersistentStateView,
+) -> PersistentView {
+    PersistentView {
         kind: "conceptual".to_string(),
         provider: "w3id".to_string(),
         value,
@@ -281,13 +284,9 @@ async fn require_status_visibility(
     ensure_permission(state, auth, path, Permission::READ).await
 }
 
-/// Authenticated typed status is sourced only from the durable PID mapping.
-/// `requested`, `processing`, `active`, `failed`, `admin-withdrawn` and
-/// `tombstoned` are its stored lifecycle states; failure and job fields come
-/// from that same row, never from a possibly unreadable job endpoint.
-/// `unknown` means the caller may read the document but the authority cannot
-/// currently give a definitive record. Anonymous access to a private
-/// mapping or registry row remains 404 and is not an existence oracle.
+/// Returns authenticated status and failure facts solely from the durable PID mapping.
+/// `unknown` means the authority lacks a definitive row for a readable document.
+/// Anonymous access to private mappings remains 404 and reveals no existence.
 #[utoipa::path(
     get,
     path = "/metadata/{document_id}/pids",
@@ -308,7 +307,7 @@ needs READ on the document's frozen permission path and answers 404 anonymously.
         (
             status = 200,
             description = "Typed list containing the automatic w3id status",
-            body = [PersistentIdView],
+            body = [PersistentView],
             example = json!([
                 {
                     "kind": "conceptual",
@@ -334,10 +333,10 @@ async fn list_persistent_ids(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(document_id): Path<String>,
-) -> ServerResult<Json<Vec<PersistentIdView>>> {
+) -> ServerResult<Json<Vec<PersistentView>>> {
     let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
     let ctx = state.get_ctx();
-    let record = load_metadata_record_by_document(&ctx, document_id)
+    let record = load_document_record(&ctx, document_id)
         .await
         .map_err(|error| ServerError::InternalError(format!("{error:?}")))?;
     let routed = read_pid_routed(&ctx, state.get_realm_id(), document_id).await;
@@ -353,7 +352,7 @@ async fn list_persistent_ids(
             Ok(Json(vec![synthetic_status_view(
                 document_id,
                 None,
-                PersistentIdStateView::Unknown,
+                PersistentStateView::Unknown,
             )]))
         }
         Err(_) => {
@@ -362,20 +361,21 @@ async fn list_persistent_ids(
             Ok(Json(vec![synthetic_status_view(
                 document_id,
                 None,
-                PersistentIdStateView::Unknown,
+                PersistentStateView::Unknown,
             )]))
         }
     }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-struct WithdrawPersistentIdRequest {
+#[schema(as = WithdrawPersistentIdRequest)]
+struct WithdrawPersistentRequest {
     provider: String,
     confirm_pid: String,
     reason: String,
 }
 
-fn validated_withdrawal_reason(request: &WithdrawPersistentIdRequest) -> ServerResult<String> {
+fn validated_withdrawal_reason(request: &WithdrawPersistentRequest) -> ServerResult<String> {
     let reason = request.reason.trim();
     if request.provider != "w3id"
         || reason.is_empty()
@@ -411,7 +411,7 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentIdRequest) -> ServerR
 - `reason` is trimmed first and must then be 1 to 1024 bytes long and free of control characters."#,
     params(("document_id" = String, Path, description = "Document ULID whose PID is withdrawn, for example 01JMETADATA0123456789ABCDE")),
     request_body(
-        content = WithdrawPersistentIdRequest,
+        content = WithdrawPersistentRequest,
         description = "Provider, the exact stored PID as confirmation, and a non-empty reason",
         example = json!({
             "provider": "w3id",
@@ -432,11 +432,11 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentIdRequest) -> ServerR
 async fn withdraw_pid(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
-    Json(request): Json<WithdrawPersistentIdRequest>,
+    Json(request): Json<WithdrawPersistentRequest>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
     let reason = validated_withdrawal_reason(&request)?;
     let ctx = state.get_ctx();
@@ -449,7 +449,7 @@ async fn withdraw_pid(
     .await?;
     let existing = read_pid_routed(&ctx, state.get_realm_id(), document_id)
         .await
-        .map_err(map_metadata_api_error)?
+        .map_err(map_api_error)?
         .ok_or(ServerError::NotFound)?;
     if request.confirm_pid != existing.pid {
         return Err(ServerError::BadRequest);
@@ -464,7 +464,7 @@ async fn withdraw_pid(
         forwarded_auth_token(bearer_token)?,
     )
     .await
-    .map_err(map_metadata_api_error)?;
+    .map_err(map_api_error)?;
     if mapping.status != PersistentIdStatus::AdminWithdrawn {
         return Err(ServerError::ServiceUnavailable);
     }
@@ -516,16 +516,16 @@ mod tests {
     }
 
     #[test]
-    fn stored_intent_does_not_depend_on_job_readability() {
+    fn intent_ignores_readability() {
         let id = Ulid::from_bytes([3; 16]);
         let mapping = PersistentIdMapping::requested(
             id,
             false,
             aruna_core::UserId::local(
                 Ulid::from_bytes([4; 16]),
-                aruna_core::structs::RealmId([5; 32]),
+                aruna_core::structs::identity::realm::RealmId([5; 32]),
             ),
-            aruna_core::structs::JobId::from_bytes([6; 16]),
+            aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
             false,
             "/private/document".to_string(),
             aruna_core::structs::PersistentIdRevision {
@@ -536,14 +536,14 @@ mod tests {
         );
 
         let view = status_view(&mapping);
-        assert_eq!(view.state, PersistentIdStateView::Requested);
+        assert_eq!(view.state, PersistentStateView::Requested);
         assert_eq!(view.job_id, mapping.job_id.map(|job_id| job_id.to_string()));
         assert_eq!(view.value.as_deref(), Some(mapping.pid.as_str()));
     }
 
     #[test]
-    fn admin_withdrawal_requires_provider_confirmation_fields() {
-        let valid = WithdrawPersistentIdRequest {
+    fn withdrawal_requires_confirmation() {
+        let valid = WithdrawPersistentRequest {
             provider: "w3id".to_string(),
             confirm_pid: "https://w3id.org/aruna/example".to_string(),
             reason: "  duplicate external registration  ".to_string(),
@@ -553,7 +553,7 @@ mod tests {
             "duplicate external registration"
         );
         assert!(
-            validated_withdrawal_reason(&WithdrawPersistentIdRequest {
+            validated_withdrawal_reason(&WithdrawPersistentRequest {
                 provider: "doi".to_string(),
                 ..valid
             })

@@ -1,25 +1,23 @@
-//! Exact local capacity held for one accepted execution.
-//!
-//! Advertised availability is stale telemetry that only ranks a target. This is
-//! the authoritative admission: the reservation, the signed receipt, and the
-//! record that makes both visible commit in one transaction, so two concurrent
-//! offers can never oversubscribe the same backend and no work ever starts
-//! before its receipt is durable.
+//! Holds exact local capacity for one accepted execution and releases it again.
+//! Reservation, receipt and record commit together, so concurrent offers cannot oversubscribe.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    JOB_FAMILY_OUTBOX_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE,
+    FAMILY_OUTBOX_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
-    EffectiveResources, JobFamilyRecord, JobId, JobRecord, LaunchIntent, RealmConfigDocument,
-    RealmId, RecordVerdict,
+use aruna_core::structs::execution::job::{
+    EffectiveResources, JobFamilyRecord, JobId, JobRecord, LaunchIntent, RecordVerdict,
 };
-use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 
 use smallvec::smallvec;
 use tracing::{debug, warn};
@@ -38,7 +36,7 @@ pub const MAX_RESERVATION_SCAN: usize = 512;
 
 /// Capacity held for one physical execution: the shared core contract, written
 /// with the receipt and released at that execution's terminal state.
-pub use aruna_core::compute_quota::JobReservationRecord as ExecutionReservation;
+pub use aruna_core::compute::quota::JobReservationRecord as ExecutionReservation;
 
 pub fn reservation_key(execution_id: Ulid) -> Key {
     Key::from(execution_id.to_bytes().as_slice())
@@ -188,13 +186,13 @@ impl ReserveExecutionOperation {
         }
     }
 
-    fn family(&self) -> aruna_core::structs::JobFamilyId {
+    fn family(&self) -> aruna_core::structs::execution::job::JobFamilyId {
         self.config.receipt.envelope().family()
     }
 
     fn read_config(&mut self) -> Effects {
         self.state = ReserveState::ReadConfig;
-        let target = DocumentSyncTarget::RealmConfig {
+        let target = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
         smallvec![Effect::Storage(StorageEffect::Read {
@@ -236,7 +234,7 @@ impl ReserveExecutionOperation {
         }
         self.state = ReserveState::ReadCache { txn_id };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+            key_space: FAMILY_PROJECTION_KEYSPACE.to_string(),
             key: family_prefix(&self.family()),
             txn_id: Some(txn_id),
         })]
@@ -294,12 +292,12 @@ impl ReserveExecutionOperation {
                 ),
             ),
             (
-                JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                FAMILY_RECORD_KEYSPACE.to_string(),
                 key.clone(),
                 Value::from(to_bytes(receipt)?.as_slice()),
             ),
             (
-                JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+                FAMILY_OUTBOX_KEYSPACE.to_string(),
                 key,
                 Value::from(
                     to_bytes(&OutboxEntry {
@@ -312,7 +310,7 @@ impl ReserveExecutionOperation {
                 ),
             ),
             (
-                JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+                FAMILY_PROJECTION_KEYSPACE.to_string(),
                 family_prefix(&self.family()),
                 Value::from(
                     to_bytes(&ProjectionCache::invalidated(self.cache.as_ref()))?.as_slice(),
@@ -322,9 +320,7 @@ impl ReserveExecutionOperation {
         writes.extend(
             job_insert_entries(self.config.record.as_ref())?
                 .into_iter()
-                .filter(|(key_space, _, _)| {
-                    key_space != aruna_core::keyspaces::JOB_OWNER_INDEX_KEYSPACE
-                }),
+                .filter(|(key_space, _, _)| key_space != aruna_core::keyspaces::JOB_INDEX_KEYSPACE),
         );
         Ok(writes)
     }
@@ -652,7 +648,7 @@ impl Operation for ReleaseExecutionOperation {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use aruna_core::errors::StorageError;
 
@@ -661,7 +657,7 @@ mod tests {
         // An event this state cannot accept must fail the release and close its
         // transaction instead of being ignored.
         let txn_id = TxnId::generate();
-        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(1, 1));
         operation.state = ReleaseState::Read { txn_id };
 
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
@@ -683,7 +679,7 @@ mod tests {
     fn release_aborts_txn() {
         // A dropped release must never leak the write transaction it opened.
         let txn_id = TxnId::generate();
-        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(2, 2));
         operation.state = ReleaseState::Delete { txn_id };
 
         assert!(matches!(
@@ -692,7 +688,7 @@ mod tests {
                 if *aborted == txn_id
         ));
         assert!(
-            ReleaseExecutionOperation::new(Ulid::generate())
+            ReleaseExecutionOperation::new(Ulid::from_parts(3, 3))
                 .abort()
                 .is_empty()
         );
@@ -702,7 +698,7 @@ mod tests {
     fn rejects_commit_error() {
         // A failed durable release must remain a retryable error.
         let txn_id = TxnId::generate();
-        let mut operation = ReleaseExecutionOperation::new(Ulid::generate());
+        let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(4, 4));
         operation.state = ReleaseState::Commit { txn_id };
         operation.outcome = Some(Ok(true));
 

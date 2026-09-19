@@ -1,3 +1,7 @@
+//! Plans which task inputs are staged as files and which are mounted from object storage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -5,7 +9,7 @@ use aruna_core::compute::{
     BackendError, InputStream, StagingMode, TaskSpec, has_wildcard, literal_prefix,
     normalize_container_path, paths_overlap,
 };
-use aruna_core::structs::ensure_confined_relative_path;
+use aruna_core::structs::storage::blob::ensure_confined_path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageLayout {
@@ -103,7 +107,7 @@ impl StageLayout {
         let mut mounts = Vec::with_capacity(spec.s3_mounts.len());
         for mount in &spec.s3_mounts {
             let path = normalize_container_path(&mount.path).map_err(BackendError::InvalidSpec)?;
-            ensure_confined_relative_path(Path::new(&mount.key))
+            ensure_confined_path(Path::new(&mount.key))
                 .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
             if mount.bucket.is_empty() || !input_paths.insert(path.clone()) {
                 return Err(BackendError::InvalidSpec(format!(

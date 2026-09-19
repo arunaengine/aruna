@@ -1,8 +1,12 @@
-pub const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
+//! Hashes bearer credentials and checks token lifetime and revocation retention bounds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub const REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 
 /// Maximum bearer-token lifetime accepted by replicated revocation admission.
 /// 366 days covers every 12-calendar-month token, including leap years.
-pub const MAX_BEARER_TOKEN_LIFETIME_SECS: u64 = 366 * 24 * 60 * 60;
+pub const MAX_TOKEN_LIFETIME: u64 = 366 * 24 * 60 * 60;
 
 /// Bounded grace for revocation retention across pairwise clock skew. Also the
 /// only skew a replicated timestamp may be ahead of the local clock before it
@@ -35,8 +39,7 @@ pub fn revocation_retained(expires_at: u64, now: u64) -> bool {
 }
 
 pub fn valid_revocation_expiry(expires_at: u64, now: u64) -> bool {
-    expires_at.saturating_sub(now)
-        <= MAX_BEARER_TOKEN_LIFETIME_SECS.saturating_add(REVOCATION_GRACE_SECS)
+    expires_at.saturating_sub(now) <= MAX_TOKEN_LIFETIME.saturating_add(REVOCATION_GRACE_SECS)
 }
 
 /// Whether the signed lifetime of a token stays revocable. Issuance and
@@ -44,18 +47,18 @@ pub fn valid_revocation_expiry(expires_at: u64, now: u64) -> bool {
 /// revocation set is able to hold.
 pub fn valid_token_lifetime(iat: u64, exp: u64) -> bool {
     exp.checked_sub(iat)
-        .is_some_and(|lifetime| lifetime <= MAX_BEARER_TOKEN_LIFETIME_SECS)
+        .is_some_and(|lifetime| lifetime <= MAX_TOKEN_LIFETIME)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        REVOCATION_GRACE_SECS, TRUSTED_REALMS_LIST_KEY, bearer_token_hash, credential_hash,
+        REALMS_LIST_KEY, REVOCATION_GRACE_SECS, bearer_token_hash, credential_hash,
         revocation_live, revocation_retained, valid_revocation_expiry,
     };
 
     #[test]
-    fn bearer_token_hash_matches_existing_blake3_hex() {
+    fn bearer_token_hex() {
         let token = "bearer-token";
         let expected = blake3::hash(b"bearer-token").to_string();
 
@@ -63,15 +66,15 @@ mod tests {
     }
 
     #[test]
-    fn credential_hash_matches_existing_blake3_hex() {
+    fn credential_hash_hex() {
         let secret = b"credential-secret";
 
         assert_eq!(credential_hash(secret), blake3::hash(secret).to_string());
     }
 
     #[test]
-    fn auth_state_keys_preserve_persisted_names() {
-        assert_eq!(TRUSTED_REALMS_LIST_KEY, b"trusted_realms_list");
+    fn auth_state_names() {
+        assert_eq!(REALMS_LIST_KEY, b"trusted_realms_list");
     }
 
     #[test]
@@ -82,7 +85,7 @@ mod tests {
         assert!(revocation_retained(now - REVOCATION_GRACE_SECS, now));
         assert!(!revocation_retained(now - REVOCATION_GRACE_SECS - 1, now));
         assert!(valid_revocation_expiry(
-            now + super::MAX_BEARER_TOKEN_LIFETIME_SECS,
+            now + super::MAX_TOKEN_LIFETIME,
             now
         ));
     }

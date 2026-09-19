@@ -1,11 +1,11 @@
-//! The terminal publication a receipted execution owes its family: the stored
-//! output record, the update that names its digest, and the projection both
-//! must reduce to.
+//! Tests the terminal publication a receipted execution owes: outputs, update and projection.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     AttemptIntent, EffectiveResources, ExecutionReceipt, JobClaim, JobFamilyRecord, JobId,
     JobPayload, JobRecord, JobResultPayload, JobState, LogicalJobState, OutputObject,
     PhysicalExecutionState,
@@ -19,11 +19,11 @@ use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecuti
 use crate::jobs::lifecycle::updates::{execution_chain, publish_state, publish_terminal};
 use crate::jobs::output_record::store_outputs;
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::records::tests::fixture::{Family, REALM, context};
 use crate::jobs::records::{
     AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
 };
 use crate::jobs::store::{iter_prefix_page, record_attempt_intent, reserve_output_commits};
+use crate::tests::records::{Family, REALM, context};
 
 const TOKEN: Ulid = Ulid(0x7E12);
 
@@ -129,7 +129,7 @@ pub(super) async fn reserve_execution(
     record.claim = Some(JobClaim {
         holder_node_id: family.target.public(),
         claim_token: TOKEN,
-        lease_expires_at_ms: 100_000,
+        lease_expires_ms: 100_000,
     });
     drive(
         ReserveExecutionOperation::new(ReserveExecutionConfig {

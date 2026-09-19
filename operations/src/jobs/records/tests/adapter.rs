@@ -1,20 +1,24 @@
-//! The transport peer and the record publisher are separate authorities.
+//! Tests that record transport separates the peer from the publisher and refuses bad offers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, PageLimit, StorageEffect};
 use aruna_core::events::{JobRecordRejection, LaunchDecline};
 use aruna_core::handle::Handle;
-use aruna_core::structs::{Actor, JobFamilyRecord, RealmConfigDocument, RealmId};
+use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
 
-use super::fixture::{Family, REALM, secret, user};
 use crate::driver::DriverContext;
 use crate::jobs::records::transport::{serve_job_record, serve_launch_offer};
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::tests::records::{Family, REALM, secret, user};
 
 async fn fixture() -> (TempDir, Arc<DriverContext>, NetHandle, Family) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -50,7 +54,7 @@ async fn seed_config(
     config: &RealmConfigDocument,
     node_id: aruna_core::NodeId,
 ) {
-    let target = DocumentSyncTarget::RealmConfig {
+    let target = DocumentTarget::RealmConfig {
         realm_id: RealmId(REALM.0),
     };
     let actor = Actor {
@@ -102,7 +106,7 @@ async fn separates_peer_authority() {
             .expect("bounded record");
     let relayed = serve_job_record(
         &context,
-        super::fixture::node(2),
+        crate::tests::records::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
             record: Box::new(forged),
@@ -118,7 +122,7 @@ async fn separates_peer_authority() {
 
     let accepted = serve_job_record(
         &context,
-        super::fixture::node(2),
+        crate::tests::records::node(2),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
             record: Box::new(record),
@@ -134,9 +138,8 @@ async fn separates_peer_authority() {
 
 #[tokio::test]
 async fn refuses_unknown_offer() {
-    // A launch offer from a node outside the realm is declined before any
-    // admission work, and an offer naming another target is not this node's
-    // launch to accept.
+    // An offer from outside the realm is declined before admission, and one naming
+    // another target is not this node's launch to accept.
     let (_dir, context, net, family) = fixture().await;
     let spec = family.spec();
     let launch = family.launch(&spec, family.holder.public(), 0);
@@ -152,7 +155,7 @@ async fn refuses_unknown_offer() {
         }
     );
     assert_eq!(
-        serve_launch_offer(&context, super::fixture::node(2), offer).await,
+        serve_launch_offer(&context, crate::tests::records::node(2), offer).await,
         MetadataTransportMessage::ForwardedLaunchOffer {
             result: Err(LaunchDecline::Unauthorized),
         }
@@ -164,14 +167,14 @@ async fn refuses_unknown_offer() {
 async fn refuses_page_mismatch() {
     // A peer cannot use a valid local placement to read another submission.
     let (_dir, context, net, family) = fixture().await;
-    let placement = aruna_core::structs::PlacementRef {
+    let placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: family.placement.strategy_id,
         shard: family.placement.shard + 1,
     };
     let response = serve_job_record(
         &context,
-        super::fixture::node(2),
-        MetadataTransportMessage::ForwardJobRecordPage {
+        crate::tests::records::node(2),
+        MetadataTransportMessage::ForwardRecordPage {
             placement,
             submission_id: family.submission_id,
             request_digest: None,
@@ -182,7 +185,7 @@ async fn refuses_page_mismatch() {
     .await;
     assert_eq!(
         response,
-        MetadataTransportMessage::ForwardedJobRecordPage {
+        MetadataTransportMessage::ForwardedRecordPage {
             result: Err(JobRecordRejection::Invalid),
         }
     );

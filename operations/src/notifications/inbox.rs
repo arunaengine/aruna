@@ -1,16 +1,21 @@
+//! Upserts notification records into the holder inbox and reports new recipients.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeMap;
 
+use aruna_core::UserId;
 use aruna_core::effects::IterStart;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
-use aruna_core::storage_entries::notification_inbox_write_entries;
-use aruna_core::structs::{
-    NOTIFICATION_TRANSIENT_PER_USER_CAP, NotificationClass, NotificationRecord,
-    notification_inbox_key, notification_inbox_prefix,
+use aruna_core::storage_entries::inbox_write_entries;
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationRecord, TRANSIENT_USER_CAP, notification_inbox_key,
+    notification_inbox_prefix,
 };
-use aruna_core::types::{Key, KeySpace, TxnId, UserId, Value};
+use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use aruna_storage::StorageHandle;
 
 #[derive(Debug)]
@@ -19,32 +24,30 @@ pub(crate) enum UpsertFailure {
     Fatal(String),
 }
 
-/// Result of a holder-local inbox upsert. `recipients` lists the distinct
-/// recipients whose inbox actually gained a record (in first-seen order), so a
-/// caller with net access can fire one wake per woken user; a pure redelivery
-/// reports zero writes and an empty recipient set.
+/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen
+/// order, recipients that gained a record, so a caller can wake each once; a
+/// pure redelivery reports zero writes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InboxWriteOutcome {
     pub written: usize,
     pub recipients: Vec<UserId>,
 }
 
-/// Idempotent holder-local upsert. Records whose primary key already exists are
-/// skipped inside the write transaction, so a duplicate delivery never clobbers
-/// a read_at_ms set by a concurrent mark-read. Returns the number of newly
-/// written records.
+/// Idempotent holder-local upsert: existing primary keys are skipped inside the
+/// write transaction, so a duplicate never clobbers a concurrent mark-read's
+/// `read_at_ms`. Returns the number of newly written records.
 pub async fn upsert_inbox_records(
     storage: &StorageHandle,
     records: &[NotificationRecord],
 ) -> Result<usize, String> {
-    upsert_inbox_records_reporting(storage, records)
+    upsert_with_report(storage, records)
         .await
         .map(|outcome| outcome.written)
 }
 
 /// Like [`upsert_inbox_records`] but reports the distinct recipients actually
 /// written so a caller with net access can wake their live streams.
-pub async fn upsert_inbox_records_reporting(
+pub async fn upsert_with_report(
     storage: &StorageHandle,
     records: &[NotificationRecord],
 ) -> Result<InboxWriteOutcome, String> {
@@ -81,7 +84,7 @@ async fn upsert_once(
         }
     };
 
-    let outcome = match upsert_inbox_records_in_transaction(storage, records, txn_id).await {
+    let outcome = match upsert_transactionally(storage, records, txn_id).await {
         Ok(outcome) => outcome,
         Err(error) => {
             abort_txn(storage, txn_id).await;
@@ -105,7 +108,7 @@ async fn upsert_once(
     }
 }
 
-pub(crate) async fn upsert_inbox_records_in_transaction(
+pub(crate) async fn upsert_transactionally(
     storage: &StorageHandle,
     records: &[NotificationRecord],
     txn_id: TxnId,
@@ -147,7 +150,7 @@ pub(crate) async fn upsert_inbox_records_in_transaction(
         if existing_value.is_some() {
             continue;
         }
-        match notification_inbox_write_entries(record) {
+        match inbox_write_entries(record) {
             Ok(entries) => {
                 writes.extend(entries);
                 outcome.written += 1;
@@ -166,9 +169,9 @@ pub(crate) async fn upsert_inbox_records_in_transaction(
 
     for (recipient, added) in transient_counts {
         let existing = count_transient(storage, recipient, txn_id).await?;
-        if existing.saturating_add(added) > NOTIFICATION_TRANSIENT_PER_USER_CAP {
+        if existing.saturating_add(added) > TRANSIENT_USER_CAP {
             return Err(UpsertFailure::Fatal(format!(
-                "notification transient count for recipient {recipient} exceeds cap {NOTIFICATION_TRANSIENT_PER_USER_CAP}"
+                "notification transient count for recipient {recipient} exceeds cap {TRANSIENT_USER_CAP}"
             )));
         }
     }
@@ -211,7 +214,7 @@ async fn count_transient(
                 key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
                 prefix: Some(prefix.clone()),
                 start: start_after.take().map(IterStart::After),
-                limit: NOTIFICATION_TRANSIENT_PER_USER_CAP.saturating_add(1),
+                limit: TRANSIENT_USER_CAP.saturating_add(1),
                 txn_id: Some(txn_id),
             })
             .await;
@@ -233,7 +236,7 @@ async fn count_transient(
                 .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
             if record.class == NotificationClass::Transient {
                 count = count.saturating_add(1);
-                if count >= NOTIFICATION_TRANSIENT_PER_USER_CAP {
+                if count >= TRANSIENT_USER_CAP {
                     return Ok(count);
                 }
             }
@@ -263,33 +266,13 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::keyspaces::{
-        NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE,
-    };
-    use aruna_core::storage_entries::notification_inbox_update_entry;
-    use aruna_core::structs::{NotificationClass, NotificationKind, RealmId};
-    use aruna_core::types::UserId;
-    use aruna_storage::FjallStorage;
-    use tempfile::tempdir;
-    use ulid::Ulid;
-
-    fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
-        let dir = tempdir().expect("temp dir");
-        let storage =
-            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-        (dir, storage)
-    }
+    use crate::tests::notifications::{record, temp_storage, user};
+    use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
+    use aruna_core::storage_entries::inbox_update_entry;
+    use aruna_core::structs::execution::notification::NotificationClass;
 
     fn make_record() -> NotificationRecord {
-        NotificationRecord::new(
-            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
-            NotificationClass::Direct,
-            NotificationKind::AddedToGroup {
-                group_id: Ulid::from_bytes([9u8; 16]),
-                actor_user_id: UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32])),
-            },
-            1_000,
-        )
+        record(user(1, 2), NotificationClass::Direct, 1_000)
     }
 
     fn transient_record() -> NotificationRecord {
@@ -333,7 +316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_writes_primary_and_prune_index() {
+    async fn upsert_writes_indexes() {
         let (_dir, storage) = temp_storage();
         let record = make_record();
 
@@ -347,14 +330,11 @@ mod tests {
             NotificationRecord::from_bytes(&stored).expect("decodes"),
             record
         );
-        assert_eq!(
-            count_keyspace(&storage, NOTIFICATION_INBOX_PRUNE_INDEX_KEYSPACE).await,
-            1
-        );
+        assert_eq!(count_keyspace(&storage, PRUNE_INDEX_KEYSPACE).await, 1);
     }
 
     #[tokio::test]
-    async fn duplicate_upsert_is_noop() {
+    async fn duplicate_upsert_noop() {
         let (_dir, storage) = temp_storage();
         let record = make_record();
 
@@ -373,17 +353,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reporting_lists_recipients_on_fresh_write_and_none_on_rewrite() {
+    async fn reporting_lists_recipients() {
         let (_dir, storage) = temp_storage();
         let record = make_record();
 
-        let fresh = upsert_inbox_records_reporting(&storage, std::slice::from_ref(&record))
+        let fresh = upsert_with_report(&storage, std::slice::from_ref(&record))
             .await
             .expect("fresh write");
         assert_eq!(fresh.written, 1);
         assert_eq!(fresh.recipients, vec![record.recipient]);
 
-        let rewrite = upsert_inbox_records_reporting(&storage, std::slice::from_ref(&record))
+        let rewrite = upsert_with_report(&storage, std::slice::from_ref(&record))
             .await
             .expect("rewrite");
         assert_eq!(rewrite.written, 0);
@@ -391,14 +371,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reporting_dedupes_recipients_across_records() {
+    async fn reporting_dedupes_recipients() {
         let (_dir, storage) = temp_storage();
         let mut second = make_record();
         second.created_at_ms += 1;
         let first = make_record();
         assert_eq!(first.recipient, second.recipient);
 
-        let outcome = upsert_inbox_records_reporting(&storage, &[first.clone(), second])
+        let outcome = upsert_with_report(&storage, &[first.clone(), second])
             .await
             .expect("write");
         assert_eq!(outcome.written, 2);
@@ -406,7 +386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_upsert_preserves_read_state() {
+    async fn duplicate_preserves_read() {
         let (_dir, storage) = temp_storage();
         let record = make_record();
         assert_eq!(
@@ -416,8 +396,7 @@ mod tests {
 
         let mut read_marked = record.clone();
         read_marked.read_at_ms = Some(5);
-        let (key_space, key, value) =
-            notification_inbox_update_entry(&read_marked).expect("update entry");
+        let (key_space, key, value) = inbox_update_entry(&read_marked).expect("update entry");
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space,
@@ -448,24 +427,24 @@ mod tests {
     #[tokio::test]
     async fn transient_cap_exact() {
         let (_dir, storage) = temp_storage();
-        let records: Vec<_> = (0..NOTIFICATION_TRANSIENT_PER_USER_CAP)
+        let records: Vec<_> = (0..TRANSIENT_USER_CAP)
             .map(|_| transient_record())
             .collect();
 
         assert_eq!(
             upsert_inbox_records(&storage, &records).await,
-            Ok(NOTIFICATION_TRANSIENT_PER_USER_CAP)
+            Ok(TRANSIENT_USER_CAP)
         );
         assert_eq!(
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
-            NOTIFICATION_TRANSIENT_PER_USER_CAP
+            TRANSIENT_USER_CAP
         );
     }
 
     #[tokio::test]
     async fn transient_cap_rejects() {
         let (_dir, storage) = temp_storage();
-        let records: Vec<_> = (0..NOTIFICATION_TRANSIENT_PER_USER_CAP)
+        let records: Vec<_> = (0..TRANSIENT_USER_CAP)
             .map(|_| transient_record())
             .collect();
         upsert_inbox_records(&storage, &records)
@@ -478,14 +457,14 @@ mod tests {
         assert!(error.contains("exceeds cap"));
         assert_eq!(
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
-            NOTIFICATION_TRANSIENT_PER_USER_CAP
+            TRANSIENT_USER_CAP
         );
     }
 
     #[tokio::test]
     async fn concurrent_cap_holds() {
         let (_dir, storage) = temp_storage();
-        let records: Vec<_> = (0..NOTIFICATION_TRANSIENT_PER_USER_CAP - 1)
+        let records: Vec<_> = (0..TRANSIENT_USER_CAP - 1)
             .map(|_| transient_record())
             .collect();
         upsert_inbox_records(&storage, &records)
@@ -501,7 +480,7 @@ mod tests {
         assert!(first.is_ok() ^ second.is_ok());
         assert_eq!(
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
-            NOTIFICATION_TRANSIENT_PER_USER_CAP
+            TRANSIENT_USER_CAP
         );
     }
 }

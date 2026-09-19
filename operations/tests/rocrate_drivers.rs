@@ -1,5 +1,10 @@
+//! Tests RO-Crate zip import drivers, covering bad archives, rollback and resumed rollback.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "512"]
+
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
@@ -9,6 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use aruna_blob::blob::BlobHandler;
+use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::StorageError;
@@ -18,20 +24,26 @@ use aruna_core::keyspaces::{
     ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    Actor, AuthContext, Backend, BackendConfig, BucketInfo, ExportRoCrateSpec,
-    FIRST_GRANTABLE_HANDLE, Group, GroupAuthorizationDocument, ImportMetadataTarget,
-    ImportReportRow, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId,
-    JobPayload, JobRecord, JobResultPayload, MetadataRegistryRecord, PathRestriction, Permission,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, ReasonCode,
-    RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord, RoutingSnapshot, SourceConnectorKind,
-    VersionKey,
+use aruna_core::structs::execution::job::{
+    ExportRoCrateSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
+    ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord, JobResultPayload,
+    ReasonCode, RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord,
 };
-use aruna_core::types::{GroupId, UserId};
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+};
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo, VersionKey};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::connectors::create_source_connector::{
-    CreateSourceConnectorInput, CreateSourceConnectorOperation,
+use aruna_operations::connectors::create_connector::{
+    SourceConnectorInput, SourceConnectorOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
@@ -43,10 +55,10 @@ use aruna_operations::jobs::store::{
 };
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
-use aruna_operations::metadata::projector::replay_metadata_event_log;
-use aruna_operations::s3::create_bucket::CreateBucketOperation;
-use aruna_operations::s3::put_object::{
+use aruna_operations::metadata::materialization_queue::process_materialization_batch;
+use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -86,7 +98,7 @@ fn job_id() -> JobId {
 
 const ELABFTW: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/fixtures/eln/elabftw.eln"
+    "/tests/fixtures/elabftw.eln"
 ));
 const BUCKET: &str = "rocrate-target";
 const TARGET_KEY: &str = "imported/data.txt";
@@ -168,11 +180,8 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(result.imported, 1);
     assert_eq!(result.failed, 0);
 
-    assert_eq!(
-        replay_metadata_event_log(fixture.context.as_ref()).await?,
-        1
-    );
-    let materialized = process_metadata_materialization_batch(fixture.context.as_ref()).await?;
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
+    let materialized = process_materialization_batch(fixture.context.as_ref()).await?;
     assert_eq!(materialized.processed, 1);
 
     let export = ExportRoCrateSpec {
@@ -242,12 +251,9 @@ async fn imports_eln_export() -> Result<(), Box<dyn std::error::Error>> {
         .len(),
         1
     );
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
     assert_eq!(
-        replay_metadata_event_log(fixture.context.as_ref()).await?,
-        1
-    );
-    assert_eq!(
-        process_metadata_materialization_batch(fixture.context.as_ref())
+        process_materialization_batch(fixture.context.as_ref())
             .await?
             .processed,
         1
@@ -281,12 +287,9 @@ async fn imports_nested_folders() -> Result<(), Box<dyn std::error::Error>> {
             .len(),
         1
     );
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
     assert_eq!(
-        replay_metadata_event_log(fixture.context.as_ref()).await?,
-        1
-    );
-    assert_eq!(
-        process_metadata_materialization_batch(fixture.context.as_ref())
+        process_materialization_batch(fixture.context.as_ref())
             .await?
             .processed,
         1
@@ -811,12 +814,9 @@ async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         return Err("RO-Crate import did not succeed".into());
     }
+    assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
     assert_eq!(
-        replay_metadata_event_log(fixture.context.as_ref()).await?,
-        1
-    );
-    assert_eq!(
-        process_metadata_materialization_batch(fixture.context.as_ref())
+        process_materialization_batch(fixture.context.as_ref())
             .await?
             .processed,
         1
@@ -1327,9 +1327,9 @@ async fn seed_auth(
     actor: &Actor,
     group_id: GroupId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let realm = RealmAuthorizationDocument::new_default_realm_doc(actor.realm_id);
+    let realm = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
     let group =
-        GroupAuthorizationDocument::new_default_group_doc(actor.user_id, actor.realm_id, group_id);
+        GroupAuthorizationDocument::default_group_doc(actor.user_id, actor.realm_id, group_id);
     write_value(
         storage,
         AUTH_KEYSPACE,
@@ -1402,8 +1402,7 @@ async fn create_bucket(
         ),
         context,
     )
-    .await?
-    .ok_or("bucket operation did not finish")??;
+    .await?;
     Ok(())
 }
 
@@ -1758,8 +1757,7 @@ async fn put_object(
         }),
         fixture.context.as_ref(),
     )
-    .await?
-    .ok_or("put object returned no result")??)
+    .await?)
 }
 
 async fn create_connector(
@@ -1767,7 +1765,7 @@ async fn create_connector(
     endpoint: &str,
 ) -> Result<Ulid, Box<dyn std::error::Error>> {
     let result = drive(
-        CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+        SourceConnectorOperation::new(SourceConnectorInput {
             group_id: fixture.group_id,
             created_by: fixture.actor.user_id,
             name: "driver-http".to_string(),
@@ -1992,7 +1990,7 @@ async fn pair_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 async fn artifact_bytes(
     fixture: &Fixture,
-    artifact: &aruna_core::structs::ArtifactRef,
+    artifact: &aruna_core::structs::execution::job::ArtifactRef,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut read =
         read_artifact_range(fixture.context.as_ref(), artifact, 0..artifact.size).await?;

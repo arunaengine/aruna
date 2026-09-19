@@ -1,13 +1,17 @@
-use crate::structs::{PathRestriction, Permission};
+//! Compiles permission path patterns and keeps role grants inside their own subtree.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::structs::identity::auth::{PathRestriction, Permission};
 use globset::GlobMatcher;
 use thiserror::Error;
 
 /// Maximum number of path restrictions a token or credential may carry.
 pub const MAX_TOKEN_RESTRICTIONS: usize = 50;
 /// Maximum byte length of a single restriction pattern.
-pub const MAX_RESTRICTION_PATTERN_BYTES: usize = 512;
+pub const MAX_RESTRICTION_BYTES: usize = 512;
 /// Maximum combined byte length of all restriction patterns.
-pub const MAX_RESTRICTIONS_TOTAL_BYTES: usize = 16 * 1024;
+pub const MAX_RESTRICTIONS_BYTES: usize = 16 * 1024;
 
 /// Compiles a permission path pattern with separator-anchored wildcards: `*` and
 /// `?` never cross `/`, only `**` spans segments, so a pattern scoped to one
@@ -161,12 +165,12 @@ pub fn validate_restriction_limits(
     let mut total = 0usize;
     for restriction in restrictions {
         let bytes = restriction.pattern.len();
-        if bytes > MAX_RESTRICTION_PATTERN_BYTES {
+        if bytes > MAX_RESTRICTION_BYTES {
             return Err(RestrictionLimitError::PatternTooLong { bytes });
         }
         total = total.saturating_add(bytes);
     }
-    if total > MAX_RESTRICTIONS_TOTAL_BYTES {
+    if total > MAX_RESTRICTIONS_BYTES {
         return Err(RestrictionLimitError::TotalTooLarge { bytes: total });
     }
     Ok(())
@@ -175,10 +179,10 @@ pub fn validate_restriction_limits(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_RESTRICTION_PATTERN_BYTES, MAX_TOKEN_RESTRICTIONS, RestrictionLimitError,
+        MAX_RESTRICTION_BYTES, MAX_TOKEN_RESTRICTIONS, RestrictionLimitError,
         permission_pattern_matches, readable_roots, validate_restriction_limits,
     };
-    use crate::structs::{PathRestriction, Permission};
+    use crate::structs::identity::auth::{PathRestriction, Permission};
 
     #[test]
     fn single_star_bounded() {
@@ -257,13 +261,13 @@ mod tests {
         );
 
         let long = vec![PathRestriction {
-            pattern: "a".repeat(MAX_RESTRICTION_PATTERN_BYTES + 1),
+            pattern: "a".repeat(MAX_RESTRICTION_BYTES + 1),
             permission: Permission::READ,
         }];
         assert_eq!(
             validate_restriction_limits(&long),
             Err(RestrictionLimitError::PatternTooLong {
-                bytes: MAX_RESTRICTION_PATTERN_BYTES + 1
+                bytes: MAX_RESTRICTION_BYTES + 1
             })
         );
     }

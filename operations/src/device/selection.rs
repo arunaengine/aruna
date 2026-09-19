@@ -1,8 +1,7 @@
-//! What the owner keeps available offline on this device.
-//!
-//! Selection is the owner's own decision and lives only here: a selected
-//! document gets a local replica the device reads and edits without the realm,
-//! and a deselected one goes back to being forwarded like any other read.
+//! Selects and deselects the documents the owner keeps available offline on this device.
+//! A selected document gets a local replica; a deselected one is read through the realm.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
@@ -34,10 +33,8 @@ pub enum SelectionError {
 }
 
 /// Keeps one document available offline.
-///
-/// A first selection needs the realm once: the device has nothing to serve
-/// until a holder has handed it the graph. Selecting again is idempotent and
-/// only refreshes what is already there.
+/// A first selection needs the realm once for the graph; selecting again is
+/// idempotent and only refreshes what is already there.
 pub async fn select_document(
     context: &Arc<DriverContext>,
     document_id: Ulid,

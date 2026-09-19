@@ -1,5 +1,9 @@
+//! Checks the node's iroh endpoint by dialing it and running a DHT request over it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::error::CliError;
-use crate::info::{default_info_url_from_env, fetch_info_url_with_timeout, resolve_token};
+use crate::info::{default_info_url, fetch_info_url, resolve_token};
 use aruna_api::routes::info::{
     InfoResponse, NetworkServiceStatus, PeerConnectionInfo, ServiceStatus,
 };
@@ -13,7 +17,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-const MAX_DHT_RESPONSE_SIZE: usize = 1024 * 1024;
+const MAX_DHT_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 struct IrohCheckOutput {
@@ -76,7 +80,7 @@ pub async fn print_iroh_check(
     let _ = dotenvy::dotenv();
     let info_url = match info_url {
         Some(info_url) => info_url,
-        None => default_info_url_from_env()?,
+        None => default_info_url()?,
     };
     let output = run_iroh_check(
         info_url,
@@ -97,7 +101,7 @@ async fn run_iroh_check(
     let mut checks = Vec::new();
 
     let info_started = Instant::now();
-    let endpoint_info = fetch_info_url_with_timeout(&info_url, timeout, token.as_deref()).await?;
+    let endpoint_info = fetch_info_url(&info_url, timeout, token.as_deref()).await?;
     checks.push(ok_step("info", info_started.elapsed()));
 
     let network = endpoint_info.services.network.as_ref().ok_or_else(|| {
@@ -114,7 +118,7 @@ async fn run_iroh_check(
     }
 
     let endpoint_started = Instant::now();
-    let endpoint_addr = endpoint_addr_from_info(&endpoint_info)?;
+    let endpoint_addr = endpoint_from_info(&endpoint_info)?;
     let endpoint_addr = normalize_endpoint_addr(endpoint_addr, &info_url)?;
     checks.push(ok_step("endpoint_addr", endpoint_started.elapsed()));
 
@@ -130,7 +134,7 @@ async fn run_iroh_check(
     })
 }
 
-fn endpoint_addr_from_info(endpoint_info: &InfoResponse) -> Result<EndpointAddr, CliError> {
+fn endpoint_from_info(endpoint_info: &InfoResponse) -> Result<EndpointAddr, CliError> {
     let peer_id = endpoint_info
         .node
         .peer_id
@@ -146,7 +150,7 @@ fn endpoint_addr_from_info(endpoint_info: &InfoResponse) -> Result<EndpointAddr,
     let addresses = endpoint_info
         .my_addresses
         .iter()
-        .map(|address| transport_addr_from_info(address))
+        .map(|address| transport_from_info(address))
         .collect::<Result<Vec<_>, _>>()?;
 
     if addresses.is_empty() {
@@ -156,7 +160,7 @@ fn endpoint_addr_from_info(endpoint_info: &InfoResponse) -> Result<EndpointAddr,
     Ok(EndpointAddr::from_parts(peer_id, addresses))
 }
 
-fn transport_addr_from_info(address: &str) -> Result<TransportAddr, CliError> {
+fn transport_from_info(address: &str) -> Result<TransportAddr, CliError> {
     if address.starts_with("http://") || address.starts_with("https://") {
         return address
             .parse::<iroh::RelayUrl>()
@@ -174,7 +178,7 @@ fn normalize_endpoint_addr(
     endpoint_addr: EndpointAddr,
     info_url: &str,
 ) -> Result<EndpointAddr, CliError> {
-    let replacement_ip = replacement_ip_from_url(info_url);
+    let replacement_ip = replacement_ip(info_url);
     let mut addrs = Vec::with_capacity(endpoint_addr.addrs.len());
     for addr in endpoint_addr.addrs {
         match addr {
@@ -199,8 +203,8 @@ async fn active_iroh_check(
     timeout: Duration,
     checks: &mut Vec<IrohCheckStep>,
 ) -> Result<ActiveIrohCheck, CliError> {
-    let bind_addr = local_bind_addr_for(&endpoint_addr);
-    let relay_mode = relay_mode_for_target(&endpoint_addr)?;
+    let bind_addr = local_bind_addr(&endpoint_addr);
+    let relay_mode = target_relay_mode(&endpoint_addr)?;
     let endpoint_builder = Endpoint::builder(presets::Minimal)
         .relay_mode(relay_mode)
         .alpns(vec![Alpn::Dht.as_bytes().to_vec()])
@@ -211,12 +215,12 @@ async fn active_iroh_check(
         .await
         .map_err(|error| iroh_check_error("bind", error))?;
 
-    let check = active_iroh_check_with_endpoint(&endpoint, endpoint_addr, timeout, checks).await;
+    let check = check_with_endpoint(&endpoint, endpoint_addr, timeout, checks).await;
     endpoint.close().await;
     check
 }
 
-async fn active_iroh_check_with_endpoint(
+async fn check_with_endpoint(
     endpoint: &Endpoint,
     endpoint_addr: EndpointAddr,
     timeout: Duration,
@@ -244,7 +248,7 @@ async fn active_iroh_check_with_endpoint(
     let mut response_len = [0u8; 4];
     with_timeout("read_dht_pong", timeout, recv.read_exact(&mut response_len)).await?;
     let response_len = u32::from_be_bytes(response_len) as usize;
-    if response_len > MAX_DHT_RESPONSE_SIZE {
+    if response_len > MAX_DHT_SIZE {
         return Err(iroh_check_error(
             "read_dht_pong",
             format!("response too large: {response_len} bytes"),
@@ -279,7 +283,7 @@ async fn active_iroh_check_with_endpoint(
     Ok(active)
 }
 
-fn relay_mode_for_target(endpoint_addr: &EndpointAddr) -> Result<RelayMode, CliError> {
+fn target_relay_mode(endpoint_addr: &EndpointAddr) -> Result<RelayMode, CliError> {
     let relay_urls = endpoint_addr
         .relay_urls()
         .map(|url| url.to_string())
@@ -317,11 +321,7 @@ fn target_output(endpoint_info: &InfoResponse, endpoint_addr: &EndpointAddr) -> 
         realm_id: Some(endpoint_info.node.realm_id.clone()),
         node_id: endpoint_info.node.peer_id.clone(),
         endpoint_addr: serde_json::to_value(endpoint_addr).unwrap_or(serde_json::Value::Null),
-        addresses: endpoint_addr
-            .addrs
-            .iter()
-            .map(transport_addr_to_string)
-            .collect(),
+        addresses: endpoint_addr.addrs.iter().map(transport_string).collect(),
         has_direct_ip: endpoint_addr.addrs.iter().any(TransportAddr::is_ip),
         has_relay: endpoint_addr.addrs.iter().any(TransportAddr::is_relay),
     }
@@ -344,7 +344,7 @@ fn path_statuses(conn: &iroh::endpoint::Connection) -> Vec<IrohPathStatus> {
         .iter()
         .map(|path| IrohPathStatus {
             id: format!("{:?}", path.id()),
-            remote_addr: transport_addr_to_string(path.remote_addr()),
+            remote_addr: transport_string(path.remote_addr()),
             selected: path.is_selected(),
             closed: false, // iroh currently does not provide a way to determine if a path is closed
             rtt_ms: Some(path.rtt().as_millis() as u64),
@@ -352,7 +352,7 @@ fn path_statuses(conn: &iroh::endpoint::Connection) -> Vec<IrohPathStatus> {
         .collect()
 }
 
-fn local_bind_addr_for(endpoint_addr: &EndpointAddr) -> SocketAddr {
+fn local_bind_addr(endpoint_addr: &EndpointAddr) -> SocketAddr {
     let has_ipv4 = endpoint_addr.ip_addrs().any(SocketAddr::is_ipv4);
     let has_ipv6 = endpoint_addr.ip_addrs().any(SocketAddr::is_ipv6);
     if has_ipv6 && !has_ipv4 {
@@ -362,7 +362,7 @@ fn local_bind_addr_for(endpoint_addr: &EndpointAddr) -> SocketAddr {
     }
 }
 
-fn replacement_ip_from_url(info_url: &str) -> Option<IpAddr> {
+fn replacement_ip(info_url: &str) -> Option<IpAddr> {
     let url = reqwest::Url::parse(info_url).ok()?;
     let host = url.host_str()?;
     if host.eq_ignore_ascii_case("localhost") {
@@ -376,7 +376,7 @@ fn replacement_ip_from_url(info_url: &str) -> Option<IpAddr> {
     host.parse().ok()
 }
 
-fn transport_addr_to_string(addr: &TransportAddr) -> String {
+fn transport_string(addr: &TransportAddr) -> String {
     match addr {
         TransportAddr::Ip(addr) => addr.to_string(),
         TransportAddr::Relay(url) => url.to_string(),
@@ -413,7 +413,7 @@ mod tests {
     use aruna_api::routes::info::{
         InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeStatus, ServicesStatus,
     };
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
@@ -425,7 +425,7 @@ mod tests {
             .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[2u8; 32]).public());
         let my_addresses = endpoint_addr
             .as_ref()
-            .map(|addr| addr.addrs.iter().map(transport_addr_to_string).collect())
+            .map(|addr| addr.addrs.iter().map(transport_string).collect())
             .unwrap_or_default();
 
         InfoResponse {
@@ -487,8 +487,8 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_addr_from_info_requires_endpoint_addr() {
-        let error = endpoint_addr_from_info(&test_info_response(None)).unwrap_err();
+    fn requires_endpoint_addr() {
+        let error = endpoint_from_info(&test_info_response(None)).unwrap_err();
 
         assert!(matches!(
             error,
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_endpoint_addr_rewrites_unspecified_ipv4() {
+    fn rewrites_unspecified_ipv4() {
         let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
         let endpoint_addr =
             EndpointAddr::new(node_id).with_ip_addr("0.0.0.0:3001".parse().unwrap());
@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_endpoint_addr_rewrites_unspecified_ipv6() {
+    fn rewrites_unspecified_ipv6() {
         let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
         let endpoint_addr = EndpointAddr::new(node_id).with_ip_addr("[::]:3001".parse().unwrap());
 
@@ -532,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_endpoint_addr_rejects_dns_wildcard() {
+    fn rejects_dns_wildcard() {
         let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
         let endpoint_addr =
             EndpointAddr::new(node_id).with_ip_addr("0.0.0.0:3001".parse().unwrap());
@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_iroh_check_pings_live_node() {
+    async fn pings_live_node() {
         let (target, _dir) = test_net_handle().await;
         let mut checks = Vec::new();
 
@@ -567,10 +567,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_iroh_check_builds_output_from_info() {
+    async fn builds_check_output() {
         let (target, _dir) = test_net_handle().await;
         let output_endpoint =
-            endpoint_addr_from_info(&test_info_response(Some(target.endpoint_addr()))).unwrap();
+            endpoint_from_info(&test_info_response(Some(target.endpoint_addr()))).unwrap();
         let mut checks = Vec::new();
 
         let active = active_iroh_check(output_endpoint, Duration::from_secs(5), &mut checks)

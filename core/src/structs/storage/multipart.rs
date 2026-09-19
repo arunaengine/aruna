@@ -1,0 +1,435 @@
+//! Defines multipart upload records: upload state, part keys, parts and their checksums.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::UserId;
+use crate::errors::ConversionError;
+use crate::structs::checksum::{ChecksumAlgorithm, HASH_MD5};
+use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
+use crate::structs::storage::blob::checked_refs;
+use crate::structs::storage::blob::{BackendLocation, BackendRef};
+use crate::types::GroupId;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::SystemTime;
+use ulid::Ulid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MultipartChecksumType {
+    FullObject,
+    Composite,
+}
+
+impl MultipartChecksumType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullObject => "FULL_OBJECT",
+            Self::Composite => "COMPOSITE",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MultipartChecksumHint {
+    pub algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: MultipartChecksumType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MultipartUploadStatus {
+    Open,
+    Completing,
+    Aborting,
+}
+
+/// How long one completion attempt owns an upload. A request whose connection
+/// died leaves the record `Completing`, so a later attempt takes it over once
+/// the lease lapses instead of failing forever with `NoSuchUpload`.
+pub const COMPLETION_LEASE_MS: u64 = 15 * 60 * 1000;
+
+/// Ceiling on one CompleteMultipartUpload. Composing a huge object is
+/// legitimately slow, so the bound only has to stop an operation that never
+/// finishes; nothing may reclaim the upload while a request still owns it.
+pub const COMPLETION_DEADLINE_MS: u64 = 2 * 60 * 60 * 1000;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MultipartUpload {
+    pub upload_id: Ulid,
+    /// Backend pinned at CreateMultipartUpload; every part and the composed
+    /// object land here, so no later step re-runs routing.
+    pub backend: BackendRef,
+    pub storage_class: Option<String>,
+    pub bucket: String,
+    pub key: String,
+    pub group_id: GroupId,
+    pub created_by: UserId,
+    pub created_at: SystemTime,
+    pub status: MultipartUploadStatus,
+    pub checksum_hint: Option<MultipartChecksumHint>,
+    pub metadata: HashMap<String, String>,
+    /// Refs inherited from the sources parts were copied from, canonically
+    /// sorted. The completed object unions them with the destination default,
+    /// so a part-wise copy cannot drop its source's constraints.
+    pub placement_policies: Vec<PlacementPolicyRef>,
+    /// Subject generation the CreateMultipartUpload gate admitted this upload
+    /// under. Every part re-checks it before writing bytes; zero is ungoverned.
+    pub subject_generation: u64,
+    /// When the current completion attempt claimed the record, in epoch ms.
+    /// Only meaningful while the status is `Completing`.
+    pub completing_since_ms: Option<u64>,
+}
+
+impl MultipartUpload {
+    /// Whether a part may still land here. The create-time gate stored the refs
+    /// and the subject; a part is only a cheap re-check of the same values.
+    pub fn admits_part(
+        &self,
+        subject: Option<&crate::structs::placement::node_subject::NodeSubjectRecord>,
+    ) -> bool {
+        if self.placement_policies.is_empty() {
+            return true;
+        }
+        subject.is_some_and(|record| {
+            record.subject.generation == self.subject_generation
+                && !record.serving_blocked
+                && !record.policy_draining
+        })
+    }
+
+    /// Adds the refs a copied part brought along. Returns whether the stored set
+    /// changed, so an unchanged upload record is not rewritten.
+    pub fn merge_policies(
+        &mut self,
+        policies: &[PlacementPolicyRef],
+    ) -> Result<bool, PlacementPolicyError> {
+        let mut merged = self.placement_policies.clone();
+        merged.extend(policies.iter().copied());
+        let merged = PlacementPolicyRef::canonical_set(&merged)?;
+        let changed = merged != self.placement_policies;
+        self.placement_policies = merged;
+        Ok(changed)
+    }
+
+    /// Whether a `Completing` record may be taken over: an unstamped record is
+    /// stale by definition, so a crash before the stamp cannot strand it.
+    pub fn completion_stale(&self, now_ms: u64) -> bool {
+        self.completing_since_ms
+            .is_none_or(|since| now_ms.saturating_sub(since) >= COMPLETION_LEASE_MS)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        checked_refs(&self.placement_policies)?;
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let upload: Self = postcard::from_bytes(bytes)?;
+        checked_refs(&upload.placement_policies)?;
+        Ok(upload)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MultipartPartKey {
+    pub upload_id: Ulid,
+    pub part_number: u16,
+}
+
+impl MultipartPartKey {
+    pub fn new(upload_id: Ulid, part_number: u16) -> Self {
+        Self {
+            upload_id,
+            part_number,
+        }
+    }
+
+    pub fn prefix(upload_id: Ulid) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&upload_id)?)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MultipartPart {
+    pub part_number: u16,
+    pub location: BackendLocation,
+    pub created_at: SystemTime,
+}
+
+impl MultipartPart {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn etag(&self) -> Option<&[u8]> {
+        self.location.hashes.get(HASH_MD5).map(Vec::as_slice)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MultipartObjectKey {
+    Summary { version_id: Ulid },
+    Part { version_id: Ulid, part_number: u16 },
+}
+
+impl MultipartObjectKey {
+    pub fn summary(version_id: Ulid) -> Self {
+        Self::Summary { version_id }
+    }
+
+    pub fn part(version_id: Ulid, part_number: u16) -> Self {
+        Self::Part {
+            version_id,
+            part_number,
+        }
+    }
+
+    pub fn part_prefix(version_id: Ulid) -> Result<Vec<u8>, ConversionError> {
+        let mut prefix = Self::Part {
+            version_id,
+            part_number: 0,
+        }
+        .to_bytes()?;
+        let part_number_len = postcard::to_allocvec(&0u16)?.len();
+        prefix.truncate(prefix.len().saturating_sub(part_number_len));
+        Ok(prefix)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MultipartObjectSummary {
+    pub checksum_type: MultipartChecksumType,
+    pub part_count: usize,
+    #[serde(skip)]
+    pub composite_hashes: HashMap<String, Vec<u8>>,
+}
+
+impl MultipartObjectSummary {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        #[derive(Serialize)]
+        struct StoredSummary<'a> {
+            checksum_type: MultipartChecksumType,
+            part_count: usize,
+            composite_hashes: &'a HashMap<String, Vec<u8>>,
+        }
+
+        Ok(postcard::to_allocvec(&StoredSummary {
+            checksum_type: self.checksum_type,
+            part_count: self.part_count,
+            composite_hashes: &self.composite_hashes,
+        })?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        #[derive(Deserialize)]
+        struct StoredSummary {
+            checksum_type: MultipartChecksumType,
+            part_count: usize,
+            composite_hashes: HashMap<String, Vec<u8>>,
+        }
+
+        match postcard::from_bytes::<StoredSummary>(bytes) {
+            Ok(summary) => Ok(Self {
+                checksum_type: summary.checksum_type,
+                part_count: summary.part_count,
+                composite_hashes: summary.composite_hashes,
+            }),
+            Err(_) => Ok(postcard::from_bytes(bytes)?),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MultipartObjectPart {
+    pub part_number: u16,
+    pub size: u64,
+    pub hashes: HashMap<String, Vec<u8>>,
+}
+
+impl MultipartObjectPart {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary};
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use ulid::Ulid;
+
+    // Prefix keeps the whole version id, spans all part numbers, excludes the summary.
+    #[test]
+    fn prefix_covers_version() {
+        let version_id = Ulid::generate();
+        let prefix = MultipartObjectKey::part_prefix(version_id).unwrap();
+
+        // The prefix must be the part key with the fixed part-number suffix stripped.
+        let zero_part = MultipartObjectKey::part(version_id, 0).to_bytes().unwrap();
+        assert_eq!(prefix.as_slice(), &zero_part[..zero_part.len() - 1]);
+
+        // Every part key for this version shares the prefix, across part numbers.
+        for part_number in [0u16, 1, 127, 128, 255, 256, 65535] {
+            let part_key = MultipartObjectKey::part(version_id, part_number)
+                .to_bytes()
+                .unwrap();
+            assert!(
+                part_key.starts_with(&prefix),
+                "part {part_number} key does not start with prefix",
+            );
+        }
+
+        // The summary key must not be captured by the part prefix.
+        let summary_key = MultipartObjectKey::summary(version_id).to_bytes().unwrap();
+        assert!(!summary_key.starts_with(&prefix));
+
+        // A different version must not be captured by this version's prefix.
+        let other_key = MultipartObjectKey::part(Ulid::generate(), 0)
+            .to_bytes()
+            .unwrap();
+        assert!(!other_key.starts_with(&prefix));
+    }
+
+    // Two versions differing only in the last ULID byte must not share a part scan.
+    #[test]
+    fn prefix_isolates_versions() {
+        let mut first_bytes = [7u8; 16];
+        let mut second_bytes = [7u8; 16];
+        first_bytes[15] = 0xAA;
+        second_bytes[15] = 0xAB;
+        let first = Ulid::from_bytes(first_bytes);
+        let second = Ulid::from_bytes(second_bytes);
+
+        let first_prefix = MultipartObjectKey::part_prefix(first).unwrap();
+        let second_prefix = MultipartObjectKey::part_prefix(second).unwrap();
+        assert_ne!(first_prefix, second_prefix);
+
+        let second_part = MultipartObjectKey::part(second, 1).to_bytes().unwrap();
+        assert!(!second_part.starts_with(&first_prefix));
+        let second_summary = MultipartObjectKey::summary(second).to_bytes().unwrap();
+        assert!(!second_summary.starts_with(&first_prefix));
+    }
+
+    #[test]
+    fn prefix_spans_parts() {
+        let version_id = Ulid::from_bytes([3u8; 16]);
+        let prefix = MultipartObjectKey::part_prefix(version_id).unwrap();
+        for part_number in [0u16, 1, 127, 128, 255, 256, 65535] {
+            let key = MultipartObjectKey::part(version_id, part_number)
+                .to_bytes()
+                .unwrap();
+            assert!(
+                key.starts_with(&prefix),
+                "part {part_number} missing prefix"
+            );
+        }
+        let summary = MultipartObjectKey::summary(version_id).to_bytes().unwrap();
+        assert!(!summary.starts_with(&prefix));
+    }
+
+    #[test]
+    fn key_round_trips() {
+        let version_id = Ulid::from_bytes([9u8; 16]);
+        let summary = MultipartObjectKey::summary(version_id);
+        assert_eq!(
+            MultipartObjectKey::from_bytes(&summary.to_bytes().unwrap()).unwrap(),
+            summary
+        );
+        for part_number in [0u16, 1, 65535] {
+            let part = MultipartObjectKey::part(version_id, part_number);
+            assert_eq!(
+                MultipartObjectKey::from_bytes(&part.to_bytes().unwrap()).unwrap(),
+                part
+            );
+        }
+        assert!(MultipartObjectKey::from_bytes(&[]).is_err());
+        assert!(MultipartObjectKey::from_bytes(&[9u8; 5]).is_err());
+    }
+
+    #[test]
+    fn keys_keep_legacy() {
+        let version_id = Ulid::from_bytes([9u8; 16]);
+        for key in [
+            MultipartObjectKey::summary(version_id),
+            MultipartObjectKey::part(version_id, 256),
+        ] {
+            let legacy_bytes = postcard::to_allocvec(&key).unwrap();
+            assert_eq!(key.to_bytes().unwrap(), legacy_bytes);
+            assert_eq!(MultipartObjectKey::from_bytes(&legacy_bytes).unwrap(), key);
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+    struct LegacySummary {
+        checksum_type: MultipartChecksumType,
+        part_count: usize,
+    }
+
+    #[test]
+    fn decodes_legacy_summary() {
+        let legacy = LegacySummary {
+            checksum_type: MultipartChecksumType::Composite,
+            part_count: 3,
+        };
+
+        assert_eq!(
+            MultipartObjectSummary::from_bytes(&postcard::to_allocvec(&legacy).unwrap()).unwrap(),
+            MultipartObjectSummary {
+                checksum_type: MultipartChecksumType::Composite,
+                part_count: 3,
+                composite_hashes: HashMap::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn retains_summary_hashes() {
+        let summary = MultipartObjectSummary {
+            checksum_type: MultipartChecksumType::Composite,
+            part_count: 2,
+            composite_hashes: HashMap::from([("sha256".to_string(), vec![7u8; 32])]),
+        };
+        let legacy = LegacySummary {
+            checksum_type: summary.checksum_type,
+            part_count: summary.part_count,
+        };
+
+        assert_eq!(
+            postcard::to_allocvec(&summary).unwrap(),
+            postcard::to_allocvec(&legacy).unwrap()
+        );
+        assert_eq!(
+            postcard::from_bytes::<LegacySummary>(&postcard::to_allocvec(&summary).unwrap())
+                .unwrap(),
+            legacy
+        );
+        assert_eq!(
+            MultipartObjectSummary::from_bytes(&summary.to_bytes().unwrap()).unwrap(),
+            summary
+        );
+    }
+}

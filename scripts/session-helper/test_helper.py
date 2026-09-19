@@ -1,3 +1,7 @@
+"""Unit tests for the session helper: request lines, output order and interrupts."""
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 import io
 import pathlib
 import queue

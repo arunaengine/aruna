@@ -1,3 +1,7 @@
+//! Wraps a backend byte stream in a boxed type with one error kind and a success callback.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use futures::Stream;
 use std::error::Error;
 use std::fmt;
@@ -67,7 +71,7 @@ impl<T> BackendStream<Result<T, StreamError>> {
         Fut: Future<Output = Result<(), StreamError>> + Send + 'static,
         T: 'static,
     {
-        BackendStream(Box::pin(AsyncStreamCompletionCallback {
+        BackendStream(Box::pin(AsyncCompletionCallback {
             inner: self,
             callback: Some(Box::new(move || Box::pin(callback()))),
             pending: Mutex::new(None),
@@ -109,7 +113,7 @@ impl<T> Stream for StreamCompletionCallback<T> {
     }
 }
 
-struct AsyncStreamCompletionCallback<T> {
+struct AsyncCompletionCallback<T> {
     inner: BackendStream<Result<T, StreamError>>,
     callback: Option<CompletionCallback>,
     pending: Mutex<Option<CompletionFuture>>,
@@ -117,9 +121,9 @@ struct AsyncStreamCompletionCallback<T> {
     completed: bool,
 }
 
-impl<T> Unpin for AsyncStreamCompletionCallback<T> {}
+impl<T> Unpin for AsyncCompletionCallback<T> {}
 
-impl<T> Stream for AsyncStreamCompletionCallback<T> {
+impl<T> Stream for AsyncCompletionCallback<T> {
     type Item = Result<T, StreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -230,7 +234,7 @@ mod tests {
     };
 
     #[test]
-    fn on_success_runs_after_stream_completion() {
+    fn on_success_completion() {
         futures::executor::block_on(async {
             let calls = Arc::new(AtomicUsize::new(0));
             let calls_for_callback = calls.clone();
@@ -246,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn on_success_does_not_run_after_stream_error() {
+    fn on_success_error() {
         futures::executor::block_on(async {
             let calls = Arc::new(AtomicUsize::new(0));
             let calls_for_callback = calls.clone();
@@ -264,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn on_success_async_waits_for_callback_before_completion() {
+    fn on_async_completion() {
         futures::executor::block_on(async {
             let calls = Arc::new(AtomicUsize::new(0));
             let calls_for_callback = calls.clone();
@@ -281,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn on_success_async_surfaces_callback_error() {
+    fn on_async_error() {
         futures::executor::block_on(async {
             let mut stream = BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(1)]))
                 .on_success_async(move || async move {

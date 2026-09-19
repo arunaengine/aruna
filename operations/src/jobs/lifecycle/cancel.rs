@@ -1,24 +1,24 @@
-//! Append-only cancellation of one request family.
-//!
-//! Cancelling is a replicated intent, not a global stop: a holder that checked
-//! the caller's permission against the stored spec signs a token-free record,
-//! every holder that observes it stops launching, and known active executions
-//! are asked to stop. A partitioned execution may still finish, and its late
-//! success is projected with `cancel_requested` set.
+//! Cancels one request family by signing a cancel record and asking executions to stop.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::JobRecordFrame;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
-use aruna_core::structs::{
-    AuthContext, CancelAuthority, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobRecordEnvelope, JobRecordKind, LogicalJobSpec, Permission, blob_group_permission_path,
+use aruna_core::structs::execution::job::{
+    CancelAuthority, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope,
+    JobRecordKind, LogicalJobSpec,
 };
-use aruna_core::types::NodeId;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_core::time::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::routing::{family_of_alias, family_projection};
 use super::updates::{SETTLE_RETRY_AFTER, publish_terminal, schedule_terminal_settle};
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::protocol::send_job_request;
@@ -28,10 +28,8 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::kick_drain;
 use crate::jobs::store::{CancelRequestOutcome, JobMutationError, set_cancel_requested};
-use crate::metadata::MetadataAuthToken;
+use crate::metadata::AuthToken;
 use crate::metadata::api::load_realm_config;
-use crate::request_authorization::authorize;
-use crate::request_policy::PolicyRequestExtras;
 
 /// Cancels one external job through its family. `None` means the alias names no
 /// family here, so the caller keeps its ordinary local cancellation.
@@ -39,7 +37,7 @@ pub async fn cancel_family(
     context: &DriverContext,
     auth: &AuthContext,
     job_id: JobId,
-    auth_token: Option<MetadataAuthToken>,
+    auth_token: Option<AuthToken>,
 ) -> Option<Result<(), JobRouteError>> {
     let family = match family_of_alias(context, job_id).await {
         Ok(Some(family)) => family,
@@ -98,7 +96,7 @@ async fn cancel_authority(
         context,
         spec.realm_id,
         auth,
-        &blob_group_permission_path(spec.realm_id, spec.group_id, local),
+        &group_permission_path(spec.realm_id, spec.group_id, local),
         &Permission::WRITE,
         PolicyRequestExtras::rest(),
     )
@@ -124,7 +122,7 @@ async fn publish_cancel(
     let config = load_realm_config(context, realm_id)
         .await
         .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
-    let family = aruna_core::structs::JobFamilyId {
+    let family = aruna_core::structs::execution::job::JobFamilyId {
         submission_id: spec.submission_id,
         request_digest: spec.request_digest,
     };
@@ -142,7 +140,7 @@ async fn publish_cancel(
                 context,
                 holder,
                 JobRequest::Cancel {
-                    auth_token: MetadataAuthToken::internal(auth.clone()),
+                    auth_token: AuthToken::internal(auth.clone()),
                     job_id: spec.job_id,
                 },
             )
@@ -221,9 +219,9 @@ async fn publish_cancel(
 /// an unreachable executor keeps running and converges through the record.
 async fn stop_execution(
     context: &DriverContext,
-    executor: aruna_core::types::NodeId,
+    executor: aruna_core::id::NodeId,
     job_id: JobId,
-    auth_token: &MetadataAuthToken,
+    auth_token: &AuthToken,
 ) {
     // A local execution has no network cancel: `cancel_local_runs` flagged it.
     if context

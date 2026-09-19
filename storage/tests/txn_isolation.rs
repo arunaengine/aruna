@@ -1,8 +1,8 @@
-//! A transaction that stays open across many other snapshots must still see
-//! its commit refused when a concurrent transaction changed what it read.
-//! fjall 3.1.8 closed a committing transaction's snapshot twice, so a snapshot
-//! sharing its sequence number counted as closed, the GC watermark passed it
-//! and the conflict records it needed were pruned: the stale write won.
+//! Tests that a long transaction conflicts when a concurrent write changes data it read.
+//! Fjall 3.1.8 once pruned the needed records, letting the stale transaction commit.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};

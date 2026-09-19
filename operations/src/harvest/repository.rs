@@ -1,11 +1,15 @@
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+//! Builds storage keys and effects for harvest connectors, sources and provenance records.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
-    HARVEST_PROVENANCE_KEYSPACE, HARVEST_SOURCE_KEYSPACE, REPOSITORY_CONNECTOR_INDEX_KEYSPACE,
-    REPOSITORY_CONNECTOR_SECRET_KEYSPACE,
+    CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, HARVEST_PROVENANCE_KEYSPACE,
+    HARVEST_SOURCE_KEYSPACE,
 };
-use aruna_core::structs::{
+use aruna_core::structs::execution::harvest::{
     HarvestProvenance, HarvestSource, RepositoryConnector, RepositoryConnectorSecret,
     harvest_provenance_key, harvest_provenance_prefix,
 };
@@ -14,9 +18,9 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 pub use crate::connectors::repository::StorageReadError;
-use crate::connectors::repository::parse_storage_read;
+use crate::storage_read::parse_storage_read;
 
-pub const HARVEST_SCAN_PAGE_SIZE: usize = 128;
+pub const HARVEST_PAGE_SIZE: usize = 128;
 
 pub fn connector_key(group_id: GroupId, connector_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(32);
@@ -62,7 +66,7 @@ pub fn read_connector_effect(
     txn_id: Option<TxnId>,
 ) -> Effect {
     Effect::Storage(StorageEffect::Read {
-        key_space: REPOSITORY_CONNECTOR_INDEX_KEYSPACE.to_string(),
+        key_space: CONNECTOR_INDEX_KEYSPACE.to_string(),
         key: connector_key(group_id, connector_id),
         txn_id,
     })
@@ -113,21 +117,6 @@ pub fn write_provenance_effect(
     }))
 }
 
-pub fn iter_provenance_effect(
-    group_id: GroupId,
-    namespace: &str,
-    start_after: Option<Key>,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: HARVEST_PROVENANCE_KEYSPACE.to_string(),
-        prefix: Some(provenance_prefix(group_id, namespace)),
-        start: start_after.map(IterStart::After),
-        limit: HARVEST_SCAN_PAGE_SIZE,
-        txn_id,
-    })
-}
-
 pub fn parse_connector_read(event: Event) -> Result<Option<RepositoryConnector>, StorageReadError> {
     parse_storage_read(event, RepositoryConnector::from_bytes)
 }
@@ -147,13 +136,13 @@ pub fn connector_writes(
     secret: Option<&RepositoryConnectorSecret>,
 ) -> Result<Vec<(String, Key, ByteView)>, ConversionError> {
     let mut writes = vec![(
-        REPOSITORY_CONNECTOR_INDEX_KEYSPACE.to_string(),
+        CONNECTOR_INDEX_KEYSPACE.to_string(),
         connector_key(connector.group_id, connector.connector_id),
         connector.to_bytes()?.into(),
     )];
     if let Some(secret) = secret {
         writes.push((
-            REPOSITORY_CONNECTOR_SECRET_KEYSPACE.to_string(),
+            CONNECTOR_SECRET_KEYSPACE.to_string(),
             connector_secret_key(secret.connector_id),
             secret.to_bytes()?.into(),
         ));
@@ -162,7 +151,7 @@ pub fn connector_writes(
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
 
     // the connector key is group-scoped

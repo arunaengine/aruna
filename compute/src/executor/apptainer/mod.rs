@@ -1,10 +1,12 @@
+//! Runs tasks in Apptainer containers and reports their attempt status.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::{Command, ExitStatus, Stdio};
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
@@ -16,13 +18,14 @@ use aruna_core::compute::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::channel::ChannelStream;
 use super::config::ApptainerConfig;
 use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
@@ -105,7 +108,12 @@ impl ApptainerBackend {
             plan.layout.output_parents.insert(PathBuf::from(workdir));
         }
         let directory = self.state.attempt_dir(context);
-        let temp = directory.with_extension(format!("{}.tmp", context.controller_generation));
+        let name = directory
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        let temp =
+            directory.with_file_name(format!("{}.{}.tmp", name, context.controller_generation));
         remove_staging_temps(&directory)?;
         std::fs::create_dir_all(temp.join("workspace/root")).map_err(io_error)?;
         std::fs::create_dir_all(temp.join("logs")).map_err(io_error)?;
@@ -980,7 +988,7 @@ async fn read_log(path: &Path, limits: &LogLimits) -> Result<(Vec<u8>, u64, bool
         }
         Err(error) => return Err(io_error(error)),
     };
-    let mut tail = BoundedTail::new(limits.max_bytes_per_stream);
+    let mut tail = BoundedTail::new(limits.max_stream_bytes);
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let count = file.read(&mut buffer).await.map_err(io_error)?;
@@ -1015,16 +1023,6 @@ async fn stream_file(path: PathBuf, tx: mpsc::Sender<Result<Bytes, BackendError>
     .await;
     if let Err(error) = result {
         let _ = tx.send(Err(error)).await;
-    }
-}
-
-struct ChannelStream(mpsc::Receiver<Result<Bytes, BackendError>>);
-
-impl Stream for ChannelStream {
-    type Item = Result<Bytes, BackendError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(context)
     }
 }
 
@@ -1225,7 +1223,7 @@ fn list_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::compute::{AttemptRef, NOBODY};
+    use aruna_core::compute::{AttemptRef, NOBODY, TaskInput};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -1387,6 +1385,44 @@ mod tests {
         backend.cleanup(&context).await.unwrap();
 
         assert!(!foreign.exists());
+    }
+
+    #[tokio::test]
+    async fn dotted_job_temp() {
+        let root = tempdir().unwrap();
+        let backend = test_backend(root.path());
+        let context = FenceContext {
+            attempt: AttemptRef::new("job.with.dots", 0),
+            attempt_epoch: 1,
+            controller_generation: 3,
+        };
+        let directory = backend.state.attempt_dir(&context);
+        let name = directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let parent = directory.parent().unwrap().to_path_buf();
+        let stale = parent.join(format!("{name}.1.tmp"));
+        std::fs::create_dir_all(stale.join("workspace")).unwrap();
+
+        let mut spec = TaskSpec::new(context.attempt.clone(), "alpine");
+        let stream =
+            futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"data"))]);
+        spec.inputs = vec![TaskInput::from_stream("/input", 8, Box::pin(stream))];
+        let metadata = OciMetadata {
+            entrypoint: vec!["/bin/true".to_string()],
+            command: Vec::new(),
+        };
+        assert!(
+            backend
+                .prepare_attempt(&context, &spec, PathBuf::from("/image.sif"), metadata)
+                .await
+                .is_err()
+        );
+
+        assert!(!stale.exists());
+        assert!(parent.join(format!("{name}.3.tmp")).is_dir());
     }
 
     fn test_backend(root: &Path) -> ApptainerBackend {

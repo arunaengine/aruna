@@ -1,20 +1,15 @@
-//! Per-bucket write-admission fence.
-//!
-//! An empty outbox scan proves nothing on its own: a write that resolved the
-//! bucket before the cutover can still commit its row afterwards, and the
-//! departing holder has by then given up its publish authority. So a
-//! holder-authoritative writer reads the bucket's fence inside the very
-//! transaction that commits its domain mutation and outbox row. The departing
-//! holder closes that fence durably before it drains, which conflicts every
-//! predecessor-generation transaction that has not committed yet and leaves a
-//! finite remainder to drain.
+//! Provides the per-bucket write fence that admits writes at the bucket activation epoch.
+//! A writer reads the fence in its commit, so a holder close conflicts with pending writes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::PLACEMENT_WRITE_FENCE_KEYSPACE;
+use aruna_core::keyspaces::WRITE_FENCE_KEYSPACE;
 use aruna_core::storage_entries::placement_fence_key;
-use aruna_core::structs::{PlacementRef, RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -37,7 +32,7 @@ pub fn write_generation(config: &RealmConfigDocument, placement: &PlacementRef) 
 /// The bucket's fence read, addressed for a batch read inside a transaction.
 pub fn fence_read(realm_id: &RealmId, placement: &PlacementRef) -> (String, Key) {
     (
-        PLACEMENT_WRITE_FENCE_KEYSPACE.to_string(),
+        WRITE_FENCE_KEYSPACE.to_string(),
         placement_fence_key(realm_id, placement),
     )
 }
@@ -129,11 +124,9 @@ impl WriteFence {
     }
 }
 
-/// Durably closes `placement` through `generation`, so no later transaction
-/// can be admitted at it and every uncommitted one conflicts. Monotone and
-/// idempotent: a repeat after a crash re-closes the same generation. An
-/// unparseable stored value is overwritten, since it admits no generation at
-/// all and would otherwise leave the bucket permanently unwritable.
+/// Durably closes `placement` through `generation`, so no later transaction is
+/// admitted and every uncommitted one conflicts. Monotone and idempotent; an
+/// unparseable stored value is overwritten rather than bricking the bucket.
 pub async fn close(
     storage: &StorageHandle,
     realm_id: &RealmId,
@@ -264,7 +257,7 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config
             .strategies
-            .push(aruna_core::structs::PlacementStrategy {
+            .push(aruna_core::structs::placement::record::PlacementStrategy {
                 strategy_id: placement().strategy_id,
                 name: "default".to_string(),
                 replica_count: Some(1),
@@ -292,7 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_conflicts_paused_write() {
+    async fn close_conflicts_write() {
         // A write that read the open fence and then paused must not commit
         // after the departing holder closed that generation.
         let directory = tempdir().unwrap();
@@ -309,7 +302,7 @@ mod tests {
         };
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
             .send_storage_effect(StorageEffect::Read {
-                key_space: PLACEMENT_WRITE_FENCE_KEYSPACE.to_string(),
+                key_space: WRITE_FENCE_KEYSPACE.to_string(),
                 key: placement_fence_key(&realm_id, &placement),
                 txn_id: Some(txn_id),
             })
@@ -325,7 +318,7 @@ mod tests {
 
         let write = storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                key_space: aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
                 key: ByteView::from(b"paused-row".to_vec()),
                 value: ByteView::from(vec![1u8]),
                 txn_id: Some(txn_id),
@@ -359,7 +352,7 @@ mod tests {
         let stored = || async {
             match storage
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: PLACEMENT_WRITE_FENCE_KEYSPACE.to_string(),
+                    key_space: WRITE_FENCE_KEYSPACE.to_string(),
                     key: placement_fence_key(&realm_id, &placement),
                     txn_id: None,
                 })

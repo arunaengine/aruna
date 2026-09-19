@@ -1,10 +1,12 @@
-use super::backend::{build_backend_path, build_multipart_part_path, rebuild_backend_path};
+//! Tests blob backend routing, bucket reservation, write cleanup, connection limits and groups.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::backend::{build_backend_path, build_part_path, rebuild_backend_path};
 use super::{
-    BackendRegistry, BlobHandle, BlobHandler, ControlPlaneTimeoutKind, NodeBackend,
-    control_plane::control_plane_timeout_event,
-    control_plane::{
-        parse_replication_init, validate_replication_init_ack, with_control_plane_timeout,
-    },
+    BackendRegistry, BlobHandle, BlobHandler, ControlPlaneKind, NodeBackend,
+    control_plane::timeout_event,
+    control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::s3::make_bucket;
@@ -14,17 +16,23 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HIDDEN_RESERVATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB,
-    GROUP_STORAGE_BACKEND_KEYSPACE, GROUP_STORAGE_BACKEND_SECRET_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE,
+    BACKEND_SECRET_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::Status;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::{
-    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, GroupBackendKind,
-    GroupStorageBackend, GroupStorageBackendSecret, HiddenBlobKey, MultipartUploadPartKey, RealmId,
-    ResolvedBackend, ResolvedSourceAccess, SourceConnectorKind, Status,
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobTimeoutConfig, HiddenBlobKey,
+    ResolvedBackend,
 };
+use aruna_core::structs::storage::group_backend::{
+    GroupBackendKind, GroupStorage, GroupStorageSecret,
+};
+use aruna_core::structs::storage::multipart::MultipartPartKey;
 use aruna_core::{NodeId, UserId};
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
@@ -250,36 +258,88 @@ struct TestContext {
     storage_handle: aruna_storage::storage::StorageHandle,
 }
 
-async fn setup_blob_handle(max_bucket_size: u64) -> TestContext {
+enum TestContextSetup<'a> {
+    Single { max_bucket_size: u64 },
+    TwoFilesystem,
+    S3Mixed(&'a S3Env),
+}
+
+async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
-    let blob_root = format!("{temp_root}/blobstore");
-    std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
         .await
         .unwrap();
-    let blob_handle = BlobHandler::new(
-        BackendConfig {
-            backend_type: Backend::FileSystem,
-            root: blob_root,
-            service_config: HashMap::new(),
-            bucket_prefix: Some("aruna-test-".to_string()),
-            max_bucket_size: Some(max_bucket_size),
-            multipart_bucket: Some("uploaded-parts".to_string()),
-            timeouts: Default::default(),
-        },
-        storage_handle.clone(),
-        net_handle,
-    )
-    .await
-    .unwrap();
+
+    let (backends, policy) = match &setup {
+        TestContextSetup::Single { max_bucket_size } => {
+            let blob_root = format!("{temp_root}/blobstore");
+            std::fs::create_dir_all(&blob_root).unwrap();
+            let mut backends = std::collections::BTreeMap::new();
+            backends.insert(
+                BackendRef::DEFAULT_NODE_NAME.to_string(),
+                Arc::new(NodeBackend::new(
+                    BackendConfig {
+                        backend_type: Backend::FileSystem,
+                        root: blob_root,
+                        service_config: HashMap::new(),
+                        bucket_prefix: Some("aruna-test-".to_string()),
+                        max_bucket_size: Some(*max_bucket_size),
+                        multipart_bucket: Some("uploaded-parts".to_string()),
+                        timeouts: Default::default(),
+                    },
+                    None,
+                )),
+            );
+            (backends, EgressPolicy::strict())
+        }
+        TestContextSetup::TwoFilesystem | TestContextSetup::S3Mixed(_) => {
+            let mut backends = std::collections::BTreeMap::new();
+            backends.insert(
+                "default".to_string(),
+                Arc::new(NodeBackend::new(
+                    filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
+                    None,
+                )),
+            );
+            let cold = match &setup {
+                TestContextSetup::S3Mixed(env) => NodeBackend::new(
+                    BackendConfig {
+                        backend_type: Backend::S3,
+                        root: String::new(),
+                        service_config: s3_config(env, None),
+                        bucket_prefix: Some(unique_name("aruna-cold-")),
+                        max_bucket_size: None,
+                        multipart_bucket: Some(unique_name("aruna-parts-")),
+                        timeouts: Default::default(),
+                    },
+                    Some("cold".to_string()),
+                ),
+                _ => NodeBackend::new(
+                    filesystem_backend(&format!("{temp_root}/cold"), "cold-", "cold-parts"),
+                    Some("cold".to_string()),
+                ),
+            };
+            backends.insert("cold".to_string(), Arc::new(cold));
+            (backends, EgressPolicy::loopback())
+        }
+    };
+    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+    let blob_handle =
+        BlobHandler::with_registry(registry, storage_handle.clone(), net_handle, policy)
+            .await
+            .unwrap();
 
     TestContext {
         _temp_dir: temp_dir,
         blob_handle,
         storage_handle,
     }
+}
+
+async fn setup_blob_handle(max_bucket_size: u64) -> TestContext {
+    setup_context(TestContextSetup::Single { max_bucket_size }).await
 }
 
 fn stream_from_bytes(
@@ -369,42 +429,7 @@ fn filesystem_backend(root: &str, prefix: &str, parts: &str) -> BackendConfig {
 // Two filesystem backends with distinct roots are the multi-backend fixture:
 // deterministic, hermetic, and enough to prove registry dispatch.
 async fn setup_two_backends() -> TestContext {
-    let temp_dir = tempdir().unwrap();
-    let temp_root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
-    let mut backends = std::collections::BTreeMap::new();
-    backends.insert(
-        "default".to_string(),
-        std::sync::Arc::new(NodeBackend::new(
-            filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
-            None,
-        )),
-    );
-    backends.insert(
-        "cold".to_string(),
-        std::sync::Arc::new(NodeBackend::new(
-            filesystem_backend(&format!("{temp_root}/cold"), "cold-", "cold-parts"),
-            Some("cold".to_string()),
-        )),
-    );
-    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
-    let blob_handle = BlobHandler::with_registry(
-        registry,
-        storage_handle.clone(),
-        net_handle,
-        EgressPolicy::loopback(),
-    )
-    .await
-    .unwrap();
-
-    TestContext {
-        _temp_dir: temp_dir,
-        blob_handle,
-        storage_handle,
-    }
+    setup_context(TestContextSetup::TwoFilesystem).await
 }
 
 fn cold_backend() -> ResolvedBackend {
@@ -448,7 +473,7 @@ async fn copies_across_backends() {
     };
     let BlobEvent::WriteFinished { location: part } = handler
         .write_blob_part(
-            MultipartUploadPartKey::new(Ulid::generate(), 1),
+            MultipartPartKey::new(Ulid::generate(), 1),
             cold_backend(),
             test_user_id(),
             false,
@@ -484,7 +509,7 @@ async fn copies_across_backends() {
 #[test]
 fn registry_reads_config() {
     // The parsed backends file is the only source of names, classes and rules.
-    let file = aruna_core::structs::BackendsFile::parse(
+    let file = aruna_core::structs::storage::backends::BackendsFile::parse(
         r#"
 [backend.hot]
 type = "filesystem"
@@ -520,25 +545,29 @@ serve_group_backends = false
     assert_eq!(routing.catalog.class_of("cold"), Some("cold"));
     let snapshot = routing.snapshot(Ulid::from_bytes([1u8; 16]));
     assert_eq!(
-        aruna_core::structs::resolve_backend(&snapshot, "bucket", "archive/one").unwrap(),
+        aruna_core::structs::storage::routing::resolve_backend(&snapshot, "bucket", "archive/one")
+            .unwrap(),
         ResolvedBackend::new(
             BackendRef::Node("cold".to_string()),
             Some("cold".to_string())
         )
     );
     assert_eq!(
-        aruna_core::structs::resolve_backend(&snapshot, "bucket", "other").unwrap(),
+        aruna_core::structs::storage::routing::resolve_backend(&snapshot, "bucket", "other")
+            .unwrap(),
         ResolvedBackend::new(BackendRef::Node("hot".to_string()), None)
     );
     assert_eq!(
-        aruna_core::structs::resolve_backend(
-            &snapshot.with_group_default(Some(aruna_core::structs::RoutingTarget::Backend(
-                BackendRef::Group(Ulid::from_bytes([2u8; 16]))
-            ))),
+        aruna_core::structs::storage::routing::resolve_backend(
+            &snapshot.with_group_default(Some(
+                aruna_core::structs::storage::routing::RoutingTarget::Backend(BackendRef::Group(
+                    Ulid::from_bytes([2u8; 16])
+                ))
+            )),
             "bucket",
             "other"
         ),
-        Err(aruna_core::structs::RoutingError::GroupEgressDisabled)
+        Err(aruna_core::structs::storage::routing::RoutingError::GroupEgressDisabled)
     );
 }
 
@@ -657,7 +686,7 @@ async fn pins_part_area() {
 
     let BlobEvent::WriteFinished { location } = handler
         .write_blob_part(
-            MultipartUploadPartKey::new(Ulid::generate(), 1),
+            MultipartPartKey::new(Ulid::generate(), 1),
             cold_backend(),
             test_user_id(),
             false,
@@ -674,7 +703,7 @@ async fn pins_part_area() {
 }
 
 #[test]
-fn backend_config_exposes_custom_timeout_values() {
+fn exposes_custom_timeouts() {
     let config = BackendConfig {
         backend_type: Backend::FileSystem,
         root: "/tmp".to_string(),
@@ -683,20 +712,17 @@ fn backend_config_exposes_custom_timeout_values() {
         max_bucket_size: Some(1),
         multipart_bucket: Some("multipart".to_string()),
         timeouts: BlobTimeoutConfig {
-            control_plane_connect_timeout: Duration::from_secs(11),
-            control_plane_io_timeout: Duration::from_secs(12),
+            control_connect_timeout: Duration::from_secs(11),
+            control_io_timeout: Duration::from_secs(12),
             transfer_idle_timeout: Duration::from_secs(13),
         },
     };
 
     assert_eq!(
-        config.timeouts.control_plane_connect_timeout,
+        config.timeouts.control_connect_timeout,
         Duration::from_secs(11)
     );
-    assert_eq!(
-        config.timeouts.control_plane_io_timeout,
-        Duration::from_secs(12)
-    );
+    assert_eq!(config.timeouts.control_io_timeout, Duration::from_secs(12));
     assert_eq!(
         config.timeouts.transfer_idle_timeout,
         Duration::from_secs(13)
@@ -704,15 +730,15 @@ fn backend_config_exposes_custom_timeout_values() {
 }
 
 #[test]
-fn replication_init_ack_accepts_matching_ack() {
+fn accepts_matching_ack() {
     let replication_id = Ulid::generate();
-    let ack = ReplicationMessage::new(replication_id, MessageType::BaoTreeInfoReceived);
+    let ack = ReplicationMessage::new(replication_id, MessageType::BaoTreeReceived);
 
-    assert_eq!(validate_replication_init_ack(ack, replication_id), Ok(()));
+    assert_eq!(validate_init_ack(ack, replication_id), Ok(()));
 }
 
 #[test]
-fn replication_init_ack_rejects_unexpected_message_type() {
+fn rejects_unexpected_type() {
     let replication_id = Ulid::generate();
     let message = ReplicationMessage::new(
         replication_id,
@@ -722,7 +748,7 @@ fn replication_init_ack_rejects_unexpected_message_type() {
         },
     );
 
-    let result = validate_replication_init_ack(message, replication_id);
+    let result = validate_init_ack(message, replication_id);
     assert!(matches!(
         result,
         Err(BlobError::ReplicationRejected(message))
@@ -731,13 +757,13 @@ fn replication_init_ack_rejects_unexpected_message_type() {
 }
 
 #[test]
-fn replication_init_ack_rejects_wrong_replication_id() {
+fn rejects_wrong_replication() {
     let replication_id = Ulid::generate();
     let wrong_id = Ulid::generate();
-    let ack = ReplicationMessage::new(wrong_id, MessageType::BaoTreeInfoReceived);
+    let ack = ReplicationMessage::new(wrong_id, MessageType::BaoTreeReceived);
 
     assert_eq!(
-        validate_replication_init_ack(ack, replication_id),
+        validate_init_ack(ack, replication_id),
         Err(BlobError::ReplicationRejected(format!(
             "received replication init ack for unexpected replication id: expected {replication_id}, got {wrong_id}"
         )))
@@ -745,7 +771,7 @@ fn replication_init_ack_rejects_wrong_replication_id() {
 }
 
 #[test]
-fn parse_replication_init_accepts_matching_bao_tree_info() {
+fn parses_matching_init() {
     let replication_id = Ulid::generate();
     let location = make_test_location();
     let root = blake3::hash(b"hello world");
@@ -764,7 +790,7 @@ fn parse_replication_init_accepts_matching_bao_tree_info() {
 }
 
 #[test]
-fn parse_replication_init_rejects_wrong_replication_id() {
+fn rejects_mismatched_init() {
     let replication_id = Ulid::generate();
     let wrong_id = Ulid::generate();
     let message = ReplicationMessage::new(
@@ -784,7 +810,7 @@ fn parse_replication_init_rejects_wrong_replication_id() {
 }
 
 #[test]
-fn parse_replication_init_uses_message_id_when_unknown() {
+fn uses_message_fallback() {
     let replication_id = Ulid::generate();
     let location = make_test_location();
     let root = blake3::hash(b"hello world");
@@ -803,11 +829,11 @@ fn parse_replication_init_uses_message_id_when_unknown() {
 }
 
 #[tokio::test]
-async fn control_plane_timeout_reports_read_timeout() {
-    let event = with_control_plane_timeout(
+async fn reports_read_timeout() {
+    let event = with_timeout(
         std::future::pending::<()>(),
         Duration::from_millis(1),
-        ControlPlaneTimeoutKind::Read,
+        ControlPlaneKind::Read,
         "reading replication control message",
     )
     .await
@@ -822,10 +848,10 @@ async fn control_plane_timeout_reports_read_timeout() {
 }
 
 #[test]
-fn control_plane_timeout_reports_connection_timeout() {
+fn reports_connect_timeout() {
     assert_eq!(
-        control_plane_timeout_event(
-            ControlPlaneTimeoutKind::Connection,
+        timeout_event(
+            ControlPlaneKind::Connection,
             "opening bao replication stream",
             Duration::from_secs(30),
         ),
@@ -836,7 +862,7 @@ fn control_plane_timeout_reports_connection_timeout() {
 }
 
 #[tokio::test]
-async fn reuses_bucket_until_max_object_count_is_reached() {
+async fn reuses_current_bucket() {
     let context = setup_blob_handle(2).await;
 
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
@@ -905,7 +931,7 @@ async fn hidden_bucket_registered() {
 }
 
 #[tokio::test]
-async fn creates_new_bucket_after_reaching_max_object_count() {
+async fn starts_fresh_bucket() {
     let context = setup_blob_handle(1).await;
 
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
@@ -958,7 +984,7 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
 }
 
 #[tokio::test]
-async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
+async fn keeps_bucket_reusable() {
     let context = setup_blob_handle(1).await;
 
     let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
@@ -1022,7 +1048,7 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
 }
 
 #[tokio::test]
-async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
+async fn excludes_part_bucket() {
     let context = setup_blob_handle(5).await;
 
     let Event::Blob(BlobEvent::WriteFinished { location }) = context
@@ -1088,7 +1114,7 @@ async fn hidden_spool_roundtrip() {
         0
     );
     assert_eq!(
-        keyspace_count(&context.storage_handle, HASH_PATHS_INDEX_KEYSPACE).await,
+        keyspace_count(&context.storage_handle, PATHS_INDEX_KEYSPACE).await,
         0
     );
 
@@ -1390,6 +1416,34 @@ async fn reports_range_size() {
 }
 
 #[tokio::test]
+async fn reads_empty_blob() {
+    // A zero-length object must round-trip instead of being rejected as absent.
+    let context = setup_blob_handle(16).await;
+    let handler = context.blob_handle.handler.clone();
+
+    let BlobEvent::WriteFinished { location } = handler
+        .write_blob(
+            "bucket",
+            "empty.bin",
+            ResolvedBackend::node_default(),
+            test_user_id(),
+            stream_from_bytes(b""),
+        )
+        .await
+    else {
+        panic!("empty write failed")
+    };
+
+    assert_eq!(location.blob_size, 0);
+    let BlobEvent::ReadFinished { blob, stream_size } = handler.read_blob(location).await else {
+        panic!("empty read failed")
+    };
+    assert_eq!(stream_size, 0);
+    let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    assert!(chunks.concat().is_empty());
+}
+
+#[tokio::test]
 async fn keeps_storage_cause() {
     // The storage reason must reach the blob error, not be flattened into a
     // fixed message that hides why the transaction never started.
@@ -1507,12 +1561,12 @@ async fn tracks_concurrent_loads() {
 }
 
 #[tokio::test]
-async fn staging_source_effect_dispatches_via_blob_handle() {
+async fn dispatches_staging_source() {
     let context = setup_blob_handle(1).await;
 
     let event = context
         .blob_handle
-        .send_staging_source_effect(StagingSourceEffect::Head {
+        .send_staging_effect(StagingSourceEffect::Head {
             access: ResolvedSourceAccess::OpenDal {
                 kind: SourceConnectorKind::Http,
                 config: HashMap::from([(
@@ -1533,7 +1587,7 @@ async fn staging_source_effect_dispatches_via_blob_handle() {
 }
 
 #[tokio::test]
-async fn concurrent_connections_receive_distinct_non_nil_ids() {
+async fn assigns_distinct_ids() {
     let context = setup_blob_handle(1).await;
     let handler = context.blob_handle.handler.clone();
     let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
@@ -1676,7 +1730,7 @@ async fn connection_limit() {
 }
 
 #[tokio::test]
-async fn add_connection_rejects_nil_and_duplicate_ids() {
+async fn rejects_invalid_connections() {
     let context = setup_blob_handle(1).await;
     let handler = context.blob_handle.handler.clone();
     let (net_a, _dir_a, net_b, _dir_b) = connected_stream_pair().await;
@@ -1711,7 +1765,7 @@ async fn add_connection_rejects_nil_and_duplicate_ids() {
 }
 
 #[tokio::test]
-async fn write_finalization_failure_emits_no_success_or_load() {
+async fn reports_finalization_failure() {
     let context = setup_blob_handle(1).await;
     let handler = context.blob_handle.handler.clone();
     let location = BackendLocation {
@@ -1733,7 +1787,7 @@ async fn write_finalization_failure_emits_no_success_or_load() {
 
     let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .write_stream_to_location(location.clone(), operator, stream_from_bytes(b"payload"))
+        .write_stream(location.clone(), operator, stream_from_bytes(b"payload"))
         .await;
 
     assert!(
@@ -1793,7 +1847,7 @@ async fn failed_write_cleans() {
     let event = context
         .blob_handle
         .handler
-        .write_stream_to_location(location.clone(), operator, blob)
+        .write_stream(location.clone(), operator, blob)
         .await;
 
     assert!(matches!(
@@ -1844,7 +1898,7 @@ async fn compose_close_fails() {
 
     let (operator, aborts) = failing_close::operator_with_aborts();
     let event = handler
-        .compose_parts_to_location(target.clone(), operator, vec![part])
+        .compose_parts(target.clone(), operator, vec![part])
         .await;
 
     assert!(
@@ -1899,7 +1953,7 @@ async fn compose_cleanup_error() {
     let event = context
         .blob_handle
         .handler
-        .compose_parts_to_location(target.clone(), operator, Vec::new())
+        .compose_parts(target.clone(), operator, Vec::new())
         .await;
 
     let BlobEvent::Error(BlobError::WriteCleanup { location, .. }) = event else {
@@ -1917,7 +1971,7 @@ async fn write_cleanup_error() {
     let event = context
         .blob_handle
         .handler
-        .write_stream_to_location(location.clone(), operator, stream_from_bytes(b"payload"))
+        .write_stream(location.clone(), operator, stream_from_bytes(b"payload"))
         .await;
 
     let BlobEvent::Error(BlobError::WriteCleanup {
@@ -2035,13 +2089,13 @@ async fn cancelled_spool_releases() {
     .await
     .expect("spool must reach its second chunk");
     assert_eq!(
-        keyspace_count(&context.storage_handle, BLOB_HIDDEN_RESERVATION_KEYSPACE).await,
+        keyspace_count(&context.storage_handle, HIDDEN_RESERVATION_KEYSPACE).await,
         1
     );
 
     drop(spool);
     tokio::time::timeout(Duration::from_secs(30), async {
-        while keyspace_count(&context.storage_handle, BLOB_HIDDEN_RESERVATION_KEYSPACE).await > 0 {
+        while keyspace_count(&context.storage_handle, HIDDEN_RESERVATION_KEYSPACE).await > 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -2108,7 +2162,7 @@ async fn delete_missing_safe() {
 }
 
 #[test]
-fn build_backend_path_rejects_traversal_keys() {
+fn rejects_traversal_keys() {
     let ulid = Ulid::generate();
     assert!(build_backend_path("bucket", "nested/object.bin", ulid).is_ok());
 
@@ -2138,7 +2192,7 @@ fn reserved_bucket_rejected() {
 fn isolates_tenant_parts() {
     // In-flight parts must not share the container namespace with objects.
     let upload_id = Ulid::generate();
-    let path = build_multipart_part_path(upload_id, 1, Ulid::generate());
+    let path = build_part_path(upload_id, 1, Ulid::generate());
 
     assert!(path.starts_with(&format!("_parts/{upload_id}/")));
     assert!(matches!(
@@ -2148,7 +2202,7 @@ fn isolates_tenant_parts() {
 }
 
 #[test]
-fn rebuild_backend_path_rejects_sender_supplied_traversal() {
+fn rejects_sender_traversal() {
     let ulid = Ulid::generate();
     assert!(rebuild_backend_path("bucket/object_0000", ulid).is_ok());
 
@@ -2164,7 +2218,7 @@ fn rebuild_backend_path_rejects_sender_supplied_traversal() {
 }
 
 #[test]
-fn get_storage_path_rejects_replicated_traversal_path() {
+fn rejects_replicated_traversal() {
     let mut location = make_test_location();
     location.storage_bucket = "bucket".to_string();
     location.backend_path = "../../etc/passwd".to_string();
@@ -2264,8 +2318,8 @@ async fn reservation_forces_rollover() {
     }
 }
 
-/// Coverage against a real S3 endpoint. Every test returns early when the
-/// endpoint variables are unset, so the default lane stays filesystem-only.
+/// Coverage against a real S3 endpoint. Ignored by default; run with
+/// `--ignored` and the `ARUNA_TEST_S3_*` variables set.
 struct S3Env {
     endpoint: String,
     access_key: String,
@@ -2273,13 +2327,16 @@ struct S3Env {
     region: String,
 }
 
-fn s3_env() -> Option<S3Env> {
-    Some(S3Env {
-        endpoint: std::env::var("ARUNA_TEST_S3_ENDPOINT").ok()?,
-        access_key: std::env::var("ARUNA_TEST_S3_ACCESS_KEY").ok()?,
-        secret_key: std::env::var("ARUNA_TEST_S3_SECRET_KEY").ok()?,
+fn s3_env() -> S3Env {
+    S3Env {
+        endpoint: std::env::var("ARUNA_TEST_S3_ENDPOINT")
+            .expect("ARUNA_TEST_S3_ENDPOINT is required for ignored S3 tests"),
+        access_key: std::env::var("ARUNA_TEST_S3_ACCESS_KEY")
+            .expect("ARUNA_TEST_S3_ACCESS_KEY is required for ignored S3 tests"),
+        secret_key: std::env::var("ARUNA_TEST_S3_SECRET_KEY")
+            .expect("ARUNA_TEST_S3_SECRET_KEY is required for ignored S3 tests"),
         region: std::env::var("ARUNA_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-    })
+    }
 }
 
 fn s3_config(env: &S3Env, bucket: Option<&str>) -> HashMap<String, String> {
@@ -2303,55 +2360,13 @@ fn unique_name(prefix: &str) -> String {
 /// A filesystem default plus an S3 `cold` backend, so one handler covers mixed
 /// routing without a second fixture.
 async fn setup_s3_mixed(env: &S3Env) -> TestContext {
-    let temp_dir = tempdir().unwrap();
-    let temp_root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
-    let mut backends = std::collections::BTreeMap::new();
-    backends.insert(
-        "default".to_string(),
-        std::sync::Arc::new(NodeBackend::new(
-            filesystem_backend(&format!("{temp_root}/hot"), "hot-", "hot-parts"),
-            None,
-        )),
-    );
-    backends.insert(
-        "cold".to_string(),
-        std::sync::Arc::new(NodeBackend::new(
-            BackendConfig {
-                backend_type: Backend::S3,
-                root: String::new(),
-                service_config: s3_config(env, None),
-                bucket_prefix: Some(unique_name("aruna-cold-")),
-                max_bucket_size: None,
-                multipart_bucket: Some(unique_name("aruna-parts-")),
-                timeouts: Default::default(),
-            },
-            Some("cold".to_string()),
-        )),
-    );
-    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
-    let blob_handle = BlobHandler::with_registry(
-        registry,
-        storage_handle.clone(),
-        net_handle,
-        EgressPolicy::loopback(),
-    )
-    .await
-    .unwrap();
-
-    TestContext {
-        _temp_dir: temp_dir,
-        blob_handle,
-        storage_handle,
-    }
+    setup_context(TestContextSetup::S3Mixed(env)).await
 }
 
 #[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_roundtrip_range() {
-    let Some(env) = s3_env() else { return };
+    let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();
 
@@ -2395,8 +2410,9 @@ async fn s3_roundtrip_range() {
 }
 
 #[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_multipart_compose() {
-    let Some(env) = s3_env() else { return };
+    let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();
     let upload_id = Ulid::generate();
@@ -2405,7 +2421,7 @@ async fn s3_multipart_compose() {
     for (number, payload) in [(1u16, b"first-".to_vec()), (2, b"second".to_vec())] {
         let BlobEvent::WriteFinished { location } = handler
             .write_blob_part(
-                MultipartUploadPartKey::new(upload_id, number),
+                MultipartPartKey::new(upload_id, number),
                 cold_backend(),
                 test_user_id(),
                 false,
@@ -2438,7 +2454,7 @@ async fn s3_multipart_compose() {
 
 async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bool) {
     let key: aruna_core::types::Key = backend_id.to_bytes().to_vec().into();
-    let record = GroupStorageBackend {
+    let record = GroupStorage {
         backend_id,
         group_id: Ulid::generate(),
         name: "tenant".to_string(),
@@ -2451,21 +2467,21 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
         updated_at: SystemTime::UNIX_EPOCH,
         created_by: UserId::default(),
         disabled: false,
-        cleanup: aruna_core::structs::CleanupStrategy::Retain,
+        cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
     };
     let mut writes = vec![(
-        GROUP_STORAGE_BACKEND_KEYSPACE.to_string(),
+        STORAGE_BACKEND_KEYSPACE.to_string(),
         key.clone(),
         record.to_bytes().unwrap().into(),
     )];
     if paired {
-        let secret = GroupStorageBackendSecret {
+        let secret = GroupStorageSecret {
             backend_id,
             secret_config: HashMap::from([("access_key_id".to_string(), "id".to_string())]),
             updated_at: SystemTime::UNIX_EPOCH,
         };
         writes.push((
-            GROUP_STORAGE_BACKEND_SECRET_KEYSPACE.to_string(),
+            BACKEND_SECRET_KEYSPACE.to_string(),
             key,
             secret.to_bytes().unwrap().into(),
         ));
@@ -2526,7 +2542,7 @@ async fn close_blocks_writes() {
 async fn quarantine_upserts_record() {
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
-    use aruna_core::structs::{BackendRef, BlobQuarantineRecord};
+    use aruna_core::structs::storage::blob::{BackendRef, BlobQuarantineRecord};
 
     let context = setup_blob_handle(64).await;
     let blake3 = [7u8; 32];
@@ -2626,9 +2642,10 @@ async fn needs_paired_secret() {
 }
 
 #[tokio::test]
-async fn serves_group_backend() {
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_group_backend() {
     // The tenant endpoint path: MinIO stands in for a group-owned store.
-    let Some(env) = s3_env() else { return };
+    let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let bucket = unique_name("tenant-");
     make_bucket(&bucket, &s3_config(&env, None)).await.unwrap();
@@ -2675,9 +2692,10 @@ async fn serves_group_backend() {
 }
 
 #[tokio::test]
-async fn routes_backends_apart() {
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_backend_routes() {
     // A cold-class rule pins to S3 while the default stays on the filesystem.
-    let Some(env) = s3_env() else { return };
+    let env = s3_env();
     let context = setup_s3_mixed(&env).await;
     let handler = context.blob_handle.handler.clone();
 

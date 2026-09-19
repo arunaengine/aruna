@@ -1,11 +1,12 @@
-//! Planning and preview for placement transitions: the pure functions that
-//! turn "move these buckets onto that candidate map" into a self-describing
-//! plan every node can re-derive.
+//! Plans and previews placement transitions as pure functions every node can re-derive.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::structs::{
-    BucketPlan, CandidatePlacementMap, PlacementRef, PlacementStrategy, RealmConfigDocument,
-    TRANSITION_OVERDUE_MS, TransitionLimits, TransitionPlan,
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
+use aruna_core::structs::placement::transition::{
+    BucketPlan, CandidatePlacementMap, TRANSITION_OVERDUE_MS, TransitionLimits, TransitionPlan,
 };
 use thiserror::Error;
 use ulid::Ulid;
@@ -19,7 +20,7 @@ pub enum TransitionPlanError {
     #[error("candidate map epoch {0} is missing or conflicted")]
     MapUnavailable(u64),
     #[error("bucket {0} is outside the strategy's shard count")]
-    BucketOutOfRange(u32),
+    OutOfRange(u32),
     #[error("bucket {0} has no activation to move")]
     ActivationUnavailable(u32),
     #[error("bucket {0} resolves no holder in the target map")]
@@ -134,7 +135,7 @@ pub fn preview_transition(
     let mut previews = Vec::with_capacity(scope.len());
     for bucket in scope {
         if bucket >= strategy.shard_count {
-            return Err(TransitionPlanError::BucketOutOfRange(bucket));
+            return Err(TransitionPlanError::OutOfRange(bucket));
         }
         let placement = PlacementRef {
             strategy_id,
@@ -283,10 +284,11 @@ fn locations_of(config: &RealmConfigDocument, holders: &[NodeId]) -> Vec<String>
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
-    use aruna_core::structs::{
-        PlacementTransition, RealmId, RealmNodeKind, StallReport, TransitionStatus,
+    use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+    use aruna_core::structs::placement::transition::{
+        PlacementTransition, StallReport, TransitionStatus,
     };
 
     fn node(seed: u8) -> NodeId {

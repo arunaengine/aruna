@@ -1,10 +1,15 @@
+//! Tests bucket replication: sync modes, quotas, permission rechecks, cycles and repairs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 mod shared;
 
-use aruna_api::routes::credentials::CreateS3PathRestriction;
-use aruna_api::routes::groups::AddGroupMemberRequest;
-use aruna_api::routes::info::{RealmGroupQuotaOverride, RealmInfoResponse, RealmQuotaConfig};
+use aruna_api::routes::credentials::CreatePathRestriction;
+use aruna_api::routes::groups::AddMemberRequest;
+use aruna_api::routes::info::{RealmInfoResponse, RealmQuotaConfig, RealmQuotaOverride};
 use aruna_api::routes::sync::{
     ApiReferenceHandling, ApiSyncMode, CreateSyncRequest, SyncDetailResponse,
     SyncRelationshipResponse, SyncSourceRequest, SyncTargetRequest,
@@ -13,19 +18,20 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_REPLICATION_JOB_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SYNC_RELATIONSHIP_IN_KEYSPACE,
-    SYNC_RELATIONSHIP_OUT_KEYSPACE, USAGE_STATS_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+    USAGE_STATS_KEYSPACE,
 };
-use aruna_core::structs::{
-    AuthContext, BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, PathRestriction,
-    Permission, SourceConnectorKind, StagingStrategy, SyncRelationship, SyncState, UsageCounters,
-    VersionKey, blob_group_permission_path, sync_relationship_key,
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey, group_permission_path,
 };
+use aruna_core::structs::storage::usage::UsageCounters;
+use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::replication::queue::{
-    LiveReplicationObligationRecord, live_replication_obligation_key,
-};
+use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -35,10 +41,9 @@ use aws_sdk_s3::types::{
 };
 use reqwest::StatusCode;
 use shared::{
-    JoinerNode, SeedNode, TestResult, bucket_arn, create_bearer_token, create_group_via_http,
-    create_onboarding_secret_via_http, create_s3_credentials_via_http,
-    create_s3_credentials_with_restrictions_via_http, s3_client, shutdown_pair,
-    spawn_full_joiner_node, spawn_full_seed_node, wait_for_group_via_http, wait_for_realm_nodes,
+    JoinerNode, SeedNode, TestResult, bucket_arn, create_bearer_token, create_group_http,
+    create_onboarding_secret, create_restricted_credentials, create_s3_credentials, s3_client,
+    shutdown_pair, spawn_complete_joiner, spawn_complete_seed, wait_group_http, wait_realm_nodes,
     wait_until,
 };
 use std::time::Duration;
@@ -110,13 +115,10 @@ struct ReplicationHarness {
 
 impl ReplicationHarness {
     async fn new(group_name: &str) -> TestResult<Self> {
-        let seed = spawn_full_seed_node().await?;
-        let onboarding_secret = create_onboarding_secret_via_http(
-            &seed,
-            aruna_core::onboarding::OnboardingMode::Server,
-        )
-        .await?;
-        let joiner = spawn_full_joiner_node(&seed, onboarding_secret).await?;
+        let seed = spawn_complete_seed().await?;
+        let onboarding_secret =
+            create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server).await?;
+        let joiner = spawn_complete_joiner(&seed, onboarding_secret).await?;
 
         let seed_s3 = seed
             .s3
@@ -127,7 +129,7 @@ impl ReplicationHarness {
             .as_ref()
             .ok_or_else(|| std::io::Error::other("joiner node did not start S3 server"))?;
 
-        wait_for_realm_nodes(
+        wait_realm_nodes(
             &[seed.context.as_ref(), joiner.context.as_ref()],
             &seed.realm_id,
             2,
@@ -142,13 +144,13 @@ impl ReplicationHarness {
         )
         .await?;
 
-        let group = create_group_via_http(&seed.base_url, &seed_token, group_name).await?;
-        wait_for_group_via_http(&joiner.base_url, &seed_token, &group.group_id).await?;
+        let group = create_group_http(&seed.base_url, &seed_token, group_name).await?;
+        wait_group_http(&joiner.base_url, &seed_token, &group.group_id).await?;
 
         let seed_credentials =
-            create_s3_credentials_via_http(&seed.base_url, &seed_token, &group.group_id).await?;
+            create_s3_credentials(&seed.base_url, &seed_token, &group.group_id).await?;
         let joiner_credentials =
-            create_s3_credentials_via_http(&joiner.base_url, &seed_token, &group.group_id).await?;
+            create_s3_credentials(&joiner.base_url, &seed_token, &group.group_id).await?;
 
         let seed_client = s3_client(seed_s3, &seed_credentials);
         let joiner_client = s3_client(joiner_s3, &joiner_credentials);
@@ -167,16 +169,16 @@ impl ReplicationHarness {
         bucket_arn(&self.seed.realm_id, self.joiner.config.node_id, bucket)
     }
 
-    async fn create_seed_scoped_client(
+    async fn create_seed_client(
         &self,
-        path_restrictions: Vec<CreateS3PathRestriction>,
+        path_restrictions: Vec<CreatePathRestriction>,
     ) -> TestResult<S3Client> {
         let seed_s3 = self
             .seed
             .s3
             .as_ref()
             .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-        let credentials = create_s3_credentials_with_restrictions_via_http(
+        let credentials = create_restricted_credentials(
             &self.seed.base_url,
             &self.seed_token,
             &self.group_id,
@@ -277,7 +279,7 @@ impl ReplicationHarness {
                 self.seed.base_url, self.group_id
             ))
             .bearer_auth(&self.seed_token)
-            .json(&AddGroupMemberRequest {
+            .json(&AddMemberRequest {
                 user_id: user_id.to_string(),
                 role_ids: None,
             })
@@ -427,7 +429,7 @@ impl ReplicationHarness {
         .await
     }
 
-    async fn assert_object_never_appears(
+    async fn assert_object_absent(
         &self,
         bucket: &str,
         key: &str,
@@ -547,8 +549,10 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
                 },
             )
             .await?;
-        let source_arn = aruna_core::structs::ArunaArn::parse(&relationship.source)?;
-        let target_arn = aruna_core::structs::ArunaArn::parse(&relationship.target)?;
+        let source_arn =
+            aruna_core::structs::storage::replication::ArunaArn::parse(&relationship.source)?;
+        let target_arn =
+            aruna_core::structs::storage::replication::ArunaArn::parse(&relationship.target)?;
         assert_eq!(source_arn.bucket(), Some(source_bucket));
         assert_eq!(source_arn.key_prefix(), Some("selected/"));
         assert_eq!(target_arn.bucket(), Some(target_bucket));
@@ -580,18 +584,13 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
             .assert_object_matches(target_bucket, target_key, &body)
             .await?;
         harness
-            .assert_object_never_appears(target_bucket, source_key, 10, Duration::from_millis(200))
+            .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
             .await?;
         harness
-            .assert_object_never_appears(
-                target_bucket,
-                excluded_key,
-                10,
-                Duration::from_millis(200),
-            )
+            .assert_object_absent(target_bucket, excluded_key, 10, Duration::from_millis(200))
             .await?;
         harness
-            .assert_object_never_appears(
+            .assert_object_absent(
                 target_bucket,
                 excluded_target,
                 10,
@@ -719,18 +718,13 @@ async fn once_syncs_prefix() -> TestResult<()> {
             .assert_object_matches(target_bucket, target_key, &body)
             .await?;
         harness
-            .assert_object_never_appears(target_bucket, source_key, 10, Duration::from_millis(200))
+            .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
             .await?;
         harness
-            .assert_object_never_appears(
-                target_bucket,
-                excluded_key,
-                10,
-                Duration::from_millis(200),
-            )
+            .assert_object_absent(target_bucket, excluded_key, 10, Duration::from_millis(200))
             .await?;
         harness
-            .assert_object_never_appears(
+            .assert_object_absent(
                 target_bucket,
                 excluded_target,
                 10,
@@ -987,7 +981,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
         let relationship_id = relationship.id.parse::<Ulid>()?;
         let stub = read_value(
             harness.seed.context.as_ref(),
-            SYNC_RELATIONSHIP_OUT_KEYSPACE,
+            RELATIONSHIP_OUT_KEYSPACE,
             sync_relationship_key(source_bucket, relationship_id),
         )
         .await?
@@ -1005,7 +999,7 @@ async fn reference_syncs_lazily() -> TestResult<()> {
                 async move {
                     read_value(
                         context.as_ref(),
-                        SYNC_RELATIONSHIP_IN_KEYSPACE,
+                        RELATIONSHIP_IN_KEYSPACE,
                         sync_relationship_key(target_bucket, relationship_id),
                     )
                     .await
@@ -1058,18 +1052,18 @@ async fn quota_surfaces_failure() -> TestResult<()> {
             .await?;
 
         let quota = RealmQuotaConfig {
-            default_group_quota_bytes: None,
+            default_quota_bytes: None,
             grace_factor_percent: 100,
             warn_threshold_percent: 85,
-            group_overrides: vec![RealmGroupQuotaOverride {
+            group_overrides: vec![RealmQuotaOverride {
                 group_id: harness.group_id.clone(),
                 quota_bytes: Some(1),
                 grace_factor_percent: Some(100),
             }],
-            max_groups_per_user: Some(3),
-            user_group_cap_overrides: Vec::new(),
-            max_devices_per_user: None,
-            device_requests_per_minute: None,
+            groups_per_user: Some(3),
+            group_cap_overrides: Vec::new(),
+            devices_per_user: None,
+            device_request_rate: None,
             device_concurrent_pulls: None,
         };
         let quota_response = reqwest::Client::new()
@@ -1386,21 +1380,17 @@ async fn chain_blocks_cycle() -> TestResult<()> {
             || async {
                 keyspace_empty(
                     harness.seed.context.as_ref(),
-                    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+                    REPLICATION_OBLIGATION_KEYSPACE,
                 )
                 .await
                     && keyspace_empty(
                         harness.joiner.context.as_ref(),
-                        BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+                        REPLICATION_OBLIGATION_KEYSPACE,
                     )
                     .await
-                    && keyspace_empty(harness.seed.context.as_ref(), BLOB_REPLICATION_JOB_KEYSPACE)
+                    && keyspace_empty(harness.seed.context.as_ref(), REPLICATION_JOB_KEYSPACE).await
+                    && keyspace_empty(harness.joiner.context.as_ref(), REPLICATION_JOB_KEYSPACE)
                         .await
-                    && keyspace_empty(
-                        harness.joiner.context.as_ref(),
-                        BLOB_REPLICATION_JOB_KEYSPACE,
-                    )
-                    .await
             },
         )
         .await?;
@@ -1428,7 +1418,7 @@ async fn chain_blocks_cycle() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn replication_live_put_reaches_joined_node() -> TestResult<()> {
+async fn live_put_replicates() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-live-put-e2e-group").await?;
 
     let result = async {
@@ -1468,7 +1458,7 @@ async fn replication_live_put_reaches_joined_node() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn replication_delete_marker_reaches_joined_node() -> TestResult<()> {
+async fn delete_marker_replicates() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-delete-marker-e2e-group").await?;
 
     let result = async {
@@ -1504,7 +1494,7 @@ async fn replication_delete_marker_reaches_joined_node() -> TestResult<()> {
             .send()
             .await?;
         assert_eq!(delete_output.delete_marker(), Some(true));
-        let delete_marker_version_id = delete_output
+        let marker_version_id = delete_output
             .version_id()
             .ok_or_else(|| {
                 std::io::Error::other("delete object did not return delete-marker version id")
@@ -1548,16 +1538,16 @@ async fn replication_delete_marker_reaches_joined_node() -> TestResult<()> {
             .await;
         assert!(current_get_error.is_err());
 
-        let delete_marker_get_error = harness
+        let marker_get_error = harness
             .joiner_client
             .get_object()
             .bucket(bucket)
             .key(key)
-            .version_id(delete_marker_version_id)
+            .version_id(marker_version_id)
             .send()
             .await;
         assert_eq!(
-            error_code(&delete_marker_get_error).as_deref(),
+            error_code(&marker_get_error).as_deref(),
             Some("MethodNotAllowed")
         );
 
@@ -1638,7 +1628,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             .await?;
 
         let scoped_client = harness
-            .create_seed_scoped_client(vec![CreateS3PathRestriction {
+            .create_seed_client(vec![CreatePathRestriction {
                 pattern: format!("{bucket}/scoped/**"),
                 permission: "WRITE".to_string(),
             }])
@@ -1655,12 +1645,12 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             .ok_or_else(|| std::io::Error::other("scoped put did not return version id"))?
             .parse()?;
 
-        let group_root = blob_group_permission_path(
+        let group_root = group_permission_path(
             harness.seed.realm_id,
             harness.group_id.parse()?,
             harness.seed.net.node_id(),
         );
-        let record = LiveReplicationObligationRecord::new(
+        let record = LiveObligationRecord::new(
             harness.seed.net.node_id(),
             AuthContext {
                 user_id: harness.seed.user_id,
@@ -1676,13 +1666,13 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             version_id,
             false,
         );
-        let obligation_key = live_replication_obligation_key(&record)?;
+        let obligation_key = live_obligation_key(&record)?;
         let Event::Storage(StorageEvent::WriteResult { .. }) = harness
             .seed
             .context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
                 key: obligation_key,
                 value: record.to_bytes()?.into(),
                 txn_id: None,
@@ -1699,17 +1689,16 @@ async fn repair_honors_restrictions() -> TestResult<()> {
             || async {
                 keyspace_empty(
                     harness.seed.context.as_ref(),
-                    BLOB_LIVE_REPLICATION_OBLIGATION_KEYSPACE,
+                    REPLICATION_OBLIGATION_KEYSPACE,
                 )
                 .await
-                    && keyspace_empty(harness.seed.context.as_ref(), BLOB_REPLICATION_JOB_KEYSPACE)
-                        .await
+                    && keyspace_empty(harness.seed.context.as_ref(), REPLICATION_JOB_KEYSPACE).await
             },
         )
         .await?;
 
         harness
-            .assert_object_never_appears(bucket, scoped_key, 5, Duration::from_millis(200))
+            .assert_object_absent(bucket, scoped_key, 5, Duration::from_millis(200))
             .await?;
         Ok(())
     }
@@ -1720,7 +1709,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<()> {
+async fn scoped_replication_paths() -> TestResult<()> {
     let harness = ReplicationHarness::new("replication-scoped-credential-group").await?;
 
     let result = async {
@@ -1736,7 +1725,7 @@ async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<
             .await?;
 
         let scoped_client = harness
-            .create_seed_scoped_client(vec![CreateS3PathRestriction {
+            .create_seed_client(vec![CreatePathRestriction {
                 pattern: format!("{bucket}/scoped/**"),
                 permission: "WRITE".to_string(),
             }])
@@ -1768,7 +1757,7 @@ async fn replication_honors_scoped_credential_path_restrictions() -> TestResult<
             .await?;
 
         harness
-            .assert_object_never_appears(bucket, scoped_key, 10, Duration::from_millis(200))
+            .assert_object_absent(bucket, scoped_key, 10, Duration::from_millis(200))
             .await?;
 
         let scoped_destination_get = harness

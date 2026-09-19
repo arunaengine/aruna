@@ -1,15 +1,13 @@
-//! Rebuilding one family's projection from its immutable records.
-//!
-//! The projection is a cache with a bounded revision, never authority: it is
-//! deleted-and-rebuilt safe, it is invalidated by every append, and the mutable
-//! job row it bridges into is a local view of it, not its owner.
+//! Rebuilds one job family projection cache from its records and bridges the local job row.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_PROJECTION_KEYSPACE};
-use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_ALIAS_KEYSPACE, FAMILY_PROJECTION_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyId, JobId, JobProjection, JobRecord, JobRecordEnvelope, JobRecordKey, JobState,
     LogicalJobState, job_record_key, validate_transition,
 };
@@ -112,7 +110,7 @@ impl ProjectFamilyOperation {
         };
         self.state = ProjectState::ReadCache;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+            key_space: FAMILY_PROJECTION_KEYSPACE.to_string(),
             key: family_prefix(&family),
             txn_id: None,
         })]
@@ -124,7 +122,7 @@ impl ProjectFamilyOperation {
         };
         self.state = ProjectState::Page { txn_id };
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             prefix: Some(family_prefix(&family)),
             start: self.cursor.map(|key| IterStart::After(record_key(&key))),
             limit: RECORD_PAGE_SIZE,
@@ -243,7 +241,7 @@ impl ProjectFamilyOperation {
             Err(error) => return self.fail(error.into()),
         };
         writes.push((
-            JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+            FAMILY_PROJECTION_KEYSPACE.to_string(),
             family_prefix(&family),
             Value::from(bytes.as_slice()),
         ));
@@ -288,7 +286,8 @@ impl ProjectFamilyOperation {
                     .executions
                     .iter()
                     .filter(|execution| {
-                        execution.role == aruna_core::structs::ExecutionRole::DuplicateSuccess
+                        execution.role
+                            == aruna_core::structs::execution::job::ExecutionRole::DuplicateSuccess
                     })
                     .count()
             })
@@ -360,7 +359,7 @@ impl Operation for ProjectFamilyOperation {
             FamilyRef::Alias(job_id) => {
                 self.state = ProjectState::ResolveAlias;
                 smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: JOB_FAMILY_ALIAS_KEYSPACE.to_string(),
+                    key_space: FAMILY_ALIAS_KEYSPACE.to_string(),
                     prefix: Some(alias_prefix(job_id)),
                     start: None,
                     limit: MAX_ALIAS_FAMILIES,

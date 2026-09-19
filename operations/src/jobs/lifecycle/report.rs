@@ -1,22 +1,21 @@
-//! What the external surfaces report about one request family.
-//!
-//! Everything here is derived from the immutable records this responder holds,
-//! plus two explicitly responder-local diagnostics: the plan this node stored
-//! when it was a witness, and whether it still has a retry armed. Both are kept
-//! outside the replicated projection digest, so a client can tell a local view
-//! apart from realm-wide truth.
+//! Reports one request family to external surfaces: its records, status and audit pages.
+//! The witness plan and retry state stay outside the projection digest as local diagnostics.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{FetchCursor, PageLimit};
+use aruna_core::id::NodeId;
 use aruna_core::jobs::JobStatusView;
-use aruna_core::keyspaces::{JOB_FAMILY_RECORD_KEYSPACE, JOB_PLAN_EXPLAIN_KEYSPACE};
+use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
-use aruna_core::structs::{
-    AuthContext, ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection,
-    JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
+use aruna_core::structs::execution::job::{
+    ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection, JobRecordEnvelope,
+    JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
     PhysicalExecutionResult, PhysicalExecutionState, ProjectedExecution, SubmissionId,
 };
-use aruna_core::types::{Key, NodeId};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::types::Key;
 use std::collections::BTreeMap;
 use tracing::debug;
 
@@ -36,10 +35,9 @@ const MAX_SIBLING_SCAN: usize = 256;
 /// Explain rows one report reads; only this node ever writes them.
 const MAX_EXPLAIN_ROWS: usize = 4;
 
-/// The placement behind one family: the plan this responder's own witness round
-/// stored, or, when it never planned the request, the newest launch record any
-/// witness published. The counted alternatives and rejections exist only in the
-/// first case, because only a local round keeps them.
+/// The placement behind one family: the plan this responder's witness round
+/// stored, or the newest launch record any witness published when it never
+/// planned. Counted alternatives and rejections exist only in the first case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanEstimate {
     pub target: Option<ExecutionTargetId>,
@@ -131,7 +129,8 @@ pub async fn family_report(
             continue;
         }
         if let Ok(Some(document)) =
-            crate::node_info::read_node_info_document(&context.storage_handle, output.node_id).await
+            crate::node::node_info::read_info_document(&context.storage_handle, output.node_id)
+                .await
             && let Some(endpoint) = document.urls.s3
         {
             output_endpoints.insert(output.node_id, endpoint);
@@ -179,7 +178,7 @@ pub async fn family_report(
 async fn sibling_families(context: &DriverContext, family: JobFamilyId) -> u32 {
     let Ok((rows, _)) = iter_prefix_page(
         &context.storage_handle,
-        JOB_FAMILY_RECORD_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE,
         Some(submission_prefix(family.submission_id)),
         None,
         MAX_SIBLING_SCAN,
@@ -260,7 +259,7 @@ async fn plan_estimate(context: &DriverContext, family: JobFamilyId) -> Option<P
 async fn stored_plan(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
     let (rows, _) = iter_prefix_page(
         &context.storage_handle,
-        JOB_PLAN_EXPLAIN_KEYSPACE,
+        PLAN_EXPLAIN_KEYSPACE,
         Some(Key::from(family.to_bytes().as_slice())),
         None,
         MAX_EXPLAIN_ROWS,
@@ -328,7 +327,7 @@ async fn launched_plan(context: &DriverContext, family: JobFamilyId) -> Option<P
 
 /// Records one audit page may return. The transport clamps to this before it
 /// reaches the record store, so a caller cannot ask for an unbounded page.
-pub const MAX_AUDIT_PAGE: usize = aruna_core::effects::MAX_JOB_RECORD_PAGE;
+pub const MAX_AUDIT_PAGE: usize = aruna_core::effects::MAX_RECORD_PAGE;
 
 /// Why one audit request could not be paged. Both are caller mistakes, so they
 /// map to a bad request rather than to an availability answer.
@@ -441,7 +440,7 @@ pub async fn audit_endpoints(
                 continue;
             }
             if let Ok(Some(document)) =
-                crate::node_info::read_node_info_document(&context.storage_handle, object.node_id)
+                crate::node::node_info::read_info_document(&context.storage_handle, object.node_id)
                     .await
                 && let Some(endpoint) = document.urls.s3
             {

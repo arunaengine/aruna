@@ -1,9 +1,15 @@
+//! Holds the job run context and progress reporter, and dispatches a payload to its runner.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aruna_core::structs::{JobError, JobId, JobPayload, JobProgress, JobResultPayload};
-use aruna_core::types::NodeId;
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::{
+    JobError, JobId, JobPayload, JobProgress, JobResultPayload,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::DriverContext;
@@ -98,7 +104,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             .await
         }
         JobPayload::WriteRunCrate { for_job } => {
-            crate::jobs::workflow::run_crate::run_write_run_crate(ctx, *for_job).await
+            crate::jobs::workflow::run_crate::write_run_crate(ctx, *for_job).await
         }
         JobPayload::TerminalCleanup {
             for_job,

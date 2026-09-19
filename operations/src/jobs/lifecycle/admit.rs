@@ -1,27 +1,25 @@
-//! Local admission of one submission.
-//!
-//! A holder commits the immutable spec and its claim in one transaction, or it
-//! commits nothing: a matching claim replays the canonical alias and a claim of
-//! another request under the same key is a visible conflict. The candidate
-//! records are signed before this runs, so the transaction only decides.
+//! Admits one submission locally, committing the spec and the claim in a single transaction.
+//! A matching claim replays the alias, and a conflicting claim stays visible to the caller.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute_quota::QuotaDenied;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::compute::quota::QuotaDenied;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    JOB_ADMISSION_QUOTA_KEYSPACE, JOB_FAMILY_ALIAS_KEYSPACE, JOB_FAMILY_OUTBOX_KEYSPACE,
-    JOB_FAMILY_PROJECTION_KEYSPACE, JOB_FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE,
-    JOB_OWNER_INDEX_KEYSPACE,
+    ADMISSION_QUOTA_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
+    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{
+use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
-    RealmConfigDocument, RealmId, RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode,
-    job_owner_index_key, job_record_key,
+    RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode, job_record_key, owner_index_key,
 };
-use aruna_core::types::{Effects, Key, NodeId, TxnId, Value};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use tracing::{debug, warn};
 
@@ -126,7 +124,7 @@ impl AdmitSubmissionOperation {
 
     fn read_config(&mut self) -> Effects {
         self.state = AdmitState::ReadConfig;
-        let config = DocumentSyncTarget::RealmConfig {
+        let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
         smallvec![Effect::Storage(StorageEffect::Read {
@@ -150,7 +148,7 @@ impl AdmitSubmissionOperation {
     fn scan(&mut self, txn_id: TxnId) -> Effects {
         self.state = AdmitState::Scan { txn_id };
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             prefix: Some(submission_prefix(self.config.submission_id)),
             start: self.cursor.clone().map(IterStart::After),
             limit: RECORD_PAGE_SIZE,
@@ -206,7 +204,7 @@ impl AdmitSubmissionOperation {
             return self.cancel(txn_id);
         };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            key_space: ADMISSION_QUOTA_KEYSPACE.to_string(),
             key: Key::from(spec.group_id.to_bytes().as_slice()),
             txn_id: Some(txn_id),
         })]
@@ -230,7 +228,7 @@ impl AdmitSubmissionOperation {
         }
         self.state = AdmitState::ReadCache { txn_id };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+            key_space: FAMILY_PROJECTION_KEYSPACE.to_string(),
             key: family_prefix(&self.family()),
             txn_id: Some(txn_id),
         })]
@@ -272,12 +270,12 @@ impl AdmitSubmissionOperation {
         for envelope in [spec, claim] {
             let key = record_key(&envelope.key());
             writes.push((
-                JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                FAMILY_RECORD_KEYSPACE.to_string(),
                 key.clone(),
                 Value::from(to_bytes(envelope)?.as_slice()),
             ));
             writes.push((
-                JOB_FAMILY_OUTBOX_KEYSPACE.to_string(),
+                FAMILY_OUTBOX_KEYSPACE.to_string(),
                 key,
                 Value::from(
                     to_bytes(&OutboxEntry {
@@ -291,12 +289,12 @@ impl AdmitSubmissionOperation {
             ));
         }
         writes.push((
-            JOB_FAMILY_ALIAS_KEYSPACE.to_string(),
+            FAMILY_ALIAS_KEYSPACE.to_string(),
             alias_key(self.config.candidate.job_id, &self.family()),
             Value::from(claim.key().to_bytes().as_slice()),
         ));
         writes.push((
-            JOB_FAMILY_PROJECTION_KEYSPACE.to_string(),
+            FAMILY_PROJECTION_KEYSPACE.to_string(),
             family_prefix(&self.family()),
             Value::from(to_bytes(&ProjectionCache::invalidated(self.cache.as_ref()))?.as_slice()),
         ));
@@ -307,12 +305,12 @@ impl AdmitSubmissionOperation {
             Value::from(record.to_bytes()?.as_slice()),
         ));
         writes.push((
-            JOB_OWNER_INDEX_KEYSPACE.to_string(),
-            job_owner_index_key(record.created_by, record.created_at_ms, record.job_id),
+            JOB_INDEX_KEYSPACE.to_string(),
+            owner_index_key(record.created_by, record.created_at_ms, record.job_id),
             Value::from(Vec::<u8>::new().as_slice()),
         ));
         writes.push((
-            JOB_ADMISSION_QUOTA_KEYSPACE.to_string(),
+            ADMISSION_QUOTA_KEYSPACE.to_string(),
             Key::from(stored.group_id.to_bytes().as_slice()),
             Value::from(to_bytes(&self.quota_revision.saturating_add(1))?.as_slice()),
         ));
@@ -523,9 +521,9 @@ fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, REALM};
+    use crate::tests::records::{Family, REALM};
 
     // A state that expects no event must reject one instead of ignoring it.
     #[test]

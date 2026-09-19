@@ -1,10 +1,15 @@
+//! Writes, reads, lists and deletes blob objects on a backend, including hidden staged blobs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::BlobHandler;
 use super::backend::{
-    build_backend_path, build_hidden_path, build_multipart_part_path, intent_key, intent_value,
+    build_backend_path, build_hidden_path, build_part_path, intent_key, intent_value,
 };
 use super::group::GROUP_WRITE_CHUNK;
 use crate::hash::Hasher;
-use crate::opendal::abort_partial_writer;
+use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -12,11 +17,11 @@ use aruna_core::handle::Handle as _;
 use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
-use aruna_core::structs::{
+use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
-    HiddenBlobKey, MultipartUploadPartKey, ResolvedBackend,
+    HiddenBlobKey, ResolvedBackend,
 };
-use aruna_core::types::UserId;
+use aruna_core::structs::storage::multipart::MultipartPartKey;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};
@@ -219,9 +224,8 @@ impl HiddenReservation {
         } else {
             Ok(())
         };
-        // Capacity is released even when the partial object could not be
-        // removed, so a failed cleanup cannot strand the reservation; the
-        // leftover object is the reclaim sweep's to collect.
+        // Capacity is released even if cleanup fails; the reclaim sweep
+        // collects the leftover object.
         let released = match self.key.lock().ok().and_then(|key| key.clone()) {
             Some(key) if !self.uncertain => {
                 let released = handler.release_hidden(&key).await;
@@ -292,7 +296,7 @@ impl Drop for HiddenReservation {
 }
 
 impl BlobHandler {
-    pub(super) async fn write_stream_to_location(
+    pub(super) async fn write_stream(
         &self,
         location: BackendLocation,
         operator: Operator,
@@ -327,7 +331,7 @@ impl BlobHandler {
                 .await
             }
             None => timeout(
-                self.control_plane_io_timeout(),
+                self.io_timeout(),
                 open_writer(&operator, &storage_path, &location.backend),
             )
             .await
@@ -433,7 +437,7 @@ impl BlobHandler {
         let close = match reservation.writer_mut() {
             Some(writer) => match deadline {
                 Some(deadline) => with_deadline(Some(deadline), writer.close()).await,
-                None => timeout(self.control_plane_io_timeout(), writer.close())
+                None => timeout(self.io_timeout(), writer.close())
                     .await
                     .map_err(|_| ()),
             },
@@ -568,10 +572,9 @@ impl BlobHandler {
         }
     }
 
-    /// Removes the partial object a failed or cancelled write left behind. An
-    /// abandoned writer is never polled again, and backends without writer
-    /// abort (fs) keep the partial object at its final path, so deleting that
-    /// path is the equivalent cleanup.
+    /// Removes the partial object a failed or cancelled write left behind.
+    /// An abandoned writer is never polled again; backends without writer
+    /// abort keep the partial object, so deleting its path is equivalent.
     pub(super) async fn clean_partial(
         &self,
         writer: Option<&mut opendal::Writer>,
@@ -582,7 +585,7 @@ impl BlobHandler {
         if let Some(writer) = writer
             && !abandoned
         {
-            match self.abort_writer(writer).await {
+            match abort_writer(writer, self.io_timeout(), UnsupportedAbort::DeletePath).await {
                 Ok(()) => return Ok(()),
                 // Other abort failures stay uncertain and must not delete.
                 Err(BlobError::CleanupUnsupported) => {}
@@ -595,33 +598,12 @@ impl BlobHandler {
         }
     }
 
-    async fn abort_writer(&self, writer: &mut opendal::Writer) -> Result<(), BlobError> {
-        match timeout(self.control_plane_io_timeout(), writer.abort()).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) if error.kind() == ErrorKind::Unsupported => {
-                Err(BlobError::CleanupUnsupported)
-            }
-            Ok(Err(error)) => Err(BlobError::DeleteError(format!(
-                "partial blob cleanup is uncertain: {error}"
-            ))),
-            Err(_) => Err(BlobError::DeleteError(
-                "partial blob cleanup is uncertain: timed out aborting partial blob writer"
-                    .to_string(),
-            )),
-        }
-    }
-
     pub(super) async fn delete_path(
         &self,
         operator: &Operator,
         storage_path: &str,
     ) -> Result<(), BlobError> {
-        match timeout(
-            self.control_plane_io_timeout(),
-            operator.delete(storage_path),
-        )
-        .await
-        {
+        match timeout(self.io_timeout(), operator.delete(storage_path)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => Ok(()),
             Ok(Err(error)) => Err(BlobError::DeleteError(error.to_string())),
@@ -632,12 +614,7 @@ impl BlobHandler {
     }
 
     async fn release_hidden(&self, key: &HiddenBlobKey) -> Result<(), BlobError> {
-        match timeout(
-            self.control_plane_io_timeout(),
-            self.release_hidden_key(key),
-        )
-        .await
-        {
+        match timeout(self.io_timeout(), self.release_hidden_key(key)).await {
             Ok(result) => result,
             Err(_) => Err(BlobError::DeleteError(
                 "timed out releasing hidden blob reservation".to_string(),
@@ -693,12 +670,7 @@ impl BlobHandler {
         };
         let operator = self.operator_from_location(&location)?;
         let storage_path = location.get_storage_path()?;
-        match timeout(
-            self.control_plane_io_timeout(),
-            operator.stat(&storage_path),
-        )
-        .await
-        {
+        match timeout(self.io_timeout(), operator.stat(&storage_path)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
                 self.release_reservation(&location).await?;
@@ -802,10 +774,7 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        match self
-            .write_stream_to_location(location.clone(), operator, blob)
-            .await
-        {
+        match self.write_stream(location.clone(), operator, blob).await {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
                 match self.finalize_reservation(&location).await {
@@ -829,7 +798,7 @@ impl BlobHandler {
 
     pub async fn write_blob_part(
         &self,
-        part: MultipartUploadPartKey,
+        part: MultipartPartKey,
         resolved: ResolvedBackend,
         created_by: UserId,
         compressed: bool,
@@ -850,7 +819,7 @@ impl BlobHandler {
             storage_class: resolved.storage_class.clone(),
             root,
             storage_bucket: multipart_bucket.clone(),
-            backend_path: build_multipart_part_path(part.upload_id, part.part_number, ulid),
+            backend_path: build_part_path(part.upload_id, part.part_number, ulid),
             ulid,
             compressed,
             encrypted,
@@ -880,8 +849,7 @@ impl BlobHandler {
                     return BlobEvent::Error(err);
                 }
             };
-        let result =
-            Box::pin(self.write_stream_to_location(location.clone(), operator, blob)).await;
+        let result = Box::pin(self.write_stream(location.clone(), operator, blob)).await;
         match result {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
@@ -957,10 +925,7 @@ impl BlobHandler {
                 return BlobEvent::Error(err);
             }
         };
-        match self
-            .compose_parts_to_location(location.clone(), operator, parts)
-            .await
-        {
+        match self.compose_parts(location.clone(), operator, parts).await {
             BlobEvent::WriteFinished { location } => {
                 reservation.retain();
                 match self.finalize_reservation(&location).await {
@@ -982,7 +947,7 @@ impl BlobHandler {
         }
     }
 
-    pub(super) async fn compose_parts_to_location(
+    pub(super) async fn compose_parts(
         &self,
         mut location: BackendLocation,
         operator: Operator,
@@ -993,7 +958,7 @@ impl BlobHandler {
             Err(e) => return BlobEvent::Error(e),
         };
         let mut writer = match timeout(
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             open_writer(&operator, &storage_path, &location.backend),
         )
         .await
@@ -1017,20 +982,18 @@ impl BlobHandler {
             for part in parts {
                 let part_operator = self.operator_from_location(&part)?;
                 let part_storage_path = part.get_storage_path()?;
-                let reader = timeout(
-                    self.control_plane_io_timeout(),
-                    part_operator.reader(&part_storage_path),
-                )
-                .await
-                .map_err(|_| BlobError::ReadError("timed out opening compose reader".to_string()))?
-                .map_err(|err| BlobError::ReadError(err.to_string()))?;
-                let reader = timeout(
-                    self.control_plane_io_timeout(),
-                    reader.into_bytes_stream(..),
-                )
-                .await
-                .map_err(|_| BlobError::ReadError("timed out starting compose reader".to_string()))?
-                .map_err(|err| BlobError::ReadError(err.to_string()))?;
+                let reader = timeout(self.io_timeout(), part_operator.reader(&part_storage_path))
+                    .await
+                    .map_err(|_| {
+                        BlobError::ReadError("timed out opening compose reader".to_string())
+                    })?
+                    .map_err(|err| BlobError::ReadError(err.to_string()))?;
+                let reader = timeout(self.io_timeout(), reader.into_bytes_stream(..))
+                    .await
+                    .map_err(|_| {
+                        BlobError::ReadError("timed out starting compose reader".to_string())
+                    })?
+                    .map_err(|err| BlobError::ReadError(err.to_string()))?;
 
                 let mut reader = BackendStream::new(reader);
                 loop {
@@ -1071,8 +1034,7 @@ impl BlobHandler {
         let bytes_written = match compose_result {
             Ok(bytes_written) => bytes_written,
             Err(err) => {
-                let cleanup =
-                    abort_partial_writer(&mut writer, self.control_plane_io_timeout()).await;
+                let cleanup = abort_partial_writer(&mut writer, self.io_timeout()).await;
                 if ambiguous {
                     return BlobEvent::Error(BlobError::WriteCleanup {
                         location,
@@ -1123,28 +1085,20 @@ impl BlobHandler {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
-        let reader = match timeout(
-            self.control_plane_io_timeout(),
-            operator.reader(&storage_path),
-        )
-        .await
-        {
-            Ok(Ok(reader)) => match timeout(
-                self.control_plane_io_timeout(),
-                reader.into_bytes_stream(..),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    return BlobEvent::Error(BlobError::ReadError(error.to_string()));
+        let reader = match timeout(self.io_timeout(), operator.reader(&storage_path)).await {
+            Ok(Ok(reader)) => {
+                match timeout(self.io_timeout(), reader.into_bytes_stream(..)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        return BlobEvent::Error(BlobError::ReadError(error.to_string()));
+                    }
+                    Err(_) => {
+                        return BlobEvent::Error(BlobError::ReadError(
+                            "timed out starting blob reader".to_string(),
+                        ));
+                    }
                 }
-                Err(_) => {
-                    return BlobEvent::Error(BlobError::ReadError(
-                        "timed out starting blob reader".to_string(),
-                    ));
-                }
-            },
+            }
             Ok(Err(error)) => return BlobEvent::Error(BlobError::ReadError(error.to_string())),
             Err(_) => {
                 return BlobEvent::Error(BlobError::ReadError(
@@ -1156,7 +1110,7 @@ impl BlobHandler {
         let expected_size = location.blob_size;
         let idle_timeout = self.transfer_idle_timeout();
         let blob = BackendStream::new(stream::try_unfold(
-            (BackendStream::new(reader), Hasher::new(), 0u64),
+            (BackendStream::new(reader), blake3::Hasher::new(), 0u64),
             move |(mut stream, mut hasher, bytes_read)| async move {
                 match next_chunk(&mut stream, idle_timeout).await? {
                     Some(Ok(bytes)) => {
@@ -1173,7 +1127,7 @@ impl BlobHandler {
                             )));
                         }
 
-                        if hasher.finalize().blake3.as_bytes() != &expected_blake3 {
+                        if hasher.finalize().as_bytes() != &expected_blake3 {
                             return Err(BlobError::IntegrityCheckFailed(
                                 "blake3 hash mismatch".to_string(),
                             ));
@@ -1206,28 +1160,20 @@ impl BlobHandler {
             Err(e) => return BlobEvent::Error(e),
         };
         let stream_size = range_length(&range, location.blob_size);
-        let reader = match timeout(
-            self.control_plane_io_timeout(),
-            operator.reader(&storage_path),
-        )
-        .await
-        {
-            Ok(Ok(reader)) => match timeout(
-                self.control_plane_io_timeout(),
-                reader.into_bytes_stream(range),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    return BlobEvent::Error(BlobError::ReadError(error.to_string()));
+        let reader = match timeout(self.io_timeout(), operator.reader(&storage_path)).await {
+            Ok(Ok(reader)) => {
+                match timeout(self.io_timeout(), reader.into_bytes_stream(range)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        return BlobEvent::Error(BlobError::ReadError(error.to_string()));
+                    }
+                    Err(_) => {
+                        return BlobEvent::Error(BlobError::ReadError(
+                            "timed out starting blob reader".to_string(),
+                        ));
+                    }
                 }
-                Err(_) => {
-                    return BlobEvent::Error(BlobError::ReadError(
-                        "timed out starting blob reader".to_string(),
-                    ));
-                }
-            },
+            }
             Ok(Err(error)) => return BlobEvent::Error(BlobError::ReadError(error.to_string())),
             Err(_) => {
                 return BlobEvent::Error(BlobError::ReadError(
@@ -1524,7 +1470,7 @@ impl BlobHandler {
         if let Some(start_after) = start_after {
             request = request.start_after(start_after);
         }
-        tokio::time::timeout(self.control_plane_io_timeout(), async move {
+        tokio::time::timeout(self.io_timeout(), async move {
             let lister = request
                 .await
                 .map_err(|error| BlobError::ListError(error.to_string()))?;
@@ -1540,10 +1486,10 @@ impl BlobHandler {
         start_after: Option<Vec<u8>>,
     ) -> Result<(Vec<HiddenBlobEntry>, Option<Vec<u8>>), BlobError> {
         let event = tokio::time::timeout(
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             self.storage
                 .send_effect(Effect::Storage(StorageEffect::Iter {
-                    key_space: aruna_core::keyspaces::BLOB_HIDDEN_RESERVATION_KEYSPACE.to_string(),
+                    key_space: aruna_core::keyspaces::HIDDEN_RESERVATION_KEYSPACE.to_string(),
                     prefix: None,
                     start: start_after.map(|key| IterStart::After(key.into())),
                     limit: HIDDEN_LIST_PAGE,
@@ -1611,12 +1557,7 @@ impl BlobHandler {
         };
 
         // A retried cleanup must not decrement the load a second time.
-        match timeout(
-            self.control_plane_io_timeout(),
-            operator.stat(&storage_path),
-        )
-        .await
-        {
+        match timeout(self.io_timeout(), operator.stat(&storage_path)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
                 if let Err(error) = self.release_reservation(&location).await {
@@ -1633,12 +1574,7 @@ impl BlobHandler {
                 ));
             }
         }
-        match timeout(
-            self.control_plane_io_timeout(),
-            operator.delete(&storage_path),
-        )
-        .await
-        {
+        match timeout(self.io_timeout(), operator.delete(&storage_path)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {}
             Ok(Err(error)) => return BlobEvent::Error(BlobError::DeleteError(error.to_string())),

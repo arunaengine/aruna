@@ -1,8 +1,7 @@
-//! When each realm peer last reached this node.
-//!
-//! A device publishes no realm presence, so the only liveness signal a realm
-//! node holds about one is that the device itself reached it. This records that
-//! observation: node-local, in memory, never replicated and never published.
+//! Remembers when each authenticated realm peer last reached this node.
+//! It is kept in memory only, never replicated, and is the only liveness signal for devices.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -54,7 +53,7 @@ fn within_window(seen_ms: u64, now_ms: u64) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::{PEER_CONTACT_WINDOW, PeerContacts};
     use aruna_core::NodeId;
 

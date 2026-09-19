@@ -1,33 +1,37 @@
+//! Tests that a token revoked on one node is denied on a peer once the realm config converges.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::UserId;
-use aruna_core::admin_document_reducer::AdminDocumentReducerState;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::bearer_token_hash;
-use aruna_core::document::{DocumentSyncPublish, DocumentSyncTarget};
+use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::{
-    Actor, NodePlacementEntry, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
-};
-use aruna_core::{DocumentSyncEffect, DocumentSyncNetEvent};
+use aruna_core::reducer::AdminDocumentState;
+use aruna_core::structs::identity::auth::{Actor, TokenClaims};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::placement::record::NodePlacementEntry;
+use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::auth::{
-    ArunaBearerTokenError, ArunaBearerTokenValidationState, decode_aruna_bearer_token,
-    realm_token_revoked,
+use aruna_operations::auth::bearer_token::{
+    ArunaBearerError, ArunaValidationState, decode_bearer_token, realm_token_revoked,
 };
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::revoke_token::{
+use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::sync::incoming::initialize_net_holder;
+use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::{FjallStorage, StorageHandle};
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
@@ -46,6 +50,9 @@ struct TestNode {
     _temp_dir: TempDir,
     net: NetHandle,
     context: Arc<DriverContext>,
+    /// Keeps the inbound handler's scheduled tasks tied to a live owner for
+    /// the node's whole lifetime.
+    _shutdown: aruna_core::shutdown::Shutdown,
 }
 
 /// Mirrors how production wires revocation: enforcement reads the replicated
@@ -56,12 +63,12 @@ struct PeerAuthState {
 }
 
 #[async_trait]
-impl ArunaBearerTokenValidationState for PeerAuthState {
+impl ArunaValidationState for PeerAuthState {
     async fn is_token_revoked(
         &self,
         realm_id: &RealmId,
         token_hash: &str,
-    ) -> Result<bool, ArunaBearerTokenError> {
+    ) -> Result<bool, ArunaBearerError> {
         realm_token_revoked(&self.storage, *realm_id, token_hash).await
     }
 
@@ -82,7 +89,7 @@ async fn peer_denies_token() -> TestResult<()> {
     let token_hash = bearer_token_hash(&token);
 
     let peer = peer_auth(&nodes[1], realm_id);
-    decode_aruna_bearer_token(&peer, &token)
+    decode_bearer_token(&peer, &token)
         .await
         .expect("peer accepts the token before it is revoked");
 
@@ -97,7 +104,7 @@ async fn peer_denies_token() -> TestResult<()> {
             expires_at,
             token_owner: user_id,
             admission: RevokeTokenAdmission::SelfService,
-            now: aruna_core::util::unix_timestamp_secs(),
+            now: aruna_core::time::unix_timestamp_secs(),
         }),
         nodes[0].context.as_ref(),
     )
@@ -114,22 +121,22 @@ async fn peer_denies_token() -> TestResult<()> {
     )
     .await?;
 
-    let error = decode_aruna_bearer_token(&peer, &token)
+    let error = decode_bearer_token(&peer, &token)
         .await
         .expect_err("peer rejects the revoked token");
-    assert!(matches!(error, ArunaBearerTokenError::TokenRevoked));
+    assert!(matches!(error, ArunaBearerError::TokenRevoked));
 
     // The revocation is durable realm state, not process state: a validation
     // state built fresh over the same storage still denies the token.
     let restarted = peer_auth(&nodes[1], realm_id);
     assert!(matches!(
-        decode_aruna_bearer_token(&restarted, &token).await,
-        Err(ArunaBearerTokenError::TokenRevoked)
+        decode_bearer_token(&restarted, &token).await,
+        Err(ArunaBearerError::TokenRevoked)
     ));
 
     // Only the revoked token is denied; the realm stays usable.
     let (other, _) = mint_token(&signing_key, realm_id, user_id);
-    decode_aruna_bearer_token(&peer, &other)
+    decode_bearer_token(&peer, &other)
         .await
         .expect("peer still accepts a token that was never revoked");
 
@@ -217,18 +224,21 @@ async fn spawn_node(realm_id: RealmId) -> TestResult<TestNode> {
         compute_handle: None,
     });
 
-    initialize_net_incoming(context.clone());
-    initialize_task_incoming(
+    let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
+    let shutdown = aruna_core::shutdown::Shutdown::new();
+    initialize_net_holder(
         context.clone(),
-        task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
-    )
-    .await;
+        aruna_core::structs::execution::job::RoCrateLimits::default(),
+        jobs_runtime.clone(),
+        &shutdown,
+    );
+    start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
 
     Ok(TestNode {
         _temp_dir: temp_dir,
         net,
         context,
+        _shutdown: shutdown,
     })
 }
 
@@ -273,11 +283,11 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResu
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => return Err(format!("unexpected realm config write event: {other:?}").into()),
         }
-        node.net.refresh_realm_peers_from_document(&config).await?;
+        node.net.refresh_document_peers(&config).await?;
     }
     seed_sync_topic(nodes, realm_id, &config).await?;
     for node in nodes {
-        aruna_operations::process_placements::process_shard_placements(
+        aruna_operations::placement::process_placements::process_shard_placements(
             &node.context,
             realm_id,
             node.net.node_id(),
@@ -294,20 +304,19 @@ async fn seed_sync_topic(
     realm_id: RealmId,
     config: &RealmConfigDocument,
 ) -> TestResult<()> {
-    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    let target = DocumentTarget::RealmConfig { realm_id };
     let placement =
-        aruna_operations::placement::placement_ref_for_target(config, &target, Default::default());
+        aruna_operations::placement::target_placement_ref(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),
         user_id: UserId::nil(realm_id),
         realm_id,
     };
-    let mut reducer_state =
-        AdminDocumentReducerState::new(AdminDocumentTarget::RealmConfig { realm_id });
+    let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
     let event = reducer_state.apply_operation(
         &actor,
-        AdminDocumentOperation::RealmConfigNodePlacementSet {
+        AdminDocumentOperation::NodePlacementSet {
             entry: config
                 .placement_map
                 .first()
@@ -319,7 +328,7 @@ async fn seed_sync_topic(
     match nodes[1]
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentSyncEffect::PublishDocuments {
+            DocumentEffect::PublishDocuments {
                 documents: vec![DocumentSyncPublish::AdminOperation {
                     target: target.clone(),
                     event: Box::new(event),
@@ -332,23 +341,21 @@ async fn seed_sync_topic(
         )))
         .await
     {
-        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsPublished { .. })) => {}
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished { .. })) => {}
         other => return Err(format!("unexpected config seed publish event: {other:?}").into()),
     }
 
     match nodes[0]
         .net
         .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentSyncEffect::SyncDocuments {
+            DocumentEffect::SyncDocuments {
                 topics: vec![topic],
                 peers: Vec::new(),
             },
         )))
         .await
     {
-        Event::Net(NetEvent::DocumentSync(DocumentSyncNetEvent::DocumentsReconciled {
-            ..
-        })) => Ok(()),
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled { .. })) => Ok(()),
         other => Err(format!("unexpected config seed sync event: {other:?}").into()),
     }
 }

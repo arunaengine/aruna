@@ -1,10 +1,7 @@
-//! Timestamp-ordered index of the records an anonymous caller may read.
-//!
-//! OAI-PMH enumeration is unauthenticated, so it must neither scan the registry
-//! nor evaluate a request policy per candidate. A background pass rebuilds the
-//! index into a fresh generation and publishes it only once complete; readers
-//! page the published generation under a fixed candidate budget and re-check
-//! authorization on every record before it is rendered.
+//! Keeps a timestamp-ordered index of the records an anonymous caller may read.
+//! A background pass publishes a generation that readers re-check instead of scanning.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,23 +10,23 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    METADATA_VISIBILITY_INDEX_KEYSPACE, METADATA_VISIBILITY_STATE_KEYSPACE,
-};
+use aruna_core::keyspaces::{VISIBILITY_INDEX_KEYSPACE, VISIBILITY_STATE_KEYSPACE};
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::{MetadataRegistryRecord, Permission};
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
-use aruna_core::util::unix_timestamp_millis;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 use crate::driver::DriverContext;
 use crate::metadata::repository::{StorageReadError, delete_index_keys};
 use crate::metadata::timestamp_index::enumerate_updated;
-use crate::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
+use crate::storage_read::parse_storage_scan;
 
 /// Registry rows evaluated per rebuild batch, and index rows per scan batch.
 const BUILD_BATCH: usize = 256;
@@ -188,7 +185,7 @@ async fn read_index_datestamp(
     let event = context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
+            key_space: VISIBILITY_INDEX_KEYSPACE.to_string(),
             key: index_key(generation, updated_at_ms, document_id),
             txn_id: None,
         }))
@@ -227,7 +224,10 @@ fn record_visible(record: &MetadataRegistryRecord, evaluators: &Evaluators) -> b
 }
 
 type Evaluators = std::collections::HashMap<
-    (aruna_core::structs::RealmId, aruna_core::types::GroupId),
+    (
+        aruna_core::structs::identity::realm::RealmId,
+        aruna_core::types::GroupId,
+    ),
     PolicyEvaluator,
 >;
 
@@ -286,7 +286,7 @@ async fn read_state(context: &DriverContext) -> Result<Option<VisibilityState>, 
     let event = context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: METADATA_VISIBILITY_STATE_KEYSPACE.to_string(),
+            key_space: VISIBILITY_STATE_KEYSPACE.to_string(),
             key: state_key(),
             txn_id: None,
         }))
@@ -312,7 +312,7 @@ async fn write_state(
     let event = context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: METADATA_VISIBILITY_STATE_KEYSPACE.to_string(),
+            key_space: VISIBILITY_STATE_KEYSPACE.to_string(),
             key: state_key(),
             value,
             txn_id: None,
@@ -329,28 +329,12 @@ async fn write_state(
 
 fn scan_effect(start: IterStart, limit: usize) -> Effect {
     Effect::Storage(StorageEffect::Iter {
-        key_space: METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
+        key_space: VISIBILITY_INDEX_KEYSPACE.to_string(),
         prefix: None,
         start: Some(start),
         limit,
         txn_id: None,
     })
-}
-
-/// A scanned index batch: its entries and the storage cursor to resume after.
-type IndexBatch = (Vec<(Key, Value)>, Option<Key>);
-
-fn parse_scan(event: Event) -> Result<IndexBatch, StorageReadError> {
-    match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((values, next_start_after)),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(StorageError::ReadError(
-            "unexpected event".to_string(),
-        ))),
-    }
 }
 
 /// Rewrites a cursor minted against an older generation onto the current one, so
@@ -361,9 +345,8 @@ fn rebase_cursor(cursor: &Key, generation: u64) -> Option<Key> {
 }
 
 /// Page anonymously visible records in `[from_ms, until_ms]` after `after`.
-///
-/// Fails closed: without a published generation, or when the per-record re-check
-/// cannot be evaluated, the caller gets `Unavailable` rather than a wider scan.
+/// Fails closed: no published generation or an unevaluable per-record check
+/// yields `Unavailable` rather than a wider scan.
 pub async fn visible_page(
     context: &DriverContext,
     from_ms: u64,
@@ -403,7 +386,7 @@ pub async fn visible_page(
             .storage_handle
             .send_effect(scan_effect(start.clone(), SCAN_BATCH))
             .await;
-        let (batch, next) = parse_scan(event)?;
+        let (batch, next) = parse_storage_scan(event)?;
         if batch.is_empty() {
             more = false;
             break;
@@ -425,11 +408,8 @@ pub async fn visible_page(
             if effective_ms >= from_ms
                 && effective_ms <= until_ms
                 && let Some(record) =
-                    crate::get_metadata_document::load_metadata_record_by_document(
-                        context,
-                        document_id,
-                    )
-                    .await?
+                    crate::metadata::get_document::load_document_record(context, document_id)
+                        .await?
                 && record.updated_at_ms == updated_at_ms
             {
                 let mut record = record;
@@ -521,10 +501,8 @@ async fn admit_visible(
 }
 
 /// The datestamp of the oldest anonymously visible record, for `earliestDatestamp`.
-///
-/// Follows continuations so a run of denied leading candidates cannot report a
-/// repository as empty, and fails closed rather than reporting a datestamp that
-/// is not the oldest once the walk budget is spent.
+/// Follows continuations so denied leading candidates do not report an empty
+/// repository, and fails closed once the walk budget is spent.
 pub async fn earliest_visible(context: &DriverContext) -> Result<Option<u64>, VisibilityError> {
     let mut after = None;
     for _ in 0..EARLIEST_PAGES {
@@ -554,12 +532,9 @@ fn fold_visible(digest: &mut [u8; 32], updated_at_ms: u64, document_id: Ulid) {
     }
 }
 
-/// One bounded step of index maintenance.
-///
-/// A cycle walks the registry comparing it against the published generation and
-/// writes a new one only once the visible set actually differs, so a steady-state
-/// pass rewrites nothing. Every storage mutation is gated on `token`, and the
-/// walk keeps a persisted cursor so a pass never spans the whole registry.
+/// One bounded step of index maintenance. A cycle writes a new generation only
+/// once the visible set differs, so a steady-state pass rewrites nothing; every
+/// mutation is gated on `token` and a persisted cursor keeps the walk bounded.
 pub async fn visibility_pass(
     context: &DriverContext,
     token: &CancellationToken,
@@ -628,7 +603,7 @@ async fn pass_bounded(
                     pass.max_uplift_ms = pass.max_uplift_ms.max(effective_ms);
                 }
                 writes.push((
-                    METADATA_VISIBILITY_INDEX_KEYSPACE.to_string(),
+                    VISIBILITY_INDEX_KEYSPACE.to_string(),
                     index_key(generation, record.updated_at_ms, record.document_id),
                     ByteView::from(effective_ms.to_be_bytes().to_vec()),
                 ));
@@ -713,7 +688,7 @@ async fn prune_pass(
         .storage_handle
         .send_effect(scan_effect(start, bounds.prune))
         .await;
-    let (batch, next) = parse_scan(event)?;
+    let (batch, next) = parse_storage_scan(event)?;
     let mut stale = Vec::new();
     for (key, _) in batch {
         let (key_generation, _, _) =
@@ -725,7 +700,7 @@ async fn prune_pass(
     if token.is_cancelled() {
         return Ok(PassOutcome::Cancelled);
     }
-    delete_index_keys(context, METADATA_VISIBILITY_INDEX_KEYSPACE, stale).await?;
+    delete_index_keys(context, VISIBILITY_INDEX_KEYSPACE, stale).await?;
     match next {
         Some(next) => state.prune_after = Some(next.as_ref().to_vec()),
         None => {
@@ -787,9 +762,8 @@ async fn write_index_keys(
 }
 
 /// Keeps the index current on the shutdown supervisor, one bounded pass per tick.
-/// A record whose visibility or governing policy changed is picked up by the next
-/// cycle; until then the reader's per-record re-check keeps a newly-hidden record
-/// from being served.
+/// Changed visibility is picked up next cycle; until then the reader's per-record
+/// re-check keeps a newly-hidden record from being served.
 pub fn spawn_visibility_index(context: Arc<DriverContext>, shutdown: &Shutdown) {
     let token = shutdown.token();
     shutdown.spawn(async move {
@@ -814,12 +788,15 @@ pub fn spawn_visibility_index(context: Arc<DriverContext>, shutdown: &Shutdown) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::repository::create_records_and_outbox_write_entries;
+    use crate::metadata::repository::create_outbox_entries;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, MetadataAuditOperation, MetadataAuditRecord,
-        PlacementRef, RealmConfigDocument, RealmId,
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::structs::storage::metadata_registry::{
+        MetadataAuditOperation, MetadataAuditRecord,
     };
     use aruna_core::{NodeId, UserId};
     use aruna_storage::storage;
@@ -921,7 +898,7 @@ mod tests {
     async fn seed_realm(context: &DriverContext, policies: Vec<RequestPolicy>) {
         let mut config = RealmConfigDocument::new(REALM, Vec::new(), 1);
         config.request_policies = policies;
-        let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id: REALM };
+        let target = aruna_core::document::DocumentTarget::RealmConfig { realm_id: REALM };
         write(
             context,
             vec![(
@@ -965,9 +942,7 @@ mod tests {
     }
 
     async fn seed_record(context: &DriverContext, record: &MetadataRegistryRecord) {
-        let writes =
-            create_records_and_outbox_write_entries(record, &audit(record), Ulid::generate(), None)
-                .unwrap();
+        let writes = create_outbox_entries(record, &audit(record), Ulid::generate(), None).unwrap();
         write(context, writes).await;
     }
 
@@ -1147,7 +1122,7 @@ mod tests {
         .await;
         rebuild_index(&context).await.unwrap();
 
-        let target = aruna_core::document::DocumentSyncTarget::RealmConfig { realm_id: REALM };
+        let target = aruna_core::document::DocumentTarget::RealmConfig { realm_id: REALM };
         let event = context
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::Delete {
@@ -1240,7 +1215,7 @@ mod tests {
                 .storage_handle
                 .send_effect(scan_effect(start.clone(), SCAN_BATCH))
                 .await;
-            let (batch, next) = parse_scan(event).unwrap();
+            let (batch, next) = parse_storage_scan(event).unwrap();
             keys.extend(batch.into_iter().map(|(key, _)| key.as_ref().to_vec()));
             match next {
                 Some(next) => start = IterStart::After(next),
@@ -1386,7 +1361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn newly_allowed_record_gets_new_oai_datestamp() {
+    async fn newly_allowed_record() {
         let (context, _dir) = context();
         let group_id = Ulid::from_bytes([99; 16]);
         seed_realm(&context, Vec::new()).await;

@@ -1,19 +1,20 @@
-use crate::util::xor_distance_32;
-use crate::{structs::RealmId, types::GroupId};
+//! Defines node, DHT key and topic identifiers plus short display and XOR distance helpers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::structs::identity::realm::RealmId;
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use ulid::Ulid;
 
 pub type NodeId = iroh::PublicKey;
 
-pub const SHORT_DISPLAY_ID_CHARS: usize = 8;
+pub const DISPLAY_ID_CHARS: usize = 8;
 pub const HEX_PREFIX_BYTES: usize = 8;
 
 pub fn short_display_id(id: impl fmt::Display) -> String {
-    id.to_string()
-        .chars()
-        .take(SHORT_DISPLAY_ID_CHARS)
-        .collect()
+    id.to_string().chars().take(DISPLAY_ID_CHARS).collect()
 }
 
 pub fn hex_prefix(bytes: &[u8]) -> String {
@@ -22,6 +23,16 @@ pub fn hex_prefix(bytes: &[u8]) -> String {
 
 pub fn hex_prefix_bytes(bytes: &[u8], max_bytes: usize) -> String {
     hex::encode(&bytes[..bytes.len().min(max_bytes)])
+}
+
+/// Compute XOR distance between two 32-byte values.
+#[inline]
+pub fn xor_distance_32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    for (i, byte) in result.iter_mut().enumerate() {
+        *byte = a[i] ^ b[i];
+    }
+    result
 }
 
 pub trait NodeIdExt {
@@ -64,11 +75,6 @@ impl DhtKeyId {
     #[inline]
     pub fn from_data(data: &[u8]) -> Self {
         Self(*blake3::hash(data).as_bytes())
-    }
-
-    #[inline]
-    pub fn xor_distance_to_node(&self, node: &NodeId) -> [u8; 32] {
-        xor_distance_32(self.as_bytes(), node.as_bytes())
     }
 }
 
@@ -250,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn test_node_id_xor_distance() {
+    fn node_distance_symmetric() {
         let a = make_node_id(1);
         let b = make_node_id(2);
         assert_eq!(a.xor_distance(&b), b.xor_distance(&a));
@@ -272,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dht_key_from_data() {
+    fn dht_key_deterministic() {
         let key1 = DhtKeyId::from_data(b"hello");
         let key2 = DhtKeyId::from_data(b"hello");
         let key3 = DhtKeyId::from_data(b"world");
@@ -281,14 +287,14 @@ mod tests {
     }
 
     #[test]
-    fn display_helpers_use_stable_prefixes() {
+    fn display_prefixes_stable() {
         assert_eq!(hex_prefix(&[0xab; 16]), "abababababababab");
         assert_eq!(hex_prefix_bytes(&[0xab; 2], 8), "abab");
         assert_eq!(short_display_id("abcdef123456"), "abcdef12");
     }
 
     #[test]
-    fn test_topic_id_roundtrip() {
+    fn topic_id_roundtrip() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let topic = TopicId::realm(realm_id);
         let bytes = topic.to_bytes();
@@ -297,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_topic_id_group() {
+    fn group_topic_roundtrip() {
         let topic = TopicId::group(GroupId::generate());
         let bytes = topic.to_bytes();
         assert_eq!(bytes[0], PREFIX_GROUP);
@@ -306,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn test_topic_id_metadata() {
+    fn metadata_topic_roundtrip() {
         let topic = TopicId::metadata(Ulid::from_bytes([9u8; 16]));
         let bytes = topic.to_bytes();
         assert_eq!(bytes[0], PREFIX_METADATA);
@@ -315,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_topic_id_users() {
+    fn users_topic_roundtrip() {
         let topic = TopicId::users(RealmId::from_bytes([10u8; 32]));
         let bytes = topic.to_bytes();
         assert_eq!(bytes[0], PREFIX_USERS);
@@ -324,10 +330,18 @@ mod tests {
     }
 
     #[test]
-    fn test_topic_id_display() {
+    fn topic_display_prefix() {
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let topic = TopicId::realm(realm_id);
         let display = format!("{topic}");
         assert!(display.starts_with("r:"));
+    }
+
+    #[test]
+    fn computes_xor_distance() {
+        let a = [0xAA; 32];
+        let b = [0x0F; 32];
+        let dist = xor_distance_32(&a, &b);
+        assert_eq!(dist, [0xA5; 32]);
     }
 }

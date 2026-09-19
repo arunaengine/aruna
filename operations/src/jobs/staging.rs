@@ -1,57 +1,46 @@
+//! Runs the staging job that copies source entries into blobs and checkpoints its progress.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::path::{Component, Path};
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::STAGING_JOB_STATE_KEYSPACE;
-use aruna_core::structs::{
-    BucketInfo, JobError, JobId, JobResultPayload, Permission, SourceEntry, SourceEntryKind,
-    StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase, StagingJobSpec,
-    StagingPendingItem, StagingStrategy, blob_object_permission_path,
+use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
+use aruna_core::structs::execution::job::{
+    JobError, JobId, JobResultPayload, StagingJobCheckpoint, StagingJobDirectory, StagingJobError,
+    StagingJobPhase, StagingJobSpec, StagingPendingItem,
 };
-use aruna_core::types::Value;
+use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
+use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use byteview::ByteView;
 use tracing::warn;
 
 use super::executor::{JobContext, JobRunOutcome};
-use super::store::put_staging_checkpoint;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use super::store::{put_state, read_state};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
-use crate::get_realm_config::GetRealmConfigOperation;
-use crate::replication::queue::{
-    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
-};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::staging::head_source::{HeadStagingSourceInput, HeadStagingSourceOperation};
-use crate::staging::list_source::{ListStagingSourceInput, ListStagingSourceOperation};
+use crate::realm::get_config::GetConfigOperation;
+use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
+use crate::staging::list_source::{ListStagingInput, ListStagingOperation};
 use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};
 use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
 
-const STAGING_LIST_PAGE_SIZE: usize = 500;
+const STAGING_PAGE_SIZE: usize = 500;
 
 pub async fn read_staging_checkpoint(
     context: &crate::driver::DriverContext,
     job_id: JobId,
 ) -> Result<Option<StagingJobCheckpoint>, String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: STAGING_JOB_STATE_KEYSPACE.to_string(),
-            key: staging_checkpoint_key(job_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected staging checkpoint read event: {other:?}"
-        )),
-    }
+    read_state(
+        &context.storage_handle,
+        STAGING_STATE_KEYSPACE,
+        staging_checkpoint_key(job_id),
+        "staging checkpoint read",
+    )
+    .await
 }
 
 pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
@@ -350,7 +339,7 @@ async fn stage_item(
     // Without the replication seed peers never learn about the staged version, so
     // the item is not a success.
     if let Err(error) = drive(
-        QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+        LiveVersionOperation::new(LiveVersionInput {
             local_node_id: spec.node_id,
             auth_context: spec.auth_context.clone(),
             bucket: spec.bucket.clone(),
@@ -382,7 +371,7 @@ async fn inspect_item(
 ) -> Result<u64, ItemFailure> {
     let _ = ensure_item_permission(ctx, spec, item).await?;
     drive(
-        HeadStagingSourceOperation::new(HeadStagingSourceInput {
+        HeadSourceOperation::new(HeadSourceInput {
             group_id: spec.group_id,
             connector_id: spec.connector_id,
             source_path: item.source_path.clone(),
@@ -406,7 +395,7 @@ async fn ensure_item_permission(
         ));
     }
     let source_path = source_permission_path(spec, &item.source_path);
-    let target_path = blob_object_permission_path(
+    let target_path = object_permission_path(
         spec.auth_context.realm_id,
         spec.group_id,
         spec.node_id,
@@ -437,13 +426,13 @@ async fn ensure_item_permission(
 async fn load_live_bucket(
     ctx: &JobContext,
     bucket: &str,
-) -> Result<aruna_core::structs::BucketInfo, ItemFailure> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await {
-        Ok(Some(Ok(bucket_info))) => Ok(bucket_info),
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => Err(ItemFailure::Stage(
+) -> Result<aruna_core::structs::storage::blob::BucketInfo, ItemFailure> {
+    match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
+        Ok(bucket_info) => Ok(bucket_info),
+        Err(GetBucketError::NotFound) => Err(ItemFailure::Stage(
             "destination bucket no longer exists".to_string(),
         )),
-        Ok(Some(Err(error))) | Err(error) => Err(ItemFailure::System(error.to_string())),
+        Err(error) => Err(ItemFailure::System(error.to_string())),
     }
 }
 
@@ -452,7 +441,7 @@ async fn current_quota(
     spec: &StagingJobSpec,
 ) -> Result<Option<u64>, ItemFailure> {
     drive(
-        GetRealmConfigOperation::new(spec.auth_context.realm_id),
+        GetConfigOperation::new(spec.auth_context.realm_id),
         &ctx.driver,
     )
     .await
@@ -484,12 +473,12 @@ async fn discover_page(
         return Err(ItemFailure::Denied("permission denied".to_string()));
     }
     drive(
-        ListStagingSourceOperation::new(ListStagingSourceInput {
+        ListStagingOperation::new(ListStagingInput {
             group_id: spec.group_id,
             connector_id: spec.connector_id,
             source_path: directory.source_path.clone(),
             offset: directory.offset,
-            limit: STAGING_LIST_PAGE_SIZE,
+            limit: STAGING_PAGE_SIZE,
             recursive: false,
             files_only: false,
         }),
@@ -607,12 +596,13 @@ async fn persist_checkpoint(
     job_id: JobId,
     checkpoint: &StagingJobCheckpoint,
 ) -> Result<(), String> {
-    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
-    put_staging_checkpoint(
+    put_state(
         &ctx.driver.storage_handle,
         job_id,
         ctx.claim_token,
-        Value::from(value),
+        STAGING_STATE_KEYSPACE,
+        staging_checkpoint_key(job_id),
+        checkpoint,
     )
     .await
     .map_err(|error| error.to_string())
@@ -637,7 +627,7 @@ fn permanent_error(message: impl Into<String>) -> JobRunOutcome {
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
     use ulid::Ulid;
 
@@ -666,9 +656,9 @@ mod tests {
 
     #[test]
     fn initial_prefix_marked() {
-        let realm_id = aruna_core::structs::RealmId::from_bytes([1; 32]);
+        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let mut spec = StagingJobSpec {
-            auth_context: aruna_core::structs::AuthContext {
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id: aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm_id),
                 realm_id,
                 path_restrictions: None,
@@ -680,7 +670,7 @@ mod tests {
             bucket: "bucket".to_string(),
             strategy: StagingStrategy::Reference,
             items: Vec::new(),
-            prefixes: vec![aruna_core::structs::StagingJobPrefix {
+            prefixes: vec![aruna_core::structs::execution::job::StagingJobPrefix {
                 source_prefix: "refseq".to_string(),
                 target_prefix: String::new(),
             }],

@@ -1,3 +1,7 @@
+//! Tests session helper line reading, cell admission limits and output truncation.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use aruna_core::compute::session::{MAX_CELL_OUTPUTS, MAX_RING_EVENTS, TRUNCATED_NOTICE};
 use serde_json::json;
@@ -10,7 +14,7 @@ fn config(idle_after_ms: u64) -> SessionConfig {
         workspace_bucket: "lab-data".to_string(),
         executor_node_id: "node-1".to_string(),
         idle_after_ms,
-        credential_expires_at_ms: 42,
+        credential_expires_ms: 42,
     }
 }
 
@@ -31,13 +35,13 @@ async fn reads_helper_lines() {
 
 #[tokio::test(start_paused = true)]
 async fn bounds_helper_lines() {
-    for bytes in [MAX_HELPER_LINE_BYTES, MAX_HELPER_LINE_BYTES + 1] {
+    for bytes in [MAX_HELPER_BYTES, MAX_HELPER_BYTES + 1] {
         let mut input = vec![b'x'; bytes];
         input.extend_from_slice(b"\nnext\n");
         let mut reader = BufReader::with_capacity(input.len(), input.as_slice());
         let mut line = Vec::new();
         let result = read_line(&mut reader, &mut line).await;
-        if bytes > MAX_HELPER_LINE_BYTES {
+        if bytes > MAX_HELPER_BYTES {
             assert!(result.is_err());
         } else {
             assert_eq!(result.unwrap(), bytes);
@@ -68,7 +72,29 @@ async fn ended_session_stays() {
     let (session, _channel) = registry.open_detached(config.clone());
     session.end(EndReason::Ended);
     assert!(registry.get(&config.job_id).is_some());
-    registry.close(&config.job_id);
+    registry.close(&session);
+    assert!(registry.get(&config.job_id).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn replacement_survives_close() {
+    // An attempt that ended is replaced under the same job id; the old
+    // attempt's cleanup must not drop the replacement.
+    let registry = Arc::new(SessionRegistry::new());
+    let config = config(600_000);
+    let (first, _first_channel) = registry.open_detached(config.clone());
+    first.end(EndReason::Ended);
+    let (second, _second_channel) = registry.open_detached(config.clone());
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert!(Arc::ptr_eq(&registry.get(&config.job_id).unwrap(), &second));
+
+    registry.close(&first);
+    let registered = registry
+        .get(&config.job_id)
+        .expect("the replacement stays registered");
+    assert!(Arc::ptr_eq(&registered, &second));
+
+    registry.close(&second);
     assert!(registry.get(&config.job_id).is_none());
 }
 
@@ -136,7 +162,7 @@ async fn refuses_bad_id() {
     assert_eq!(session.submit_cell("", "1"), Err(SessionError::CellId));
     assert_eq!(session.submit_cell("a b", "1"), Err(SessionError::CellId));
     assert_eq!(
-        session.submit_cell(&"c".repeat(MAX_CELL_ID_LEN + 1), "1"),
+        session.submit_cell(&"c".repeat(MAX_ID_LEN + 1), "1"),
         Err(SessionError::CellId)
     );
 }
@@ -144,7 +170,7 @@ async fn refuses_bad_id() {
 #[tokio::test(start_paused = true)]
 async fn refuses_large_code() {
     let (session, _channel) = ready(600_000);
-    let code = "x".repeat(MAX_CELL_CODE_BYTES + 1);
+    let code = "x".repeat(MAX_CELL_BYTES + 1);
     assert_eq!(
         session.submit_cell("c1", &code),
         Err(SessionError::CodeTooLarge)
@@ -317,7 +343,7 @@ async fn announces_credential_refresh() {
     // A refreshed credential expiry reaches the client as its own frame.
     let (session, _channel) = ready(600_000);
     session.credential_renewed(99);
-    assert_eq!(session.snapshot().credential_expires_at_ms, 99);
+    assert_eq!(session.snapshot().credential_expires_ms, 99);
     let (backlog, _receiver) = session.subscribe(0).expect("resume");
     assert!(
         backlog

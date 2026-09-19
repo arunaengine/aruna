@@ -1,8 +1,11 @@
+//! Replicates blobs between nodes over verified bao streams and quarantines corrupt copies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::BlobHandler;
 use super::backend::rebuild_backend_path;
 use super::control_plane::{
-    parse_replication_init, read_replication_message_with_timeout,
-    send_replication_message_with_timeout, validate_replication_init_ack,
+    parse_replication_init, read_replication_message, send_replication_message, validate_init_ack,
 };
 use crate::bao_tree::{
     BaoReadWriter, OpenDalReader, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper,
@@ -14,10 +17,11 @@ use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
-    BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend, ResolvedSourceAccess,
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobQuarantineRecord, ResolvedBackend,
 };
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
@@ -283,10 +287,10 @@ impl BlobHandler {
             },
         };
         let sx = &mut stream.0;
-        if let Err(event) = send_replication_message_with_timeout(
+        if let Err(event) = send_replication_message(
             sx,
             replication_init,
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             "sending replication tree info",
         )
         .await
@@ -295,15 +299,15 @@ impl BlobHandler {
         }
 
         let rx = &mut stream.1;
-        match read_replication_message_with_timeout(
+        match read_replication_message(
             rx,
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
             "waiting for replication tree info acknowledgement",
         )
         .await
         {
             Ok(msg) => {
-                if let Err(err) = validate_replication_init_ack(msg, replication_id) {
+                if let Err(err) = validate_init_ack(msg, replication_id) {
                     return BlobEvent::Error(err);
                 }
             }
@@ -347,9 +351,9 @@ impl BlobHandler {
             };
             let mut stream = stream.lock().await;
 
-            match read_replication_message_with_timeout(
+            match read_replication_message(
                 &mut stream.1,
-                self.control_plane_io_timeout(),
+                self.io_timeout(),
                 "waiting for incoming replication tree info",
             )
             .await
@@ -361,10 +365,10 @@ impl BlobHandler {
                             Err(err) => return BlobEvent::Error(err),
                         };
 
-                    if let Err(event) = send_replication_message_with_timeout(
+                    if let Err(event) = send_replication_message(
                         &mut stream.0,
-                        ReplicationMessage::new(replication_id, MessageType::BaoTreeInfoReceived),
-                        self.control_plane_io_timeout(),
+                        ReplicationMessage::new(replication_id, MessageType::BaoTreeReceived),
+                        self.io_timeout(),
                         "sending replication tree info acknowledgement",
                     )
                     .await
@@ -430,7 +434,7 @@ impl BlobHandler {
             &operator,
             &storage_path,
             self.transfer_idle_timeout(),
-            self.control_plane_io_timeout(),
+            self.io_timeout(),
         )
         .await
         {
@@ -581,10 +585,11 @@ mod tests {
     use super::verified_source;
     use aruna_core::errors::BlobError;
     use aruna_core::events::BlobEvent;
-    use aruna_core::structs::{
-        FileStat, OFFERED_DIRECTORY_ROOT, ResolvedSourceAccess, SourceConnectorKind,
-        weak_fingerprint,
+    use aruna_core::structs::execution::offered_directory::{
+        FileStat, OFFERED_DIRECTORY_ROOT, weak_fingerprint,
     };
+    use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use std::collections::HashMap;
     use std::path::Path;
 

@@ -1,23 +1,23 @@
+//! Tests that a non-holder node fans out, merges audit pages and reports unreachable nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
-//! Distributed audit coverage: rows are node-local; non-holders fan out to
-//! metadata nodes, merge pages, and report unreachable nodes as partial rather
-//! than a false 200.
 
 mod topology;
 
 use aruna_core::StructuredId;
-use aruna_core::structs::PlacementRef;
-use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-    mint_local_document,
-};
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::audit::{
-    AUDIT_DEADLINE_SECS, AuditAggregate, ListAuditOperation, ListAuditRequest,
-    LocalAuditPageOperation, MAX_AUDIT_PAGE_SIZE, list_audit,
+    AUDIT_DEADLINE_SECS, AUDIT_PAGE_LIMIT, AuditAggregate, ListAuditOperation, ListAuditRequest,
+    LocalPageOperation, list_audit,
 };
-use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+};
+use aruna_operations::metadata::projector::replay_event_log;
 use std::cell::RefCell;
 use ulid::Ulid;
 
@@ -203,7 +203,7 @@ async fn fan_out(
                         None,
                         peers.to_vec(),
                         None,
-                        MAX_AUDIT_PAGE_SIZE,
+                        AUDIT_PAGE_LIMIT,
                         Some(realm.bearer_token()),
                         realm.config.digest()?,
                     ),
@@ -242,7 +242,9 @@ fn request(
     }
 }
 
-fn unique_documents(records: &[aruna_core::structs::MetadataAuditRecord]) -> usize {
+fn unique_documents(
+    records: &[aruna_core::structs::storage::metadata_registry::MetadataAuditRecord],
+) -> usize {
     let mut ids: Vec<Ulid> = records.iter().map(|record| record.document_id).collect();
     ids.sort();
     ids.dedup();
@@ -255,14 +257,14 @@ fn document_config(
     group_id: Ulid,
     document_id: Ulid,
     document_path: &str,
-) -> CreateMetadataDocumentConfig {
-    CreateMetadataDocumentConfig {
+) -> CreateDocumentConfig {
+    CreateDocumentConfig {
         actor: realm.actor(node),
         group_id,
         document_id,
         document_path: document_path.to_string(),
         public: true,
-        payload: CreateMetadataDocumentPayload::Scaffold {
+        payload: CreateDocumentPayload::Scaffold {
             name: "Audit Dataset".to_string(),
             description: "Written to exercise the distributed audit trail".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -279,7 +281,7 @@ async fn create_document(
     document_path: &str,
 ) -> TestResult<PlacementRef> {
     let created = drive(
-        CreateMetadataDocumentOperation::new(document_config(
+        CreateDocumentOperation::new(document_config(
             realm,
             node,
             group_id,
@@ -289,18 +291,18 @@ async fn create_document(
         node.context.as_ref(),
     )
     .await?;
-    replay_metadata_event_log(node.context.as_ref()).await?;
+    replay_event_log(node.context.as_ref()).await?;
     Ok(created.record.placement)
 }
 
 async fn audit_has_document(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
     drive(
-        LocalAuditPageOperation::new(
+        LocalPageOperation::new(
             *node.net.realm_id(),
             group_id,
             Some(document_id),
             None,
-            MAX_AUDIT_PAGE_SIZE,
+            AUDIT_PAGE_LIMIT,
         ),
         node.context.as_ref(),
     )

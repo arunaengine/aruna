@@ -1,3 +1,7 @@
+//! Runs leased jobs on this node with heartbeats, retries, and a draining shutdown.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -7,13 +11,13 @@ use std::time::{Duration, Instant};
 
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::JOB_SCHEDULE_INDEX_KEYSPACE;
-use aruna_core::structs::{
-    JOB_LEASE_INDEX_PREFIX, JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload,
-    JobRecord, JobState, parse_job_schedule_index_key,
+use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
+use aruna_core::structs::execution::job::{
+    JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
+    LEASE_INDEX_PREFIX, parse_schedule_key,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use futures_util::future::FutureExt;
@@ -29,15 +33,15 @@ use super::store::{
     fail_job, flush_progress, handoff_external_attempt, iter_prefix_page, read_job_record,
     release_job, renew_lease, requeue_job, transition_to_running,
 };
-use super::submit::schedule_job_drain_effect;
+use super::submit::schedule_drain_effect;
 use super::{
-    JOB_CONCURRENCY_CAP, JOB_DRAIN_BATCH_SIZE, JOB_EXTERNAL_CONCURRENCY_CAP, JOB_HEARTBEAT_MS,
-    JOB_PROGRESS_FLUSH_INTERVAL_MS,
+    DRAIN_BATCH_SIZE, EXTERNAL_CONCURRENCY_CAP, FLUSH_INTERVAL_MS, JOB_CONCURRENCY_CAP,
+    JOB_HEARTBEAT_MS,
 };
 use crate::driver::DriverContext;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const DEPENDENCY_RETRY_AFTER_MS: u64 = 1_000;
+const RETRY_AFTER_MS: u64 = 1_000;
 
 struct RunningJob {
     /// Per-execution identity: a re-spawned job at the same id gets a fresh nonce so a
@@ -100,23 +104,18 @@ impl JobsRuntime {
     }
 
     pub fn new_paused() -> Arc<Self> {
-        Self::build(
-            JOB_CONCURRENCY_CAP,
-            JOB_EXTERNAL_CONCURRENCY_CAP,
-            None,
-            false,
-        )
+        Self::build(JOB_CONCURRENCY_CAP, EXTERNAL_CONCURRENCY_CAP, None, false)
     }
 
     pub fn with_capacity(cap: usize) -> Arc<Self> {
-        Self::build(cap, JOB_EXTERNAL_CONCURRENCY_CAP, None, true)
+        Self::build(cap, EXTERNAL_CONCURRENCY_CAP, None, true)
     }
 
     /// Wire the reconcile hook that receives lost external attempts (Stage 2).
     pub fn with_reconciler(reconciler: Arc<dyn ExternalReconciler>) -> Arc<Self> {
         Self::build(
             JOB_CONCURRENCY_CAP,
-            JOB_EXTERNAL_CONCURRENCY_CAP,
+            EXTERNAL_CONCURRENCY_CAP,
             Some(reconciler),
             true,
         )
@@ -256,9 +255,8 @@ impl JobsRuntime {
         let runtime = self.clone();
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            // A panicking payload is turned into a job failure inside `supervise`; this
-            // guard still runs `finish` if anything else unwinds, so a panic can never
-            // leak the concurrency slot and wedge the runtime.
+            // A panicking payload is turned into a failure inside `supervise`; this guard
+            // still runs `finish` on other unwinds, so a panic cannot leak the slot.
             let _ = AssertUnwindSafe(run_job(
                 context.clone(),
                 record,
@@ -428,7 +426,7 @@ impl JobsRuntime {
         }
         if let Some(task_handle) = context.task_handle.as_ref()
             && let Event::Task(TaskEvent::Error { message, .. }) =
-                task_handle.send_effect(schedule_job_drain_effect()).await
+                task_handle.send_effect(schedule_drain_effect()).await
         {
             warn!(message = %message, "Failed to kick job drain after completion");
         }
@@ -484,26 +482,42 @@ impl JobsRuntime {
         }
     }
 
-    /// At startup every claimed/running holder is definitionally dead: re-queue the
-    /// in-process ones. External attempts route to the reconcile hook instead, since a
-    /// blind requeue would spawn a second container for a job that may still be running.
-    /// The restart itself costs them no attempt; only an adoption that fails does.
+    /// At startup every claimed/running holder is definitionally dead. Re-queue
+    /// the in-process ones and route external attempts to the reconcile hook,
+    /// since a blind requeue would double-run; a restart costs them no attempt.
     pub async fn recover_stale_jobs(&self, storage: &StorageHandle) -> Result<usize, String> {
+        self.recover_until_stopped(storage, &CancellationToken::new(), || false)
+            .await
+    }
+
+    /// [`Self::recover_stale_jobs`] with an explicit stop and a required-service
+    /// failure probe. Both are checked before every recovery unit, so an accepted
+    /// stop or observed failure lets the current unit finish and admits no next.
+    pub async fn recover_until_stopped(
+        &self,
+        storage: &StorageHandle,
+        stop: &CancellationToken,
+        should_stop: impl Fn() -> bool,
+    ) -> Result<usize, String> {
+        let stopped = || stop.is_cancelled() || should_stop();
         let now_ms = unix_timestamp_millis();
         let mut job_ids = Vec::new();
         let mut start_after = None;
         loop {
+            if stopped() {
+                break;
+            }
             let (values, next) = iter_prefix_page(
                 storage,
-                JOB_SCHEDULE_INDEX_KEYSPACE,
-                Some(ByteView::from(JOB_LEASE_INDEX_PREFIX.to_vec())),
+                SCHEDULE_INDEX_KEYSPACE,
+                Some(ByteView::from(LEASE_INDEX_PREFIX.to_vec())),
                 start_after,
-                JOB_DRAIN_BATCH_SIZE,
+                DRAIN_BATCH_SIZE,
                 None,
             )
             .await?;
             for (key, _) in &values {
-                if let Ok((_, job_id)) = parse_job_schedule_index_key(key.as_ref()) {
+                if let Ok((_, job_id)) = parse_schedule_key(key.as_ref()) {
                     job_ids.push(job_id);
                 }
             }
@@ -515,6 +529,9 @@ impl JobsRuntime {
 
         let mut recovered = 0;
         for job_id in job_ids {
+            if stopped() {
+                break;
+            }
             let Some(record) = read_job_record(storage, job_id, None).await? else {
                 continue;
             };
@@ -572,9 +589,7 @@ async fn run_job(
     shutdown: CancellationToken,
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
-    // lease there reconciles rather than requeues (spec 16.7). A shutdown mid-supervise
-    // hands the lease back through `JobsRuntime::shutdown`, so the attempt is adopted
-    // rather than re-run.
+    // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
     if record.execution_class == JobExecutionClass::ExternalAttempt {
         Box::pin(super::workflow::run_execution_job(context, record, cancel)).await;
         return;
@@ -695,7 +710,7 @@ async fn run_job(
                 job_id,
                 token,
                 unix_timestamp_millis(),
-                DEPENDENCY_RETRY_AFTER_MS,
+                RETRY_AFTER_MS,
                 error,
             )
             .await
@@ -742,12 +757,11 @@ fn terminal_or_none(result: Result<JobRecord, JobMutationError>, job_id: JobId) 
     }
 }
 
-const TERMINAL_WRITE_MAX_ATTEMPTS: u32 = 5;
+const WRITE_MAX_ATTEMPTS: u32 = 5;
 
-/// Retry a terminal write past transient storage failures. The execution already
-/// finished, so a bare storage error would otherwise leave the job `Running` until the
-/// sweep re-runs it and can flip a succeeded job to `Failed`; token/transition races are
-/// legitimate outcomes and are returned unretried.
+/// Retry a terminal write past transient storage failures: the execution already
+/// finished, so a storage error would otherwise leave it `Running` until the sweep
+/// re-runs it. Token/transition races are legitimate and returned unretried.
 async fn retry_terminal<F, Fut>(mut op: F) -> Result<JobRecord, JobMutationError>
 where
     F: FnMut() -> Fut,
@@ -756,7 +770,7 @@ where
     let mut attempt = 0;
     loop {
         match op().await {
-            Err(JobMutationError::Storage(error)) if attempt + 1 < TERMINAL_WRITE_MAX_ATTEMPTS => {
+            Err(JobMutationError::Storage(error)) if attempt + 1 < WRITE_MAX_ATTEMPTS => {
                 warn!(error = %error, "Retrying job terminal write after storage failure");
                 tokio::time::sleep(Duration::from_millis(20u64 << attempt)).await;
                 attempt += 1;
@@ -773,9 +787,8 @@ async fn supervise(
     record: &JobRecord,
     ctx: &JobContext,
 ) -> SuperviseResult {
-    // Renew the lease and flush progress on a SEPARATE task so a payload stuck in a
-    // non-yielding section cannot starve its own renewals and be swept out from under
-    // itself into a second concurrent execution.
+    // Renew the lease and flush progress on a separate task so a non-yielding
+    // payload cannot starve its renewals and be swept into a second execution.
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(heartbeat_loop(
         storage.clone(),
@@ -832,7 +845,7 @@ async fn heartbeat_loop(
 ) {
     let mut heartbeat = interval(Duration::from_millis(JOB_HEARTBEAT_MS));
     heartbeat.tick().await;
-    let mut flush = interval(Duration::from_millis(JOB_PROGRESS_FLUSH_INTERVAL_MS));
+    let mut flush = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
     flush.tick().await;
 
     loop {
@@ -864,14 +877,17 @@ mod tests {
         AdoptOutcome, ClaimOutcome, JobMutation, adopt_external_attempt, claim_job, complete_job,
         insert_job, list_job_entries, mutate_job, record_attempt_intent, set_cancel_requested,
     };
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::keyspaces::ROCRATE_JOB_STATE_KEYSPACE;
-    use aruna_core::structs::{
-        AttemptIntent, AuthContext, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
-        ImportRoCrateSpec, ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload, RealmId,
+    use aruna_core::id::NodeId;
+    use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
+    use aruna_core::structs::execution::job::{
+        AttemptIntent, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
+        ImportRoCrateSpec, ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload,
         RoCrateLimits,
     };
-    use aruna_core::types::{NodeId, UserId};
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -998,7 +1014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_runs_to_success() {
+    async fn probe_reaches_success() {
         let (_dir, storage) = temp_storage();
         let ctx = context(storage.clone());
         let runtime = JobsRuntime::new();
@@ -1104,7 +1120,7 @@ mod tests {
         assert!(matches!(
             storage
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+                    key_space: JOB_STATE_KEYSPACE.to_string(),
                     key: ByteView::from(job_id.to_bytes().to_vec()),
                     txn_id: None,
                 })
@@ -1211,7 +1227,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
-            lease_expires_at_ms: 60_000,
+            lease_expires_ms: 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
 
@@ -1246,7 +1262,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::generate(),
-            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+            lease_expires_ms: unix_timestamp_millis() + 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
 
@@ -1583,7 +1599,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
-            lease_expires_at_ms: 60_000,
+            lease_expires_ms: 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
         let ctx = JobContext {
@@ -1607,7 +1623,7 @@ mod tests {
         assert!(matches!(
             storage
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
+                    key_space: JOB_STATE_KEYSPACE.to_string(),
                     key: ByteView::from(job_id.to_bytes().to_vec()),
                     txn_id: None,
                 })
@@ -1662,7 +1678,7 @@ mod tests {
         assert_eq!(runtime.available_slots_for(JobExecutionClass::InProcess), 0);
         assert_eq!(
             runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
-            JOB_EXTERNAL_CONCURRENCY_CAP,
+            EXTERNAL_CONCURRENCY_CAP,
             "internal load never consumes external slots"
         );
 
@@ -1672,7 +1688,7 @@ mod tests {
         );
         assert_eq!(
             runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
-            JOB_EXTERNAL_CONCURRENCY_CAP - 1
+            EXTERNAL_CONCURRENCY_CAP - 1
         );
         assert_eq!(
             runtime.available_slots_for(JobExecutionClass::InProcess),
@@ -1700,7 +1716,7 @@ mod tests {
         );
         assert_eq!(
             runtime.available_slots_for(JobExecutionClass::ExternalAttempt),
-            JOB_EXTERNAL_CONCURRENCY_CAP
+            EXTERNAL_CONCURRENCY_CAP
         );
     }
 
@@ -1718,7 +1734,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::generate(),
-            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+            lease_expires_ms: unix_timestamp_millis() + 60_000,
         });
         record.attempt_intent = Some(AttemptIntent {
             attempt_no: 1,
@@ -1739,6 +1755,108 @@ mod tests {
         assert_eq!(after.attempts, 0, "the restart spends no attempt");
         assert!(after.claim.is_some());
         assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
+    }
+
+    fn external_running_record(job_id: JobId) -> JobRecord {
+        let mut record = probe_record(job_id, 3, 0, None);
+        record.execution_class = JobExecutionClass::ExternalAttempt;
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(3),
+            claim_token: Ulid::generate(),
+            lease_expires_ms: unix_timestamp_millis() + 60_000,
+        });
+        record.attempt_intent = Some(AttemptIntent {
+            attempt_no: 1,
+            external_name: "attempt".to_string(),
+            executor_kind: "docker".to_string(),
+            pinned_image: "alpine@sha256:digest".to_string(),
+            attempt_epoch: 1,
+        });
+        record
+    }
+
+    #[derive(Default)]
+    struct BlockingReconciler {
+        seen: std::sync::Mutex<Vec<JobId>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalReconciler for BlockingReconciler {
+        async fn reconcile_lost_attempt(&self, _storage: &StorageHandle, record: JobRecord) {
+            self.seen.lock().unwrap().push(record.job_id);
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    // An observed required-service failure while one recovery unit is pending
+    // lets that unit finish and admits no next one.
+    #[tokio::test]
+    async fn stop_between_units() {
+        let (_dir, storage) = temp_storage();
+        let reconciler = Arc::new(BlockingReconciler::default());
+        let runtime = JobsRuntime::with_reconciler(reconciler.clone());
+        let first = JobId::from_bytes([0xE9; 16]);
+        let second = JobId::from_bytes([0xEA; 16]);
+        insert_job(&storage, &external_running_record(first))
+            .await
+            .unwrap();
+        insert_job(&storage, &external_running_record(second))
+            .await
+            .unwrap();
+
+        let stop = CancellationToken::new();
+        let failure = std::sync::atomic::AtomicBool::new(false);
+        let recover = runtime.recover_until_stopped(&storage, &stop, || {
+            failure.load(std::sync::atomic::Ordering::SeqCst)
+        });
+        tokio::pin!(recover);
+        tokio::select! {
+            _ = &mut recover => panic!("recovery must hold on the first recovery unit"),
+            _ = reconciler.entered.notified() => {}
+        }
+        assert_eq!(reconciler.seen.lock().unwrap().len(), 1);
+
+        // The failure arrives while the unit is still pending; releasing it
+        // finishes that unit and the loop starts no next one.
+        failure.store(true, std::sync::atomic::Ordering::SeqCst);
+        reconciler.release.notify_one();
+        assert_eq!(recover.await.unwrap(), 0);
+        let processed = reconciler.seen.lock().unwrap().clone();
+        assert_eq!(processed.len(), 1, "no next recovery unit after the stop");
+        let unprocessed = if processed[0] == first { second } else { first };
+        let untouched = read_job_record(&storage, unprocessed, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.state, JobState::Running);
+        assert!(untouched.claim.is_some());
+    }
+
+    // A stop accepted before recovery admits no recovery unit at all.
+    #[tokio::test]
+    async fn cancel_before_recovery() {
+        let (_dir, storage) = temp_storage();
+        let recorder = Arc::new(RecordingReconciler::default());
+        let runtime = JobsRuntime::with_reconciler(recorder.clone());
+        let job_id = JobId::from_bytes([0xEB; 16]);
+        insert_job(&storage, &external_running_record(job_id))
+            .await
+            .unwrap();
+
+        let stop = CancellationToken::new();
+        stop.cancel();
+        assert_eq!(
+            runtime
+                .recover_until_stopped(&storage, &stop, || false)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(recorder.seen.lock().unwrap().is_empty());
     }
 
     struct AdoptingReconciler;
@@ -1772,7 +1890,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: token,
-            lease_expires_at_ms: unix_timestamp_millis() + 60_000,
+            lease_expires_ms: unix_timestamp_millis() + 60_000,
         });
         insert_job(&storage, &record).await.unwrap();
         record_attempt_intent(
@@ -1808,7 +1926,7 @@ mod tests {
     async fn expire_lease(storage: &StorageHandle, job_id: JobId) {
         mutate_job(storage, job_id, |record| {
             if let Some(claim) = record.claim.as_mut() {
-                claim.lease_expires_at_ms = 1;
+                claim.lease_expires_ms = 1;
             }
             Ok(JobMutation::Persist)
         })

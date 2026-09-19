@@ -1,22 +1,12 @@
-//! The append-only job-record store.
-//!
-//! Cross-node truth about an external job lives here: immutable signed records,
-//! keyed once and never rewritten. The mutable [`aruna_core::structs::JobRecord`]
-//! row remains a local execution and projection cache during the transition;
-//! reduced projections are written into it where the existing status surfaces
-//! read it, but it is no longer the sole cross-node truth.
-//!
-//! * [`append`] admits one record after verifying it against this node's own
-//!   view and the evidence it already stored.
-//! * [`reduce`] turns an authentic record set into one projection per family,
-//!   identically under any order, replay, duplication, or partition merge.
-//! * [`project`] caches that projection with a bounded revision.
-//! * [`audit`] pages the immutable log with bounded cursors.
-//! * [`transport`] carries records and launch offers between nodes.
+//! Owns the append-only store of signed job records, with its shared limits and errors.
+//! The mutable job row is a local execution and projection cache, not the shared truth.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::FrameBoundsError;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::structs::{JobFamilyError, JobRecordError};
+use aruna_core::structs::execution::job::JobRecordError;
+use aruna_core::structs::identity::realm::JobFamilyError;
 use thiserror::Error;
 
 pub mod admit;

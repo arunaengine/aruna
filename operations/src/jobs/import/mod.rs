@@ -1,23 +1,18 @@
-mod archive;
+//! Runs the RO-Crate import job and re-exports the staged upload it reads the archive from.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub(crate) mod archive;
 #[cfg(test)]
 mod consortium;
 mod reader;
-mod rewrite;
+pub(crate) mod rewrite;
 mod upload;
 
-#[cfg(test)]
-pub(crate) mod fixture {
-    pub(crate) use super::archive::{
-        file_id_candidates, inspect_archive, open_archive, payload_entries, read_metadata,
-        signature_entry,
-    };
-    pub(crate) use super::rewrite::{RewriteTarget, rewrite_document, validate_document};
-}
-
 pub use upload::{
-    CreateRoCrateUploadConfig, CreateRoCrateUploadError, CreateRoCrateUploadOperation,
-    UploadClaimError, claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload,
-    read_rocrate_upload, write_rocrate_upload,
+    CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, UploadClaimError,
+    claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, read_rocrate_upload,
+    write_rocrate_upload,
 };
 
 use std::collections::HashMap;
@@ -26,21 +21,23 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use aruna_core::effects::{BlobEffect, StorageEffect};
-use aruna_core::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
+use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, ROCRATE_JOB_STATE_KEYSPACE};
+use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, JOB_STATE_KEYSPACE};
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::{
-    ARUNA_DATA_PREFIX, Actor, AuthContext, BackendLocation, BucketInfo, ImportReportDetail,
-    ImportReportRow, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec,
-    JOB_SYSTEM_ENTRY_PREFIX, JobError, JobResultPayload, MetadataRegistryRecord,
-    OBJECT_CONTENT_TYPE_KEY, Permission, ReasonCode, RoCrateCheckpointRefs, RoCrateMediaType,
-    VersionedObjectArn, blob_bucket_permission_path, blob_object_permission_path, job_entry_key,
-    rocrate_plan_key,
+use aruna_core::structs::execution::job::{
+    ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
+    ImportRoCrateSpec, JobError, JobResultPayload, ReasonCode, RoCrateCheckpointRefs,
+    RoCrateMediaType, SYSTEM_ENTRY_PREFIX, job_entry_key, rocrate_plan_key,
 };
-use aruna_core::types::Value;
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, object_permission_path,
+};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
 use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::{StreamExt, stream};
@@ -58,27 +55,24 @@ use self::reader::HiddenRangeReader;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document, validate_document};
 use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
-use super::store::{list_job_entries, put_job_entry, put_rocrate_checkpoint, put_rocrate_plan};
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
-};
+use super::store::{list_job_entries, put_job_entry, put_state, read_state};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
-use crate::get_realm_config::GetRealmConfigOperation;
-use crate::metadata::MetadataAuthToken;
-use crate::metadata::forward::{MetadataWriteError, create_metadata_document_routed};
+use crate::forward::transport::MetadataWriteError;
+use crate::metadata::AuthToken;
+use crate::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
+};
+use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
-use crate::replication::queue::{
-    QueueLiveVersionReplicationInput, QueueLiveVersionReplicationOperation,
-};
-use crate::s3::delete_object::DeleteObjectError;
-use crate::s3::delete_objects::{DeleteObjectsEntry, DeleteObjectsInput, delete_objects};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::staging::read_source::{
-    ReadStagingSourceError, ReadStagingSourceInput, ReadStagingSourceOperation,
-};
+use crate::realm::get_config::GetConfigOperation;
+use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::delete::DeleteObjectError;
+use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -377,7 +371,7 @@ async fn acquire_source(
                 *upload_id,
                 spec.auth_context.user_id,
                 ctx.job_id,
-                aruna_core::util::unix_timestamp_millis(),
+                aruna_core::time::unix_timestamp_millis(),
             )
             .await
             .map_err(|error| match error {
@@ -401,7 +395,7 @@ async fn acquire_source(
             ensure_permission(
                 ctx,
                 &spec.auth_context,
-                blob_object_permission_path(
+                object_permission_path(
                     spec.auth_context.realm_id,
                     bucket_info.group_id,
                     ctx.owner_node_id,
@@ -425,9 +419,7 @@ async fn acquire_source(
                 &ctx.driver,
             )
             .await
-            .and_then(|result| result.transpose())
-            .map_err(classify_get)?
-            .ok_or_else(|| ImportFailure::Permanent("source object not found".to_string()))?;
+            .map_err(classify_get)?;
             let expected_size = result
                 .location
                 .as_ref()
@@ -442,12 +434,7 @@ async fn acquire_source(
                 .source_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.content_type.as_deref())
-                .or_else(|| {
-                    result
-                        .metadata
-                        .get(OBJECT_CONTENT_TYPE_KEY)
-                        .map(String::as_str)
-                });
+                .or_else(|| result.metadata.get(CONTENT_TYPE_KEY).map(String::as_str));
             spool_source(
                 ctx,
                 result.blob,
@@ -478,7 +465,7 @@ async fn acquire_source(
             )
             .await?;
             let result = drive(
-                ReadStagingSourceOperation::new(ReadStagingSourceInput {
+                ReadSourceOperation::new(ReadSourceInput {
                     group_id: *group_id,
                     connector_id: *connector_id,
                     source_path: path.clone(),
@@ -748,10 +735,8 @@ async fn validate_source(
 }
 
 /// Rejects a crate that would fail validation before anything is written.
-///
-/// Every rewritten identifier is already known here. The placeholder content
-/// hash is a literal value rather than a reference, so it cannot change the
-/// graph the validator walks.
+/// Every rewritten identifier is known here, and the literal placeholder content
+/// hash cannot change the graph the validator walks.
 fn preflight_crate(
     spec: &ImportRoCrateSpec,
     node_id: aruna_core::NodeId,
@@ -812,7 +797,7 @@ async fn write_next(
     ensure_permission(
         ctx,
         &spec.auth_context,
-        blob_object_permission_path(
+        object_permission_path(
             spec.auth_context.realm_id,
             bucket_info.group_id,
             ctx.owner_node_id,
@@ -839,7 +824,7 @@ async fn write_next(
     )
     .await?;
     let quota = drive(
-        GetRealmConfigOperation::new(spec.auth_context.realm_id),
+        GetConfigOperation::new(spec.auth_context.realm_id),
         &ctx.driver,
     )
     .await
@@ -892,16 +877,12 @@ async fn write_next(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
-    let result = drive(operation, &ctx.driver)
-        .await
-        .and_then(|result| result.transpose());
-    let result = match result {
+    let result = match drive(operation, &ctx.driver).await {
         Ok(result) => result,
         Err(_) if ctx.cancel.is_cancelled() => return Err(ImportFailure::Cancelled),
         Err(_) if ctx.shutdown.is_cancelled() => return Err(ImportFailure::Interrupted),
         Err(error) => return Err(classify_put(error)),
-    }
-    .ok_or_else(|| ImportFailure::Retryable("object write returned no result".to_string()))?;
+    };
     // The preflight validated identifiers built from the planned version.
     if result.version_id != entry.version_id {
         report_divergent(ctx, entry, result.version_id).await?;
@@ -928,7 +909,7 @@ async fn write_next(
     }
     checkpoint.next_entry = checkpoint.next_entry.saturating_add(1);
     let _ = drive(
-        QueueLiveVersionReplicationOperation::new(QueueLiveVersionReplicationInput {
+        LiveVersionOperation::new(LiveVersionInput {
             local_node_id: ctx.owner_node_id,
             auth_context: spec.auth_context.clone(),
             bucket: spec.target.bucket.clone(),
@@ -1020,19 +1001,17 @@ async fn create_document(
         user_id: spec.auth_context.user_id,
         realm_id: spec.auth_context.realm_id,
     };
-    match create_metadata_document_routed(
-        CreateMetadataDocumentOperation::new_for_generated_document_id(
-            CreateMetadataDocumentConfig {
-                actor,
-                group_id: spec.metadata.group_id,
-                document_id: spec.document_id,
-                document_path: spec.metadata.path.clone(),
-                public: spec.metadata.public,
-                payload: CreateMetadataDocumentPayload::RoCrate { jsonld },
-            },
-        ),
+    match route_metadata_create(
+        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+            actor,
+            group_id: spec.metadata.group_id,
+            document_id: spec.document_id,
+            document_path: spec.metadata.path.clone(),
+            public: spec.metadata.public,
+            payload: CreateDocumentPayload::RoCrate { jsonld },
+        }),
         ctx.driver.clone(),
-        Some(MetadataAuthToken::internal(spec.auth_context.clone())),
+        Some(AuthToken::internal(spec.auth_context.clone())),
     )
     .await
     {
@@ -1109,9 +1088,8 @@ fn rollback_required(checkpoint: &ImportCheckpoint) -> bool {
 }
 
 /// Deletes exactly the object versions this import wrote.
-///
-/// Every version id is minted by this job, so a version another writer owns can
-/// never be removed, even where the import landed on an existing key.
+/// Every version id is minted by this job, so versions another writer owns are
+/// never removed, even where the import landed on an existing key.
 async fn rollback_writes(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
@@ -1139,11 +1117,11 @@ async fn rollback_writes(
         })?;
     let outcomes = delete_objects(
         &ctx.driver,
-        DeleteObjectsInput {
+        BulkDeleteInput {
             bucket: spec.target.bucket.clone(),
             entries: plan.entries[..attempted]
                 .iter()
-                .map(|entry| DeleteObjectsEntry {
+                .map(|entry| BulkDeleteEntry {
                     key: entry.target_key.clone(),
                     version_id: Some(entry.version_id),
                 })
@@ -1195,7 +1173,7 @@ async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<()
     ensure_permission(
         ctx,
         &spec.auth_context,
-        blob_bucket_permission_path(
+        bucket_permission_path(
             spec.auth_context.realm_id,
             bucket.group_id,
             ctx.owner_node_id,
@@ -1253,12 +1231,12 @@ async fn ensure_permission(
 }
 
 async fn load_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, ImportFailure> {
-    match drive(GetBucketInfoOperation::new(bucket.to_string()), &ctx.driver).await {
-        Ok(Some(Ok(info))) => Ok(info),
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Ok(None) => Err(ImportFailure::Permanent(
-            format!("bucket `{bucket}` does not exist"),
-        )),
-        Ok(Some(Err(error))) | Err(error) => Err(ImportFailure::Retryable(error.to_string())),
+    match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
+        Ok(info) => Ok(info),
+        Err(GetBucketError::NotFound) => Err(ImportFailure::Permanent(format!(
+            "bucket `{bucket}` does not exist"
+        ))),
+        Err(error) => Err(ImportFailure::Retryable(error.to_string())),
     }
 }
 
@@ -1425,11 +1403,9 @@ async fn write_phase_error(
     let key = format!("failure/{}", phase_name(phase));
     let row = ImportReportRow {
         entry_key: key,
-        code: if message.contains("unsupported_crate_version") {
-            ReasonCode::UnsupportedCrateVersion
-        } else {
-            ReasonCode::Failed
-        },
+        // The phase-failure path only sees a plain string or the panic marker;
+        // validation codes travel typed through `write_validation_rows`.
+        code: ReasonCode::Failed,
         message: Some(message.to_string()),
         detail: ImportReportDetail {
             archive_path: "ro-crate-metadata.json".to_string(),
@@ -1505,7 +1481,7 @@ async fn put_report(
 
 fn system_report_key(entry_key: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(entry_key.len().saturating_add(1));
-    key.push(JOB_SYSTEM_ENTRY_PREFIX);
+    key.push(SYSTEM_ENTRY_PREFIX);
     key.extend_from_slice(entry_key.as_bytes());
     key
 }
@@ -1565,7 +1541,7 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
             .await
             .map_err(ImportFailure::Retryable)?;
         for (entry_key, value) in page {
-            if entry_key.first() == Some(&JOB_SYSTEM_ENTRY_PREFIX) {
+            if entry_key.first() == Some(&SYSTEM_ENTRY_PREFIX) {
                 continue;
             }
             let row: ImportReportRow = postcard::from_bytes(value.as_ref())
@@ -1580,68 +1556,46 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
 }
 
 async fn read_checkpoint(ctx: &JobContext) -> Result<Option<ImportCheckpoint>, String> {
-    match ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(ctx.job_id.to_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected import checkpoint event: {other:?}")),
-    }
+    read_state(
+        &ctx.driver.storage_handle,
+        JOB_STATE_KEYSPACE,
+        ByteView::from(ctx.job_id.to_bytes().to_vec()),
+        "import checkpoint",
+    )
+    .await
 }
 
 async fn read_plan(ctx: &JobContext) -> Result<Option<ImportPlan>, String> {
-    match ctx
-        .driver
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_JOB_STATE_KEYSPACE.to_string(),
-            key: rocrate_plan_key(ctx.job_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected import plan event: {other:?}")),
-    }
+    read_state(
+        &ctx.driver.storage_handle,
+        JOB_STATE_KEYSPACE,
+        rocrate_plan_key(ctx.job_id),
+        "import plan",
+    )
+    .await
 }
 
 async fn persist_checkpoint(ctx: &JobContext, checkpoint: &ImportCheckpoint) -> Result<(), String> {
-    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
-    put_rocrate_checkpoint(
+    put_state(
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        Value::from(value),
+        JOB_STATE_KEYSPACE,
+        ByteView::from(ctx.job_id.to_bytes().to_vec()),
+        checkpoint,
     )
     .await
     .map_err(|error| error.to_string())
 }
 
 async fn persist_plan(ctx: &JobContext, plan: &ImportPlan) -> Result<(), String> {
-    let value = postcard::to_allocvec(plan).map_err(|error| error.to_string())?;
-    put_rocrate_plan(
+    put_state(
         &ctx.driver.storage_handle,
         ctx.job_id,
         ctx.claim_token,
-        Value::from(value),
+        JOB_STATE_KEYSPACE,
+        rocrate_plan_key(ctx.job_id),
+        plan,
     )
     .await
     .map_err(|error| error.to_string())
@@ -1683,7 +1637,7 @@ fn precheck_size(size: u64, limit: u64) -> Result<(), ImportFailure> {
 }
 
 fn source_permission_path(
-    realm_id: aruna_core::structs::RealmId,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
     group_id: Ulid,
     node_id: aruna_core::NodeId,
     connector_id: Ulid,
@@ -1731,13 +1685,54 @@ fn validation_message(violations: &[MetadataValidationViolation]) -> String {
         .join("; ")
 }
 
+/// Why a backend blob write failed, as far as the import may decide. The typed
+/// error carries the cause; local error text is never interpreted, so wording
+/// cannot flip permanence, and an unknown cause stays retryable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobWriteFailure {
+    /// An integrity fault the source bytes will not heal by retrying.
+    Checksum,
+    /// A declared body length that does not match what arrived.
+    ContentLength,
+    /// A client/body fault, distinct from a backend failure.
+    ClientBody,
+    /// A backend fault the import cannot pin to the written bytes.
+    Unknown,
+}
+
+impl BlobWriteFailure {
+    fn retryable(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
+/// The import's retry decision for a frozen blob write fault, taken from the
+/// typed cause. Integrity and client-body faults are permanent; transport,
+/// setup, cleanup, and storage faults stay retryable.
+fn backend_blob_failure(error: &BlobError) -> BlobWriteFailure {
+    match error {
+        BlobError::IntegrityCheckFailed(_) => BlobWriteFailure::Checksum,
+        BlobError::SizeLimitExceeded { .. } => BlobWriteFailure::ContentLength,
+        BlobError::StreamFailed(_) => BlobWriteFailure::ClientBody,
+        BlobError::WriteError(_)
+        | BlobError::WriteCleanup { .. }
+        | BlobError::OperatorCreationFailed(_)
+        | BlobError::OutboardCreationFailed(_)
+        | BlobError::MakeBucketError(_)
+        | BlobError::ConnectionFailed(_) => BlobWriteFailure::Unknown,
+        _ => BlobWriteFailure::Unknown,
+    }
+}
+
 fn classify_put(error: PutObjectError) -> ImportFailure {
     match error {
         PutObjectError::StorageError(_) => ImportFailure::Retryable(error.to_string()),
-        PutObjectError::BlobWriteFailed(ref message)
-            if !message.contains("checksum") && !message.contains("Content-Length") =>
-        {
-            ImportFailure::Retryable(error.to_string())
+        PutObjectError::BlobWriteFailed(ref cause) => {
+            if backend_blob_failure(cause).retryable() {
+                ImportFailure::Retryable(error.to_string())
+            } else {
+                ImportFailure::Permanent(error.to_string())
+            }
         }
         _ => ImportFailure::Permanent(error.to_string()),
     }
@@ -1767,10 +1762,10 @@ fn classify_get(error: GetObjectError) -> ImportFailure {
     }
 }
 
-fn classify_read(error: ReadStagingSourceError) -> ImportFailure {
+fn classify_read(error: ReadSourceError) -> ImportFailure {
     let permanent = match &error {
-        ReadStagingSourceError::Resolve(error) => permanent_resolve(error),
-        ReadStagingSourceError::Staging(error) => permanent_staging(error),
+        ReadSourceError::Resolve(error) => permanent_resolve(error),
+        ReadSourceError::Staging(error) => permanent_staging(error),
         _ => false,
     };
     if permanent {
@@ -1781,22 +1776,24 @@ fn classify_read(error: ReadStagingSourceError) -> ImportFailure {
 }
 
 fn classify_blob(error: BlobError) -> ImportFailure {
-    match error {
+    match &error {
         BlobError::SizeLimitExceeded { limit } => {
             ImportFailure::Permanent(format!("import source exceeds limit {limit}"))
         }
-        error @ BlobError::StreamFailed(_) => ImportFailure::Permanent(error.to_string()),
-        error => ImportFailure::Retryable(error.to_string()),
+        BlobError::IntegrityCheckFailed(_) | BlobError::StreamFailed(_) => {
+            ImportFailure::Permanent(error.to_string())
+        }
+        _ => ImportFailure::Retryable(error.to_string()),
     }
 }
 
-fn permanent_resolve(error: &SourceConnectorResolutionError) -> bool {
+fn permanent_resolve(error: &SourceResolutionError) -> bool {
     matches!(
         error,
-        SourceConnectorResolutionError::ConversionError(_)
-            | SourceConnectorResolutionError::NotFound
-            | SourceConnectorResolutionError::UnsupportedConnectorKind(_)
-            | SourceConnectorResolutionError::InvalidSourcePath
+        SourceResolutionError::ConversionError(_)
+            | SourceResolutionError::NotFound
+            | SourceResolutionError::UnsupportedConnectorKind(_)
+            | SourceResolutionError::InvalidSourcePath
     )
 }
 
@@ -1885,19 +1882,27 @@ fn retryable_error(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::retryable(message.into()))
 }
 
+/// A node that cannot build a destination gate is retryable: the transition it
+/// is in ends on its own, and the import resumes from its checkpoint.
+fn classify_gate(error: GateContextError) -> ImportFailure {
+    ImportFailure::Retryable(error.to_string())
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+
     use super::*;
-    use aruna_core::structs::{
+    use aruna_core::UserId;
+    use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateTarget, JobClaim, JobId, JobPayload, JobRecord,
-        JobState, RealmId, RoCrateUploadRecord,
+        JobState, RoCrateUploadRecord,
     };
-    use aruna_core::types::UserId;
+    use aruna_core::structs::identity::realm::RealmId;
     use tokio_util::sync::CancellationToken;
 
     use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::insert_job;
-    use crate::staging::test_utils::setup_driver_context;
+    use crate::tests::staging::setup_driver_context;
 
     #[test]
     fn target_checks_limits() {
@@ -1930,7 +1935,7 @@ mod tests {
         ] {
             let system_key = system_report_key(entry_key);
             assert_ne!(system_key, entry_key.as_bytes());
-            assert_eq!(system_key.first(), Some(&JOB_SYSTEM_ENTRY_PREFIX));
+            assert_eq!(system_key.first(), Some(&SYSTEM_ENTRY_PREFIX));
             assert_eq!(&system_key[1..], entry_key.as_bytes());
         }
     }
@@ -1950,6 +1955,82 @@ mod tests {
 
     // A source that keeps changing can settle, but a dropped historical
     // observation and an exhausted binding never heal by retrying.
+    // The typed blob cause decides permanence; local wording never does.
+    #[test]
+    fn blob_write_classification() {
+        let cases = [
+            (
+                BlobError::IntegrityCheckFailed("sha256 mismatch".to_string()),
+                BlobWriteFailure::Checksum,
+                false,
+            ),
+            (
+                BlobError::SizeLimitExceeded { limit: 5 },
+                BlobWriteFailure::ContentLength,
+                false,
+            ),
+            (
+                BlobError::StreamFailed("checksum mismatch".to_string()),
+                BlobWriteFailure::ClientBody,
+                false,
+            ),
+            (
+                BlobError::WriteError("checksum mismatch for sha256".to_string()),
+                BlobWriteFailure::Unknown,
+                true,
+            ),
+            (
+                BlobError::ConnectionFailed("connection reset by peer".to_string()),
+                BlobWriteFailure::Unknown,
+                true,
+            ),
+        ];
+        for (error, expected, retryable) in cases {
+            assert_eq!(backend_blob_failure(&error), expected, "{error:?}");
+            assert_eq!(expected.retryable(), retryable, "{error:?}");
+        }
+
+        // A generic write fault stays retryable whatever its text says, so a
+        // punctuation or wording change cannot flip its permanence.
+        for wording in [
+            "No space left on device",
+            "no space left on device!",
+            "checksum mismatch",
+        ] {
+            assert!(
+                matches!(
+                    classify_put(PutObjectError::BlobWriteFailed(BlobError::WriteError(
+                        wording.to_string()
+                    ))),
+                    ImportFailure::Retryable(_)
+                ),
+                "{wording}"
+            );
+            assert!(matches!(
+                classify_put(PutObjectError::BlobWriteFailed(BlobError::StreamFailed(
+                    wording.to_string()
+                ))),
+                ImportFailure::Permanent(_)
+            ));
+            assert!(matches!(
+                classify_put(PutObjectError::BlobWriteFailed(
+                    BlobError::SizeLimitExceeded { limit: 5 }
+                )),
+                ImportFailure::Permanent(_)
+            ));
+            assert!(matches!(
+                classify_put(PutObjectError::BlobWriteFailed(BlobError::ChannelClosed)),
+                ImportFailure::Retryable(_)
+            ));
+            assert!(matches!(
+                classify_put(PutObjectError::BlobWriteFailed(
+                    BlobError::IntegrityCheckFailed(wording.to_string())
+                )),
+                ImportFailure::Permanent(_)
+            ));
+        }
+    }
+
     #[test]
     fn classifies_reference_errors() {
         assert!(matches!(
@@ -1979,9 +2060,7 @@ mod tests {
             ImportFailure::Retryable(_)
         ));
         assert!(matches!(
-            classify_read(ReadStagingSourceError::Resolve(
-                SourceConnectorResolutionError::NotFound
-            )),
+            classify_read(ReadSourceError::Resolve(SourceResolutionError::NotFound)),
             ImportFailure::Permanent(_)
         ));
         assert!(matches!(
@@ -1995,19 +2074,19 @@ mod tests {
     }
 
     #[test]
-    fn import_path_keeps_profile_gate_rejections_permanent() {
-        let finding = aruna_core::metadata::MetadataProfileValidationFinding {
+    fn profile_rejections_permanent() {
+        let finding = aruna_core::metadata::ProfileValidationFinding {
             code: "unsupported_constraint".to_string(),
-            severity: aruna_core::metadata::MetadataProfileValidationSeverity::Violation,
+            severity: aruna_core::metadata::ProfileValidationSeverity::Violation,
             focus_node: None,
             path: None,
             rule: "http://www.w3.org/ns/shacl#SPARQLConstraintComponent".to_string(),
             message: "unsupported".to_string(),
             profile_revision: None,
-            completeness: aruna_core::metadata::MetadataProfileValidationCompleteness::Incomplete,
+            completeness: aruna_core::metadata::ProfileValidationCompleteness::Incomplete,
         };
         let failure = classify_metadata(MetadataWriteError::Create(
-            crate::create_metadata_document::CreateMetadataDocumentError::MetadataError(
+            crate::metadata::create_document::CreateDocumentError::MetadataError(
                 aruna_core::metadata::MetadataError::ProfileValidation(vec![finding]),
             ),
         ));
@@ -2093,7 +2172,7 @@ mod tests {
         record.claim = Some(JobClaim {
             holder_node_id: node_id,
             claim_token: token,
-            lease_expires_at_ms: u64::MAX,
+            lease_expires_ms: u64::MAX,
         });
         insert_job(&driver.storage_handle, &record).await.unwrap();
         let ctx = JobContext {
@@ -2129,7 +2208,10 @@ mod tests {
         let JobRunOutcome::Failed(error) = cleanup_after_panic(&ctx, &spec).await else {
             panic!("panic cleanup must fail the job")
         };
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
         assert!(
             load_rocrate_upload(&driver, upload_id)
                 .await
@@ -2145,10 +2227,4 @@ mod tests {
             Event::Blob(BlobEvent::HiddenListed { entries, .. }) if entries.is_empty()
         ));
     }
-}
-
-/// A node that cannot build a destination gate is retryable: the transition it
-/// is in ends on its own, and the import resumes from its checkpoint.
-fn classify_gate(error: GateContextError) -> ImportFailure {
-    ImportFailure::Retryable(error.to_string())
 }

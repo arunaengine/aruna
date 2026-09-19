@@ -1,7 +1,11 @@
+//! Reads and writes length prefixed frames, rejecting empty or oversized lengths.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const MAX_CONTROL_PLANE_FRAME: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_CONTROL_FRAME: usize = 128 * 1024 * 1024;
 
 pub(crate) fn checked_frame_len(len: u32, max_len: usize) -> io::Result<usize> {
     let len = len as usize;
@@ -59,16 +63,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_CONTROL_PLANE_FRAME, checked_frame_len, checked_send_len, read_frame, write_frame,
-    };
+    use super::{MAX_CONTROL_FRAME, checked_frame_len, checked_send_len, read_frame, write_frame};
     use std::io::ErrorKind;
     use tokio::io::AsyncWriteExt;
 
     const TEST_LIMIT: usize = 64;
 
     #[tokio::test]
-    async fn round_trips_payload_at_limit() {
+    async fn accepts_max_payload() {
         let (mut writer, mut reader) = tokio::io::duplex(4096);
         let payload = vec![7u8; TEST_LIMIT];
         write_frame(&mut writer, &payload, TEST_LIMIT)
@@ -79,7 +81,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_length_one_over_limit_before_allocation() {
+    async fn rejects_oversized_length() {
         let (mut writer, mut reader) = tokio::io::duplex(4096);
         writer.write_u32(TEST_LIMIT as u32 + 1).await.unwrap();
         writer.flush().await.unwrap();
@@ -88,7 +90,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_u32_max_header_without_allocating() {
+    async fn rejects_huge_header() {
         let (mut writer, mut reader) = tokio::io::duplex(4096);
         writer.write_u32(u32::MAX).await.unwrap();
         writer.flush().await.unwrap();
@@ -97,7 +99,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_zero_length_header() {
+    async fn rejects_empty_header() {
         let (mut writer, mut reader) = tokio::io::duplex(4096);
         writer.write_u32(0).await.unwrap();
         writer.flush().await.unwrap();
@@ -106,7 +108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_to_send_oversized_payload() {
+    async fn refuses_oversized_send() {
         let (mut writer, _reader) = tokio::io::duplex(4096);
         let payload = vec![0u8; TEST_LIMIT + 1];
         let err = write_frame(&mut writer, &payload, TEST_LIMIT)
@@ -116,18 +118,18 @@ mod tests {
     }
 
     #[test]
-    fn checked_frame_len_boundaries() {
+    fn checks_frame_boundaries() {
         assert_eq!(
             checked_frame_len(TEST_LIMIT as u32, TEST_LIMIT).unwrap(),
             TEST_LIMIT
         );
         assert!(checked_frame_len(0, TEST_LIMIT).is_err());
         assert!(checked_frame_len(TEST_LIMIT as u32 + 1, TEST_LIMIT).is_err());
-        assert!(checked_frame_len(u32::MAX, MAX_CONTROL_PLANE_FRAME).is_err());
+        assert!(checked_frame_len(u32::MAX, MAX_CONTROL_FRAME).is_err());
     }
 
     #[test]
-    fn checked_send_len_rejects_over_limit() {
+    fn checks_send_limit() {
         assert_eq!(
             checked_send_len(TEST_LIMIT, TEST_LIMIT).unwrap(),
             TEST_LIMIT as u32

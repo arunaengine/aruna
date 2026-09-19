@@ -1,40 +1,13 @@
-pub mod abort_multipart_upload;
-mod access_index;
-pub mod bucket_cors;
-pub mod bucket_placement;
-pub mod bucket_routing;
-pub mod bucket_usage;
-pub mod complete_multipart_upload;
-pub mod copy_object;
-pub mod create_bucket;
-pub mod create_multipart_upload;
-pub mod create_user_access;
-pub mod delete_bucket;
-pub mod delete_object;
-pub mod delete_objects;
-pub mod get_bucket_info;
-pub mod get_object;
-pub mod get_object_attributes;
-pub mod get_user_access;
-pub mod head_object;
-pub mod list_buckets;
-pub mod list_multipart_uploads;
-pub mod list_object_versions;
-pub mod list_objects_v2;
-pub mod list_parts;
-pub mod list_user_access;
+//! Groups the S3 surface: buckets, objects, multipart uploads, access keys and policies.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod access;
+pub mod bucket;
 pub mod listing;
-pub mod object_placement;
-pub mod policy_bulk;
-pub mod policy_coverage;
-pub mod policy_mutation;
-pub mod policy_successor;
+pub mod multipart;
+pub mod object;
+pub mod policy;
 pub mod purge_fence;
-pub mod put_object;
-pub mod refresh_reference_metadata;
-pub mod revoke_user_access;
-pub mod search_buckets;
-pub mod search_objects;
 pub mod session;
-pub mod upload_part;
-pub mod upload_part_copy;
+mod write_cleanup;

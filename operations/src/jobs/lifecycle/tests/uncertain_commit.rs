@@ -1,6 +1,6 @@
-//! Reservation outcomes that prove nothing about this node's willingness to
-//! run work: a commit that neither succeeded nor was refused is reconciled from
-//! the store, a refused write is retried, and neither is ever a drain.
+//! Tests that an uncertain reservation commit is reconciled or retried, never taken as a drain.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -9,17 +9,16 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::compute::ExecutorCapability;
-use aruna_core::compute_quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
+use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LaunchDecline, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    JOB_FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, NODE_INFO_KEYSPACE,
-};
-use aruna_core::structs::{
-    AdvertisementEpoch, JobFamilyRecord, JobRecordKind, LaunchIntent, NodeInfoDocument, NodeUrls,
-    NodeUtilization, PlacementSubject, node_info_storage_key,
+use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, NODE_INFO_KEYSPACE};
+use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordKind, LaunchIntent};
+use aruna_core::structs::placement::policy::PlacementSubject;
+use aruna_core::structs::storage::node_info::{
+    AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
@@ -39,8 +38,8 @@ use crate::jobs::lifecycle::target::{
 use crate::jobs::records::keys::record_key;
 use crate::jobs::records::load_kind_complete;
 use crate::jobs::records::rows::to_bytes;
-use crate::jobs::records::tests::fixture::{Family, REALM, context};
-use crate::node_info::set_operator_drain;
+use crate::node::node_info::set_operator_drain;
+use crate::tests::records::{Family, REALM, context};
 
 /// Detects a wakeup that never arrives, not a slow machine.
 const WAKEUP_LIMIT: Duration = Duration::from_secs(30);
@@ -91,7 +90,7 @@ async fn wakeups(fired: &mut mpsc::UnboundedReceiver<TaskKey>) -> HashSet<TaskKe
 
 /// Replication of the receipt and the start of the execution.
 fn both_wakeups() -> HashSet<TaskKey> {
-    HashSet::from([TaskKey::DrainJobFamilyOutbox, TaskKey::DrainJobQueue])
+    HashSet::from([TaskKey::DrainFamilyOutbox, TaskKey::DrainJobQueue])
 }
 
 /// A receipt for this launch id storing different content. The row is written
@@ -103,7 +102,7 @@ async fn seed_receipt(ctx: &DriverContext, family: &Family, launch: &LaunchInten
     let event = ctx
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
             key: record_key(&envelope.key()),
             value: Value::from(to_bytes(&envelope).expect("record encodes").as_slice()),
             txn_id: None,
@@ -155,7 +154,7 @@ async fn advertise(ctx: &DriverContext, document: &NodeInfoDocument) {
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Write {
             key_space: NODE_INFO_KEYSPACE.to_string(),
-            key: Key::from(node_info_storage_key(document.node_id)),
+            key: Key::from(node_info_key(document.node_id)),
             value: Value::from(document.to_bytes().expect("document validates").as_slice()),
             txn_id: None,
         }))
@@ -225,7 +224,7 @@ async fn cancellation_read_required() {
             let event = driver
                 .storage_handle
                 .send_effect(Effect::Storage(StorageEffect::Write {
-                    key_space: JOB_FAMILY_RECORD_KEYSPACE.to_string(),
+                    key_space: FAMILY_RECORD_KEYSPACE.to_string(),
                     key,
                     value: Value::from([0xffu8; 16].as_slice()),
                     txn_id: None,

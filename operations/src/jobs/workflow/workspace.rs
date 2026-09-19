@@ -1,3 +1,7 @@
+//! Mints run credentials, stages the workspace inputs, and captures the run outputs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -8,31 +12,35 @@ use aruna_core::compute::{
     has_wildcard, output_suffix,
 };
 use aruna_core::errors::{AuthorizationError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{
-    AttemptControl, AuthContext, BackendLocation, BucketInfo, CapturedInput, ExecutionSpec,
-    HashPathIndexKey, InputMode, InputSelection, InputSource, JobError, JobRecord,
-    MAX_EXECUTION_OUTPUTS, OBJECT_CONTENT_TYPE_KEY, OutputDestination, OutputObject,
-    OutputSelection, PathRestriction, Permission, PlacementPolicyRef, RealmId, UserAccess,
-    VersionedObjectArn, blob_bucket_permission_path, blob_group_permission_path,
-    blob_object_permission_path, ensure_confined_relative_path, key_content_type,
+use aruna_core::structs::execution::job::{
+    AttemptControl, CapturedInput, ExecutionSpec, InputMode, InputSelection, InputSource, JobError,
+    JobRecord, MAX_EXECUTION_OUTPUTS, OutputDestination, OutputObject, OutputSelection,
     workspace_credential_id,
 };
-use aruna_core::types::NodeId;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::policy::PlacementPolicyRef;
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BucketInfo, CONTENT_TYPE_KEY, HashIndex, UserAccess, bucket_permission_path,
+    ensure_confined_path, group_permission_path, key_content_type, object_permission_path,
+};
+use aruna_core::structs::storage::replication::{ReplicationFailure, VersionedObjectArn};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
-use crate::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     quota_marked_routing, routing_snapshot,
 };
-use crate::get_realm_config::GetRealmConfigOperation;
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::store::reserve_output_commits;
+use crate::realm::get_config::GetConfigOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,
@@ -41,16 +49,16 @@ use crate::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
     SourceAuthorizationError,
 };
-use crate::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
-use crate::s3::create_user_access::{CreateUserAccessConfig, CreateUserAccessOperation};
-use crate::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::delete_object::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
-use crate::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
-use crate::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
-use crate::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use crate::s3::list_objects_v2::{ListObjectsV2Input, ListObjectsV2Operation};
-use crate::s3::put_object::{
+use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
+use crate::s3::access::get::{GetAccessError, GetAccessOperation};
+use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
+use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
+use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 
@@ -79,7 +87,7 @@ pub async fn ensure_group_write(
                 path_restrictions: None,
                 session: None,
             },
-            path: blob_group_permission_path(record.created_by.realm_id, spec.group_id, node_id),
+            path: group_permission_path(record.created_by.realm_id, spec.group_id, node_id),
             required_permission: Permission::WRITE,
         }),
         context,
@@ -89,9 +97,7 @@ pub async fn ensure_group_write(
         AuthorizationError::InvalidRealmId
         | AuthorizationError::InvalidGroupId
         | AuthorizationError::GroupNotFound
-        | AuthorizationError::AuthDocNotFound => {
-            JobError::permanent("workspace write access denied")
-        }
+        | AuthorizationError::DocNotFound => JobError::permanent("workspace write access denied"),
         other => JobError::retryable(format!("workspace authorization failed: {other}")),
     })?;
     if allowed {
@@ -110,14 +116,9 @@ pub async fn check_workspace_bucket(
     node_id: NodeId,
     bucket: &str,
 ) -> Result<(), JobError> {
-    let info = Box::pin(drive(
-        GetBucketInfoOperation::new(bucket.to_string()),
-        context,
-    ))
-    .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| bucket_lookup_error("workspace", error))?
-    .ok_or_else(|| JobError::permanent("existing workspace bucket not found"))?;
+    let info = Box::pin(drive(GetBucketOperation::new(bucket.to_string()), context))
+        .await
+        .map_err(|error| bucket_lookup_error("workspace", error))?;
     if info.group_id != spec.group_id {
         return Err(JobError::permanent(
             "existing workspace bucket is outside the execution group",
@@ -131,7 +132,7 @@ pub async fn check_workspace_bucket(
                 path_restrictions: None,
                 session: None,
             },
-            path: blob_bucket_permission_path(
+            path: bucket_permission_path(
                 record.created_by.realm_id,
                 spec.group_id,
                 node_id,
@@ -162,7 +163,7 @@ pub async fn mint_workspace_credential(
     ensure_group_write(context, spec, record, node_id).await?;
     let realm_id = record.created_by.realm_id;
     // WRITE on the bucket and its subtree also satisfies READ without matching siblings.
-    let bucket_path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
+    let bucket_path = bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
     let restrictions = vec![
         PathRestriction {
             pattern: bucket_path.clone(),
@@ -188,7 +189,7 @@ pub async fn mint_input_credential(
     let restrictions = buckets
         .iter()
         .flat_map(|bucket| {
-            let path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
+            let path = bucket_permission_path(realm_id, spec.group_id, node_id, bucket);
             [
                 PathRestriction {
                     pattern: path.clone(),
@@ -229,13 +230,8 @@ async fn mint_credential(
         .as_ref()
         .map(|net| net.credential_encryption_key())
         .ok_or_else(|| JobError::permanent("workspace credential needs a net handle"))?;
-    match Box::pin(drive(
-        GetUserAccessOperation::new(access_key.clone()),
-        context,
-    ))
-    .await
-    {
-        Ok(Some(Ok(access))) => {
+    match Box::pin(drive(GetAccessOperation::new(access_key.clone()), context)).await {
+        Ok(access) => {
             let matches_job = access.access_key == access_key
                 && access.user_identity == record.created_by
                 && access.group_id == spec.group_id
@@ -259,10 +255,8 @@ async fn mint_credential(
                 return Err(JobError::permanent("workspace credential expired"));
             }
         }
-        Ok(None)
-        | Ok(Some(Err(GetUserAccessError::NotFound)))
-        | Err(GetUserAccessError::NotFound) => {}
-        Ok(Some(Err(error))) | Err(error) => {
+        Err(GetAccessError::NotFound) => {}
+        Err(error) => {
             return Err(JobError::retryable(format!(
                 "workspace credential lookup failed: {error}"
             )));
@@ -286,8 +280,8 @@ async fn mint_credential(
         None => SystemTime::now() + walltime + CREDENTIAL_SLACK,
     };
     let (_, secret, access) = Box::pin(drive(
-        CreateUserAccessOperation::new_with_key(
-            CreateUserAccessConfig {
+        CreateUserOperation::new_with_key(
+            CreateUserConfig {
                 user_identity: record.created_by,
                 group_id: spec.group_id,
                 expiry,
@@ -300,7 +294,6 @@ async fn mint_credential(
         context,
     ))
     .await
-    .map_err(|error| JobError::retryable(format!("workspace credential mint failed: {error}")))?
     .map_err(|error| JobError::retryable(format!("workspace credential mint failed: {error}")))?;
     Ok(WorkspaceCredential {
         access_key: access.access_key,
@@ -346,7 +339,7 @@ fn source_object(input: &InputSelection) -> Result<SourceObject, JobError> {
         key,
         version_id,
     } = &input.source;
-    ensure_confined_relative_path(Path::new(key))
+    ensure_confined_path(Path::new(key))
         .map_err(|error| JobError::permanent(format!("invalid input key: {error}")))?;
     let path = input
         .container_path
@@ -375,13 +368,11 @@ async fn authorize_source(
     source: &SourceObject,
 ) -> Result<(), JobError> {
     let bucket_info = Box::pin(drive(
-        GetBucketInfoOperation::new(source.bucket.clone()),
+        GetBucketOperation::new(source.bucket.clone()),
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
-    .map_err(|error| bucket_lookup_error("input", error))?
-    .ok_or_else(|| JobError::permanent(format!("input bucket {} not found", source.bucket)))?;
+    .map_err(|error| bucket_lookup_error("input", error))?;
     if bucket_info.group_id != spec.group_id {
         return Err(JobError::permanent(
             "input bucket is outside the execution group",
@@ -395,7 +386,7 @@ async fn authorize_source(
                 path_restrictions: None,
                 session: None,
             },
-            path: blob_object_permission_path(
+            path: object_permission_path(
                 record.created_by.realm_id,
                 spec.group_id,
                 node_id,
@@ -441,11 +432,9 @@ pub async fn prepare_mounts(
             context,
         ))
         .await
-        .and_then(|result| result.transpose())
         {
-            Ok(Some(_)) => {}
-            Ok(None)
-            | Err(
+            Ok(_) => {}
+            Err(
                 HeadObjectError::NoSuchKey
                 | HeadObjectError::NoSuchVersion
                 | HeadObjectError::DeleteMarker,
@@ -545,11 +534,9 @@ async fn input_bytes(
         }),
         context,
     ))
-    .await
-    .and_then(|result| result.transpose());
+    .await;
     let failure = match local {
-        Ok(Some(get)) => return Ok(StagedSource::from_local(get)),
-        Ok(None) => None,
+        Ok(get) => return Ok(StagedSource::from_local(get)),
         Err(error) => Some(error),
     };
     let Some(input_pin) = captured() else {
@@ -579,11 +566,7 @@ async fn input_bytes(
 /// Registered copies of the same bytes this node holds itself, deduplicated by
 /// the object they name. Only copies of this realm on this node can be read
 /// locally, so everything else is dropped.
-fn local_copies(
-    candidates: Vec<HashPathIndexKey>,
-    realm_id: RealmId,
-    node_id: NodeId,
-) -> Vec<HashPathIndexKey> {
+fn local_copies(candidates: Vec<HashIndex>, realm_id: RealmId, node_id: NodeId) -> Vec<HashIndex> {
     let mut unique = BTreeMap::new();
     for candidate in candidates {
         if candidate.realm_id != realm_id || candidate.node_id != node_id {
@@ -610,12 +593,9 @@ async fn local_copy_source(
     source: &SourceObject,
     captured: &CapturedInput,
 ) -> Option<StagedSource> {
-    let candidates = Box::pin(drive(
-        ResolveBlobPermissionPathsOperation::new(captured.blake3),
-        context,
-    ))
-    .await
-    .ok()?;
+    let candidates = Box::pin(drive(ResolvePathsOperation::new(captured.blake3), context))
+        .await
+        .ok()?;
     for candidate in local_copies(candidates, record.created_by.realm_id, node_id) {
         let copy = SourceObject {
             path: source.path.clone(),
@@ -641,9 +621,8 @@ async fn local_copy_source(
             }),
             context,
         ))
-        .await
-        .and_then(|result| result.transpose());
-        if let Ok(Some(get)) = get {
+        .await;
+        if let Ok(get) = get {
             return Some(StagedSource::from_local(get));
         }
     }
@@ -851,11 +830,9 @@ async fn put_file_output(
         Box::pin(ensure_output_stage(context, spec, record, &stage_bucket)).await?;
         (stage_bucket, version_id.to_string())
     } else {
-        let bucket_info = Box::pin(drive(GetBucketInfoOperation::new(bucket.clone()), context))
+        let bucket_info = Box::pin(drive(GetBucketOperation::new(bucket.clone()), context))
             .await
-            .and_then(|result| result.transpose())
-            .map_err(|error| bucket_lookup_error("output", error))?
-            .ok_or_else(|| JobError::permanent(format!("output bucket {bucket} not found")))?;
+            .map_err(|error| bucket_lookup_error("output", error))?;
         if bucket_info.group_id != spec.group_id {
             return Err(JobError::permanent(
                 "output bucket is outside the execution group",
@@ -869,7 +846,7 @@ async fn put_file_output(
                     path_restrictions: None,
                     session: None,
                 },
-                path: blob_object_permission_path(
+                path: object_permission_path(
                     record.created_by.realm_id,
                     spec.group_id,
                     node_id,
@@ -891,7 +868,7 @@ async fn put_file_output(
     };
 
     let realm_config = Box::pin(drive(
-        GetRealmConfigOperation::new(record.created_by.realm_id),
+        GetConfigOperation::new(record.created_by.realm_id),
         context,
     ))
     .await
@@ -948,7 +925,6 @@ async fn put_file_output(
     }
     let result = Box::pin(drive(operation, context))
         .await
-        .and_then(|result| result.transpose())
         // A failure caused by the container-side stream keeps its own
         // retryable/permanent classification instead of the put's.
         .map_err(
@@ -956,8 +932,7 @@ async fn put_file_output(
                 Some(backend_error) => output_read_error(&backend_error),
                 None => put_object_error("output write", error),
             },
-        )?
-        .ok_or_else(|| JobError::retryable("output write returned no version"))?;
+        )?;
     if remote {
         Box::pin(replicate_output(
             context,
@@ -1070,11 +1045,10 @@ async fn replicate_output(
     .with_destination(bucket.clone(), key.clone(), record.owner_node_id, auth);
     let result = Box::pin(drive(operation, context))
         .await
-        .and_then(|result| result.transpose())
-        .map_err(|error| output_replication_error(error.to_string()))?
-        .ok_or_else(|| JobError::retryable("output copy returned no result"))?;
+        .map_err(|error| output_replication_error(error.failure(), error.to_string()))?;
     if result.failed > 0 || result.replicated == 0 && result.skipped == 0 {
         return Err(output_replication_error(
+            result.failure.unwrap_or(ReplicationFailure::Other),
             result
                 .last_error
                 .unwrap_or_else(|| "output copy made no progress".to_string()),
@@ -1104,14 +1078,8 @@ async fn cleanup_output_stage(
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(_)) | Err(DeleteObjectError::NoSuchVersion) => {}
-        Ok(None) => {
-            return Err(JobError::retryable(
-                "output staging delete returned no result",
-            ));
-        }
+        Ok(_) | Err(DeleteObjectError::NoSuchVersion) => {}
         Err(error) => {
             return Err(JobError::retryable(format!(
                 "output staging delete failed: {error}"
@@ -1123,20 +1091,16 @@ async fn cleanup_output_stage(
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(())) | Err(DeleteBucketError::NotFound) => Ok(()),
-        Ok(None) => Err(JobError::retryable(
-            "output staging bucket delete returned no result",
-        )),
+        Ok(()) | Err(DeleteBucketError::NotFound) => Ok(()),
         Err(error) => Err(JobError::retryable(format!(
             "output staging bucket delete failed: {error}"
         ))),
     }
 }
 
-fn output_replication_error(message: String) -> JobError {
-    if message.contains("access denied") || message.contains("writer_access_denied") {
+fn output_replication_error(failure: ReplicationFailure, message: String) -> JobError {
+    if failure.is_denied() {
         JobError::permanent(format!("output copy failed: {message}"))
     } else {
         JobError::retryable(format!("output copy failed: {message}"))
@@ -1156,7 +1120,7 @@ fn output_read_error(error: &BackendError) -> JobError {
 /// or a JSON result is served as itself instead of an opaque download.
 fn output_metadata(key: &str) -> HashMap<String, String> {
     HashMap::from([(
-        OBJECT_CONTENT_TYPE_KEY.to_string(),
+        CONTENT_TYPE_KEY.to_string(),
         key_content_type(key).to_string(),
     )])
 }
@@ -1191,7 +1155,7 @@ struct StagedSource {
 }
 
 impl StagedSource {
-    fn from_local(get: crate::s3::get_object::GetObjectResult) -> Self {
+    fn from_local(get: crate::s3::object::get::GetObjectResult) -> Self {
         Self {
             blob: get.blob,
             location: get.location,
@@ -1218,9 +1182,8 @@ async fn remote_source(
             .transpose()
             .map_err(|_| JobError::permanent("input version is invalid".to_string()))?,
     };
-    // The record's own source is the holder the plan picked. It may be any node
-    // with a registered copy, so only the pinned version has to match here; the
-    // hash and size below bind the bytes.
+    // The record's source is the holder the plan picked, possibly any node with a
+    // registered copy: only the pinned version must match; hash and size bind.
     if version != Some(captured.version_id) {
         return Err(JobError::permanent(
             "captured remote input does not match the physical input".to_string(),
@@ -1320,9 +1283,9 @@ fn device_read_error(bucket: &str, key: &str, error: BaoReadError) -> JobError {
     }
 }
 
-fn bucket_lookup_error(scope: &str, error: GetBucketInfoError) -> JobError {
+fn bucket_lookup_error(scope: &str, error: GetBucketError) -> JobError {
     let message = format!("{scope} bucket lookup failed: {error}");
-    if matches!(&error, GetBucketInfoError::StorageError(error) if storage_retryable(error)) {
+    if matches!(&error, GetBucketError::StorageError(error) if storage_retryable(error)) {
         JobError::retryable(message)
     } else {
         JobError::permanent(message)
@@ -1405,9 +1368,8 @@ fn storage_retryable(error: &StorageError) -> bool {
 }
 
 /// Attribute this execution's outputs under the declared prefixes. A listed key
-/// counts only when this execution durably reserved its VersionId before
-/// writing: the current head may belong to a duplicate execution or to an
-/// unrelated later write, and stamping it here would forge provenance.
+/// counts only when this execution durably reserved its VersionId before writing;
+/// the current head may otherwise belong to a duplicate or unrelated write.
 pub async fn collect_outputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
@@ -1434,7 +1396,7 @@ pub async fn collect_outputs(
         let mut continuation = None;
         loop {
             let result = Box::pin(drive(
-                ListObjectsV2Operation::new(ListObjectsV2Input {
+                ListBucketOperation::new(ListBucketInput {
                     bucket: bucket.to_string(),
                     group_id: spec.group_id,
                     continuation_token: continuation.clone(),
@@ -1446,9 +1408,7 @@ pub async fn collect_outputs(
                 context,
             ))
             .await
-            .and_then(|result| result.transpose())
             .map_err(|error| JobError::retryable(format!("output inventory failed: {error}")))?;
-            let Some(result) = result else { break };
             for object in result.objects {
                 let key = object.head.key;
                 let Some(version_id) = reserved_version(control, node_id, bucket, &key) else {
@@ -1529,16 +1489,14 @@ async fn head_version(
         context,
     ))
     .await
-    .and_then(|result| result.transpose())
     {
-        Ok(Some(result)) => match result.version_id {
+        Ok(result) => match result.version_id {
             Some(found) if found == version_id => Ok(Some(result.location)),
             _ => Err(JobError::permanent(format!(
                 "output {bucket}/{key} does not carry reserved version {version_id}"
             ))),
         },
-        Ok(None)
-        | Err(
+        Err(
             HeadObjectError::NoSuchKey
             | HeadObjectError::NoSuchVersion
             | HeadObjectError::DeleteMarker,
@@ -1607,9 +1565,13 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
-    use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, JobErrorKind, JobId, JobPayload,
-        OutputCommitIntent, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    use aruna_core::structs::execution::job::{
+        JobErrorKind, JobId, JobPayload, OutputCommitIntent,
+    };
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -1655,12 +1617,12 @@ mod tests {
         // The captured put must name the type, or a chart serves as a download.
         let metadata = output_metadata("results/run-1/chart.png");
         assert_eq!(
-            metadata.get(OBJECT_CONTENT_TYPE_KEY).map(String::as_str),
+            metadata.get(CONTENT_TYPE_KEY).map(String::as_str),
             Some("image/png")
         );
         assert_eq!(
             output_metadata("out/blob")
-                .get(OBJECT_CONTENT_TYPE_KEY)
+                .get(CONTENT_TYPE_KEY)
                 .map(String::as_str),
             Some("application/octet-stream")
         );
@@ -1669,7 +1631,7 @@ mod tests {
     // Both input mappings must retry only transient drift: a job that waits on a
     // rebind or a dropped observation would burn its whole attempt budget.
     #[test]
-    fn device_read_fails_fast() {
+    fn device_read_fails() {
         // A governed or missing realm input must not burn every attempt.
         for error in [
             BaoReadError::GovernedUnavailable,
@@ -1705,7 +1667,7 @@ mod tests {
         let group = Ulid::from_bytes([5; 16]);
         let version = Ulid::from_bytes([6; 16]);
         let alias = |realm_id, node_id, bucket: &str, key: &str| {
-            HashPathIndexKey::new(hash, version, realm_id, group, node_id, bucket, key)
+            HashIndex::new(hash, version, realm_id, group, node_id, bucket, key)
         };
         let candidates = vec![
             alias(realm, node, "shared", "reads.fastq"),
@@ -1899,9 +1861,9 @@ mod tests {
             user_id,
             realm_id,
         };
-        let realm_doc = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+        let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let group_doc =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, spec.group_id);
+            GroupAuthorizationDocument::default_group_doc(user_id, realm_id, spec.group_id);
         // Policy loading fails closed without the realm config and group record.
         let realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         let group = Group {
@@ -2001,7 +1963,10 @@ mod tests {
         let owner = record.created_by;
         let ungranted = UserId::local(Ulid::from_bytes([9; 16]), realm_id);
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-        config.ensure_node(node_id, aruna_core::structs::RealmNodeKind::User { owner });
+        config.ensure_node(
+            node_id,
+            aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
+        );
         let actor = Actor {
             node_id,
             user_id: owner,
@@ -2063,12 +2028,10 @@ mod tests {
         assert_eq!(second.secret, first.secret);
 
         let access = Box::pin(drive(
-            GetUserAccessOperation::new(first.access_key.clone()),
+            GetAccessOperation::new(first.access_key.clone()),
             &context,
         ))
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         let mut expired = access.clone();
         expired.expiry = SystemTime::UNIX_EPOCH;
@@ -2086,16 +2049,14 @@ mod tests {
             .unwrap();
         assert_eq!(renewed.access_key, first.access_key);
         let renewed_access = Box::pin(drive(
-            GetUserAccessOperation::new(first.access_key.clone()),
+            GetAccessOperation::new(first.access_key.clone()),
             &context,
         ))
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         assert!(!renewed_access.is_expired(SystemTime::now()));
         let restrictions = renewed_access.path_restrictions.unwrap();
-        let bucket_path = blob_bucket_permission_path(realm_id, spec.group_id, node_id, &bucket);
+        let bucket_path = bucket_permission_path(realm_id, spec.group_id, node_id, &bucket);
         let permits = |path: &str| {
             restrictions.iter().any(|restriction| {
                 globset::Glob::new(&restriction.pattern)
@@ -2128,12 +2089,10 @@ mod tests {
             .await
             .unwrap();
         let mut access = Box::pin(drive(
-            GetUserAccessOperation::new(minted.access_key.clone()),
+            GetAccessOperation::new(minted.access_key.clone()),
             &context,
         ))
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
         access
             .encrypt_secret(
@@ -2157,7 +2116,10 @@ mod tests {
             panic!("a foreign key must not yield a credential")
         };
 
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
         assert!(
             error
                 .message
@@ -2181,7 +2143,7 @@ mod tests {
             bucket,
             mut spec,
         } = credential_fixture().await;
-        let bearer_ms = aruna_core::util::unix_timestamp_millis() + 60_000;
+        let bearer_ms = aruna_core::time::unix_timestamp_millis() + 60_000;
         spec.resources.max_walltime_ms = Some(24 * 60 * 60 * 1000);
         spec.tags
             .insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
@@ -2246,7 +2208,10 @@ mod tests {
             panic!("an over-limit mount set must not yield a credential")
         };
 
-        assert_eq!(over.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(
+            over.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
         assert!(
             over.message
                 .starts_with("workspace credential restrictions invalid")
@@ -2386,7 +2351,10 @@ mod tests {
         assert_eq!(merged.len(), MAX_EXECUTION_OUTPUTS);
 
         let error = merge_outputs(inventoried, vec![output("overflow")]).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
     }
 
     fn wildcard_output(pattern: &str) -> OutputSelection {
@@ -2452,12 +2420,18 @@ mod tests {
     fn rejects_foreign_match() {
         let output = wildcard_output("/out/*.txt");
         let error = expand_selection(&output, vec!["/other/a.txt".to_string()]).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
 
         let mut output = output;
         output.path_prefix = None;
         let error = expand_selection(&output, vec!["/out/a.txt".to_string()]).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
     }
 
     #[test]
@@ -2469,7 +2443,10 @@ mod tests {
         }
         insert_output(&mut outputs, &mut keys, output("0")).unwrap();
         let error = insert_output(&mut outputs, &mut keys, output("overflow")).unwrap_err();
-        assert_eq!(error.kind, aruna_core::structs::JobErrorKind::Permanent);
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
         assert_eq!(outputs.len(), MAX_EXECUTION_OUTPUTS);
     }
 }

@@ -1,3 +1,7 @@
+//! Defines the executor backend trait and the pieces every compute backend shares.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use aruna_core::compute::{
     AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails,
     ReconcileEvidence, ResourceEnvelope, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
@@ -9,6 +13,12 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
+
+#[cfg(any(feature = "apptainer", feature = "docker", feature = "kubernetes"))]
+pub(crate) mod channel;
+
+#[cfg(any(feature = "apptainer", feature = "docker"))]
+pub(crate) mod control_store;
 
 pub mod config;
 pub mod logs;
@@ -246,8 +256,4 @@ pub trait ExecutorBackend: Send + Sync {
     /// Idempotently delete the external object. Called only after terminal
     /// evidence is durably recorded by the caller.
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError>;
-
-    async fn sweep_orphans(&self, _grace: Duration) -> Result<(), BackendError> {
-        Ok(())
-    }
 }

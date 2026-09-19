@@ -1,11 +1,16 @@
-use crate::connectors::{ResolveSourceConnectorInput, resolve_source_connector_suboperation};
+//! Resolves a connector and opens a byte stream for one staging source path.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
 use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
-use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
+use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{SourceConnector, SourceMetadata};
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{Effects, GroupId};
 use bytes::Bytes;
 use smallvec::smallvec;
@@ -14,7 +19,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReadStagingSourceInput {
+pub struct ReadSourceInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
     pub source_path: String,
@@ -22,14 +27,14 @@ pub struct ReadStagingSourceInput {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ReadStagingSourceResult {
+pub struct ReadSourceResult {
     pub connector: SourceConnector,
     pub metadata: SourceMetadata,
     pub stream: BackendStream<Result<Bytes, StreamError>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReadStagingSourceState {
+pub enum ReadSourceState {
     Init,
     ResolveConnector,
     ReadSource,
@@ -38,47 +43,47 @@ pub enum ReadStagingSourceState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ReadStagingSourceError {
+pub enum ReadSourceError {
     #[error(transparent)]
-    Resolve(#[from] SourceConnectorResolutionError),
+    Resolve(#[from] SourceResolutionError),
     #[error(transparent)]
     Staging(#[from] StagingSourceError),
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: ReadStagingSourceState,
+        state: ReadSourceState,
         expected: &'static str,
         got: String,
     },
     #[error("Read staging source failed")]
-    ReadStagingSourceFailed,
+    ReadSourceFailed,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ReadStagingSourceOperation {
-    input: ReadStagingSourceInput,
-    state: ReadStagingSourceState,
+pub struct ReadSourceOperation {
+    input: ReadSourceInput,
+    state: ReadSourceState,
     connector: Option<SourceConnector>,
-    output: Option<Result<ReadStagingSourceResult, ReadStagingSourceError>>,
+    output: Option<Result<ReadSourceResult, ReadSourceError>>,
 }
 
-impl ReadStagingSourceOperation {
-    pub fn new(input: ReadStagingSourceInput) -> Self {
+impl ReadSourceOperation {
+    pub fn new(input: ReadSourceInput) -> Self {
         Self {
             input,
-            state: ReadStagingSourceState::Init,
+            state: ReadSourceState::Init,
             connector: None,
             output: None,
         }
     }
 
-    fn emit_error(&mut self, error: ReadStagingSourceError) -> Effects {
-        self.state = ReadStagingSourceState::Error;
+    fn emit_error(&mut self, error: ReadSourceError) -> Effects {
+        self.state = ReadSourceState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn emit_unexpected(&mut self, expected: &'static str, event: &Event) -> Effects {
-        self.emit_error(ReadStagingSourceError::UnexpectedEvent {
+        self.emit_error(ReadSourceError::UnexpectedEvent {
             state: self.state.clone(),
             expected,
             got: describe_event(event),
@@ -86,15 +91,13 @@ impl ReadStagingSourceOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
-        self.state = ReadStagingSourceState::ResolveConnector;
-        smallvec![resolve_source_connector_suboperation(
-            ResolveSourceConnectorInput {
-                group_id: self.input.group_id,
-                connector_id: self.input.connector_id,
-                source_path: self.input.source_path.clone(),
-                allow_root: false,
-            }
-        )]
+        self.state = ReadSourceState::ResolveConnector;
+        smallvec![resolve_connector_effect(ResolveConnectorInput {
+            group_id: self.input.group_id,
+            connector_id: self.input.connector_id,
+            source_path: self.input.source_path.clone(),
+            allow_root: false,
+        })]
     }
 
     fn handle_resolved_connector(&mut self, event: Event) -> Effects {
@@ -103,7 +106,7 @@ impl ReadStagingSourceOperation {
                 match *result {
                     Ok(resolved) => {
                         self.connector = Some(resolved.connector);
-                        self.state = ReadStagingSourceState::ReadSource;
+                        self.state = ReadSourceState::ReadSource;
                         smallvec![Effect::StagingSource(StagingSourceEffect::Read {
                             access: resolved.access,
                             range: self.input.range.clone(),
@@ -123,11 +126,11 @@ impl ReadStagingSourceOperation {
         match event {
             Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
                 let Some(connector) = self.connector.clone() else {
-                    return self.emit_error(ReadStagingSourceError::ReadStagingSourceFailed);
+                    return self.emit_error(ReadSourceError::ReadSourceFailed);
                 };
 
-                self.state = ReadStagingSourceState::Finish;
-                self.output = Some(Ok(ReadStagingSourceResult {
+                self.state = ReadSourceState::Finish;
+                self.output = Some(Ok(ReadSourceResult {
                     connector,
                     metadata,
                     stream,
@@ -145,9 +148,9 @@ impl ReadStagingSourceOperation {
     }
 }
 
-impl Operation for ReadStagingSourceOperation {
-    type Output = ReadStagingSourceResult;
-    type Error = ReadStagingSourceError;
+impl Operation for ReadSourceOperation {
+    type Output = ReadSourceResult;
+    type Error = ReadSourceError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -155,31 +158,27 @@ impl Operation for ReadStagingSourceOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ReadStagingSourceState::Init => self.handle_init(),
-            ReadStagingSourceState::ResolveConnector => self.handle_resolved_connector(event),
-            ReadStagingSourceState::ReadSource => self.handle_read_result(event),
-            ReadStagingSourceState::Finish => smallvec![],
-            ReadStagingSourceState::Error => self.abort(),
+            ReadSourceState::Init => self.handle_init(),
+            ReadSourceState::ResolveConnector => self.handle_resolved_connector(event),
+            ReadSourceState::ReadSource => self.handle_read_result(event),
+            ReadSourceState::Finish => smallvec![],
+            ReadSourceState::Error => self.abort(),
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ReadStagingSourceState::Finish | ReadStagingSourceState::Error
-        )
+        matches!(self.state, ReadSourceState::Finish | ReadSourceState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ReadStagingSourceState::Error {
+        if self.state == ReadSourceState::Error {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(ReadStagingSourceError::ReadStagingSourceFailed);
+            return Err(ReadSourceError::ReadSourceFailed);
         }
 
-        self.output
-            .ok_or(ReadStagingSourceError::ReadStagingSourceFailed)?
+        self.output.ok_or(ReadSourceError::ReadSourceFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -191,14 +190,17 @@ impl Operation for ReadStagingSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::staging::test_utils::{create_http_connector, setup_driver_context};
-    use aruna_core::structs::{ResolvedSourceAccess, ResolvedSourceConnector, SourceConnectorKind};
+    use crate::tests::staging::{create_http_connector, setup_driver_context};
+    use aruna_core::structs::execution::source_access::{
+        ResolvedSourceAccess, ResolvedSourceConnector,
+    };
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use futures_util::{StreamExt, stream};
     use std::collections::HashMap;
     use std::time::SystemTime;
 
-    fn sample_input() -> ReadStagingSourceInput {
-        ReadStagingSourceInput {
+    fn sample_input() -> ReadSourceInput {
+        ReadSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
             source_path: "folder/file.txt".to_string(),
@@ -250,18 +252,18 @@ mod tests {
     }
 
     #[test]
-    fn start_emits_resolve_connector_suboperation() {
-        let mut operation = ReadStagingSourceOperation::new(sample_input());
+    fn start_emits_resolve() {
+        let mut operation = ReadSourceOperation::new(sample_input());
 
         let effects = operation.start();
 
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        assert_eq!(operation.state, ReadStagingSourceState::ResolveConnector);
+        assert_eq!(operation.state, ReadSourceState::ResolveConnector);
     }
 
     #[test]
-    fn resolved_connector_emits_read_effect_with_range() {
-        let mut operation = ReadStagingSourceOperation::new(sample_input());
+    fn resolved_emits_read() {
+        let mut operation = ReadSourceOperation::new(sample_input());
         operation.start();
         let resolved = sample_resolved_connector();
         let expected_access = resolved.access.clone();
@@ -277,32 +279,32 @@ mod tests {
             [Effect::StagingSource(StagingSourceEffect::Read { access, range })]
                 if access == &expected_access && range == &Some(5..11)
         ));
-        assert_eq!(operation.state, ReadStagingSourceState::ReadSource);
+        assert_eq!(operation.state, ReadSourceState::ReadSource);
     }
 
     #[test]
-    fn resolve_error_is_exposed() {
-        let mut operation = ReadStagingSourceOperation::new(sample_input());
+    fn exposes_resolve_error() {
+        let mut operation = ReadSourceOperation::new(sample_input());
         operation.start();
 
         let effects = operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Err(SourceConnectorResolutionError::InvalidSourcePath)),
+                result: Box::new(Err(SourceResolutionError::InvalidSourcePath)),
             },
         ));
 
         assert!(effects.is_empty());
         assert_eq!(
             operation.finalize(),
-            Err(ReadStagingSourceError::Resolve(
-                SourceConnectorResolutionError::InvalidSourcePath,
+            Err(ReadSourceError::Resolve(
+                SourceResolutionError::InvalidSourcePath,
             )),
         );
     }
 
     #[tokio::test]
-    async fn read_result_finishes_operation_and_exposes_stream() {
-        let mut operation = ReadStagingSourceOperation::new(sample_input());
+    async fn read_finishes_operation() {
+        let mut operation = ReadSourceOperation::new(sample_input());
         operation.start();
         operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
@@ -328,8 +330,8 @@ mod tests {
     }
 
     #[test]
-    fn staging_error_is_exposed() {
-        let mut operation = ReadStagingSourceOperation::new(sample_input());
+    fn exposes_staging_error() {
+        let mut operation = ReadSourceOperation::new(sample_input());
         operation.start();
         operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
@@ -344,15 +346,15 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(
             operation.finalize(),
-            Err(ReadStagingSourceError::Staging(
-                StagingSourceError::ReadError("boom".to_string()),
-            )),
+            Err(ReadSourceError::Staging(StagingSourceError::ReadError(
+                "boom".to_string()
+            ),)),
         );
     }
 
     #[test]
-    fn unexpected_event_uses_event_description() {
-        let mut operation = ReadStagingSourceOperation::new(sample_input());
+    fn unexpected_describes_event() {
+        let mut operation = ReadSourceOperation::new(sample_input());
         operation.start();
 
         let effects = operation.step(Event::Task(aruna_core::task::TaskEvent::Error {
@@ -363,8 +365,8 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(
             operation.finalize(),
-            Err(ReadStagingSourceError::UnexpectedEvent {
-                state: ReadStagingSourceState::ResolveConnector,
+            Err(ReadSourceError::UnexpectedEvent {
+                state: ReadSourceState::ResolveConnector,
                 expected: "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
                 got: "Event::Task".to_string(),
             })
@@ -372,7 +374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_operation_resolves_connector_and_hits_runtime() {
+    async fn read_hits_runtime() {
         let test_context = setup_driver_context().await;
         let group_id = Ulid::generate();
         let connector =
@@ -380,7 +382,7 @@ mod tests {
                 .await;
 
         let result = drive(
-            ReadStagingSourceOperation::new(ReadStagingSourceInput {
+            ReadSourceOperation::new(ReadSourceInput {
                 group_id,
                 connector_id: connector.connector_id,
                 source_path: "folder/file.txt".to_string(),
@@ -390,6 +392,6 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(ReadStagingSourceError::Staging(_))));
+        assert!(matches!(result, Err(ReadSourceError::Staging(_))));
     }
 }

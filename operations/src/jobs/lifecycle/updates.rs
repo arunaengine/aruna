@@ -1,33 +1,31 @@
-//! The monotonic execution chain one executor publishes.
-//!
-//! Only the node fenced by its own attempt control may advance an execution.
-//! Each update chains by digest from the receipt, so a gap cannot silently skip
-//! a state or forge a terminal result, and terminal success may only name an
-//! output record that is already durable.
+//! Publishes the monotonic execution chain, each update chained by digest from the receipt.
+//! Only the fenced node may advance a chain, and success may name only a durable output record.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
 use aruna_core::effects::{Effect, JobRecordFrame};
-use aruna_core::structs::{
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::{
     ExecutionReceipt, ExecutionUpdate, JobErrorKind, JobFamilyId, JobFamilyRecord, JobId,
     JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
     PhysicalExecutionResult, PhysicalExecutionState, ResultMessage,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::NodeId;
-use aruna_core::util::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::reservation::{ReleaseExecutionOperation, held_reservations, job_reservation};
 use super::routing::family_of_alias;
 use super::witness::arm_family;
-use crate::dashboard::notify_dashboard_change;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
 };
 use crate::jobs::store::read_job_record;
+use crate::node::dashboard::notify_dashboard_change;
 
 /// The replicated identity of one physical execution, read back from the
 /// receipt that authorized it. Without it there is no distributed chain to
@@ -469,10 +467,10 @@ fn log_tails(result: Option<&JobResultPayload>) -> (Option<ResultMessage>, Optio
 }
 
 #[cfg(test)]
-mod tests {
+mod pure_tests {
     use super::*;
-    use crate::jobs::records::tests::fixture::{Family, node, payload, user};
-    use aruna_core::structs::{JobError, JobPayload};
+    use crate::tests::records::{Family, node, payload, user};
+    use aruna_core::structs::execution::job::{JobError, JobPayload};
 
     fn receipt(family: &Family) -> ExecutionReceipt {
         let spec = family.spec();
@@ -495,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn infra_failure_is_error() {
+    fn retryable_maps_error() {
         // Only an authenticated permanent, job-specific failure may replicate as
         // `failed`; a retryable one stays an infrastructure `error`.
         assert_eq!(

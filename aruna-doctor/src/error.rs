@@ -1,9 +1,13 @@
+//! Defines the doctor's top level error type and the conversions into it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use crate::explorer::ExplorerError;
 use crate::storage::SnapshotError;
 use aruna::config::SetupError;
 use aruna::portal::PortalArtifactError;
 use aruna_core::onboarding::OnboardingSecretError;
-use aruna_operations::create_token::CreateTokenError;
+use aruna_operations::auth::create_token::CreateTokenError;
 use aruna_storage::errors::StorageLibError;
 use thiserror::Error;
 use tokio::task::JoinError;
@@ -18,8 +22,6 @@ pub enum CliError {
     JwtTokenError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Base64DecodeError(#[from] base64::DecodeError),
-    #[error("Cannot convert Vec into Slice")]
-    IntoSliceError,
     #[error(transparent)]
     Ed25519Error(#[from] ed25519_dalek::ed25519::Error),
     #[error(transparent)]
@@ -67,24 +69,10 @@ pub enum CliError {
     #[error("portal config value {0} is required")]
     MissingPortalConfig(&'static str),
     #[error("no prerelease in {repo} contains portal artifact {asset}")]
-    MissingPortalWebsiteArtifact {
+    PortalArtifactMissing {
         repo: &'static str,
         asset: &'static str,
     },
     #[error("OIDC provider '{0}' is not configured")]
-    OidcProviderNotFound(String),
-    #[error("OIDC flow requires local Aruna HTTP address to be configured")]
-    MissingArunaHttpAddress,
-    #[error("Local bootstrap flow requires --name")]
-    MissingBootstrapName,
-    #[error("No initial local onboarding secret is available")]
-    MissingInitialOnboardingSecret,
-    #[error("Arbitrary user ids require --unsafe-arbitrary-user-id")]
-    UnsafeUserIdRequired,
-    #[error("invalid {key} value {value:?}: {message}")]
-    InvalidConfigValue {
-        key: &'static str,
-        value: String,
-        message: String,
-    },
+    OidcNotFound(String),
 }

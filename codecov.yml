@@ -1,7 +1,12 @@
+# Codecov targets and thresholds for the project and patch status checks.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
 coverage:
   status:
     project:
       default:
+        # Compare the same compiled src-file set to the merge base; inline tests remain counted.
         target: auto
         threshold: 0.8%
     patch:
