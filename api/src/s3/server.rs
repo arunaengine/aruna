@@ -36,7 +36,7 @@ use aruna_core::structs::storage::blob::BucketCorsConfiguration;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use futures_core::future::BoxFuture;
-use http::{Method, Request};
+use http::{Method, Request, header};
 use hyper::body::Incoming;
 use hyper::service::Service;
 use hyper_util::rt::TokioExecutor;
