@@ -22,6 +22,10 @@ struct Repository {
     corrupt: bool,
     loop_pages: bool,
     lost_create: bool,
+    lost_commit: bool,
+    lost_publish: bool,
+    foreign_page: bool,
+    public_files: bool,
 }
 
 struct Server {
@@ -100,6 +104,11 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
     let value = match (method, parts.as_slice()) {
         (Method::GET, ["api", "records", "2", "versions"]) => {
             let second = query.contains("page=2");
+            if state.foreign_page {
+                return axum::Json(json!({"hits": {"total": 2, "hits": [{"id": "1"}]},
+                    "links": {"next": "http://127.0.0.1:1/api/records/2/versions"}}))
+                .into_response();
+            }
             json!({"hits": {"total": 2, "hits": [{"id": if second {"2"} else {"1"}}]},
                 "links": {"next": if !second || state.loop_pages {Some("/api/records/2/versions?page=2")} else {None}}})
         }
@@ -128,6 +137,14 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["metadata"]["title"], "Exported dataset");
             assert_eq!(body["files"]["enabled"], true);
+            assert_eq!(
+                body["access"]["files"],
+                if state.public_files {
+                    "public"
+                } else {
+                    "restricted"
+                }
+            );
             if state.lost_create {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
@@ -158,12 +175,18 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
         (Method::POST, ["api", "records", "3", "draft", "files", key, "commit"]) => {
             assert_eq!(state.key.as_deref(), Some(*key));
             state.committed = true;
+            if std::mem::take(&mut state.lost_commit) {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             file(key, &state.bytes, true)
         }
         (Method::POST, ["api", "records", "3", "draft", "actions", "publish"]) => {
             assert!(state.committed);
             assert!(!state.published);
             state.published = true;
+            if std::mem::take(&mut state.lost_publish) {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             record("3", true)
         }
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -262,6 +285,10 @@ async fn invenio_rejects_corruption() -> Result<(), Box<dyn std::error::Error>> 
             loop_pages: true,
             ..Default::default()
         },
+        Repository {
+            foreign_page: true,
+            ..Default::default()
+        },
     ] {
         let fixture = build_fixture(false).await?;
         let server = serve(repository).await;
@@ -315,10 +342,15 @@ async fn export_spec(
 
 #[tokio::test]
 async fn invenio_export_modes() -> Result<(), Box<dyn std::error::Error>> {
-    for publish in [false, true] {
+    for (publish, public_files) in [(false, false), (true, false), (true, true)] {
         let fixture = build_fixture(false).await?;
-        let server = serve(Repository::default()).await;
-        let spec = export_spec(&fixture, &server, publish).await?;
+        let server = serve(Repository {
+            public_files,
+            ..Default::default()
+        })
+        .await;
+        let mut spec = export_spec(&fixture, &server, publish).await?;
+        spec.destination.as_mut().unwrap().public_files = public_files;
         let ctx =
             claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
         for _ in 0..2 {
@@ -356,6 +388,54 @@ async fn invenio_export_modes() -> Result<(), Box<dyn std::error::Error>> {
             archive.by_name("data.txt")?.read_to_end(&mut data)?;
             assert_eq!(data, PAYLOAD);
             assert!(archive.by_name("ro-crate-metadata.json").is_ok());
+        }
+        fixture.stop().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_export_recovers() -> Result<(), Box<dyn std::error::Error>> {
+    for lost_commit in [false, true] {
+        let fixture = build_fixture(false).await?;
+        let server = serve(Repository {
+            lost_commit,
+            lost_publish: !lost_commit,
+            ..Default::default()
+        })
+        .await;
+        let spec = export_spec(&fixture, &server, true).await?;
+        let ctx =
+            claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+        assert!(matches!(
+            run_export_job(&ctx, &spec).await,
+            JobRunOutcome::Failed(_)
+        ));
+        match run_export_job(&ctx, &spec).await {
+            JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) => {
+                assert!(result.repository.unwrap().published);
+            }
+            JobRunOutcome::Failed(error) => panic!("{}", error.message),
+            _ => panic!("unexpected recovery outcome"),
+        }
+        {
+            let state = server.state.lock().unwrap();
+            assert_eq!(
+                state
+                    .calls
+                    .iter()
+                    .filter(|(method, _)| *method == Method::PUT)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                state
+                    .calls
+                    .iter()
+                    .filter(|(method, path)| *method == Method::POST && path.ends_with("/publish"))
+                    .count(),
+                1
+            );
         }
         fixture.stop().await;
     }
