@@ -145,6 +145,14 @@ pub(crate) mod tests {
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
     const RUNTIME_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/metadata/{document_id}/git"),
+        ("POST", "/metadata/{document_id}/git"),
+        ("GET", "/metadata/{document_id}/git/rocrate"),
+        ("GET", "/git/{repository}/info/refs"),
+        ("POST", "/git/{repository}/{service}"),
+        ("POST", "/git/{repository}/info/lfs/objects/batch"),
+        ("GET", "/git/{repository}/info/lfs/objects/{oid}"),
+        ("PUT", "/git/{repository}/info/lfs/objects/{oid}"),
         ("POST", "/access/groups/{id}/join-requests"),
         ("GET", "/access/groups/{id}/join-requests"),
         ("DELETE", "/access/groups/{id}/join-requests/{request_id}"),
