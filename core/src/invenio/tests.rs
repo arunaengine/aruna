@@ -77,6 +77,7 @@ fn binds_repository_login() {
                 group_id: group,
                 connector_id: connector,
                 draft_id: None,
+                new_version: None,
                 metadata_json: "{}".into(),
                 publish: true,
                 public_files: false,
@@ -244,4 +245,35 @@ fn derives_export_metadata() {
     assert_eq!(metadata["subjects"], json!([{"subject": "genomics"}]));
     assert_eq!(metadata["rights"][0]["link"], "https://example.org/license");
     assert!(export_metadata(&json!({}), &json!({})).is_err());
+}
+
+#[test]
+fn retains_native_fields() {
+    let metadata = json!({"title": "Software", "publication_date": "2020-11", "resource_type": {"id": "software"},
+        "creators": [{"person_or_org": {"type": "personal", "name": "Researcher, A", "family_name": "Researcher"},
+            "affiliations": [{"id": "01ggx4157", "name": "CERN"}], "role": {"id": "researcher"}}],
+        "funding": [{"funder": {"id": "01ggx4157", "name": "CERN"}, "award": {"number": "12345"}}],
+        "rights": [{"id": "cc-by-4.0"}],
+        "related_identifiers": [{"identifier": "10.1234/paper", "scheme": "doi", "relation_type": {"id": "issupplementto"}}]
+    });
+    let fields = json!({"local:experiment": "sequencing"});
+    let document = import_crate(
+        "https://zenodo.org/api/",
+        "1",
+        &[(
+            json!({"id": "1", "metadata": metadata, "custom_fields": fields}),
+            json!({"entries": []}),
+        )],
+    )
+    .unwrap();
+    let validated = craqle::validate_rocrate_jsonld(&document.to_string()).unwrap();
+    assert!(validated.nquads.contains("metadata/funding/0/award/number"));
+    assert!(validated.nquads.contains("12345"));
+    let exported = export_fields(&document, &Value::Null).unwrap();
+    assert_eq!(exported["metadata"], metadata);
+    assert_eq!(exported["custom_fields"], fields);
+    assert_eq!(
+        export_fields(&document, &json!({"title": "Edited"})).unwrap()["metadata"]["title"],
+        "Edited"
+    );
 }

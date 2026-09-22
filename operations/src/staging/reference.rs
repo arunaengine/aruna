@@ -100,6 +100,7 @@ pub async fn stage_reference_blob(
     let (version_id, _changed) = write_reference_version(
         context,
         ReferenceWrite {
+            preassigned_version_id: None,
             group_id: input.group_id,
             user_id: input.user_id,
             realm_id: input.realm_id,
@@ -129,6 +130,7 @@ pub async fn stage_reference_blob(
 /// One reference version to record: freshly resolved through a connector, or
 /// cloned from a version that already carries the binding.
 pub struct ReferenceWrite {
+    pub preassigned_version_id: Option<Ulid>,
     pub group_id: GroupId,
     pub user_id: UserId,
     pub realm_id: RealmId,
@@ -151,7 +153,7 @@ pub async fn write_reference_version(
     context: &DriverContext,
     write: ReferenceWrite,
 ) -> Result<(Ulid, bool), MaterializeReferenceError> {
-    let version_id = Ulid::generate();
+    let version_id = write.preassigned_version_id.unwrap_or_else(Ulid::generate);
     let now = SystemTime::now();
 
     let txn_id = match context
@@ -177,6 +179,19 @@ pub async fn write_reference_version(
         policies.extend(write.inherited_policies.iter().copied());
         if let Some((connector, fingerprint)) = write.connector_guard.as_ref() {
             guard_connector_unchanged(context, txn_id, connector, *fingerprint).await?;
+        }
+
+        if write.preassigned_version_id.is_some()
+            && let Some(existing) = read_blob_version(context, txn_id, &write.bucket, &write.key, version_id).await?
+        {
+            if !matches!(&existing.state, BlobVersionState::Reference { source, cached_metadata, .. }
+                if source == &write.version_source && source_metadata_matches(cached_metadata, &write.metadata)) {
+                return Err(StorageError::WriteError("planned reference version changed".into()).into());
+            }
+            return match send_storage_effect(context, Effect::Storage(StorageEffect::CommitTransaction { txn_id })).await? {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok((version_id, false)),
+                _ => Err(StorageError::WriteError("unexpected commit event".into()).into()),
+            };
         }
 
         let existing_pointer =
@@ -206,6 +221,7 @@ pub async fn write_reference_version(
                 ..
             }),
         ) = (existing_pointer.as_ref(), existing_version.as_ref())
+            && write.preassigned_version_id.is_none()
             && source == &write.version_source
             && source_metadata_matches(cached_metadata, &write.metadata)
         {

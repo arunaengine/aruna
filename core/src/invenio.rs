@@ -10,13 +10,50 @@ use ulid::Ulid;
 mod credential;
 pub use credential::InvenioCredential;
 
+const NATIVE_METADATA: &str = "https://w3id.org/aruna/invenio/metadata";
+const CUSTOM_FIELDS: &str = "https://w3id.org/aruna/invenio/customFields";
 const PUBLICATION_DATE: &str = "https://w3id.org/aruna/invenio/publicationDate";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InvenioQuery {
+    pub group_id: Ulid,
+    pub connector_id: Ulid,
+    pub q: String,
+    pub page: u32,
+    pub size: u8,
+    pub all_versions: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvenioMode {
+    #[default]
+    Copy,
+    Reference,
+    Metadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InvenioOptions {
+    pub mode: InvenioMode,
+    pub all_versions: bool,
+}
+
+impl Default for InvenioOptions {
+    fn default() -> Self {
+        Self {
+            mode: InvenioMode::Copy,
+            all_versions: true,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InvenioDestination {
     pub group_id: Ulid,
     pub connector_id: Ulid,
     pub draft_id: Option<String>,
+    pub new_version: Option<String>,
     pub metadata_json: String,
     pub publish: bool,
     pub public_files: bool,
@@ -28,6 +65,9 @@ pub struct InvenioRecord {
     pub id: String,
     pub url: String,
     pub published: bool,
+    pub parent_id: String,
+    pub revision_id: u64,
+    pub doi: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -92,6 +132,14 @@ pub fn record_entity(record: &Value, id: &str) -> Result<Value, InvenioError> {
         "@id": id, "@type": "Dataset", "name": title,
         "description": "Imported repository record"
     });
+    entity[NATIVE_METADATA] = json!(metadata.to_string());
+    if record["custom_fields"].is_object() {
+        entity[CUSTOM_FIELDS] = json!(record["custom_fields"].to_string());
+    }
+    let mut properties = Vec::new();
+    native_properties(metadata, "metadata", &mut properties);
+    native_properties(&record["custom_fields"], "custom_fields", &mut properties);
+    entity["additionalProperty"] = Value::Array(properties);
     for (source, target) in [
         ("description", "description"),
         ("version", "version"),
@@ -232,16 +280,7 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let root_id = graph
-        .iter()
-        .find(|entity| {
-            entity["@id"].as_str().is_some_and(|id| {
-                id == "ro-crate-metadata.json" || id.ends_with("/ro-crate-metadata.json")
-            })
-        })
-        .and_then(|entity| schema_value(entity, "about")["@id"].as_str())
-        .unwrap_or("./");
-    if let Some(root) = graph.iter().find(|entity| entity["@id"] == root_id) {
+    if let Some(root) = crate_root(document) {
         for (source, target) in [
             ("name", "title"),
             ("description", "description"),
@@ -289,7 +328,7 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
                 let mut person = if organizational {
                     json!({"type": "organizational", "name": name?})
                 } else {
-                    let family = family?;
+                    let family = family.or(name)?;
                     let mut person = json!({"type": "personal", "family_name": family});
                     if let Some(given) = schema_value(creator, "givenName").as_str() {
                         person["given_name"] = json!(given);
@@ -302,7 +341,18 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
                         .filter_map(identifier)
                         .collect(),
                 );
-                Some(json!({"person_or_org": person}))
+                let affiliations = values(schema_value(creator, "affiliation"))
+                    .iter()
+                    .filter_map(|value| {
+                        let value = value["@id"]
+                            .as_str()
+                            .and_then(|id| graph.iter().find(|entity| entity["@id"] == id))
+                            .unwrap_or(value);
+                        let name = schema_value(value, "name").as_str()?;
+                        Some(json!({"name": name}))
+                    })
+                    .collect::<Vec<_>>();
+                Some(json!({"person_or_org": person, "affiliations": affiliations}))
             })
             .collect::<Vec<_>>();
         if !creators.is_empty() && creators.len() == expected_creators {
@@ -341,6 +391,52 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
                 .collect(),
         );
     }
+    if let Some(root) = crate_root(document)
+        && let Some(native) = root[NATIVE_METADATA].as_str()
+    {
+        let native: Value =
+            serde_json::from_str(native).map_err(|_| InvenioError("invalid native metadata"))?;
+        let baseline = record_entity(&json!({"metadata": native}), "./")?;
+        for (key, field) in [("description", "description"), ("rights", "license")] {
+            if native.get(key).is_none() && schema_value(root, field) == &baseline[field] {
+                if let Some(metadata) = metadata.as_object_mut() {
+                    metadata.remove(key);
+                }
+            }
+        }
+        for (key, value) in native
+            .as_object()
+            .ok_or(InvenioError("native metadata must be an object"))?
+        {
+            let field = match key.as_str() {
+                "title" => Some("name"),
+                "description" => Some("description"),
+                "publication_date" => Some("datePublished"),
+                "version" => Some("version"),
+                "publisher" => Some("publisher"),
+                "creators" => Some("creator"),
+                "subjects" => Some("keywords"),
+                "rights" => Some("license"),
+                "related_identifiers" => continue,
+                _ => None,
+            };
+            if field.is_none_or(|field| schema_value(root, field) == &baseline[field]) {
+                metadata[key] = value.clone();
+            }
+        }
+        let mut related = native["related_identifiers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for value in values(&metadata["related_identifiers"]) {
+            if !related.contains(value) {
+                related.push(value.clone());
+            }
+        }
+        if !related.is_empty() {
+            metadata["related_identifiers"] = Value::Array(related);
+        }
+    }
     if let Some(overrides) = overrides.as_object() {
         for (key, value) in overrides {
             metadata[key] = value.clone();
@@ -350,6 +446,53 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
     }
     validate_metadata(&metadata)?;
     Ok(metadata)
+}
+
+/// Returns native descriptive fields without copying source ownership, access settings or managed PIDs.
+pub fn export_fields(document: &Value, overrides: &Value) -> Result<Value, InvenioError> {
+    let mut result =
+        json!({"metadata": export_metadata(document, overrides)?, "custom_fields": {}});
+    if let Some(fields) = crate_root(document).and_then(|root| root[CUSTOM_FIELDS].as_str()) {
+        let fields: Value =
+            serde_json::from_str(fields).map_err(|_| InvenioError("invalid custom fields"))?;
+        if !fields.is_object() {
+            return Err(InvenioError("custom fields must be an object"));
+        }
+        result["custom_fields"] = fields;
+    }
+    Ok(result)
+}
+
+fn crate_root(document: &Value) -> Option<&Value> {
+    let graph = document["@graph"].as_array()?;
+    let id = graph
+        .iter()
+        .find(|entity| {
+            entity["@id"].as_str().is_some_and(|id| {
+                id == "ro-crate-metadata.json" || id.ends_with("/ro-crate-metadata.json")
+            })
+        })
+        .and_then(|entity| schema_value(entity, "about")["@id"].as_str())
+        .unwrap_or("./");
+    graph.iter().find(|entity| entity["@id"] == id)
+}
+
+fn native_properties(value: &Value, path: &str, result: &mut Vec<Value>) {
+    match value {
+        Value::Object(values) => {
+            for (key, value) in values {
+                let key = key.replace('~', "~0").replace('/', "~1");
+                native_properties(value, &format!("{path}/{key}"), result);
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                native_properties(value, &format!("{path}/{index}"), result);
+            }
+        }
+        Value::Null => {}
+        value => result.push(json!({"@type": "PropertyValue", "propertyID": path, "value": value})),
+    }
 }
 
 fn schema_value<'a>(entity: &'a Value, name: &str) -> &'a Value {

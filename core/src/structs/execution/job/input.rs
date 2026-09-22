@@ -286,6 +286,7 @@ pub enum ImportRoCrateSource {
         group_id: GroupId,
         connector_id: Ulid,
         record_id: String,
+        options: crate::invenio::InvenioOptions,
     },
     Upload {
         upload_id: Ulid,

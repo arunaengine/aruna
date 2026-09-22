@@ -145,6 +145,24 @@ impl<'a> InvenioClient<'a> {
         serde_json::from_slice(&body).map_err(|_| InvenioError::Json)
     }
 
+    pub async fn update(
+        &self,
+        url: Url,
+        body: &Value,
+        revision: u64,
+    ) -> Result<Value, InvenioError> {
+        let response = self
+            .request(Method::PUT, url)?
+            .header("Accept", JSON_ACCEPT)
+            .header("If-Match", revision.to_string())
+            .json(body)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|_| InvenioError::Transport)?;
+        self.read_json(response).await
+    }
+
     pub async fn download(&self, url: Url) -> Result<Response, InvenioError> {
         let response = self
             .request(Method::GET, url)?
@@ -154,6 +172,35 @@ impl<'a> InvenioClient<'a> {
             .map_err(|_| InvenioError::Transport)?;
         check_status(&response)?;
         Ok(response)
+    }
+
+    pub async fn head(
+        &self,
+        url: Url,
+    ) -> Result<aruna_core::structs::execution::source_access::SourceMetadata, InvenioError> {
+        let response = self
+            .request(Method::HEAD, url)?
+            .header("Accept", "*/*")
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|_| InvenioError::Transport)?;
+        check_status(&response)?;
+        let headers = response.headers();
+        let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+        Ok(
+            aruna_core::structs::execution::source_access::SourceMetadata {
+                content_length: text("content-length")
+                    .and_then(|value| value.parse().ok())
+                    .ok_or(InvenioError::Json)?,
+                content_type: text("content-type").map(str::to_string),
+                etag: text("etag").map(str::to_string),
+                last_modified: text("last-modified")
+                    .and_then(|value| chrono::DateTime::parse_from_rfc2822(value).ok())
+                    .map(Into::into),
+                source_version: None,
+            },
+        )
     }
 
     pub async fn upload(
