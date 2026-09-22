@@ -90,16 +90,15 @@ pub async fn import_record(
 #[utoipa::path(
     post, path = "/metadata/{document_id}/invenio/exports", tag = "metadata/invenio",
     summary = "Export a crate and its data to Invenio or Zenodo",
-    description = "Uploads the complete RO-Crate ZIP and native Invenio metadata derived from the crate, with optional repository.metadata overrides using an HTTP connector with a secret token. Requires READ on the crate and WRITE on the connector group. Every referenced file must be included. Set repository.publish to true to publish after checksum verification; false leaves an unpublished draft. Files stay restricted unless repository.public_files is explicitly true. Existing drafts retain their access settings. An existing unpublished draft_id can be supplied for recovery. The job result contains the repository record URL and publication state. Ambiguous draft creation is never repeated automatically.",
+    description = "Creates a native Invenio record with mapped RO-Crate metadata and separately uploaded data files. Optional repository.metadata fields override the mapping. The requesting user must supply repository.access_token from their own Invenio/Zenodo account. Connector credentials are never used for export; the token is encrypted for this user and node and omitted from responses and debug output. The RO-Crate JSON is retained as a provenance file. Requires READ on the crate and WRITE on the connector group. Every referenced file must be included. Set repository.publish to true to publish after checksum verification; false leaves an unpublished draft. Files stay restricted unless repository.public_files is explicitly true. Existing drafts retain their access settings. An existing unpublished draft_id can be supplied for recovery. The job result contains the repository record URL and publication state. Ambiguous draft creation is never repeated automatically.",
     params(("document_id" = String, Path, description = "Aruna metadata document identifier")),
     request_body(content = SubmitInvenioExport, example = json!({"repository": {
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
-        "publish": false, "metadata": {"title": "Research dataset", "publication_date": "2026-09-22",
-            "resource_type": {"id": "dataset"}, "creators": [{"person_or_org": {"type": "organizational", "name": "Research group"}}]}
+        "access_token": "<personal-access-token>", "publish": false
     }})),
     responses(
         (status = 202, description = "Transfer accepted", body = SubmitExportResponse),
-        (status = 400, description = "Invalid repository metadata or draft identifier", body = ErrorResponse),
+        (status = 400, description = "Missing personal repository token, invalid metadata or draft identifier", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Crate or connector access denied", body = ErrorResponse),
         (status = 404, description = "Crate not found", body = ErrorResponse),

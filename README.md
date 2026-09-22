@@ -262,8 +262,9 @@ stored bytes; operators should reserve capacity accordingly.
 The native REST API transfers crates through durable jobs. Create an HTTP source connector
 with `public_config.endpoint` set to the repository API root, for example
 `https://zenodo.org/api/` or `https://sandbox.zenodo.org/api/`. Store a repository personal
-access token in `secret_config.token` for private imports or exports. Connector credentials
-remain separate from job requests and results. The node's egress policy applies to all requests.
+access token in `secret_config.token` for private imports. Exports require the requesting user's
+own Invenio/Zenodo access token in `repository.access_token`; the connector token is never used
+for publishing. The node's egress policy applies to all requests.
 
 Import a record with `POST /api/v1/metadata/invenio/imports`:
 
@@ -295,31 +296,33 @@ Export with `POST /api/v1/metadata/{document_id}/invenio/exports`:
   "repository": {
     "group_id": "<connector-group-id>",
     "connector_id": "<http-connector-id>",
-    "publish": false,
-    "metadata": {
-      "title": "Research dataset",
-      "publication_date": "2026-09-22",
-      "resource_type": {"id": "dataset"},
-      "creators": [{"person_or_org": {"type": "organizational", "name": "Research group"}}]
-    }
+    "access_token": "<personal-access-token>",
+    "publish": false
   },
   "idempotency_key": "export-research-dataset"
 }
 ```
 
-Exports attach the complete RO-Crate ZIP, including data and original crate metadata, to a
-native Invenio record. Repository metadata is derived from the crate's standard schema.org
+Exports create native Invenio records with each data file uploaded separately under its crate
+path. Files can be listed and downloaded directly through Invenio/Zenodo. The RO-Crate JSON is
+also retained as a provenance file for fields without a native equivalent. Repository metadata
+is derived from the crate's standard schema.org
 fields; optional `repository.metadata` fields override the mapping. Supply native creators
 when source names lack the structured information required by Invenio, or override controlled
 vocabulary fields for the target repository. Source identifiers become provenance relations;
 the transfer does not claim an existing source DOI as a newly issued repository DOI.
 Exports with omitted files fail.
 `publish: false` (the default) leaves an unpublished draft with restricted file access;
-`publish: true` publishes after verifying the uploaded archive. Repository validation and
+`publish: true` publishes after verifying every uploaded file. Repository validation and
 publication permissions still apply. Set `repository.public_files: true` explicitly to make
 the files public when publishing; otherwise files remain restricted. Existing drafts retain
-their configured access. An exported ZIP imported later is retained as a file
-of its source version, including the original crate inside it.
+their configured access, with their metadata replaced by the mapped crate metadata.
+
+The user's personal token determines the owning Invenio/Zenodo account; bibliographic authors
+come from the crate's creators. Aruna encrypts the token for the job's retention period, binding
+it to the requesting user, node, connector and endpoint. It is never echoed in responses,
+debug output or public job results. Each export submission requires the user's token; changing the
+token changes the idempotency identity. No shared publishing account is selected implicitly.
 
 The response provides job status and report URLs; the existing job API also supports cancellation.
 Successful exports include `result.repository` with the record ID, API URL and publication
