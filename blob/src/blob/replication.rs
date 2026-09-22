@@ -163,7 +163,7 @@ impl BlobHandler {
         expected_blake3: [u8; 32],
         fingerprint: String,
     ) -> BlobEvent {
-        let (reader, mut outboard, path, current) =
+        let (reader, mut outboard, file, current) =
             match verified_source(&access, size, expected_blake3, &fingerprint).await {
                 Ok(verified) => verified,
                 Err(event) => return event,
@@ -173,7 +173,7 @@ impl BlobHandler {
             .await;
         // The encoder validates every chunk against the outboard, so a file
         // rewritten mid-stream already fails; this only names the cause.
-        if crate::fs_source::current_fingerprint(&path).await != Some(current) {
+        if crate::fs_source::current_fingerprint(&file).await != Some(current) {
             return BlobEvent::Error(BlobError::IntegrityCheckFailed(
                 "the offered file changed while it was served".to_string(),
             ));
@@ -541,7 +541,7 @@ async fn verified_source(
     (
         crate::bao_tree::LocalFileReader,
         PreOrderOutboard<BytesMut>,
-        std::path::PathBuf,
+        tokio::fs::File,
         String,
     ),
     BlobEvent,
@@ -553,7 +553,7 @@ async fn verified_source(
             "only a local directory is served from its source".to_string(),
         )));
     }
-    let (path, current) = crate::fs_source::stable_source(access)
+    let (file, current) = crate::fs_source::stable_source(access)
         .await
         .map_err(|error| BlobEvent::Error(BlobError::ReadError(error.to_string())))?;
     if fingerprint != current {
@@ -561,9 +561,11 @@ async fn verified_source(
             "the offered file changed since it was observed".to_string(),
         )));
     }
-    let mut reader = crate::bao_tree::LocalFileReader::open(&path, size)
+    let observed = file
+        .try_clone()
         .await
         .map_err(|error| BlobEvent::Error(BlobError::ReadError(error.to_string())))?;
+    let mut reader = crate::bao_tree::LocalFileReader::from_file(file, size);
     let outboard = match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
         Ok(outboard) if outboard.root.as_bytes() == &expected_blake3 => outboard,
         Ok(_) => {
@@ -577,7 +579,7 @@ async fn verified_source(
             )));
         }
     };
-    Ok((reader, outboard, path, current))
+    Ok((reader, outboard, observed, current))
 }
 
 #[cfg(test)]
@@ -626,6 +628,31 @@ mod tests {
             )
             .await
             .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_handle_pinned() {
+        use iroh_io::AsyncSliceReader;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, b"inside").unwrap();
+        std::fs::write(outside.path().join("file"), b"secret").unwrap();
+        let (mut reader, _, _, _) = verified_source(
+            &access(root.path(), "file", SourceConnectorKind::LocalDirectory),
+            6,
+            *blake3::hash(b"inside").as_bytes(),
+            &fingerprint_of(&path).await,
+        )
+        .await
+        .unwrap();
+        std::fs::rename(&path, root.path().join("saved")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("file"), &path).unwrap();
+        assert_eq!(
+            reader.read_exact_at(0, 6).await.unwrap().as_ref(),
+            b"inside"
         );
     }
 

@@ -385,6 +385,10 @@ pub struct LocalFileReader {
 }
 
 impl LocalFileReader {
+    pub(crate) fn from_file(file: tokio::fs::File, size: u64) -> Self {
+        Self { file, size }
+    }
+
     pub async fn open(path: &std::path::Path, size: u64) -> std::io::Result<Self> {
         Ok(Self {
             file: tokio::fs::File::open(path).await?,

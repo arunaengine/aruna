@@ -222,8 +222,8 @@ pub(crate) async fn move_aside(root: &str, relative: &str, guard: &WriteGuard) -
 /// The stable identity of one file: its weak fingerprint and its blake3, read
 /// as one observation and refused when the file moved underneath the read.
 pub(crate) async fn hash_local(root: &str, relative: &str) -> LocalFileEvent {
-    let resolved = match jailed_file(root, relative).await {
-        Ok(resolved) => resolved,
+    let file = match crate::fs_source::open_file(root, relative).await {
+        Ok(file) => file,
         Err(StagingSourceError::NotFound) => {
             return LocalFileEvent::Refused {
                 reason: LocalFileRefusal::Missing,
@@ -240,7 +240,7 @@ pub(crate) async fn hash_local(root: &str, relative: &str) -> LocalFileEvent {
             };
         }
     };
-    match hash_stable(&resolved).await {
+    match hash_file(file).await {
         Ok((fingerprint, blake3, size)) => LocalFileEvent::Hashed {
             fingerprint,
             blake3,
@@ -571,9 +571,19 @@ async fn rescue_displaced(spool: &Path, target: &Path) -> Result<(), PlaceError>
 /// Hashes one file and refuses the result when the file changed while it was
 /// read: those bytes are not one representation of anything.
 async fn hash_stable(path: &Path) -> Result<(String, [u8; 32], u64), StagingSourceError> {
-    let before = tokio::fs::metadata(path).await.map_err(map_io_error)?;
+    let hashed = hash_file(tokio::fs::File::open(path).await.map_err(map_io_error)?).await?;
+    let after = tokio::fs::metadata(path).await.map_err(map_io_error)?;
+    if weak_fingerprint(&FileStat::from_metadata(&after)) != hashed.0 {
+        return Err(StagingSourceError::SourceUnstable);
+    }
+    Ok(hashed)
+}
+
+async fn hash_file(
+    mut file: tokio::fs::File,
+) -> Result<(String, [u8; 32], u64), StagingSourceError> {
+    let before = file.metadata().await.map_err(map_io_error)?;
     let fingerprint = weak_fingerprint(&FileStat::from_metadata(&before));
-    let mut file = tokio::fs::File::open(path).await.map_err(map_io_error)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 256 * 1024];
     loop {
@@ -585,7 +595,7 @@ async fn hash_stable(path: &Path) -> Result<(String, [u8; 32], u64), StagingSour
         }
         hasher.update(&buffer[..read]);
     }
-    let after = tokio::fs::metadata(path).await.map_err(map_io_error)?;
+    let after = file.metadata().await.map_err(map_io_error)?;
     if weak_fingerprint(&FileStat::from_metadata(&after)) != fingerprint {
         return Err(StagingSourceError::SourceUnstable);
     }
@@ -1116,7 +1126,7 @@ mod tests {
         assert_eq!(size, 5);
         assert_eq!(blake3, *::blake3::hash(b"hello").as_bytes());
         assert_eq!(
-            crate::fs_source::current_fingerprint(&file)
+            crate::fs_source::current_fingerprint(&tokio::fs::File::open(&file).await.unwrap())
                 .await
                 .as_deref(),
             Some(fingerprint.as_str())
