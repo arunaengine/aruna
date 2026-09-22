@@ -4,6 +4,29 @@
 
 use super::*;
 
+pub(in crate::document_sync) async fn group_fence_txn(
+    storage: &StorageHandle,
+    group_id: GroupId,
+    txn_id: TxnId,
+) -> Result<()> {
+    use aruna_core::structs::identity::group_delete::{GroupWriteError, check_group_write};
+    let value = transaction_read(
+        storage,
+        aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+        group_id.to_bytes().into(),
+        Some(txn_id),
+    )
+    .await?;
+    match check_group_write(value.as_deref()) {
+        Ok(()) => Ok(()),
+        Err(GroupWriteError::Frozen) => Err(NetError::Deferred("group deletion is pending".into())),
+        Err(GroupWriteError::Deleted) => Err(NetError::Bootstrap("group has been deleted".into())),
+        Err(error) => Err(NetError::Storage(StorageError::ReadError(
+            error.to_string(),
+        ))),
+    }
+}
+
 pub(in crate::document_sync) async fn store_registry_upsert(
     storage: &StorageHandle,
     record: MetadataRegistryRecord,
@@ -583,6 +606,9 @@ pub(in crate::document_sync) async fn policy_merge_txn(
     incoming: &PlacementPolicyDocument,
     txn_id: TxnId,
 ) -> Result<std::result::Result<Option<PlacementPolicyDocument>, ()>> {
+    if let Some(group_id) = incoming.policy.owner_group_id {
+        group_fence_txn(storage, group_id, txn_id).await?;
+    }
     let target = placement_policy_target(incoming.policy_id());
     let local = transaction_read(
         storage,
@@ -943,12 +969,18 @@ pub(in crate::document_sync) async fn create_fence_txn(
     event: &MetadataEventRecord,
     txn_id: TxnId,
 ) -> Result<bool> {
-    if let Some(delete) = delete_record_txn(storage, event.record.document_id, txn_id).await? {
-        return Ok(event.event_id <= delete.deleted_after_id);
+    let fenced =
+        if let Some(delete) = delete_record_txn(storage, event.record.document_id, txn_id).await? {
+            event.event_id <= delete.deleted_after_id
+        } else {
+            graph_record_txn(storage, &event.record.graph_iri, txn_id)
+                .await?
+                .is_some_and(|record| record.is_deleted())
+        };
+    if !fenced {
+        group_fence_txn(storage, event.record.group_id, txn_id).await?;
     }
-    Ok(graph_record_txn(storage, &event.record.graph_iri, txn_id)
-        .await?
-        .is_some_and(|record| record.is_deleted()))
+    Ok(fenced)
 }
 
 pub(in crate::document_sync) async fn record_fenced_txn(
@@ -1013,6 +1045,7 @@ pub(in crate::document_sync) async fn transaction_placement_fence(
     record: &MetadataRegistryRecord,
     txn_id: TxnId,
 ) -> Result<MetadataPlacementOutcome<MetadataPlacementFence>> {
+    group_fence_txn(storage, record.group_id, txn_id).await?;
     Ok(
         match derive_placement_txn(
             storage,

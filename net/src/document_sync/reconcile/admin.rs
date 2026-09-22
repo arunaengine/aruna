@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::keyspaces::GROUP_DELETE_KEYSPACE;
+use aruna_core::storage_entries::group_deletion_entries;
+use aruna_core::structs::identity::group_delete::{GroupDeleteRecord, MembershipFence};
 
 pub(crate) async fn apply_admin_operation(
     storage: &StorageHandle,
@@ -231,29 +234,36 @@ pub(in crate::document_sync) async fn group_reducer_entries(
     storage: &StorageHandle,
     group_id: Ulid,
     reducer_state: &AdminDocumentState,
+    txn_id: TxnId,
 ) -> Result<Vec<(String, ByteView, Value)>> {
     let target = DocumentTarget::Group { group_id };
-    let group =
-        match storage_read_from(storage, GROUP_KEYSPACE.to_string(), target.storage_key()).await? {
-            Some(bytes) => {
-                let mut group = Group::from_bytes(&bytes)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-                if group.group_id != group_id {
-                    return Err(NetError::Bootstrap(format!(
-                        "stored group document id {group_id} does not match payload group id {}",
-                        group.group_id
-                    )));
-                }
-                overlay_group_state(&mut group, reducer_state);
-                group
+    let group = match transaction_read(
+        storage,
+        GROUP_KEYSPACE.to_string(),
+        target.storage_key(),
+        Some(txn_id),
+    )
+    .await?
+    {
+        Some(bytes) => {
+            let mut group = Group::from_bytes(&bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if group.group_id != group_id {
+                return Err(NetError::Bootstrap(format!(
+                    "stored group document id {group_id} does not match payload group id {}",
+                    group.group_id
+                )));
             }
-            None => {
-                let Some(group) = materialized_group(group_id, reducer_state) else {
-                    return Ok(Vec::new());
-                };
-                group
-            }
-        };
+            overlay_group_state(&mut group, reducer_state);
+            group
+        }
+        None => {
+            let Some(group) = materialized_group(group_id, reducer_state) else {
+                return Ok(Vec::new());
+            };
+            group
+        }
+    };
 
     Ok(vec![
         target_write_entry(
@@ -274,6 +284,32 @@ pub(in crate::document_sync) async fn apply_group_authorization(
     storage: &StorageHandle,
     document_target: DocumentTarget,
     event: AdminDocumentEvent,
+) -> Result<()> {
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        let txn_id = start_storage_transaction(storage).await?;
+        let result =
+            group_transaction(storage, document_target.clone(), event.clone(), txn_id).await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                if !matches!(error, NetError::Storage(StorageError::TransactionConflict)) {
+                    return Err(error);
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+    Err(NetError::Storage(StorageError::TransactionConflict))
+}
+
+async fn group_transaction(
+    storage: &StorageHandle,
+    document_target: DocumentTarget,
+    event: AdminDocumentEvent,
+    txn_id: TxnId,
 ) -> Result<()> {
     let DocumentTarget::GroupAuthorization { group_id } = document_target.clone() else {
         return Err(NetError::Bootstrap(
@@ -296,6 +332,7 @@ pub(in crate::document_sync) async fn apply_group_authorization(
     if !matches!(
         &event.op,
         AdminDocumentOperation::GroupCreated { .. }
+            | AdminDocumentOperation::GroupDeleted { .. }
             | AdminDocumentOperation::GroupRoleAdded { .. }
             | AdminDocumentOperation::GroupRoleCreated { .. }
             | AdminDocumentOperation::GroupRoleRemoved { .. }
@@ -312,10 +349,11 @@ pub(in crate::document_sync) async fn apply_group_authorization(
         ));
     }
 
-    let previous_state = storage_read_from(
+    let previous_state = transaction_read(
         storage,
         DOCUMENT_STATE_KEYSPACE.to_string(),
         reducer_state_key(&event.target),
+        Some(txn_id),
     )
     .await?
     .map(|bytes| decode_reducer_state(&bytes))
@@ -327,14 +365,94 @@ pub(in crate::document_sync) async fn apply_group_authorization(
     let apply_status = reducer_state
         .apply(&event)
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-    if persist_stale_event(storage, apply_status, &reducer_state).await? {
-        return Ok(());
+    if reducer_state.group_deleted() {
+        let mut record = reducer_state
+            .group_deletion()
+            .ok_or_else(|| NetError::Bootstrap("group tombstone is invalid".into()))?;
+        if transaction_read(
+            storage,
+            GROUP_DELETE_KEYSPACE.to_string(),
+            record.plan.cancelled_key().into(),
+            Some(txn_id),
+        )
+        .await?
+        .is_some()
+        {
+            return Err(NetError::Bootstrap(
+                "group deletion attempt was cancelled".into(),
+            ));
+        }
+        let previous = transaction_read(
+            storage,
+            GROUP_DELETE_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+            Some(txn_id),
+        )
+        .await?;
+        record.event = previous
+            .as_deref()
+            .map(GroupDeleteRecord::from_bytes)
+            .transpose()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .filter(|previous| previous.plan == record.plan)
+            .and_then(|previous| previous.event);
+        if matches!(&event.op, AdminDocumentOperation::GroupDeleted { certificate } if certificate.plan == record.plan)
+        {
+            record.event = Some(Box::new(event.clone()));
+        }
+        let (mut deletes, mut writes) = group_deletion_entries(&record, &reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let membership = transaction_read(
+            storage,
+            GROUP_DELETE_KEYSPACE.to_string(),
+            MembershipFence::key(record.plan.realm_id),
+            Some(txn_id),
+        )
+        .await?;
+        let mut membership = MembershipFence::from_value(membership.as_deref())
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        if membership.pending.remove(&group_id) {
+            writes.push(
+                membership
+                    .entry(record.plan.realm_id)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            );
+        }
+        deletes.extend(stale_conflict_deletes(
+            previous_state.as_ref(),
+            Some(&reducer_state),
+        ));
+        writes.extend(
+            conflict_write_entries(&reducer_state)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+        replace_batch_in(storage, txn_id, deletes, writes).await?;
+        return match storage.send_storage_effect(StorageEffect::SyncAll).await {
+            Event::Storage(StorageEvent::SyncAllFinished) => Ok(()),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            _ => Err(NetError::Bootstrap(
+                "group deletion persistence did not finish".into(),
+            )),
+        };
+    }
+    if apply_status != AdminApplyStatus::Applied {
+        return replace_batch_in(
+            storage,
+            txn_id,
+            Vec::new(),
+            vec![
+                reducer_state_entry(&reducer_state)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            ],
+        )
+        .await;
     }
 
-    let previous_auth_doc = storage_read_from(
+    let previous_auth_doc = transaction_read(
         storage,
         document_target.storage_keyspace().to_string(),
         document_target.storage_key(),
+        Some(txn_id),
     )
     .await?
     .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
@@ -346,7 +464,7 @@ pub(in crate::document_sync) async fn apply_group_authorization(
         policies: Default::default(),
     });
     materialize_group_authorization(&mut auth_doc, &reducer_state, &event);
-    let group_writes = group_reducer_entries(storage, group_id, &reducer_state).await?;
+    let group_writes = group_reducer_entries(storage, group_id, &reducer_state, txn_id).await?;
 
     let mut writes = vec![
         (
@@ -368,7 +486,7 @@ pub(in crate::document_sync) async fn apply_group_authorization(
 
     let stale_conflict_deletes =
         stale_conflict_deletes(previous_state.as_ref(), Some(&reducer_state));
-    replace_batch_transactionally(storage, stale_conflict_deletes, writes).await
+    replace_batch_in(storage, txn_id, stale_conflict_deletes, writes).await
 }
 
 pub(in crate::document_sync) async fn apply_realm_authorization(
