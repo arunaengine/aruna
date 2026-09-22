@@ -106,6 +106,9 @@ enum ExportPhase {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ExportCheckpoint {
+    repository_started: bool,
+    repository_complete: bool,
+    repository: Option<aruna_core::invenio::InvenioRecord>,
     refs: RoCrateCheckpointRefs,
     phase: ExportPhase,
     winning_event_id: Option<Ulid>,
@@ -122,6 +125,9 @@ struct ExportCheckpoint {
 impl Default for ExportCheckpoint {
     fn default() -> Self {
         Self {
+            repository_started: false,
+            repository_complete: false,
+            repository: None,
             refs: RoCrateCheckpointRefs::default(),
             phase: ExportPhase::Snapshot,
             winning_event_id: None,
@@ -418,6 +424,12 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
                 }
             }
             ExportPhase::Publish => {
+                if let Some(destination) = &spec.destination
+                    && let Err(error) =
+                        repository_export(ctx, spec, destination, &mut checkpoint).await
+                {
+                    return failure_outcome(error);
+                }
                 let outcome = publish_export(ctx, &checkpoint).await;
                 if matches!(&outcome, JobRunOutcome::Cancelled) {
                     discard_artifact(ctx, &mut checkpoint, true).await;
@@ -433,6 +445,67 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
             return retryable(error);
         }
     }
+}
+
+async fn repository_export(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &aruna_core::invenio::InvenioDestination,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<(), ExportFailure> {
+    use super::invenio::{TransferError, export, interruptible};
+    let classify = |error| match error {
+        TransferError::Permanent(message) => ExportFailure::Permanent(message),
+        TransferError::Retryable(message) => ExportFailure::Retryable(message),
+        TransferError::Cancelled => ExportFailure::Cancelled,
+        TransferError::Interrupted => ExportFailure::Interrupted,
+    };
+    if checkpoint.repository_complete {
+        return Ok(());
+    }
+    let (_, omitted) = report_counts(&checkpoint.report);
+    if omitted.external + omitted.denied + omitted.missing + omitted.offline + omitted.unsupported
+        > 0
+    {
+        return Err(ExportFailure::Permanent(
+            "repository export requires a complete crate with no omitted files".into(),
+        ));
+    }
+    if checkpoint.repository.is_none() {
+        if checkpoint.repository_started && destination.draft_id.is_none() {
+            return Err(ExportFailure::Permanent("draft creation outcome is unknown; inspect the repository and retry with its draft_id".into()));
+        }
+        checkpoint.repository_started = true;
+        persist_checkpoint(ctx, checkpoint)
+            .await
+            .map_err(ExportFailure::Retryable)?;
+        let record = interruptible(ctx, export::create_draft(ctx, spec, destination))
+            .await
+            .map_err(classify)?;
+        checkpoint.repository = Some(record);
+        persist_checkpoint(ctx, checkpoint)
+            .await
+            .map_err(ExportFailure::Retryable)?;
+    }
+    let record = checkpoint
+        .repository
+        .as_ref()
+        .ok_or_else(|| ExportFailure::Permanent("repository draft missing".into()))?;
+    let artifact = checkpoint
+        .artifact
+        .as_ref()
+        .ok_or_else(|| ExportFailure::Permanent("export artifact missing".into()))?;
+    let record = interruptible(
+        ctx,
+        export::deposit(ctx, spec, destination, record, artifact),
+    )
+    .await
+    .map_err(classify)?;
+    checkpoint.repository = Some(record);
+    checkpoint.repository_complete = true;
+    persist_checkpoint(ctx, checkpoint)
+        .await
+        .map_err(ExportFailure::Retryable)
 }
 
 async fn snapshot_export(

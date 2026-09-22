@@ -1177,6 +1177,7 @@ pub(super) async fn publish_export(
     }
     let (included, omitted) = report_counts(&checkpoint.report);
     JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(ExportRoCrateResult {
+        repository: checkpoint.repository.clone(),
         artifact: Some(artifact),
         included,
         omitted,

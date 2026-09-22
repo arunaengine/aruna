@@ -913,6 +913,7 @@ mod tests {
         let mut record = JobRecord::new(
             job_id,
             JobPayload::ExportRoCrate(ExportRoCrateSpec {
+                destination: None,
                 auth_context: AuthContext {
                     user_id: UserId::nil(realm),
                     realm_id: realm,
@@ -934,6 +935,7 @@ mod tests {
 
     fn export_result(location: BackendLocation) -> JobResultPayload {
         JobResultPayload::ExportRoCrate(ExportRoCrateResult {
+            repository: None,
             artifact: Some(ArtifactRef {
                 location,
                 blake3: [0u8; 32],

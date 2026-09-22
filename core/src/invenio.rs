@@ -13,12 +13,15 @@ pub struct InvenioDestination {
     pub connector_id: Ulid,
     pub draft_id: Option<String>,
     pub metadata_json: String,
+    pub publish: bool,
+    pub public_files: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InvenioRecord {
     pub id: String,
     pub url: String,
+    pub published: bool,
 }
 
 #[derive(Debug, Error)]

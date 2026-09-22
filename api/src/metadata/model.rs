@@ -370,7 +370,23 @@ pub struct RoCrateExportParams {
 #[schema(as = SubmitRoCrateExportRequest)]
 pub struct SubmitExportRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<InvenioExportRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InvenioExportRequest {
+    pub group_id: String,
+    pub connector_id: String,
+    #[serde(default)]
+    pub draft_id: Option<String>,
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub publish: bool,
+    #[serde(default)]
+    pub public_files: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

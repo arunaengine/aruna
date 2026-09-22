@@ -365,6 +365,32 @@ async fn acquire_source(
     spec: &ImportRoCrateSpec,
 ) -> Result<ImportInput, ImportFailure> {
     match &spec.source {
+        ImportRoCrateSource::Invenio {
+            group_id,
+            connector_id,
+            record_id,
+        } => {
+            let artifact =
+                super::invenio::import::acquire(ctx, spec, *group_id, *connector_id, record_id)
+                    .await
+                    .map_err(|error| match error {
+                        super::invenio::TransferError::Permanent(message) => {
+                            ImportFailure::Permanent(message)
+                        }
+                        super::invenio::TransferError::Retryable(message) => {
+                            ImportFailure::Retryable(message)
+                        }
+                        super::invenio::TransferError::Cancelled => ImportFailure::Cancelled,
+                        super::invenio::TransferError::Interrupted => ImportFailure::Interrupted,
+                    })?;
+            Ok(ImportInput {
+                location: artifact.location,
+                size: artifact.size,
+                blake3: artifact.blake3,
+                upload_id: None,
+                eln: false,
+            })
+        }
         ImportRoCrateSource::Upload { upload_id } => {
             let record = claim_rocrate_upload(
                 &ctx.driver.storage_handle,

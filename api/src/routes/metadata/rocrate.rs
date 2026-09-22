@@ -282,9 +282,46 @@ pub async fn submit_rocrate_export(
         PolicyRequestExtras::operation("metadata.read"),
     )
     .await?;
+    let destination = request
+        .destination
+        .map(|destination| {
+            if destination.metadata.to_string().len() as u64 > state.rocrate_limits().metadata_bytes
+            {
+                return Err(ServerError::BadRequestReason(
+                    "repository metadata exceeds limit".into(),
+                ));
+            }
+            aruna_core::invenio::validate_metadata(&destination.metadata)
+                .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+            if let Some(id) = &destination.draft_id {
+                aruna_core::invenio::validate_id(id)
+                    .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+            }
+            Ok(aruna_core::invenio::InvenioDestination {
+                group_id: ulid::Ulid::from_string(&destination.group_id)
+                    .map_err(|_| ServerError::BadRequest)?,
+                connector_id: ulid::Ulid::from_string(&destination.connector_id)
+                    .map_err(|_| ServerError::BadRequest)?,
+                draft_id: destination.draft_id,
+                metadata_json: destination.metadata.to_string(),
+                publish: destination.publish,
+                public_files: destination.public_files,
+            })
+        })
+        .transpose()?;
+    if let Some(destination) = &destination {
+        crate::routes::storage::connectors::ensure_data_permission(
+            &state,
+            &auth,
+            destination.group_id,
+            Permission::WRITE,
+        )
+        .await?;
+    }
     let result = submit_export_job(
         &state.get_ctx(),
         ExportRoCrateSpec {
+            destination,
             auth_context: auth,
             document_id,
             limits: state.rocrate_limits().clone(),

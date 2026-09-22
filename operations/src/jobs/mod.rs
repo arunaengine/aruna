@@ -11,6 +11,7 @@ pub mod executor;
 pub mod export;
 pub mod harvest;
 pub mod import;
+pub mod invenio;
 pub mod lifecycle;
 pub mod metadata_class;
 pub mod output_record;

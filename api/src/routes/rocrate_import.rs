@@ -74,6 +74,11 @@ pub struct UploadRoCrateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImportSourceRequest {
+    Invenio {
+        group_id: String,
+        connector_id: String,
+        record_id: String,
+    },
     Upload {
         upload_id: String,
     },
@@ -389,6 +394,19 @@ pub async fn submit_import(
 
 fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrateSource> {
     match source {
+        ImportSourceRequest::Invenio {
+            group_id,
+            connector_id,
+            record_id,
+        } => {
+            aruna_core::invenio::validate_id(&record_id)
+                .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+            Ok(ImportRoCrateSource::Invenio {
+                group_id: parse_ulid(&group_id)?,
+                connector_id: parse_ulid(&connector_id)?,
+                record_id,
+            })
+        }
         ImportSourceRequest::Upload { upload_id } => Ok(ImportRoCrateSource::Upload {
             upload_id: parse_ulid(&upload_id)?,
         }),
@@ -465,6 +483,15 @@ async fn fast_source_check(
     idempotency_key: Option<&str>,
 ) -> ServerResult<()> {
     match source {
+        ImportRoCrateSource::Invenio { group_id, .. } => {
+            crate::routes::storage::connectors::ensure_data_permission(
+                state,
+                auth,
+                *group_id,
+                Permission::READ,
+            )
+            .await
+        }
         ImportRoCrateSource::Upload { upload_id } => {
             let record = load_rocrate_upload(&state.get_ctx(), *upload_id)
                 .await

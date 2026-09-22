@@ -334,6 +334,7 @@ impl JobResultPayload {
                 "report_digest": hex::encode(result.report_digest),
             }),
             JobResultPayload::ExportRoCrate(result) => serde_json::json!({
+                "repository": result.repository,
                 "artifact": result.artifact.as_ref().map(|artifact| serde_json::json!({
                     "blake3": hex::encode(artifact.blake3),
                     "size": artifact.size,

@@ -282,6 +282,11 @@ pub struct StagingJobCheckpoint {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportRoCrateSource {
+    Invenio {
+        group_id: GroupId,
+        connector_id: Ulid,
+        record_id: String,
+    },
     Upload {
         upload_id: Ulid,
     },
@@ -359,6 +364,7 @@ pub struct ImportRoCrateSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRoCrateSpec {
+    pub destination: Option<crate::invenio::InvenioDestination>,
     pub auth_context: AuthContext,
     pub document_id: Ulid,
     pub limits: RoCrateLimits,
@@ -523,6 +529,7 @@ pub struct ExportOmissionCounts {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRoCrateResult {
+    pub repository: Option<crate::invenio::InvenioRecord>,
     pub artifact: Option<ArtifactRef>,
     pub included: u64,
     pub omitted: ExportOmissionCounts,
