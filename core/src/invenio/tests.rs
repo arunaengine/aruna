@@ -54,3 +54,31 @@ fn preserves_version_identifiers() {
 fn requires_selected_version() {
     assert!(import_crate("https://example.org/api/", "9", &[]).is_err());
 }
+
+#[test]
+fn maps_creator_identifiers() {
+    let entity = record_entity(
+        &json!({
+            "id": "1", "created": "2024-01-01T00:00:00Z", "updated": "2025-01-01T00:00:00Z",
+            "metadata": {"title": "Record", "subjects": [{"subject": "Genomics"}],
+                "creators": [{"person_or_org": {"type": "personal", "name": "Researcher",
+                    "identifiers": [{"scheme": "orcid", "identifier": "0000-0002-1825-0097"}]},
+                    "affiliations": [{"id": "01ggx4157", "name": "CERN"}]}]}
+        }),
+        "./",
+    )
+    .unwrap();
+    assert_eq!(entity["dateCreated"], "2024-01-01T00:00:00Z");
+    assert_eq!(entity["dateModified"], "2025-01-01T00:00:00Z");
+    assert_eq!(entity["keywords"], json!(["Genomics"]));
+    assert_eq!(
+        entity["creator"][0]["identifier"][0],
+        json!({
+            "@type": "PropertyValue", "propertyID": "orcid", "value": "0000-0002-1825-0097"
+        })
+    );
+    assert_eq!(
+        entity["creator"][0]["affiliation"][0]["identifier"],
+        "01ggx4157"
+    );
+}

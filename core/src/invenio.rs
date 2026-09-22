@@ -91,10 +91,22 @@ pub fn record_entity(record: &Value, id: &str) -> Result<Value, InvenioError> {
         ("publication_date", "datePublished"),
         ("version", "version"),
         ("publisher", "publisher"),
-        ("subjects", "keywords"),
     ] {
         if !metadata[source].is_null() {
             entity[target] = metadata[source].clone();
+        }
+    }
+    if let Some(subjects) = metadata["subjects"].as_array() {
+        entity["keywords"] = Value::Array(
+            subjects
+                .iter()
+                .filter_map(|subject| subject["subject"].as_str().map(|value| json!(value)))
+                .collect(),
+        );
+    }
+    for (source, target) in [("created", "dateCreated"), ("updated", "dateModified")] {
+        if let Some(value) = record[source].as_str() {
+            entity[target] = json!(value);
         }
     }
     let mut identifiers = Vec::new();
@@ -124,7 +136,13 @@ pub fn record_entity(record: &Value, id: &str) -> Result<Value, InvenioError> {
             json!({
                 "@type": if person["type"] == "organizational" { "Organization" } else { "Person" },
                 "name": person["name"], "givenName": person["given_name"],
-                "familyName": person["family_name"], "identifier": person["identifiers"]
+                "familyName": person["family_name"],
+                "identifier": person["identifiers"].as_array().map(|ids| ids.iter().map(|identifier| json!({
+                    "@type": "PropertyValue", "propertyID": identifier["scheme"], "value": identifier["identifier"]
+                })).collect::<Vec<_>>()).unwrap_or_default(),
+                "affiliation": creator["affiliations"].as_array().map(|affiliations| affiliations.iter().map(|affiliation| json!({
+                    "@type": "Organization", "name": affiliation["name"], "identifier": affiliation["id"]
+                })).collect::<Vec<_>>()).unwrap_or_default()
             })
         }).collect());
     }
