@@ -1,2 +1,2 @@
-arctrl==3.2.1
+-r ../../blob/arc-requirements.txt
 boto3==1.43.99
