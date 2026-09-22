@@ -66,7 +66,7 @@ pub async fn restore_reclaim_sweep(storage: &StorageHandle, task_handle: &TaskHa
 
 /// What one candidate resolved to. `Dropped` covers every reason the queue row
 /// is stale: retain, a vanished backend, or a location that is already gone.
-/// `NotDue` keeps the row: the grace grew after the sweep read it.
+/// `NotDue` keeps the row: the candidate or grace changed after the sweep read it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReclaimVerdict {
     Freed { bytes: u64 },
@@ -345,6 +345,7 @@ pub async fn backend_status(
 enum ReclaimState {
     Init,
     StartTransaction,
+    ReadCandidate,
     FenceBackend,
     ReadLocation,
     ScanAliases,
@@ -370,6 +371,8 @@ pub enum ReclaimBlobError {
     Read(#[from] RecordReadError),
     #[error("reclaim failed")]
     Failed,
+    #[error("indexed blob version is missing")]
+    MissingOwner,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
     InvalidStateEvent {
         state: &'static str,
@@ -379,7 +382,7 @@ pub enum ReclaimBlobError {
 }
 
 /// Deletes one unreferenced copy. Everything that decides it happens inside one
-/// transaction: the tenant fence, the location read and the full alias scan, so
+/// transaction: the candidate, tenant fence, location and full alias scan, so
 /// a concurrent write either loses its commit or pins the hash first.
 #[derive(Debug, PartialEq)]
 pub struct ReclaimBlobOperation {
@@ -449,17 +452,12 @@ impl ReclaimBlobOperation {
         match event {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                 self.txn_id = Some(txn_id);
-                match self.key.backend {
-                    BackendRef::Group(backend_id) => {
-                        self.state = ReclaimState::FenceBackend;
-                        smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-                            key: backend_key(backend_id),
-                            txn_id: self.txn_id,
-                        })]
-                    }
-                    BackendRef::Node(_) => self.read_location(),
-                }
+                self.state = ReclaimState::ReadCandidate;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: BLOB_RECLAIM_KEYSPACE.to_string(),
+                    key: self.key.to_bytes().into(),
+                    txn_id: self.txn_id,
+                })]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
             received => self.unexpected(
@@ -467,6 +465,28 @@ impl ReclaimBlobOperation {
                 "Event::Storage(StorageEvent::TransactionStarted)",
                 received,
             ),
+        }
+    }
+
+    fn handle_candidate(&mut self, event: Event) -> Effects {
+        let candidate = match parse_read(event, ReclaimCandidate::from_bytes) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => return self.drop_candidate(ReclaimVerdict::Dropped),
+            Err(error) => return self.fail(error.into()),
+        };
+        if candidate.enqueued_at != self.enqueued_at {
+            return self.finish_not_due();
+        }
+        match self.key.backend {
+            BackendRef::Group(backend_id) => {
+                self.state = ReclaimState::FenceBackend;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
+                    key: backend_key(backend_id),
+                    txn_id: self.txn_id,
+                })]
+            }
+            BackendRef::Node(_) => self.read_location(),
         }
     }
 
@@ -569,9 +589,8 @@ impl ReclaimBlobOperation {
         })]
     }
 
-    /// A version that still names this exact copy pins it. An alias whose
-    /// version row is gone does not pin; one that cannot be decoded fails the
-    /// sweep closed and leaves the candidate queued.
+    /// A version naming this exact copy pins it. Missing or undecodable indexed
+    /// versions fail the sweep closed and leave the candidate queued.
     fn handle_versions(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(
@@ -583,7 +602,7 @@ impl ReclaimBlobOperation {
         let wanted = self.location_key();
         for (_, value) in values {
             let Some(value) = value else {
-                continue;
+                return self.fail(ReclaimBlobError::MissingOwner);
             };
             let version = match BlobVersion::from_bytes(value.as_ref()) {
                 Ok(version) => version,
@@ -760,6 +779,7 @@ impl Operation for ReclaimBlobOperation {
         match self.state {
             ReclaimState::Init => self.start(),
             ReclaimState::StartTransaction => self.handle_txn_started(event),
+            ReclaimState::ReadCandidate => self.handle_candidate(event),
             ReclaimState::FenceBackend => self.handle_fence(event),
             ReclaimState::ReadLocation => self.handle_location(event),
             ReclaimState::ScanAliases => self.handle_alias_page(event),
@@ -839,7 +859,10 @@ mod tests {
             staging: false,
             partial: false,
             blob_size: size,
-            hashes: HashMap::new(),
+            hashes: HashMap::from([(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                HASH.to_vec(),
+            )]),
         }
     }
 
@@ -1046,6 +1069,305 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refreshed_candidate_waits() {
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        let refreshed = ReclaimCandidate {
+            enqueued_at: SystemTime::UNIX_EPOCH + Duration::from_secs(3_600),
+        };
+        write(
+            &context,
+            BLOB_RECLAIM_KEYSPACE,
+            candidate_key().to_bytes(),
+            refreshed.to_bytes().unwrap(),
+        )
+        .await;
+        let sweep_time = SystemTime::UNIX_EPOCH
+            + CleanupStrategy::DEFAULT_RECLAIM_AFTER
+            + Duration::from_secs(1);
+
+        let verdict = drive(
+            ReclaimBlobOperation::new(candidate_key(), SystemTime::UNIX_EPOCH, sweep_time),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(verdict, ReclaimVerdict::NotDue);
+        assert_eq!(
+            read(&context, BLOB_RECLAIM_KEYSPACE, candidate_key().to_bytes()).await,
+            Some(refreshed.to_bytes().unwrap().into())
+        );
+        assert!(
+            read(
+                &context,
+                BLOB_LOCATIONS_KEYSPACE,
+                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+            )
+            .await
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_owner_blocks() {
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        let version_id = Ulid::from_bytes([6u8; 16]);
+        add_alias(&context, version_id, true).await;
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new("bucket", "key", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::DeleteResult { .. })
+        ));
+
+        assert_eq!(
+            drive(reclaim_op(candidate_key()), &context).await,
+            Err(ReclaimBlobError::MissingOwner)
+        );
+        assert!(
+            read(&context, BLOB_RECLAIM_KEYSPACE, candidate_key().to_bytes())
+                .await
+                .is_some()
+        );
+        assert!(
+            read(
+                &context,
+                BLOB_LOCATIONS_KEYSPACE,
+                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+            )
+            .await
+            .is_some()
+        );
+        let (queued, _) = iter_prefix_page(
+            &context.storage_handle,
+            BLOB_CLEANUP_KEYSPACE,
+            None,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(queued.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_owner_blocks() {
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        let version_id = Ulid::from_bytes([6u8; 16]);
+        add_alias(&context, version_id, true).await;
+        write(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new("bucket", "key", version_id)
+                .to_bytes()
+                .unwrap(),
+            vec![255],
+        )
+        .await;
+
+        assert!(drive(reclaim_op(candidate_key()), &context).await.is_err());
+        assert!(
+            read(&context, BLOB_RECLAIM_KEYSPACE, candidate_key().to_bytes())
+                .await
+                .is_some()
+        );
+        assert!(
+            read(
+                &context,
+                BLOB_LOCATIONS_KEYSPACE,
+                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+            )
+            .await
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_states_survive() {
+        use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+        use aruna_core::structs::storage::blob::{
+            ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
+        };
+        for state in [
+            ManagedCopyState::Registered,
+            ManagedCopyState::Quarantined(ManagedCopyQuarantine::Rejoin),
+            ManagedCopyState::Quarantined(ManagedCopyQuarantine::SubjectTransition),
+            ManagedCopyState::Quarantined(ManagedCopyQuarantine::PolicyViolation),
+            ManagedCopyState::UnresolvedDeparted,
+        ] {
+            let dir = tempdir().unwrap();
+            let context = context(dir.path().to_str().unwrap());
+            seed(&context, 10).await;
+            let version_id = Ulid::from_bytes([6u8; 16]);
+            add_alias(&context, version_id, true).await;
+            let copy = ManagedCopyRecord::new(
+                VersionKey::new("bucket", "key", version_id),
+                iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+                location(10),
+                Vec::new(),
+                0,
+                state,
+            )
+            .unwrap();
+            let key = copy.key().to_bytes().unwrap();
+            let value = copy.to_bytes().unwrap();
+            write(&context, MANAGED_COPY_KEYSPACE, key.clone(), value.clone()).await;
+
+            assert_eq!(
+                drive(reclaim_op(candidate_key()), &context).await.unwrap(),
+                ReclaimVerdict::Pinned
+            );
+            assert_eq!(
+                read(&context, MANAGED_COPY_KEYSPACE, key).await,
+                Some(value.into())
+            );
+            assert!(
+                read(
+                    &context,
+                    BLOB_LOCATIONS_KEYSPACE,
+                    BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+                )
+                .await
+                .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_survives_restart() {
+        let dir = tempdir().unwrap();
+        let before = context(dir.path().to_str().unwrap());
+        seed(&before, 10).await;
+        assert_eq!(
+            drive(reclaim_op(candidate_key()), &before).await.unwrap(),
+            ReclaimVerdict::Freed { bytes: 10 }
+        );
+        before.storage_handle.close().await;
+
+        let after = context(dir.path().to_str().unwrap());
+        assert_eq!(
+            drive(reclaim_op(candidate_key()), &after).await.unwrap(),
+            ReclaimVerdict::Dropped
+        );
+        let counters = read(
+            &after,
+            aruna_core::keyspaces::USAGE_STATS_KEYSPACE,
+            usage_hash_key(&HASH),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            UsageCounters::from_bytes(&counters).unwrap(),
+            UsageCounters::default()
+        );
+        let outcome = crate::blob::cleanup::process_cleanup_batch(&after)
+            .await
+            .unwrap();
+        assert_eq!(outcome.failed, 1);
+        let (queued, _) = iter_prefix_page(
+            &after.storage_handle,
+            BLOB_CLEANUP_KEYSPACE,
+            None,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(BlobCleanupWork::from_bytes(&queued[0].1).unwrap(),
+            BlobCleanupWork::DeleteBlob { location: queued } if queued == location(10)));
+    }
+
+    #[tokio::test]
+    async fn refresh_conflicts_commit() {
+        let dir = tempdir().unwrap();
+        let context = context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        let mut operation = reclaim_op(candidate_key());
+        let mut effects = std::collections::VecDeque::from_iter(operation.start());
+        let mut refreshed = false;
+        while !operation.is_complete() {
+            let effect = effects.pop_front().expect("reclaim must make progress");
+            if matches!(
+                effect,
+                Effect::Storage(StorageEffect::CommitTransaction { .. })
+            ) {
+                assert!(!refreshed);
+                refreshed = true;
+                write(
+                    &context,
+                    BLOB_RECLAIM_KEYSPACE,
+                    candidate_key().to_bytes(),
+                    ReclaimCandidate {
+                        enqueued_at: SystemTime::UNIX_EPOCH + Duration::from_secs(3_600),
+                    }
+                    .to_bytes()
+                    .unwrap(),
+                )
+                .await;
+            }
+            let event = context.storage_handle.send_effect(effect).await;
+            effects.extend(operation.step(event));
+        }
+        assert!(refreshed);
+        assert_eq!(
+            operation.finalize(),
+            Err(ReclaimBlobError::Storage(StorageError::TransactionConflict))
+        );
+        let (queued, _) = iter_prefix_page(
+            &context.storage_handle,
+            BLOB_CLEANUP_KEYSPACE,
+            None,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(queued.is_empty());
+        assert!(
+            read(
+                &context,
+                BLOB_LOCATIONS_KEYSPACE,
+                BlobLocationKey::new(HASH, BackendRef::node_default()).to_bytes(),
+            )
+            .await
+            .is_some()
+        );
+        let counters = read(
+            &context,
+            aruna_core::keyspaces::USAGE_STATS_KEYSPACE,
+            usage_hash_key(&HASH),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            UsageCounters::from_bytes(&counters).unwrap().stored_bytes,
+            10
+        );
+
+        let due = SystemTime::UNIX_EPOCH + CleanupStrategy::DEFAULT_RECLAIM_AFTER * 2;
+        assert_eq!(sweep_at(&context, due, None).await.unwrap().freed, 1);
+    }
+
+    #[tokio::test]
     async fn other_never_pins() {
         // Deduplication is per backend, so a copy elsewhere holds nothing here.
         let dir = tempdir().unwrap();
@@ -1209,6 +1531,17 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([9u8; 16]),
         }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: operation.key.to_bytes().into(),
+            value: Some(
+                ReclaimCandidate {
+                    enqueued_at: SystemTime::UNIX_EPOCH,
+                }
+                .to_bytes()
+                .unwrap()
+                .into(),
+            ),
+        }));
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"x".to_vec().into(),
@@ -1238,6 +1571,10 @@ mod tests {
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_bytes([9u8; 16]),
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: operation.key.to_bytes().into(),
+            value: Some(ReclaimCandidate { enqueued_at }.to_bytes().unwrap().into()),
         }));
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
