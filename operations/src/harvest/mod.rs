@@ -4,6 +4,7 @@
 
 pub mod create_connector;
 pub mod create_source;
+pub mod delete_connector;
 pub mod oai_pmh;
 pub mod read_connector;
 pub mod repository;
