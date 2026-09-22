@@ -93,13 +93,13 @@ impl<'a> InvenioClient<'a> {
         Ok(url)
     }
 
+    // File bodies rely on the egress idle timeout; only metadata calls set a total deadline.
     fn request(&self, method: Method, url: Url) -> Result<reqwest::RequestBuilder, InvenioError> {
         self.link(url.as_str())?;
         let mut request = self
             .blob
             .repository_request(method, url)
-            .map_err(|_| InvenioError::Egress)?
-            .timeout(Duration::from_secs(1800));
+            .map_err(|_| InvenioError::Egress)?;
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
