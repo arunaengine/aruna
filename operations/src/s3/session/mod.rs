@@ -51,6 +51,8 @@ const SESSION_TOKEN_LEN: usize = 64;
 #[derive(Debug, Error, PartialEq)]
 pub enum S3SessionError {
     #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),

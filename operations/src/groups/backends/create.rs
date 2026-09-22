@@ -5,9 +5,9 @@
 use super::validation::{GroupBackendError, validate_backend_input};
 use super::{RecordReadError, backend_key, record_writes};
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::BACKEND_SECRET_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
@@ -43,6 +43,8 @@ enum CreateState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateBackendError {
+    #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -167,20 +169,16 @@ impl CreateBackendOperation {
         ));
 
         self.state = CreateState::WriteRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })]
+        smallvec![crate::groups::fence::write_group_records(
+            self.input.group_id,
+            writes
+        )]
     }
 
     fn handle_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.fail(CreateBackendError::InvalidStateEvent {
-                state: "WriteRecords",
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
-            });
-        };
+        if let Err(error) = crate::groups::fence::group_write_result(event) {
+            return self.fail(error.into());
+        }
         let Some(record) = self.record.clone() else {
             return self.fail(CreateBackendError::Failed);
         };
@@ -268,7 +266,18 @@ mod pure_tests {
             [Effect::Blob(BlobEffect::CheckGroupBackend { .. })]
         ));
 
-        let effects = operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
+        let mut effects = operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
+        let [Effect::SubOperation(write)] = effects.as_mut_slice() else {
+            panic!("expected a guarded group write");
+        };
+        write.start();
+        write.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([7; 16]),
+        }));
+        let effects = write.step(Event::Storage(StorageEvent::ReadResult {
+            key: input().group_id.to_bytes().into(),
+            value: None,
+        }));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected one batch write, got {effects:?}")
         };

@@ -120,16 +120,18 @@ impl CreateS3Operation {
         };
         self.txn_id = Some(txn_id);
         self.state = CreateSessionState::ReadIndex;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: SESSION_OWNER_KEYSPACE.to_string(),
-            key: owner_key(self.config.user_identity, self.config.group_id),
-            txn_id: Some(txn_id),
-        })]
+        smallvec![crate::groups::fence::read_group_record(
+            self.config.group_id,
+            SESSION_OWNER_KEYSPACE,
+            owner_key(self.config.user_identity, self.config.group_id),
+            txn_id,
+        )]
     }
 
     fn index_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event, "StorageEvent::ReadResult");
+        let value = match crate::groups::fence::parse_group_record(event) {
+            Ok(value) => value,
+            Err(error) => return self.fail(error.into()),
         };
         let index = match decode_index(value.as_ref()) {
             Ok(index) => index,

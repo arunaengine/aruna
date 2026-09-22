@@ -6,9 +6,8 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::Event;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::harvest::{
     RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
@@ -47,6 +46,8 @@ enum State {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateConnectorError {
+    #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -134,20 +135,26 @@ impl CreateConnectorOperation {
         self.has_secret = secret.is_some();
         self.connector = Some(connector);
         self.state = State::WriteRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })]
+        smallvec![crate::groups::fence::write_group_records(
+            self.input.group_id,
+            writes
+        )]
     }
 
     fn handle_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+        if !matches!(
+            &event,
+            Event::SubOperation(aruna_core::events::SubOperationEvent::GroupWritten { .. })
+        ) {
             return self.emit_error(CreateConnectorError::InvalidStateEvent {
-                state: format!("{:?}", self.state),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                state: "WriteRecords".into(),
+                expected: "group write result",
                 received: event,
             });
-        };
+        }
+        if let Err(error) = crate::groups::fence::group_write_result(event) {
+            return self.emit_error(error.into());
+        }
         let Some(connector) = self.connector.clone() else {
             return self.emit_error(CreateConnectorError::Failed);
         };
@@ -202,6 +209,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::harvest::repository::{parse_connector_read, read_connector_effect};
+    use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_storage::storage;
     use tempfile::tempdir;

@@ -48,6 +48,8 @@ pub enum CreateUserState {
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateUserError {
     #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
@@ -166,20 +168,18 @@ impl CreateUserOperation {
         };
         self.txn_id = Some(txn_id);
         self.state = CreateUserState::ReadOwnerIndex;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: ACCESS_OWNER_KEYSPACE.to_string(),
-            key: owner_key(self.config.user_identity),
-            txn_id: Some(txn_id),
-        })]
+        smallvec![crate::groups::fence::read_group_record(
+            self.config.group_id,
+            ACCESS_OWNER_KEYSPACE,
+            owner_key(self.config.user_identity),
+            txn_id,
+        )]
     }
 
     fn handle_index(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.handle_error(CreateUserError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
+        let value = match crate::groups::fence::parse_group_record(event) {
+            Ok(value) => value,
+            Err(error) => return self.handle_error(error.into()),
         };
         let index = match decode_index(value.as_ref()) {
             Ok(index) => index,
@@ -444,6 +444,15 @@ mod pure_tests {
     use super::*;
     use crate::s3::access::index::owner_key;
 
+    fn owner_read(op: &CreateUserOperation, value: Option<aruna_core::types::Value>) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (owner_key(op.config.user_identity), value),
+                (op.config.group_id.to_bytes().into(), None),
+            ],
+        })
+    }
+
     fn test_issuer() -> [u8; 32] {
         *iroh::SecretKey::from_bytes(&[9u8; 32]).public().as_bytes()
     }
@@ -489,15 +498,16 @@ mod pure_tests {
 
         let txn_id = Ulid::from_parts(2, 2);
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let Effect::Storage(StorageEffect::Read {
-            key_space,
+        let Effect::Storage(StorageEffect::BatchRead {
+            reads,
             txn_id: Some(read_txn),
             ..
         }) = &effects[0]
         else {
             panic!("Expected owner index read");
         };
-        assert_eq!(key_space, aruna_core::keyspaces::ACCESS_OWNER_KEYSPACE);
+        assert_eq!(reads[0].0, aruna_core::keyspaces::ACCESS_OWNER_KEYSPACE);
+        assert_eq!(reads[1].0, aruna_core::keyspaces::GROUP_DELETE_KEYSPACE);
         assert_eq!(*read_txn, txn_id);
 
         let Some(access) = op.access.as_ref() else {
@@ -512,10 +522,7 @@ mod pure_tests {
 
         // An empty index still probes the fresh key for a collision in the txn.
         let access_key = access.access_key.clone();
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: owner_key(user_identity),
-            value: None,
-        }));
+        let effects = op.step(owner_read(&op, None));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(id), .. })] if *id == txn_id
@@ -566,12 +573,10 @@ mod pure_tests {
         op.start();
         let txn_id = Ulid::from_parts(4, 4);
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: owner_key(user_identity),
-            value: Some(
-                encode_index(&std::collections::BTreeSet::from([stale_key.clone()])).unwrap(),
-            ),
-        }));
+        op.step(owner_read(
+            &op,
+            Some(encode_index(&std::collections::BTreeSet::from([stale_key.clone()])).unwrap()),
+        ));
         let stale = UserAccess {
             access_key: stale_key.clone(),
             user_identity,
@@ -629,12 +634,10 @@ mod pure_tests {
         op.start();
         let txn_id = Ulid::from_parts(7, 7);
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: owner_key(user_identity),
-            value: Some(
-                encode_index(&std::collections::BTreeSet::from(["newkey".to_string()])).unwrap(),
-            ),
-        }));
+        op.step(owner_read(
+            &op,
+            Some(encode_index(&std::collections::BTreeSet::from(["newkey".to_string()])).unwrap()),
+        ));
         let access = UserAccess {
             access_key: "newkey".to_string(),
             user_identity,
@@ -676,10 +679,7 @@ mod pure_tests {
         op.start();
         let txn_id = Ulid::from_parts(10, 10);
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: owner_key(user_identity),
-            value: Some(encode_index(&keys).unwrap()),
-        }));
+        op.step(owner_read(&op, Some(encode_index(&keys).unwrap())));
         let mut values = keys
             .iter()
             .map(|key| {
