@@ -475,7 +475,11 @@ async fn repository_export(
     }
     if checkpoint.repository.is_none() {
         if checkpoint.repository_started && destination.draft_id.is_none() {
-            return Err(ExportFailure::Permanent("draft creation outcome is unknown; inspect the repository and retry with its draft_id".into()));
+            return Err(ExportFailure::Permanent(
+                "draft creation outcome is unknown; \
+                 inspect the repository and retry with its draft_id"
+                    .into(),
+            ));
         }
         let jsonld = checkpoint
             .raw_jsonld

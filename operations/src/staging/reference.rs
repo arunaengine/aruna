@@ -182,14 +182,24 @@ pub async fn write_reference_version(
         }
 
         if write.preassigned_version_id.is_some()
-            && let Some(existing) = read_blob_version(context, txn_id, &write.bucket, &write.key, version_id).await?
+            && let Some(existing) =
+                read_blob_version(context, txn_id, &write.bucket, &write.key, version_id).await?
         {
-            if !matches!(&existing.state, BlobVersionState::Reference { source, cached_metadata, .. }
-                if source == &write.version_source && source_metadata_matches(cached_metadata, &write.metadata)) {
-                return Err(StorageError::WriteError("planned reference version changed".into()).into());
+            if !matches!(
+                &existing.state,
+                BlobVersionState::Reference { source, cached_metadata, .. }
+                    if source == &write.version_source
+                        && source_metadata_matches(cached_metadata, &write.metadata)
+            ) {
+                return Err(
+                    StorageError::WriteError("planned reference version changed".into()).into(),
+                );
             }
-            return match send_storage_effect(context, Effect::Storage(StorageEffect::CommitTransaction { txn_id })).await? {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok((version_id, false)),
+            let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id });
+            return match send_storage_effect(context, commit).await? {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    Ok((version_id, false))
+                }
                 _ => Err(StorageError::WriteError("unexpected commit event".into()).into()),
             };
         }
