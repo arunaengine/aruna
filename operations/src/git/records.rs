@@ -9,6 +9,39 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use serde::{Serialize, de::DeserializeOwned};
 
+pub(super) async fn save<T: Serialize>(
+    context: &DriverContext,
+    space: &str,
+    key: Vec<u8>,
+    value: &T,
+) -> Result<(), GitError> {
+    let value = postcard::to_allocvec(value).map_err(|_| GitError::Invalid)?;
+    if !matches!(
+        context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: space.into(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            }))
+            .await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ) {
+        return Err(GitError::Unavailable);
+    }
+    if !matches!(
+        context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::SyncAll))
+            .await,
+        Event::Storage(StorageEvent::SyncAllFinished)
+    ) {
+        return Err(GitError::Unavailable);
+    }
+    Ok(())
+}
+
 pub(super) async fn load<T: DeserializeOwned>(
     context: &DriverContext,
     space: &str,
