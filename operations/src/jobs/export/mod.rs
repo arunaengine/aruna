@@ -108,6 +108,7 @@ enum ExportPhase {
 struct ExportCheckpoint {
     repository_started: bool,
     repository_complete: bool,
+    repository_metadata: Option<[u8; 32]>,
     repository: Option<aruna_core::invenio::InvenioRecord>,
     refs: RoCrateCheckpointRefs,
     phase: ExportPhase,
@@ -127,6 +128,7 @@ impl Default for ExportCheckpoint {
         Self {
             repository_started: false,
             repository_complete: false,
+            repository_metadata: None,
             repository: None,
             refs: RoCrateCheckpointRefs::default(),
             phase: ExportPhase::Snapshot,
@@ -491,6 +493,27 @@ async fn repository_export(
             .await
             .map_err(ExportFailure::Retryable)?;
     }
+    if checkpoint.repository_metadata.is_none() {
+        let record = checkpoint
+            .repository
+            .as_ref()
+            .ok_or_else(|| ExportFailure::Permanent("repository draft missing".into()))?;
+        let jsonld = checkpoint
+            .raw_jsonld
+            .as_deref()
+            .ok_or_else(|| ExportFailure::Permanent("source crate metadata missing".into()))?;
+        let (record, digest) = interruptible(
+            ctx,
+            export::prepare_draft(ctx, spec, destination, record, jsonld),
+        )
+        .await
+        .map_err(classify)?;
+        checkpoint.repository = Some(record);
+        checkpoint.repository_metadata = Some(digest);
+        persist_checkpoint(ctx, checkpoint)
+            .await
+            .map_err(ExportFailure::Retryable)?;
+    }
     let record = checkpoint
         .repository
         .as_ref()
@@ -501,7 +524,16 @@ async fn repository_export(
         .ok_or_else(|| ExportFailure::Permanent("export artifact missing".into()))?;
     let record = interruptible(
         ctx,
-        export::deposit(ctx, spec, destination, record, artifact),
+        export::deposit(
+            ctx,
+            spec,
+            destination,
+            record,
+            artifact,
+            checkpoint.repository_metadata.ok_or_else(|| {
+                ExportFailure::Permanent("repository metadata checkpoint missing".into())
+            })?,
+        ),
     )
     .await
     .map_err(classify)?;

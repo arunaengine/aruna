@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::invenio::{
-    InvenioDestination, InvenioRecord, export_metadata, record_id, validate_id,
+    InvenioDestination, InvenioRecord, export_fields, record_id, validate_id,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
@@ -32,7 +32,7 @@ pub(crate) async fn create_draft(
         .as_ref()
         .ok_or_else(|| invalid("a personal repository login is required"))?;
     let client = connect(
-        ctx,
+        &ctx.driver,
         &spec.auth_context,
         destination.group_id,
         destination.connector_id,
@@ -48,37 +48,54 @@ pub(crate) async fn create_draft(
         .map_err(|_| invalid("invalid repository metadata"))?;
     let document: Value =
         serde_json::from_str(jsonld).map_err(|_| invalid("invalid source crate"))?;
-    let metadata = export_metadata(&document, &overrides)?;
-    if metadata.to_string().len() as u64 > spec.limits.metadata_bytes {
+    let mut fields = export_fields(&document, &overrides)?;
+    if fields.to_string().len() as u64 > spec.limits.metadata_bytes {
         return Err(invalid("mapped repository metadata exceeds limit"));
     }
+    let parent = if let Some(id) = &destination.new_version {
+        validate_id(id)?;
+        let source = client
+            .json(Method::GET, client.url(&["records", id])?, None)
+            .await?;
+        if source["is_published"] != true {
+            return Err(invalid("new version requires a published record"));
+        }
+        Some(
+            source["parent"]["id"]
+                .as_str()
+                .ok_or_else(|| invalid("missing parent identity"))?
+                .to_string(),
+        )
+    } else {
+        None
+    };
     let record = if let Some(id) = &destination.draft_id {
         validate_id(id)?;
-        let draft = client
-            .json(Method::GET, client.url(&["records", id, "draft"])?, None)
-            .await?;
-        if record_id(&draft)? != id || draft["is_published"] != false {
-            return Err(invalid("export requires the selected unpublished draft"));
-        }
         client
-            .json(
-                Method::PUT,
-                client.url(&["records", id, "draft"])?,
-                Some(&json!({"metadata": metadata})),
-            )
+            .json(Method::GET, client.url(&["records", id, "draft"])?, None)
             .await?
-    } else {
+    } else if let Some(id) = &destination.new_version {
         client
             .json(
                 Method::POST,
-                client.url(&["records"])?,
-                Some(&json!({
-                    "metadata": metadata, "files": {"enabled": true},
-                    "access": {"record": "public", "files": if destination.public_files { "public" } else { "restricted" }}
-                })),
+                client.url(&["records", id, "versions"])?,
+                None,
             )
             .await?
+    } else {
+        fields["files"] = json!({"enabled": true});
+        fields["access"] = json!({"record": "public", "files": if destination.public_files { "public" } else { "restricted" }});
+        client
+            .json(Method::POST, client.url(&["records"])?, Some(&fields))
+            .await?
     };
+    let parent_id = record["parent"]["id"]
+        .as_str()
+        .ok_or_else(|| invalid("missing draft parent"))?
+        .to_string();
+    if parent.is_some_and(|parent| parent != parent_id) {
+        return Err(invalid("new version belongs to another record"));
+    }
     if record["is_published"] != false {
         return Err(invalid("export requires an unpublished draft"));
     }
@@ -94,7 +111,85 @@ pub(crate) async fn create_draft(
         url: client.url(&["records", &id, "draft"])?.to_string(),
         id,
         published: false,
+        parent_id,
+        revision_id: record["revision_id"]
+            .as_u64()
+            .ok_or_else(|| invalid("missing draft revision"))?,
+        doi: record["pids"]["doi"]["identifier"]
+            .as_str()
+            .map(str::to_string),
     })
+}
+
+pub(crate) async fn prepare_draft(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &InvenioDestination,
+    record: &InvenioRecord,
+    jsonld: &str,
+) -> Result<(InvenioRecord, [u8; 32]), TransferError> {
+    let credential = destination
+        .credential
+        .as_ref()
+        .ok_or_else(|| invalid("personal login missing"))?;
+    let client = connect(
+        &ctx.driver,
+        &spec.auth_context,
+        destination.group_id,
+        destination.connector_id,
+        Permission::WRITE,
+        spec.limits.metadata_bytes,
+        Some(credential),
+    )
+    .await?;
+    let document: Value =
+        serde_json::from_str(jsonld).map_err(|_| invalid("invalid crate metadata"))?;
+    let overrides: Value = serde_json::from_str(&destination.metadata_json)
+        .map_err(|_| invalid("invalid metadata overrides"))?;
+    let mut fields = export_fields(&document, &overrides)?;
+    fields["files"] = json!({"enabled": true});
+    let url = client.url(&["records", &record.id, "draft"])?;
+    let current = client.json(Method::GET, url.clone(), None).await?;
+    if record_id(&current)? != record.id
+        || current["parent"]["id"] != record.parent_id
+        || current["is_published"] != false
+    {
+        return Err(invalid("repository draft identity changed"));
+    }
+    let draft = if destination.draft_id.is_some() || destination.new_version.is_some() {
+        if current["revision_id"].as_u64() == Some(record.revision_id) {
+            client.update(url, &fields, record.revision_id).await?
+        } else if current["revision_id"].as_u64() == record.revision_id.checked_add(1)
+            && complete_fields(&fields["metadata"], &current["metadata"])
+            && complete_fields(&fields["custom_fields"], &current["custom_fields"])
+        {
+            current
+        } else {
+            return Err(invalid(
+                "draft changed after an ambiguous metadata update; inspect and recover with draft_id",
+            ));
+        }
+    } else {
+        current
+    };
+    if record_id(&draft)? != record.id
+        || draft["parent"]["id"] != record.parent_id
+        || draft["is_published"] != false
+    {
+        return Err(invalid("repository draft identity changed"));
+    }
+    verify_metadata(&fields, &draft)?;
+    if destination.draft_id.is_none()
+        && destination.new_version.is_none()
+        && draft["revision_id"].as_u64() != Some(record.revision_id)
+    {
+        return Err(invalid("repository metadata changed during creation"));
+    }
+    let mut record = record.clone();
+    record.revision_id = draft["revision_id"]
+        .as_u64()
+        .ok_or_else(|| invalid("missing draft revision"))?;
+    Ok((record, metadata_digest(&draft)))
 }
 
 pub(crate) async fn deposit(
@@ -103,13 +198,14 @@ pub(crate) async fn deposit(
     destination: &InvenioDestination,
     record: &InvenioRecord,
     artifact: &ArtifactRef,
+    metadata: [u8; 32],
 ) -> Result<InvenioRecord, TransferError> {
     let credential = destination
         .credential
         .as_ref()
         .ok_or_else(|| invalid("a personal repository login is required"))?;
     let client = connect(
-        ctx,
+        &ctx.driver,
         &spec.auth_context,
         destination.group_id,
         destination.connector_id,
@@ -140,10 +236,16 @@ pub(crate) async fn deposit(
         ),
         Err(error) => return Err(error.into()),
     };
-    if record_id(&draft)? != record.id || draft["is_published"] != published {
+    if record_id(&draft)? != record.id
+        || draft["is_published"] != published
+        || draft["parent"]["id"] != record.parent_id
+    {
         return Err(invalid(
             "export record identity or publication state changed",
         ));
+    }
+    if metadata_digest(&draft) != metadata {
+        return Err(invalid("repository metadata changed after preparation"));
     }
     let blob = ctx
         .driver
@@ -191,6 +293,7 @@ pub(crate) async fn deposit(
     }
     ctx.progress.set_total(paths.len() as u64);
     ctx.progress.set_current(0);
+    let mut verified = std::collections::BTreeMap::new();
     for (index, entry) in inspection
         .entries
         .iter()
@@ -198,10 +301,19 @@ pub(crate) async fn deposit(
         .enumerate()
     {
         let existing = remote.get(entry.path.as_str()).copied();
-        upload_entry(ctx, &client, record, artifact, entry, existing, published).await?;
+        let hash = upload_entry(ctx, &client, record, artifact, entry, existing, published).await?;
+        verified.insert(entry.path.clone(), (hash, entry.uncompressed_size));
         ctx.progress.set_current(index as u64 + 1);
     }
-    finish(&client, record, destination.publish, published).await
+    finish(
+        &client,
+        record,
+        destination.publish,
+        published,
+        metadata,
+        &verified,
+    )
+    .await
 }
 
 async fn upload_entry(
@@ -212,7 +324,7 @@ async fn upload_entry(
     entry: &ArchiveEntry,
     existing: Option<&Value>,
     published: bool,
-) -> Result<(), TransferError> {
+) -> Result<Hasher, TransferError> {
     if entry.compression != ArchiveCompression::Stored
         || entry.compressed_size != entry.uncompressed_size
     {
@@ -247,13 +359,14 @@ async fn upload_entry(
     {
         verify_file(file, &expected, size, false)?;
         if file["status"] == "completed" {
-            return Ok(());
+            return Ok(expected);
         }
         if published {
             return Err(invalid("published record contains an incomplete file"));
         }
         let file = client.json(Method::POST, commit_url, None).await?;
-        return verify_file(&file, &expected, size, true);
+        verify_file(&file, &expected, size, true)?;
+        return Ok(expected);
     }
     if published {
         return Err(invalid("published record is missing a complete crate file"));
@@ -298,7 +411,8 @@ async fn upload_entry(
         return Err(invalid("crate file changed while uploading"));
     }
     let file = client.json(Method::POST, commit_url, None).await?;
-    verify_file(&file, &expected, size, true)
+    verify_file(&file, &expected, size, true)?;
+    Ok(expected)
 }
 
 async fn finish(
@@ -306,7 +420,22 @@ async fn finish(
     record: &InvenioRecord,
     publish: bool,
     published: bool,
+    metadata: [u8; 32],
+    files: &std::collections::BTreeMap<String, (Hasher, u64)>,
 ) -> Result<InvenioRecord, TransferError> {
+    let current_url = if published {
+        client.url(&["records", &record.id])?
+    } else {
+        client.url(&["records", &record.id, "draft"])?
+    };
+    let mut current = client.json(Method::GET, current_url, None).await?;
+    if metadata_digest(&current) != metadata {
+        return Err(invalid("repository metadata changed before publication"));
+    }
+    if current["parent"]["id"] != record.parent_id {
+        return Err(invalid("repository parent changed"));
+    }
+    verify_files(client, record, published, files).await?;
     if publish && !published {
         let result = client
             .json(
@@ -318,6 +447,14 @@ async fn finish(
         if record_id(&result)? != record.id || result["is_published"] != true {
             return Err(invalid("repository did not confirm publication"));
         }
+        if metadata_digest(&result) != metadata {
+            return Err(invalid("published metadata changed"));
+        }
+        if result["parent"]["id"] != record.parent_id {
+            return Err(invalid("published parent changed"));
+        }
+        verify_files(client, record, true, files).await?;
+        current = result;
     }
     Ok(InvenioRecord {
         id: record.id.clone(),
@@ -327,7 +464,105 @@ async fn finish(
             record.url.clone()
         },
         published: publish,
+        parent_id: record.parent_id.clone(),
+        revision_id: current["revision_id"]
+            .as_u64()
+            .ok_or_else(|| invalid("missing record revision"))?,
+        doi: current["pids"]["doi"]["identifier"]
+            .as_str()
+            .map(str::to_string),
     })
+}
+
+async fn verify_files(
+    client: &InvenioClient<'_>,
+    record: &InvenioRecord,
+    published: bool,
+    expected: &std::collections::BTreeMap<String, (Hasher, u64)>,
+) -> Result<(), TransferError> {
+    let url = if published {
+        client.url(&["records", &record.id, "files"])?
+    } else {
+        client.url(&["records", &record.id, "draft", "files"])?
+    };
+    let files = client.json(Method::GET, url, None).await?;
+    let entries = files["entries"]
+        .as_array()
+        .ok_or_else(|| invalid("missing repository files"))?;
+    if entries.len() != expected.len()
+        || files["links"]["next"]
+            .as_str()
+            .is_some_and(|link| !link.is_empty())
+    {
+        return Err(invalid("repository file set changed"));
+    }
+    let mut keys = std::collections::HashSet::new();
+    for file in entries {
+        let key = file["key"]
+            .as_str()
+            .ok_or_else(|| invalid("missing file key"))?;
+        if !keys.insert(key) {
+            return Err(invalid("duplicate repository file"));
+        }
+        let (hash, size) = expected
+            .get(key)
+            .ok_or_else(|| invalid("unexpected repository file"))?;
+        verify_file(file, hash, *size, true)?;
+    }
+    Ok(())
+}
+
+fn metadata_digest(record: &Value) -> [u8; 32] {
+    let fields = json!({"metadata": record["metadata"], "custom_fields": record.get("custom_fields").cloned().unwrap_or_else(|| json!({}))});
+    *blake3::hash(fields.to_string().as_bytes()).as_bytes()
+}
+
+fn verify_metadata(expected: &Value, record: &Value) -> Result<(), TransferError> {
+    if !matches_fields(&expected["metadata"], &record["metadata"])
+        || (expected.get("custom_fields").is_some()
+            && !complete_fields(&expected["custom_fields"], &record["custom_fields"]))
+    {
+        return Err(invalid(
+            "repository metadata differs from the requested crate",
+        ));
+    }
+    Ok(())
+}
+
+fn complete_fields(expected: &Value, actual: &Value) -> bool {
+    if actual.is_null() && expected.as_object().is_some_and(serde_json::Map::is_empty) {
+        return true;
+    }
+    matches_fields(expected, actual)
+        && actual.as_object().is_some_and(|fields| {
+            fields.iter().all(|(key, value)| {
+                expected.get(key).is_some()
+                    || value.is_null()
+                    || value.as_array().is_some_and(Vec::is_empty)
+            })
+        })
+}
+
+fn matches_fields(expected: &Value, actual: &Value) -> bool {
+    if actual.is_null() && expected.as_array().is_some_and(Vec::is_empty) {
+        return true;
+    }
+    match expected {
+        Value::Object(fields) => {
+            actual.is_object()
+                && fields
+                    .iter()
+                    .all(|(key, value)| matches_fields(value, &actual[key]))
+        }
+        Value::Array(values) => actual.as_array().is_some_and(|actual| {
+            values.len() == actual.len()
+                && values
+                    .iter()
+                    .zip(actual)
+                    .all(|(expected, actual)| matches_fields(expected, actual))
+        }),
+        _ => expected == actual,
+    }
 }
 
 fn verify_file(
