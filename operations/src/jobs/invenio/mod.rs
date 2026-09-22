@@ -23,6 +23,7 @@ pub(crate) mod export;
 pub(crate) mod import;
 mod query;
 pub(crate) mod reference;
+mod verify;
 pub use query::search_records;
 
 #[derive(Debug, thiserror::Error)]
