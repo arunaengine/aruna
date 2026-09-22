@@ -113,7 +113,7 @@ pub(super) async fn history(
     if let Some(url) = &mut next {
         url.query_pairs_mut()
             .append_pair("allversions", "true")
-            .append_pair("size", "100");
+            .append_pair("size", "25");
     }
     let mut pages = HashSet::new();
     let mut ids = HashSet::new();

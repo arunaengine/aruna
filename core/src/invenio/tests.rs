@@ -153,6 +153,44 @@ fn requires_selected_version() {
 }
 
 #[test]
+fn preserves_date_precision() {
+    for (date, start) in [
+        ("2020", "2020-01-01"),
+        ("2020-11", "2020-11-01"),
+        ("2020-11-10", "2020-11-10"),
+        ("1939/1945", "1939-01-01"),
+        ("1939-09-01/1945-09", "1939-09-01"),
+    ] {
+        let record = json!({"id": "1", "metadata": {
+            "title": "Dates", "publication_date": date,
+            "creators": [{"person_or_org": {"type": "personal", "family_name": "Researcher"}}]
+        }});
+        let document = import_crate(
+            "https://zenodo.org/api/",
+            "1",
+            &[(record, json!({"entries": []}))],
+        )
+        .unwrap();
+        craqle::validate_rocrate_jsonld(&document.to_string()).unwrap();
+        let root = document["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["@id"] == "./")
+            .unwrap();
+        assert_eq!(root["datePublished"], start);
+        assert_eq!(root[PUBLICATION_DATE], date);
+        assert_eq!(
+            export_metadata(&document, &Value::Null).unwrap()["publication_date"],
+            date
+        );
+    }
+    for date in ["", "2020-13", "2021-02-29", "2020/x", "2020/2021/2022"] {
+        assert!(publication_start(date).is_err(), "{date}");
+    }
+}
+
+#[test]
 fn maps_creator_identifiers() {
     let entity = record_entity(
         &json!({

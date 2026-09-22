@@ -10,6 +10,8 @@ use ulid::Ulid;
 mod credential;
 pub use credential::InvenioCredential;
 
+const PUBLICATION_DATE: &str = "https://w3id.org/aruna/invenio/publicationDate";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InvenioDestination {
     pub group_id: Ulid,
@@ -92,13 +94,16 @@ pub fn record_entity(record: &Value, id: &str) -> Result<Value, InvenioError> {
     });
     for (source, target) in [
         ("description", "description"),
-        ("publication_date", "datePublished"),
         ("version", "version"),
         ("publisher", "publisher"),
     ] {
         if !metadata[source].is_null() {
             entity[target] = metadata[source].clone();
         }
+    }
+    if let Some(date) = metadata["publication_date"].as_str() {
+        entity["datePublished"] = json!(publication_start(date)?);
+        entity[PUBLICATION_DATE] = json!(date);
     }
     if let Some(subjects) = metadata["subjects"].as_array() {
         entity["keywords"] = Value::Array(
@@ -248,7 +253,11 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
             }
         }
         if let Some(date) = schema_value(root, "datePublished").as_str() {
-            metadata["publication_date"] = json!(date.split('T').next().unwrap_or(date));
+            let date = date.split('T').next().unwrap_or(date);
+            let original = root[PUBLICATION_DATE]
+                .as_str()
+                .filter(|original| publication_start(original).is_ok_and(|start| start == date));
+            metadata["publication_date"] = json!(original.unwrap_or(date));
         }
         let creators = schema_value(root, "creator");
         let creators = if creators.is_null() {
@@ -355,6 +364,29 @@ fn schema_value<'a>(entity: &'a Value, name: &str) -> &'a Value {
         }
     }
     &Value::Null
+}
+
+/// Uses the earliest day represented by an EDTF date; the source precision is retained separately.
+fn publication_start(value: &str) -> Result<String, InvenioError> {
+    let mut start = None;
+    let parts = value.split('/').collect::<Vec<_>>();
+    if parts.len() > 2 {
+        return Err(InvenioError("invalid publication interval"));
+    }
+    for part in parts {
+        let full = match part.len() {
+            4 => format!("{part}-01-01"),
+            7 => format!("{part}-01"),
+            10 => part.to_string(),
+            _ => return Err(InvenioError("invalid publication date")),
+        };
+        let date = chrono::NaiveDate::parse_from_str(&full, "%Y-%m-%d")
+            .map_err(|_| InvenioError("invalid publication date"))?;
+        if start.is_none() {
+            start = Some(date.to_string());
+        }
+    }
+    start.ok_or(InvenioError("missing publication date"))
 }
 
 fn values(value: &Value) -> &[Value] {

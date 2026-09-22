@@ -95,7 +95,7 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
     );
     let expected = if request.method() == Method::GET && request.uri().path().ends_with("/content")
     {
-        "application/octet-stream"
+        "*/*"
     } else {
         "application/vnd.inveniordm.v1+json, application/json;q=0.9"
     };
@@ -109,6 +109,9 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
     let parts = path.trim_start_matches('/').split('/').collect::<Vec<_>>();
     let value = match (method, parts.as_slice()) {
         (Method::GET, ["api", "records", "2", "versions"]) => {
+            if query.contains("size=100") {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
             let second = query.contains("page=2");
             if state.foreign_page {
                 return axum::Json(json!({"hits": {"total": 2, "hits": [{"id": "1"}]},

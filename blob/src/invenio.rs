@@ -148,7 +148,7 @@ impl<'a> InvenioClient<'a> {
     pub async fn download(&self, url: Url) -> Result<Response, InvenioError> {
         let response = self
             .request(Method::GET, url)?
-            .header("Accept", "application/octet-stream")
+            .header("Accept", "*/*")
             .send()
             .await
             .map_err(|_| InvenioError::Transport)?;
