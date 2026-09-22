@@ -21,6 +21,9 @@ use super::executor::JobContext;
 
 pub(crate) mod export;
 pub(crate) mod import;
+mod query;
+pub(crate) mod reference;
+pub use query::search_records;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
@@ -64,7 +67,7 @@ impl From<async_zip::error::ZipError> for TransferError {
 }
 
 pub(crate) async fn connect<'a>(
-    ctx: &'a JobContext,
+    context: &'a DriverContext,
     auth: &AuthContext,
     group_id: Ulid,
     connector_id: Ulid,
@@ -73,7 +76,7 @@ pub(crate) async fn connect<'a>(
     credential: Option<&InvenioCredential>,
 ) -> Result<InvenioClient<'a>, TransferError> {
     authorize(
-        &ctx.driver,
+        context,
         auth.realm_id,
         auth,
         &format!("/{}/g/{group_id}/data/**", auth.realm_id),
@@ -95,7 +98,7 @@ pub(crate) async fn connect<'a>(
                 group_id,
                 connector_id,
             }),
-            &ctx.driver,
+            context,
         )
         .await
         .map_err(connector_error)?
@@ -109,7 +112,7 @@ pub(crate) async fn connect<'a>(
                 source_path: String::new(),
                 allow_root: true,
             }),
-            &ctx.driver,
+            context,
         )
         .await
         .map_err(|error| match error {
@@ -129,14 +132,12 @@ pub(crate) async fn connect<'a>(
     let endpoint = config
         .get("endpoint")
         .ok_or_else(|| TransferError::Permanent("repository endpoint missing".into()))?;
-    let blob = ctx
-        .driver
+    let blob = context
         .blob_handle
         .as_ref()
         .ok_or_else(|| TransferError::Retryable("blob handle unavailable".into()))?;
     let token = if let Some(credential) = credential {
-        let key = ctx
-            .driver
+        let key = context
             .net_handle
             .as_ref()
             .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?

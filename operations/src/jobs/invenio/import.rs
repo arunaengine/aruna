@@ -9,7 +9,9 @@ use aruna_blob::invenio::InvenioClient;
 use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::invenio::{file_path, import_crate, record_id, validate_id};
+use aruna_core::invenio::{
+    InvenioMode, InvenioOptions, file_path, import_crate, record_id, validate_id,
+};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
 use aruna_core::structs::identity::auth::Permission;
@@ -29,10 +31,11 @@ pub(crate) async fn acquire(
     group_id: Ulid,
     connector_id: Ulid,
     selected: &str,
+    options: &InvenioOptions,
 ) -> Result<ArtifactRef, TransferError> {
     validate_id(selected)?;
     let client = connect(
-        ctx,
+        &ctx.driver,
         &spec.auth_context,
         group_id,
         connector_id,
@@ -41,8 +44,9 @@ pub(crate) async fn acquire(
         None,
     )
     .await?;
-    let records = interruptible(ctx, history(&client, selected, &spec.limits)).await?;
-    let document = import_crate(client.endpoint(), selected, &records)?;
+    let (selected, records) =
+        interruptible(ctx, history(&client, selected, &spec.limits, options)).await?;
+    let document = import_crate(client.endpoint(), &selected, &records)?;
     let metadata = document.to_string();
     if metadata.len() as u64 > spec.limits.metadata_bytes {
         return Err(TransferError::Permanent(
@@ -57,7 +61,14 @@ pub(crate) async fn acquire(
         .ok_or_else(|| TransferError::Retryable("blob handle unavailable".into()))?;
     let write = interruptible(
         ctx,
-        write_archive(&client, writer, &metadata, &records, &spec.limits),
+        write_archive(
+            &client,
+            writer,
+            &metadata,
+            &records,
+            &spec.limits,
+            options.mode,
+        ),
     );
     let spool = blob.send_blob_effect(BlobEffect::SpoolHidden {
         namespace: ctx.job_id.as_ulid(),
@@ -101,31 +112,47 @@ pub(super) async fn history(
     client: &InvenioClient<'_>,
     selected: &str,
     limits: &RoCrateLimits,
-) -> Result<Vec<(Value, Value)>, TransferError> {
+    options: &InvenioOptions,
+) -> Result<(String, Vec<(Value, Value)>), TransferError> {
     let seed = client
         .json(Method::GET, client.url(&["records", selected])?, None)
         .await?;
+    let selected = record_id(&seed)?.to_string();
+    if seed["is_published"] != true {
+        return Err(invalid("record is not published"));
+    }
     let parent = seed["parent"]["id"]
         .as_str()
         .ok_or_else(|| invalid("missing parent identity"))?
         .to_string();
-    let mut next = Some(client.url(&["records", selected, "versions"])?);
+    let mut next = Some(client.url(&["records", &selected, "versions"])?);
     if let Some(url) = &mut next {
         url.query_pairs_mut()
             .append_pair("allversions", "true")
             .append_pair("size", "25");
     }
+    let mut single = if options.all_versions {
+        None
+    } else {
+        next = None;
+        Some(json!({"hits": {"total": 1, "hits": [{"id": selected}]}}))
+    };
     let mut pages = HashSet::new();
     let mut ids = HashSet::new();
     let mut records = Vec::new();
     let mut total = None;
     let mut bytes = 0u64;
     let mut entries = 1u64;
-    while let Some(url) = next.take() {
-        if pages.len() >= 10_000 || !pages.insert(url.as_str().to_string()) {
-            return Err(invalid("version pagination loop or limit"));
-        }
-        let page = client.json(Method::GET, url, None).await?;
+    while single.is_some() || next.is_some() {
+        let page = if let Some(page) = single.take() {
+            page
+        } else {
+            let url = next.take().ok_or_else(|| invalid("missing version page"))?;
+            if pages.len() >= 10_000 || !pages.insert(url.as_str().to_string()) {
+                return Err(invalid("version pagination loop or limit"));
+            }
+            client.json(Method::GET, url, None).await?
+        };
         let count = page["hits"]["total"]
             .as_u64()
             .or_else(|| page["hits"]["total"]["value"].as_u64())
@@ -156,9 +183,13 @@ pub(super) async fn history(
             {
                 return Err(invalid("version identity or publication state changed"));
             }
-            let files = client
-                .json(Method::GET, client.url(&["records", id, "files"])?, None)
-                .await?;
+            let files = if options.mode == InvenioMode::Metadata {
+                json!({"entries": [], "listing_requested": false})
+            } else {
+                client
+                    .json(Method::GET, client.url(&["records", id, "files"])?, None)
+                    .await?
+            };
             if files["links"]["next"]
                 .as_str()
                 .is_some_and(|link| !link.is_empty())
@@ -185,11 +216,11 @@ pub(super) async fn history(
             .map(|link| client.link(link))
             .transpose()?;
     }
-    if Some(records.len() as u64) != total || !ids.contains(selected) {
+    if Some(records.len() as u64) != total || !ids.contains(&selected) {
         return Err(invalid("incomplete repository version history"));
     }
     records.sort_by_key(|(record, _)| record["versions"]["index"].as_u64().unwrap_or(0));
-    Ok(records)
+    Ok((selected, records))
 }
 
 async fn write_archive(
@@ -198,6 +229,7 @@ async fn write_archive(
     metadata: &str,
     records: &[(Value, Value)],
     limits: &RoCrateLimits,
+    mode: InvenioMode,
 ) -> Result<(), TransferError> {
     let mut archive = async_zip::base::write::ZipFileWriter::with_tokio(writer);
     archive
@@ -225,6 +257,14 @@ async fn write_archive(
             let path = file_path(id, key)?;
             if path.len() as u64 > limits.key_bytes || !paths.insert(path.clone()) {
                 return Err(invalid("duplicate or oversized file path"));
+            }
+            if mode == InvenioMode::Reference {
+                let descriptor = json!({"record_id": id, "file": file}).to_string();
+                size = checked_size(size, descriptor.len() as u64, limits.expanded_import_bytes)?;
+                archive
+                    .write_entry_whole(entry(&path), descriptor.as_bytes())
+                    .await?;
+                continue;
             }
             let expected = file["size"]
                 .as_u64()

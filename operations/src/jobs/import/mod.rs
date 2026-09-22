@@ -360,6 +360,16 @@ pub(crate) async fn cleanup_after_panic(
     JobRunOutcome::Failed(JobError::permanent(message))
 }
 
+fn transfer_failure(error: super::invenio::TransferError) -> ImportFailure {
+    use super::invenio::TransferError;
+    match error {
+        TransferError::Permanent(message) => ImportFailure::Permanent(message),
+        TransferError::Retryable(message) => ImportFailure::Retryable(message),
+        TransferError::Cancelled => ImportFailure::Cancelled,
+        TransferError::Interrupted => ImportFailure::Interrupted,
+    }
+}
+
 async fn acquire_source(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
@@ -369,20 +379,18 @@ async fn acquire_source(
             group_id,
             connector_id,
             record_id,
+            options,
         } => {
-            let artifact =
-                super::invenio::import::acquire(ctx, spec, *group_id, *connector_id, record_id)
-                    .await
-                    .map_err(|error| match error {
-                        super::invenio::TransferError::Permanent(message) => {
-                            ImportFailure::Permanent(message)
-                        }
-                        super::invenio::TransferError::Retryable(message) => {
-                            ImportFailure::Retryable(message)
-                        }
-                        super::invenio::TransferError::Cancelled => ImportFailure::Cancelled,
-                        super::invenio::TransferError::Interrupted => ImportFailure::Interrupted,
-                    })?;
+            let artifact = super::invenio::import::acquire(
+                ctx,
+                spec,
+                *group_id,
+                *connector_id,
+                record_id,
+                options,
+            )
+            .await
+            .map_err(transfer_failure)?;
             Ok(ImportInput {
                 location: artifact.location,
                 size: artifact.size,
@@ -840,7 +848,7 @@ async fn write_next(
         row.detail.version_id = Some(entry.version_id);
         write_report(ctx, &row).await?;
     }
-    let body = payload_stream(
+    let mut body = payload_stream(
         ctx,
         &input.location,
         input.size,
@@ -849,6 +857,39 @@ async fn write_next(
         ctx.shutdown.clone(),
     )
     .await?;
+    if super::invenio::reference::is_reference(spec, &entry.path) {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| ImportFailure::Retryable(error.to_string()))?;
+            if bytes.len() as u64 + chunk.len() as u64 > spec.limits.metadata_bytes {
+                return Err(ImportFailure::Permanent(
+                    "reference descriptor exceeds limit".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let descriptor = serde_json::from_slice(&bytes)
+            .map_err(|_| ImportFailure::Permanent("invalid reference descriptor".into()))?;
+        let metadata = super::invenio::reference::write_reference(
+            ctx,
+            spec,
+            bucket_info,
+            &entry.target_key,
+            entry.version_id,
+            &descriptor,
+        )
+        .await
+        .map_err(transfer_failure)?;
+        let arn = entry_arn(spec, ctx.owner_node_id, entry)?;
+        row.detail.size = Some(metadata.content_length);
+        row.detail.arn = Some(arn.to_string());
+        row.detail.w3id = Some(arn.to_w3id());
+        write_report(ctx, &row).await?;
+        queue_import(ctx, spec, entry).await?;
+        checkpoint.imported = checkpoint.imported.saturating_add(1);
+        checkpoint.next_entry = checkpoint.next_entry.saturating_add(1);
+        return Ok(());
+    }
     let quota = drive(
         GetConfigOperation::new(spec.auth_context.realm_id),
         &ctx.driver,
@@ -934,19 +975,29 @@ async fn write_next(
         _ => {}
     }
     checkpoint.next_entry = checkpoint.next_entry.saturating_add(1);
-    let _ = drive(
+    let _ = queue_import(ctx, spec, entry).await;
+    Ok(())
+}
+
+async fn queue_import(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    entry: &ImportEntryPlan,
+) -> Result<(), ImportFailure> {
+    drive(
         LiveVersionOperation::new(LiveVersionInput {
             local_node_id: ctx.owner_node_id,
             auth_context: spec.auth_context.clone(),
             bucket: spec.target.bucket.clone(),
             key: entry.target_key.clone(),
-            version_id: result.version_id,
+            version_id: entry.version_id,
             delete_marker: false,
         }),
         &ctx.driver,
     )
-    .await;
-    Ok(())
+    .await
+    .map(|_| ())
+    .map_err(|error| ImportFailure::Retryable(error.to_string()))
 }
 
 async fn rewrite_crate(
@@ -965,22 +1016,30 @@ async fn rewrite_crate(
         let report = reports
             .get(&entry.path)
             .ok_or_else(|| ImportFailure::Permanent("import report row is missing".to_string()))?;
-        let hash: [u8; 32] = report
-            .detail
-            .blake3
-            .as_deref()
-            .ok_or_else(|| ImportFailure::Permanent("imported hash is missing".to_string()))
-            .and_then(|hash| {
-                hex::decode(hash)
-                    .ok()
-                    .and_then(|hash| hash.try_into().ok())
-                    .ok_or_else(|| ImportFailure::Permanent("imported hash is invalid".to_string()))
-            })?;
+        let w3id = entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id();
+        let hash_w3id = if super::invenio::reference::is_reference(spec, &entry.path) {
+            w3id.clone()
+        } else {
+            let hash: [u8; 32] = report
+                .detail
+                .blake3
+                .as_deref()
+                .ok_or_else(|| ImportFailure::Permanent("imported hash is missing".to_string()))
+                .and_then(|hash| {
+                    hex::decode(hash)
+                        .ok()
+                        .and_then(|hash| hash.try_into().ok())
+                        .ok_or_else(|| {
+                            ImportFailure::Permanent("imported hash is invalid".to_string())
+                        })
+                })?;
+            format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash))
+        };
         targets.insert(
             file_id.clone(),
             RewriteTarget {
-                w3id: entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id(),
-                hash_w3id: format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash)),
+                w3id,
+                hash_w3id,
                 local_path: entry.path.clone(),
             },
         );
