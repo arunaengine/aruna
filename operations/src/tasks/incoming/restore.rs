@@ -814,10 +814,11 @@ impl OperationsTaskHandler {
             self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
         } else {
             match read_outbox_batch(&self.context.storage_handle, None, 1, None).await {
-                Ok(batch) if !batch.records.is_empty() || batch.has_more => {
-                    self.reschedule_timer(retry_key, Duration::ZERO).await;
+                Ok(batch) => {
+                    if let Some(after) = batch.retry_after() {
+                        self.reschedule_timer(retry_key, after).await;
+                    }
                 }
-                Ok(_) => {}
                 Err(error) => {
                     warn!(task_id = ?retry_key, error = %error, "Failed to check for notification outbox records appended during drain");
                     self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;

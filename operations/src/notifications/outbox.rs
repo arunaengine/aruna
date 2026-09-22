@@ -41,6 +41,18 @@ pub struct NotificationOutboxBatch {
     pub next_start_after: Option<Vec<u8>>,
 }
 
+impl NotificationOutboxBatch {
+    pub(crate) fn retry_after(&self) -> Option<Duration> {
+        if !self.records.is_empty() {
+            Some(Duration::ZERO)
+        } else if self.has_more {
+            Some(DELIVERY_RETRY_AFTER)
+        } else {
+            None
+        }
+    }
+}
+
 pub async fn read_outbox_batch(
     storage: &StorageHandle,
     start_after: Option<Vec<u8>>,
@@ -67,9 +79,7 @@ pub async fn read_outbox_batch(
                 match NotificationOutboxRecord::from_bytes(&value) {
                     Ok(record) => records.push((key.to_vec(), record)),
                     Err(error) => {
-                        let key = key.to_vec();
-                        warn!(error = %error, key = ?key, "Deleting malformed notification outbox record");
-                        delete_outbox_records(storage, vec![key]).await?;
+                        warn!(error = %error, key = ?key, "Retaining malformed notification outbox record for recovery");
                     }
                 }
             }
@@ -361,7 +371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_record_deleted() {
+    async fn malformed_record_retained() {
         let (_dir, storage) = temp_storage();
         let valid = record_with_id(Ulid::from_parts(2, 0));
         write_outbox(&storage, &valid).await;
@@ -383,6 +393,7 @@ mod tests {
             .expect("outbox read succeeds");
         assert_eq!(batch.records.len(), 1);
         assert_eq!(batch.records[0].1, valid);
+        assert_eq!(batch.retry_after(), Some(Duration::ZERO));
 
         let stored = match storage
             .send_storage_effect(StorageEffect::Read {
@@ -395,7 +406,82 @@ mod tests {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value.map(|v| v.to_vec()),
             other => panic!("unexpected read event: {other:?}"),
         };
-        assert_eq!(stored, None);
+        assert_eq!(stored, Some(vec![1, 2, 3]));
+
+        delete_outbox_records(
+            &storage,
+            vec![notification_outbox_key(valid.outbox_id).to_vec()],
+        )
+        .await
+        .expect("delivered row removed");
+        let remaining = read_outbox_batch(&storage, None, 1, None).await.unwrap();
+        assert!(remaining.records.is_empty());
+        assert_eq!(remaining.retry_after(), None);
+    }
+
+    #[tokio::test]
+    async fn malformed_prefix_delays() {
+        let (_dir, storage) = temp_storage();
+        let corrupt_keys: Vec<_> = (1..=2)
+            .map(|id| notification_outbox_key(Ulid::from_parts(id, 0)))
+            .collect();
+        for key in &corrupt_keys {
+            let event = storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+                    key: key.clone(),
+                    value: vec![1, 2, 3].into(),
+                    txn_id: None,
+                })
+                .await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+        }
+        let valid = record_with_id(Ulid::from_parts(3, 0));
+        write_outbox(&storage, &valid).await;
+
+        let snapshot = start_read_snapshot(&storage).await;
+        let mut cursor = None;
+        for key in &corrupt_keys {
+            let batch = read_outbox_batch(&storage, cursor, 1, Some(snapshot))
+                .await
+                .unwrap();
+            assert!(batch.records.is_empty());
+            assert_eq!(batch.next_start_after.as_deref(), Some(key.as_ref()));
+            assert_eq!(batch.retry_after(), Some(DELIVERY_RETRY_AFTER));
+            cursor = batch.next_start_after;
+        }
+        let batch = read_outbox_batch(&storage, cursor, 1, Some(snapshot))
+            .await
+            .unwrap();
+        assert_eq!(batch.records[0].1, valid);
+        assert!(!batch.has_more);
+        close_read_snapshot(&storage, snapshot).await;
+
+        delete_outbox_records(
+            &storage,
+            vec![notification_outbox_key(valid.outbox_id).to_vec()],
+        )
+        .await
+        .unwrap();
+        let remaining = read_outbox_batch(&storage, None, 1, None).await.unwrap();
+        assert!(remaining.records.is_empty());
+        assert_eq!(remaining.retry_after(), Some(DELIVERY_RETRY_AFTER));
+        for key in corrupt_keys {
+            let event = storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+                    key,
+                    txn_id: None,
+                })
+                .await;
+            let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                panic!("unexpected retained evidence read: {event:?}");
+            };
+            assert_eq!(value.as_deref(), Some([1, 2, 3].as_slice()));
+        }
     }
 
     async fn recording_task_handle() -> (TaskHandle, mpsc::Receiver<TaskKey>) {
