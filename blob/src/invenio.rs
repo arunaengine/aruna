@@ -12,6 +12,8 @@ use thiserror::Error;
 
 use crate::blob::BlobHandle;
 
+const JSON_ACCEPT: &str = "application/vnd.inveniordm.v1+json, application/json;q=0.9";
+
 #[derive(Debug, Error)]
 pub enum InvenioError {
     #[error("invalid repository URL or cross-origin link")]
@@ -97,10 +99,6 @@ impl<'a> InvenioClient<'a> {
             .blob
             .repository_request(method, url)
             .map_err(|_| InvenioError::Egress)?
-            .header(
-                "Accept",
-                "application/vnd.inveniordm.v1+json, application/json;q=0.9",
-            )
             .timeout(Duration::from_secs(1800));
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
@@ -114,7 +112,10 @@ impl<'a> InvenioClient<'a> {
         url: Url,
         body: Option<&Value>,
     ) -> Result<Value, InvenioError> {
-        let mut request = self.request(method, url)?.timeout(Duration::from_secs(120));
+        let mut request = self
+            .request(method, url)?
+            .header("Accept", JSON_ACCEPT)
+            .timeout(Duration::from_secs(120));
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -163,6 +164,7 @@ impl<'a> InvenioClient<'a> {
     ) -> Result<(), InvenioError> {
         let response = self
             .request(Method::PUT, url)?
+            .header("Accept", JSON_ACCEPT)
             .header("Content-Type", "application/octet-stream")
             .header("Content-Length", size)
             .body(reqwest::Body::wrap_stream(stream))

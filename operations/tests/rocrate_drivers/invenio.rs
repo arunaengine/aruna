@@ -291,6 +291,13 @@ async fn invenio_rejects_corruption() -> Result<(), Box<dyn std::error::Error>> 
         },
     ] {
         let fixture = build_fixture(false).await?;
+        let expected = if repository.corrupt {
+            "checksum"
+        } else if repository.loop_pages {
+            "pagination"
+        } else {
+            "cross-origin"
+        };
         let server = serve(repository).await;
         let connector_id = connector(&fixture, &server).await;
         let spec = spec_with_source(
@@ -304,10 +311,12 @@ async fn invenio_rejects_corruption() -> Result<(), Box<dyn std::error::Error>> 
         );
         let ctx =
             claim_context(&fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
-        assert!(matches!(
-            run_rocrate_import(&ctx, &spec).await,
-            JobRunOutcome::Failed(_)
-        ));
+        match run_rocrate_import(&ctx, &spec).await {
+            JobRunOutcome::Failed(error) => {
+                assert!(error.message.contains(expected), "{}", error.message)
+            }
+            _ => panic!("invalid repository input was accepted"),
+        }
         assert_eq!(hidden_count(&fixture, ctx.job_id.as_ulid()).await?, 0);
         fixture.stop().await;
     }
@@ -407,10 +416,13 @@ async fn invenio_export_recovers() -> Result<(), Box<dyn std::error::Error>> {
         let spec = export_spec(&fixture, &server, true).await?;
         let ctx =
             claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
-        assert!(matches!(
-            run_export_job(&ctx, &spec).await,
-            JobRunOutcome::Failed(_)
-        ));
+        match run_export_job(&ctx, &spec).await {
+            JobRunOutcome::Failed(error) => assert_eq!(
+                error.kind,
+                aruna_core::structs::execution::job::JobErrorKind::Retryable
+            ),
+            _ => panic!("lost repository response did not request a retry"),
+        }
         match run_export_job(&ctx, &spec).await {
             JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) => {
                 assert!(result.repository.unwrap().published);
