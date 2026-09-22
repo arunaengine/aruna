@@ -45,6 +45,28 @@ LFS mappings preserve exact VersionIds when S3 key heads change. Administrative 
 purge can still remove those bytes. Git repository maintenance, cross-node failover and
 full ARC validation remain separate work. Node-local Git files live under `storage_path/git`.
 
+## Metadata representation
+
+Aruna metadata and committed ARC files are currently linked by document ID, without
+automatic conversion between them:
+
+- `POST /api/v1/metadata` creates an RO-Crate from scaffold fields or accepts supplied
+  RO-Crate JSON-LD. Scaffold creation uses RO-Crate 1.3; supplied 1.2/1.3 crates retain
+  their version. The document has a root Dataset and linked data/contextual entities.
+- `GET /api/v1/metadata/{document_id}/rocrate` exports that document's metadata graph.
+- Enabling Git creates an empty bare repository bound to the document and LFS bucket.
+  It does not export the existing graph into the repository or create ISA workbooks.
+- Push stores the submitted files, commits and refs. ISA workbooks and any committed
+  `ro-crate-metadata.json` remain ordinary Git files; the server does not generate or
+  synchronize that JSON-LD file, parse ISA into the graph, or index each commit there.
+- LFS stores payload bytes with SHA-256, size and exact Aruna VersionId bindings. An
+  upload does not automatically add a File entity or `hasPart` link to the RO-Crate.
+
+The integration fixture explicitly generates `ro-crate-metadata.json` using ARCtrl
+before committing it. That is test setup, not automatic server behavior. A future
+commit-to-RO-Crate conversion must preserve commit/branch identity and define how it
+interacts with the editable metadata document before claiming automatic synchronization.
+
 ## ARCitect client patch
 
 `arcitect.patch` applies to ARCitect revision
@@ -79,7 +101,7 @@ and safety hooks, and assigns ephemeral ports to ARCitect's unused auxiliary ser
 
 ```bash
 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
-  uv run --no-project --with-requirements scripts/arc-bridge/requirements.txt \
+  uv run --no-project --with-requirements scripts/arc-native/requirements.txt \
   sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)"; \
     exec nice -n 19 ionice -c3 cargo test --locked -p aruna --no-default-features \
     --test git_native -- --ignored --nocapture'
