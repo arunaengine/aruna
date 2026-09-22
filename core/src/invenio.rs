@@ -182,7 +182,7 @@ pub fn import_crate(
     for (record, files) in records {
         let id = record_id(record)?;
         let dataset_id = format!("versions/{id}/");
-        let source = format!("{}records/{id}", endpoint.trim_end_matches("api/"));
+        let source = format!("{endpoint}records/{id}");
         let mut dataset = record_entity(record, &dataset_id)?;
         dataset["isBasedOn"] = json!({"@id": source});
         let mut children = Vec::new();

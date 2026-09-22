@@ -45,6 +45,10 @@ fn preserves_version_identifiers() {
             .unwrap();
         assert_eq!(version["identifier"][0]["value"], format!("10.1234/{id}"));
         assert_eq!(version["identifier"][1]["value"], "10.1234/all");
+        assert_eq!(
+            version["isBasedOn"]["@id"],
+            format!("https://zenodo.org/api/records/{id}")
+        );
         assert_eq!(version["hasPart"].as_array().unwrap().len(), 2);
     }
     craqle::validate_rocrate_jsonld(&document.to_string()).unwrap();
