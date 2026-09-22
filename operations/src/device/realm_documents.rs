@@ -671,16 +671,86 @@ async fn read_bytes(context: &Arc<DriverContext>, target: DocumentTarget) -> Opt
     }
 }
 
-async fn write_batch(context: &Arc<DriverContext>, writes: Vec<(String, Key, Value)>) -> bool {
+async fn write_batch(context: &Arc<DriverContext>, mut writes: Vec<(String, Key, Value)>) -> bool {
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_DELETE_KEYSPACE};
+    use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
+    let groups: Vec<_> = writes
+        .iter()
+        .filter(|(space, _, _)| space == GROUP_KEYSPACE)
+        .map(|(_, key, _)| (GROUP_DELETE_KEYSPACE.to_string(), key.clone()))
+        .collect();
+    let txn_id = if groups.is_empty() {
+        None
+    } else {
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            return false;
+        };
+        let read = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchRead {
+                reads: groups,
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let closed = match read {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => values
+                .into_iter()
+                .try_fold(BTreeSet::new(), |mut closed, (key, value)| {
+                    if let Some(value) = value {
+                        let record = GroupDeleteRecord::from_bytes(&value)?;
+                        if record.phase == GroupDeletePhase::Deleted {
+                            closed.insert(key);
+                        }
+                    }
+                    Ok::<_, aruna_core::errors::ConversionError>(closed)
+                })
+                .ok(),
+            _ => None,
+        };
+        let Some(closed) = closed else {
+            let _ = context
+                .storage_handle
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return false;
+        };
+        writes.retain(|(space, key, _)| {
+            !matches!(space.as_str(), GROUP_KEYSPACE | AUTH_KEYSPACE) || !closed.contains(key)
+        });
+        Some(txn_id)
+    };
     let event = context
         .storage_handle
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
+        .send_storage_effect(StorageEffect::BatchWrite { writes, txn_id })
         .await;
     if matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
+        if let Some(txn_id) = txn_id {
+            let committed = context
+                .storage_handle
+                .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+                .await;
+            if !matches!(
+                committed,
+                Event::Storage(StorageEvent::TransactionCommitted { .. })
+            ) {
+                let _ = context
+                    .storage_handle
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return false;
+            }
+        }
         return true;
+    }
+    if let Some(txn_id) = txn_id {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
     }
     warn!(event = ?event, "Failed to install the fetched realm documents");
     false
@@ -935,6 +1005,63 @@ mod tests {
             installed_group_docs(&context).await,
             vec![first, renamed],
             "one pair of rows per group, in group-id order"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_stays_deleted() {
+        use aruna_core::structs::identity::group_delete::{
+            GroupDeletePhase, GroupDeletePlan, GroupDeleteRecord,
+        };
+        let (_dir, context) = device(&config(&[1])).await;
+        let mut documents = group_docs(1, "Deleted");
+        let owner = UserId::local(Ulid::from(3), realm());
+        documents.group.owner = owner;
+        documents.authorization =
+            GroupAuthorizationDocument::default_group_doc(owner, realm(), documents.group.group_id);
+        let actor = Actor {
+            node_id: node(1),
+            user_id: owner,
+            realm_id: realm(),
+        };
+        let record = GroupDeleteRecord {
+            plan: GroupDeletePlan {
+                request_id: Ulid::from(2),
+                group_id: documents.group.group_id,
+                realm_id: realm(),
+                owner,
+                requested_by: owner,
+                coordinator: node(1),
+                nodes: BTreeSet::from([node(1)]),
+            },
+            phase: GroupDeletePhase::Deleted,
+            deleted_by: Some(owner),
+            event: None,
+        };
+        assert!(
+            write_batch(
+                &context,
+                vec![(
+                    aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+                    documents.group.group_id.to_bytes().into(),
+                    record.to_bytes().unwrap().into()
+                )]
+            )
+            .await
+        );
+        assert!(
+            install_group_docs(&context, &actor, &documents.group, &documents.authorization).await
+        );
+        assert!(installed_group_docs(&context).await.is_empty());
+        assert!(
+            read_bytes(
+                &context,
+                DocumentTarget::GroupAuthorization {
+                    group_id: documents.group.group_id
+                }
+            )
+            .await
+            .is_none()
         );
     }
 

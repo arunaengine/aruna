@@ -167,6 +167,8 @@ enum PutGroupState {
 #[derive(Debug, Error, PartialEq)]
 pub enum PutGroupError {
     #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
@@ -229,12 +231,14 @@ impl PutGroupOperation {
             Err(err) => return self.fail(err.into()),
         };
         self.state = PutGroupState::WriteRecord;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: STORAGE_ROUTING_KEYSPACE.to_string(),
-            key: routing_key(self.record.group_id),
-            value: value.into(),
-            txn_id: None,
-        })]
+        smallvec![crate::groups::fence::write_group_records(
+            self.record.group_id,
+            vec![(
+                STORAGE_ROUTING_KEYSPACE.to_string(),
+                routing_key(self.record.group_id),
+                value.into(),
+            )]
+        )]
     }
 }
 
@@ -267,13 +271,19 @@ impl Operation for PutGroupOperation {
                 }
             }
             PutGroupState::WriteRecord => {
-                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+                if !matches!(
+                    &event,
+                    Event::SubOperation(aruna_core::events::SubOperationEvent::GroupWritten { .. })
+                ) {
                     return self.fail(PutGroupError::InvalidStateEvent {
                         state: "WriteRecord",
-                        expected: "Event::Storage(StorageEvent::WriteResult)",
+                        expected: "group write result",
                         received: event,
                     });
-                };
+                }
+                if let Err(error) = crate::groups::fence::group_write_result(event) {
+                    return self.fail(error.into());
+                }
                 self.state = PutGroupState::Finish;
                 self.output = Some(Ok(self.record.clone()));
                 smallvec![]
@@ -485,18 +495,24 @@ mod pure_tests {
             SystemTime::UNIX_EPOCH,
         );
 
-        let effects = loaded(&mut operation, BTreeSet::new());
+        let mut effects = loaded(&mut operation, BTreeSet::new());
+        let [Effect::SubOperation(write)] = effects.as_mut_slice() else {
+            panic!("expected a guarded group write");
+        };
+        write.start();
+        write.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([7; 16]),
+        }));
+        let effects = write.step(Event::Storage(StorageEvent::ReadResult {
+            key: group().to_bytes().into(),
+            value: None,
+        }));
 
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
             panic!("expected one record write, got {effects:?}")
+        };
+        let [(key_space, key, value)] = writes.as_slice() else {
+            panic!("expected one record");
         };
         assert_eq!(key_space, STORAGE_ROUTING_KEYSPACE);
         assert_eq!(key, &routing_key(group()));

@@ -4,6 +4,7 @@
 
 pub const AUTH_KEYSPACE: &str = "auth";
 pub const GROUP_KEYSPACE: &str = "groups";
+pub const GROUP_DELETE_KEYSPACE: &str = "group_deletions";
 pub const OWNER_INDEX_KEYSPACE: &str = "group_owner_index";
 pub const REALM_CONFIG_KEYSPACE: &str = "realm_config";
 pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";
@@ -254,6 +255,7 @@ pub const CRAQLE_LOG_KEYSPACE: &str = "log";
 pub const KEYSPACE_CATALOG: &[&str] = &[
     AUTH_KEYSPACE,
     GROUP_KEYSPACE,
+    GROUP_DELETE_KEYSPACE,
     OWNER_INDEX_KEYSPACE,
     REALM_CONFIG_KEYSPACE,
     METADATA_INDEX_KEYSPACE,

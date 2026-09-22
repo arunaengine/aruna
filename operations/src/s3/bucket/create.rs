@@ -29,6 +29,8 @@ pub enum CreateBucketState {
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateBucketError {
     #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
@@ -108,20 +110,18 @@ impl CreateBucketOperation {
 
         self.txn_id = Some(txn_id);
         self.state = CreateBucketState::CheckExists;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.bucket.as_bytes().into(),
-            txn_id: Some(txn_id),
-        })]
+        smallvec![crate::groups::fence::read_group_record(
+            self.bucket_info.group_id,
+            S3_BUCKET_KEYSPACE,
+            self.bucket.as_bytes().into(),
+            txn_id,
+        )]
     }
 
     fn handle_bucket_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(CreateBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
+        let value = match crate::groups::fence::parse_group_record(event) {
+            Ok(value) => value,
+            Err(error) => return self.emit_error(error.into()),
         };
 
         if value.is_some() {

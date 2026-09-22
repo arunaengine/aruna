@@ -119,12 +119,10 @@ impl ReplaceSourceOperation {
             return self.emit_error(error.into());
         }
 
-        self.state = ReplaceSourceState::ReadCurrent;
-        smallvec![read_connector_effect(
-            self.input.group_id,
-            self.input.connector_id,
-            None,
-        )]
+        self.state = ReplaceSourceState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn handle_current_read(&mut self, event: Event) -> Effects {
@@ -132,10 +130,10 @@ impl ReplaceSourceOperation {
             Ok(Some(existing)) => {
                 self.prepare_replacement(existing);
                 self.state = ReplaceSourceState::ReadSecret;
-                smallvec![read_secret_effect(self.input.connector_id, None)]
+                smallvec![read_secret_effect(self.input.connector_id, self.txn_id)]
             }
-            Ok(None) => self.emit_error(ReplaceSourceError::NotFound),
-            Err(error) => self.emit_error(error.into()),
+            Ok(None) => self.fail_or_abort(ReplaceSourceError::NotFound),
+            Err(error) => self.fail_or_abort(error.into()),
         }
     }
 
@@ -161,14 +159,11 @@ impl ReplaceSourceOperation {
     fn handle_secret_read(&mut self, event: Event) -> Effects {
         let current_secret = match parse_secret_read(event) {
             Ok(secret) => secret,
-            Err(error) => return self.emit_error(error.into()),
+            Err(error) => return self.fail_or_abort(error.into()),
         };
 
         if secret_config_changed(current_secret.as_ref(), self.replacement_secret.as_ref()) {
-            self.state = ReplaceSourceState::StartTransaction;
-            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })];
+            return self.scan_reference_versions(None);
         }
 
         self.write_records()
@@ -178,7 +173,12 @@ impl ReplaceSourceOperation {
         match event {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                 self.txn_id = Some(txn_id);
-                self.scan_reference_versions(None)
+                self.state = ReplaceSourceState::ReadCurrent;
+                smallvec![read_connector_effect(
+                    self.input.group_id,
+                    self.input.connector_id,
+                    Some(txn_id),
+                )]
             }
             Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
             received => self.emit_error(ReplaceSourceError::InvalidStateEvent {
@@ -590,6 +590,7 @@ mod tests {
             secret_config: HashMap::new(),
         });
         operation.state = ReplaceSourceState::ReadSecret;
+        operation.txn_id = Some(txn_id);
         operation.replacement = Some(replacement_connector(group_id, connector_id));
         operation.replacement_secret = Some(connector_secret(connector_id, "bob"));
 
@@ -602,14 +603,6 @@ mod tests {
                     .into(),
             ),
         }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Iter { txn_id: Some(scan_txn), .. })]

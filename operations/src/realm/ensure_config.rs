@@ -19,6 +19,7 @@ use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::group_delete::MembershipFence;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::record::{
     BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
@@ -52,6 +53,7 @@ pub struct EnsureConfigParams {
 #[derive(Debug, PartialEq)]
 pub struct EnsureConfigOperation {
     config: EnsureConfigParams,
+    membership: MembershipFence,
     txn_id: Option<TxnId>,
     state: EnsureConfigState,
     output: Option<Result<RealmConfigDocument, EnsureConfigError>>,
@@ -92,6 +94,8 @@ enum EnsureConfigState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EnsureConfigError {
+    #[error("realm membership is frozen while group deletion is pending")]
+    DeletionPending,
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -124,6 +128,7 @@ impl EnsureConfigOperation {
     pub fn new(config: EnsureConfigParams) -> Self {
         Self {
             config,
+            membership: MembershipFence::default(),
             txn_id: None,
             state: EnsureConfigState::Init,
             output: None,
@@ -156,6 +161,10 @@ impl EnsureConfigOperation {
                 (
                     DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
+                ),
+                (
+                    aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+                    MembershipFence::key(self.config.actor.realm_id)
                 ),
             ],
             txn_id: Some(txn_id),
@@ -403,6 +412,9 @@ impl EnsureConfigOperation {
                 &self.config.target_node_kind,
             )
         });
+        if !node_is_noop && !self.membership.pending.is_empty() {
+            return Err(EnsureConfigError::DeletionPending);
+        }
         let resources = self.plan_resources(&document, &reducer_state, fresh)?;
         if node_is_noop
             && resources.range_is_noop
@@ -516,12 +528,22 @@ impl Operation for EnsureConfigOperation {
             },
             EnsureConfigState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
+                    let [
+                        (_, document_value),
+                        (_, reducer_state_value),
+                        (_, membership),
+                    ] = values.as_slice()
+                    else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
                             format!("{values:?}"),
                         );
                     };
+                    let membership = match MembershipFence::from_value(membership.as_deref()) {
+                        Ok(fence) => fence,
+                        Err(error) => return self.fail(error.into()),
+                    };
+                    self.membership = membership;
                     match self
                         .emit_document_write(document_value.clone(), reducer_state_value.clone())
                     {

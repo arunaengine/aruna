@@ -609,6 +609,10 @@ pub(in crate::document_sync) async fn validate_group_authority(
         ));
     }
 
+    if previous_state.is_some_and(AdminDocumentState::group_deleted) {
+        return Ok(AdminEventValidation::Accepted);
+    }
+
     let group_value = storage_read_from(
         storage,
         GROUP_KEYSPACE.to_string(),
@@ -653,6 +657,39 @@ pub(in crate::document_sync) async fn validate_group_authority(
         return Ok(AdminEventValidation::Rejected(
             "stored group identity does not match the event".to_string(),
         ));
+    }
+    if let AdminDocumentOperation::GroupDeleted { certificate } = &event.op
+        && certificate.plan.owner != group.owner
+    {
+        return Ok(AdminEventValidation::Rejected(
+            "deletion owner does not match the group".into(),
+        ));
+    }
+    if let AdminDocumentOperation::GroupDeleted { certificate } = &event.op
+        && certificate.plan.requested_by == event.actor.user_id
+        && certificate.verify()
+    {
+        use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
+        let prepared = storage_read_from(
+            storage,
+            aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+        )
+        .await?
+        .map(|value| GroupDeleteRecord::from_bytes(&value))
+        .transpose()
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        if certificate.plan.matches_config(&config)
+            || prepared.is_some_and(|record| {
+                record.plan == certificate.plan && record.phase == GroupDeletePhase::Preparing
+            })
+        {
+            return Ok(AdminEventValidation::Accepted);
+        }
+        return Ok(AdminEventValidation::Deferred {
+            dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
+            reason: "deletion participant set has not synchronized".into(),
+        });
     }
     if let AdminDocumentOperation::GroupJoinRequested { request } = &event.op {
         if request.user_id != event.actor.user_id || request.group_id != group_id {
@@ -777,7 +814,8 @@ pub(in crate::document_sync) async fn validate_group_authority(
         AdminDocumentOperation::GroupPoliciesSet { .. } => {
             vec![format!("/{realm_id}/g/{group_id}/admin/config")]
         }
-        AdminDocumentOperation::DisplayNameSet { .. } => vec![
+        AdminDocumentOperation::DisplayNameSet { .. }
+        | AdminDocumentOperation::GroupDeleted { .. } => vec![
             format!("/{realm_id}/g/{group_id}/admin"),
             format!("/{realm_id}/admin/groups"),
         ],
@@ -1270,6 +1308,22 @@ fn validate_role_assignment(event: &AdminDocumentEvent) -> std::result::Result<(
 fn validate_group_shape(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
     validate_role_assignment(event)?;
     match &event.op {
+        AdminDocumentOperation::GroupDeleted { certificate } => {
+            let AdminDocumentTarget::Group { group_id } = event.target else {
+                return Err("deletion target must be a group".into());
+            };
+            if certificate.plan.group_id != group_id
+                || certificate.plan.realm_id != event.actor.realm_id
+                || certificate.plan.owner.realm_id != event.actor.realm_id
+                || certificate.plan.coordinator != event.origin_node_id
+                || certificate.plan.requested_by != event.actor.user_id
+                || certificate.plan.request_id.is_nil()
+                || !certificate.plan.nodes.contains(&event.origin_node_id)
+                || !certificate.verify()
+            {
+                return Err("group deletion certificate is invalid".into());
+            }
+        }
         AdminDocumentOperation::GroupCreated {
             realm_id, owner, ..
         } => {
@@ -1480,6 +1534,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::GroupRoleCreated { .. }
         | AdminDocumentOperation::GroupRoleRemoved { .. }
         | AdminDocumentOperation::GroupCreated { .. }
+        | AdminDocumentOperation::GroupDeleted { .. }
         | AdminDocumentOperation::DisplayNameSet { .. }
         | AdminDocumentOperation::GroupPoliciesSet { .. }
         | AdminDocumentOperation::GroupJoinRequested { .. }

@@ -6,9 +6,8 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::Event;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
@@ -46,6 +45,8 @@ pub enum SourceConnectorState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum SourceConnectorError {
+    #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -137,20 +138,16 @@ impl SourceConnectorOperation {
         self.connector = Some(connector);
         self.secret = secret;
         self.state = SourceConnectorState::WriteRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })]
+        smallvec![crate::groups::fence::write_group_records(
+            self.input.group_id,
+            writes
+        )]
     }
 
     fn handle_records_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.emit_error(SourceConnectorError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
-            });
-        };
+        if let Err(error) = crate::groups::fence::group_write_result(event) {
+            return self.emit_error(error.into());
+        }
 
         let Some(connector) = self.connector.clone() else {
             return self.emit_error(SourceConnectorError::CreateConnectorFailed);

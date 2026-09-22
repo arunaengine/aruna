@@ -48,6 +48,8 @@ pub const MAX_SUBMISSION_SCAN: usize = 512;
 #[derive(Debug, PartialEq, Error)]
 pub enum LifecycleError {
     #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),

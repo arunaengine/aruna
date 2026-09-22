@@ -333,7 +333,8 @@ pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
         LifecycleError::Storage(storage) if storage.proves_no_commit() => CommitVerdict::Retry,
         LifecycleError::Storage(_) => CommitVerdict::Uncertain,
         LifecycleError::NotHolder | LifecycleError::RealmConfigMissing => CommitVerdict::Drained,
-        LifecycleError::Conversion(_)
+        LifecycleError::GroupWrite(_)
+        | LifecycleError::Conversion(_)
         | LifecycleError::Record(_)
         | LifecycleError::Family(_)
         | LifecycleError::Store(_)

@@ -17,7 +17,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::harvest::oai_pmh::request::{normalize_metadata_prefix, normalize_set};
-use crate::harvest::repository::{StorageReadError, read_connector_effect, write_source_effect};
+use crate::harvest::repository::{StorageReadError, read_connector_effect};
 use crate::harvest::target_path::{normalize_target_prefix, prefix_is_blank};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +42,8 @@ enum State {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateSourceError {
+    #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -167,23 +169,27 @@ impl CreateSourceOperation {
             SystemTime::now(),
             self.input.created_by,
         );
-        let write = match write_source_effect(&source, None) {
-            Ok(write) => write,
+        let value = match source.to_bytes() {
+            Ok(value) => value,
             Err(error) => return self.emit_error(error.into()),
         };
+        let write = crate::groups::fence::write_group_records(
+            self.input.group_id,
+            vec![(
+                aruna_core::keyspaces::HARVEST_SOURCE_KEYSPACE.to_string(),
+                crate::harvest::repository::source_key(source.group_id, source.source_id),
+                value.into(),
+            )],
+        );
         self.source = Some(source);
         self.state = State::WriteSource;
         smallvec![write]
     }
 
     fn handle_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(CreateSourceError::InvalidStateEvent {
-                state: format!("{:?}", self.state),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: event,
-            });
-        };
+        if let Err(error) = crate::groups::fence::group_write_result(event) {
+            return self.emit_error(error.into());
+        }
         let Some(source) = self.source.clone() else {
             return self.emit_error(CreateSourceError::Failed);
         };

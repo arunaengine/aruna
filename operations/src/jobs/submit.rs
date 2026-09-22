@@ -75,6 +75,8 @@ pub struct SubmitJobResult {
 #[derive(Debug, Error, PartialEq)]
 pub enum SubmitJobError {
     #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
@@ -109,6 +111,9 @@ pub enum SubmitJobError {
 enum SubmitState {
     Init,
     StartTransaction,
+    GroupFence {
+        txn_id: TxnId,
+    },
     ReadDedup {
         txn_id: TxnId,
     },
@@ -137,6 +142,7 @@ enum SubmitState {
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,
+    group_checked: bool,
     active_cap: Option<u32>,
     state: SubmitState,
     output: Option<Result<SubmitJobResult, SubmitJobError>>,
@@ -173,6 +179,7 @@ impl SubmitJobOperation {
         }
         Self {
             record,
+            group_checked: false,
             active_cap,
             state: SubmitState::Init,
             output: None,
@@ -181,6 +188,7 @@ impl SubmitJobOperation {
 
     fn fail(&mut self, error: SubmitJobError) -> Effects {
         let txn_id = match self.state {
+            SubmitState::GroupFence { txn_id } => Some(txn_id),
             SubmitState::ReadDedup { txn_id }
             | SubmitState::VerifyDedup { txn_id, .. }
             | SubmitState::CheckActive { txn_id }
@@ -196,6 +204,7 @@ impl SubmitJobOperation {
     }
 
     fn start_transaction(&mut self) -> Effects {
+        self.group_checked = false;
         self.state = SubmitState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
@@ -203,7 +212,10 @@ impl SubmitJobOperation {
     }
 
     fn begin(&mut self) -> Effects {
-        if self.record.dedup_key.is_some() || self.active_cap.is_some() {
+        if self.record.dedup_key.is_some()
+            || self.active_cap.is_some()
+            || self.record.payload.owner_group().is_some()
+        {
             self.start_transaction()
         } else {
             self.write_job(None)
@@ -259,6 +271,20 @@ impl SubmitJobOperation {
     }
 
     fn write_job(&mut self, txn_id: Option<TxnId>) -> Effects {
+        if !self.group_checked
+            && let Some(group_id) = self.record.payload.owner_group()
+        {
+            let Some(txn_id) = txn_id else {
+                return self.start_transaction();
+            };
+            self.state = SubmitState::GroupFence { txn_id };
+            let (key_space, key) = crate::groups::fence::group_fence_key(group_id);
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: Some(txn_id)
+            })];
+        }
         let writes = match job_insert_entries(&self.record) {
             Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
@@ -333,6 +359,21 @@ impl Operation for SubmitJobOperation {
             SubmitState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.read_dedup(txn_id)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
+            SubmitState::GroupFence { txn_id } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    match aruna_core::structs::identity::group_delete::check_group_write(
+                        value.as_deref(),
+                    ) {
+                        Ok(()) => {
+                            self.group_checked = true;
+                            self.write_job(Some(txn_id))
+                        }
+                        Err(error) => self.fail(error.into()),
+                    }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
@@ -440,6 +481,7 @@ impl Operation for SubmitJobOperation {
 
     fn abort(&mut self) -> Effects {
         let txn_id = match self.state {
+            SubmitState::GroupFence { txn_id } => Some(txn_id),
             SubmitState::ReadDedup { txn_id }
             | SubmitState::VerifyDedup { txn_id, .. }
             | SubmitState::CheckActive { txn_id }

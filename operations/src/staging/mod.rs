@@ -39,6 +39,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
         Event::Net(_) => "Event::Net".to_string(),
         Event::Metadata(_) => "Event::Metadata".to_string(),
         Event::SubOperation(suboperation_event) => match suboperation_event {
+            SubOperationEvent::GroupWritten { .. } => {
+                "Event::SubOperation(SubOperationEvent::GroupWritten)".to_string()
+            }
             SubOperationEvent::DepthLimitExceeded { .. } => {
                 "Event::SubOperation(SubOperationEvent::DepthLimitExceeded)".to_string()
             }

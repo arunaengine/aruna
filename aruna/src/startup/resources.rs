@@ -334,6 +334,38 @@ async fn fill(
         }
     };
     stopped(stop)?;
+    if matches!(
+        config.startup_mode,
+        crate::config::StartupMode::JoinRealm {
+            phase: aruna_core::onboarding::OnboardingPhase::Bootstrapped
+        }
+    ) {
+        let ticket = config
+            .node_state
+            .onboarding_sync_ticket
+            .as_deref()
+            .ok_or("missing onboarding sync ticket")?;
+        let ticket = aruna_core::onboarding::OnboardingTicket::decode(ticket)?;
+        let context = DriverContext {
+            storage_handle: acquired.storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        aruna_operations::groups::deletion::install_onboarding(
+            &context,
+            &ticket,
+            config.realm_id,
+            config.node_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        )
+        .await?;
+        stopped(stop)?;
+    }
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: config.p2p_addr,

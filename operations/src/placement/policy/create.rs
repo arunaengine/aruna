@@ -79,6 +79,8 @@ struct PendingPublication {
 #[derive(Debug, Error, PartialEq)]
 pub enum CreatePolicyError {
     #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
@@ -143,14 +145,18 @@ impl CreatePolicyOperation {
             realm_id: self.config.actor.realm_id,
         };
         let target = self.target();
+        let mut reads = vec![
+            (
+                config_target.storage_keyspace().to_string(),
+                config_target.storage_key(),
+            ),
+            (target.storage_keyspace().to_string(), target.storage_key()),
+        ];
+        if let Some(group_id) = self.config.policy.owner_group_id {
+            reads.push(crate::groups::fence::group_fence_key(group_id));
+        }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    config_target.storage_keyspace().to_string(),
-                    config_target.storage_key(),
-                ),
-                (target.storage_keyspace().to_string(), target.storage_key()),
-            ],
+            reads,
             txn_id: Some(txn_id),
         })]
     }
@@ -367,12 +373,29 @@ impl Operation for CreatePolicyOperation {
             },
             CreatePolicyState::ReadConfig => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, config_value), (_, policy_value)] = values.as_slice() else {
+                    let [(_, config_value), (_, policy_value), tail @ ..] = values.as_slice()
+                    else {
                         return self.unexpected_event(
                             "realm config and policy row",
                             format!("{values:?}"),
                         );
                     };
+                    match (self.config.policy.owner_group_id, tail) {
+                        (Some(_), [(_, value)]) => {
+                            if let Err(error) =
+                                aruna_core::structs::identity::group_delete::check_group_write(
+                                    value.as_deref(),
+                                )
+                            {
+                                return self.fail(error.into());
+                            }
+                        }
+                        (None, []) => {}
+                        _ => {
+                            return self
+                                .unexpected_event("group deletion fence", format!("{values:?}"));
+                        }
+                    }
                     match self.plan_write(config_value.clone(), policy_value.clone()) {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),

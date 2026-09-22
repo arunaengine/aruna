@@ -8,9 +8,10 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::USER_KEYSPACE;
+use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Key};
 use ed25519_dalek::SigningKey;
@@ -37,6 +38,7 @@ pub struct IssueSyncOperation {
     input: IssueSyncInput,
     state: IssueSyncState,
     documents: Vec<DocumentTarget>,
+    deletions: Vec<GroupDeleteRecord>,
     next_start_after: Option<Key>,
     output: Option<Result<OnboardingTicket, IssueSyncError>>,
 }
@@ -45,6 +47,8 @@ pub struct IssueSyncOperation {
 enum IssueSyncState {
     Init,
     ListUsers,
+    ListDeletions,
+    Persist,
     Finish,
     Error,
 }
@@ -94,6 +98,7 @@ impl IssueSyncOperation {
             input,
             state: IssueSyncState::Init,
             documents,
+            deletions: Vec::new(),
             next_start_after: None,
             output: None,
         }
@@ -110,13 +115,25 @@ impl IssueSyncOperation {
         })]
     }
 
+    fn list_deletions(&mut self) -> Effects {
+        self.state = IssueSyncState::ListDeletions;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: GROUP_DELETE_KEYSPACE.to_string(),
+            prefix: None,
+            start: self.next_start_after.take().map(IterStart::After),
+            limit: TICKET_PAGE_SIZE,
+            txn_id: None,
+        })]
+    }
+
     fn finish(&mut self) -> Effects {
-        match OnboardingTicket::issue(
+        match OnboardingTicket::issue_with_deletions(
             &self.input.realm_signing_key,
             &self.input.realm_id,
             self.input.node_id,
             self.input.now.saturating_add(self.input.ttl_secs),
             std::mem::take(&mut self.documents),
+            std::mem::take(&mut self.deletions),
         ) {
             Ok(ticket) => {
                 self.state = IssueSyncState::Finish;
@@ -165,13 +182,56 @@ impl Operation for IssueSyncOperation {
                         self.next_start_after = Some(next_start_after);
                         self.emit_list_users()
                     } else {
-                        self.finish()
+                        self.list_deletions()
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(IssueSyncError::UnexpectedEvent {
                     state: format!("{:?}", self.state),
                     expected: "storage iter result",
+                    got: format!("{other:?}"),
+                }),
+            },
+            IssueSyncState::ListDeletions => match event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    for (key, value) in values {
+                        if key.len() != 16 {
+                            continue;
+                        }
+                        let record = match GroupDeleteRecord::from_bytes(&value) {
+                            Ok(record) => record,
+                            Err(error) => return self.fail(error.into()),
+                        };
+                        if record.plan.realm_id == self.input.realm_id
+                            && record.phase == GroupDeletePhase::Deleted
+                        {
+                            self.deletions.push(record);
+                        }
+                    }
+                    self.next_start_after = next_start_after;
+                    if self.next_start_after.is_some() {
+                        self.list_deletions()
+                    } else {
+                        self.state = IssueSyncState::Persist;
+                        smallvec![Effect::Storage(StorageEffect::SyncAll)]
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(IssueSyncError::UnexpectedEvent {
+                    state: format!("{:?}", self.state),
+                    expected: "deletion records",
+                    got: format!("{other:?}"),
+                }),
+            },
+            IssueSyncState::Persist => match event {
+                Event::Storage(StorageEvent::SyncAllFinished) => self.finish(),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(IssueSyncError::UnexpectedEvent {
+                    state: format!("{:?}", self.state),
+                    expected: "durable deletion records",
                     got: format!("{other:?}"),
                 }),
             },
@@ -225,12 +285,21 @@ mod tests {
         });
 
         assert_eq!(operation.start().len(), 1);
+        for _ in 0..2 {
+            assert_eq!(
+                operation
+                    .step(Event::Storage(StorageEvent::IterResult {
+                        values: Vec::new(),
+                        next_start_after: None,
+                    }))
+                    .len(),
+                1
+            );
+            assert!(!operation.is_complete());
+        }
         assert!(
             operation
-                .step(Event::Storage(StorageEvent::IterResult {
-                    values: Vec::new(),
-                    next_start_after: None,
-                }))
+                .step(Event::Storage(StorageEvent::SyncAllFinished))
                 .is_empty()
         );
         let ticket = operation.finalize().unwrap();

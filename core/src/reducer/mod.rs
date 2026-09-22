@@ -68,6 +68,8 @@ pub enum AdminDocumentError {
     UnsupportedTarget,
     #[error("invalid group join request or decision")]
     InvalidJoinRequest,
+    #[error("group deletion certificate is invalid")]
+    InvalidGroupDeletion,
     #[error(transparent)]
     InvalidUserAttribute(#[from] UserAttributeError),
     #[error("placement labels must not set the derived label `{0}`")]
@@ -173,6 +175,28 @@ pub fn decode_reducer_state(bytes: &[u8]) -> Result<AdminDocumentState, postcard
 }
 
 impl AdminDocumentState {
+    pub fn group_deleted(&self) -> bool {
+        self.user_subject_ids.contains_key(GROUP_DELETED_PATH)
+            || self.conflicts.contains_key(GROUP_DELETED_PATH)
+    }
+
+    pub fn group_deletion(
+        &self,
+    ) -> Option<crate::structs::identity::group_delete::GroupDeleteRecord> {
+        self.user_subject_ids
+            .get(GROUP_DELETED_PATH)
+            .and_then(|version| version.value.as_deref())
+            .into_iter()
+            .chain(
+                self.conflicts
+                    .get(GROUP_DELETED_PATH)
+                    .into_iter()
+                    .flat_map(|conflict| &conflict.values)
+                    .filter_map(|version| version.value.as_deref()),
+            )
+            .find_map(|value| serde_json::from_str(value).ok())
+    }
+
     pub fn new(target: AdminDocumentTarget) -> Self {
         Self {
             target,

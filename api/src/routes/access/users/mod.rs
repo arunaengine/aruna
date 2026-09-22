@@ -1751,6 +1751,9 @@ async fn evict_node(
             ServerError::NotFound
         }
         RemoveNodeError::NotManagementNode => ServerError::Forbidden,
+        RemoveNodeError::DeletionPending => {
+            ServerError::Conflict("group deletion is pending; retry device removal".into())
+        }
         other => ServerError::InternalError(other.to_string()),
     })?;
     Ok(())

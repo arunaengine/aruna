@@ -16,6 +16,7 @@ use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::group_delete::MembershipFence;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
@@ -80,6 +81,8 @@ enum RemoveNodeState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum RemoveNodeError {
+    #[error("realm membership is frozen while group deletion is pending")]
+    DeletionPending,
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -140,6 +143,10 @@ impl RemoveNodeOperation {
                 (
                     DOCUMENT_STATE_KEYSPACE.to_string(),
                     reducer_state_key(&target),
+                ),
+                (
+                    aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+                    MembershipFence::key(self.config.actor.realm_id)
                 ),
             ],
             txn_id: Some(txn_id),
@@ -291,12 +298,24 @@ impl Operation for RemoveNodeOperation {
             },
             RemoveNodeState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
+                    let [
+                        (_, document_value),
+                        (_, reducer_state_value),
+                        (_, membership),
+                    ] = values.as_slice()
+                    else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
                             format!("{values:?}"),
                         );
                     };
+                    let membership = match MembershipFence::from_value(membership.as_deref()) {
+                        Ok(fence) => fence,
+                        Err(error) => return self.fail(error.into()),
+                    };
+                    if !membership.pending.is_empty() {
+                        return self.fail(RemoveNodeError::DeletionPending);
+                    }
                     match self
                         .emit_removal_writes(document_value.clone(), reducer_state_value.clone())
                     {

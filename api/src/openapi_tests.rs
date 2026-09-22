@@ -52,6 +52,7 @@ const OPTIONAL_AUTH: &[(&str, &str)] = &[
 /// Operations that reject an anonymous caller.
 const REQUIRED_AUTH: &[(&str, &str)] = &[
     ("/access/users/register", "post"),
+    ("/access/groups/{id}", "delete"),
     ("/metadata", "post"),
     ("/metadata/{document_id}", "delete"),
     ("/metadata/references", "get"),

@@ -610,6 +610,22 @@ impl ExecutionSpec {
 }
 
 impl JobPayload {
+    pub fn owner_group(&self) -> Option<GroupId> {
+        match self {
+            Self::Execution(spec) => Some(spec.group_id),
+            Self::Staging(spec) => Some(spec.group_id),
+            Self::ImportRoCrate(spec) => Some(spec.metadata.group_id),
+            Self::Harvest(spec) => Some(spec.group_id),
+            Self::StoragePurge(spec) => Some(spec.group_id),
+            Self::CopyObject(spec) => Some(spec.group_id),
+            Self::Probe { .. }
+            | Self::WriteRunCrate { .. }
+            | Self::TerminalCleanup { .. }
+            | Self::ExportRoCrate(_)
+            | Self::MintPersistentId(_) => None,
+        }
+    }
+
     /// Stable discriminant string. Payload internals are never echoed verbatim.
     pub fn kind(&self) -> &'static str {
         match self {

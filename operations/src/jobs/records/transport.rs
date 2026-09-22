@@ -376,6 +376,14 @@ async fn accept_record(
     )
     .await
     .map_err(|error| {
+        if matches!(
+            error,
+            super::RecordStoreError::GroupWrite(
+                aruna_core::structs::identity::group_delete::GroupWriteError::Deleted
+            )
+        ) {
+            return ServeError::Refused(JobRecordRejection::Unauthorized);
+        }
         warn!(error = %error, "Job record append failed");
         ServeError::Unavailable
     })?;
