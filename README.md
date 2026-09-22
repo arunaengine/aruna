@@ -27,7 +27,7 @@
 </p>
 
 > [!NOTE]
-> **Aruna v3 is now in public testing.** You can try it out and share feedback through [GitHub issues](https://github.com/arunaengine/aruna/issues). Aruna v2 remains available on the [v2 branch](https://github.com/arunaengine/aruna/tree/v2).
+> **Aruna v3 is now in public testing.** You can [try it out](https://v3.aruna-engine.org) and share feedback through [GitHub issues](https://github.com/arunaengine/aruna/issues). Aruna v2 remains available on the [v2 branch](https://github.com/arunaengine/aruna/tree/v2).
 
 Aruna helps organizations share and organize research data and metadata while keeping control of their own infrastructure. Each organization runs its own node and connects with others through a peer-to-peer network.
 
