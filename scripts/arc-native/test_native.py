@@ -6,8 +6,10 @@ import datetime
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -47,17 +49,55 @@ def http(url, method="GET", body=None, token=None):
         return error.code, error.read()
 
 
+def wait_snapshot(url, previous):
+    deadline = time.monotonic() + 300
+    while True:
+        status, body = http(url + "/git")
+        assert status in (200, 503), body
+        if status == 200:
+            updated = json.loads(body)
+            assert updated["error"] is None, updated
+            if updated["commit"] != previous:
+                return updated["commit"]
+        assert time.monotonic() < deadline, "metadata snapshot did not advance"
+        time.sleep(0.1)
+
+
 def exercise(root):
     url = os.environ["ARUNA_GIT_URL"]
+    metadata_url = os.environ["ARUNA_API_URL"] + "/api/v1/metadata/" + os.environ["ARUNA_DOCUMENT_ID"]
     source = root / "source"
-    scaffold(source)
     askpass = root / "askpass"
     askpass.write_text('#!/bin/sh\ncase "$1" in *Username*) printf "aruna\\n";; *) printf "%s\\n" "$ARUNA_TOKEN";; esac\n')
     askpass.chmod(0o700)
     env = dict(os.environ, GIT_ASKPASS=str(askpass), GIT_TERMINAL_PROMPT="0")
-    command(source, env, "init", "--initial-branch=main")
+    command(root, env, "clone", url, str(source))
+    initial = command(source, env, "rev-parse", "HEAD").decode().strip()
+    assert command(source, env, "log", "-1", "--format=%G?").strip() == b"G"
+    assert (source / "isa.investigation.xlsx").is_file()
+    assert (source / "ro-crate-metadata.json").is_file()
+    generated = json.loads((source / "ro-crate-metadata.json").read_text())
+    generated_root = next(item for item in generated["@graph"] if item.get("@id") == "./")
+    assert generated_root["license"] == {"@id": "https://creativecommons.org/licenses/by/4.0/"}
+    assert not list(source.glob("studies/*/isa.study.xlsx"))
+    assert not list(source.glob("assays/*/isa.assay.xlsx"))
+    original_metadata = json.loads((source / "aruna-metadata.json").read_text())
+    for _ in range(2):
+        status, body = http(metadata_url + "/git")
+        assert status == 200 and json.loads(body)["commit"] == initial
+    assert http(metadata_url + "/git", "POST", {"bucket": os.environ["ARUNA_BUCKET"], "arc": False})[0] == 400
+    descriptor = next(item for item in original_metadata["@graph"] if item.get("@id") == "ro-crate-metadata.json")
+    dataset = next(item for item in original_metadata["@graph"] if item.get("@id") == descriptor["about"]["@id"])
+    dataset["name"] = "First metadata update"
+    assert http(metadata_url + "/rocrate", "PUT", {"rocrate": original_metadata})[0] == 200
+    initial = wait_snapshot(metadata_url, initial)
+    assert initial in command(source, env, "ls-remote", "origin", "refs/heads/main").decode()
+    command(source, env, "pull", "--ff-only", "origin", "main")
+    original_metadata = json.loads((source / "aruna-metadata.json").read_text())
+    fixture = root / "fixture"
+    scaffold(fixture)
+    shutil.copytree(fixture, source, dirs_exist_ok=True)
     command(source, env, "lfs", "install", "--local", "--skip-repo")
-    command(source, env, "remote", "add", "origin", url)
     command(source, env, "add", ".gitattributes", "isa.investigation.xlsx", "ro-crate-metadata.json", "studies", "assays", "runs", "workflows")
     first = commit(source, env, "test: create native ARC revision")
     payload = "assays/assay/dataset/measurements.bin"
@@ -115,6 +155,24 @@ def exercise(root):
     command(source, env, "push", "origin", ":refs/heads/feature", ":refs/tags/snapshot")
     assert not command(source, env, "ls-remote", "origin", "refs/heads/feature", "refs/tags/snapshot")
     print("PASS: multiple branches, lightweight/signed annotated tags and ref deletion", flush=True)
+
+    command(source, env, "push", "origin", "main:aruna", success=False)
+    status, body = http(metadata_url + "/git/rocrate?revision=" + first)
+    assert status == 200
+    exported = json.loads(body)
+    assert exported["commit"] == first
+    assert any(item.get("additionalType") == "Study" for item in exported["rocrate"]["@graph"])
+    descriptor = next(item for item in original_metadata["@graph"] if item.get("@id") == "ro-crate-metadata.json")
+    dataset = next(item for item in original_metadata["@graph"] if item.get("@id") == descriptor["about"]["@id"])
+    dataset["name"] = "Updated native metadata"
+    dataset["https://example.org/custom"] = "preserved extension"
+    assert http(metadata_url + "/rocrate", "PUT", {"rocrate": original_metadata})[0] == 200
+    wait_snapshot(metadata_url, initial)
+    assert second in command(source, env, "ls-remote", "origin", "refs/heads/main").decode()
+    command(source, env, "fetch", "origin", "aruna")
+    preserved = command(source, env, "show", "FETCH_HEAD:aruna-metadata.json").decode()
+    assert "preserved extension" in preserved
+    print("PASS: automatic signed ARC creation, protected graph snapshots and ISA RO-Crate export", flush=True)
 
     if os.environ.get("ARUNA_ARCITECT"):
         subprocess.run(["node", str(Path(__file__).with_name("test_arcitect.mjs")), str(root)],
