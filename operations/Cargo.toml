@@ -30,6 +30,7 @@ chrono = { workspace = true }
 globset = { workspace = true }
 fjall = { workspace = true }
 futures-util = { workspace = true }
+http = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
@@ -38,7 +39,6 @@ opentelemetry = { workspace = true }
 postcard = { workspace = true }
 quick-xml = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -61,6 +61,7 @@ url = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 proptest = { workspace = true }
+reqwest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

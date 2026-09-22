@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrat
 use aruna_core::structs::identity::auth::Permission;
 use async_zip::{Compression, ZipEntryBuilder};
 use futures_util::io::AsyncWriteExt;
-use reqwest::Method;
+use http::Method;
 use serde_json::{Value, json};
 use ulid::Ulid;
 

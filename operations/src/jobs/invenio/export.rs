@@ -13,7 +13,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
 use aruna_core::structs::identity::auth::Permission;
 use futures_util::StreamExt;
-use reqwest::Method;
+use http::Method;
 use serde_json::{Value, json};
 
 use super::{TransferError, connect};

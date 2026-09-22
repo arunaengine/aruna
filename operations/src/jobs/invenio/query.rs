@@ -4,7 +4,7 @@
 
 use aruna_core::invenio::InvenioQuery;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use reqwest::Method;
+use http::Method;
 use serde_json::Value;
 
 use super::{TransferError, connect};
