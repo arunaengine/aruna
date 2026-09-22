@@ -8,6 +8,7 @@ use ulid::Ulid;
 
 pub const REPOSITORIES: &str = "git_repositories";
 pub const LFS_OBJECTS: &str = "git_lfs_objects";
+pub const STATUS: &str = "git_status";
 pub const MAX_GIT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,13 +54,32 @@ pub struct GitRequest {
     pub lfs_url: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GitSnapshot {
+    pub document_id: Ulid,
+    pub event_id: Ulid,
+    pub occurred_at_ms: u64,
+    pub jsonld: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GitStatus {
+    pub event_id: Ulid,
+    pub commit: Option<String>,
+    pub error: Option<String>,
+}
+
 pub enum GitEffect {
     Initialize(Ulid),
+    Snapshot(GitSnapshot),
+    Export { document_id: Ulid, revision: String },
     Http(GitRequest),
 }
 
 pub enum GitEvent {
     Initialized,
+    Snapshot(GitStatus),
+    Exported(Bytes),
     Response {
         status: u16,
         headers: Vec<(String, String)>,

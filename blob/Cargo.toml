@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 bao-tree = { workspace = true }
+base64 = { workspace = true }
 blake3 = { workspace = true }
 byteview = { workspace = true }
 bytes = { workspace = true }
@@ -32,10 +33,12 @@ opendal = { workspace = true }
 postcard = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 ulid = { workspace = true }
@@ -45,6 +48,3 @@ rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

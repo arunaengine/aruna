@@ -37,11 +37,24 @@ impl GitStore {
         let _slot = self.slots.try_acquire().map_err(std::io::Error::other)?;
         let id = match &effect {
             GitEffect::Initialize(id) => *id,
+            GitEffect::Snapshot(source) => source.document_id,
+            GitEffect::Export { document_id, .. } => *document_id,
             GitEffect::Http(request) => request.repository.document_id,
         };
         let _lock = self.locks[id.to_bytes()[15] as usize % 64].lock().await;
         let repository = self.root.join(format!("{id}.git"));
         match effect {
+            GitEffect::Snapshot(source) => crate::arc::snapshot(&repository, source)
+                .await
+                .map(GitEvent::Snapshot),
+            GitEffect::Export { revision, .. } => {
+                let result = crate::arc::export(&repository, &revision).await?;
+                Ok(GitEvent::Exported(
+                    serde_json::to_vec(&result)
+                        .map_err(std::io::Error::other)?
+                        .into(),
+                ))
+            }
             GitEffect::Initialize(_) => {
                 tokio::fs::create_dir_all(&self.root).await?;
                 let root = tokio::fs::canonicalize(&self.root).await?;
@@ -193,7 +206,11 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn exchange(mut process: Command, body: Bytes, grouped: bool) -> std::io::Result<Bytes> {
+pub(crate) async fn exchange(
+    mut process: Command,
+    body: Bytes,
+    grouped: bool,
+) -> std::io::Result<Bytes> {
     #[cfg(unix)]
     if grouped {
         process.process_group(0);
@@ -222,9 +239,11 @@ async fn exchange(mut process: Command, body: Bytes, grouped: bool) -> std::io::
         .take()
         .ok_or_else(|| std::io::Error::other("Git stdout missing"))?;
     tokio::time::timeout(Duration::from_secs(300), async {
-        let send = async {
+        let send = async move {
             stdin.write_all(&body).await?;
-            stdin.shutdown().await
+            stdin.shutdown().await?;
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
         };
         let receive = async {
             let mut bytes = Vec::new();
@@ -245,4 +264,22 @@ async fn exchange(mut process: Command, body: Bytes, grouped: bool) -> std::io::
     })
     .await
     .map_err(std::io::Error::other)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stdin_closes() {
+        let mut process = Command::new("git");
+        process.args(["hash-object", "--stdin"]);
+        let result = exchange(process, Bytes::from_static(b"test content\n"), false)
+            .await
+            .expect("EOF-dependent Git command completes");
+        assert_eq!(
+            result.as_ref(),
+            b"d670460b4b4aece5915caf5c68d12f560a9fe3e4\n"
+        );
+    }
 }
