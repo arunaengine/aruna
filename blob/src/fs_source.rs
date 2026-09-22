@@ -1,5 +1,5 @@
 //! Reads a directory the owner offers: lists entries, stats files and streams file contents.
-//! Paths must resolve inside the canonical root, but the check is not a no-follow open.
+//! Reads stay beneath an open root handle even when paths or symlinks are replaced.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -57,22 +57,20 @@ pub(crate) async fn check_local(access: &ResolvedSourceAccess) -> Result<(), Sta
     }
 }
 
-/// Resolves one staging-source access to the jailed file it names, together
-/// with the weak fingerprint it currently carries. Serving a device's own
-/// observation needs both: the path to stream, and the identity to re-check.
+/// Opens one jailed file and fingerprints that handle before any bytes are read.
 pub(crate) async fn stable_source(
     access: &ResolvedSourceAccess,
-) -> Result<(PathBuf, String), StagingSourceError> {
+) -> Result<(tokio::fs::File, String), StagingSourceError> {
     let (root, path) = access_parts(access)?;
-    let resolved = jailed_file(&root, &path).await?;
-    let metadata = tokio::fs::metadata(&resolved).await.map_err(map_io_error)?;
+    let file = open_file(&root, &path).await?;
+    let metadata = file.metadata().await.map_err(map_io_error)?;
     let fingerprint = weak_fingerprint(&FileStat::from_metadata(&metadata));
-    Ok((resolved, fingerprint))
+    Ok((file, fingerprint))
 }
 
-/// The weak fingerprint one already-resolved file carries now.
-pub(crate) async fn current_fingerprint(path: &Path) -> Option<String> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
+/// The weak fingerprint of the opened file, without resolving its path again.
+pub(crate) async fn current_fingerprint(file: &tokio::fs::File) -> Option<String> {
+    let metadata = file.metadata().await.ok()?;
     Some(weak_fingerprint(&FileStat::from_metadata(&metadata)))
 }
 
@@ -80,9 +78,25 @@ pub(crate) async fn head_local(
     access: &ResolvedSourceAccess,
 ) -> Result<SourceMetadata, StagingSourceError> {
     let (root, path) = access_parts(access)?;
-    let resolved = jailed_file(&root, &path).await?;
-    let metadata = tokio::fs::metadata(&resolved).await.map_err(map_io_error)?;
-    Ok(file_metadata(&metadata))
+    tokio::task::spawn_blocking(move || {
+        let root = OfferedRoot::open(&root)?;
+        let metadata = root
+            .directory
+            .metadata(root.resolve(&path)?)
+            .map_err(map_io_error)?;
+        if !metadata.is_file() {
+            return Err(StagingSourceError::NotFound);
+        }
+        Ok(SourceMetadata {
+            content_length: metadata.len(),
+            content_type: None,
+            etag: Some(weak_fingerprint(&entry_stat(&metadata))),
+            last_modified: metadata.modified().ok().map(|time| time.into_std()),
+            source_version: None,
+        })
+    })
+    .await
+    .map_err(|error| StagingSourceError::ReadError(error.to_string()))?
 }
 
 pub(crate) async fn list_local(
@@ -93,24 +107,37 @@ pub(crate) async fn list_local(
     files_only: bool,
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
     let (root, path) = access_parts(access)?;
-    let resolved_root = canonical_root(&root).await?;
-    let start = jailed_entry(&resolved_root, &path).await?;
+    tokio::task::spawn_blocking(move || {
+        list_entries(&root, &path, offset, limit, recursive, files_only)
+    })
+    .await
+    .map_err(|error| StagingSourceError::ListError(error.to_string()))?
+}
+
+fn list_entries(
+    root: &str,
+    path: &str,
+    offset: usize,
+    limit: usize,
+    recursive: bool,
+    files_only: bool,
+) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
+    let root = OfferedRoot::open(root)?;
+    let start = root.resolve(path)?;
     // Resolved directories already queued. A link to an ancestor inside the
     // offered root would otherwise walk in circles forever.
     let mut visited = HashSet::from([start.clone()]);
-    let mut queue = VecDeque::from([(start, path)]);
+    let mut queue = VecDeque::from([(start, path.to_string())]);
     let mut entries = Vec::new();
     let mut skipped = 0usize;
 
     while let Some((directory, prefix)) = queue.pop_front() {
-        let mut reader = tokio::fs::read_dir(&directory)
-            .await
+        let reader = root
+            .directory
+            .read_dir(&directory)
             .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
-        while let Some(entry) = reader
-            .next_entry()
-            .await
-            .map_err(|error| StagingSourceError::ListError(error.to_string()))?
-        {
+        for entry in reader {
+            let entry = entry.map_err(|error| StagingSourceError::ListError(error.to_string()))?;
             let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
@@ -122,10 +149,10 @@ pub(crate) async fn list_local(
             let relative = join_relative(&prefix, &name);
             // A link out of the offered directory is skipped, not an error: one
             // stray link must not make the whole listing unusable.
-            let Ok(resolved) = jailed_entry(&resolved_root, &relative).await else {
+            let Ok(resolved) = root.resolve(&relative) else {
                 continue;
             };
-            let Ok(metadata) = tokio::fs::metadata(&resolved).await else {
+            let Ok(metadata) = root.directory.metadata(&resolved) else {
                 continue;
             };
             let kind = if metadata.is_dir() {
@@ -153,10 +180,10 @@ pub(crate) async fn list_local(
                 path: relative,
                 kind,
                 size: (kind == SourceEntryKind::File).then_some(metadata.len()),
-                modified: metadata.modified().ok(),
+                modified: metadata.modified().ok().map(|time| time.into_std()),
                 // The listing carries the same stat the serve path reads, so an
                 // observation and a later read agree on one identity.
-                stat: Some(FileStat::from_metadata(&metadata)),
+                stat: Some(entry_stat(&metadata)),
             });
         }
     }
@@ -169,14 +196,10 @@ pub(crate) async fn read_local(
     range: Option<std::ops::Range<u64>>,
 ) -> Result<(SourceMetadata, BackendStream<Result<Bytes, StreamError>>), StagingSourceError> {
     let (root, path) = access_parts(access)?;
-    let resolved = jailed_file(&root, &path).await?;
-    let before = tokio::fs::metadata(&resolved).await.map_err(map_io_error)?;
+    let mut file = open_file(&root, &path).await?;
+    let before = file.metadata().await.map_err(map_io_error)?;
     let metadata = file_metadata(&before);
     let fingerprint = weak_fingerprint(&FileStat::from_metadata(&before));
-
-    let mut file = tokio::fs::File::open(&resolved)
-        .await
-        .map_err(map_io_error)?;
     let stream = match range {
         Some(range) if range.start < range.end => {
             file.seek(std::io::SeekFrom::Start(range.start))
@@ -193,8 +216,11 @@ pub(crate) async fn read_local(
             ));
         }
         // Only a complete read may become an identity, so only it is verified.
-        None => BackendStream::new(ReaderStream::new(file))
-            .on_success_async(move || verify_stable(resolved, fingerprint)),
+        None => {
+            let observed = file.try_clone().await.map_err(map_io_error)?;
+            BackendStream::new(ReaderStream::new(file))
+                .on_success_async(move || verify_stable(observed, fingerprint))
+        }
     };
 
     Ok((metadata, stream))
@@ -202,8 +228,9 @@ pub(crate) async fn read_local(
 
 /// Refuses the bytes that were just streamed when the file no longer carries
 /// the fingerprint it was opened with.
-async fn verify_stable(path: PathBuf, fingerprint: String) -> Result<(), StreamError> {
-    let after = tokio::fs::metadata(&path)
+async fn verify_stable(file: tokio::fs::File, fingerprint: String) -> Result<(), StreamError> {
+    let after = file
+        .metadata()
         .await
         .map_err(|error| StreamError(Box::new(error)))?;
     if weak_fingerprint(&FileStat::from_metadata(&after)) == fingerprint {
@@ -232,6 +259,17 @@ pub(crate) async fn jailed_entry(
     root: &Path,
     relative: &str,
 ) -> Result<PathBuf, StagingSourceError> {
+    validate_relative(relative)?;
+    let resolved = tokio::fs::canonicalize(root.join(relative))
+        .await
+        .map_err(map_io_error)?;
+    if !resolved.starts_with(root) {
+        return Err(StagingSourceError::AccessDenied);
+    }
+    Ok(resolved)
+}
+
+fn validate_relative(relative: &str) -> Result<(), StagingSourceError> {
     let candidate = Path::new(relative);
     if candidate.is_absolute()
         || candidate
@@ -240,13 +278,96 @@ pub(crate) async fn jailed_entry(
     {
         return Err(StagingSourceError::NotFound);
     }
-    let resolved = tokio::fs::canonicalize(root.join(candidate))
-        .await
-        .map_err(map_io_error)?;
-    if !resolved.starts_with(root) {
-        return Err(StagingSourceError::AccessDenied);
+    Ok(())
+}
+
+struct OfferedRoot {
+    directory: cap_std::fs::Dir,
+    path: PathBuf,
+}
+
+impl OfferedRoot {
+    fn open(root: &str) -> Result<Self, StagingSourceError> {
+        let directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+            .map_err(map_io_error)?;
+        let path = std::fs::canonicalize(root).map_err(map_io_error)?;
+        Ok(Self { directory, path })
     }
-    Ok(resolved)
+
+    fn resolve(&self, relative: &str) -> Result<PathBuf, StagingSourceError> {
+        validate_relative(relative)?;
+        // Preserve absolute in-root links; only the directory handle grants access.
+        let resolved = std::fs::canonicalize(self.path.join(relative)).map_err(map_io_error)?;
+        let path = resolved
+            .strip_prefix(&self.path)
+            .map_err(|_| StagingSourceError::AccessDenied)?;
+        Ok(if path.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            path.to_path_buf()
+        })
+    }
+
+    fn open_file(&self, relative: &Path) -> Result<std::fs::File, StagingSourceError> {
+        if !self
+            .directory
+            .metadata(relative)
+            .map_err(map_io_error)?
+            .is_file()
+        {
+            return Err(StagingSourceError::NotFound);
+        }
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+        }
+        let file = self
+            .directory
+            .open_with(relative, &options)
+            .map_err(map_io_error)?
+            .into_std();
+        if !file.metadata().map_err(map_io_error)?.is_file() {
+            return Err(StagingSourceError::NotFound);
+        }
+        Ok(file)
+    }
+}
+
+pub(crate) async fn open_file(
+    root: &str,
+    relative: &str,
+) -> Result<tokio::fs::File, StagingSourceError> {
+    let root = root.to_string();
+    let relative = relative.to_string();
+    let file = tokio::task::spawn_blocking(move || {
+        let root = OfferedRoot::open(&root)?;
+        root.open_file(&root.resolve(&relative)?)
+    })
+    .await
+    .map_err(|error| StagingSourceError::ReadError(error.to_string()))??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+fn entry_stat(metadata: &cap_std::fs::Metadata) -> FileStat {
+    let stat = FileStat::partial(
+        metadata.len(),
+        metadata.modified().ok().map(|time| time.into_std()),
+    );
+    #[cfg(unix)]
+    let stat = {
+        use cap_std::fs::MetadataExt;
+        let mut stat = stat;
+        stat.inode = Some(metadata.ino());
+        stat.changed_ns = u128::try_from(metadata.ctime())
+            .ok()
+            .zip(u128::try_from(metadata.ctime_nsec()).ok())
+            .map(|(seconds, nanos)| seconds.saturating_mul(1_000_000_000).saturating_add(nanos));
+        stat
+    };
+    stat
 }
 
 /// The same resolution, restricted to regular files: opening a fifo or a device
@@ -370,6 +491,10 @@ mod tests {
 
         let head = head_local(&access(root.path(), "alias")).await.unwrap();
         assert_eq!(head.content_length, 4);
+        let (_, stream) = read_local(&access(root.path(), "alias"), None)
+            .await
+            .unwrap();
+        assert_eq!(collect(stream).await.unwrap(), b"data");
     }
 
     #[tokio::test]
@@ -393,6 +518,97 @@ mod tests {
         let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, vec!["nested/inner.txt", "top.txt"]);
         assert_eq!(entries[0].size, Some(2));
+        let metadata = std::fs::metadata(root.path().join("nested/inner.txt")).unwrap();
+        assert_eq!(entries[0].stat, Some(FileStat::from_metadata(&metadata)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_paths_refused() {
+        for replace_parent in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("nested")).unwrap();
+            std::fs::write(root.path().join("nested/file"), b"inside").unwrap();
+            std::fs::write(outside.path().join("file"), b"secret").unwrap();
+            let offered = OfferedRoot::open(root.path().to_str().unwrap()).unwrap();
+            let resolved = offered.resolve("nested/file").unwrap();
+            let (replaced, target) = if replace_parent {
+                (root.path().join("nested"), outside.path().to_path_buf())
+            } else {
+                (root.path().join("nested/file"), outside.path().join("file"))
+            };
+            std::fs::rename(&replaced, root.path().join("saved")).unwrap();
+            std::os::unix::fs::symlink(target, replaced).unwrap();
+            assert!(matches!(
+                offered.open_file(&resolved),
+                Err(StagingSourceError::AccessDenied)
+            ));
+            assert!(offered.directory.metadata(&resolved).is_err());
+            if replace_parent {
+                assert!(offered.directory.read_dir("nested").is_err());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_handle_pinned() {
+        use std::io::Read;
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("offered");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("file"), b"inside").unwrap();
+        std::fs::write(outside.join("file"), b"secret").unwrap();
+        let offered = OfferedRoot::open(root.to_str().unwrap()).unwrap();
+        let resolved = offered.resolve("file").unwrap();
+        std::fs::rename(&root, base.path().join("saved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        let mut bytes = Vec::new();
+        offered
+            .open_file(&resolved)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"inside");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn range_handle_pinned() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, b"inside").unwrap();
+        std::fs::write(outside.path().join("file"), b"secret").unwrap();
+        let (_, stream) = read_local(&access(root.path(), "file"), Some(1..4))
+            .await
+            .unwrap();
+        std::fs::rename(&path, root.path().join("saved")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("file"), &path).unwrap();
+        assert_eq!(collect(stream).await.unwrap(), b"nsi");
+        assert_eq!(
+            head_local(&access(root.path(), "file")).await,
+            Err(StagingSourceError::AccessDenied)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            root.path().join("pipe"),
+            rustix::fs::Mode::RUSR,
+        )
+        .unwrap();
+        assert!(matches!(
+            open_file(root.path().to_str().unwrap(), "pipe").await,
+            Err(StagingSourceError::NotFound)
+        ));
     }
 
     // A link back to an ancestor inside the offered root must not make the walk

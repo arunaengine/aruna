@@ -21,6 +21,7 @@ bao-tree = { workspace = true }
 blake3 = { workspace = true }
 byteview = { workspace = true }
 bytes = { workspace = true }
+cap-std = { workspace = true }
 chrono = { workspace = true }
 crc-fast = { workspace = true }
 futures = { workspace = true }
