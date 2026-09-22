@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use aruna_core::stream::{BackendStream, StreamError};
@@ -28,6 +29,8 @@ pub enum InvenioError {
     Limit,
     #[error("repository returned invalid JSON")]
     Json,
+    #[error("repository tokens require HTTPS outside loopback")]
+    InsecureToken,
 }
 
 pub struct InvenioClient<'a> {
@@ -53,6 +56,9 @@ impl<'a> InvenioClient<'a> {
             || endpoint.fragment().is_some()
         {
             return Err(InvenioError::InvalidUrl);
+        }
+        if token.is_some() && !secure_transport(&endpoint) {
+            return Err(InvenioError::InsecureToken);
         }
         let path = format!("{}/", endpoint.path().trim_end_matches('/'));
         endpoint.set_path(&path);
@@ -222,10 +228,45 @@ impl<'a> InvenioClient<'a> {
     }
 }
 
+fn secure_transport(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    url.scheme() == "https"
+        || host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn check_status(response: &Response) -> Result<(), InvenioError> {
     if response.status().is_success() {
         Ok(())
     } else {
         Err(InvenioError::Status(response.status().as_u16()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_plain_token() {
+        for (endpoint, secure) in [
+            ("https://zenodo.org/api/", true),
+            ("http://127.0.0.2:5000/api/", true),
+            ("http://[::1]/api/", true),
+            ("http://LOCALHOST/api/", true),
+            ("http://zenodo.org/api/", false),
+            ("http://10.0.0.1/api/", false),
+            ("http://localhost.example.org/api/", false),
+        ] {
+            assert_eq!(
+                secure_transport(&Url::parse(endpoint).unwrap()),
+                secure,
+                "{endpoint}"
+            );
+        }
     }
 }
