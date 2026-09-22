@@ -307,7 +307,11 @@ pub async fn submit_rocrate_export(
                     "metadata overrides must be an object".into(),
                 ));
             }
-            if let Some(id) = &destination.draft_id {
+            for id in destination
+                .draft_id
+                .iter()
+                .chain(destination.new_version.iter())
+            {
                 aruna_core::invenio::validate_id(id)
                     .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
             }
@@ -317,6 +321,7 @@ pub async fn submit_rocrate_export(
                 connector_id: ulid::Ulid::from_string(&destination.connector_id)
                     .map_err(|_| ServerError::BadRequest)?,
                 draft_id: destination.draft_id,
+                new_version: destination.new_version,
                 metadata_json: destination.metadata.to_string(),
                 publish: destination.publish,
                 public_files: destination.public_files,

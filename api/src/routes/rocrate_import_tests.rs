@@ -46,6 +46,7 @@ async fn invenio_requires_auth() {
             group_id: group_id.clone(),
             connector_id: Ulid::generate().to_string(),
             record_id: "42".into(),
+            options: Default::default(),
             target: ImportTargetRequest {
                 bucket: "target".into(),
                 prefix: String::new(),
@@ -63,11 +64,30 @@ async fn invenio_requires_auth() {
             result,
             Err(ServerError::Unauthorized | ServerError::Forbidden)
         ));
+        let query = crate::routes::invenio::InvenioSearch {
+            group_id: group_id.clone(),
+            connector_id: Ulid::generate().to_string(),
+            q: "dataset".into(),
+            page: 1,
+            size: 25,
+            all_versions: false,
+        };
+        let result = crate::routes::invenio::search_records(
+            State(state.clone()),
+            Extension(auth.clone()),
+            axum::extract::Query(query),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ServerError::Unauthorized | ServerError::Forbidden)
+        ));
         let export = SubmitInvenioExport {
             repository: InvenioExportRequest {
                 group_id,
                 connector_id: Ulid::generate().to_string(),
                 draft_id: None,
+                new_version: None,
                 metadata: serde_json::json!({}),
                 publish: true,
                 public_files: false,
@@ -97,6 +117,7 @@ async fn invenio_denies_connector() {
         group_id: Ulid::generate().to_string(),
         connector_id: Ulid::generate().to_string(),
         record_id: "42".into(),
+        options: Default::default(),
         target: ImportTargetRequest {
             bucket: "target".into(),
             prefix: "import".into(),
@@ -115,6 +136,7 @@ async fn invenio_denies_connector() {
 #[test]
 fn invenio_openapi_contract() {
     let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
+    assert!(openapi["paths"]["/metadata/invenio/records"]["get"]["responses"]["200"].is_object());
     for path in [
         "/metadata/invenio/imports",
         "/metadata/{document_id}/invenio/exports",
@@ -137,6 +159,28 @@ fn invenio_openapi_contract() {
     let configured: crate::metadata::InvenioExportRequest =
         serde_json::from_value(configured).unwrap();
     assert!(configured.publish);
+}
+
+#[test]
+fn invenio_mode_contract() {
+    for mode in ["copy", "reference", "metadata"] {
+        let request: crate::routes::invenio::InvenioImportRequest =
+            serde_json::from_value(serde_json::json!({
+                "group_id": "group", "connector_id": "connector", "record_id": "42", "mode": mode,
+                "all_versions": false, "target": {"bucket": "target", "prefix": "import"},
+                "metadata": {"group_id": "group", "path": "crate", "public": false}
+            }))
+            .unwrap();
+        assert!(!request.options.all_versions);
+        assert_eq!(serde_json::to_value(&request).unwrap()["mode"], mode);
+    }
+    let options: crate::routes::invenio::InvenioOptionsRequest =
+        serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(options.all_versions);
+    assert!(matches!(
+        options.mode,
+        crate::routes::invenio::InvenioDataMode::Copy
+    ));
 }
 
 #[test]

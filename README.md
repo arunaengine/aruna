@@ -266,6 +266,11 @@ access token in `secret_config.token` for private imports. Exports require the r
 own Invenio/Zenodo access token in `repository.access_token`; the connector token is never used
 for publishing. The node's egress policy applies to all requests.
 
+Search published records with `GET /api/v1/metadata/invenio/records`, passing `group_id`,
+`connector_id`, `q`, `page` and `size` as query parameters. Results use the native repository
+JSON representation. Pages start at 1, size is at most 25, and `all_versions=true` includes
+older published versions. Search requires READ on the connector group and does not import data.
+
 Import a record with `POST /api/v1/metadata/invenio/imports`:
 
 ```json
@@ -273,21 +278,32 @@ Import a record with `POST /api/v1/metadata/invenio/imports`:
   "group_id": "<connector-group-id>",
   "connector_id": "<http-connector-id>",
   "record_id": "1234567",
+  "mode": "copy",
+  "all_versions": true,
   "target": {"bucket": "research", "prefix": "zenodo/1234567"},
   "metadata": {"group_id": "<destination-group-id>", "path": "datasets/zenodo", "public": false},
   "idempotency_key": "import-zenodo-1234567"
 }
 ```
 
-Every accessible published version becomes a separate dataset within the imported crate.
-All files are copied and checked against their source sizes and checksums. Each version also
+Every accessible published version becomes a separate dataset within the imported crate by
+default. Set `all_versions: false` to import only the selected version. Mode `copy` copies files
+and checks their source sizes and checksums. Mode `reference` creates native Aruna object
+references, reading repository bytes on demand; the target bucket and connector must share
+a group. Mode `metadata` skips attached files and file-list requests, allowing metadata imports
+without access to restricted data. References depend on remote availability and credentials.
+Each version also
 contains `invenio-record.json`, preserving its complete record and file metadata, including
 DOIs, concept identifiers, timestamps, relations, creator identifiers and custom fields.
 Foreign identifiers remain provenance; Aruna assigns local document and object identities.
 Filenames are encoded in storage paths so repeated or unsafe source names cannot collide.
 Source names remain in the metadata. Missing files, incomplete pagination and checksum
 failures fail the transfer. Hidden edit histories and inaccessible or deleted records are
-not exposed by the repository API and cannot be reconstructed.
+not exposed by the repository API and cannot be reconstructed. Native metadata scalar values
+are queryable as `additionalProperty` entries whose `propertyID` is a JSON-pointer-style path,
+such as `metadata/funding/0/award/number`. Partial publication dates use their earliest day for
+crate validation; `https://w3id.org/aruna/invenio/publicationDate` retains the exact original
+date or interval, which is restored on export when the mapped date has not been edited.
 
 Export with `POST /api/v1/metadata/{document_id}/invenio/exports`:
 
@@ -307,9 +323,11 @@ Exports create native Invenio records with each data file uploaded separately un
 path. Files can be listed and downloaded directly through Invenio/Zenodo. The RO-Crate JSON is
 also retained as a provenance file for fields without a native equivalent. Repository metadata
 is derived from the crate's standard schema.org
-fields; optional `repository.metadata` fields override the mapping. Supply native creators
-when source names lack the structured information required by Invenio, or override controlled
-vocabulary fields for the target repository. Source identifiers become provenance relations;
+fields; optional `repository.metadata` fields override the mapping. Imported native metadata,
+including affiliations, funding, relations and resource type, is retained when its corresponding
+crate fields are unchanged. Custom fields are also restored; the destination must support
+their vocabulary. Override controlled vocabulary fields for the target repository as needed.
+Source identifiers become provenance relations;
 the transfer does not claim an existing source DOI as a newly issued repository DOI.
 Exports with omitted files fail.
 `publish: false` (the default) leaves an unpublished draft with restricted file access;
@@ -318,6 +336,15 @@ publication permissions still apply. Set `repository.public_files: true` explici
 the files public when publishing; otherwise files remain restricted. Existing drafts retain
 their configured access, with their metadata replaced by the mapped crate metadata.
 
+Set `repository.new_version` to an existing published record ID to create its next version
+under the same parent identifier. This requires permission on that record. A new-version draft
+inherits repository access settings and may already exist; unexpected files cause a failure.
+Supply `draft_id` alongside `new_version` when recovering that draft. Metadata updates use the
+captured draft revision and fail on conflicts. Metadata and the complete file set are checked
+before and after publication; the upstream publication action has no atomic revision guard.
+Exporting an imported history remains one crate snapshot unless versions are submitted
+separately. Original publication timestamps and hidden edit histories are not recreated.
+
 The user's personal token determines the owning Invenio/Zenodo account; bibliographic authors
 come from the crate's creators. Aruna encrypts the token for the job's retention period, binding
 it to the requesting user, node, connector and endpoint. It is never echoed in responses,
@@ -325,8 +352,9 @@ debug output or public job results. Each export submission requires the user's t
 token changes the idempotency identity. No shared publishing account is selected implicitly.
 
 The response provides job status and report URLs; the existing job API also supports cancellation.
-Successful exports include `result.repository` with the record ID, API URL and publication
-state. Both transfers support `idempotency_key`. An ambiguous draft-creation response stops
+Successful exports include `result.repository` with the record ID, parent ID, revision, assigned
+DOI when available, API URL and publication state. Both transfers support `idempotency_key`.
+An ambiguous draft-creation response stops
 automatic creation; inspect the repository and supply `repository.draft_id` in a new request
 to reuse the unpublished draft. Failed or cancelled transfers leave remote drafts available
 for inspection. Import requires connector-group READ and destination WRITE; export requires

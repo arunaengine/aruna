@@ -78,6 +78,8 @@ pub enum ImportSourceRequest {
         group_id: String,
         connector_id: String,
         record_id: String,
+        #[serde(flatten)]
+        options: super::invenio::InvenioOptionsRequest,
     },
     Upload {
         upload_id: String,
@@ -398,10 +400,12 @@ fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrat
             group_id,
             connector_id,
             record_id,
+            options,
         } => {
             aruna_core::invenio::validate_id(&record_id)
                 .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
             Ok(ImportRoCrateSource::Invenio {
+                options: options.into(),
                 group_id: parse_ulid(&group_id)?,
                 connector_id: parse_ulid(&connector_id)?,
                 record_id,
