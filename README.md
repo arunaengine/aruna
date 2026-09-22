@@ -308,7 +308,12 @@ Export with `POST /api/v1/metadata/{document_id}/invenio/exports`:
 ```
 
 Exports attach the complete RO-Crate ZIP, including data and original crate metadata, to a
-native Invenio record with the supplied repository metadata. Exports with omitted files fail.
+native Invenio record. Repository metadata is derived from the crate's standard schema.org
+fields; optional `repository.metadata` fields override the mapping. Supply native creators
+when source names lack the structured information required by Invenio, or override controlled
+vocabulary fields for the target repository. Source identifiers become provenance relations;
+the transfer does not claim an existing source DOI as a newly issued repository DOI.
+Exports with omitted files fail.
 `publish: false` (the default) leaves an unpublished draft with restricted file access;
 `publish: true` publishes after verifying the uploaded archive. Repository validation and
 publication permissions still apply. Set `repository.public_files: true` explicitly to make

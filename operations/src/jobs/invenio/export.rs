@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::invenio::{
-    InvenioDestination, InvenioRecord, record_id, validate_id, validate_metadata,
+    InvenioDestination, InvenioRecord, export_metadata, record_id, validate_id,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
@@ -24,6 +24,7 @@ pub(crate) async fn create_draft(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     destination: &InvenioDestination,
+    jsonld: &str,
 ) -> Result<InvenioRecord, TransferError> {
     let client = connect(
         ctx,
@@ -37,9 +38,14 @@ pub(crate) async fn create_draft(
     if destination.metadata_json.len() as u64 > spec.limits.metadata_bytes {
         return Err(invalid("repository metadata exceeds limit"));
     }
-    let metadata: Value = serde_json::from_str(&destination.metadata_json)
+    let overrides: Value = serde_json::from_str(&destination.metadata_json)
         .map_err(|_| invalid("invalid repository metadata"))?;
-    validate_metadata(&metadata)?;
+    let document: Value =
+        serde_json::from_str(jsonld).map_err(|_| invalid("invalid source crate"))?;
+    let metadata = export_metadata(&document, &overrides)?;
+    if metadata.to_string().len() as u64 > spec.limits.metadata_bytes {
+        return Err(invalid("mapped repository metadata exceeds limit"));
+    }
     let record = if let Some(id) = &destination.draft_id {
         validate_id(id)?;
         client
@@ -140,7 +146,11 @@ pub(crate) async fn deposit(
                 .map_err(TransferError::Retryable)?;
             let mut hasher = Hasher::new();
             while let Some(chunk) = read.blob.next().await {
-                hasher.update(&chunk?);
+                hasher.update(
+                    &chunk.map_err(|_| {
+                        TransferError::Retryable("crate artifact read failed".into())
+                    })?,
+                );
             }
             verify_file(file, &hasher, artifact)?;
             return finish(&client, record, destination.publish, published).await;

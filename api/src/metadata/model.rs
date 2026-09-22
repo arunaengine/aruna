@@ -382,6 +382,7 @@ pub struct InvenioExportRequest {
     pub connector_id: String,
     #[serde(default)]
     pub draft_id: Option<String>,
+    #[serde(default)]
     pub metadata: serde_json::Value,
     #[serde(default)]
     pub publish: bool,

@@ -216,5 +216,171 @@ pub fn import_crate(
     Ok(json!({"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": graph}))
 }
 
+/// Supplied native fields override mapped crate fields; missing mandatory fields fail closed.
+pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, InvenioError> {
+    let mut metadata = json!({"resource_type": {"id": "dataset"}, "rights": []});
+    let graph = document["@graph"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let root_id = graph
+        .iter()
+        .find(|entity| {
+            entity["@id"].as_str().is_some_and(|id| {
+                id == "ro-crate-metadata.json" || id.ends_with("/ro-crate-metadata.json")
+            })
+        })
+        .and_then(|entity| schema_value(entity, "about")["@id"].as_str())
+        .unwrap_or("./");
+    if let Some(root) = graph.iter().find(|entity| entity["@id"] == root_id) {
+        for (source, target) in [
+            ("name", "title"),
+            ("description", "description"),
+            ("version", "version"),
+            ("publisher", "publisher"),
+        ] {
+            if let Some(value) = schema_value(root, source).as_str() {
+                metadata[target] = json!(value);
+            }
+        }
+        if let Some(date) = schema_value(root, "datePublished").as_str() {
+            metadata["publication_date"] = json!(date.split('T').next().unwrap_or(date));
+        }
+        let creators = schema_value(root, "creator");
+        let creators = if creators.is_null() {
+            schema_value(root, "author")
+        } else {
+            creators
+        };
+        let expected_creators = values(creators).len();
+        let creators = values(creators)
+            .iter()
+            .filter_map(|creator| {
+                let creator = creator["@id"]
+                    .as_str()
+                    .and_then(|id| graph.iter().find(|entity| entity["@id"] == id))
+                    .unwrap_or(creator);
+                let family = schema_value(creator, "familyName").as_str();
+                let name = schema_value(creator, "name").as_str();
+                let organizational = values(&creator["@type"]).iter().any(|kind| {
+                    kind.as_str().is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            "Organization"
+                                | "schema:Organization"
+                                | "http://schema.org/Organization"
+                                | "https://schema.org/Organization"
+                        )
+                    })
+                });
+                let mut person = if organizational {
+                    json!({"type": "organizational", "name": name?})
+                } else {
+                    let family = family?;
+                    let mut person = json!({"type": "personal", "family_name": family});
+                    if let Some(given) = schema_value(creator, "givenName").as_str() {
+                        person["given_name"] = json!(given);
+                    }
+                    person
+                };
+                person["identifiers"] = Value::Array(
+                    values(schema_value(creator, "identifier"))
+                        .iter()
+                        .filter_map(identifier)
+                        .collect(),
+                );
+                Some(json!({"person_or_org": person}))
+            })
+            .collect::<Vec<_>>();
+        if !creators.is_empty() && creators.len() == expected_creators {
+            metadata["creators"] = Value::Array(creators);
+        }
+        let identifiers = values(schema_value(root, "identifier"))
+            .iter()
+            .filter_map(identifier)
+            .map(|mut id| {
+                id["relation_type"] = json!({"id": "isderivedfrom"});
+                id
+            })
+            .collect::<Vec<_>>();
+        if !identifiers.is_empty() {
+            metadata["related_identifiers"] = Value::Array(identifiers);
+        }
+        let subjects = values(schema_value(root, "keywords"))
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|subject| json!({"subject": subject}))
+            .collect::<Vec<_>>();
+        if !subjects.is_empty() {
+            metadata["subjects"] = Value::Array(subjects);
+        }
+        metadata["rights"] = Value::Array(
+            values(schema_value(root, "license"))
+                .iter()
+                .filter_map(|license| {
+                    let text = license.as_str().or_else(|| license["@id"].as_str())?;
+                    let mut right = json!({"title": {"en": text}});
+                    if text.starts_with("https://") || text.starts_with("http://") {
+                        right["link"] = json!(text);
+                    }
+                    Some(right)
+                })
+                .collect(),
+        );
+    }
+    if let Some(overrides) = overrides.as_object() {
+        for (key, value) in overrides {
+            metadata[key] = value.clone();
+        }
+    } else if !overrides.is_null() {
+        return Err(InvenioError("metadata overrides must be an object"));
+    }
+    validate_metadata(&metadata)?;
+    Ok(metadata)
+}
+
+fn schema_value<'a>(entity: &'a Value, name: &str) -> &'a Value {
+    for key in [
+        name.to_string(),
+        format!("schema:{name}"),
+        format!("http://schema.org/{name}"),
+        format!("https://schema.org/{name}"),
+    ] {
+        if let Some(value) = entity.get(key) {
+            return value;
+        }
+    }
+    &Value::Null
+}
+
+fn values(value: &Value) -> &[Value] {
+    match value {
+        Value::Null => &[],
+        Value::Array(values) => values,
+        value => std::slice::from_ref(value),
+    }
+}
+
+fn identifier(value: &Value) -> Option<Value> {
+    let scheme = schema_value(value, "propertyID").as_str();
+    let text = schema_value(value, "value")
+        .as_str()
+        .or_else(|| value.as_str())
+        .or_else(|| value["@id"].as_str())?;
+    let (scheme, text) = if let Some(doi) = text
+        .strip_prefix("https://doi.org/")
+        .or_else(|| text.strip_prefix("http://doi.org/"))
+    {
+        ("doi", doi)
+    } else if let Some(scheme) = scheme {
+        (scheme, text)
+    } else if text.starts_with("https://") || text.starts_with("http://") {
+        ("url", text)
+    } else {
+        return None;
+    };
+    Some(json!({"scheme": scheme, "identifier": text}))
+}
+
 #[cfg(test)]
 mod tests;

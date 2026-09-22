@@ -82,3 +82,31 @@ fn maps_creator_identifiers() {
         "01ggx4157"
     );
 }
+
+#[test]
+fn derives_export_metadata() {
+    let document = json!({"@graph": [
+        {"@id": "ro-crate-metadata.json", "about": {"@id": "./"}},
+        {"@id": "./", "name": "Source title", "description": "Source description",
+            "datePublished": "2024-01-01T12:00:00Z", "creator": {"@id": "#author"},
+            "identifier": "https://doi.org/10.1234/source", "keywords": ["genomics"],
+            "license": {"@id": "https://example.org/license"}},
+        {"@id": "#author", "@type": "Person", "name": "Researcher, A", "familyName": "Researcher",
+            "givenName": "A", "identifier": {"@type": "PropertyValue", "propertyID": "orcid", "value": "0000-0002-1825-0097"}}
+    ]});
+    let metadata = export_metadata(&document, &json!({"title": "Chosen title"})).unwrap();
+    assert_eq!(metadata["title"], "Chosen title");
+    assert_eq!(metadata["description"], "Source description");
+    assert_eq!(metadata["publication_date"], "2024-01-01");
+    assert_eq!(
+        metadata["creators"][0]["person_or_org"]["identifiers"][0]["identifier"],
+        "0000-0002-1825-0097"
+    );
+    assert_eq!(
+        metadata["related_identifiers"][0],
+        json!({"scheme": "doi", "identifier": "10.1234/source", "relation_type": {"id": "isderivedfrom"}})
+    );
+    assert_eq!(metadata["subjects"], json!([{"subject": "genomics"}]));
+    assert_eq!(metadata["rights"][0]["link"], "https://example.org/license");
+    assert!(export_metadata(&json!({}), &json!({})).is_err());
+}

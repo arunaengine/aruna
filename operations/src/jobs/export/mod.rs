@@ -479,7 +479,11 @@ async fn repository_export(
         persist_checkpoint(ctx, checkpoint)
             .await
             .map_err(ExportFailure::Retryable)?;
-        let record = interruptible(ctx, export::create_draft(ctx, spec, destination))
+        let jsonld = checkpoint
+            .raw_jsonld
+            .as_deref()
+            .ok_or_else(|| ExportFailure::Permanent("source crate metadata missing".into()))?;
+        let record = interruptible(ctx, export::create_draft(ctx, spec, destination, jsonld))
             .await
             .map_err(classify)?;
         checkpoint.repository = Some(record);

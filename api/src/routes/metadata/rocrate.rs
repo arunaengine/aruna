@@ -291,8 +291,11 @@ pub async fn submit_rocrate_export(
                     "repository metadata exceeds limit".into(),
                 ));
             }
-            aruna_core::invenio::validate_metadata(&destination.metadata)
-                .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+            if !destination.metadata.is_null() && !destination.metadata.is_object() {
+                return Err(ServerError::BadRequestReason(
+                    "metadata overrides must be an object".into(),
+                ));
+            }
             if let Some(id) = &destination.draft_id {
                 aruna_core::invenio::validate_id(id)
                     .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
