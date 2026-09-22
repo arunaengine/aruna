@@ -17,6 +17,7 @@ pub mod audit;
 pub mod device;
 pub mod drs;
 pub mod execution;
+pub mod git;
 pub mod info;
 pub mod management_relay;
 pub mod metadata;
@@ -66,6 +67,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(execution::jobs::router())
         .merge(execution::job::audit::router())
         .merge(metadata::router())
+        .merge(git::router())
         .merge(oai::router())
         .merge(pid::router())
         .merge(placement::router())
@@ -91,6 +93,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
             crate::rate_limit::principal_middleware,
         ))
         .layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(git::credentials))
         .layer(from_fn_with_state(
             state.clone(),
             request_tracing_middleware,
