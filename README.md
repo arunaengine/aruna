@@ -2,29 +2,34 @@
 <!-- Copyright (c) 2026 The Aruna Contributors -->
 <!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
 
-[![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-Apache_2.0-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-APACHE)
-[![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-MIT)
-![CI](https://github.com/arunaengine/aruna/actions/workflows/ci.yml/badge.svg)
-[![Codecov](https://codecov.io/github/arunaengine/aruna/coverage.svg?branch=main)](https://codecov.io/gh/arunaengine/aruna)
-
-___
-
 <p align="center">
-    <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./img/logo_white.png">
-    <img alt="Aruna logo" src="./img/logo_dark.png" width="70%">
-    </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./img/lockup-white.png">
+    <img alt="Aruna" src="./img/lockup.png" width="640">
+  </picture>
 </p>
 
-<br>
+<h1 align="center">A FAIR, federated data orchestration engine</h1>
 
-# A FAIR, federated data orchestration engine
+<p align="center">
+  <a href="https://www.rust-lang.org/"><img alt="Built with Rust" src="https://img.shields.io/badge/built_with-Rust-08216C.svg"></a>
+  <a href="https://github.com/arunaengine/aruna/blob/main/LICENSE-APACHE"><img alt="Apache 2.0 license" src="https://img.shields.io/badge/License-Apache_2.0-335DC6.svg"></a>
+  <a href="https://github.com/arunaengine/aruna/blob/main/LICENSE-MIT"><img alt="MIT license" src="https://img.shields.io/badge/License-MIT-335DC6.svg"></a>
+  <a href="https://github.com/arunaengine/aruna/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/arunaengine/aruna/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://codecov.io/gh/arunaengine/aruna"><img alt="Coverage" src="https://codecov.io/github/arunaengine/aruna/coverage.svg?branch=main"></a>
+</p>
 
-> [!WARNING]
-> Work in progress! You are viewing the upcoming version 3. See the [v2](https://github.com/arunaengine/aruna/tree/v2) branch for the latest stable release. 
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#architecture-and-goals">Architecture</a> ·
+  <a href="#getting-started">Getting started</a> ·
+  <a href="#feedback--contributions">Contributing</a>
+</p>
 
-Aruna is a federated peer-to-peer data orchestration engine that enables organizations to share and organize data and metadata without handing over control to a central platform.
+> [!NOTE]
+> **Aruna v3 is now in public testing.** You can try it out and share feedback through [GitHub issues](https://github.com/arunaengine/aruna/issues). Aruna v2 remains available on the [v2 branch](https://github.com/arunaengine/aruna/tree/v2).
+
+Aruna helps organizations share and organize research data and metadata while keeping control of their own infrastructure. Each organization runs its own node and connects with others through a peer-to-peer network.
 
 ## Features
 
@@ -34,39 +39,37 @@ Aruna is a federated peer-to-peer data orchestration engine that enables organiz
 - **Virtual buckets**: Buckets are virtual collections of local and remote data resources, with configurable materialization behavior.
 - **Extensible storage backends**: Support for a variety of storage backends through [OpenDAL](https://opendal.apache.org/).
 - **Standardized metadata**: Metadata is stored as [RO-Crate](https://www.researchobject.org/ro-crate/) JSON-LD enabling rich, interoperable descriptions of datasets, files, and processes.
-- **Powerful metadata manipulation**: RO-Crates can be created, edited and viewed through SPARQL queries and updates.
+- **Metadata queries and editing**: Query and update RO-Crate metadata with SPARQL.
 - **Distributed full-text search**: Per-node [Tantivy](https://github.com/quickwit-oss/tantivy) indexes with fan-out queries and authorization filtering.
 - **Built-in replication and synchronization**: Metadata edits converge across holders. Blob copies move through explicit copy or replication requests; each node owns its S3 keys, versions, and current heads.
 - **Interoperable using open standards**: [OIDC](https://openid.net/connect/) for authentication, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) for data referencing, [OAI-PMH](https://www.openarchives.org/pmh/) for metadata harvesting.
 - **AI assistant tools**: Authenticated [MCP](https://modelcontextprotocol.io/) access to Aruna context, data, metadata, and compute operations.
-- **Easy deployment**: Run a node as a single binary or deploy a multi-node cluster.
+- **Deployment**: Run a node as a single binary or deploy a multi-node cluster.
 
 ## Architecture and Goals
 
-Aruna is built for research data that does not live in one place, and often cannot be moved into one. Universities, institutes, labs, archives, repositories and infrastructure providers each have their own storage systems, policies, identities, and responsibilities. A central platform can be convenient, but it also creates a new point of control and tends to clash with legal, organizational, or practical constraints. Aruna takes a different approach: every participating organization runs its own node, keeps authority over its data, and still joins a shared network for discovery, access, replication, and collaboration.
- 
-The system is organized around **realms**. A realm is an organizational trust boundary, such as an institute, department, consortium, or project network. Each node belongs to one realm, and realms can establish trust with each other when collaboration requires it. Trust is not the same as access. A trusted partner does not automatically gain permission to read or modify data. Access stays explicit, granted through groups, roles, and path-based permissions. Data sits with the organization responsible for it, while researchers can still work across institutions.
+Research data rarely lives in one place. Universities, labs, archives, and infrastructure providers have their own storage systems, policies, and responsibilities. Aruna connects these systems so researchers can find and work with data across participating nodes, while each organization decides how its data is stored and who can access it.
+
+Nodes are organized into **realms**, which define a shared trust boundary for an institute, consortium, or project network. Each node belongs to one realm. Membership alone does not grant access to data: permissions are assigned explicitly through groups, roles, and paths.
 
 ### Data, metadata, and access
 
-Each Aruna node exposes an **S3-compatible API**, so researchers can keep using the tools, scripts, workflow systems, and libraries they already have instead of learning a new storage protocol. Buckets are virtual collections that mix local data, replicated data, and references to remote resources. To a user, this looks like one coherent access point. Underneath, Aruna tracks where data actually lives, which permissions apply, and whether an object should be materialized locally or fetched on demand.
+Each Aruna node exposes an **S3-compatible API** for the tools, scripts, and workflow systems researchers already use. Virtual buckets bring together local data, replicated copies, and references to remote resources. Aruna tracks where each object lives and whether to keep a local copy or fetch it when needed.
 
 > [!NOTE]
 > Object keys for `PutObject`, `CreateMultipartUpload`, `UploadPart`, and `CompleteMultipartUpload` must be non-empty relative paths; they are rejected if they begin with `/`, contain an exact `..` path segment, or contain control characters.
  
-Metadata is part of the core system, not an external catalog bolted on afterwards. Descriptions are stored as **RO-Crate JSON-LD**, so datasets, files, people, instruments, workflows, software, and process runs can be described in a shared format. These descriptions live in a CRDT-based triple store, which allows concurrent edits on different nodes and merges them without a single authority arbitrating the result. Management resources such as users and groups are synchronized through durable document-sync topics, which lets nodes keep working through network outages and reconcile state once they reconnect.
- 
-File contents go into a content-addressed blob layer. Objects are hashed with **BLAKE3**, making integrity checks and deduplication part of the storage model rather than a separate step. If the same file shows up under different paths or on different nodes, it is recognized by its content instead of its location. Replication uses Bao-tree verified streaming, so data can be checked incrementally as it arrives.
+Metadata is stored as **RO-Crate JSON-LD**, describing datasets alongside their files, people, instruments, software, and workflows. A CRDT-based triple store merges concurrent metadata edits across nodes. Users, groups, and other management resources also synchronize between nodes, allowing them to reconcile changes after a network outage.
+
+File contents are hashed with **BLAKE3** for integrity checks and deduplication within each storage backend. Replication uses Bao-tree verified streaming to check data as it arrives. Each node owns its local object keys and versions; copying a file to another node creates a copy managed by that node.
 
 ### Network and research workflows
 
-The network layer is built on **iroh**, which gives Aruna a peer-to-peer foundation for node discovery, authenticated communication, and direct exchange between nodes, even if they are behind NATs or firewalls.
- 
-For researchers, the data remains where it is, but becomes easier to find, describe, access, replicate and incorporate into workflows. Familiar S3 tooling keeps working, while Aruna adds shared metadata, authorization, replication, provenance, and standards-based interoperability on top of the existing infrastructure.
+The network layer uses **iroh** for peer discovery, authenticated connections, and data exchange, including connections across NATs and firewalls.
 
-Aruna serves as a base layer for larger research infrastructures. Distributed full-text search, GA4GH DRS identifiers, OAI-PMH harvesting, GA4GH TES-based compute execution, CEL-based policy enforcement, event subscriptions, and transparent request forwarding all rest on the same foundation: sovereign nodes, shared metadata, verified data exchange, and open interfaces. 
+Researchers can search across nodes, describe datasets, share files, and run compute jobs through the same system. Aruna supports GA4GH DRS for data references, OAI-PMH for metadata harvesting, and GA4GH TES for compute execution. Policies and permissions govern access throughout these workflows.
 
-The goal is to support FAIR data practice in a way that matches how research actually works: distributed, collaborative, policy-bound, and owned by many parties at once.
+The goal is practical support for FAIR research data: making it findable, accessible, interoperable, and reusable across the institutions responsible for it.
 
 ## Getting Started
 
@@ -74,14 +77,13 @@ The quickest way to try Aruna is a local 3-node demo deployment.
 
 ### Prerequisites
 
-
-#### For local builds:
+#### For local builds
 
 - Rust `1.97.1` (see [rust-toolchain.toml](rust-toolchain.toml), for source builds)
 - OpenSSL development headers
 - `mold` linker
 
-#### For local test deployments:
+#### For local test deployments
 
 - `curl` (`ss` for cluster setup)
 - `docker`
@@ -259,4 +261,4 @@ at your option. Unless you explicitly state otherwise, any contribution intentio
 
 ## Feedback & Contributions
 
-If you have any ideas, suggestions, or issues, please don't hesitate to open an issue and/or PR. Contributions to this project are always welcome! We appreciate your help in making this project better. Please have a look at our [Contributor Guidelines](./CONTRIBUTING.md) as well as our [Code of Conduct](./CODE_OF_CONDUCT.md) for more information.
+Found a bug or have an idea? Open an [issue](https://github.com/arunaengine/aruna/issues) or send a pull request. Reports from the v3 public test phase help us understand what works and what needs attention. See the [Contributor Guidelines](./CONTRIBUTING.md) and [Code of Conduct](./CODE_OF_CONDUCT.md) before contributing.
