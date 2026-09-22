@@ -1,5 +1,8 @@
 # Aruna Git/LFS ARC PoC
 
+This is the original standalone experiment. Use the [native endpoint and ARCitect guide](../arc-native/README.md)
+for the integration now served by Aruna itself. The native test reuses this directory's fixture generator.
+
 This standalone bridge serves one private ARC repository over Git smart HTTP and Git LFS.
 LFS uploads are verified by SHA-256 and size, stored through Aruna S3, and read using the
 returned VersionId. An explicit publication request creates private, commit-specific
