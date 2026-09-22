@@ -3,9 +3,11 @@
 <!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
 
 <p align="center">
+  <img alt="" src="./img/icon-mark.png" width="240">
+  <br>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./img/lockup-white.png">
-    <img alt="Aruna" src="./img/lockup.png" width="640">
+    <source media="(prefers-color-scheme: dark)" srcset="./img/wordmark-white.png">
+    <img alt="Aruna" src="./img/wordmark.png" width="320">
   </picture>
 </p>
 
@@ -20,6 +22,8 @@
 </p>
 
 <p align="center">
+  <a href="https://v3.aruna-engine.org/app/docs/v1">Portal documentation</a> ·
+  <a href="https://api.node-1.v3.aruna-engine.org/swagger-ui/">Swagger UI</a> ·
   <a href="#features">Features</a> ·
   <a href="#architecture-and-goals">Architecture</a> ·
   <a href="#getting-started">Getting started</a> ·
@@ -33,16 +37,20 @@ Aruna helps organizations share and organize research data and metadata while ke
 
 ## Features
 
+- **Web portal**: Browse files, edit datasets, manage access, and follow compute runs in the browser.
 - **Sovereign trust model**: Each node belongs to one organization. Realms define shared trust between them.
 - **Fine-grained access control**: Path-based permissions with wildcard support and group-based roles.
 - **S3-compatible API**: Every node exposes an [S3 API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations_Amazon_Simple_Storage_Service.html) for data access.
 - **Virtual buckets**: Buckets are virtual collections of local and remote data resources, with configurable materialization behavior.
 - **Extensible storage backends**: Support for a variety of storage backends through [OpenDAL](https://opendal.apache.org/).
 - **Standardized metadata**: Metadata is stored as [RO-Crate](https://www.researchobject.org/ro-crate/) JSON-LD enabling rich, interoperable descriptions of datasets, files, and processes.
+- **Metadata profiles**: Define dataset requirements with SHACL profiles and check descriptions against them.
 - **Metadata queries and editing**: Query and update RO-Crate metadata with SPARQL.
 - **Distributed full-text search**: Per-node [Tantivy](https://github.com/quickwit-oss/tantivy) indexes with fan-out queries and authorization filtering.
 - **Built-in replication and synchronization**: Metadata edits converge across holders. Blob copies move through explicit copy or replication requests; each node owns its S3 keys, versions, and current heads.
 - **Interoperable using open standards**: [OIDC](https://openid.net/connect/) for authentication, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) for data referencing, [OAI-PMH](https://www.openarchives.org/pmh/) for metadata harvesting.
+- **Compute jobs**: Run container workloads with Docker, Apptainer, or Kubernetes through the portal or GA4GH TES API.
+- **Interactive notebooks**: Work with `.ipynb` notebooks in the portal, run cells in live sessions, and access files in S3 buckets.
 - **AI assistant tools**: Authenticated [MCP](https://modelcontextprotocol.io/) access to Aruna context, data, metadata, and compute operations.
 - **Deployment**: Run a node as a single binary or deploy a multi-node cluster.
 
@@ -73,7 +81,7 @@ The goal is practical support for FAIR research data: making it findable, access
 
 ## Getting Started
 
-The quickest way to try Aruna is a local 3-node demo deployment.
+Try the [public v3 portal](https://v3.aruna-engine.org) and follow the [portal documentation](https://v3.aruna-engine.org/app/docs/v1), or explore the REST API in [Swagger UI](https://api.node-1.v3.aruna-engine.org/swagger-ui/). To run Aruna locally, start with the 3-node demo deployment below.
 
 ### Prerequisites
 
