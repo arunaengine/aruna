@@ -29,6 +29,7 @@ struct Repository {
     corrupt: bool,
     loop_pages: bool,
     lost_create: bool,
+    lost_source: bool,
     lost_commit: bool,
     lost_publish: bool,
     lost_content: bool,
@@ -163,7 +164,12 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             json!({"hits": {"total": 2, "hits": [{"id": if second {"2"} else {"1"}}]},
                 "links": {"next": if !second || state.loop_pages {Some("/api/records/2/versions?page=2")} else {None}}})
         }
-        (Method::GET, ["api", "records", id @ ("1" | "2")]) => record(id, true),
+        (Method::GET, ["api", "records", id @ ("1" | "2")]) => {
+            if std::mem::take(&mut state.lost_source) {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            record(id, true)
+        }
         (Method::GET, ["api", "records", id @ ("1" | "2"), "files"]) => {
             let mut entry = file(
                 state.file_name.as_deref().unwrap_or("data.txt"),
@@ -839,6 +845,35 @@ async fn invenio_continues_versions() -> Result<(), Box<dyn std::error::Error>> 
                 .calls
                 .contains(&(Method::PUT, "/api/records/3/draft".into()))
         );
+    }
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_retries_versions() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository {
+        lost_source: true,
+        ..Default::default()
+    })
+    .await;
+    let mut spec = export_spec(&fixture, &server, true).await?;
+    spec.destination.as_mut().unwrap().new_version = Some("2".into());
+    let ctx = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+    match run_export_job(&ctx, &spec).await {
+        JobRunOutcome::Failed(error) => assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Retryable
+        ),
+        _ => panic!("unavailable source record did not request a retry"),
+    }
+    match run_export_job(&ctx, &spec).await {
+        JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) => {
+            assert!(result.repository.unwrap().published);
+        }
+        JobRunOutcome::Failed(error) => panic!("{}", error.message),
+        _ => panic!("unexpected version retry outcome"),
     }
     fixture.stop().await;
     Ok(())

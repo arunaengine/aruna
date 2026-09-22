@@ -477,17 +477,22 @@ async fn repository_export(
         if checkpoint.repository_started && destination.draft_id.is_none() {
             return Err(ExportFailure::Permanent("draft creation outcome is unknown; inspect the repository and retry with its draft_id".into()));
         }
-        checkpoint.repository_started = true;
-        persist_checkpoint(ctx, checkpoint)
-            .await
-            .map_err(ExportFailure::Retryable)?;
         let jsonld = checkpoint
             .raw_jsonld
-            .as_deref()
+            .clone()
             .ok_or_else(|| ExportFailure::Permanent("source crate metadata missing".into()))?;
-        let record = interruptible(ctx, export::create_draft(ctx, spec, destination, jsonld))
-            .await
-            .map_err(classify)?;
+        let fence = async || {
+            checkpoint.repository_started = true;
+            persist_checkpoint(ctx, checkpoint)
+                .await
+                .map_err(TransferError::Retryable)
+        };
+        let record = interruptible(
+            ctx,
+            export::create_draft(ctx, spec, destination, &jsonld, fence),
+        )
+        .await
+        .map_err(classify)?;
         checkpoint.repository = Some(record);
         persist_checkpoint(ctx, checkpoint)
             .await

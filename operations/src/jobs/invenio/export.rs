@@ -26,6 +26,7 @@ pub(crate) async fn create_draft(
     spec: &ExportRoCrateSpec,
     destination: &InvenioDestination,
     jsonld: &str,
+    fence: impl AsyncFnOnce() -> Result<(), TransferError>,
 ) -> Result<InvenioRecord, TransferError> {
     let credential = destination
         .credential
@@ -85,6 +86,7 @@ pub(crate) async fn create_draft(
     } else {
         fields["files"] = json!({"enabled": true});
         fields["access"] = json!({"record": "public", "files": if destination.public_files { "public" } else { "restricted" }});
+        fence().await?;
         client
             .json(Method::POST, client.url(&["records"])?, Some(&fields))
             .await?
