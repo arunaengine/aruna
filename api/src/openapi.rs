@@ -20,6 +20,7 @@ use utoipa::{Modify, OpenApi};
 **Authentication**: most operations take a realm bearer token; the GA4GH TES facade also accepts
 HTTP Basic with an access key and secret issued by this node, and public routes carry an empty
 security requirement.
+Native Git/LFS also accepts HTTP Basic with an Aruna bearer token as the password.
 
 **Conventions**
 - Errors answer `application/json` with `ErrorResponse` (`error` plus an optional `code`); the
@@ -90,7 +91,7 @@ fn add_transport_responses(openapi: &mut utoipa::openapi::OpenApi) {
                 .responses
                 .entry("429".to_string())
                 .or_insert_with(|| rate_limit_response().into());
-            if path != "/metadata/rocrate/uploads" {
+            if !crate::server::is_exempt(Some(path)) {
                 operation
                     .responses
                     .responses
