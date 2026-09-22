@@ -38,6 +38,7 @@ struct Repository {
     conflict: bool,
     partial_metadata: bool,
     file_name: Option<String>,
+    redirect: Option<String>,
     head_started: Option<Arc<tokio::sync::Notify>>,
     head_release: Option<Arc<tokio::sync::Notify>>,
 }
@@ -94,6 +95,17 @@ fn file(key: &str, bytes: &[u8], committed: bool) -> Value {
     );
     json!({"key": key, "size": bytes.len(), "checksum": format!("md5:{md5}"),
         "status": if committed {"completed"} else {"pending"}, "mimetype": "application/octet-stream", "file_id": key})
+}
+
+fn stored_content(id: &str) -> Response {
+    (
+        [
+            ("content-type", "application/octet-stream"),
+            ("content-length", "1"),
+        ],
+        id.to_string(),
+    )
+        .into_response()
 }
 
 async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Request) -> Response {
@@ -186,15 +198,13 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             ["api", "records", id @ ("1" | "2"), "files", key, "content"],
         ) => {
             assert_eq!(*key, state.file_name.as_deref().unwrap_or("data.txt"));
-            return (
-                [
-                    ("content-type", "application/octet-stream"),
-                    ("content-length", "1"),
-                ],
-                id.to_string(),
-            )
-                .into_response();
+            if let Some(target) = &state.redirect {
+                let location = format!("{target}{id}/content");
+                return (StatusCode::FOUND, [("location", location)]).into_response();
+            }
+            return stored_content(id);
         }
+        (Method::GET | Method::HEAD, ["storage", id, "content"]) => return stored_content(id),
         (Method::POST, ["api", "records"]) => {
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["metadata"]["title"], "Exported dataset");
@@ -414,6 +424,72 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::invenio::{InvenioMode, InvenioOptions};
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let storage = format!("http://{}/storage/", listener.local_addr()?);
+    let recorder = seen.clone();
+    let app = Router::new().fallback(move |request: Request| async move {
+        recorder
+            .lock()
+            .unwrap()
+            .push(request.headers().contains_key("authorization"));
+        let id = request.uri().path().split('/').nth(2).unwrap_or_default();
+        stored_content(id)
+    });
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for (foreign, mode) in [
+        (false, InvenioMode::Copy),
+        (true, InvenioMode::Copy),
+        (true, InvenioMode::Reference),
+    ] {
+        let fixture = build_fixture(false).await?;
+        let server = serve(Repository::default()).await;
+        let target = if foreign {
+            storage.clone()
+        } else {
+            server.endpoint.replace("/api/", "/storage/")
+        };
+        server.state.lock().unwrap().redirect = Some(target);
+        let spec = spec_with_source(
+            &fixture,
+            ImportRoCrateSource::Invenio {
+                group_id: fixture.group_id,
+                connector_id: connector(&fixture, &server).await,
+                record_id: "2".into(),
+                options: InvenioOptions {
+                    mode,
+                    all_versions: false,
+                },
+            },
+            doc_id(1),
+        );
+        let ctx =
+            claim_context(&fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
+        match run_rocrate_import(&ctx, &spec).await {
+            JobRunOutcome::Succeeded(_) => {}
+            JobRunOutcome::Failed(error) => panic!("{}", error.message),
+            _ => panic!("redirected import did not complete"),
+        }
+        let local = server
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(_, path)| path.starts_with("/storage/"));
+        assert_eq!(local, !foreign);
+        fixture.stop().await;
+    }
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() >= 2);
+    assert!(seen.iter().all(|authorized| !authorized));
+    task.abort();
     Ok(())
 }
 

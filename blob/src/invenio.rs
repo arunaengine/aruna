@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::blob::BlobHandle;
 
+const REDIRECT_HOPS: usize = 5;
 const JSON_ACCEPT: &str = "application/vnd.inveniordm.v1+json, application/json;q=0.9";
 
 #[derive(Debug, Error)]
@@ -29,6 +30,8 @@ pub enum InvenioError {
     Limit,
     #[error("repository returned invalid JSON")]
     Json,
+    #[error("repository redirected too often")]
+    Redirects,
     #[error("repository tokens require HTTPS outside loopback")]
     InsecureToken,
 }
@@ -170,14 +173,53 @@ impl<'a> InvenioClient<'a> {
     }
 
     pub async fn download(&self, url: Url) -> Result<Response, InvenioError> {
-        let response = self
-            .request(Method::GET, url)?
-            .header("Accept", "*/*")
-            .send()
-            .await
-            .map_err(|_| InvenioError::Transport)?;
-        check_status(&response)?;
-        Ok(response)
+        self.content(Method::GET, url, None).await
+    }
+
+    /// Follows storage redirects for file content only and screens every hop.
+    /// The token is sent only while the target stays on the repository origin.
+    async fn content(
+        &self,
+        method: Method,
+        url: Url,
+        timeout: Option<Duration>,
+    ) -> Result<Response, InvenioError> {
+        let mut url = self.link(url.as_str())?;
+        let mut authorized = true;
+        for _ in 0..=REDIRECT_HOPS {
+            authorized &= url.origin() == self.endpoint.origin();
+            let mut request = self
+                .blob
+                .repository_request(method.clone(), url.clone())
+                .map_err(|_| InvenioError::Egress)?
+                .header("Accept", "*/*");
+            if let Some(timeout) = timeout {
+                request = request.timeout(timeout);
+            }
+            if let Some(token) = self.token.as_ref().filter(|_| authorized) {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.map_err(|_| InvenioError::Transport)?;
+            if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                check_status(&response)?;
+                return Ok(response);
+            }
+            let next = response
+                .headers()
+                .get("location")
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| url.join(location).ok())
+                .ok_or(InvenioError::InvalidUrl)?;
+            if !matches!(next.scheme(), "https" | "http")
+                || (url.scheme() == "https" && next.scheme() != "https")
+                || !next.username().is_empty()
+                || next.password().is_some()
+            {
+                return Err(InvenioError::InvalidUrl);
+            }
+            url = next;
+        }
+        Err(InvenioError::Redirects)
     }
 
     pub async fn head(
@@ -185,13 +227,8 @@ impl<'a> InvenioClient<'a> {
         url: Url,
     ) -> Result<aruna_core::structs::execution::source_access::SourceMetadata, InvenioError> {
         let response = self
-            .request(Method::HEAD, url)?
-            .header("Accept", "*/*")
-            .timeout(Duration::from_secs(120))
-            .send()
-            .await
-            .map_err(|_| InvenioError::Transport)?;
-        check_status(&response)?;
+            .content(Method::HEAD, url, Some(Duration::from_secs(120)))
+            .await?;
         let headers = response.headers();
         let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
         Ok(
