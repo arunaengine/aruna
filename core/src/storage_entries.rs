@@ -276,10 +276,12 @@ pub fn reducer_state_key(target: &AdminDocumentTarget) -> Key {
     admin_target_key(target)
 }
 
+pub type GroupDeleteEntries = (Vec<(KeySpace, Key)>, Vec<(KeySpace, Key, Value)>);
+
 pub fn group_deletion_entries(
     record: &crate::structs::identity::group_delete::GroupDeleteRecord,
     state: &AdminDocumentState,
-) -> Result<(Vec<(KeySpace, Key)>, Vec<(KeySpace, Key, Value)>), ConversionError> {
+) -> Result<GroupDeleteEntries, ConversionError> {
     let group_id = record.plan.group_id;
     let deletes = vec![
         (

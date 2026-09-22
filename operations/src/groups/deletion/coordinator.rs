@@ -314,8 +314,7 @@ async fn cancel_plan(
                 .nodes
                 .iter()
                 .any(|member| member.node_id == node.to_string())
-        {
-            if let Err(error) = request_node(
+            && let Err(error) = request_node(
                 context,
                 *node,
                 None,
@@ -324,9 +323,8 @@ async fn cancel_plan(
                 },
             )
             .await
-            {
-                failure = Some(error);
-            }
+        {
+            failure = Some(error);
         }
     }
     if let Some(error) = failure {
