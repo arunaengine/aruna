@@ -22,10 +22,12 @@ const MEDIA: &str = "application/vnd.git-lfs+json";
 #[utoipa::path(post, path = "/git/{repository}/info/lfs/objects/batch", tag = "metadata/git",
     security(("bearer_auth" = []), ("basic_auth" = [])),
     summary = "Negotiate native LFS transfers",
-    description = "Requires repository and object-path READ or WRITE. Supports the basic transfer adapter with SHA-256 identities. Individual failures are returned per object.",
+    description = "Negotiates basic Git LFS transfers using SHA-256 identities.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password, with repository and object-path READ or WRITE.\n\n**Behavior**: individual failures are reported per object.",
     params(("repository" = String, Path, description = "Document ID followed by .git")),
-    request_body(content = Value, content_type = "application/vnd.git-lfs+json"),
-    responses((status = 200, description = "LFS batch actions", body = Value, content_type = "application/vnd.git-lfs+json"),
+    request_body(content = Value, content_type = "application/vnd.git-lfs+json",
+                 example = json!({"operation":"download","transfers":["basic"],"objects":[{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":42}]})),
+    responses((status = 200, description = "LFS batch actions", body = Value, content_type = "application/vnd.git-lfs+json",
+               example = json!({"transfer":"basic","objects":[{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":42,"error":{"code":404,"message":"object not found"}}]})),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
 pub async fn batch(
     State(state): State<Arc<ServerState>>,
@@ -104,7 +106,7 @@ pub async fn batch(
 #[utoipa::path(put, path = "/git/{repository}/info/lfs/objects/{oid}", tag = "metadata/git",
     security(("bearer_auth" = []), ("basic_auth" = [])),
     summary = "Upload a native LFS object",
-    description = "Requires repository and destination-object WRITE. Streams through Aruna quota, routing and checksum operations. The SHA-256 and Content-Length must match before publication.",
+    description = "Uploads and verifies one Git LFS object.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password, with repository and destination-object WRITE.\n\n**Behavior**: the transfer uses Aruna quota, routing and checksum operations. SHA-256 and Content-Length must match before publication.",
     params(("repository" = String, Path, description = "Document ID followed by .git"), ("oid" = String, Path, description = "Lowercase SHA-256")),
     responses((status = 200, description = "Verified object stored"), (status = 400, description = "Invalid content"),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
@@ -146,7 +148,7 @@ pub async fn upload(
 #[utoipa::path(get, path = "/git/{repository}/info/lfs/objects/{oid}", tag = "metadata/git",
     security(("bearer_auth" = []), ("basic_auth" = [])),
     summary = "Download an exact native LFS version",
-    description = "Requires repository and source-object READ. Uses the recorded Aruna VersionId; changing the S3 key head does not change the LFS payload.",
+    description = "Downloads the exact Aruna version bound to an LFS identity.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password, with repository and source-object READ.\n\n**Behavior**: changing the S3 key head does not change the recorded LFS payload.",
     params(("repository" = String, Path, description = "Document ID followed by .git"), ("oid" = String, Path, description = "Lowercase SHA-256")),
     responses((status = 200, description = "LFS bytes", content_type = "application/octet-stream"),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),

@@ -110,11 +110,12 @@ pub struct RepositoryResponse {
 
 #[utoipa::path(post, path = "/metadata/{document_id}/git", tag = "metadata/git",
     security(("bearer_auth" = [])),
-    summary = "Bind an ARC repository to an explicit LFS bucket",
-    description = "Requires document and same-group bucket WRITE. Automatic repositories already have a binding; it cannot be replaced. ARC validation cannot be disabled. Normal clients discover the automatic repository with GET on this route.",
+    summary = "Bind an ARC repository to LFS storage",
+    description = "Binds a repository to an explicit same-group LFS bucket.\n\n**Authentication**: realm bearer token with WRITE on the document and bucket.\n\n**Behavior**: automatic repositories already have an immutable binding. ARC validation cannot be disabled. Normal clients discover the automatic repository with GET on this route.",
     params(("document_id" = String, Path, description = "Existing crate document ID")),
-    request_body = CreateRepository,
-    responses((status = 200, description = "Repository enabled", body = RepositoryResponse),
+    request_body(content = CreateRepository, example = serde_json::json!({"bucket":"arc-storage","arc":true})),
+    responses((status = 200, description = "Repository enabled", body = RepositoryResponse,
+               example = serde_json::json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","arc":true})),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
               (status = 404, description = "Document or bucket missing"), (status = 409, description = "Different binding exists")))]
 pub async fn create_repository(
