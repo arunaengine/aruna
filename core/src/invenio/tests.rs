@@ -28,7 +28,7 @@ fn separates_version_files() {
 #[test]
 fn preserves_version_identifiers() {
     let records: Vec<_> = ["1", "2"].into_iter().map(|id| (
-        json!({"id": id, "metadata": {"title": format!("Version {id}"), "version": id},
+        json!({"id": id, "metadata": {"title": format!("Version {id}"), "version": id, "publication_date": "2024-01-01"},
             "pids": {"doi": {"identifier": format!("10.1234/{id}")}},
             "parent": {"pids": {"doi": {"identifier": "10.1234/all"}}}}),
         json!({"entries": [{"key": "data.csv", "size": 4, "file_id": format!("file-{id}")}]}),

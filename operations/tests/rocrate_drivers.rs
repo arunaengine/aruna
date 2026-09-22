@@ -5,6 +5,9 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "512"]
 
+#[path = "rocrate_drivers/invenio.rs"]
+mod invenio;
+
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::net::SocketAddr;
@@ -185,6 +188,7 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(materialized.processed, 1);
 
     let export = ExportRoCrateSpec {
+        destination: None,
         auth_context: AuthContext {
             user_id: fixture.actor.user_id,
             realm_id: fixture.actor.realm_id,
@@ -829,6 +833,7 @@ async fn local_denial_omits() -> Result<(), Box<dyn std::error::Error>> {
         document_id,
     );
     let export = ExportRoCrateSpec {
+        destination: None,
         auth_context: AuthContext {
             user_id: fixture.actor.user_id,
             realm_id: fixture.actor.realm_id,

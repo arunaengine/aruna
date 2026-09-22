@@ -82,7 +82,10 @@ pub fn record_entity(record: &Value, id: &str) -> Result<Value, InvenioError> {
     let title = metadata["title"]
         .as_str()
         .ok_or(InvenioError("missing title"))?;
-    let mut entity = json!({"@id": id, "@type": "Dataset", "name": title});
+    let mut entity = json!({
+        "@id": id, "@type": "Dataset", "name": title,
+        "description": "Imported repository record"
+    });
     for (source, target) in [
         ("description", "description"),
         ("publication_date", "datePublished"),

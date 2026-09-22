@@ -316,7 +316,8 @@ the files public when publishing; otherwise files remain restricted. Existing dr
 their configured access. An exported ZIP imported later is retained as a file
 of its source version, including the original crate inside it.
 
-The response provides job status and report URLs; the existing job API also supports cancellation. Successful exports include `result.repository` with the record ID, API URL and publication
+The response provides job status and report URLs; the existing job API also supports cancellation.
+Successful exports include `result.repository` with the record ID, API URL and publication
 state. Both transfers support `idempotency_key`. An ambiguous draft-creation response stops
 automatic creation; inspect the repository and supply `repository.draft_id` in a new request
 to reuse the unpublished draft. Failed or cancelled transfers leave remote drafts available
