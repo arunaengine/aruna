@@ -2,9 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::invenio::{InvenioMode, validate_id};
+use std::collections::HashMap;
+use std::time::SystemTime;
+
+use aruna_core::invenio::{
+    InvenioMode, REFERENCE_FILE, REFERENCE_GROUP, REFERENCE_RECORD, validate_id,
+};
 use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec};
 use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -12,8 +18,6 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::{TransferError, connect, interruptible};
-use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
-use crate::driver::drive;
 use crate::jobs::executor::JobContext;
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::reference::{ReferenceWrite, write_reference_version};
@@ -47,25 +51,6 @@ pub(crate) async fn write_reference(
             "reference target and connector must share a group".into(),
         ));
     }
-    let resolved = interruptible(ctx, async {
-        drive(
-            ResolveConnectorOperation::new(ResolveConnectorInput {
-                group_id: *group_id,
-                connector_id: *connector_id,
-                source_path: String::new(),
-                allow_root: true,
-            }),
-            &ctx.driver,
-        )
-        .await
-        .map_err(|error| match error {
-            aruna_core::errors::SourceResolutionError::StorageError(_) => {
-                TransferError::Retryable("repository connector storage unavailable".into())
-            }
-            _ => invalid("repository connector unavailable"),
-        })
-    })
-    .await?;
     let client = interruptible(
         ctx,
         connect(
@@ -92,20 +77,21 @@ pub(crate) async fn write_reference(
     if file["size"].as_u64() != Some(metadata.content_length) {
         return Err(invalid("repository reference size changed"));
     }
-    let mut connector = resolved.connector.clone();
-    if connector
-        .public_config
-        .get("endpoint")
-        .map(|endpoint| format!("{}/", endpoint.trim_end_matches('/')))
-        .as_deref()
-        != Some(client.endpoint())
-    {
-        return Err(invalid("repository connector changed"));
-    }
-    // Keep the encoded file key in the endpoint; OpenDAL only encodes the final path component.
-    connector.public_config.insert(
-        "endpoint".into(),
-        client.url(&["records", id, "files", name])?.to_string(),
+    // The binding freezes the API root and file; reads resolve the token by connector id.
+    let connector = SourceConnector::new(
+        *connector_id,
+        *group_id,
+        String::new(),
+        SourceConnectorKind::Invenio,
+        HashMap::from([
+            ("endpoint".to_string(), client.endpoint().to_string()),
+            (REFERENCE_GROUP.to_string(), group_id.to_string()),
+            (REFERENCE_RECORD.to_string(), id.to_string()),
+            (REFERENCE_FILE.to_string(), name.to_string()),
+        ]),
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH,
+        spec.auth_context.user_id,
     );
     let source = build_source_binding(
         StagingStrategy::Reference,
@@ -135,7 +121,7 @@ pub(crate) async fn write_reference(
             version_source: source,
             metadata: metadata.clone(),
             inherited_policies: Vec::new(),
-            connector_guard: Some((resolved.connector, resolved.secret_fingerprint)),
+            connector_guard: None,
         },
     )
     .await

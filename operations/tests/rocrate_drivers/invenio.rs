@@ -4,6 +4,8 @@
 
 use super::*;
 use aruna_core::invenio::InvenioDestination;
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
+use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
@@ -352,12 +354,13 @@ fn draft_record(state: &Repository, published: bool) -> Value {
 
 async fn connector(fixture: &Fixture, server: &Server) -> Ulid {
     drive(
-        SourceConnectorOperation::new(SourceConnectorInput {
+        CreateConnectorOperation::new(CreateConnectorInput {
             group_id: fixture.group_id,
             created_by: fixture.actor.user_id,
             name: "repository".into(),
-            kind: SourceConnectorKind::Http,
-            public_config: HashMap::from([("endpoint".into(), server.endpoint.clone())]),
+            kind: RepositoryConnectorKind::Invenio,
+            endpoint: server.endpoint.clone(),
+            public_config: HashMap::new(),
             secret_config: HashMap::from([("token".into(), "repository-token".into())]),
         }),
         &fixture.context,

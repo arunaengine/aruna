@@ -488,13 +488,7 @@ async fn fast_source_check(
 ) -> ServerResult<()> {
     match source {
         ImportRoCrateSource::Invenio { group_id, .. } => {
-            crate::routes::storage::connectors::ensure_data_permission(
-                state,
-                auth,
-                *group_id,
-                Permission::READ,
-            )
-            .await
+            crate::metadata::ensure_metadata_scope(state, auth, *group_id, Permission::READ).await
         }
         ImportRoCrateSource::Upload { upload_id } => {
             let record = load_rocrate_upload(&state.get_ctx(), *upload_id)

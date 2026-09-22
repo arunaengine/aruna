@@ -330,7 +330,7 @@ pub async fn submit_rocrate_export(
         })
         .transpose()?;
     if let Some(destination) = &mut destination {
-        crate::routes::storage::connectors::ensure_data_permission(
+        crate::metadata::ensure_metadata_scope(
             &state,
             &auth,
             destination.group_id,

@@ -4,6 +4,8 @@
 
 use super::*;
 use aruna_core::invenio::{InvenioMode, InvenioOptions, InvenioQuery, InvenioRecord};
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
+use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
 use aruna_operations::jobs::invenio::{seal_credential, search_records};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 
@@ -214,12 +216,13 @@ async fn live_connector(
     token: Option<&str>,
 ) -> Result<Ulid, Box<dyn std::error::Error>> {
     Ok(drive(
-        SourceConnectorOperation::new(SourceConnectorInput {
+        CreateConnectorOperation::new(CreateConnectorInput {
             group_id: fixture.group_id,
             created_by: fixture.actor.user_id,
             name: format!("live-{}", Ulid::generate()),
-            kind: SourceConnectorKind::Http,
-            public_config: HashMap::from([("endpoint".into(), endpoint.into())]),
+            kind: RepositoryConnectorKind::Invenio,
+            endpoint: endpoint.into(),
+            public_config: HashMap::new(),
             secret_config: token
                 .map(|token| HashMap::from([("token".into(), token.into())]))
                 .unwrap_or_default(),

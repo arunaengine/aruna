@@ -116,6 +116,30 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
             JobRunOutcome::Failed(error) => panic!("{}", error.message),
             _ => panic!("redirected import did not complete"),
         }
+        if mode == InvenioMode::Reference {
+            use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
+            let mut object = drive(
+                GetObjectOperation::new(GetObjectInput {
+                    bucket: BUCKET.into(),
+                    key: format!(
+                        "imported/{}",
+                        aruna_core::invenio::file_path("2", "data.txt")?
+                    ),
+                    version_id: None,
+                    range: None,
+                    group_id: fixture.group_id,
+                    user_identity: fixture.actor.user_id,
+                    node_id: fixture.actor.node_id,
+                }),
+                &fixture.context,
+            )
+            .await?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = object.blob.next().await {
+                bytes.extend_from_slice(&chunk?);
+            }
+            assert_eq!(bytes, b"2");
+        }
         let local = server
             .state
             .lock()

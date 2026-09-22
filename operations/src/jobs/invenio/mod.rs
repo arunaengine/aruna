@@ -1,21 +1,22 @@
-//! Coordinates repository transfers using existing connector authority and crate jobs.
+//! Coordinates repository transfers through Invenio repository connectors and crate jobs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
 
 use aruna_blob::invenio::{InvenioClient, InvenioError};
+use aruna_core::handle::Handle;
 use aruna_core::invenio::{InvenioCredential, InvenioDestination};
-use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
-use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::connectors::get_connector::{GetSourceError, GetSourceInput, GetSourceOperation};
-use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
 use crate::driver::{DriverContext, drive};
+use crate::harvest::create_connector::INVENIO_TOKEN;
+use crate::harvest::read_connector::{ConnectorView, GetRepositoryOperation, ReadConnectorError};
+use crate::harvest::repository::{parse_secret_read, read_secret_effect};
 
 use super::executor::JobContext;
 
@@ -80,7 +81,7 @@ pub(crate) async fn connect<'a>(
         context,
         auth.realm_id,
         auth,
-        &format!("/{}/g/{group_id}/data/**", auth.realm_id),
+        &format!("/{}/g/{group_id}/meta/**", auth.realm_id),
         &permission,
         PolicyRequestExtras::operation("metadata.invenio"),
     )
@@ -93,59 +94,24 @@ pub(crate) async fn connect<'a>(
         }
         _ => TransferError::Permanent(error.to_string()),
     })?;
-    let (kind, config) = if credential.is_some() {
-        let connector = drive(
-            GetSourceOperation::new(GetSourceInput {
-                group_id,
-                connector_id,
-            }),
-            context,
-        )
-        .await
-        .map_err(connector_error)?
-        .connector;
-        (connector.kind, connector.public_config)
-    } else {
-        let resolved = drive(
-            ResolveConnectorOperation::new(ResolveConnectorInput {
-                group_id,
-                connector_id,
-                source_path: String::new(),
-                allow_root: true,
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| match error {
-            aruna_core::errors::SourceResolutionError::StorageError(_) => {
-                TransferError::Retryable("repository connector storage unavailable".into())
-            }
-            _ => TransferError::Permanent("repository connector unavailable".into()),
-        })?;
-        let ResolvedSourceAccess::OpenDal { kind, config, .. } = resolved.access;
-        (kind, config)
-    };
-    if kind != SourceConnectorKind::Http || config.get("root").is_some_and(|root| root != "/") {
-        return Err(TransferError::Permanent(
-            "repository requires an HTTP connector without a root prefix".into(),
-        ));
-    }
-    let endpoint = config
-        .get("endpoint")
-        .ok_or_else(|| TransferError::Permanent("repository endpoint missing".into()))?;
+    let view = repository(context, group_id, connector_id).await?;
+    let endpoint = &view.connector.endpoint;
     let blob = context
         .blob_handle
         .as_ref()
         .ok_or_else(|| TransferError::Retryable("blob handle unavailable".into()))?;
-    let token = if let Some(credential) = credential {
-        let key = context
-            .net_handle
-            .as_ref()
-            .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?
-            .credential_encryption_key();
-        Some(credential.open(&key, auth.user_id, group_id, connector_id, endpoint)?)
-    } else {
-        config.get("token").cloned()
+    // Exports only use the personal sealed token; the connector token is for private reads.
+    let token = match credential {
+        Some(credential) => {
+            let key = context
+                .net_handle
+                .as_ref()
+                .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?
+                .credential_encryption_key();
+            Some(credential.open(&key, auth.user_id, group_id, connector_id, endpoint)?)
+        }
+        None if view.has_secret_config => connector_token(context, connector_id).await?,
+        None => None,
     };
     Ok(InvenioClient::new(blob, endpoint, token, limit)?)
 }
@@ -156,25 +122,7 @@ pub async fn seal_credential(
     destination: &InvenioDestination,
     token: &str,
 ) -> Result<InvenioCredential, TransferError> {
-    let connector = drive(
-        GetSourceOperation::new(GetSourceInput {
-            group_id: destination.group_id,
-            connector_id: destination.connector_id,
-        }),
-        context,
-    )
-    .await
-    .map_err(connector_error)?
-    .connector;
-    if connector.kind != SourceConnectorKind::Http {
-        return Err(TransferError::Permanent(
-            "repository requires an HTTP connector".into(),
-        ));
-    }
-    let endpoint = connector
-        .public_config
-        .get("endpoint")
-        .ok_or_else(|| TransferError::Permanent("repository endpoint missing".into()))?;
+    let view = repository(context, destination.group_id, destination.connector_id).await?;
     let key = context
         .net_handle
         .as_ref()
@@ -185,18 +133,46 @@ pub async fn seal_credential(
         auth.user_id,
         destination.group_id,
         destination.connector_id,
-        endpoint.clone(),
+        view.connector.endpoint,
         token,
     )?)
 }
 
-fn connector_error(error: GetSourceError) -> TransferError {
-    match error {
-        GetSourceError::StorageError(_) | GetSourceError::GetConnectorFailed => {
-            TransferError::Retryable("repository connector unavailable".into())
-        }
-        _ => TransferError::Permanent("repository connector unavailable".into()),
+/// Reads the group's Invenio repository connector; other kinds are refused.
+pub(crate) async fn repository(
+    context: &DriverContext,
+    group_id: Ulid,
+    connector_id: Ulid,
+) -> Result<ConnectorView, TransferError> {
+    let view = drive(GetRepositoryOperation::new(group_id, connector_id), context)
+        .await
+        .map_err(|error| match error {
+            ReadConnectorError::NotFound => {
+                TransferError::Permanent("repository connector unavailable".into())
+            }
+            ReadConnectorError::Storage(_) | ReadConnectorError::Unexpected => {
+                TransferError::Retryable("repository connector storage unavailable".into())
+            }
+        })?;
+    if view.connector.kind != RepositoryConnectorKind::Invenio {
+        return Err(TransferError::Permanent(
+            "repository requires an Invenio repository connector".into(),
+        ));
     }
+    Ok(view)
+}
+
+async fn connector_token(
+    context: &DriverContext,
+    connector_id: Ulid,
+) -> Result<Option<String>, TransferError> {
+    let event = context
+        .storage_handle
+        .send_effect(read_secret_effect(connector_id, None))
+        .await;
+    let secret = parse_secret_read(event)
+        .map_err(|_| TransferError::Retryable("repository connector storage unavailable".into()))?;
+    Ok(secret.and_then(|secret| secret.secret_config.get(INVENIO_TOKEN).cloned()))
 }
 
 pub(crate) async fn interruptible<T>(

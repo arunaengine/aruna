@@ -32,7 +32,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 pub struct InvenioSearch {
     /// Group that owns the repository connector.
     pub group_id: String,
-    /// HTTP connector configured with the repository API root.
+    /// Invenio repository connector of the group.
     pub connector_id: String,
     /// Native repository query; an empty query lists records.
     #[serde(default)]
@@ -62,7 +62,7 @@ fn page_size() -> u8 {
 
 **Authentication**
 
-Requires authentication and READ on the HTTP connector group.
+Requires authentication and READ on the metadata path of the repository connector group.
 
 **Behavior**
 
@@ -102,7 +102,7 @@ pub async fn search_records(
         size: query.size,
         all_versions: query.all_versions,
     };
-    super::storage::connectors::ensure_data_permission(
+    crate::metadata::ensure_metadata_scope(
         &state,
         &auth,
         query.group_id,
@@ -197,7 +197,7 @@ pub struct SubmitInvenioExport {
 
 **Authentication**
 
-Requires READ on the HTTP connector group and WRITE on destination data and metadata. The connector endpoint is the repository API root, such as https://zenodo.org/api/.
+Requires READ on the metadata path of the repository connector group and WRITE on destination data and metadata. The connector is an Invenio repository connector whose endpoint is the API root, such as https://zenodo.org/api/.
 
 **Behavior**
 
@@ -262,7 +262,7 @@ pub async fn import_record(
 
 **Authentication**
 
-Requires READ on the crate, WRITE on the connector group and the user's repository.access_token. The token is encrypted for the user and node, omitted from output, and never replaced by connector credentials.
+Requires READ on the crate, WRITE on the metadata path of the repository connector group and the user's repository.access_token. The token is encrypted for the user, node, connector and endpoint, omitted from output, and never replaced by the connector token.
 
 **Behavior**
 
