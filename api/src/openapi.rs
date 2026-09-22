@@ -26,8 +26,8 @@ Native Git/LFS also accepts HTTP Basic with an Aruna bearer token as the passwor
 - Errors answer `application/json` with `ErrorResponse` (`error` plus an optional `code`); the
   GA4GH DRS and TES facades use their own error payloads.
 - Every operation may answer 429 with a `Retry-After` header.
-- An operation may answer 408 when the request exceeds the REST time limit; the streaming RO-Crate
-  upload does not.
+- An operation may answer 408 when the request exceeds the REST time limit; streaming RO-Crate
+  uploads and Git/LFS transfers are exempt.
 - An operation with a request body may answer 413 when the body exceeds the configured limit.
 - An operation that reports errors as a body may answer 500 on an unexpected internal failure.
 - Paths are relative to the `/api/v1` base path."#,

@@ -626,7 +626,12 @@ fn pins_transport_docs() {
             let limited = &responses["429"];
             assert!(limited["content"]["application/json"].is_object());
             assert!(limited["headers"]["Retry-After"].is_object());
-            if path != "/metadata/rocrate/uploads" {
+            if !matches!(
+                path.as_str(),
+                "/metadata/rocrate/uploads"
+                    | "/git/{repository}/info/lfs/objects/{oid}"
+                    | "/git/{repository}/{service}"
+            ) {
                 assert!(responses["408"]["content"].is_null());
             } else {
                 assert!(responses.get("408").is_none());
