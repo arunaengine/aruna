@@ -76,7 +76,11 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .await?;
     assert_eq!(value["metadata"]["title"], title);
-    assert_eq!(value["parent"]["access"]["owned_by"]["user"], user);
+    let owner = &value["parent"]["access"]["owned_by"]["user"];
+    assert_eq!(
+        owner.as_u64().or_else(|| owner.as_str()?.parse().ok()),
+        Some(user)
+    );
     assert_eq!(value["access"]["files"], "restricted");
     let target = spec.destination.as_mut().unwrap();
     target.draft_id = Some(draft.id.clone());

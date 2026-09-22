@@ -360,6 +360,15 @@ to reuse the unpublished draft. Failed or cancelled transfers leave remote draft
 for inspection. Import requires connector-group READ and destination WRITE; export requires
 crate READ and connector-group WRITE.
 
+The opt-in `invenio::live::native_repository` test exercises a real local Invenio instance.
+Set `ARUNA_INVENIO_ENDPOINT` to its loopback API URL, `ARUNA_INVENIO_TOKEN_FILE` to an
+owner-readable personal-token file, and `ARUNA_INVENIO_USER_ID` to the corresponding numeric
+account ID. Run `cargo test -p aruna-operations --test rocrate_drivers
+invenio::live::native_repository -- --ignored --exact`. It creates and publishes disposable
+records, checks ownership and restricted access, creates another version, and tests search,
+copy imports, reference reads and metadata-only imports. Use a disposable repository with
+external DOI registration and email disabled.
+
 ## License
 
 Aruna is licensed under either of
