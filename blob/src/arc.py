@@ -4,11 +4,13 @@
 
 import base64
 import importlib.metadata
+import io
 import json
 import resource
 import sys
 import tempfile
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
@@ -204,6 +206,25 @@ def inspect(root, require_data=True):
     return document
 
 
+def canonical_workbook(path):
+    output = io.BytesIO()
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(output, "w") as target:
+        for name in sorted(source.namelist()):
+            content = source.read(name)
+            if name == "docProps/core.xml":
+                properties = ET.fromstring(content)
+                for field in ("created", "modified"):
+                    value = properties.find("{http://purl.org/dc/terms/}" + field)
+                    if value is not None:
+                        value.text = "1980-01-01T00:00:00Z"
+                content = ET.tostring(properties, encoding="utf-8")
+            entry = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            entry.create_system = 3
+            entry.external_attr = 0o600 << 16
+            target.writestr(entry, content)
+    path.write_bytes(output.getvalue())
+
+
 def generate(request, root):
     source = request["jsonld"]
     arc = prepare(source, request["document_id"])
@@ -214,6 +235,12 @@ def generate(request, root):
         confined(contract.path)
     arc.Write(str(root))
     document = inspect(root, require_data=False)
+    for entity in document["@graph"]:
+        if entity.get("@id") == "./":
+            # ARCtrl adds wall-clock export time, which cannot define a stable Git object.
+            entity.pop("sdDatePublished", None)
+    for workbook in root.rglob("*.xlsx"):
+        canonical_workbook(workbook)
     (root / "ro-crate-metadata.json").write_text(json.dumps(document, indent=2) + "\n")
     (root / "aruna-metadata.json").write_text(source)
     (root / ".gitattributes").write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n")

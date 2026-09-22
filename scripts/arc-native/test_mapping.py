@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT or Apache-2.0
 
 import base64
+import datetime
 import importlib.util
 import json
 import tempfile
@@ -38,6 +39,22 @@ def files(root):
 
 
 class MappingTests(unittest.TestCase):
+    def test_generation_reproducible(self):
+        request = {"mode": "generate", "document_id": "stable-id", "jsonld": json.dumps(source())}
+        results = []
+        for year in (2001, 2031):
+            class Clock(datetime.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return cls(year, 2, 3, 4, 5, 6, tzinfo=tz)
+
+            with patch("datetime.datetime", Clock), patch("zipfile.time.localtime", return_value=(year, 2, 3, 4, 5, 6, 0, 1, 0)):
+                results.append(conversion.convert(request))
+        self.assertEqual(results[0], results[1])
+        parsed = conversion.convert({"mode": "inspect", "files": results[0]["files"]})
+        root = next(item for item in parsed["rocrate"]["@graph"] if item.get("@id") == "./")
+        self.assertEqual(root["name"], "Supplied title")
+
     def test_minimal_preserved(self):
         original = json.dumps(source())
         result = conversion.convert({"mode": "generate", "document_id": "document-id", "jsonld": original})
