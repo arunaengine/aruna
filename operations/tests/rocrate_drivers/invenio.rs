@@ -18,6 +18,9 @@ struct Repository {
     files: std::collections::BTreeMap<String, Option<Vec<u8>>>,
     committed: HashSet<String>,
     metadata: Option<Value>,
+    custom_fields: Value,
+    revision: u64,
+    lost_metadata: bool,
     author_login: bool,
     published: bool,
     corrupt: bool,
@@ -28,6 +31,11 @@ struct Repository {
     lost_content: bool,
     foreign_page: bool,
     public_files: bool,
+    conflict: bool,
+    partial_metadata: bool,
+    file_name: Option<String>,
+    head_started: Option<Arc<tokio::sync::Notify>>,
+    head_release: Option<Arc<tokio::sync::Notify>>,
 }
 
 struct Server {
@@ -60,7 +68,7 @@ async fn serve(state: Repository) -> Server {
 fn record(id: &str, published: bool) -> Value {
     json!({
         "id": id, "parent": {"id": "parent", "pids": {"doi": {"identifier": "10.1234/all"}}},
-        "is_published": published, "versions": {"index": id.parse::<u64>().unwrap()},
+        "revision_id": 1, "files": {"enabled": true}, "is_published": published, "versions": {"index": id.parse::<u64>().unwrap()},
         "pids": {"doi": {"identifier": format!("10.1234/{id}")}},
         "created": "2024-01-01T00:00:00Z", "updated": "2025-01-01T00:00:00Z",
         "custom_fields": {"local:extra": {"preserve": [1, 2, 3]}},
@@ -93,13 +101,37 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             "Bearer repository-token"
         }
     );
-    let expected = if request.method() == Method::GET && request.uri().path().ends_with("/content")
+    if (request.method() == Method::GET || request.method() == Method::HEAD)
+        && request.uri().path().ends_with("/content")
     {
-        "*/*"
+        assert!(
+            request
+                .headers()
+                .get("accept")
+                .is_none_or(|value| value == "*/*")
+        );
     } else {
-        "application/vnd.inveniordm.v1+json, application/json;q=0.9"
-    };
-    assert_eq!(request.headers().get("accept").unwrap(), expected);
+        assert_eq!(
+            request.headers().get("accept").unwrap(),
+            "application/vnd.inveniordm.v1+json, application/json;q=0.9"
+        );
+    }
+    if request.method() == Method::PUT && request.uri().path().ends_with("/draft") {
+        assert_eq!(
+            request.headers().get("if-match").unwrap().to_str().unwrap(),
+            state.lock().unwrap().revision.max(1).to_string()
+        );
+    }
+    if request.method() == Method::HEAD {
+        let wait = {
+            let state = state.lock().unwrap();
+            state.head_started.clone().zip(state.head_release.clone())
+        };
+        if let Some((started, release)) = wait {
+            started.notify_one();
+            release.notified().await;
+        }
+    }
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let query = request.uri().query().unwrap_or("").to_string();
@@ -108,6 +140,13 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
     state.calls.push((method.clone(), path.clone()));
     let parts = path.trim_start_matches('/').split('/').collect::<Vec<_>>();
     let value = match (method, parts.as_slice()) {
+        (Method::GET, ["api", "records"]) => {
+            assert!(query.contains("size=25"));
+            assert!(query.contains("q=doi%3A"));
+            json!({"hits": {"total": 1, "hits": [record("2", true)]}, "links": {"next": null}})
+        }
+        (Method::GET, ["api", "records", "parent"]) => record("2", true),
+        (Method::POST, ["api", "records", "2", "versions"]) => draft_record(&state, false),
         (Method::GET, ["api", "records", "2", "versions"]) => {
             if query.contains("size=100") {
                 return StatusCode::BAD_REQUEST.into_response();
@@ -123,24 +162,29 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
         }
         (Method::GET, ["api", "records", id @ ("1" | "2")]) => record(id, true),
         (Method::GET, ["api", "records", id @ ("1" | "2"), "files"]) => {
-            let mut entry = file("data.txt", id.as_bytes(), true);
+            let mut entry = file(
+                state.file_name.as_deref().unwrap_or("data.txt"),
+                id.as_bytes(),
+                true,
+            );
             if state.corrupt {
                 entry["checksum"] = json!("md5:00000000000000000000000000000000");
             }
             json!({"entries": [entry]})
         }
         (
-            Method::GET,
-            [
-                "api",
-                "records",
-                id @ ("1" | "2"),
-                "files",
-                "data.txt",
-                "content",
-            ],
+            Method::GET | Method::HEAD,
+            ["api", "records", id @ ("1" | "2"), "files", key, "content"],
         ) => {
-            return (StatusCode::OK, id.to_string()).into_response();
+            assert_eq!(*key, state.file_name.as_deref().unwrap_or("data.txt"));
+            return (
+                [
+                    ("content-type", "application/octet-stream"),
+                    ("content-length", "1"),
+                ],
+                id.to_string(),
+            )
+                .into_response();
         }
         (Method::POST, ["api", "records"]) => {
             let body: Value = serde_json::from_slice(&body).unwrap();
@@ -155,6 +199,7 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
                 "0000-0002-1825-0097"
             );
             state.metadata = Some(body["metadata"].clone());
+            state.custom_fields = body["custom_fields"].clone();
             assert_eq!(
                 body["access"]["files"],
                 if state.public_files {
@@ -175,8 +220,20 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             draft_record(&state, false)
         }
         (Method::PUT, ["api", "records", "3", "draft"]) => {
+            if state.conflict {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
             let body: Value = serde_json::from_slice(&body).unwrap();
             state.metadata = Some(body["metadata"].clone());
+            state.custom_fields = body["custom_fields"].clone();
+            if state.partial_metadata {
+                state.metadata.as_mut().unwrap()["title"] = Value::Null;
+            }
+            state.revision = state.revision.max(1) + 1;
+            if state.lost_metadata {
+                state.lost_metadata = false;
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             draft_record(&state, false)
         }
         (Method::GET, ["api", "records", "3"]) if state.published => draft_record(&state, true),
@@ -244,6 +301,12 @@ fn draft_record(state: &Repository, published: bool) -> Value {
     if let Some(metadata) = &state.metadata {
         record["metadata"] = metadata.clone();
     }
+    record["revision_id"] = json!(state.revision.max(1));
+    record["custom_fields"] = if state.custom_fields.is_null() {
+        json!({})
+    } else {
+        state.custom_fields.clone()
+    };
     record["parent"]["access"] = json!({"owned_by": {"user": 42}});
     record
 }
@@ -277,6 +340,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
             group_id: fixture.group_id,
             connector_id,
             record_id: "2".into(),
+            options: Default::default(),
         },
         doc_id(1),
     );
@@ -329,6 +393,136 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn invenio_import_modes() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::invenio::{InvenioMode, InvenioOptions};
+    use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
+    for mode in [InvenioMode::Metadata, InvenioMode::Reference] {
+        let fixture = build_fixture(false).await?;
+        let server = serve(Repository {
+            file_name: Some("content".into()),
+            ..Default::default()
+        })
+        .await;
+        let connector_id = connector(&fixture, &server).await;
+        let spec = spec_with_source(
+            &fixture,
+            ImportRoCrateSource::Invenio {
+                group_id: fixture.group_id,
+                connector_id,
+                record_id: "parent".into(),
+                options: InvenioOptions {
+                    mode,
+                    all_versions: false,
+                },
+            },
+            doc_id(1),
+        );
+        let ctx =
+            claim_context(&fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
+        match run_rocrate_import(&ctx, &spec).await {
+            JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => {
+                assert_eq!(
+                    result.imported,
+                    if mode == InvenioMode::Reference { 2 } else { 1 }
+                );
+            }
+            JobRunOutcome::Failed(error) => panic!("{}", error.message),
+            _ => panic!("unexpected import result"),
+        }
+        assert!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .all(|(method, path)| !path.ends_with("/versions")
+                    && !(*method == Method::GET && path.ends_with("/content")))
+        );
+        let key = format!(
+            "imported/{}",
+            aruna_core::invenio::file_path("2", "content")?
+        );
+        if mode == InvenioMode::Reference {
+            assert_eq!(object_versions(&fixture, &key).await?.len(), 1);
+            let mut object = drive(
+                GetObjectOperation::new(GetObjectInput {
+                    bucket: BUCKET.into(),
+                    key: key.clone(),
+                    version_id: None,
+                    range: None,
+                    group_id: fixture.group_id,
+                    user_identity: fixture.actor.user_id,
+                    node_id: fixture.actor.node_id,
+                }),
+                &fixture.context,
+            )
+            .await?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = object.blob.next().await {
+                bytes.extend_from_slice(&chunk?);
+            }
+            assert_eq!(bytes, b"2");
+            assert!(matches!(
+                run_rocrate_import(&ctx, &spec).await,
+                JobRunOutcome::Succeeded(_)
+            ));
+            assert_eq!(object_versions(&fixture, &key).await?.len(), 1);
+        } else {
+            assert!(object_versions(&fixture, &key).await?.is_empty());
+            assert!(
+                server
+                    .state
+                    .lock()
+                    .unwrap()
+                    .calls
+                    .iter()
+                    .all(|(_, path)| !path.ends_with("/files"))
+            );
+        }
+        fixture.stop().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let connector_id = connector(&fixture, &server).await;
+    let auth = AuthContext {
+        user_id: fixture.actor.user_id,
+        realm_id: fixture.actor.realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let query = aruna_core::invenio::InvenioQuery {
+        group_id: fixture.group_id,
+        connector_id,
+        q: "doi:\"10.1234/2\"".into(),
+        page: 1,
+        size: 25,
+        all_versions: false,
+    };
+    let page = aruna_operations::jobs::invenio::search_records(
+        &fixture.context,
+        &auth,
+        &query,
+        1024 * 1024,
+    )
+    .await?;
+    assert_eq!(page["hits"]["hits"][0]["id"], "2");
+    let invalid = aruna_core::invenio::InvenioQuery { size: 100, ..query };
+    assert!(
+        aruna_operations::jobs::invenio::search_records(&fixture.context, &auth, &invalid, 1024)
+            .await
+            .is_err()
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn invenio_rejects_corruption() -> Result<(), Box<dyn std::error::Error>> {
     for repository in [
         Repository {
@@ -360,6 +554,7 @@ async fn invenio_rejects_corruption() -> Result<(), Box<dyn std::error::Error>> 
                 group_id: fixture.group_id,
                 connector_id,
                 record_id: "2".into(),
+                options: Default::default(),
             },
             doc_id(1),
         );
@@ -396,6 +591,7 @@ async fn export_spec(
         group_id: fixture.group_id,
         connector_id: connector(fixture, server).await,
         draft_id: None,
+        new_version: None,
         metadata_json: "{}".into(),
         publish,
         public_files: false,
@@ -514,7 +710,7 @@ async fn invenio_export_modes() -> Result<(), Box<dyn std::error::Error>> {
                     server.endpoint
                 ))
                 .bearer_auth("author-token")
-                .header("Accept", "application/octet-stream")
+                .header("Accept", "*/*")
                 .send()
                 .await?
                 .error_for_status()?
@@ -590,6 +786,198 @@ async fn invenio_export_recovers() -> Result<(), Box<dyn std::error::Error>> {
         }
         fixture.stop().await;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_continues_versions() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let mut spec = export_spec(&fixture, &server, true).await?;
+    spec.destination.as_mut().unwrap().new_version = Some("2".into());
+    let ctx = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+    match run_export_job(&ctx, &spec).await {
+        JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) => {
+            let record = result.repository.unwrap();
+            assert_eq!(record.id, "3");
+            assert_eq!(record.parent_id, "parent");
+            assert_eq!(record.doi.as_deref(), Some("10.1234/3"));
+            assert!(record.published);
+        }
+        JobRunOutcome::Failed(error) => panic!("{}", error.message),
+        _ => panic!("unexpected version outcome"),
+    }
+    {
+        let state = server.state.lock().unwrap();
+        assert!(
+            state
+                .calls
+                .contains(&(Method::POST, "/api/records/2/versions".into()))
+        );
+        assert!(!state.calls.contains(&(Method::POST, "/api/records".into())));
+        assert!(
+            state
+                .calls
+                .contains(&(Method::PUT, "/api/records/3/draft".into()))
+        );
+    }
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_rejects_updates() -> Result<(), Box<dyn std::error::Error>> {
+    for conflict in [true, false] {
+        let fixture = build_fixture(false).await?;
+        let server = serve(Repository {
+            conflict,
+            partial_metadata: !conflict,
+            ..Default::default()
+        })
+        .await;
+        let mut spec = export_spec(&fixture, &server, true).await?;
+        spec.destination.as_mut().unwrap().draft_id = Some("3".into());
+        let ctx =
+            claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+        match run_export_job(&ctx, &spec).await {
+            JobRunOutcome::Failed(error) => assert!(
+                error
+                    .message
+                    .contains(if conflict { "412" } else { "metadata differs" }),
+                "{}",
+                error.message
+            ),
+            _ => panic!("unsafe draft update accepted"),
+        }
+        assert!(!server.state.lock().unwrap().published);
+        assert!(server.state.lock().unwrap().files.is_empty());
+        fixture.stop().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    for concurrent in [false, true] {
+        let fixture = build_fixture(false).await?;
+        let server = serve(Repository {
+            lost_metadata: true,
+            ..Default::default()
+        })
+        .await;
+        let mut spec = export_spec(&fixture, &server, true).await?;
+        spec.destination.as_mut().unwrap().new_version = Some("2".into());
+        let ctx =
+            claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+        match run_export_job(&ctx, &spec).await {
+            JobRunOutcome::Failed(error) => assert_eq!(
+                error.kind,
+                aruna_core::structs::execution::job::JobErrorKind::Retryable
+            ),
+            _ => panic!("lost metadata reply did not fail"),
+        }
+        if concurrent {
+            server.state.lock().unwrap().metadata.as_mut().unwrap()["subjects"] =
+                json!([{"subject": "concurrent"}]);
+        }
+        match run_export_job(&ctx, &spec).await {
+            JobRunOutcome::Succeeded(_) if !concurrent => {}
+            JobRunOutcome::Failed(error) if concurrent => {
+                assert!(error.message.contains("ambiguous metadata"))
+            }
+            _ => panic!("incorrect metadata reconciliation"),
+        }
+        assert_eq!(server.state.lock().unwrap().published, !concurrent);
+        assert_eq!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|(method, path)| *method == Method::PUT && path.ends_with("/draft"))
+                .count(),
+            1
+        );
+        fixture.stop().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_cancels_reference() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server = serve(Repository {
+        head_started: Some(started.clone()),
+        head_release: Some(release.clone()),
+        ..Default::default()
+    })
+    .await;
+    let spec = spec_with_source(
+        &fixture,
+        ImportRoCrateSource::Invenio {
+            group_id: fixture.group_id,
+            connector_id: connector(&fixture, &server).await,
+            record_id: "2".into(),
+            options: aruna_core::invenio::InvenioOptions {
+                mode: aruna_core::invenio::InvenioMode::Reference,
+                all_versions: false,
+            },
+        },
+        doc_id(1),
+    );
+    let ctx = claim_context(&fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
+    let cancel = ctx.cancel.clone();
+    let task = tokio::spawn(async move { run_rocrate_import(&ctx, &spec).await });
+    tokio::time::timeout(std::time::Duration::from_secs(120), started.notified()).await?;
+    cancel.cancel();
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(120), task).await??,
+        JobRunOutcome::Cancelled
+    ));
+    release.notify_one();
+    let key = format!(
+        "imported/{}",
+        aruna_core::invenio::file_path("2", "data.txt")?
+    );
+    assert!(object_versions(&fixture, &key).await?.is_empty());
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_removes_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let mut spec = export_spec(&fixture, &server, false).await?;
+    let first = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+    assert!(matches!(
+        run_export_job(&first, &spec).await,
+        JobRunOutcome::Succeeded(_)
+    ));
+    server.state.lock().unwrap().metadata.as_mut().unwrap()["subjects"] =
+        json!([{"subject": "obsolete"}]);
+    spec.destination.as_mut().unwrap().draft_id = Some("3".into());
+    let next = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+    match run_export_job(&next, &spec).await {
+        JobRunOutcome::Succeeded(_) => {}
+        JobRunOutcome::Failed(error) => panic!("{}", error.message),
+        _ => panic!("unexpected metadata replacement result"),
+    }
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("subjects")
+            .is_none()
+    );
+    fixture.stop().await;
     Ok(())
 }
 
