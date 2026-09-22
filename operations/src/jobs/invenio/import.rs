@@ -1,0 +1,281 @@
+//! Builds an import archive from every accessible published version and checked file.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::HashSet;
+
+use aruna_blob::hash::Hasher;
+use aruna_blob::invenio::InvenioClient;
+use aruna_core::effects::BlobEffect;
+use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event};
+use aruna_core::invenio::{file_path, import_crate, record_id, validate_id};
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
+use aruna_core::structs::identity::auth::Permission;
+use async_zip::{Compression, ZipEntryBuilder};
+use futures_util::io::AsyncWriteExt;
+use reqwest::Method;
+use serde_json::{Value, json};
+use ulid::Ulid;
+
+use super::{TransferError, connect, interruptible};
+use crate::blob::hidden::delete_hidden;
+use crate::jobs::executor::JobContext;
+
+pub(crate) async fn acquire(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    group_id: Ulid,
+    connector_id: Ulid,
+    selected: &str,
+) -> Result<ArtifactRef, TransferError> {
+    validate_id(selected)?;
+    let client = connect(
+        ctx,
+        &spec.auth_context,
+        group_id,
+        connector_id,
+        Permission::READ,
+        spec.limits.metadata_bytes,
+    )
+    .await?;
+    let records = interruptible(ctx, history(&client, selected, &spec.limits)).await?;
+    let document = import_crate(client.endpoint(), selected, &records)?;
+    let metadata = document.to_string();
+    if metadata.len() as u64 > spec.limits.metadata_bytes {
+        return Err(TransferError::Permanent(
+            "generated crate exceeds metadata limit".into(),
+        ));
+    }
+    let (writer, reader) = tokio::io::duplex(128 * 1024);
+    let blob = ctx
+        .driver
+        .blob_handle
+        .as_ref()
+        .ok_or_else(|| TransferError::Retryable("blob handle unavailable".into()))?;
+    let write = interruptible(
+        ctx,
+        write_archive(&client, writer, &metadata, &records, &spec.limits),
+    );
+    let spool = blob.send_blob_effect(BlobEffect::SpoolHidden {
+        namespace: ctx.job_id.as_ulid(),
+        name: "input".into(),
+        created_by: spec.auth_context.user_id,
+        max_bytes: Some(spec.limits.import_source_bytes),
+        deadline: None,
+        blob: BackendStream::new(tokio_util::io::ReaderStream::new(reader)),
+    });
+    let (written, event) = tokio::join!(write, spool);
+    match event {
+        Event::Blob(BlobEvent::HiddenSpooled {
+            location,
+            size,
+            blake3,
+        }) => {
+            if let Err(error) = written {
+                let _ = delete_hidden(&ctx.driver, &location).await;
+                return Err(error);
+            }
+            Ok(ArtifactRef {
+                location,
+                size,
+                blake3,
+                expires_at_ms: 0,
+            })
+        }
+        Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { .. })) => {
+            Err(invalid("repository archive exceeds import source limit"))
+        }
+        _ => {
+            written?;
+            Err(TransferError::Retryable(
+                "repository archive spool failed".into(),
+            ))
+        }
+    }
+}
+
+pub(super) async fn history(
+    client: &InvenioClient<'_>,
+    selected: &str,
+    limits: &RoCrateLimits,
+) -> Result<Vec<(Value, Value)>, TransferError> {
+    let seed = client
+        .json(Method::GET, client.url(&["records", selected])?, None)
+        .await?;
+    let parent = seed["parent"]["id"]
+        .as_str()
+        .ok_or_else(|| invalid("missing parent identity"))?
+        .to_string();
+    let mut next = Some(client.url(&["records", selected, "versions"])?);
+    if let Some(url) = &mut next {
+        url.query_pairs_mut()
+            .append_pair("allversions", "true")
+            .append_pair("size", "100");
+    }
+    let mut pages = HashSet::new();
+    let mut ids = HashSet::new();
+    let mut records = Vec::new();
+    let mut total = None;
+    let mut bytes = 0u64;
+    let mut entries = 1u64;
+    while let Some(url) = next.take() {
+        if pages.len() >= 10_000 || !pages.insert(url.as_str().to_string()) {
+            return Err(invalid("version pagination loop or limit"));
+        }
+        let page = client.json(Method::GET, url, None).await?;
+        let count = page["hits"]["total"]
+            .as_u64()
+            .or_else(|| page["hits"]["total"]["value"].as_u64())
+            .ok_or_else(|| invalid("missing version total"))?;
+        if count > limits.max_entries
+            || total.is_some_and(|total| total != count)
+            || page["hits"]["total"]["relation"]
+                .as_str()
+                .is_some_and(|relation| relation != "eq")
+        {
+            return Err(invalid("version listing changed or exceeds limits"));
+        }
+        total = Some(count);
+        let hits = page["hits"]["hits"]
+            .as_array()
+            .ok_or_else(|| invalid("missing version hits"))?;
+        for hit in hits {
+            let id = record_id(hit)?;
+            if !ids.insert(id.to_string()) || ids.len() as u64 > limits.max_entries {
+                return Err(invalid("duplicate version or version limit"));
+            }
+            let record = client
+                .json(Method::GET, client.url(&["records", id])?, None)
+                .await?;
+            if record_id(&record)? != id
+                || record["parent"]["id"] != parent
+                || record["is_published"] != true
+            {
+                return Err(invalid("version identity or publication state changed"));
+            }
+            let files = client
+                .json(Method::GET, client.url(&["records", id, "files"])?, None)
+                .await?;
+            if files["links"]["next"]
+                .as_str()
+                .is_some_and(|link| !link.is_empty())
+            {
+                return Err(invalid("paginated file listing is not complete"));
+            }
+            let list = files["entries"]
+                .as_array()
+                .ok_or_else(|| invalid("missing file entries"))?;
+            entries = entries
+                .checked_add(list.len() as u64 + 1)
+                .ok_or_else(|| invalid("entry overflow"))?;
+            bytes = bytes
+                .checked_add(record.to_string().len() as u64 + files.to_string().len() as u64)
+                .ok_or_else(|| invalid("metadata overflow"))?;
+            if entries > limits.max_entries || bytes > limits.metadata_bytes {
+                return Err(invalid("repository history exceeds crate limits"));
+            }
+            records.push((record, files));
+        }
+        next = page["links"]["next"]
+            .as_str()
+            .filter(|link| !link.is_empty())
+            .map(|link| client.link(link))
+            .transpose()?;
+    }
+    if Some(records.len() as u64) != total || !ids.contains(selected) {
+        return Err(invalid("incomplete repository version history"));
+    }
+    records.sort_by_key(|(record, _)| record["versions"]["index"].as_u64().unwrap_or(0));
+    Ok(records)
+}
+
+async fn write_archive(
+    client: &InvenioClient<'_>,
+    writer: tokio::io::DuplexStream,
+    metadata: &str,
+    records: &[(Value, Value)],
+    limits: &RoCrateLimits,
+) -> Result<(), TransferError> {
+    let mut archive = async_zip::base::write::ZipFileWriter::with_tokio(writer);
+    archive
+        .write_entry_whole(entry("ro-crate-metadata.json"), metadata.as_bytes())
+        .await?;
+    let mut size = metadata.len() as u64;
+    let mut paths = HashSet::new();
+    for (record, files) in records {
+        let id = record_id(record)?;
+        let provenance = json!({"record": record, "files": files}).to_string();
+        size = checked_size(size, provenance.len() as u64, limits.expanded_import_bytes)?;
+        archive
+            .write_entry_whole(
+                entry(&format!("versions/{id}/invenio-record.json")),
+                provenance.as_bytes(),
+            )
+            .await?;
+        for file in files["entries"]
+            .as_array()
+            .ok_or_else(|| invalid("missing files"))?
+        {
+            let key = file["key"]
+                .as_str()
+                .ok_or_else(|| invalid("missing file key"))?;
+            let path = file_path(id, key)?;
+            if path.len() as u64 > limits.key_bytes || !paths.insert(path.clone()) {
+                return Err(invalid("duplicate or oversized file path"));
+            }
+            let expected = file["size"]
+                .as_u64()
+                .ok_or_else(|| invalid("missing file size"))?;
+            size = checked_size(size, expected, limits.expanded_import_bytes)?;
+            let checksum = file["checksum"]
+                .as_str()
+                .ok_or_else(|| invalid("missing file checksum"))?;
+            let (algorithm, digest) = checksum
+                .split_once(':')
+                .ok_or_else(|| invalid("invalid checksum"))?;
+            if !matches!(algorithm, "md5" | "sha1" | "sha256" | "blake3") {
+                return Err(invalid("unsupported repository checksum"));
+            }
+            let mut response = client
+                .download(client.url(&["records", id, "files", key, "content"])?)
+                .await?;
+            let mut target = archive.write_entry_stream(entry(&path)).await?;
+            let mut actual = 0u64;
+            let mut hasher = Hasher::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| TransferError::Retryable("repository file read failed".into()))?
+            {
+                actual = checked_size(actual, chunk.len() as u64, expected)?;
+                hasher.update(&chunk);
+                target.write_all(&chunk).await?;
+            }
+            let hashes = hasher.to_map();
+            if actual != expected
+                || hashes.get(algorithm).map(hex::encode).as_deref() != Some(digest)
+            {
+                return Err(invalid("repository file size or checksum mismatch"));
+            }
+            target.close().await?;
+        }
+    }
+    archive.close().await?;
+    Ok(())
+}
+
+fn entry(path: &str) -> ZipEntryBuilder {
+    ZipEntryBuilder::new(path.into(), Compression::Stored)
+}
+
+fn checked_size(size: u64, added: u64, limit: u64) -> Result<u64, TransferError> {
+    size.checked_add(added)
+        .filter(|size| *size <= limit)
+        .ok_or_else(|| invalid("repository data exceeds size limit"))
+}
+
+fn invalid(message: &str) -> TransferError {
+    TransferError::Permanent(message.into())
+}
