@@ -4,6 +4,186 @@
 
 use super::*;
 
+#[tokio::test]
+async fn group_tombstone_replays() {
+    use aruna_core::structs::identity::group_delete::{
+        GroupDeleteCertificate, GroupDeletePhase, GroupDeletePlan, GroupDeleteProof,
+        GroupDeleteRecord, MembershipFence,
+    };
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([35; 32]);
+    let group_id = Ulid::from_parts(190, 1);
+    let actor = test_actor(
+        8,
+        UserId::local(Ulid::from_parts(191, 1), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::Group { group_id };
+    let document = DocumentTarget::GroupAuthorization { group_id };
+    let created = test_admin_event(
+        Ulid::from_parts(192, 1),
+        target.clone(),
+        &actor,
+        1,
+        AdminDocumentOperation::GroupCreated {
+            realm_id,
+            display_name: "Empty".into(),
+            owner: actor.user_id,
+        },
+    );
+    apply_admin_operation(&storage, document.clone(), created.clone())
+        .await
+        .unwrap();
+    let plan = GroupDeletePlan {
+        request_id: Ulid::from_parts(193, 1),
+        group_id,
+        realm_id,
+        owner: actor.user_id,
+        requested_by: actor.user_id,
+        coordinator: actor.node_id,
+        nodes: std::collections::BTreeSet::from([actor.node_id]),
+    };
+    let proof = GroupDeleteProof {
+        node_id: actor.node_id,
+        signature: iroh::SecretKey::from_bytes(&[8; 32]).sign(&plan.signing_bytes().unwrap()),
+    };
+    let mut deleted = test_admin_event(
+        Ulid::from_parts(194, 1),
+        target.clone(),
+        &actor,
+        2,
+        AdminDocumentOperation::GroupDeleted {
+            certificate: Box::new(GroupDeleteCertificate {
+                plan: plan.clone(),
+                proofs: vec![proof],
+            }),
+        },
+    );
+    deleted.observed.advance(actor.node_id, 1);
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+    config.ensure_node(actor.node_id, RealmNodeKind::Server);
+    config.ensure_node(
+        test_actor(9, actor.user_id, realm_id).node_id,
+        RealmNodeKind::Server,
+    );
+    batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            DocumentTarget::RealmConfig { realm_id },
+            config.to_bytes(&actor).unwrap().into(),
+        )],
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        validate_group_authority(&storage, &deleted, None)
+            .await
+            .unwrap(),
+        AdminEventValidation::Deferred { .. }
+    ));
+    let prepared = GroupDeleteRecord {
+        plan,
+        phase: GroupDeletePhase::Preparing,
+        deleted_by: None,
+        event: None,
+    };
+    batch_write_to(
+        &storage,
+        vec![
+            (
+                aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+                group_id.to_bytes().into(),
+                prepared.to_bytes().unwrap().into(),
+            ),
+            MembershipFence {
+                pending: std::collections::BTreeSet::from([group_id]),
+            }
+            .entry(realm_id)
+            .unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        validate_group_authority(&storage, &deleted, None)
+            .await
+            .unwrap(),
+        AdminEventValidation::Accepted
+    );
+    apply_admin_operation(&storage, document.clone(), deleted.clone())
+        .await
+        .unwrap();
+    apply_admin_operation(&storage, document.clone(), created)
+        .await
+        .unwrap();
+    apply_admin_operation(&storage, document.clone(), deleted.clone())
+        .await
+        .unwrap();
+    let mut renamed = test_admin_event(
+        Ulid::from_parts(195, 1),
+        target.clone(),
+        &actor,
+        3,
+        AdminDocumentOperation::DisplayNameSet {
+            display_name: "Replayed".into(),
+        },
+    );
+    renamed.observed.advance(actor.node_id, 2);
+    apply_admin_operation(&storage, document, renamed)
+        .await
+        .unwrap();
+    for space in [GROUP_KEYSPACE, AUTH_KEYSPACE] {
+        assert!(
+            read_storage_value(&storage, space, group_id.to_bytes().into())
+                .await
+                .is_none()
+        );
+    }
+    assert!(
+        read_storage_value(
+            &storage,
+            OWNER_INDEX_KEYSPACE,
+            owner_group_key(actor.user_id, group_id).into()
+        )
+        .await
+        .is_none()
+    );
+    let value = read_storage_value(
+        &storage,
+        aruna_core::keyspaces::GROUP_DELETE_KEYSPACE,
+        group_id.to_bytes().into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        GroupDeleteRecord::from_bytes(&value)
+            .unwrap()
+            .event
+            .as_deref(),
+        Some(&deleted)
+    );
+    let value = read_storage_value(
+        &storage,
+        DOCUMENT_STATE_KEYSPACE,
+        reducer_state_key(&target),
+    )
+    .await
+    .unwrap();
+    assert!(decode_reducer_state(&value).unwrap().group_deleted());
+    let value = read_storage_value(
+        &storage,
+        aruna_core::keyspaces::GROUP_DELETE_KEYSPACE,
+        MembershipFence::key(realm_id),
+    )
+    .await;
+    assert!(
+        MembershipFence::from_value(value.as_deref())
+            .unwrap()
+            .pending
+            .is_empty()
+    );
+}
+
 #[test]
 fn visibility_conflicts_private() {
     let realm_id = RealmId::from_bytes([44; 32]);
