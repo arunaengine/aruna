@@ -31,9 +31,9 @@ def initialize(store):
                        check=True, capture_output=True, timeout=30)
     hooks = repo / "hooks"
     hooks.mkdir(exist_ok=True)
-    command = shlex.join([sys.executable, str(Path(__file__).with_name("receive.py").resolve())])
+    script = shlex.quote(str(Path(__file__).with_name("receive.py").resolve()))
     hook = hooks / "pre-receive"
-    expected = f"#!/bin/sh\nexec {command}\n"
+    expected = f'#!/bin/sh\nexec "${{ARC_PYTHON:?}}" {script}\n'
     if hook.exists() and hook.read_text() != expected:
         raise ValueError("refusing to replace an existing receive hook")
     hook.write_text(expected)
@@ -54,7 +54,7 @@ def git_http(store, request, body):
                CONTENT_TYPE=request["type"], CONTENT_LENGTH=str(len(body)),
                REMOTE_USER="arc-operator", REMOTE_ADDR="127.0.0.1",
                GIT_PROTOCOL=request["protocol"], ARC_STATE=str(store.state),
-               ARC_REPOSITORY=store.name)
+               ARC_REPOSITORY=store.name, ARC_PYTHON=sys.executable)
     with tempfile.TemporaryFile() as output:
         result = subprocess.run(["git", "http-backend"], input=body, stdout=output,
                                 stderr=subprocess.PIPE, env=env, timeout=180)
