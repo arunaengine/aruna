@@ -17,6 +17,7 @@ pub mod errors;
 pub mod events;
 pub mod handle;
 pub mod id;
+pub mod invenio;
 pub mod jobs;
 pub mod join_request;
 pub mod keys;
