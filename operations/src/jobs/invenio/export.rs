@@ -16,10 +16,88 @@ use futures_util::StreamExt;
 use http::Method;
 use serde_json::{Value, json};
 
-use super::{TransferError, connect};
+use super::{TransferError, connect, interruptible};
 use crate::jobs::executor::JobContext;
+use crate::jobs::export::{ExportCheckpoint, persist_checkpoint};
 use crate::jobs::import::archive::{ArchiveCompression, ArchiveEntry, inspect_reader};
 use crate::jobs::service::read_artifact_range;
+
+pub(crate) async fn repository_export(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &InvenioDestination,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<(), TransferError> {
+    if checkpoint.repository.is_none() {
+        if checkpoint.repository_started && destination.draft_id.is_none() {
+            return Err(TransferError::Permanent(
+                "draft creation outcome is unknown; \
+                 inspect the repository and retry with its draft_id"
+                    .into(),
+            ));
+        }
+        let jsonld = checkpoint
+            .raw_jsonld
+            .clone()
+            .ok_or_else(|| TransferError::Permanent("source crate metadata missing".into()))?;
+        let fence = async || {
+            checkpoint.repository_started = true;
+            persist_checkpoint(ctx, checkpoint)
+                .await
+                .map_err(TransferError::Retryable)
+        };
+        let record =
+            interruptible(ctx, create_draft(ctx, spec, destination, &jsonld, fence)).await?;
+        checkpoint.repository = Some(record);
+        persist_checkpoint(ctx, checkpoint)
+            .await
+            .map_err(TransferError::Retryable)?;
+    }
+    if checkpoint.repository_metadata.is_none() {
+        let record = checkpoint
+            .repository
+            .as_ref()
+            .ok_or_else(|| TransferError::Permanent("repository draft missing".into()))?;
+        let jsonld = checkpoint
+            .raw_jsonld
+            .as_deref()
+            .ok_or_else(|| TransferError::Permanent("source crate metadata missing".into()))?;
+        let (record, digest) =
+            interruptible(ctx, prepare_draft(ctx, spec, destination, record, jsonld)).await?;
+        checkpoint.repository = Some(record);
+        checkpoint.repository_metadata = Some(digest);
+        persist_checkpoint(ctx, checkpoint)
+            .await
+            .map_err(TransferError::Retryable)?;
+    }
+    let record = checkpoint
+        .repository
+        .as_ref()
+        .ok_or_else(|| TransferError::Permanent("repository draft missing".into()))?;
+    let artifact = checkpoint
+        .artifact
+        .as_ref()
+        .ok_or_else(|| TransferError::Permanent("export artifact missing".into()))?;
+    let record = interruptible(
+        ctx,
+        deposit(
+            ctx,
+            spec,
+            destination,
+            record,
+            artifact,
+            checkpoint.repository_metadata.ok_or_else(|| {
+                TransferError::Permanent("repository metadata checkpoint missing".into())
+            })?,
+        ),
+    )
+    .await?;
+    checkpoint.repository = Some(record);
+    checkpoint.repository_complete = true;
+    persist_checkpoint(ctx, checkpoint)
+        .await
+        .map_err(TransferError::Retryable)
+}
 
 pub(crate) async fn create_draft(
     ctx: &JobContext,

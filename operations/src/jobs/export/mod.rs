@@ -105,22 +105,22 @@ enum ExportPhase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ExportCheckpoint {
-    repository_started: bool,
-    repository_complete: bool,
-    repository_metadata: Option<[u8; 32]>,
-    repository: Option<aruna_core::invenio::InvenioRecord>,
+pub(crate) struct ExportCheckpoint {
+    pub(crate) repository_started: bool,
+    pub(crate) repository_complete: bool,
+    pub(crate) repository_metadata: Option<[u8; 32]>,
+    pub(crate) repository: Option<aruna_core::invenio::InvenioRecord>,
     refs: RoCrateCheckpointRefs,
     phase: ExportPhase,
     winning_event_id: Option<Ulid>,
     context_digest: Option<[u8; 32]>,
     dataset_digest: Option<[u8; 32]>,
-    raw_jsonld: Option<String>,
+    pub(crate) raw_jsonld: Option<String>,
     entities: Vec<ExportEntity>,
     rewritten_jsonld: Option<Vec<u8>>,
     report_json: Option<Vec<u8>>,
     report: Vec<ExportReportRow>,
-    artifact: Option<ArtifactRef>,
+    pub(crate) artifact: Option<ArtifactRef>,
 }
 
 impl Default for ExportCheckpoint {
@@ -455,7 +455,7 @@ async fn repository_export(
     destination: &aruna_core::invenio::InvenioDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    use super::invenio::{TransferError, export, interruptible};
+    use super::invenio::{TransferError, export};
     let classify = |error| match error {
         TransferError::Permanent(message) => ExportFailure::Permanent(message),
         TransferError::Retryable(message) => ExportFailure::Retryable(message),
@@ -473,84 +473,9 @@ async fn repository_export(
             "repository export requires a complete crate with no omitted files".into(),
         ));
     }
-    if checkpoint.repository.is_none() {
-        if checkpoint.repository_started && destination.draft_id.is_none() {
-            return Err(ExportFailure::Permanent(
-                "draft creation outcome is unknown; \
-                 inspect the repository and retry with its draft_id"
-                    .into(),
-            ));
-        }
-        let jsonld = checkpoint
-            .raw_jsonld
-            .clone()
-            .ok_or_else(|| ExportFailure::Permanent("source crate metadata missing".into()))?;
-        let fence = async || {
-            checkpoint.repository_started = true;
-            persist_checkpoint(ctx, checkpoint)
-                .await
-                .map_err(TransferError::Retryable)
-        };
-        let record = interruptible(
-            ctx,
-            export::create_draft(ctx, spec, destination, &jsonld, fence),
-        )
+    export::repository_export(ctx, spec, destination, checkpoint)
         .await
-        .map_err(classify)?;
-        checkpoint.repository = Some(record);
-        persist_checkpoint(ctx, checkpoint)
-            .await
-            .map_err(ExportFailure::Retryable)?;
-    }
-    if checkpoint.repository_metadata.is_none() {
-        let record = checkpoint
-            .repository
-            .as_ref()
-            .ok_or_else(|| ExportFailure::Permanent("repository draft missing".into()))?;
-        let jsonld = checkpoint
-            .raw_jsonld
-            .as_deref()
-            .ok_or_else(|| ExportFailure::Permanent("source crate metadata missing".into()))?;
-        let (record, digest) = interruptible(
-            ctx,
-            export::prepare_draft(ctx, spec, destination, record, jsonld),
-        )
-        .await
-        .map_err(classify)?;
-        checkpoint.repository = Some(record);
-        checkpoint.repository_metadata = Some(digest);
-        persist_checkpoint(ctx, checkpoint)
-            .await
-            .map_err(ExportFailure::Retryable)?;
-    }
-    let record = checkpoint
-        .repository
-        .as_ref()
-        .ok_or_else(|| ExportFailure::Permanent("repository draft missing".into()))?;
-    let artifact = checkpoint
-        .artifact
-        .as_ref()
-        .ok_or_else(|| ExportFailure::Permanent("export artifact missing".into()))?;
-    let record = interruptible(
-        ctx,
-        export::deposit(
-            ctx,
-            spec,
-            destination,
-            record,
-            artifact,
-            checkpoint.repository_metadata.ok_or_else(|| {
-                ExportFailure::Permanent("repository metadata checkpoint missing".into())
-            })?,
-        ),
-    )
-    .await
-    .map_err(classify)?;
-    checkpoint.repository = Some(record);
-    checkpoint.repository_complete = true;
-    persist_checkpoint(ctx, checkpoint)
-        .await
-        .map_err(ExportFailure::Retryable)
+        .map_err(classify)
 }
 
 async fn snapshot_export(

@@ -1230,7 +1230,7 @@ pub(super) async fn read_export_checkpoint(
     .await
 }
 
-pub(super) async fn persist_checkpoint(
+pub(crate) async fn persist_checkpoint(
     ctx: &JobContext,
     checkpoint: &ExportCheckpoint,
 ) -> Result<(), String> {
