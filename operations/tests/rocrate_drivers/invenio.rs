@@ -15,15 +15,17 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct Repository {
     calls: Vec<(Method, String)>,
-    bytes: Vec<u8>,
-    key: Option<String>,
-    committed: bool,
+    files: std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    committed: HashSet<String>,
+    metadata: Option<Value>,
+    author_login: bool,
     published: bool,
     corrupt: bool,
     loop_pages: bool,
     lost_create: bool,
     lost_commit: bool,
     lost_publish: bool,
+    lost_content: bool,
     foreign_page: bool,
     public_files: bool,
 }
@@ -85,7 +87,11 @@ fn file(key: &str, bytes: &[u8], committed: bool) -> Value {
 async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Request) -> Response {
     assert_eq!(
         request.headers().get("authorization").unwrap(),
-        "Bearer repository-token"
+        if state.lock().unwrap().author_login {
+            "Bearer author-token"
+        } else {
+            "Bearer repository-token"
+        }
     );
     let expected = if request.method() == Method::GET && request.uri().path().ends_with("/content")
     {
@@ -138,6 +144,15 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             assert_eq!(body["metadata"]["title"], "Exported dataset");
             assert_eq!(body["files"]["enabled"], true);
             assert_eq!(
+                body["metadata"]["creators"][0]["person_or_org"]["family_name"],
+                "Researcher"
+            );
+            assert_eq!(
+                body["metadata"]["creators"][0]["person_or_org"]["identifiers"][0]["identifier"],
+                "0000-0002-1825-0097"
+            );
+            state.metadata = Some(body["metadata"].clone());
+            assert_eq!(
                 body["access"]["files"],
                 if state.public_files {
                     "public"
@@ -148,50 +163,86 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             if state.lost_create {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            record("3", false)
+            draft_record(&state, false)
         }
         (Method::GET, ["api", "records", "3", "draft"]) => {
             if state.published {
                 return StatusCode::NOT_FOUND.into_response();
             }
-            record("3", false)
+            draft_record(&state, false)
         }
-        (Method::GET, ["api", "records", "3"]) if state.published => record("3", true),
+        (Method::PUT, ["api", "records", "3", "draft"]) => {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            state.metadata = Some(body["metadata"].clone());
+            draft_record(&state, false)
+        }
+        (Method::GET, ["api", "records", "3"]) if state.published => draft_record(&state, true),
         (Method::GET, ["api", "records", "3", "draft", "files"])
         | (Method::GET, ["api", "records", "3", "files"]) => {
-            json!({"entries": state.key.iter().map(|key| file(key, &state.bytes, state.committed)).collect::<Vec<_>>()})
+            json!({"entries": state.files.iter().map(|(key, bytes)| match bytes {
+                Some(bytes) => file(key, bytes, state.committed.contains(key)),
+                None => json!({"key": key, "status": "pending"}),
+            }).collect::<Vec<_>>()})
         }
         (Method::POST, ["api", "records", "3", "draft", "files"]) => {
             let body: Value = serde_json::from_slice(&body).unwrap();
-            assert!(state.key.is_none());
-            state.key = Some(body[0]["key"].as_str().unwrap().into());
-            json!({"entries": [file(state.key.as_ref().unwrap(), &[], false)]})
+            let key = body[0]["key"].as_str().unwrap();
+            assert!(state.files.insert(key.into(), None).is_none());
+            json!({"entries": [{"key": key, "status": "pending"}]})
         }
         (Method::PUT, ["api", "records", "3", "draft", "files", key, "content"]) => {
-            assert_eq!(state.key.as_deref(), Some(*key));
-            state.bytes = body.to_vec();
+            let key = percent_encoding::percent_decode_str(key)
+                .decode_utf8()
+                .unwrap()
+                .into_owned();
+            let entry = state.files.get_mut(&key).unwrap();
+            assert!(entry.is_none());
+            *entry = Some(body.to_vec());
+            if std::mem::take(&mut state.lost_content) {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             json!({})
         }
         (Method::POST, ["api", "records", "3", "draft", "files", key, "commit"]) => {
-            assert_eq!(state.key.as_deref(), Some(*key));
-            state.committed = true;
+            let key = percent_encoding::percent_decode_str(key)
+                .decode_utf8()
+                .unwrap()
+                .into_owned();
+            assert!(state.files[&key].is_some());
+            state.committed.insert(key.clone());
             if std::mem::take(&mut state.lost_commit) {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            file(key, &state.bytes, true)
+            file(&key, state.files[&key].as_ref().unwrap(), true)
+        }
+        (Method::GET, ["api", "records", "3", "files", key, "content"]) if state.published => {
+            let key = percent_encoding::percent_decode_str(key)
+                .decode_utf8()
+                .unwrap();
+            return state.files[key.as_ref()].clone().unwrap().into_response();
         }
         (Method::POST, ["api", "records", "3", "draft", "actions", "publish"]) => {
-            assert!(state.committed);
+            assert_eq!(state.files.len(), state.committed.len());
+            assert_eq!(state.files.len(), 3);
             assert!(!state.published);
             state.published = true;
             if std::mem::take(&mut state.lost_publish) {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            record("3", true)
+            draft_record(&state, true)
         }
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     axum::Json(value).into_response()
+}
+
+fn draft_record(state: &Repository, published: bool) -> Value {
+    let mut record = record("3", published);
+    if let Some(metadata) = &state.metadata {
+        record["metadata"] = metadata.clone();
+    }
+    record["parent"]["access"] = json!({"owned_by": {"user": 42}});
+    record
 }
 
 async fn connector(fixture: &Fixture, server: &Server) -> Ulid {
@@ -328,7 +379,8 @@ async fn export_spec(
     server: &Server,
     publish: bool,
 ) -> Result<ExportRoCrateSpec, Box<dyn std::error::Error>> {
-    let upload = create_upload(fixture, crate_archive().await?).await?;
+    server.state.lock().unwrap().author_login = true;
+    let upload = create_upload(fixture, native_archive().await?).await?;
     let import = import_spec(fixture, upload, doc_id(1));
     let ctx = claim_context(fixture, job_id(), JobPayload::ImportRoCrate(import.clone())).await?;
     assert!(matches!(
@@ -337,16 +389,62 @@ async fn export_spec(
     ));
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    let mut destination = InvenioDestination {
+        group_id: fixture.group_id,
+        connector_id: connector(fixture, server).await,
+        draft_id: None,
+        metadata_json: "{}".into(),
+        publish,
+        public_files: false,
+        credential: None,
+    };
+    destination.credential = Some(
+        aruna_operations::jobs::invenio::seal_credential(
+            &fixture.context,
+            &import.auth_context,
+            &destination,
+            "author-token",
+        )
+        .await?,
+    );
     Ok(ExportRoCrateSpec {
-        auth_context: import.auth_context, document_id: doc_id(1), limits: RoCrateLimits::default(),
-        destination: Some(InvenioDestination {
-            group_id: fixture.group_id, connector_id: connector(fixture, server).await, draft_id: None,
-            metadata_json: json!({"title": "Exported dataset", "publication_date": "2026-09-22",
-                "resource_type": {"id": "dataset"}, "creators": [{"person_or_org": {"type": "organizational", "name": "Lab"}}]}).to_string(),
-            publish,
-            public_files: false,
-        }),
+        auth_context: import.auth_context,
+        document_id: doc_id(1),
+        limits: RoCrateLimits::default(),
+        destination: Some(destination),
     })
+}
+
+async fn native_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let document = json!({"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": [
+        {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"}, "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}},
+        {"@id": "./", "@type": "Dataset", "name": "Exported dataset", "description": "Native files", "datePublished": "2026-09-22",
+            "creator": {"@id": "#author"}, "hasPart": [{"@id": "nested/data.txt"}, {"@id": "empty.txt"}],
+            "identifier": "https://doi.org/10.1234/source"},
+        {"@id": "#author", "@type": "Person", "name": "A Researcher", "familyName": "Researcher", "givenName": "A",
+            "identifier": {"@type": "PropertyValue", "propertyID": "orcid", "value": "0000-0002-1825-0097"}},
+        {"@id": "nested/data.txt", "@type": "File"}, {"@id": "empty.txt", "@type": "File"}
+    ]});
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new("ro-crate-metadata.json".into(), Compression::Stored),
+            document.to_string().as_bytes(),
+        )
+        .await?;
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new("nested/data.txt".into(), Compression::Stored),
+            PAYLOAD,
+        )
+        .await?;
+    archive
+        .write_entry_whole(
+            ZipEntryBuilder::new("empty.txt".into(), Compression::Stored),
+            &[],
+        )
+        .await?;
+    Ok(archive.close().await?)
 }
 
 #[tokio::test]
@@ -390,13 +488,50 @@ async fn invenio_export_modes() -> Result<(), Box<dyn std::error::Error>> {
                     .iter()
                     .filter(|(method, _)| *method == Method::PUT)
                     .count(),
-                1
+                3
             );
-            let mut archive = zip::ZipArchive::new(Cursor::new(&state.bytes))?;
-            let mut data = Vec::new();
-            archive.by_name("data.txt")?.read_to_end(&mut data)?;
-            assert_eq!(data, PAYLOAD);
-            assert!(archive.by_name("ro-crate-metadata.json").is_ok());
+            assert_eq!(
+                state.files.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["empty.txt", "nested/data.txt", "ro-crate-metadata.json"]
+            );
+            assert_eq!(state.files["nested/data.txt"].as_deref(), Some(PAYLOAD));
+            assert_eq!(state.files["empty.txt"].as_deref(), Some(&b""[..]));
+            let metadata: Value =
+                serde_json::from_slice(state.files["ro-crate-metadata.json"].as_ref().unwrap())?;
+            assert!(metadata["@graph"].is_array());
+            assert_eq!(
+                state.metadata.as_ref().unwrap()["related_identifiers"][0]["identifier"],
+                "10.1234/source"
+            );
+        }
+        if publish {
+            let body = reqwest::Client::new()
+                .get(format!(
+                    "{}records/3/files/nested%2Fdata.txt/content",
+                    server.endpoint
+                ))
+                .bearer_auth("author-token")
+                .header("Accept", "application/octet-stream")
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            assert_eq!(body.as_ref(), PAYLOAD);
+            let record: Value = reqwest::Client::new()
+                .get(format!("{}records/3", server.endpoint))
+                .bearer_auth("author-token")
+                .header(
+                    "Accept",
+                    "application/vnd.inveniordm.v1+json, application/json;q=0.9",
+                )
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(record["parent"]["access"]["owned_by"]["user"], 42);
+            assert_eq!(record["metadata"]["title"], "Exported dataset");
         }
         fixture.stop().await;
     }
@@ -405,11 +540,12 @@ async fn invenio_export_modes() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn invenio_export_recovers() -> Result<(), Box<dyn std::error::Error>> {
-    for lost_commit in [false, true] {
+    for failure in 0..3 {
         let fixture = build_fixture(false).await?;
         let server = serve(Repository {
-            lost_commit,
-            lost_publish: !lost_commit,
+            lost_commit: failure == 0,
+            lost_publish: failure == 1,
+            lost_content: failure == 2,
             ..Default::default()
         })
         .await;
@@ -438,7 +574,7 @@ async fn invenio_export_recovers() -> Result<(), Box<dyn std::error::Error>> {
                     .iter()
                     .filter(|(method, _)| *method == Method::PUT)
                     .count(),
-                1
+                3
             );
             assert_eq!(
                 state
@@ -481,6 +617,54 @@ async fn invenio_ambiguous_creation() -> Result<(), Box<dyn std::error::Error>> 
             .count(),
         1
     );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_requires_login() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let mut spec = export_spec(&fixture, &server, true).await?;
+    spec.destination.as_mut().unwrap().credential = None;
+    let ctx = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+    match run_export_job(&ctx, &spec).await {
+        JobRunOutcome::Failed(error) => {
+            assert!(error.message.contains("personal repository login"))
+        }
+        _ => panic!("export accepted a shared connector login"),
+    }
+    assert!(server.state.lock().unwrap().calls.is_empty());
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invenio_reuses_draft() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let mut spec = export_spec(&fixture, &server, true).await?;
+    spec.destination.as_mut().unwrap().draft_id = Some("3".into());
+    let ctx = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+    match run_export_job(&ctx, &spec).await {
+        JobRunOutcome::Succeeded(_) => {}
+        JobRunOutcome::Failed(error) => panic!("{}", error.message),
+        _ => panic!("draft export did not complete"),
+    }
+    {
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.metadata.as_ref().unwrap()["title"],
+            "Exported dataset"
+        );
+        assert!(
+            state
+                .calls
+                .contains(&(Method::PUT, "/api/records/3/draft".into()))
+        );
+        assert!(!state.calls.contains(&(Method::POST, "/api/records".into())));
+        assert_eq!(state.files.len(), 3);
+    }
     fixture.stop().await;
     Ok(())
 }
