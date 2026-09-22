@@ -16,12 +16,15 @@ use ulid::Ulid;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RepositoryConnectorKind {
     OaiPmh,
+    /// An InvenioRDM or Zenodo REST API root for record search, import and export.
+    Invenio,
 }
 
 impl RepositoryConnectorKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OaiPmh => "oai_pmh",
+            Self::Invenio => "invenio",
         }
     }
 }
