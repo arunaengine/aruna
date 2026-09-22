@@ -124,20 +124,15 @@ then runs signed Git commits and actual Git/LFS clients. It verifies historical 
 after an S3 key-head overwrite, idempotent private metadata publication, unauthorized
 requests, incorrect digests, missing LFS data and invalid non-default branches.
 
-Set `ARUNA_ARC_PYTHON` to an interpreter with the pinned requirements and put `git-lfs`
-on PATH. For example, obtain the interpreter path with:
-
-```bash
-uv run --no-project --with-requirements scripts/arc-bridge/requirements.txt \
-  python -c 'import sys; print(sys.executable)'
-```
-
-Run the focused integration using the repository's resource guard:
+Put `git-lfs` on PATH. Run Cargo inside the pinned uv environment so the Python
+interpreter and receive-hook dependencies remain available for the whole test:
 
 ```bash
 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
-  nice -n 19 ionice -c3 cargo test --locked -p aruna --no-default-features \
-  --test arc_interface -- --ignored --nocapture
+  uv run --no-project --with-requirements scripts/arc-bridge/requirements.txt \
+  sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)"; \
+    exec nice -n 19 ionice -c3 cargo test --locked -p aruna --no-default-features \
+    --test arc_interface -- --ignored --nocapture'
 ```
 
 The test requires a configured signing key and preserves existing client safety hooks.
