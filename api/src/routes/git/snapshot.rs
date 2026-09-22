@@ -32,7 +32,7 @@ pub struct RepositoryStatus {
     description = "Returns the automatic ARC repository and its conversion status.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: missing repositories are generated on their fixed owner. The protected aruna branch tracks graph snapshots. A conversion error means no new valid snapshot was published.",
     params(("document_id" = String, Path, description = "Metadata document ID")),
     responses((status = 200, description = "Repository and conversion status", body = RepositoryStatus,
-               example = serde_json::json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","bucket":"arc-storage","revision":"01M000000000000000000000001","commit":"1111111111111111111111111111111111111111","error":null})),
+               example = json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","bucket":"arc-storage","revision":"01M000000000000000000000001","commit":"1111111111111111111111111111111111111111","error":null})),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
               (status = 404, description = "Document missing or Git belongs to another node"),
               (status = 503, description = "Metadata or conversion runtime unavailable")))]
@@ -71,7 +71,7 @@ pub struct RevisionQuery {
     params(("document_id" = String, Path, description = "Metadata document ID"),
            ("revision" = String, Query, description = "Branch, tag or full commit ID")),
     responses((status = 200, description = "Exact commit and derived RO-Crate", body = Value,
-               example = serde_json::json!({"commit":"1111111111111111111111111111111111111111","rocrate":{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[{"@id":"ro-crate-metadata.json","@type":"CreativeWork","about":{"@id":"./"},"conformsTo":{"@id":"https://w3id.org/ro/crate/1.2"}},{"@id":"./","@type":"Dataset","additionalType":"Investigation","identifier":"arc-example","name":"ARC example","description":"Example investigation","datePublished":"2026-09-22","license":{"@id":"https://creativecommons.org/licenses/by/4.0/"}}]}})),
+               example = json!({"commit":"1111111111111111111111111111111111111111","rocrate":{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[{"@id":"ro-crate-metadata.json","@type":"CreativeWork","about":{"@id":"./"},"conformsTo":{"@id":"https://w3id.org/ro/crate/1.2"}},{"@id":"./","@type":"Dataset","additionalType":"Investigation","identifier":"arc-example","name":"ARC example","description":"Example investigation","datePublished":"2026-09-22","license":{"@id":"https://creativecommons.org/licenses/by/4.0/"}}]}})),
               (status = 400, description = "Revision has invalid ISA metadata"),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
               (status = 503, description = "Git revision or converter unavailable")))]
