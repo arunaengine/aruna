@@ -119,6 +119,21 @@ published. A node refuses to start while `REALM_PUBLIC_KEY`, `NODE_PUBLIC_KEY`,
 names it. Replace them with your own, or pass `--dangerously-use-default-env` (or set
 `ARUNA_DANGEROUSLY_USE_DEFAULT_ENV=1`) to start anyway, which logs a warning per key.
 
+### Use native Git and Git LFS
+
+Aruna can host a node-local Git repository for a metadata document. Enable it with
+`POST /api/v1/metadata/{document_id}/git`, naming an existing same-group bucket and
+optionally setting `arc: true`. The response provides the native clone and LFS URLs.
+Clients authenticate with an Aruna bearer token as their HTTP Basic password; repository
+and object permissions remain enforced by Aruna. Native hosting requires Unix and Git on PATH; the
+container image includes the server binaries.
+
+Branches, commit tags, atomic pushes and ref deletion are supported. Non-fast-forward
+branch updates and replacement of existing tags are refused. LFS content uses exact
+Aruna object versions. ARC mode checks file structure and LFS availability, not full
+scientific conformance. See the [native Git and ARCitect guide](scripts/arc-native/README.md)
+for setup, the minimal ARCitect custom-remote patch, tested dependencies and limitations.
+
 ### Evaluate a local cluster
 
 For a quick end-to-end evaluation, run:
