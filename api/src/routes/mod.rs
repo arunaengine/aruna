@@ -164,6 +164,10 @@ pub(crate) mod tests {
         ("DELETE", "/access/groups/{id}/members/{user_id}"),
         ("DELETE", "/access/groups/{id}/roles/{role_id}"),
         ("DELETE", "/metadata/{document_id}"),
+        (
+            "DELETE",
+            "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
         ("DELETE", "/system/notifications/watches/{id}"),
         ("DELETE", "/pid/{document_id}"),
         ("DELETE", "/access/credentials/{access_key_id}"),
@@ -215,6 +219,12 @@ pub(crate) mod tests {
         ),
         ("GET", "/metadata/groups/{group_id}"),
         ("GET", "/metadata/groups/{group_id}/path"),
+        ("GET", "/metadata/groups/{group_id}/repositories"),
+        ("GET", "/metadata/invenio/records"),
+        (
+            "GET",
+            "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
         ("GET", "/data/groups/{group_id}/storage/backends"),
         (
             "GET",
@@ -339,6 +349,9 @@ pub(crate) mod tests {
         ("POST", "/metadata/profile/validation/preview"),
         ("POST", "/metadata/references/preflight"),
         ("POST", "/metadata/rocrate/imports"),
+        ("POST", "/metadata/groups/{group_id}/repositories"),
+        ("POST", "/metadata/invenio/imports"),
+        ("POST", "/metadata/{document_id}/invenio/exports"),
         ("POST", "/metadata/rocrate/uploads"),
         ("POST", "/metadata/sparql/query"),
         (
@@ -390,6 +403,10 @@ pub(crate) mod tests {
         ("PUT", "/data/groups/{group_id}/storage/routing"),
         ("PUT", "/system/realm/quota"),
         ("PUT", "/metadata/{document_id}/rocrate"),
+        (
+            "PUT",
+            "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
         ("PUT", "/access/policies/group/{group_id}"),
         ("PUT", "/access/policies/realm"),
     ];

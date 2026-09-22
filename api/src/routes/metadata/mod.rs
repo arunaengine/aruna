@@ -6,6 +6,7 @@
 pub(crate) mod documents;
 pub(crate) mod query;
 pub(crate) mod references;
+pub(crate) mod repositories;
 pub(crate) mod rocrate;
 pub(crate) mod validation;
 
@@ -26,6 +27,7 @@ use utoipa_axum::routes;
         (name = "metadata/references", description = "Metadata reference resolution"),
         (name = "metadata/rocrate", description = "RO-Crate document operations"),
         (name = "metadata/invenio", description = "Native Invenio and Zenodo search, import and publication"),
+        (name = "metadata/repositories", description = "Invenio and OAI-PMH repository connectors"),
         (name = "metadata/validation", description = "Metadata profile validation")
     ),
     components(schemas(crate::metadata::MetadataRoCrateView))
@@ -60,4 +62,13 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(rocrate::add_data_entity))
         .routes(routes!(rocrate::add_contextual_entity))
         .routes(routes!(query::query_metadata_document))
+        .routes(routes!(
+            repositories::create_repository,
+            repositories::list_repositories
+        ))
+        .routes(routes!(
+            repositories::get_repository,
+            repositories::replace_repository,
+            repositories::delete_repository
+        ))
 }
