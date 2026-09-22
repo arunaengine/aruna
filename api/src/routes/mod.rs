@@ -158,6 +158,7 @@ pub(crate) mod tests {
             "DELETE",
             "/data/groups/{group_id}/storage/backends/{backend_id}",
         ),
+        ("DELETE", "/access/groups/{id}"),
         ("DELETE", "/access/groups/{id}/members/{user_id}"),
         ("DELETE", "/access/groups/{id}/roles/{role_id}"),
         ("DELETE", "/metadata/{document_id}"),
