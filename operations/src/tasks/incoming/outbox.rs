@@ -355,6 +355,16 @@ impl OperationsTaskHandler {
                 return DrainPage::Stop;
             }
         };
+        if batch.records.iter().any(|(_, record)| matches!(&record.event,
+            DocumentOutboxEvent::AdminOperation { event, .. }
+                if matches!(event.op, aruna_core::admin_documents::AdminDocumentOperation::GroupDeleted { .. })))
+            && let Err(error) = crate::groups::deletion::sync_decision(self.context.as_ref()).await
+        {
+            warn!(error = %error, "Group deletion decision is not durable; retaining outbox");
+            invocation.read_failed = true;
+            invocation.outcome.retry_needed = true;
+            return DrainPage::Stop;
+        }
         invocation.scan_elapsed += scan_started.elapsed();
         let has_more = batch.has_more;
         invocation.cursor = batch.next_start_after;

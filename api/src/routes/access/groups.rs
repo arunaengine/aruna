@@ -71,7 +71,7 @@ pub struct GroupsApiDoc;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(GroupsApiDoc::openapi())
         .routes(routes!(create_group, list_groups))
-        .routes(routes!(get_group, update_group))
+        .routes(routes!(get_group, update_group, delete_group))
         .routes(routes!(get_group_usage))
         .routes(routes!(list_data_paths))
         .routes(routes!(list_group_members, add_group_member))
@@ -865,6 +865,55 @@ pub async fn update_group(
         StatusCode::OK,
         Json(run_get_group(&state, Some(auth), &group_id.to_string()).await?),
     ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/groups/{group_id}",
+    tag = "access/groups",
+    params(("group_id" = String, Path, description = "Group identifier")),
+    responses(
+        (status = 204, description = "Empty group deleted, or its deletion was already committed"),
+        (status = 400, description = "Invalid group identifier", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Caller may not administer this group", body = ErrorResponse),
+        (status = 404, description = "Group not found", body = ErrorResponse),
+        (status = 409, description = "Group still owns resources, or deletion must be retried", body = ErrorResponse),
+        (status = 503, description = "A realm node is unavailable; retry to resume the durable decision", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_group(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    Path(group_id): Path<String>,
+) -> ServerResult<StatusCode> {
+    let auth = require_unrestricted(auth)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+    let group_id = parse_group_id(&group_id)?;
+    let token =
+        forwarded_bearer(bearer.as_ref().map(|bearer| bearer.as_str())).map_err(map_api_error)?;
+    aruna_operations::groups::deletion::delete_group(&state.get_ctx(), auth, token, group_id)
+        .await
+        .map_err(|error| {
+            use aruna_core::structs::identity::group_delete::GroupDeletionError;
+            match error {
+                GroupDeletionError::Unauthorized => ServerError::Forbidden,
+                GroupDeletionError::NotFound => ServerError::NotFound,
+                GroupDeletionError::NotEmpty(reason) => {
+                    ServerError::Conflict(format!("group is not empty: {reason}"))
+                }
+                GroupDeletionError::Conflict(reason) => ServerError::Conflict(reason),
+                GroupDeletionError::Invalid(reason) => ServerError::BadRequestMessage(reason),
+                GroupDeletionError::Unavailable(reason) => ServerError::ServiceUnavailableReason(
+                    format!("{reason}; retry group deletion to resume"),
+                ),
+            }
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn map_rename_error(error: UpdateGroupError) -> ServerError {

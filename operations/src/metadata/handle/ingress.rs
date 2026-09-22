@@ -906,6 +906,12 @@ impl MetadataHandle {
                 })
                 .await
             }
+            request @ MetadataTransportMessage::GroupDeletion { .. } => {
+                Box::pin(crate::groups::deletion::apply_request(
+                    context, peer, request,
+                ))
+                .await
+            }
             _ => unreachable!("request family routed incorrectly"),
         }
     }
@@ -992,7 +998,8 @@ impl MetadataHandle {
             | MetadataTransportMessage::FetchGraphState { .. }
             | MetadataTransportMessage::ForwardApplyBatch { .. }
             | MetadataTransportMessage::ForwardAdminEvent { .. }
-            | MetadataTransportMessage::ForwardGroupCreate { .. }) => (
+            | MetadataTransportMessage::ForwardGroupCreate { .. }
+            | MetadataTransportMessage::GroupDeletion { .. }) => (
                 self.forward_request(context, peer, audit_deadline, message)
                     .await,
                 None,

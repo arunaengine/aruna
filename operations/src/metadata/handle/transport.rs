@@ -463,6 +463,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::AdminEventQueued => "forwarded_admin_event_queued",
         MetadataTransportMessage::ForwardGroupCreate { .. } => "forward_group_create",
         MetadataTransportMessage::ForwardedGroupCreated { .. } => "forwarded_group_created",
+        MetadataTransportMessage::GroupDeletion { .. } => "group_deletion",
+        MetadataTransportMessage::GroupDeletionResult { .. } => "group_deletion_result",
         MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
         MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
         MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",

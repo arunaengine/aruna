@@ -466,6 +466,16 @@ pub enum MetadataTransportMessage {
         profile_id: Ulid,
         expected_revision: Ulid,
     },
+    GroupDeletion {
+        auth_token: Option<AuthToken>,
+        action: aruna_core::structs::identity::group_delete::GroupDeleteAction,
+    },
+    GroupDeletionResult {
+        result: Result<
+            Option<aruna_core::structs::identity::group_delete::GroupDeleteProof>,
+            aruna_core::structs::identity::group_delete::GroupDeletionError,
+        >,
+    },
 }
 
 /// One document as a holder serves it to a device.
