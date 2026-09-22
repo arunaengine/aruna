@@ -156,6 +156,19 @@ impl EgressGuard {
         screen_host(&self.policy, host)?;
         Ok(self.plain.get(url))
     }
+
+    /// Screens repository requests and refuses redirects for authenticated writes.
+    pub fn repository_request(
+        &self,
+        method: reqwest::Method,
+        url: Url,
+    ) -> Result<reqwest::RequestBuilder, EgressError> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
+        screen_host(&self.policy, host)?;
+        Ok(self.opendal.request(method, url))
+    }
 }
 
 /// A hop may never weaken the transport the caller chose: once the original

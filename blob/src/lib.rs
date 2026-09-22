@@ -14,6 +14,7 @@ mod framing;
 mod fs_source;
 mod fs_write;
 pub mod hash;
+pub mod invenio;
 mod messages;
 pub mod opendal;
 pub mod s3;

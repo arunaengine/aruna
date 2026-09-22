@@ -38,6 +38,7 @@ opentelemetry = { workspace = true }
 postcard = { workspace = true }
 quick-xml = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
