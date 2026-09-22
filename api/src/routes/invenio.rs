@@ -80,7 +80,7 @@ Invalid queries return 400; denied access returns 403; repository availability f
 )]
 pub async fn search_records(
     State(state): State<Arc<ServerState>>,
-    auth: Extension<Option<AuthContext>>,
+    Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<InvenioSearch>,
 ) -> ServerResult<Json<serde_json::Value>> {
     let auth = crate::auth::require_unrestricted_auth(&state, auth)?;

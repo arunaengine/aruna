@@ -292,8 +292,8 @@ and checks their source sizes and checksums. Mode `reference` creates native Aru
 references, reading repository bytes on demand; the target bucket and connector must share
 a group. Mode `metadata` skips attached files and file-list requests, allowing metadata imports
 without access to restricted data. References depend on remote availability and credentials.
-Each version also
-contains `invenio-record.json`, preserving its complete record and file metadata, including
+Each version contains `invenio-record.json`, preserving the complete returned record JSON
+and, in copy/reference modes, file-list metadata, including
 DOIs, concept identifiers, timestamps, relations, creator identifiers and custom fields.
 Foreign identifiers remain provenance; Aruna assigns local document and object identities.
 Filenames are encoded in storage paths so repeated or unsafe source names cannot collide.

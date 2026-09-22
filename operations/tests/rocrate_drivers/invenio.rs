@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+#[path = "invenio_live.rs"]
+mod live;
+
 #[derive(Default)]
 struct Repository {
     calls: Vec<(Method, String)>,

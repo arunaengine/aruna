@@ -1112,4 +1112,70 @@ mod tests {
         let usage = read_usage_counters(context, usage_group_key(group_id)).await;
         assert_eq!(usage.referenced_bytes, 8);
     }
+
+    #[tokio::test]
+    async fn reference_resumes_version() {
+        let test_context = setup_driver_context().await;
+        let context = &test_context.driver_context;
+        let group_id = Ulid::generate();
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let node_id = iroh::SecretKey::generate().public();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
+        let (server, endpoint) = spawn_reference_server("ref-data").await;
+        let connector = create_http_connector(context, group_id, &endpoint).await;
+        let original = stage_reference_blob(
+            context,
+            MaterializeReferenceInput {
+                group_id,
+                user_id,
+                realm_id,
+                node_id,
+                connector_id: connector.connector_id,
+                source_path: "folder/file.txt".into(),
+                bucket: "bucket-a".into(),
+                key: "object.txt".into(),
+                expected_bucket: bucket.clone(),
+                inherited_policies: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        let planned = Ulid::generate();
+        let input = |size| ReferenceWrite {
+            preassigned_version_id: Some(planned),
+            group_id,
+            user_id,
+            realm_id,
+            node_id,
+            bucket: "bucket-a".into(),
+            key: "object.txt".into(),
+            expected_bucket: Some(bucket.clone()),
+            version_source: original.version_source.clone(),
+            metadata: SourceMetadata {
+                content_length: size,
+                ..original.source_metadata.clone()
+            },
+            inherited_policies: Vec::new(),
+            connector_guard: None,
+        };
+        assert_eq!(
+            write_reference_version(context, input(8)).await.unwrap(),
+            (planned, true)
+        );
+        assert_ne!(planned, original.version_id);
+        assert_eq!(
+            write_reference_version(context, input(8)).await.unwrap(),
+            (planned, false)
+        );
+        assert!(write_reference_version(context, input(9)).await.is_err());
+        assert_eq!(
+            read_usage_counters(context, usage_group_key(group_id))
+                .await
+                .referenced_bytes,
+            16
+        );
+    }
 }
