@@ -121,17 +121,18 @@ names it. Replace them with your own, or pass `--dangerously-use-default-env` (o
 
 ### Use native Git and Git LFS
 
-Aruna can host a node-local Git repository for a metadata document. Enable it with
-`POST /api/v1/metadata/{document_id}/git`, naming an existing same-group bucket and
-optionally setting `arc: true`. The response provides the native clone and LFS URLs.
+Aruna automatically creates a node-local ARC Git repository when a metadata document is
+materialized. `GET /api/v1/metadata/{document_id}/git` provides clone/LFS URLs and conversion
+status. Generic RO-Crates become minimal investigations without invented studies or assays.
 Clients authenticate with an Aruna bearer token as their HTTP Basic password; repository
-and object permissions remain enforced by Aruna. Native hosting requires Unix and Git on PATH; the
-container image includes the server binaries.
+and object permissions remain enforced by Aruna. Native hosting requires Unix, Git, configured
+signing and the pinned Python converter dependencies; the container bundles the runtime.
 
 Branches, commit tags, atomic pushes and ref deletion are supported. Non-fast-forward
 branch updates and replacement of existing tags are refused. LFS content uses exact
-Aruna object versions. ARC mode checks file structure and LFS availability, not full
-scientific conformance. See the [native Git and ARCitect guide](scripts/arc-native/README.md)
+Aruna object versions. The protected `aruna` branch tracks graph snapshots. ISA metadata,
+CWL schema and data availability are checked; scientific/publication readiness needs further
+validation. See the [native Git and ARCitect guide](scripts/arc-native/README.md)
 for setup, the minimal ARCitect custom-remote patch, tested dependencies and limitations.
 
 ### Evaluate a local cluster

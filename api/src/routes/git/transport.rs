@@ -44,9 +44,22 @@ pub async fn advertise(
     ) {
         return Err(ServerError::BadRequest);
     }
+    let auth = require_realm_auth(&state, auth)?;
+    git::snapshot::ensure(
+        &state.get_ctx(),
+        &auth,
+        repository_id(&repository)?,
+        if query.service == "git-receive-pack" {
+            Permission::WRITE
+        } else {
+            Permission::READ
+        },
+    )
+    .await
+    .map_err(map_error)?;
     serve(
         state,
-        auth,
+        Some(auth),
         token,
         repository,
         "GET",

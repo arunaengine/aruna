@@ -1,71 +1,108 @@
 # Native Aruna Git, LFS and ARCitect
 
-Git and LFS are served by Aruna's own REST listener. No Python bridge process or separate
-S3 credentials are needed by Git clients. The node uses Git's HTTP backend and an Aruna
-receive helper; LFS bytes use Aruna's ordinary authorization, routing, quota, checksum
-and versioned-object operations. Repository bindings are persisted in node-local storage.
+Every metadata document automatically receives an ARC Git repository during metadata
+materialization. Git and LFS are served by Aruna's own REST listener. The node uses Git's
+HTTP backend, an Aruna receive helper and pinned ARCtrl for ISA conversion. LFS bytes use
+Aruna's ordinary authorization, routing, quota, checksum and versioned-object operations.
 
-Enable Git for an existing metadata document and a same-group bucket after the metadata
-document is readable. Aruna accepts metadata creation asynchronously, so its initial
-acceptance response can precede registry visibility.
+Creation remains asynchronous. The signed initial commit appears when the accepted
+metadata has been converted successfully. Existing documents without a repository are
+also initialized on authorized Git access. Discover its URLs and conversion status with:
 
 ```bash
-curl --fail-with-body -X POST \
+curl --fail-with-body \
   -H "Authorization: Bearer $ARUNA_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"bucket":"arc-storage","arc":true}' \
   "$ARUNA_API_URL/api/v1/metadata/$ARUNA_DOCUMENT_ID/git"
 ```
 
-The response contains `clone_url` and `lfs_url`. Git URLs have this form:
+The response contains `clone_url`, `lfs_url`, `bucket`, source `revision`, snapshot `commit`
+and any conversion `error`. Missing required information or local data produces an error
+instead of publishing an invalid snapshot. Git URLs have this form:
 
 ```text
 https://node.example/api/v1/git/<document-id>.git
 ```
 
 Use a credential manager with username `aruna` and an Aruna bearer token as password.
+The node provisions a group-local `arc-<group-id>` bucket through ordinary bucket operations.
 The token needs the appropriate READ/WRITE grants on the document and the repository's
 `git-lfs/<document-id>/` object prefix in its bucket. Restricted tokens remain restricted.
 Native Git passwords are bearer tokens, not S3 access secrets. Use HTTPS outside loopback.
 
 The server supports multiple branches, merges through normal fast-forward ref updates,
 lightweight and annotated commit tags, atomic pushes, and branch/tag deletion. Non-fast-
-forward branch replacement and replacement of an existing tag are refused. Tags must
+forward branch replacement and replacement of an existing tag are refused. The `aruna`
+branch is reserved for server-generated metadata snapshots. Tags must
 resolve to commits. Symlinks, submodules and alternate `.lfsconfig` endpoints are currently
 rejected. Git request/response bodies are bounded to 64 MiB; LFS uploads use the node's
 RO-Crate source-size limit and stream to storage. Receive validation accepts at most
 128 distinct commits per push (new commits plus updated ref targets) and 10,000 paths
 per tree. Large data should use LFS.
 
-ARC mode checks the investigation archive signature, required directory metadata paths,
-and referenced LFS availability before refs become visible. It does not certify full ISA
-semantics or every ARC specification requirement. Existing Aruna metadata is not silently
-replaced by pushed ISA spreadsheets; Git history is the committed file representation.
+Before refs become visible, validation parses ISA workbooks, checks required investigation
+sections and values, study/assay registrations, local data references, CWL v1.2 schema and
+referenced LFS availability. The CWL reference validator is restricted to ARC-local imports;
+it does not execute workflows or fetch external resources. External-resource accessibility,
+scientific correctness and publication/reproducibility readiness are not certified.
 LFS mappings preserve exact VersionIds when S3 key heads change. Administrative version
 purge can still remove those bytes. Git repository maintenance, cross-node failover and
-full ARC validation remain separate work. Node-local Git files live under `storage_path/git`.
+publication validation remain separate work. Node-local Git files live under `storage_path/git`.
+The owner is fixed by the original creation event: its authoring node when it was a holder,
+otherwise the first recorded holder. Later placement changes do not select another writer.
+Use that node's endpoint; automatic Git failover is not implemented.
 
 ## Metadata representation
 
-Aruna metadata and committed ARC files are currently linked by document ID, without
-automatic conversion between them:
+The implementation follows DataPLANT's [ISA RO-Crate mapping](https://github.com/nfdi4plants/isa-ro-crate-profile/blob/release/profile/isa_ro_crate_mapping.md)
+and the [ARC 2.1 specification](https://github.com/nfdi4plants/ARC-specification/blob/2.1/ARC%20specification.md).
+The ISA RO-Crate profile is a draft; the actual converter is pinned to ARCtrl 3.2.1.
+
+| ISA concept | RO-Crate representation |
+| --- | --- |
+| Investigation, study, assay | `Dataset`, distinguished by `additionalType`, linked with `hasPart` |
+| Title, description, identifier | `name`, `description`, `identifier` |
+| Public release date, people | `datePublished`, `creator` with `Person` entities |
+| Experimental process and protocol | `LabProcess` and `LabProtocol`, with inputs, results and protocol links |
+| Sources, samples and materials | `Sample` entities |
+| Data files | `File` entities |
+| Ontology annotations | `DefinedTerm` and ontology identifiers |
+| Parameters, characteristics, factors, units | `PropertyValue`, including property and unit identifiers |
+
+The two editing paths have explicit revision boundaries:
 
 - `POST /api/v1/metadata` creates an RO-Crate from scaffold fields or accepts supplied
   RO-Crate JSON-LD. Scaffold creation uses RO-Crate 1.3; supplied 1.2/1.3 crates retain
   their version. The document has a root Dataset and linked data/contextual entities.
 - `GET /api/v1/metadata/{document_id}/rocrate` exports that document's metadata graph.
-- Enabling Git creates an empty bare repository bound to the document and LFS bucket.
-  It does not export the existing graph into the repository or create ISA workbooks.
-- Push stores the submitted files, commits and refs. ISA workbooks and any committed
-  `ro-crate-metadata.json` remain ordinary Git files; the server does not generate or
-  synchronize that JSON-LD file, parse ISA into the graph, or index each commit there.
-- LFS stores payload bytes with SHA-256, size and exact Aruna VersionId bindings. An
-  upload does not automatically add a File entity or `hasPart` link to the RO-Crate.
+- Materialization converts the selected metadata into ISA workbooks and a derived
+  `ro-crate-metadata.json`. Generic crates become investigation-only ARCs using their
+  supplied fields. No studies, assays or experimental facts are invented.
+- `aruna-metadata.json` retains the exact selected Aruna JSON-LD, including its original
+  1.2/1.3 context, identifiers and fields outside ISA. The ARCtrl-derived representation
+  uses its supported RO-Crate 1.2 context. Additional source information is not discarded.
+- The protected `aruna` branch records signed snapshots. `main` starts at the same commit
+  and follows graph updates while it still equals the previous snapshot. If a client has
+  changed `main`, it remains intact; the new graph snapshot stays on `aruna` for an explicit merge.
+- Push preserves incoming commit IDs and spreadsheet bytes. Obtain current ISA-derived
+  metadata for any branch, tag or commit through
+  `GET /api/v1/metadata/{id}/git/rocrate?revision=main`. The response names the exact resolved
+  commit. A stale JSON-LD file committed by a client is not used as the ISA source of truth.
+- A pushed branch does not silently replace the collaborative graph or another branch.
+  LFS uploads store bytes and exact versions; ISA annotations determine their scientific role.
 
-The integration fixture explicitly generates `ro-crate-metadata.json` using ARCtrl
-before committing it. That is test setup, not automatic server behavior. A future
-commit-to-RO-Crate conversion must preserve commit/branch identity and define how it
-interacts with the editable metadata document before claiming automatic synchronization.
+Referenced local data must be supplied through Git/LFS. Generation can reuse files already
+present on `main`; it does not invent empty payloads or download arbitrary URLs. A valid
+working ARC can still lack the contacts, assays, workflows or evidence required for publication.
+
+## Runtime requirements
+
+Native hosting requires Unix, Git, Python 3.13 with `blob/arc-requirements.txt`, and configured
+Git signing. The image includes Git, GPG, Python, ARCtrl and the CWL validator. Operators must
+provide a service signing key and Git configuration, for example using `GIT_CONFIG_GLOBAL`
+and `GNUPGHOME` pointing at their mounted configuration/key store. Generated commits have
+the service author `Aruna <git@aruna.local>` and matching author/committer timestamps.
+The signing key must be usable by the unattended service. Missing runtime/signing/storage
+infrastructure leaves work pending for retry; it never creates an unsigned fallback commit.
 
 ## ARCitect client patch
 
@@ -88,8 +125,9 @@ Aruna's protocol or rewriting ARC contents.
 ## Reproduce the integration test
 
 The ignored `git_native` test starts a temporary Aruna node and native REST listener. It
-checks real Git/LFS push, clone, historical content after S3 overwrite, read-only token
-denial, malformed content, invalid ARC branches, atomic rejection, branches and tags.
+checks automatic signed repository creation without an activation request, graph snapshots,
+ISA-derived commit exports, real Git/LFS transfer, historical content after S3 overwrite,
+read-only token denial, invalid ARC branches, atomic rejection, branches and tags.
 With `ARUNA_ARCITECT` set, it also runs the actual patched Electron app with Playwright.
 
 Prepare a separate ARCitect checkout at the revision above, apply the patch, install its

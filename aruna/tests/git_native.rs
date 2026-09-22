@@ -9,9 +9,10 @@ mod shared;
 use aruna_api::cors::CorsConfig;
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
-    spawn_complete_seed,
+    TestResult, create_bearer_token, create_group_http, create_s3_credentials, spawn_complete_seed,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -58,13 +59,12 @@ async fn native_clients() -> TestResult<()> {
         let group = create_group_http(&seed.base_url, &token, "native-arc").await?;
         let credentials = create_s3_credentials(&seed.base_url, &token, &group.group_id).await?;
         let endpoint = seed.s3.as_ref().ok_or_else(|| std::io::Error::other("S3 unavailable"))?;
-        let bucket = format!("native-{}", ulid::Ulid::generate().to_string().to_lowercase());
-        s3_client(endpoint, &credentials).create_bucket().bucket(&bucket).send().await?;
         let base = format!("http://{address}");
         let client = reqwest::Client::new();
         let document: serde_json::Value = client.post(format!("{base}/api/v1/metadata")).bearer_auth(&token)
             .json(&serde_json::json!({"group_id":group.group_id,"path":"native-arc","name":"Native ARC",
-                "description":"Native Git and LFS integration","date_published":"2026-09-22","public":false}))
+                "description":"Native Git and LFS integration","date_published":"2026-09-22",
+                "license":"https://creativecommons.org/licenses/by/4.0/","public":false}))
             .send().await?.error_for_status()?.json().await?;
         let id = document["document_id"].as_str().ok_or_else(|| std::io::Error::other("document ID missing"))?;
         shared::wait_until("metadata registry visibility", shared::WAIT_CAP, Duration::from_millis(100), || async {
@@ -78,8 +78,16 @@ async fn native_clients() -> TestResult<()> {
                 permission: aruna_core::structs::identity::auth::Permission::READ,
             },
         ])?;
-        let repository: serde_json::Value = client.post(format!("{base}/api/v1/metadata/{id}/git")).bearer_auth(&token)
-            .json(&serde_json::json!({"bucket":bucket,"arc":true})).send().await?.error_for_status()?.json().await?;
+        shared::wait_until("automatic ARC repository", shared::WAIT_CAP, Duration::from_millis(100), || async {
+            matches!(seed.context.storage_handle.send_storage_effect(StorageEffect::Read {
+                key_space: aruna_core::git::STATUS.into(), key: id.parse::<ulid::Ulid>().expect("document ID").to_bytes().to_vec().into(), txn_id: None,
+            }).await, Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }))
+        }).await?;
+        assert!(directory.path().join("git").join(format!("{id}.git/refs/heads/main")).is_file(), "automatic ARC snapshot did not publish main");
+        let repository: serde_json::Value = client.get(format!("{base}/api/v1/metadata/{id}/git")).bearer_auth(&token)
+            .send().await?.error_for_status()?.json().await?;
+        assert!(repository["error"].is_null(), "ARC conversion failed");
+        let bucket = repository["bucket"].as_str().ok_or_else(|| std::io::Error::other("automatic LFS bucket missing"))?;
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("workspace root");
         let mut child = Command::new(python).arg(root.join("scripts/arc-native/test_native.py"))
             .env("ARUNA_GIT_URL", repository["clone_url"].as_str().ok_or_else(|| std::io::Error::other("Git URL missing"))?)

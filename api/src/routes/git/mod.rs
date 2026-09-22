@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod lfs;
+mod snapshot;
 mod transport;
 
 use crate::auth::{map_authorize_error, require_realm_auth};
@@ -25,6 +26,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
         .routes(routes!(create_repository))
+        .routes(routes!(snapshot::repository_status))
+        .routes(routes!(snapshot::export_revision))
         .routes(routes!(transport::advertise))
         .routes(routes!(transport::rpc))
         .routes(routes!(lfs::batch))
@@ -89,8 +92,12 @@ async fn base_url(state: &ServerState, id: Ulid) -> ServerResult<String> {
 #[serde(deny_unknown_fields)]
 pub struct CreateRepository {
     pub bucket: String,
-    #[serde(default)]
+    #[serde(default = "arc_enabled")]
     pub arc: bool,
+}
+
+fn arc_enabled() -> bool {
+    true
 }
 
 #[derive(Serialize, ToSchema)]
@@ -103,8 +110,8 @@ pub struct RepositoryResponse {
 
 #[utoipa::path(post, path = "/metadata/{document_id}/git", tag = "metadata/git",
     security(("bearer_auth" = [])),
-    summary = "Enable native Git and LFS for a crate",
-    description = "Requires authenticated WRITE on the metadata document and a same-group node-local bucket. The immutable binding survives restart. ARC mode checks repository structure, not full scientific conformance.",
+    summary = "Bind an ARC repository to an explicit LFS bucket",
+    description = "Requires document and same-group bucket WRITE. Automatic repositories already have a binding; it cannot be replaced. ARC validation cannot be disabled. Normal clients discover the automatic repository with GET on this route.",
     params(("document_id" = String, Path, description = "Existing crate document ID")),
     request_body = CreateRepository,
     responses((status = 200, description = "Repository enabled", body = RepositoryResponse),
