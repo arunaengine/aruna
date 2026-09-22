@@ -21,6 +21,9 @@ pub enum SourceConnectorKind {
     /// A directory the owner offers from their own device. It resolves only on
     /// that device, against a registration the device stores locally.
     LocalDirectory,
+    /// A file of an Invenio record read through a repository connector. It is
+    /// only created by reference imports, never registered as a source connector.
+    Invenio,
 }
 
 impl SourceConnectorKind {
@@ -32,6 +35,7 @@ impl SourceConnectorKind {
             Self::Ftp => "ftp",
             Self::ArunaNative => "aruna_native",
             Self::LocalDirectory => "local_directory",
+            Self::Invenio => "invenio",
         }
     }
 }

@@ -8,8 +8,10 @@ use std::path::{Component, Path};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::SourceResolutionError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::invenio::REFERENCE_GROUP;
 use aruna_core::keyspaces::OFFERED_DIRECTORY_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
@@ -26,6 +28,7 @@ use crate::connectors::repository::{
     StorageReadError, parse_connector_read, parse_secret_read, read_connector_effect,
     read_secret_effect,
 };
+use crate::harvest::create_connector::INVENIO_TOKEN;
 
 pub(crate) const NATIVE_RELATIONSHIP_ID: &str = "relationship_id";
 pub(crate) const ORIGIN_NODE_ID: &str = "origin_node_id";
@@ -57,6 +60,8 @@ enum ResolveBindingState {
     Init,
     ReadSecret,
     ReadOfferedDirectory,
+    ReadRepository,
+    ReadRepositorySecret,
     Finish,
     Error,
 }
@@ -195,6 +200,15 @@ impl ResolveBindingOperation {
             return smallvec![effect];
         }
 
+        if self.input.source.descriptor.kind == SourceConnectorKind::Invenio {
+            let effect = match repository_read_effect(&self.input.source) {
+                Ok(effect) => effect,
+                Err(error) => return self.emit_error(error),
+            };
+            self.state = ResolveBindingState::ReadRepository;
+            return smallvec![effect];
+        }
+
         let effect = match binding_secret_effect(&self.input.source, None) {
             Ok(effect) => effect,
             Err(error) => return self.emit_error(error),
@@ -213,6 +227,51 @@ impl ResolveBindingOperation {
         self.state = ResolveBindingState::Finish;
         self.output = Some(Ok(access));
         smallvec![]
+    }
+
+    /// The token is used only while the connector still points at the bound endpoint,
+    /// so a connector moved to another host never sends its new token to the old one.
+    fn handle_repository_read(&mut self, event: Event) -> Effects {
+        let connector = match crate::harvest::repository::parse_connector_read(event) {
+            Ok(connector) => connector,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let bound = self.input.source.descriptor.public_config.get("endpoint");
+        match (connector, self.input.source.connector_id) {
+            (Some(connector), Some(connector_id))
+                if connector.kind == RepositoryConnectorKind::Invenio
+                    && bound.is_some_and(|bound| same_endpoint(bound, &connector.endpoint)) =>
+            {
+                self.state = ResolveBindingState::ReadRepositorySecret;
+                smallvec![crate::harvest::repository::read_secret_effect(
+                    connector_id,
+                    None
+                )]
+            }
+            _ => self.finish_repository(None),
+        }
+    }
+
+    fn handle_repository_secret(&mut self, event: Event) -> Effects {
+        match crate::harvest::repository::parse_secret_read(event) {
+            Ok(secret) => self.finish_repository(secret.map(|secret| secret.secret_config)),
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn finish_repository(&mut self, secret: Option<HashMap<String, String>>) -> Effects {
+        let secret = secret.map(|mut secret| {
+            secret.retain(|key, _| key == INVENIO_TOKEN);
+            secret
+        });
+        match build_binding_access(&self.input.source, secret) {
+            Ok(access) => {
+                self.state = ResolveBindingState::Finish;
+                self.output = Some(Ok(access));
+                smallvec![]
+            }
+            Err(error) => self.emit_error(error),
+        }
     }
 
     fn handle_offered_read(&mut self, event: Event) -> Effects {
@@ -281,6 +340,8 @@ impl Operation for ResolveBindingOperation {
             ResolveBindingState::Init => self.handle_init(),
             ResolveBindingState::ReadSecret => self.handle_secret_read(event),
             ResolveBindingState::ReadOfferedDirectory => self.handle_offered_read(event),
+            ResolveBindingState::ReadRepository => self.handle_repository_read(event),
+            ResolveBindingState::ReadRepositorySecret => self.handle_repository_secret(event),
             ResolveBindingState::Finish => smallvec![],
             ResolveBindingState::Error => self.abort(),
         }
@@ -523,6 +584,31 @@ fn source_binding_version(
     }
 
     Ok(Some(selector.to_string()))
+}
+
+fn repository_read_effect(source: &VersionSourceBinding) -> Result<Effect, SourceResolutionError> {
+    let (Some(connector_id), Some(group_id)) = (
+        source.connector_id,
+        source
+            .descriptor
+            .public_config
+            .get(REFERENCE_GROUP)
+            .and_then(|group| Ulid::from_string(group).ok()),
+    ) else {
+        return Err(SourceResolutionError::ResolveFailed);
+    };
+    if source.strategy != StagingStrategy::Reference {
+        return Err(SourceResolutionError::ResolveFailed);
+    }
+    Ok(crate::harvest::repository::read_connector_effect(
+        group_id,
+        connector_id,
+        None,
+    ))
+}
+
+fn same_endpoint(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
 pub(crate) fn binding_secret_effect(
@@ -996,5 +1082,71 @@ mod tests {
             ),
             Err(SourceResolutionError::NotFound)
         );
+    }
+
+    #[tokio::test]
+    async fn invenio_token_bound() {
+        use crate::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
+        use crate::harvest::update_connector::{UpdateConnectorInput, UpdateRepositoryOperation};
+        let (_dir, context) = crate::harvest::update_connector::tests::context();
+        let group_id = Ulid::generate();
+        let connector = drive(
+            CreateConnectorOperation::new(CreateConnectorInput {
+                group_id,
+                created_by: Default::default(),
+                name: "zenodo".into(),
+                kind: RepositoryConnectorKind::Invenio,
+                endpoint: "https://zenodo.org/api/".into(),
+                public_config: HashMap::new(),
+                secret_config: HashMap::from([("token".into(), "old".into())]),
+            }),
+            &context,
+        )
+        .await
+        .unwrap()
+        .connector;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
+                kind: SourceConnectorKind::Invenio,
+                public_config: HashMap::from([
+                    ("endpoint".into(), "https://zenodo.org/api/".into()),
+                    (REFERENCE_GROUP.into(), group_id.to_string()),
+                ]),
+                source_path: "content".into(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(connector.connector_id),
+        };
+        let token = |access: ResolvedSourceAccess| {
+            let ResolvedSourceAccess::OpenDal { config, .. } = access;
+            config.get("token").cloned()
+        };
+        let resolve = || {
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source: source.clone(),
+            })
+        };
+        let bound = drive(resolve(), &context).await.unwrap();
+        assert_eq!(token(bound).as_deref(), Some("old"));
+
+        drive(
+            UpdateRepositoryOperation::new(UpdateConnectorInput {
+                group_id,
+                connector_id: connector.connector_id,
+                name: "moved".into(),
+                kind: RepositoryConnectorKind::Invenio,
+                endpoint: "https://other.example/api/".into(),
+                public_config: HashMap::new(),
+                secret_config: Some(HashMap::from([("token".into(), "new".into())])),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let moved = drive(resolve(), &context).await.unwrap();
+        assert_eq!(token(moved), None);
     }
 }

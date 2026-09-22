@@ -12,6 +12,11 @@ pub use credential::InvenioCredential;
 mod projection;
 pub use projection::normalize_metadata;
 
+/// Reference binding config keys: the file a reference reads and the group of its connector.
+pub const REFERENCE_RECORD: &str = "record_id";
+pub const REFERENCE_FILE: &str = "file_key";
+pub const REFERENCE_GROUP: &str = "group_id";
+
 const NATIVE_METADATA: &str = "https://w3id.org/aruna/invenio/metadata";
 const CUSTOM_FIELDS: &str = "https://w3id.org/aruna/invenio/customFields";
 const PUBLICATION_DATE: &str = "https://w3id.org/aruna/invenio/publicationDate";

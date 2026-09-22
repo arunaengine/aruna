@@ -85,6 +85,8 @@ pub enum ApiConnectorKind {
     /// A directory offered by a device, registered there and never here;
     /// readable on stored records only.
     LocalDirectory,
+    /// Invenio files are read through repository connectors; rejected on registration.
+    Invenio,
 }
 
 impl From<ApiConnectorKind> for SourceConnectorKind {
@@ -96,6 +98,7 @@ impl From<ApiConnectorKind> for SourceConnectorKind {
             ApiConnectorKind::Ftp => SourceConnectorKind::Ftp,
             ApiConnectorKind::ArunaNative => SourceConnectorKind::ArunaNative,
             ApiConnectorKind::LocalDirectory => SourceConnectorKind::LocalDirectory,
+            ApiConnectorKind::Invenio => SourceConnectorKind::Invenio,
         }
     }
 }
@@ -109,6 +112,7 @@ impl From<SourceConnectorKind> for ApiConnectorKind {
             SourceConnectorKind::Ftp => ApiConnectorKind::Ftp,
             SourceConnectorKind::ArunaNative => ApiConnectorKind::ArunaNative,
             SourceConnectorKind::LocalDirectory => ApiConnectorKind::LocalDirectory,
+            SourceConnectorKind::Invenio => ApiConnectorKind::Invenio,
         }
     }
 }

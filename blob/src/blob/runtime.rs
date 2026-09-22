@@ -386,6 +386,10 @@ impl BlobHandle {
         self.handler.egress.request(url)
     }
 
+    pub(crate) fn egress(&self) -> &crate::egress::EgressGuard {
+        &self.handler.egress
+    }
+
     pub fn repository_request(
         &self,
         method: reqwest::Method,

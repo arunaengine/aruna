@@ -5,13 +5,17 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use aruna_core::errors::StagingSourceError;
+use aruna_core::invenio::{REFERENCE_FILE, REFERENCE_RECORD};
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use bytes::Bytes;
 use reqwest::{Method, Response, Url};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::blob::BlobHandle;
+use crate::egress::EgressGuard;
 
 const REDIRECT_HOPS: usize = 5;
 const JSON_ACCEPT: &str = "application/vnd.inveniordm.v1+json, application/json;q=0.9";
@@ -37,7 +41,7 @@ pub enum InvenioError {
 }
 
 pub struct InvenioClient<'a> {
-    blob: &'a BlobHandle,
+    egress: &'a EgressGuard,
     endpoint: Url,
     token: Option<String>,
     metadata_limit: u64,
@@ -46,6 +50,15 @@ pub struct InvenioClient<'a> {
 impl<'a> InvenioClient<'a> {
     pub fn new(
         blob: &'a BlobHandle,
+        endpoint: &str,
+        token: Option<String>,
+        metadata_limit: u64,
+    ) -> Result<Self, InvenioError> {
+        Self::with_guard(blob.egress(), endpoint, token, metadata_limit)
+    }
+
+    fn with_guard(
+        egress: &'a EgressGuard,
         endpoint: &str,
         token: Option<String>,
         metadata_limit: u64,
@@ -66,7 +79,7 @@ impl<'a> InvenioClient<'a> {
         let path = format!("{}/", endpoint.path().trim_end_matches('/'));
         endpoint.set_path(&path);
         Ok(Self {
-            blob,
+            egress,
             endpoint,
             token,
             metadata_limit,
@@ -106,7 +119,7 @@ impl<'a> InvenioClient<'a> {
     fn request(&self, method: Method, url: Url) -> Result<reqwest::RequestBuilder, InvenioError> {
         self.link(url.as_str())?;
         let mut request = self
-            .blob
+            .egress
             .repository_request(method, url)
             .map_err(|_| InvenioError::Egress)?;
         if let Some(token) = &self.token {
@@ -173,7 +186,7 @@ impl<'a> InvenioClient<'a> {
     }
 
     pub async fn download(&self, url: Url) -> Result<Response, InvenioError> {
-        self.content(Method::GET, url, None).await
+        self.content(Method::GET, url, None, None).await
     }
 
     /// Follows storage redirects for file content only and screens every hop.
@@ -183,18 +196,23 @@ impl<'a> InvenioClient<'a> {
         method: Method,
         url: Url,
         timeout: Option<Duration>,
+        range: Option<&std::ops::Range<u64>>,
     ) -> Result<Response, InvenioError> {
         let mut url = self.link(url.as_str())?;
         let mut authorized = true;
         for _ in 0..=REDIRECT_HOPS {
             authorized &= url.origin() == self.endpoint.origin();
             let mut request = self
-                .blob
+                .egress
                 .repository_request(method.clone(), url.clone())
                 .map_err(|_| InvenioError::Egress)?
                 .header("Accept", "*/*");
             if let Some(timeout) = timeout {
                 request = request.timeout(timeout);
+            }
+            if let Some(range) = range {
+                let last = range.end.saturating_sub(1);
+                request = request.header("Range", format!("bytes={}-{last}", range.start));
             }
             if let Some(token) = self.token.as_ref().filter(|_| authorized) {
                 request = request.bearer_auth(token);
@@ -227,7 +245,7 @@ impl<'a> InvenioClient<'a> {
         url: Url,
     ) -> Result<aruna_core::structs::execution::source_access::SourceMetadata, InvenioError> {
         let response = self
-            .content(Method::HEAD, url, Some(Duration::from_secs(120)))
+            .content(Method::HEAD, url, Some(Duration::from_secs(120)), None)
             .await?;
         let headers = response.headers();
         let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
@@ -262,6 +280,71 @@ impl<'a> InvenioClient<'a> {
             .await
             .map_err(|_| InvenioError::Transport)?;
         check_status(&response)
+    }
+}
+
+/// Reads a referenced record file with the connector token, following screened storage redirects.
+pub(crate) async fn head_reference(
+    guard: &EgressGuard,
+    access: &ResolvedSourceAccess,
+) -> Result<SourceMetadata, StagingSourceError> {
+    let (client, url) = reference_client(guard, access)?;
+    client.head(url).await.map_err(reference_error)
+}
+
+pub(crate) async fn read_reference(
+    guard: &EgressGuard,
+    access: &ResolvedSourceAccess,
+    range: Option<std::ops::Range<u64>>,
+) -> Result<(SourceMetadata, BackendStream<Result<Bytes, StreamError>>), StagingSourceError> {
+    let (client, url) = reference_client(guard, access)?;
+    let metadata = client.head(url.clone()).await.map_err(reference_error)?;
+    if range.as_ref().is_some_and(|range| range.start >= range.end) {
+        return Err(StagingSourceError::ReadError("empty range".into()));
+    }
+    let response = client
+        .content(Method::GET, url, None, range.as_ref())
+        .await
+        .map_err(reference_error)?;
+    // A server that ignores the range would return the whole file at the wrong offset.
+    if range.is_some() && response.status().as_u16() != 206 {
+        return Err(StagingSourceError::ReadError(
+            "repository ignored the byte range".into(),
+        ));
+    }
+    Ok((metadata, BackendStream::new(response.bytes_stream())))
+}
+
+fn reference_client<'a>(
+    guard: &'a EgressGuard,
+    access: &ResolvedSourceAccess,
+) -> Result<(InvenioClient<'a>, Url), StagingSourceError> {
+    let ResolvedSourceAccess::OpenDal { config, .. } = access;
+    let value = |key: &str| {
+        config
+            .get(key)
+            .ok_or_else(|| StagingSourceError::OperatorCreationFailed(format!("missing {key}")))
+    };
+    let client =
+        InvenioClient::with_guard(guard, value("endpoint")?, config.get("token").cloned(), 0)
+            .map_err(|error| StagingSourceError::OperatorCreationFailed(error.to_string()))?;
+    let url = client
+        .url(&[
+            "records",
+            value(REFERENCE_RECORD)?,
+            "files",
+            value(REFERENCE_FILE)?,
+            "content",
+        ])
+        .map_err(|error| StagingSourceError::OperatorCreationFailed(error.to_string()))?;
+    Ok((client, url))
+}
+
+fn reference_error(error: InvenioError) -> StagingSourceError {
+    match error {
+        InvenioError::Status(404 | 410) => StagingSourceError::NotFound,
+        InvenioError::Status(401 | 403) => StagingSourceError::AccessDenied,
+        error => StagingSourceError::ReadError(error.to_string()),
     }
 }
 
