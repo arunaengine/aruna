@@ -30,14 +30,20 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct InvenioSearch {
+    /// Group that owns the repository connector.
     pub group_id: String,
+    /// HTTP connector configured with the repository API root.
     pub connector_id: String,
+    /// Native repository query; an empty query lists records.
     #[serde(default)]
     pub q: String,
+    /// Page number starting at 1.
     #[serde(default = "first_page")]
     pub page: u32,
+    /// Number of results, from 1 through 25.
     #[serde(default = "page_size")]
     pub size: u8,
+    /// Include older published versions.
     #[serde(default)]
     pub all_versions: bool,
 }
@@ -71,7 +77,10 @@ Page starts at 1; size is 1 to 25 and query text is at most 4096 bytes. Reposito
 Invalid queries return 400; denied access returns 403; repository availability failures return 503."#,
     params(InvenioSearch),
     responses(
-        (status = 200, description = "Native repository search page", body = serde_json::Value),
+        (status = 200, description = "Native repository search page", body = serde_json::Value, example = json!({
+            "hits": {"total": 1, "hits": [{"id": "1234567", "metadata": {"title": "Example dataset", "publication_date": "2026-09-22", "resource_type": {"id": "dataset"}, "creators": [{"person_or_org": {"type": "personal", "family_name": "Researcher"}}]}}]},
+            "links": {"next": null}
+        })),
         (status = 400, description = "Invalid query or repository response", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Connector access denied", body = ErrorResponse),
@@ -209,7 +218,12 @@ The returned job exposes progress, cancellation and failure details. Copy import
         "metadata": {"group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "path": "datasets/zenodo", "public": false}
     })),
     responses(
-        (status = 202, description = "Transfer accepted", body = SubmitImportResponse),
+        (status = 202, description = "Transfer accepted", body = SubmitImportResponse, example = json!({
+            "job_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX", "created": true,
+            "owner_node_url": "https://node.example/api/v1",
+            "status_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            "report_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/report"
+        })),
         (status = 400, description = "Invalid transfer request", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Connector or destination access denied", body = ErrorResponse),
@@ -269,7 +283,13 @@ Incomplete files, conflicting revisions or rejected metadata fail the job. An am
         "access_token": "<personal-access-token>", "publish": false
     }})),
     responses(
-        (status = 202, description = "Transfer accepted", body = SubmitExportResponse),
+        (status = 202, description = "Transfer accepted", body = SubmitExportResponse, example = json!({
+            "job_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX", "created": true,
+            "owner_node_url": "https://node.example/api/v1",
+            "status_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            "report_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/report",
+            "artifact_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/artifacts/rocrate"
+        })),
         (status = 400, description = "Missing personal repository token, invalid metadata or draft identifier", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Crate or connector access denied", body = ErrorResponse),
