@@ -1594,6 +1594,19 @@ async fn process_materialization_job(
     match apply_result {
         Ok(materialized) => {
             let raw_revision = materialized.raw_revision;
+            if let Err(error) =
+                crate::git::snapshot::capture(context, &event.record, raw_revision.as_ref()).await
+            {
+                return Ok(ProcessedMaterializationJob::deferred(
+                    defer_materialization_job(
+                        &job_key,
+                        &job,
+                        &event,
+                        &MetadataMaterializationError::UnexpectedEvent(error.to_string()),
+                    ),
+                    craqle_elapsed,
+                ));
+            }
             let iri_index_writes = match project_materialized_iris(context, &event).await {
                 Ok(writes) => writes,
                 Err(error) => {

@@ -5,6 +5,7 @@
 pub mod hook;
 pub mod lfs;
 mod records;
+pub mod snapshot;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -94,6 +95,9 @@ pub async fn create(
     arc: bool,
 ) -> Result<GitRepository, GitError> {
     let document = document(context, auth, id, Permission::WRITE).await?;
+    if !arc {
+        return Err(GitError::Invalid);
+    }
     authorize(
         context,
         auth.realm_id,

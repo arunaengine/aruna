@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: MIT or Apache-2.0
 
 import base64
-import copy
 import importlib.metadata
 import json
 import resource
@@ -14,6 +13,9 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
 from arctrl import ARC
+# ARCtrl 3.2.1 exposes graph JSON decoding through this generated extension name.
+from arctrl.py.JsonIO.ldobject import ARCtrl_ROCrate_LDGraph__LDGraph_fromROCrateJsonString_Static_Z721C83C5 as read_graph
+from arctrl.py.ROCrate.LDTypes.dataset import LDDataset
 from openpyxl import load_workbook
 
 LIMIT = 64 * 1024 * 1024
@@ -31,33 +33,62 @@ def remap(value, before):
     if isinstance(value, list):
         return [remap(item, before) for item in value]
     if isinstance(value, dict):
+        if "@value" in value:
+            return value
         return {key: "./" if key == "@id" and item == before else remap(item, before)
                 for key, item in value.items()}
     return value
 
 
+def adapt(value):
+    if isinstance(value, list):
+        return [adapt(item) for item in value]
+    if not isinstance(value, dict) or "@value" in value:
+        return value
+    result = {}
+    for key, item in value.items():
+        if key == "@context":
+            entries = item if isinstance(item, list) else [item]
+            # ARCtrl searches arrays from the front; JSON-LD gives later contexts precedence.
+            result[key] = ["https://w3id.org/ro/crate/1.2/context"
+                           if entry == "https://w3id.org/ro/crate/1.3/context" else adapt(entry)
+                           for entry in reversed(entries)]
+        else:
+            result[key] = adapt(item)
+    return result
+
+
 def prepare(source, identifier):
-    document = json.loads(source)
-    graph = document.get("@graph")
-    if not isinstance(graph, list):
+    document = adapt(json.loads(source))
+    if not isinstance(document.get("@graph"), list):
         raise ValueError("RO-Crate @graph is required")
-    descriptors = [item for item in graph if item.get("@id") == "ro-crate-metadata.json"]
-    if len(descriptors) != 1:
-        raise ValueError("one RO-Crate metadata descriptor is required")
-    root_id = descriptors[0].get("about", {}).get("@id")
-    roots = [item for item in graph if item.get("@id") == root_id]
-    if len(roots) != 1 or not root_id:
+    graph = read_graph(json.dumps(document))
+    context = graph.TryGetContext()
+    descriptor = graph.TryGetNode("ro-crate-metadata.json")
+    if descriptor is None:
+        raise ValueError("RO-Crate metadata descriptor is required")
+    root = descriptor.TryGetPropertyAsSingleNode("http://schema.org/about", graph, context)
+    if root is None:
         raise ValueError("one RO-Crate root Dataset is required")
-    document = remap(copy.deepcopy(document), root_id)
-    root = next(item for item in document["@graph"] if item.get("@id") == "./")
-    for field in ("name", "description"):
-        if not isinstance(root.get(field), str) or not root[field].strip():
-            raise ValueError("ISA investigation requires a textual " + field)
-    root.setdefault("identifier", identifier)
-    root.setdefault("additionalType", "Investigation")
-    template = ARC(identifier, title=root["name"], description=root["description"])
-    document["@context"] = json.loads(template.ToROCrateJsonString())["@context"]
-    return ARC.from_rocrate_json_string(json.dumps(document))
+    if not LDDataset.try_get_identifier_as_string(root, context):
+        entity = next(item for item in document["@graph"] if item.get("@id") == root.Id)
+        entity["http://schema.org/identifier"] = identifier
+    document = remap(document, root.Id)
+    arc = ARC.from_rocrate_json_string(json.dumps(document))
+    if not all(isinstance(value, str) and value.strip() for value in [arc.Title, arc.Description]):
+        raise ValueError("ISA investigation requires a textual name and description")
+    licenses = root.GetPropertyValues("http://schema.org/license", context=context)
+    if len(licenses) > 1:
+        raise ValueError("multiple licenses require an explicit ARC license document")
+    license_value = licenses[0] if licenses else None
+    if license_value is not None and (arc.License is None or not arc.License.Content):
+        content = license_value if isinstance(license_value, str) else getattr(license_value, "Id", None)
+        if not isinstance(content, str) or not content:
+            raise ValueError("RO-Crate license cannot be represented")
+        arc.SetLicenseFulltext(content)
+    if arc.License is not None:
+        arc.License.Path = "LICENSE"
+    return arc
 
 
 def workbook(path):
@@ -162,6 +193,12 @@ def inspect(root, require_data=True):
             if identifier not in assays or not (root / "assays" / identifier / "isa.assay.xlsx").is_file():
                 raise ValueError("registered ISA assay is missing")
     document = json.loads(arc.ToROCrateJsonString())
+    if arc.License is not None:
+        content = arc.License.Content.strip()
+        url = urlsplit(content)
+        if url.scheme in ("http", "https") and url.netloc and not any(char.isspace() for char in content):
+            root_entity = next(item for item in document["@graph"] if item.get("@id") == "./")
+            root_entity["license"] = {"@id": content}
     if require_data and any(not (root / path).is_file() for path in data_paths(document)):
         raise ValueError("referenced ARC data is missing")
     return document

@@ -28,6 +28,8 @@ pub async fn validate() -> std::io::Result<()> {
         let parts: Vec<_> = update.split_whitespace().collect();
         if parts.len() != 3
             || !(parts[2].starts_with("refs/heads/") || parts[2].starts_with("refs/tags/"))
+            || parts[2] == "refs/heads/aruna"
+            || parts[2].starts_with("refs/heads/aruna/")
         {
             return Err(invalid());
         }
@@ -118,6 +120,10 @@ pub async fn validate() -> std::io::Result<()> {
             }
         }
         if arc {
+            let converted = aruna_blob::arc::export(directory, &revision).await?;
+            if converted.get("error").is_some() || converted.get("rocrate").is_none() {
+                return Err(invalid());
+            }
             if !paths.contains("isa.investigation.xlsx") {
                 return Err(invalid());
             }

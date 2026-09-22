@@ -48,7 +48,62 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(root["name"], "Supplied title")
         self.assertEqual(root["description"], "Supplied description")
         self.assertEqual(root["identifier"], "original-identifier")
+        self.assertEqual(root["datePublished"], "2026-09-22")
         self.assertEqual(root["additionalType"], "Investigation")
+
+    def test_license_preserved(self):
+        uri = "https://creativecommons.org/licenses/by/4.0/"
+        for license in [uri, {"@id": uri}]:
+            document = source()
+            document["@graph"][1]["license"] = license
+            with self.subTest(license=license):
+                result = conversion.convert({"mode": "generate", "document_id": "document-id", "jsonld": json.dumps(document)})
+                self.assertEqual(base64.b64decode(result["files"]["LICENSE"]).decode().strip(), uri)
+                restored = conversion.convert({"mode": "inspect", "files": result["files"]})
+                root = next(item for item in restored["rocrate"]["@graph"] if item.get("@id") == "./")
+                self.assertEqual(root["license"], {"@id": uri})
+
+    def test_license_ambiguity(self):
+        document = source()
+        document["@graph"][1]["license"] = [{"@id": "https://example.org/license-a"}, {"@id": "https://example.org/license-b"}]
+        with self.assertRaisesRegex(ValueError, "multiple licenses"):
+            conversion.convert({"mode": "generate", "document_id": "document-id", "jsonld": json.dumps(document)})
+
+    def test_context_aliases(self):
+        document = source()
+        document["@context"] = [document["@context"], {
+            "name": "https://example.org/foreignName", "title": "http://schema.org/name",
+            "about": "https://example.org/foreignAbout", "root": "http://schema.org/about",
+        }]
+        descriptor, dataset = document["@graph"][:2]
+        descriptor["root"] = descriptor["about"]
+        descriptor["about"] = {"@id": "#context"}
+        dataset["title"] = dataset["name"]
+        dataset["name"] = "Foreign property, not the title"
+        original = json.dumps(document)
+        result = conversion.convert({"mode": "generate", "document_id": "document-id", "jsonld": original})
+        restored = conversion.convert({"mode": "inspect", "files": result["files"]})
+        root = next(item for item in restored["rocrate"]["@graph"] if item.get("@id") == "./")
+        self.assertEqual(root["name"], "Supplied title")
+        self.assertEqual(base64.b64decode(result["files"]["aruna-metadata.json"]).decode(), original)
+
+    def test_scoped_context(self):
+        document = source()
+        document["@graph"][1]["@context"] = [
+            {"name": "https://example.org/foreign", "title": "http://schema.org/name"},
+            {"name": "http://schema.org/name", "title": "https://example.org/foreign"},
+        ]
+        document["@graph"][1]["title"] = "Foreign value"
+        result = conversion.convert({"mode": "generate", "document_id": "document-id", "jsonld": json.dumps(document)})
+        restored = conversion.convert({"mode": "inspect", "files": result["files"]})
+        root = next(item for item in restored["rocrate"]["@graph"] if item.get("@id") == "./")
+        self.assertEqual(root["name"], "Supplied title")
+
+    def test_literal_preserved(self):
+        value = {"@id": "urn:root", "data": {"@value": {"@id": "urn:root"}, "@type": "@json"}}
+        mapped = conversion.remap(value, "urn:root")
+        self.assertEqual(mapped["@id"], "./")
+        self.assertEqual(mapped["data"], value["data"])
 
     def test_rich_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
