@@ -2,21 +2,36 @@
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
+import datetime
 import hashlib
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "arc-bridge"))
 from arc import scaffold
-from test_live import command, commit
 import boto3
 from botocore.config import Config
+
+
+def command(directory, env, *args, success=True):
+    result = subprocess.run(["git", "-c", "credential.helper=", "-C", str(directory), *args],
+                            env=env, capture_output=True, timeout=180)
+    if (result.returncode == 0) != success:
+        raise AssertionError(f"Git {args[0]} returned {result.returncode}: {result.stderr.decode()}")
+    return result.stdout
+
+
+def commit(directory, env, subject):
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    env = dict(env, GIT_AUTHOR_DATE=timestamp, GIT_COMMITTER_DATE=timestamp)
+    command(directory, env, "diff", "--cached", "--check")
+    command(directory, env, "diff", "--cached", "--")
+    command(directory, env, "commit", "-S", "-m", subject)
+    return command(directory, env, "rev-parse", "HEAD").decode().strip()
 
 
 def http(url, method="GET", body=None, token=None):

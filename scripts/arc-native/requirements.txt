@@ -1,3 +1,2 @@
-aiohttp==3.14.3
 arctrl==3.2.1
 boto3==1.43.99
