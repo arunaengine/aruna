@@ -937,6 +937,9 @@ fn map_finalize_error(error: BootstrapFinalizeError) -> ServerError {
             "storage cleanup capacity exhausted; retry".to_string(),
         ),
         BootstrapFinalizeError::Consume(error) => map_consume_error(error),
+        BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::DeletionPending) => {
+            ServerError::Conflict("group deletion is pending; retry enrollment".into())
+        }
         BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::NodeKindMismatch {
             ..
         }) => ServerError::BadRequest,
