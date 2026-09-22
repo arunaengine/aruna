@@ -282,12 +282,6 @@ pub struct StagingJobCheckpoint {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportRoCrateSource {
-    Invenio {
-        group_id: GroupId,
-        connector_id: Ulid,
-        record_id: String,
-        options: crate::invenio::InvenioOptions,
-    },
     Upload {
         upload_id: Ulid,
     },
@@ -300,6 +294,12 @@ pub enum ImportRoCrateSource {
         group_id: GroupId,
         connector_id: Ulid,
         path: String,
+    },
+    Invenio {
+        group_id: GroupId,
+        connector_id: Ulid,
+        record_id: String,
+        options: crate::invenio::InvenioOptions,
     },
 }
 
