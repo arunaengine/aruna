@@ -5,6 +5,7 @@
 #![allow(clippy::result_large_err)]
 #![recursion_limit = "256"]
 
+pub mod arc;
 mod autoindex;
 pub mod bao_tree;
 pub mod blob;
