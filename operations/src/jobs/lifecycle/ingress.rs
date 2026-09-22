@@ -630,6 +630,7 @@ fn admission_error(error: LifecycleError) -> SubmitJobError {
             SubmitJobError::JobPlanConflict { existing_job_id }
         }
         LifecycleError::QuotaDenied(reason) => SubmitJobError::QuotaDenied(reason),
+        LifecycleError::GroupWrite(error) => SubmitJobError::GroupWrite(error),
         error => SubmitJobError::PlacementUnavailable(error.to_string()),
     }
 }

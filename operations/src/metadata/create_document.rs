@@ -129,6 +129,8 @@ enum CreateDocumentState {
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateDocumentError {
     #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
     StorageError(#[from] aruna_core::errors::StorageError),
     #[error(transparent)]
     ConversionError(#[from] aruna_core::errors::ConversionError),
@@ -433,6 +435,7 @@ impl CreateDocumentOperation {
                     realm_target.storage_keyspace().to_string(),
                     realm_target.storage_key(),
                 ),
+                crate::groups::fence::group_fence_key(self.config.group_id),
             ],
             txn_id: Some(txn_id),
         })]
@@ -1026,12 +1029,24 @@ impl Operation for CreateDocumentOperation {
             },
             CreateDocumentState::ReadCreateFence => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, acceptance_value), (_, realm_config_value)] = values.as_slice() else {
+                    let [
+                        (_, acceptance_value),
+                        (_, realm_config_value),
+                        (_, group_fence),
+                    ] = values.as_slice()
+                    else {
                         return self.unexpected_event(
                             "metadata create fence read",
                             format!("batch read with {} values", values.len()),
                         );
                     };
+                    if let Err(error) =
+                        aruna_core::structs::identity::group_delete::check_group_write(
+                            group_fence.as_deref(),
+                        )
+                    {
+                        return self.fail(error.into());
+                    }
                     self.apply_create_fence(acceptance_value.clone(), realm_config_value.clone())
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -1256,6 +1271,7 @@ mod tests {
                             .into()
                     }),
                 ),
+                (vec![2].into(), None),
             ],
         })
     }
@@ -1287,9 +1303,10 @@ mod tests {
         else {
             panic!("expected create fence read");
         };
-        assert_eq!(reads.len(), 2);
+        assert_eq!(reads.len(), 3);
         assert_eq!(reads[0].0, CREATE_ACCEPTANCE_KEYSPACE);
         assert_eq!(reads[1].0, REALM_CONFIG_KEYSPACE);
+        assert_eq!(reads[2].0, aruna_core::keyspaces::GROUP_DELETE_KEYSPACE);
     }
 
     fn begin_transaction(operation: &mut CreateDocumentOperation, effects: &[Effect]) -> Effects {
@@ -1417,6 +1434,7 @@ mod tests {
                     Some(postcard::to_allocvec(&winner).unwrap().into()),
                 ),
                 (actor.realm_id.as_bytes().to_vec().into(), None),
+                (vec![2].into(), None),
             ],
         }));
         assert!(matches!(
@@ -1951,6 +1969,7 @@ mod tests {
                         values: vec![
                             (Key::from(vec![0u8]), None),
                             (Key::from(vec![1u8]), Some(realm_config.clone().into())),
+                            (Key::from(vec![2u8]), None),
                         ],
                     },
                     StorageEffect::BatchWrite { .. } => StorageEvent::BatchWriteResult {

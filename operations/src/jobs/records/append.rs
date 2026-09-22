@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -171,7 +171,7 @@ impl AppendRecordOperation {
 
     fn read_row(&mut self, txn_id: TxnId) -> Effects {
         self.state = AppendState::ReadRow { txn_id };
-        let reads = vec![
+        let mut reads = vec![
             (
                 FAMILY_RECORD_KEYSPACE.to_string(),
                 record_key(&self.envelope().key()),
@@ -181,6 +181,9 @@ impl AppendRecordOperation {
                 family_prefix(&self.family()),
             ),
         ];
+        if let JobFamilyRecord::Spec(spec) = &self.envelope().record {
+            reads.push(crate::groups::fence::group_fence_key(spec.group_id));
+        }
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
             txn_id: Some(txn_id),
@@ -511,6 +514,18 @@ impl Operation for AppendRecordOperation {
                         .and_then(|(key, value)| value.map(|value| (key, value)));
                     if let Some((_, Some(value))) = values.next() {
                         self.cache = ProjectionCache::decode(&value);
+                    }
+                    if matches!(self.envelope().record, JobFamilyRecord::Spec(_)) {
+                        let Some((_, value)) = values.next() else {
+                            return self.fail(RecordStoreError::EvidenceIncomplete);
+                        };
+                        if let Err(error) =
+                            aruna_core::structs::identity::group_delete::check_group_write(
+                                value.as_deref(),
+                            )
+                        {
+                            return self.fail(error.into());
+                        }
                     }
                     if let Err(error) = self.keep_records(row) {
                         return self.fail(error);

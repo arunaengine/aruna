@@ -203,11 +203,12 @@ impl AdmitSubmissionOperation {
             self.outcome = Some(Err(LifecycleError::NotHolder));
             return self.cancel(txn_id);
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: ADMISSION_QUOTA_KEYSPACE.to_string(),
-            key: Key::from(spec.group_id.to_bytes().as_slice()),
-            txn_id: Some(txn_id),
-        })]
+        smallvec![crate::groups::fence::read_group_record(
+            spec.group_id,
+            ADMISSION_QUOTA_KEYSPACE,
+            Key::from(spec.group_id.to_bytes().as_slice()),
+            txn_id,
+        )]
     }
 
     fn read_cache(&mut self, txn_id: TxnId, value: Option<Value>) -> Effects {
@@ -427,13 +428,12 @@ impl Operation for AdmitSubmissionOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("submission scan", format!("{other:?}")),
             },
-            AdmitState::ReadQuota { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.read_cache(txn_id, value)
+            AdmitState::ReadQuota { txn_id } => {
+                match crate::groups::fence::parse_group_record(event) {
+                    Ok(value) => self.read_cache(txn_id, value),
+                    Err(error) => self.fail(error.into()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("quota revision read", format!("{other:?}")),
-            },
+            }
             AdmitState::ReadCache { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.cache = value

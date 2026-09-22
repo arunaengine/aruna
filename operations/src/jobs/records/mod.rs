@@ -44,6 +44,8 @@ pub const MAX_CONFLICT_ROWS: usize = 32;
 #[derive(Debug, PartialEq, Error)]
 pub enum RecordStoreError {
     #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
