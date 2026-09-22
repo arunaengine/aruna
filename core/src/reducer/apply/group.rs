@@ -11,6 +11,26 @@ impl AdminDocumentState {
         group_id: &crate::types::GroupId,
     ) -> Result<AdminApplyStatus, AdminDocumentError> {
         match &event.op {
+            AdminDocumentOperation::GroupDeleted { certificate } => {
+                use crate::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
+                if certificate.plan.group_id != *group_id
+                    || certificate.plan.realm_id != event.actor.realm_id
+                    || certificate.plan.coordinator != event.origin_node_id
+                    || certificate.plan.requested_by != event.actor.user_id
+                    || !certificate.verify()
+                {
+                    return Err(AdminDocumentError::InvalidGroupDeletion);
+                }
+                let record = GroupDeleteRecord {
+                    plan: certificate.plan.clone(),
+                    phase: GroupDeletePhase::Deleted,
+                    deleted_by: Some(event.actor.user_id),
+                    event: None,
+                };
+                let value = serde_json::to_string(&record)
+                    .map_err(|_| AdminDocumentError::InvalidGroupDeletion)?;
+                self.apply_group_field(event, GROUP_DELETED_PATH, Some(value));
+            }
             AdminDocumentOperation::GroupCreated {
                 realm_id,
                 display_name,

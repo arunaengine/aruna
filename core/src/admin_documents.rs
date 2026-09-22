@@ -350,6 +350,9 @@ pub enum AdminDocumentOperation {
     GroupJoinDecided {
         decision: crate::join_request::JoinDecision,
     },
+    GroupDeleted {
+        certificate: Box<crate::structs::identity::group_delete::GroupDeleteCertificate>,
+    },
 }
 
 #[cfg(test)]

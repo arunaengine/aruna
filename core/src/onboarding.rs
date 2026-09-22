@@ -136,6 +136,7 @@ pub struct OnboardingTicketPayload {
     pub node_id: String,
     pub expires_at: u64,
     pub documents: Vec<DocumentTarget>,
+    pub group_deletions: Vec<crate::structs::identity::group_delete::GroupDeleteRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,11 +226,30 @@ impl OnboardingTicket {
         expires_at: u64,
         documents: Vec<DocumentTarget>,
     ) -> Result<Self, OnboardingSecretError> {
+        Self::issue_with_deletions(
+            signing_key,
+            realm_id,
+            node_id,
+            expires_at,
+            documents,
+            Vec::new(),
+        )
+    }
+
+    pub fn issue_with_deletions(
+        signing_key: &SigningKey,
+        realm_id: &RealmId,
+        node_id: NodeId,
+        expires_at: u64,
+        documents: Vec<DocumentTarget>,
+        group_deletions: Vec<crate::structs::identity::group_delete::GroupDeleteRecord>,
+    ) -> Result<Self, OnboardingSecretError> {
         let payload = OnboardingTicketPayload {
             realm_id: realm_id.to_string(),
             node_id: node_id.to_string(),
             expires_at,
             documents,
+            group_deletions,
         };
         let payload_bytes = postcard::to_allocvec(&payload)?;
         let signature = signing_key.sign(&payload_bytes).to_string();

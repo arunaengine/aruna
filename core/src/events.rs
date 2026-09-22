@@ -47,6 +47,9 @@ pub enum Event {
 
 #[derive(Debug, PartialEq)]
 pub enum SubOperationEvent {
+    GroupWritten {
+        result: Result<(), crate::structs::identity::group_delete::GroupWriteError>,
+    },
     DepthLimitExceeded {
         max_depth: usize,
     },

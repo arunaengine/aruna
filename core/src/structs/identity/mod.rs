@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod group;
+pub mod group_delete;
 pub mod realm;
 pub mod s3_session;
 pub mod user;

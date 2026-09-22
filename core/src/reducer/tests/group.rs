@@ -5,6 +5,52 @@
 use super::*;
 
 #[test]
+fn deletion_survives_replay() {
+    use crate::structs::identity::group_delete::{
+        GroupDeleteCertificate, GroupDeletePlan, GroupDeleteProof,
+    };
+    let created = create_group(1, 1, "Engineering", realm_id());
+    let mut state = group_state();
+    state.apply(&created).unwrap();
+    let origin = actor(node(1));
+    let plan = GroupDeletePlan {
+        request_id: Ulid::from_bytes([30; 16]),
+        group_id: group_id(),
+        realm_id: realm_id(),
+        owner: state.materialized_group_owner().unwrap(),
+        requested_by: origin.user_id,
+        coordinator: origin.node_id,
+        nodes: BTreeSet::from([origin.node_id]),
+    };
+    let proof = GroupDeleteProof {
+        node_id: origin.node_id,
+        signature: iroh::SecretKey::from_bytes(&[1; 32]).sign(&plan.signing_bytes().unwrap()),
+    };
+    let deleted = state
+        .apply_operation(
+            &origin,
+            AdminDocumentOperation::GroupDeleted {
+                certificate: Box::new(GroupDeleteCertificate {
+                    plan: plan.clone(),
+                    proofs: vec![proof],
+                }),
+            },
+        )
+        .unwrap();
+    assert!(state.group_deleted());
+    assert_eq!(state.apply(&deleted).unwrap(), AdminApplyStatus::Duplicate);
+    state
+        .apply(&create_group(2, 2, "Replayed", realm_id()))
+        .unwrap();
+    assert!(state.group_deleted());
+    assert_eq!(state.group_deletion().unwrap().plan, plan);
+    let mut reversed = group_state();
+    reversed.apply(&deleted).unwrap();
+    reversed.apply(&created).unwrap();
+    assert!(reversed.group_deleted());
+}
+
+#[test]
 fn group_policies_materialize() {
     let mut state = group_state();
     let policies = vec![crate::request_policy::RequestPolicy {

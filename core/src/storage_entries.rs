@@ -276,6 +276,36 @@ pub fn reducer_state_key(target: &AdminDocumentTarget) -> Key {
     admin_target_key(target)
 }
 
+pub fn group_deletion_entries(
+    record: &crate::structs::identity::group_delete::GroupDeleteRecord,
+    state: &AdminDocumentState,
+) -> Result<(Vec<(KeySpace, Key)>, Vec<(KeySpace, Key, Value)>), ConversionError> {
+    let group_id = record.plan.group_id;
+    let deletes = vec![
+        (
+            crate::keyspaces::GROUP_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+        ),
+        (
+            crate::keyspaces::AUTH_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+        ),
+        (
+            crate::keyspaces::OWNER_INDEX_KEYSPACE.to_string(),
+            crate::structs::identity::group::owner_group_key(record.plan.owner, group_id).into(),
+        ),
+    ];
+    let writes = vec![
+        reducer_state_entry(state)?,
+        (
+            crate::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+            record.to_bytes()?.into(),
+        ),
+    ];
+    Ok((deletes, writes))
+}
+
 pub fn reducer_conflict_prefix(target: &AdminDocumentTarget) -> Key {
     admin_target_key(target)
 }
