@@ -8,3 +8,4 @@ pub mod oai_pmh;
 pub mod read_connector;
 pub mod repository;
 pub mod target_path;
+pub mod update_connector;
