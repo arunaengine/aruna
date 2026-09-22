@@ -9,6 +9,8 @@ use ulid::Ulid;
 
 mod credential;
 pub use credential::InvenioCredential;
+mod projection;
+pub use projection::normalize_metadata;
 
 const NATIVE_METADATA: &str = "https://w3id.org/aruna/invenio/metadata";
 const CUSTOM_FIELDS: &str = "https://w3id.org/aruna/invenio/customFields";
@@ -437,6 +439,7 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
             metadata["related_identifiers"] = Value::Array(related);
         }
     }
+    normalize_metadata(&mut metadata, None);
     if let Some(overrides) = overrides.as_object() {
         for (key, value) in overrides {
             metadata[key] = value.clone();

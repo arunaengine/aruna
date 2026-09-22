@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::invenio::{
-    InvenioDestination, InvenioRecord, export_fields, record_id, validate_id,
+    InvenioDestination, InvenioRecord, export_fields, normalize_metadata, record_id, validate_id,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
@@ -531,22 +531,7 @@ fn verify_metadata(expected: &Value, record: &Value) -> Result<(), TransferError
 
 fn complete_metadata(expected: &Value, actual: &Value) -> bool {
     let mut actual = actual.clone();
-    for field in ["creators", "contributors"] {
-        if let (Some(expected), Some(actual)) =
-            (expected[field].as_array(), actual[field].as_array_mut())
-        {
-            for (expected, actual) in expected.iter().zip(actual) {
-                let expected = &expected["person_or_org"];
-                if expected["type"] == "personal"
-                    && expected["family_name"].is_string()
-                    && expected.get("name").is_none()
-                    && let Some(person) = actual["person_or_org"].as_object_mut()
-                {
-                    person.remove("name");
-                }
-            }
-        }
-    }
+    normalize_metadata(&mut actual, Some(expected));
     complete_fields(expected, &actual)
 }
 

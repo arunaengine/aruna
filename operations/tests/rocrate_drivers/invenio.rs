@@ -306,6 +306,9 @@ fn draft_record(state: &Repository, published: bool) -> Value {
     }
     if let Some(creators) = record["metadata"]["creators"].as_array_mut() {
         for creator in creators {
+            if creator["role"]["id"].is_string() {
+                creator["role"]["title"] = json!({"en": "Researcher"});
+            }
             let person = &mut creator["person_or_org"];
             if let Some(family) = person["family_name"].as_str() {
                 person["name"] = json!(format!(
@@ -316,6 +319,7 @@ fn draft_record(state: &Repository, published: bool) -> Value {
             }
         }
     }
+    record["metadata"]["resource_type"]["title"] = json!({"en": "Dataset"});
     record["revision_id"] = json!(state.revision.max(1));
     record["custom_fields"] = if state.custom_fields.is_null() {
         json!({})
@@ -873,7 +877,7 @@ async fn invenio_rejects_updates() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
-    for change in 0..3 {
+    for change in 0..4 {
         let fixture = build_fixture(false).await?;
         let server = serve(Repository {
             lost_metadata: true,
@@ -882,6 +886,13 @@ async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
         .await;
         let mut spec = export_spec(&fixture, &server, true).await?;
         spec.destination.as_mut().unwrap().new_version = Some("2".into());
+        if change == 3 {
+            spec.destination.as_mut().unwrap().metadata_json = json!({"creators": [{
+                "person_or_org": {"type": "personal", "family_name": "Researcher", "given_name": "A"},
+                "role": {"id": "researcher"}
+            }]}).to_string();
+        }
+        let succeeds = matches!(change, 0 | 3);
         let ctx =
             claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
         match run_export_job(&ctx, &spec).await {
@@ -900,13 +911,13 @@ async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
                 json!({"id": "datamanager"});
         }
         match run_export_job(&ctx, &spec).await {
-            JobRunOutcome::Succeeded(_) if change == 0 => {}
-            JobRunOutcome::Failed(error) if change != 0 => {
+            JobRunOutcome::Succeeded(_) if succeeds => {}
+            JobRunOutcome::Failed(error) if !succeeds => {
                 assert!(error.message.contains("ambiguous metadata"))
             }
             _ => panic!("incorrect metadata reconciliation"),
         }
-        assert_eq!(server.state.lock().unwrap().published, change == 0);
+        assert_eq!(server.state.lock().unwrap().published, succeeds);
         assert_eq!(
             server
                 .state

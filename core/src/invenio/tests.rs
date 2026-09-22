@@ -270,10 +270,54 @@ fn retains_native_fields() {
     assert!(validated.nquads.contains("metadata/funding/0/award/number"));
     assert!(validated.nquads.contains("12345"));
     let exported = export_fields(&document, &Value::Null).unwrap();
-    assert_eq!(exported["metadata"], metadata);
+    let mut request = metadata.clone();
+    normalize_metadata(&mut request, None);
+    assert_eq!(exported["metadata"], request);
     assert_eq!(exported["custom_fields"], fields);
     assert_eq!(
         export_fields(&document, &json!({"title": "Edited"})).unwrap()["metadata"]["title"],
         "Edited"
     );
+}
+
+#[test]
+fn strips_generated_fields() {
+    let mut metadata = json!({"resource_type": {"id": "dataset", "title": {"en": "Dataset"}},
+        "subjects": [{"id": "euroscivoc:1", "subject": "Biology", "scheme": "EuroSciVoc"},
+            {"subject": "free text"}],
+        "rights": [{"id": "cc-by-4.0", "title": {"en": "CC BY"}, "props": {"url": "u", "scheme": "s"}}],
+        "creators": [{"person_or_org": {"type": "personal", "name": "Doe, J", "family_name": "Doe"},
+            "role": {"id": "researcher", "title": {"en": "Researcher"}}}]
+    });
+    normalize_metadata(&mut metadata, None);
+    assert_eq!(
+        metadata,
+        json!({"resource_type": {"id": "dataset"},
+            "subjects": [{"id": "euroscivoc:1"}, {"subject": "free text"}],
+            "rights": [{"id": "cc-by-4.0"}],
+            "creators": [{"person_or_org": {"type": "personal", "family_name": "Doe"},
+                "role": {"id": "researcher"}}]
+        })
+    );
+}
+
+#[test]
+fn keeps_requested_fields() {
+    let expected = json!({"subjects": [{"id": "a", "subject": "Mine"}, {"id": "b"}],
+        "resource_type": {"id": "dataset"}});
+    let mut actual = json!({"subjects": [{"id": "a", "subject": "Mine", "scheme": "S"},
+            {"id": "other", "subject": "Kept", "scheme": "S"},
+            {"id": "extra", "subject": "Extra", "scheme": "S"}],
+        "resource_type": {"id": "software", "title": {"en": "Software"}}});
+    normalize_metadata(&mut actual, Some(&expected));
+    assert_eq!(
+        actual,
+        json!({"subjects": [{"id": "a", "subject": "Mine"},
+                {"id": "other", "subject": "Kept", "scheme": "S"},
+                {"id": "extra", "subject": "Extra", "scheme": "S"}],
+            "resource_type": {"id": "software", "title": {"en": "Software"}}})
+    );
+    let mut shorter = json!({"subjects": []});
+    normalize_metadata(&mut shorter, Some(&expected));
+    assert_eq!(shorter, json!({"subjects": []}));
 }
