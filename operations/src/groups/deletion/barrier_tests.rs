@@ -218,3 +218,92 @@ async fn ticket_installs_tombstone() {
         Err(GroupDeletionError::Invalid(_))
     ));
 }
+
+#[tokio::test]
+async fn replacement_cannot_reopen() {
+    use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+    use crate::connectors::delete_connector::{DeleteSourceInput, DeleteSourceOperation};
+    use crate::connectors::replace_connector::{
+        ReplaceSourceError, ReplaceSourceInput, ReplaceSourceOperation,
+    };
+    use crate::connectors::repository::{connector_secret_key, source_connector_key};
+    use aruna_core::keyspaces::{SOURCE_INDEX_KEYSPACE, SOURCE_SECRET_KEYSPACE};
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use std::collections::HashMap;
+
+    for rotate_secret in [false, true] {
+        let fixture = Fixture::new(&[1]).await;
+        let created = drive(
+            SourceConnectorOperation::new(SourceConnectorInput {
+                group_id: fixture.plan.group_id,
+                created_by: fixture.actor.user_id,
+                name: "Before".into(),
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".into(), "https://example.org".into())]),
+                secret_config: HashMap::new(),
+            }),
+            &fixture.context,
+        )
+        .await
+        .unwrap();
+        let connector_id = created.connector.connector_id;
+        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
+            group_id: fixture.plan.group_id,
+            connector_id,
+            name: "After".into(),
+            kind: SourceConnectorKind::Http,
+            public_config: created.connector.public_config,
+            secret_config: if rotate_secret {
+                HashMap::from([("token".into(), "replacement".into())])
+            } else {
+                HashMap::new()
+            },
+        });
+        let mut effects = VecDeque::from_iter(operation.start());
+        let mut deleted = false;
+        while !operation.is_complete() {
+            let Effect::Storage(effect) = effects.pop_front().expect("replacement must progress")
+            else {
+                panic!("unexpected replacement effect");
+            };
+            if !deleted
+                && matches!(&effect, StorageEffect::Read { key_space, .. } if key_space == SOURCE_SECRET_KEYSPACE)
+            {
+                drive(
+                    DeleteSourceOperation::new(DeleteSourceInput {
+                        group_id: fixture.plan.group_id,
+                        connector_id,
+                    }),
+                    &fixture.context,
+                )
+                .await
+                .unwrap();
+                let proof = fixture.prepare(1).await.unwrap();
+                fixture.commit(vec![proof]).await.unwrap();
+                deleted = true;
+            }
+            let event = fixture
+                .context
+                .storage_handle
+                .send_storage_effect(effect)
+                .await;
+            effects.extend(operation.step(event));
+        }
+        assert!(deleted);
+        assert!(matches!(
+            operation.finalize(),
+            Err(ReplaceSourceError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        ));
+        for (space, key) in [
+            (
+                SOURCE_INDEX_KEYSPACE,
+                source_connector_key(fixture.plan.group_id, connector_id),
+            ),
+            (SOURCE_SECRET_KEYSPACE, connector_secret_key(connector_id)),
+        ] {
+            assert!(read(&fixture.context, space, key.to_vec()).await.is_none());
+        }
+    }
+}
