@@ -66,7 +66,10 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
     let value: Value = client
         .get(&draft.url)
         .bearer_auth(token)
-        .header("Accept", "application/vnd.inveniordm.v1+json")
+        .header(
+            "Accept",
+            "application/vnd.inveniordm.v1+json, application/json;q=0.9",
+        )
         .send()
         .await?
         .error_for_status()?
