@@ -869,9 +869,23 @@ pub async fn update_group(
 
 #[utoipa::path(
     delete,
-    path = "/groups/{group_id}",
+    path = "/access/groups/{id}",
     tag = "access/groups",
-    params(("group_id" = String, Path, description = "Group identifier")),
+    summary = "Delete an empty group",
+    description = r#"Removes an empty group and releases its owner's group allocation.
+
+**Authentication**: realm bearer token without path restrictions, carrying WRITE on the group's
+administrative path or on the realm group-administration path.
+
+**Behavior**
+- Every current realm node must confirm that the group owns no resources.
+- Repeating a completed deletion is harmless and returns 204.
+- Retry an unavailable response to resume the persisted decision.
+
+**Limits**
+- Owned data and credentials are preserved; a nonempty group returns 409.
+- An unavailable participant prevents completion and returns 503."#,
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
         (status = 204, description = "Empty group deleted, or its deletion was already committed"),
         (status = 400, description = "Invalid group identifier", body = ErrorResponse),
