@@ -7,6 +7,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use ulid::Ulid;
 
+mod credential;
+pub use credential::InvenioCredential;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InvenioDestination {
     pub group_id: Ulid,
@@ -15,6 +18,7 @@ pub struct InvenioDestination {
     pub metadata_json: String,
     pub publish: bool,
     pub public_files: bool,
+    pub credential: Option<InvenioCredential>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

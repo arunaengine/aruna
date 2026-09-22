@@ -38,6 +38,7 @@ pub(crate) async fn acquire(
         connector_id,
         Permission::READ,
         spec.limits.metadata_bytes,
+        None,
     )
     .await?;
     let records = interruptible(ctx, history(&client, selected, &spec.limits)).await?;

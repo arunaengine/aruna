@@ -71,6 +71,7 @@ async fn invenio_requires_auth() {
                 metadata: serde_json::json!({}),
                 publish: true,
                 public_files: false,
+                access_token: Some("author-token".into()),
             },
             idempotency_key: None,
         };
@@ -136,6 +137,31 @@ fn invenio_openapi_contract() {
     let configured: crate::metadata::InvenioExportRequest =
         serde_json::from_value(configured).unwrap();
     assert!(configured.publish);
+}
+
+#[test]
+fn invenio_login_private() {
+    let request: crate::metadata::InvenioExportRequest =
+        serde_json::from_value(serde_json::json!({
+            "group_id": "group", "connector_id": "connector", "access_token": "author-private-token"
+        }))
+        .unwrap();
+    assert_eq!(
+        request.access_token.as_deref(),
+        Some("author-private-token")
+    );
+    assert!(
+        serde_json::to_value(&request)
+            .unwrap()
+            .get("access_token")
+            .is_none()
+    );
+    assert!(!format!("{request:?}").contains("author-private-token"));
+    let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
+    assert_eq!(
+        openapi["components"]["schemas"]["InvenioExportRequest"]["properties"]["access_token"]["writeOnly"],
+        true
+    );
 }
 
 fn realm() -> RealmId {

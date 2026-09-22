@@ -26,6 +26,10 @@ pub(crate) async fn create_draft(
     destination: &InvenioDestination,
     jsonld: &str,
 ) -> Result<InvenioRecord, TransferError> {
+    let credential = destination
+        .credential
+        .as_ref()
+        .ok_or_else(|| invalid("a personal repository login is required"))?;
     let client = connect(
         ctx,
         &spec.auth_context,
@@ -33,6 +37,7 @@ pub(crate) async fn create_draft(
         destination.connector_id,
         Permission::WRITE,
         spec.limits.metadata_bytes,
+        Some(credential),
     )
     .await?;
     if destination.metadata_json.len() as u64 > spec.limits.metadata_bytes {
@@ -88,6 +93,10 @@ pub(crate) async fn deposit(
     record: &InvenioRecord,
     artifact: &ArtifactRef,
 ) -> Result<InvenioRecord, TransferError> {
+    let credential = destination
+        .credential
+        .as_ref()
+        .ok_or_else(|| invalid("a personal repository login is required"))?;
     let client = connect(
         ctx,
         &spec.auth_context,
@@ -95,6 +104,7 @@ pub(crate) async fn deposit(
         destination.connector_id,
         Permission::WRITE,
         spec.limits.metadata_bytes,
+        Some(credential),
     )
     .await?;
     if client.url(&["records", &record.id, "draft"])?.as_str() != record.url {

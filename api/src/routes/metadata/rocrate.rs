@@ -282,9 +282,20 @@ pub async fn submit_rocrate_export(
         PolicyRequestExtras::operation("metadata.read"),
     )
     .await?;
-    let destination = request
+    let mut access_token = None;
+    let mut destination = request
         .destination
         .map(|destination| {
+            access_token = Some(
+                destination
+                    .access_token
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| {
+                        ServerError::BadRequestReason(
+                            "a personal repository access_token is required".into(),
+                        )
+                    })?,
+            );
             if destination.metadata.to_string().len() as u64 > state.rocrate_limits().metadata_bytes
             {
                 return Err(ServerError::BadRequestReason(
@@ -309,10 +320,11 @@ pub async fn submit_rocrate_export(
                 metadata_json: destination.metadata.to_string(),
                 publish: destination.publish,
                 public_files: destination.public_files,
+                credential: None,
             })
         })
         .transpose()?;
-    if let Some(destination) = &destination {
+    if let Some(destination) = &mut destination {
         crate::routes::storage::connectors::ensure_data_permission(
             &state,
             &auth,
@@ -320,6 +332,23 @@ pub async fn submit_rocrate_export(
             Permission::WRITE,
         )
         .await?;
+        destination.credential = Some(
+            aruna_operations::jobs::invenio::seal_credential(
+                &state.get_ctx(),
+                &auth,
+                destination,
+                access_token.as_deref().unwrap_or_default(),
+            )
+            .await
+            .map_err(|error| match error {
+                aruna_operations::jobs::invenio::TransferError::Permanent(message) => {
+                    ServerError::BadRequestReason(message)
+                }
+                _ => ServerError::ServiceUnavailableReason(
+                    "repository login could not be prepared".into(),
+                ),
+            })?,
+        );
     }
     let result = submit_export_job(
         &state.get_ctx(),

@@ -5,6 +5,99 @@
 use super::*;
 
 #[test]
+fn binds_repository_login() {
+    use crate::credential_encryption::CredentialEncryptionKey;
+    use crate::structs::execution::job::{ExportRoCrateSpec, JobPayload, RoCrateLimits};
+    use crate::structs::identity::auth::AuthContext;
+    use crate::structs::identity::realm::RealmId;
+    let key = CredentialEncryptionKey::derive(&[1; 32]);
+    let user = crate::UserId::local(Ulid::from_bytes([2; 16]), RealmId::from_bytes([3; 32]));
+    let group = Ulid::from_bytes([4; 16]);
+    let connector = Ulid::from_bytes([5; 16]);
+    let endpoint = "https://zenodo.org/api/";
+    let credential = InvenioCredential::seal(
+        &key,
+        user,
+        group,
+        connector,
+        endpoint.into(),
+        "author-token",
+    )
+    .unwrap();
+    assert_eq!(
+        credential
+            .open(&key, user, group, connector, endpoint)
+            .unwrap(),
+        "author-token"
+    );
+    assert!(
+        credential
+            .open(
+                &key,
+                crate::UserId::nil(user.realm_id),
+                group,
+                connector,
+                endpoint
+            )
+            .is_err()
+    );
+    assert!(
+        credential
+            .open(
+                &CredentialEncryptionKey::derive(&[9; 32]),
+                user,
+                group,
+                connector,
+                endpoint
+            )
+            .is_err()
+    );
+    assert!(
+        credential
+            .open(&key, user, group, connector, "https://other.example/api/")
+            .is_err()
+    );
+    assert!(!format!("{credential:?}").contains("author-token"));
+    assert!(
+        !serde_json::to_string(&credential)
+            .unwrap()
+            .contains("author-token")
+    );
+    let payload = |token| {
+        JobPayload::ExportRoCrate(ExportRoCrateSpec {
+            auth_context: AuthContext {
+                user_id: user,
+                realm_id: user.realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            document_id: Ulid::nil(),
+            limits: RoCrateLimits::default(),
+            destination: Some(InvenioDestination {
+                group_id: group,
+                connector_id: connector,
+                draft_id: None,
+                metadata_json: "{}".into(),
+                publish: true,
+                public_files: false,
+                credential: Some(
+                    InvenioCredential::seal(&key, user, group, connector, endpoint.into(), token)
+                        .unwrap(),
+                ),
+            }),
+        })
+    };
+    assert_eq!(
+        payload("author-token").plan_digest(),
+        payload("author-token").plan_digest()
+    );
+    assert_ne!(
+        payload("author-token").plan_digest(),
+        payload("different-author").plan_digest()
+    );
+}
+
+#[test]
 fn rejects_unsafe_ids() {
     for id in ["", "../42", "42?token=secret", "a/b", "%2e", "a\\b"] {
         assert!(validate_id(id).is_err());

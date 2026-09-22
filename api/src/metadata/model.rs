@@ -375,7 +375,7 @@ pub struct SubmitExportRequest {
     pub idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InvenioExportRequest {
     pub group_id: String,
@@ -388,6 +388,22 @@ pub struct InvenioExportRequest {
     pub publish: bool,
     #[serde(default)]
     pub public_files: bool,
+    #[serde(default, skip_serializing_if = "omit_token")]
+    #[schema(write_only = true, required = true)]
+    pub access_token: Option<String>,
+}
+
+fn omit_token(_: &Option<String>) -> bool {
+    true
+}
+
+impl std::fmt::Debug for InvenioExportRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvenioExportRequest")
+            .field("group_id", &self.group_id)
+            .field("connector_id", &self.connector_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

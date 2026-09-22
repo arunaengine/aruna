@@ -723,6 +723,17 @@ impl JobPayload {
     /// create; a differing digest is a `JobPlanConflict`.
     pub fn plan_digest(&self) -> [u8; 32] {
         let bytes = match self {
+            JobPayload::ExportRoCrate(spec) => {
+                let mut spec = spec.clone();
+                if let Some(credential) = spec
+                    .destination
+                    .as_mut()
+                    .and_then(|destination| destination.credential.as_mut())
+                {
+                    credential.sealed = crate::credential_encryption::EncryptedS3Secret::empty();
+                }
+                postcard::to_allocvec(&JobPayload::ExportRoCrate(spec))
+            }
             JobPayload::ImportRoCrate(spec) => {
                 let mut spec = spec.clone();
                 spec.document_id = Ulid::nil();
