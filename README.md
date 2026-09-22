@@ -259,17 +259,19 @@ stored bytes; operators should reserve capacity accordingly.
 
 ### Invenio and Zenodo transfers
 
-The native REST API transfers crates through durable jobs. Create an HTTP source connector
-with `public_config.endpoint` set to the repository API root, for example
-`https://zenodo.org/api/` or `https://sandbox.zenodo.org/api/`. Store a repository personal
-access token in `secret_config.token` for private imports. Exports require the requesting user's
+The native REST API transfers crates through durable jobs. Create an Invenio repository
+connector with `POST /api/v1/metadata/groups/{group_id}/repositories`, `kind` set to `invenio`
+and `endpoint` set to the repository API root, for example `https://zenodo.org/api/` or
+`https://sandbox.zenodo.org/api/`. Store a repository personal access token in
+`secret_config.token` for private imports. Exports require the requesting user's
 own Invenio/Zenodo access token in `repository.access_token`; the connector token is never used
 for publishing. The node's egress policy applies to all requests.
 
 Search published records with `GET /api/v1/metadata/invenio/records`, passing `group_id`,
 `connector_id`, `q`, `page` and `size` as query parameters. Results use the native repository
 JSON representation. Pages start at 1, size is at most 25, and `all_versions=true` includes
-older published versions. Search requires READ on the connector group and does not import data.
+older published versions. Search requires READ on the connector group's metadata path and does
+not import data.
 
 Import a record with `POST /api/v1/metadata/invenio/imports`:
 
