@@ -33,6 +33,111 @@ use std::time::SystemTime;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn invenio_requires_auth() {
+    use crate::metadata::InvenioExportRequest;
+    use crate::routes::invenio::{
+        InvenioImportRequest, SubmitInvenioExport, export_record, import_record,
+    };
+    let (_root, state, user) = plain_state(test_limits()).await;
+    for auth in [None, restricted(user)] {
+        let group_id = Ulid::generate().to_string();
+        let import = InvenioImportRequest {
+            group_id: group_id.clone(),
+            connector_id: Ulid::generate().to_string(),
+            record_id: "42".into(),
+            target: ImportTargetRequest {
+                bucket: "target".into(),
+                prefix: String::new(),
+            },
+            metadata: ImportMetadataRequest {
+                group_id: group_id.clone(),
+                path: "datasets/import".into(),
+                public: false,
+            },
+            idempotency_key: None,
+        };
+        let result =
+            import_record(State(state.clone()), Extension(auth.clone()), Json(import)).await;
+        assert!(matches!(
+            result,
+            Err(ServerError::Unauthorized | ServerError::Forbidden)
+        ));
+        let export = SubmitInvenioExport {
+            repository: InvenioExportRequest {
+                group_id,
+                connector_id: Ulid::generate().to_string(),
+                draft_id: None,
+                metadata: serde_json::json!({}),
+                publish: true,
+                public_files: false,
+            },
+            idempotency_key: None,
+        };
+        let result = export_record(
+            State(state.clone()),
+            Extension(auth),
+            axum::extract::Path("invalid".into()),
+            Json(export),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ServerError::Unauthorized | ServerError::Forbidden)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn invenio_denies_connector() {
+    use crate::routes::invenio::{InvenioImportRequest, import_record};
+    let (_root, state, user, group) = submit_state().await;
+    let request = InvenioImportRequest {
+        group_id: Ulid::generate().to_string(),
+        connector_id: Ulid::generate().to_string(),
+        record_id: "42".into(),
+        target: ImportTargetRequest {
+            bucket: "target".into(),
+            prefix: "import".into(),
+        },
+        metadata: ImportMetadataRequest {
+            group_id: group.to_string(),
+            path: "crate".into(),
+            public: false,
+        },
+        idempotency_key: None,
+    };
+    let result = import_record(State(state), Extension(auth(user)), Json(request)).await;
+    assert!(matches!(result, Err(ServerError::Forbidden)));
+}
+
+#[test]
+fn invenio_openapi_contract() {
+    let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
+    for path in [
+        "/metadata/invenio/imports",
+        "/metadata/{document_id}/invenio/exports",
+    ] {
+        let operation = &openapi["paths"][path]["post"];
+        assert!(operation["responses"]["202"].is_object());
+        assert_eq!(
+            operation["security"][0],
+            serde_json::json!({"bearer_auth": []})
+        );
+    }
+    let request =
+        serde_json::json!({"group_id": "group", "connector_id": "connector", "metadata": {}});
+    let default: crate::metadata::InvenioExportRequest =
+        serde_json::from_value(request.clone()).unwrap();
+    assert!(!default.publish);
+    assert!(!default.public_files);
+    let mut configured = request;
+    configured["publish"] = serde_json::json!(true);
+    let configured: crate::metadata::InvenioExportRequest =
+        serde_json::from_value(configured).unwrap();
+    assert!(configured.publish);
+}
+
 fn realm() -> RealmId {
     RealmId::from_bytes([1u8; 32])
 }

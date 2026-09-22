@@ -257,6 +257,72 @@ Object-backed RO-Crate imports copy the archive into a hidden seekable spool. Un
 deleted at the end of the import, the importing node can temporarily use roughly twice the archive's
 stored bytes; operators should reserve capacity accordingly.
 
+### Invenio and Zenodo transfers
+
+The native REST API transfers crates through durable jobs. Create an HTTP source connector
+with `public_config.endpoint` set to the repository API root, for example
+`https://zenodo.org/api/` or `https://sandbox.zenodo.org/api/`. Store a repository personal
+access token in `secret_config.token` for private imports or exports. Connector credentials
+remain separate from job requests and results. The node's egress policy applies to all requests.
+
+Import a record with `POST /api/v1/metadata/invenio/imports`:
+
+```json
+{
+  "group_id": "<connector-group-id>",
+  "connector_id": "<http-connector-id>",
+  "record_id": "1234567",
+  "target": {"bucket": "research", "prefix": "zenodo/1234567"},
+  "metadata": {"group_id": "<destination-group-id>", "path": "datasets/zenodo", "public": false},
+  "idempotency_key": "import-zenodo-1234567"
+}
+```
+
+Every accessible published version becomes a separate dataset within the imported crate.
+All files are copied and checked against their source sizes and checksums. Each version also
+contains `invenio-record.json`, preserving its complete record and file metadata, including
+DOIs, concept identifiers, timestamps, relations, creator identifiers and custom fields.
+Foreign identifiers remain provenance; Aruna assigns local document and object identities.
+Filenames are encoded in storage paths so repeated or unsafe source names cannot collide.
+Source names remain in the metadata. Missing files, incomplete pagination and checksum
+failures fail the transfer. Hidden edit histories and inaccessible or deleted records are
+not exposed by the repository API and cannot be reconstructed.
+
+Export with `POST /api/v1/metadata/{document_id}/invenio/exports`:
+
+```json
+{
+  "repository": {
+    "group_id": "<connector-group-id>",
+    "connector_id": "<http-connector-id>",
+    "publish": false,
+    "metadata": {
+      "title": "Research dataset",
+      "publication_date": "2026-09-22",
+      "resource_type": {"id": "dataset"},
+      "creators": [{"person_or_org": {"type": "organizational", "name": "Research group"}}]
+    }
+  },
+  "idempotency_key": "export-research-dataset"
+}
+```
+
+Exports attach the complete RO-Crate ZIP, including data and original crate metadata, to a
+native Invenio record with the supplied repository metadata. Exports with omitted files fail.
+`publish: false` (the default) leaves an unpublished draft with restricted file access;
+`publish: true` publishes after verifying the uploaded archive. Repository validation and
+publication permissions still apply. Set `repository.public_files: true` explicitly to make
+the files public when publishing; otherwise files remain restricted. Existing drafts retain
+their configured access. An exported ZIP imported later is retained as a file
+of its source version, including the original crate inside it.
+
+The response provides job status and report URLs; the existing job API also supports cancellation. Successful exports include `result.repository` with the record ID, API URL and publication
+state. Both transfers support `idempotency_key`. An ambiguous draft-creation response stops
+automatic creation; inspect the repository and supply `repository.draft_id` in a new request
+to reuse the unpublished draft. Failed or cancelled transfers leave remote drafts available
+for inspection. Import requires connector-group READ and destination WRITE; export requires
+crate READ and connector-group WRITE.
+
 ## License
 
 Aruna is licensed under either of
