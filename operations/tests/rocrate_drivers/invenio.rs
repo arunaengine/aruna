@@ -91,7 +91,7 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
     {
         "application/octet-stream"
     } else {
-        "application/vnd.inveniordm.v1+json"
+        "application/vnd.inveniordm.v1+json, application/json;q=0.9"
     };
     assert_eq!(request.headers().get("accept").unwrap(), expected);
     let method = request.method().clone();

@@ -97,7 +97,10 @@ impl<'a> InvenioClient<'a> {
             .blob
             .repository_request(method, url)
             .map_err(|_| InvenioError::Egress)?
-            .header("Accept", "application/vnd.inveniordm.v1+json")
+            .header(
+                "Accept",
+                "application/vnd.inveniordm.v1+json, application/json;q=0.9",
+            )
             .timeout(Duration::from_secs(1800));
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
