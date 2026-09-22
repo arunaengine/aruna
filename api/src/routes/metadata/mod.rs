@@ -25,6 +25,7 @@ use utoipa_axum::routes;
         (name = "metadata/query", description = "Metadata search and SPARQL"),
         (name = "metadata/references", description = "Metadata reference resolution"),
         (name = "metadata/rocrate", description = "RO-Crate document operations"),
+        (name = "metadata/invenio", description = "Native Invenio and Zenodo search, import and publication"),
         (name = "metadata/validation", description = "Metadata profile validation")
     ),
     components(schemas(crate::metadata::MetadataRoCrateView))

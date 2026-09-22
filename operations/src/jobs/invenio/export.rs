@@ -160,7 +160,7 @@ pub(crate) async fn prepare_draft(
         if current["revision_id"].as_u64() == Some(record.revision_id) {
             client.update(url, &fields, record.revision_id).await?
         } else if current["revision_id"].as_u64() == record.revision_id.checked_add(1)
-            && complete_fields(&fields["metadata"], &current["metadata"])
+            && complete_metadata(&fields["metadata"], &current["metadata"])
             && complete_fields(&fields["custom_fields"], &current["custom_fields"])
         {
             current
@@ -529,18 +529,54 @@ fn verify_metadata(expected: &Value, record: &Value) -> Result<(), TransferError
     Ok(())
 }
 
+fn complete_metadata(expected: &Value, actual: &Value) -> bool {
+    let mut actual = actual.clone();
+    for field in ["creators", "contributors"] {
+        if let (Some(expected), Some(actual)) =
+            (expected[field].as_array(), actual[field].as_array_mut())
+        {
+            for (expected, actual) in expected.iter().zip(actual) {
+                let expected = &expected["person_or_org"];
+                if expected["type"] == "personal"
+                    && expected["family_name"].is_string()
+                    && expected.get("name").is_none()
+                    && let Some(person) = actual["person_or_org"].as_object_mut()
+                {
+                    person.remove("name");
+                }
+            }
+        }
+    }
+    complete_fields(expected, &actual)
+}
+
 fn complete_fields(expected: &Value, actual: &Value) -> bool {
-    if actual.is_null() && expected.as_object().is_some_and(serde_json::Map::is_empty) {
+    if actual.is_null()
+        && (expected.as_object().is_some_and(serde_json::Map::is_empty)
+            || expected.as_array().is_some_and(Vec::is_empty))
+    {
         return true;
     }
-    matches_fields(expected, actual)
-        && actual.as_object().is_some_and(|fields| {
-            fields.iter().all(|(key, value)| {
-                expected.get(key).is_some()
-                    || value.is_null()
-                    || value.as_array().is_some_and(Vec::is_empty)
-            })
-        })
+    match (expected, actual) {
+        (Value::Object(expected), Value::Object(actual)) => {
+            expected
+                .iter()
+                .all(|(key, value)| complete_fields(value, actual.get(key).unwrap_or(&Value::Null)))
+                && actual.iter().all(|(key, value)| {
+                    expected.contains_key(key)
+                        || value.is_null()
+                        || value.as_array().is_some_and(Vec::is_empty)
+                })
+        }
+        (Value::Array(expected), Value::Array(actual)) => {
+            expected.len() == actual.len()
+                && expected
+                    .iter()
+                    .zip(actual)
+                    .all(|(expected, actual)| complete_fields(expected, actual))
+        }
+        _ => expected == actual,
+    }
 }
 
 fn matches_fields(expected: &Value, actual: &Value) -> bool {

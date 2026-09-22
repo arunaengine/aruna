@@ -304,6 +304,18 @@ fn draft_record(state: &Repository, published: bool) -> Value {
     if let Some(metadata) = &state.metadata {
         record["metadata"] = metadata.clone();
     }
+    if let Some(creators) = record["metadata"]["creators"].as_array_mut() {
+        for creator in creators {
+            let person = &mut creator["person_or_org"];
+            if let Some(family) = person["family_name"].as_str() {
+                person["name"] = json!(format!(
+                    "{}, {}",
+                    family,
+                    person["given_name"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+    }
     record["revision_id"] = json!(state.revision.max(1));
     record["custom_fields"] = if state.custom_fields.is_null() {
         json!({})
@@ -861,7 +873,7 @@ async fn invenio_rejects_updates() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
-    for concurrent in [false, true] {
+    for change in 0..3 {
         let fixture = build_fixture(false).await?;
         let server = serve(Repository {
             lost_metadata: true,
@@ -879,18 +891,22 @@ async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
             ),
             _ => panic!("lost metadata reply did not fail"),
         }
-        if concurrent {
+        if change == 1 {
             server.state.lock().unwrap().metadata.as_mut().unwrap()["subjects"] =
                 json!([{"subject": "concurrent"}]);
         }
+        if change == 2 {
+            server.state.lock().unwrap().metadata.as_mut().unwrap()["creators"][0]["role"] =
+                json!({"id": "datamanager"});
+        }
         match run_export_job(&ctx, &spec).await {
-            JobRunOutcome::Succeeded(_) if !concurrent => {}
-            JobRunOutcome::Failed(error) if concurrent => {
+            JobRunOutcome::Succeeded(_) if change == 0 => {}
+            JobRunOutcome::Failed(error) if change != 0 => {
                 assert!(error.message.contains("ambiguous metadata"))
             }
             _ => panic!("incorrect metadata reconciliation"),
         }
-        assert_eq!(server.state.lock().unwrap().published, !concurrent);
+        assert_eq!(server.state.lock().unwrap().published, change == 0);
         assert_eq!(
             server
                 .state
