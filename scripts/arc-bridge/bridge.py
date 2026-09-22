@@ -119,10 +119,13 @@ def application(store, token):
 
     async def batch(request):
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("an LFS request object is required")
         operation = body["operation"]
         if operation not in ("upload", "download") or body.get("hash_algo", "sha256") != "sha256":
             raise ValueError("unsupported LFS operation")
-        if "basic" not in body.get("transfers", ["basic"]):
+        transfers = body.get("transfers", ["basic"])
+        if not isinstance(transfers, list) or "basic" not in transfers:
             raise ValueError("only the basic LFS transfer is supported")
         objects = body["objects"]
         if not isinstance(objects, list) or len(objects) > 100:
@@ -169,6 +172,8 @@ def application(store, token):
 
     async def download(request):
         oid = object_id(request.match_info["oid"])
+        if await asyncio.to_thread(store.find, oid) is None:
+            raise web.HTTPNotFound()
         result = await asyncio.to_thread(store.get, oid)
         response = web.StreamResponse(headers={"Content-Type": "application/octet-stream",
                                                "Content-Length": str(result["ContentLength"])})
