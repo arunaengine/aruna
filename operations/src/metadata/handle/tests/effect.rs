@@ -134,6 +134,14 @@ fn maps_io_failures() {
 }
 
 #[test]
+fn maps_cancelled_work() {
+    // Cancelled or budget-limited work clears on retry, so it must not be parked.
+    let error = error_from_craqle(CraqleError::QueryCancelled);
+
+    assert!(matches!(error, MetadataError::Persist(_)));
+}
+
+#[test]
 fn read_error_mapping() {
     assert_eq!(
         metadata_read_error(MetadataError::GraphNotFound),
