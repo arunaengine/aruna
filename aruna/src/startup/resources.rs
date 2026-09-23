@@ -334,6 +334,12 @@ async fn fill(
         }
     };
     stopped(stop)?;
+    // Secret rows are sealed with the node key before any operation reads or writes one.
+    acquired.storage_handle.seal_secrets(
+        aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+            &config.node_state.net_secret_key,
+        ),
+    );
     if matches!(
         config.startup_mode,
         crate::config::StartupMode::JoinRealm {

@@ -32,6 +32,7 @@ fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
             std::collections::BTreeMap::new(),
         )),
         worker: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        secret_key: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     (handle, super::StorageReceivers { foreground, bulk })
 }
@@ -546,6 +547,7 @@ fn worker_exit_latches() {
         metrics,
         transaction_cleanup: _,
         worker: _,
+        secret_key: _,
     } = handle;
 
     assert!(!metrics.channel_closed.load(Ordering::Relaxed));

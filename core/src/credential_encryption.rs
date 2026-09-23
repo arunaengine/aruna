@@ -124,6 +124,47 @@ impl EncryptedS3Secret {
     }
 }
 
+/// Seals a stored secret row as `nonce || ciphertext`, bound to `aad`.
+pub fn seal_bytes(
+    key: &CredentialEncryptionKey,
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, EncryptionError> {
+    let mut nonce = [0u8; 24];
+    getrandom::fill(&mut nonce).map_err(|_| EncryptionError::Encrypt)?;
+    let ciphertext = key
+        .cipher()
+        .encrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| EncryptionError::Encrypt)?;
+    Ok([nonce.as_slice(), &ciphertext].concat())
+}
+
+/// Opens a row sealed by [`seal_bytes`]; another key, `aad` or a changed byte fails.
+pub fn open_bytes(
+    key: &CredentialEncryptionKey,
+    sealed: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, EncryptionError> {
+    let (nonce, ciphertext) = sealed
+        .split_first_chunk::<24>()
+        .ok_or(EncryptionError::Open)?;
+    key.cipher()
+        .decrypt(
+            &XNonce::from(*nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| EncryptionError::Open)
+}
+
 /// Additional authenticated data binding an encrypted secret to the fields that
 /// must not change: access key id, user, group, issuing node, and expiry. A
 /// record moved to another key, user, group, node, or expiry no longer opens.
@@ -218,6 +259,27 @@ mod tests {
             EncryptedS3Secret::empty()
                 .open(&CredentialEncryptionKey::derive(&[1u8; 32]), &[])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn sealed_rows_bind() {
+        let key = CredentialEncryptionKey::derive(&[7u8; 32]);
+        let sealed = seal_bytes(&key, b"canary-4e2a", b"row-a").unwrap();
+        assert!(!sealed.windows(11).any(|window| window == b"canary-4e2a"));
+        assert_eq!(open_bytes(&key, &sealed, b"row-a").unwrap(), b"canary-4e2a");
+        assert_eq!(
+            open_bytes(&key, &sealed, b"row-b"),
+            Err(EncryptionError::Open)
+        );
+        let other = CredentialEncryptionKey::derive(&[8u8; 32]);
+        assert_eq!(
+            open_bytes(&other, &sealed, b"row-a"),
+            Err(EncryptionError::Open)
+        );
+        assert_eq!(
+            open_bytes(&key, &sealed[..20], b"row-a"),
+            Err(EncryptionError::Open)
         );
     }
 }
