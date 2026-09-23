@@ -57,7 +57,7 @@ impl<'a> InvenioClient<'a> {
         Self::with_guard(blob.egress(), endpoint, token, metadata_limit)
     }
 
-    fn with_guard(
+    pub(crate) fn with_guard(
         egress: &'a EgressGuard,
         endpoint: &str,
         token: Option<String>,
@@ -327,7 +327,36 @@ pub(crate) async fn read_reference(
             "repository ignored the byte range".into(),
         ));
     }
+    if !matches_observation(&response, &metadata, range.as_ref()) {
+        return Err(StagingSourceError::SourceUnstable);
+    }
     Ok((metadata, BackendStream::new(response.bytes_stream())))
+}
+
+/// Whether the body answers the observed file: same size and, when both carry one, same ETag.
+/// A file that changed between the HEAD and the GET must fail, never serve other bytes.
+fn matches_observation(
+    response: &Response,
+    metadata: &SourceMetadata,
+    range: Option<&std::ops::Range<u64>>,
+) -> bool {
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+    let expected = range.map_or(metadata.content_length, |range| range.end - range.start);
+    let total = header("content-range")
+        .and_then(|value| value.rsplit_once('/'))
+        .map(|(_, total)| total.parse::<u64>().ok());
+    response
+        .content_length()
+        .is_none_or(|length| length == expected)
+        && total.is_none_or(|total| total == Some(metadata.content_length))
+        && header("etag")
+            .zip(metadata.etag.as_deref())
+            .is_none_or(|(served, observed)| served == observed)
 }
 
 fn reference_client<'a>(
@@ -383,25 +412,5 @@ fn check_status(response: &Response) -> Result<(), InvenioError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn refuses_plain_token() {
-        for (endpoint, secure) in [
-            ("https://zenodo.org/api/", true),
-            ("http://127.0.0.2:5000/api/", true),
-            ("http://[::1]/api/", true),
-            ("http://LOCALHOST/api/", true),
-            ("http://zenodo.org/api/", false),
-            ("http://10.0.0.1/api/", false),
-            ("http://localhost.example.org/api/", false),
-        ] {
-            assert_eq!(
-                secure_transport(&Url::parse(endpoint).unwrap()),
-                secure,
-                "{endpoint}"
-            );
-        }
-    }
-}
+#[path = "invenio_tests.rs"]
+mod tests;
