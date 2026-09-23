@@ -631,6 +631,20 @@ async fn endpoint_only_unauthorized() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn shutdown_releases_handler() -> Result<()> {
+    let (handle, _dir) = test_net_handle().await?;
+    let handler = Arc::new(HoldingInboundHandler {
+        streams: Default::default(),
+        received: Default::default(),
+    });
+    handle.set_inbound_handler(handler.clone());
+    handle.shutdown().await;
+    // A retained handler keeps its node context, and so the node's stores, alive.
+    assert_eq!(Arc::strong_count(&handler), 1);
+    Ok(())
+}
+
 struct HoldingInboundHandler {
     streams: tokio::sync::Mutex<Vec<streams::BiStream>>,
     received: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
