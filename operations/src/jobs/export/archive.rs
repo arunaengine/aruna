@@ -1217,7 +1217,7 @@ pub(super) async fn discard_artifact(
     }
 }
 
-pub(super) async fn read_export_checkpoint(
+pub(crate) async fn read_export_checkpoint(
     ctx: &JobContext,
     job_id: JobId,
 ) -> Result<Option<ExportCheckpoint>, String> {

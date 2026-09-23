@@ -6,7 +6,7 @@ use std::future::Future;
 
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::handle::Handle;
-use aruna_core::invenio::{InvenioCredential, InvenioDestination};
+use aruna_core::invenio::{InvenioCredential, InvenioDestination, LinkFailure};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
@@ -24,6 +24,7 @@ pub(crate) mod export;
 pub(crate) mod import;
 pub mod link_queue;
 pub mod links;
+pub(crate) mod push;
 mod query;
 pub(crate) mod reference;
 mod verify;
@@ -39,6 +40,9 @@ pub enum TransferError {
     Cancelled,
     #[error("repository transfer interrupted")]
     Interrupted,
+    /// A refusal a lasting link reports as its failure reason.
+    #[error("repository refused the request ({})", .0.reason())]
+    Refused(LinkFailure),
 }
 
 impl From<InvenioError> for TransferError {
@@ -47,6 +51,7 @@ impl From<InvenioError> for TransferError {
             InvenioError::Transport | InvenioError::Status(429 | 500..=599) => {
                 Self::Retryable(error.to_string())
             }
+            InvenioError::Status(401 | 403) => Self::Refused(LinkFailure::TokenRejected),
             _ => Self::Permanent(error.to_string()),
         }
     }

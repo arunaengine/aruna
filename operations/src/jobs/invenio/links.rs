@@ -428,6 +428,27 @@ pub async fn read_link(
     }
 }
 
+pub(crate) async fn read_secret(
+    storage: &StorageHandle,
+    link_id: Ulid,
+) -> Result<Option<InvenioCredential>, LinkError> {
+    let event = send(
+        storage,
+        StorageEffect::Read {
+            key_space: LINK_SECRET_KEYSPACE.to_string(),
+            key: id_key(link_id),
+            txn_id: None,
+        },
+    )
+    .await?;
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
+            .map(|bytes| postcard::from_bytes(&bytes).map_err(ConversionError::from))
+            .transpose()?),
+        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+    }
+}
+
 #[cfg(test)]
 #[path = "links_tests.rs"]
 mod tests;

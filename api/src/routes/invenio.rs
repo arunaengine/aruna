@@ -121,6 +121,9 @@ pub async fn search_records(
         aruna_operations::jobs::invenio::TransferError::Permanent(message) => {
             ServerError::BadRequestReason(message)
         }
+        error @ aruna_operations::jobs::invenio::TransferError::Refused(_) => {
+            ServerError::BadRequestReason(error.to_string())
+        }
         _ => ServerError::ServiceUnavailableReason("repository search unavailable".into()),
     })
 }

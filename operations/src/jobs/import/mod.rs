@@ -372,6 +372,7 @@ fn transfer_failure(error: super::invenio::TransferError) -> ImportFailure {
     use super::invenio::TransferError;
     match error {
         TransferError::Permanent(message) => ImportFailure::Permanent(message),
+        error @ TransferError::Refused(_) => ImportFailure::Permanent(error.to_string()),
         TransferError::Retryable(message) => ImportFailure::Retryable(message),
         TransferError::Cancelled => ImportFailure::Cancelled,
         TransferError::Interrupted => ImportFailure::Interrupted,

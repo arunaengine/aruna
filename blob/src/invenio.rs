@@ -185,6 +185,21 @@ impl<'a> InvenioClient<'a> {
         self.read_json(response).await
     }
 
+    /// Deletes a repository resource; a missing one counts as deleted.
+    pub async fn delete(&self, url: Url) -> Result<(), InvenioError> {
+        let response = self
+            .request(Method::DELETE, url)?
+            .header("Accept", JSON_ACCEPT)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|_| InvenioError::Transport)?;
+        match response.status().as_u16() {
+            404 => Ok(()),
+            _ => check_status(&response),
+        }
+    }
+
     pub async fn download(&self, url: Url) -> Result<Response, InvenioError> {
         self.content(Method::GET, url, None, None).await
     }

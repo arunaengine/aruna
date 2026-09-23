@@ -110,6 +110,9 @@ pub(crate) struct ExportCheckpoint {
     pub(crate) repository_complete: bool,
     pub(crate) repository_metadata: Option<[u8; 32]>,
     pub(crate) repository: Option<aruna_core::invenio::InvenioRecord>,
+    /// A link's resolved lineage base: the latest published version it continues.
+    pub(crate) repository_base: Option<String>,
+    pub(crate) link_failure: Option<aruna_core::invenio::LinkFailure>,
     refs: RoCrateCheckpointRefs,
     phase: ExportPhase,
     winning_event_id: Option<Ulid>,
@@ -130,6 +133,8 @@ impl Default for ExportCheckpoint {
             repository_complete: false,
             repository_metadata: None,
             repository: None,
+            repository_base: None,
+            link_failure: None,
             refs: RoCrateCheckpointRefs::default(),
             phase: ExportPhase::Snapshot,
             winning_event_id: None,
@@ -142,6 +147,27 @@ impl Default for ExportCheckpoint {
             report: Vec::new(),
             artifact: None,
         }
+    }
+}
+
+impl ExportCheckpoint {
+    /// The snapshot revision this export pushed, with its dataset digest.
+    pub(crate) fn pushed_revision(&self) -> Option<(Ulid, Option<[u8; 32]>)> {
+        self.winning_event_id
+            .map(|event_id| (event_id, self.dataset_digest))
+    }
+
+    /// Why a push failed: a recorded refusal, left-out files, or the job message.
+    pub(crate) fn push_failure(&self, message: &str) -> aruna_core::invenio::LinkFailure {
+        use aruna_core::invenio::LinkFailure;
+        if let Some(failure) = &self.link_failure {
+            return failure.clone();
+        }
+        let (_, omitted) = report_counts(&self.report);
+        if omitted.external + omitted.denied + omitted.missing + omitted.offline > 0 {
+            return LinkFailure::SourceUnavailable;
+        }
+        LinkFailure::Other(message.to_string())
     }
 }
 
@@ -270,6 +296,18 @@ pub(crate) struct EntityIdentity {
 }
 
 pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome {
+    let outcome = run_export(ctx, spec).await;
+    match spec
+        .destination
+        .as_ref()
+        .and_then(|target| target.link.as_ref())
+    {
+        Some(link) => super::invenio::push::settle(ctx, spec, link, outcome).await,
+        None => outcome,
+    }
+}
+
+async fn run_export(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome {
     let mut checkpoint = match read_export_checkpoint(ctx, ctx.job_id).await {
         Ok(Some(checkpoint)) => checkpoint,
         Ok(None) => ExportCheckpoint::default(),
@@ -456,12 +494,6 @@ async fn repository_export(
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
     use super::invenio::{TransferError, export};
-    let classify = |error| match error {
-        TransferError::Permanent(message) => ExportFailure::Permanent(message),
-        TransferError::Retryable(message) => ExportFailure::Retryable(message),
-        TransferError::Cancelled => ExportFailure::Cancelled,
-        TransferError::Interrupted => ExportFailure::Interrupted,
-    };
     if checkpoint.repository_complete {
         return Ok(());
     }
@@ -473,9 +505,23 @@ async fn repository_export(
             "repository export requires a complete crate with no omitted files".into(),
         ));
     }
-    export::repository_export(ctx, spec, destination, checkpoint)
-        .await
-        .map_err(classify)
+    match export::repository_export(ctx, spec, destination, checkpoint).await {
+        Ok(()) => Ok(()),
+        Err(TransferError::Permanent(message)) => Err(ExportFailure::Permanent(message)),
+        Err(TransferError::Retryable(message)) => Err(ExportFailure::Retryable(message)),
+        Err(TransferError::Cancelled) => Err(ExportFailure::Cancelled),
+        Err(TransferError::Interrupted) => Err(ExportFailure::Interrupted),
+        Err(error @ TransferError::Refused(_)) => {
+            let message = error.to_string();
+            if let TransferError::Refused(failure) = error {
+                checkpoint.link_failure = Some(failure);
+            }
+            persist_checkpoint(ctx, checkpoint)
+                .await
+                .map_err(ExportFailure::Retryable)?;
+            Err(ExportFailure::Permanent(message))
+        }
+    }
 }
 
 async fn snapshot_export(

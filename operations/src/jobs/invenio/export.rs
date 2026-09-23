@@ -31,6 +31,14 @@ pub(crate) async fn repository_export(
     destination: &InvenioDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), TransferError> {
+    let prepared;
+    let destination = match &destination.link {
+        Some(target) => {
+            prepared = super::push::prepare(ctx, spec, destination, target, checkpoint).await?;
+            &prepared
+        }
+        None => destination,
+    };
     if checkpoint.repository.is_none() {
         if checkpoint.repository_started && destination.draft_id.is_none() {
             return Err(TransferError::Permanent(
@@ -364,11 +372,18 @@ pub(crate) async fn deposit(
         .filter(|entry| !entry.directory)
         .map(|entry| entry.path.as_str())
         .collect::<std::collections::HashSet<_>>();
+    // A link keeps one draft in step with the dataset, so files the dataset dropped go.
+    let replace = destination.link.is_some() && !published;
     let mut remote = std::collections::BTreeMap::new();
     for file in entries {
         let key = file["key"]
             .as_str()
             .ok_or_else(|| invalid("missing repository file key"))?;
+        if replace && !paths.contains(key) {
+            let url = client.url(&["records", &record.id, "draft", "files", key])?;
+            client.delete(url).await?;
+            continue;
+        }
         if remote.insert(key, file).is_some() || !paths.contains(key) {
             return Err(invalid(
                 "repository draft contains duplicate or unrelated files",
@@ -385,7 +400,10 @@ pub(crate) async fn deposit(
         .enumerate()
     {
         let existing = remote.get(entry.path.as_str()).copied();
-        let hash = upload_entry(ctx, &client, record, artifact, entry, existing, published).await?;
+        let hash = upload_entry(
+            ctx, &client, record, artifact, entry, existing, published, replace,
+        )
+        .await?;
         verified.insert(entry.path.clone(), (hash, entry.uncompressed_size));
         ctx.progress.set_current(index as u64 + 1);
     }
@@ -400,14 +418,16 @@ pub(crate) async fn deposit(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_entry(
     ctx: &JobContext,
     client: &InvenioClient<'_>,
     record: &InvenioRecord,
     artifact: &ArtifactRef,
     entry: &ArchiveEntry,
-    existing: Option<&Value>,
+    mut existing: Option<&Value>,
     published: bool,
+    replace: bool,
 ) -> Result<Hasher, TransferError> {
     if entry.compression != ArchiveCompression::Stored
         || entry.compressed_size != entry.uncompressed_size
@@ -438,6 +458,15 @@ async fn upload_entry(
     }
     let key = &entry.path;
     let commit_url = client.url(&["records", &record.id, "draft", "files", key, "commit"])?;
+    if replace
+        && existing.is_some_and(|file| {
+            file["checksum"].is_string() && verify_file(file, &expected, size, false).is_err()
+        })
+    {
+        let url = client.url(&["records", &record.id, "draft", "files", key])?;
+        client.delete(url).await?;
+        existing = None;
+    }
     if let Some(file) = existing
         && file["checksum"].is_string()
     {
@@ -555,8 +584,16 @@ async fn finish(
         doi: current["pids"]["doi"]["identifier"]
             .as_str()
             .map(str::to_string),
-        html_url: None,
+        html_url: page_url(client, &current),
     })
+}
+
+/// The record's page for people, kept only on the repository's own origin.
+fn page_url(client: &InvenioClient<'_>, record: &Value) -> Option<String> {
+    let page = url::Url::parse(record["links"]["self_html"].as_str()?).ok()?;
+    let endpoint = url::Url::parse(client.endpoint()).ok()?;
+    (page.origin() == endpoint.origin() && page.username().is_empty() && page.password().is_none())
+        .then(|| page.to_string())
 }
 
 pub(super) fn invalid(message: &str) -> TransferError {
