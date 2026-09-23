@@ -19,6 +19,7 @@ pub mod drs;
 pub mod execution;
 pub mod info;
 pub mod invenio;
+pub mod invenio_links;
 pub mod management_relay;
 pub mod metadata;
 pub mod notifications;
@@ -72,6 +73,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(placement::router())
         .merge(rocrate_import::router())
         .merge(invenio::router())
+        .merge(invenio_links::router())
         .merge(notifications::router())
         .merge(policies::router())
         .merge(search::router())
@@ -221,6 +223,7 @@ pub(crate) mod tests {
         ("GET", "/metadata/groups/{group_id}/path"),
         ("GET", "/metadata/groups/{group_id}/repositories"),
         ("GET", "/metadata/invenio/records"),
+        ("GET", "/metadata/{document_id}/invenio/links"),
         (
             "GET",
             "/metadata/groups/{group_id}/repositories/{connector_id}",
@@ -353,6 +356,7 @@ pub(crate) mod tests {
         ("POST", "/metadata/groups/{group_id}/repositories"),
         ("POST", "/metadata/invenio/imports"),
         ("POST", "/metadata/{document_id}/invenio/exports"),
+        ("POST", "/metadata/{document_id}/invenio/links"),
         ("POST", "/metadata/rocrate/uploads"),
         ("POST", "/metadata/sparql/query"),
         (
