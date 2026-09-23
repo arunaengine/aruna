@@ -38,6 +38,7 @@ fn link() -> InvenioLink {
         last_push: None,
         active_job: None,
         sequence: 0,
+        limits: RoCrateLimits::default(),
         created_at: SystemTime::UNIX_EPOCH,
         updated_at: SystemTime::UNIX_EPOCH,
     }

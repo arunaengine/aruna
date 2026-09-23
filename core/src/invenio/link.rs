@@ -10,7 +10,7 @@ use ulid::Ulid;
 
 use super::{InvenioDestination, InvenioRecord};
 use crate::errors::ConversionError;
-use crate::structs::execution::job::JobId;
+use crate::structs::execution::job::{JobId, RoCrateLimits};
 use crate::{NodeId, UserId};
 
 /// Quiet time after a change before a link pushes, so a burst of edits becomes one push.
@@ -81,6 +81,8 @@ pub struct InvenioLink {
     pub active_job: Option<JobId>,
     /// Counts started pushes, so a repeated push of one revision gets its own job.
     pub sequence: u64,
+    /// The node's crate limits when the link was made; later pushes use them.
+    pub limits: RoCrateLimits,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
 }
@@ -261,11 +263,15 @@ impl InvenioLink {
         }
     }
 
-    /// Job idempotency key: retries reuse it until the push is recorded as started.
+    /// Job idempotency key: retries reuse it until the link changes or the push starts.
     pub fn push_key(&self, event_id: Ulid, publish: bool) -> String {
         let action = if publish { "publish" } else { "push" };
+        let updated = self
+            .updated_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
         format!(
-            "invenio-link/{}/{event_id}/{}/{action}",
+            "invenio-link/{}/{event_id}/{}/{updated}/{action}",
             self.link_id, self.sequence
         )
     }

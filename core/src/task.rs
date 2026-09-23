@@ -57,6 +57,7 @@ pub enum TaskKey {
     #[serde(rename = "DrainSyncUploadOutbox")]
     DrainUploadOutbox,
     SettleJobTerminals,
+    DrainLinkQueue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
