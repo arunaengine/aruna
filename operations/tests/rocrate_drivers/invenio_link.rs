@@ -752,9 +752,60 @@ async fn missing_file_fails() -> Result<(), Box<dyn std::error::Error>> {
             reason: LinkFailure::SourceUnavailable
         }
     );
-    let state = server.state.lock().unwrap();
-    assert!(state.records.is_empty(), "no partial record was pushed");
-    drop(state);
+    let pushed = server.state.lock().unwrap().records.len();
+    assert_eq!(pushed, 0, "no partial record was pushed");
+    fixture.stop().await;
+    Ok(())
+}
+
+/// Whether `key_space` still holds a row keyed by the link id.
+async fn has_row(fixture: &Fixture, key_space: &str, link: &InvenioLink) -> bool {
+    let event = fixture
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: link.link_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+        other => panic!("unexpected read {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn deleted_dataset_unlinks() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    // Drops the first push check, so the deletion itself must queue the next one.
+    fixture
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: LINK_QUEUE_KEYSPACE.to_string(),
+            key: link.link_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    drive(
+        DeleteDocumentOperation::new(fixture.actor.clone(), fixture.group_id, doc_id(1)),
+        &fixture.context,
+    )
+    .await?;
+    replay_event_log(fixture.context.as_ref()).await?;
+    process_prune_batch(fixture.context.as_ref()).await?;
+    assert!(has_row(&fixture, LINK_QUEUE_KEYSPACE, &link).await);
+
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    let storage = &fixture.context.storage_handle;
+    assert!(list_links(storage, doc_id(1)).await?.is_empty());
+    assert!(!has_row(&fixture, LINK_SECRET_KEYSPACE, &link).await);
+    assert!(!has_row(&fixture, LINK_QUEUE_KEYSPACE, &link).await);
+    assert!(server.state.lock().unwrap().records.is_empty());
     fixture.stop().await;
     Ok(())
 }
