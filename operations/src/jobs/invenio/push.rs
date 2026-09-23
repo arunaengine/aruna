@@ -94,14 +94,11 @@ async fn check_lineage(
         validate_id(draft)?;
         read(client.url(&["records", draft, "draft"])?).await?;
     }
+    // The record's own version flag comes from the database, so no search index lag applies.
     if let Some(published) = &target.published_id {
         validate_id(published)?;
-        let mut url = client.url(&["records", published, "versions"])?;
-        url.query_pairs_mut()
-            .append_pair("size", "1")
-            .append_pair("sort", "version");
-        let latest = read(url).await?;
-        if latest["hits"]["hits"][0]["id"].as_str() != Some(published.as_str()) {
+        let record = read(client.url(&["records", published])?).await?;
+        if record["versions"]["is_latest"] != true {
             return Err(changed());
         }
         return Ok(None);

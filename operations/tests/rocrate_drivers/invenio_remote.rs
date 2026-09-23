@@ -36,7 +36,8 @@ impl Remote {
         json!({"id": id, "parent": {"id": rec.parent}, "revision_id": rec.revision,
             "is_published": rec.published, "metadata": rec.metadata,
             "custom_fields": rec.custom_fields, "files": {"enabled": true},
-            "versions": {"index": rec.index}, "pids": pids,
+            "versions": {"index": rec.index, "is_latest": self.lineage(&rec.parent).first().is_some_and(|latest| latest == id)},
+            "pids": pids,
             "links": {"self_html": format!("{}/records/{id}", self.origin)}})
     }
 
@@ -162,10 +163,6 @@ async fn remote_request(State(state): State<Arc<Mutex<Remote>>>, request: Reques
             if state.records.get(*id).is_some_and(|r| r.published) =>
         {
             state.json(id)
-        }
-        (Method::GET, ["api", "records", id, "versions"]) if state.records.contains_key(*id) => {
-            let parent = state.records[*id].parent.clone();
-            state.page(state.lineage(&parent))
         }
         (Method::POST, ["api", "records", id, "versions"]) => {
             let source = state.records.get(*id).filter(|rec| rec.published).cloned();
