@@ -11,7 +11,7 @@ pub(crate) mod rocrate;
 pub(crate) mod validation;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::server::state::ServerState;
 use std::sync::Arc;

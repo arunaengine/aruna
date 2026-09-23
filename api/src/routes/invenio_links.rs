@@ -488,3 +488,7 @@ pub async fn list_repository_links(
             .collect(),
     ))
 }
+
+#[cfg(test)]
+#[path = "invenio_links_tests.rs"]
+mod tests;

@@ -83,12 +83,12 @@ async fn state_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::
     Ok(load_realm_nodes(ctx.as_ref(), state.get_realm_id(), state.get_node_id()).await)
 }
 
-struct TestState {
+pub(crate) struct TestState {
     _storage_dir: TempDir,
     _metadata_dir: TempDir,
-    auth: AuthContext,
-    group_id: Ulid,
-    state: Arc<ServerState>,
+    pub(crate) auth: AuthContext,
+    pub(crate) group_id: Ulid,
+    pub(crate) state: Arc<ServerState>,
 }
 
 fn projected(response: MetadataRoCrateResponse) -> ProjectedRoCrateResponse {
@@ -4027,7 +4027,7 @@ async fn setup_state() -> TestState {
 }
 
 // Net-capable variant for tests that need node discovery or cursor signing.
-async fn setup_network_state() -> TestState {
+pub(crate) async fn setup_network_state() -> TestState {
     let (storage_dir, storage_handle) = test_storage();
     let metadata_dir = tempfile::tempdir().unwrap();
     let realm_id = test_realm_id(3);
@@ -4131,7 +4131,7 @@ async fn setup_network_state() -> TestState {
     }
 }
 
-async fn drain_metadata_background(state: &ServerState) {
+pub(crate) async fn drain_metadata_background(state: &ServerState) {
     let ctx = state.get_ctx();
     let drained = drain_projection_queue(ctx.as_ref()).await.unwrap();
     if drained.markers_examined == 0 {
