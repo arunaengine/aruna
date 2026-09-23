@@ -145,6 +145,32 @@ pub async fn seal_credential(
     )?)
 }
 
+/// Seals a link's token for its creator, bound to the connector's current endpoint.
+pub async fn seal_link_token(
+    context: &DriverContext,
+    user: aruna_core::UserId,
+    group_id: Ulid,
+    connector_id: Ulid,
+    link_id: Ulid,
+    token: &str,
+) -> Result<InvenioCredential, TransferError> {
+    let view = repository(context, group_id, connector_id).await?;
+    let key = context
+        .net_handle
+        .as_ref()
+        .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?
+        .credential_encryption_key();
+    Ok(InvenioCredential::seal_link(
+        &key,
+        user,
+        group_id,
+        connector_id,
+        Some(link_id),
+        view.connector.endpoint,
+        token,
+    )?)
+}
+
 /// Reads the group's Invenio repository connector; other kinds are refused.
 pub(crate) async fn repository(
     context: &DriverContext,
