@@ -22,6 +22,7 @@ use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
@@ -237,6 +238,49 @@ pub async fn withdraw_pid_routed(
     .await?;
     match outcome {
         PersistentIdOutcome::Mapping { mapping, .. } => Ok(*mapping),
+        _ => Err(MetadataApiError::ServiceUnavailable),
+    }
+}
+
+/// Adds external identifiers through the document's authority, which owns the mapping lineage.
+pub async fn add_identifiers_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    document_id: Ulid,
+    identifiers: Vec<SecondaryIdentifier>,
+    occurred_at_ms: u64,
+    auth_token: Option<AuthToken>,
+) -> Result<(PersistentIdMapping, bool), MetadataApiError> {
+    let add = || {
+        crate::metadata::persistent_id::add_secondary_ids(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            identifiers.clone(),
+            occurred_at_ms,
+        )
+    };
+    if context.net_handle.is_none() {
+        return add().await.map_err(pid_error);
+    }
+    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    if is_local_node(context, authority) {
+        return add().await.map_err(pid_error);
+    }
+    let outcome = forward_pid(
+        context,
+        &config,
+        authority,
+        document_id,
+        PersistentIdRequest::AddIdentifiers {
+            identifiers: identifiers.clone(),
+            occurred_at_ms,
+        },
+        auth_token,
+    )
+    .await?;
+    match outcome {
+        PersistentIdOutcome::Mapping { mapping, changed } => Ok((*mapping, changed)),
         _ => Err(MetadataApiError::ServiceUnavailable),
     }
 }
@@ -605,6 +649,21 @@ pub(crate) async fn apply_forwarded_pid(
                 changed,
             })
         }
+        PersistentIdRequest::AddIdentifiers {
+            identifiers,
+            occurred_at_ms,
+        } => crate::metadata::persistent_id::add_secondary_ids(
+            context.as_ref(),
+            realm_id,
+            document_id,
+            identifiers,
+            occurred_at_ms,
+        )
+        .await
+        .map(|(mapping, changed)| PersistentIdOutcome::Mapping {
+            mapping: Box::new(mapping),
+            changed,
+        }),
         PersistentIdRequest::Resolve { .. } | PersistentIdRequest::Status => {
             unreachable!("read-only request returned above")
         }

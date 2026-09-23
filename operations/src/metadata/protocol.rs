@@ -567,6 +567,11 @@ pub enum PersistentIdRequest {
     },
     /// Trusted realm-peer read used by the authenticated typed status route.
     Status,
+    /// Union external identifiers into the mapping; needs WRITE on the document.
+    AddIdentifiers {
+        identifiers: Vec<aruna_core::structs::secondary_id::SecondaryIdentifier>,
+        occurred_at_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
