@@ -189,6 +189,8 @@ pub const HARVEST_SOURCE_KEYSPACE: &str = "harvest_source";
 pub const HARVEST_PROVENANCE_KEYSPACE: &str = "harvest_provenance";
 /// w3id persistent-identifier mappings, keyed by document id (#442, spec 3.5).
 pub const ID_MAPPING_KEYSPACE: &str = "persistent_id_mapping";
+/// Reverse index of secondary identifiers, `kind 0 value 0 endpoint` to document id (#451).
+pub const SECONDARY_ID_KEYSPACE: &str = "persistent_id_secondary";
 
 // Durable job framework keyspaces (#318).
 pub const JOB_KEYSPACE: &str = "jobs";
@@ -364,6 +366,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     HARVEST_SOURCE_KEYSPACE,
     HARVEST_PROVENANCE_KEYSPACE,
     ID_MAPPING_KEYSPACE,
+    SECONDARY_ID_KEYSPACE,
     JOB_KEYSPACE,
     SCHEDULE_INDEX_KEYSPACE,
     JOB_INDEX_KEYSPACE,

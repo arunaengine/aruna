@@ -14,6 +14,7 @@ pub mod checksum;
 mod info;
 mod path_claim;
 mod persistent_id;
+pub mod secondary_id;
 mod sync_quarantine;
 mod sync_relationship;
 mod synced_folder;
@@ -35,7 +36,7 @@ pub use path_claim::{PathClaimRecord, PathResolution, resolve_path_claim};
 pub use persistent_id::{
     MintPersistentSpec, PersistentIdFailure, PersistentIdKind, PersistentIdMapping,
     PersistentIdProvider, PersistentIdRevision, PersistentIdStatus, persistent_id_change,
-    persistent_id_key, persistent_id_target,
+    persistent_id_key, persistent_id_target, secondary_index_entries,
 };
 pub use sync_quarantine::{
     QUARANTINE_MAX_BYTES, QUARANTINE_MAX_RECORDS, QUARANTINE_USAGE_KEY, SyncQuarantineCapacity,

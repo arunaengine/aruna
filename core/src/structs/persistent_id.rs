@@ -6,10 +6,14 @@ use crate::NodeId;
 use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::keyspaces::SECONDARY_ID_KEYSPACE;
 use crate::structs::execution::job::JobId;
 use crate::structs::placement::record::PlacementRef;
+use crate::structs::secondary_id::SecondaryIdentifier;
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+use byteview::ByteView;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use ulid::Ulid;
 
 /// What a persistent identifier resolves to. Only `Conceptual` is built now; a
@@ -93,6 +97,9 @@ pub struct PersistentIdMapping {
     pub withdrawn_by: Option<UserId>,
     pub withdrawal_reason: Option<String>,
     pub revision: PersistentIdRevision,
+    /// External identifiers such as repository DOIs. A grow-only set, so every merge order
+    /// converges; the reverse index is written with each row that carries them.
+    pub secondary_identifiers: BTreeSet<SecondaryIdentifier>,
 }
 
 impl PersistentIdMapping {
@@ -138,6 +145,7 @@ impl PersistentIdMapping {
             withdrawn_by: None,
             withdrawal_reason: None,
             revision,
+            secondary_identifiers: BTreeSet::new(),
         }
     }
 
@@ -266,6 +274,8 @@ impl PersistentIdMapping {
             self.minted_at_ms = Some(minted_at_ms);
             self.minted_by = incoming.minted_by;
         }
+        self.secondary_identifiers
+            .extend(incoming.secondary_identifiers.iter().cloned());
         *self != before
     }
 
@@ -294,6 +304,22 @@ fn status_supersedes(local: &PersistentIdMapping, incoming: &PersistentIdMapping
 
 fn revision_key(revision: PersistentIdRevision) -> (u64, Ulid) {
     (revision.occurred_at_ms, revision.event_id)
+}
+
+/// Reverse index rows for every secondary identifier of the mapping, pointing at its document.
+/// Writing them again is idempotent, so each writer of the row writes all of them.
+pub fn secondary_index_entries(mapping: &PersistentIdMapping) -> Vec<(String, ByteView, ByteView)> {
+    mapping
+        .secondary_identifiers
+        .iter()
+        .map(|identifier| {
+            (
+                SECONDARY_ID_KEYSPACE.to_string(),
+                ByteView::from(identifier.index_key()),
+                ByteView::from(mapping.target.to_bytes().to_vec()),
+            )
+        })
+        .collect()
 }
 
 /// Mapping key: the document id alone, so a re-mint resolves the same row.
@@ -445,6 +471,31 @@ mod tests {
         let foreign = tombstone_mapping(Ulid::from_bytes([2; 16]), revision(2, 1));
         assert!(!mapping.merge(&foreign));
         assert!(mapping.is_active());
+    }
+
+    #[test]
+    fn merge_unions_identifiers() {
+        use crate::structs::secondary_id::SecondaryIdKind;
+        let id = Ulid::from_bytes([1; 16]);
+        let doi = |value| SecondaryIdentifier::new(SecondaryIdKind::Doi, value, None).unwrap();
+        let mut left = active_mapping(id, revision(1, 5));
+        left.secondary_identifiers.insert(doi("10.1/a"));
+        let mut right = active_mapping(id, revision(1, 5));
+        right.secondary_identifiers.insert(doi("10.1/b"));
+
+        let mut forward = left.clone();
+        assert!(forward.merge(&right));
+        let mut backward = right.clone();
+        assert!(backward.merge(&left));
+        assert_eq!(forward, backward);
+        assert_eq!(forward.secondary_identifiers.len(), 2);
+        assert!(!forward.clone().merge(&left));
+
+        let entries = secondary_index_entries(&forward);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|(keyspace, _, value)| {
+            keyspace == SECONDARY_ID_KEYSPACE && value.as_ref() == id.to_bytes()
+        }));
     }
 
     #[test]
