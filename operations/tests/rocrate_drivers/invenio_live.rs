@@ -211,6 +211,99 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable loopback Invenio instance and personal token file"]
+async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
+    let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
+    let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
+    let token = token.trim();
+    let fixture = build_fixture(false).await?;
+    let link = Box::pin(linked(&fixture, &endpoint, token, false, None)).await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let first = current(&fixture, &link).await.0;
+    let draft = first
+        .remote
+        .draft_id
+        .clone()
+        .ok_or("first push left no draft")?;
+    assert!(!first.remote.published);
+
+    Box::pin(change(&fixture, "Live second revision", true)).await?;
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let second = current(&fixture, &link).await.0;
+    assert_eq!(second.remote.draft_id.as_deref(), Some(draft.as_str()));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let get = async |path: String| -> Result<Value, Box<dyn std::error::Error>> {
+        Ok(client
+            .get(format!("{endpoint}{path}"))
+            .bearer_auth(token)
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    };
+    let record = get(format!("records/{draft}/draft")).await?;
+    assert_eq!(record["metadata"]["description"], "Live second revision");
+    let files = get(format!("records/{draft}/draft/files")).await?;
+    let mut keys = files["entries"]
+        .as_array()
+        .ok_or("draft files missing")?
+        .iter()
+        .filter_map(|file| file["key"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(keys, ["nested/data.txt", "ro-crate-metadata.json"]);
+
+    let event = aruna_operations::metadata::raw_revision::load_raw_revision(
+        &fixture.context,
+        doc_id(1),
+        None,
+    )
+    .await?
+    .ok_or("revision missing")?
+    .winning_event_id;
+    Box::pin(aruna_operations::jobs::invenio::link_queue::start_push(
+        &fixture.context,
+        &second,
+        event,
+        true,
+    ))
+    .await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let published = current(&fixture, &link).await.0;
+    assert!(published.remote.published);
+    assert_eq!(published.remote.record_id.as_deref(), Some(draft.as_str()));
+
+    Box::pin(change(&fixture, "Live third revision", false)).await?;
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let version = current(&fixture, &link).await.0;
+    let next = version
+        .remote
+        .draft_id
+        .clone()
+        .ok_or("no new version draft")?;
+    assert_ne!(next, draft);
+    assert_eq!(version.remote.parent_id, published.remote.parent_id);
+    let record = get(format!("records/{next}/draft")).await?;
+    assert_eq!(
+        record["parent"]["id"].as_str(),
+        published.remote.parent_id.as_deref()
+    );
+    assert_eq!(record["metadata"]["description"], "Live third revision");
+    fixture.stop().await;
+    Ok(())
+}
+
 async fn live_connector(
     fixture: &Fixture,
     endpoint: &str,

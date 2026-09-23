@@ -21,9 +21,10 @@ use aruna_operations::metadata::update_document::{
 
 const LINK_TOKEN: &str = "link-token";
 
-async fn linked(
+pub(super) async fn linked(
     fixture: &Fixture,
-    server: &RemoteServer,
+    endpoint: &str,
+    token: &str,
     auto_publish: bool,
     parent_id: Option<&str>,
 ) -> Result<InvenioLink, Box<dyn std::error::Error>> {
@@ -42,7 +43,7 @@ async fn linked(
             created_by: fixture.actor.user_id,
             name: "linked".into(),
             kind: RepositoryConnectorKind::Invenio,
-            endpoint: server.endpoint.clone(),
+            endpoint: endpoint.into(),
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         }),
@@ -58,7 +59,7 @@ async fn linked(
         fixture.group_id,
         connector_id,
         link_id,
-        LINK_TOKEN,
+        token,
     )
     .await?;
     let now = SystemTime::now();
@@ -98,7 +99,7 @@ async fn linked(
     .ok_or("created link missing")?)
 }
 
-async fn current(fixture: &Fixture, link: &InvenioLink) -> (InvenioLink, bool) {
+pub(super) async fn current(fixture: &Fixture, link: &InvenioLink) -> (InvenioLink, bool) {
     list_links(&fixture.context.storage_handle, link.document_id)
         .await
         .unwrap()
@@ -108,7 +109,10 @@ async fn current(fixture: &Fixture, link: &InvenioLink) -> (InvenioLink, bool) {
 }
 
 /// Makes the queued check due now instead of waiting out the debounce.
-async fn due_now(fixture: &Fixture, link: &InvenioLink) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) async fn due_now(
+    fixture: &Fixture,
+    link: &InvenioLink,
+) -> Result<(), Box<dyn std::error::Error>> {
     let entry = LinkQueueEntry {
         document_id: link.document_id,
         due_at_ms: 0,
@@ -123,7 +127,7 @@ async fn due_now(fixture: &Fixture, link: &InvenioLink) -> Result<(), Box<dyn st
 }
 
 /// Runs the push job the link recorded, as the job runtime would.
-async fn run_push(
+pub(super) async fn run_push(
     fixture: &Fixture,
     link: &InvenioLink,
 ) -> Result<JobRunOutcome, Box<dyn std::error::Error>> {
@@ -169,7 +173,7 @@ async fn run_push(
 }
 
 /// Replaces the dataset description and, optionally, drops `empty.txt`.
-async fn change(
+pub(super) async fn change(
     fixture: &Fixture,
     text: &str,
     drop_empty: bool,
@@ -213,12 +217,12 @@ async fn change(
     Ok(())
 }
 
-async fn drain(fixture: &Fixture) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) async fn drain(fixture: &Fixture) -> Result<(), Box<dyn std::error::Error>> {
     Box::pin(drain_links(&fixture.context)).await?;
     Ok(())
 }
 
-fn succeeded(outcome: JobRunOutcome) {
+pub(super) fn succeeded(outcome: JobRunOutcome) {
     match outcome {
         JobRunOutcome::Succeeded(_) => {}
         JobRunOutcome::Failed(error) => panic!("push failed: {}", error.message),
@@ -238,7 +242,7 @@ fn keys(server: &RemoteServer, id: &str) -> Vec<String> {
 async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;
-    let link = Box::pin(linked(&fixture, &server, false, None)).await?;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
     assert!(current(&fixture, &link).await.1);
 
     drain(&fixture).await?;
@@ -365,7 +369,7 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
 async fn token_rejection_recovers() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let server = remote("other-token").await;
-    let link = Box::pin(linked(&fixture, &server, true, None)).await?;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, true, None)).await?;
     drain(&fixture).await?;
     assert!(matches!(
         run_push(&fixture, &link).await?,
@@ -419,7 +423,14 @@ async fn queued_push_recovers() -> Result<(), Box<dyn std::error::Error>> {
         state.records.get_mut(&source).unwrap().published = true;
     }
     // The link continues the lineage of an existing, already published record.
-    let link = Box::pin(linked(&fixture, &server, false, Some("p1"))).await?;
+    let link = Box::pin(linked(
+        &fixture,
+        &server.endpoint,
+        LINK_TOKEN,
+        false,
+        Some("p1"),
+    ))
+    .await?;
     // A drain that submitted the job but stopped before recording it leaves the check queued.
     let event = load_raw_revision(&fixture.context, doc_id(1), None)
         .await?
