@@ -5,17 +5,28 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::SECONDARY_ID_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::PersistentIdMapping;
-use aruna_core::structs::secondary_id::SecondaryIdentifier;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::secondary_id::{
+    SecondaryIdKind, SecondaryIdentifier, secondary_id_prefix,
+};
 use aruna_core::types::{Effects, TxnId};
+use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
 
+use crate::driver::DriverContext;
+use crate::metadata::api::{MetadataApiError, can_read_record};
+use crate::metadata::get_document::load_document_record;
 use crate::metadata::persistent_id::{
-    MappingRoute, PersistentIdError, mapping_revision, parse_mapping_read, read_mapping_effect,
-    transition_entries,
+    MappingRoute, PersistentIdError, mapping_revision, parse_mapping_read, read_mapping,
+    read_mapping_effect, transition_entries,
 };
+use crate::storage_read::scan_all;
 
 const COMMIT_ATTEMPTS: usize = 4;
 
@@ -198,14 +209,79 @@ impl Operation for AddIdentifiersOperation {
     }
 }
 
+/// Finds the first document holding the identifier that the caller may read, with its active PID.
+/// Unreadable and deleted documents are skipped, so a miss never reveals that they exist.
+pub async fn lookup_identifier(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    auth: Option<&AuthContext>,
+    kind: SecondaryIdKind,
+    value: &str,
+    endpoint: Option<&str>,
+) -> Result<Option<(Ulid, Option<String>)>, MetadataApiError> {
+    let candidates = match endpoint {
+        Some(endpoint) => {
+            let identifier = SecondaryIdentifier {
+                kind,
+                value: value.to_string(),
+                endpoint: Some(endpoint.to_string()),
+            };
+            let event = ctx
+                .storage_handle
+                .send_effect(Effect::Storage(StorageEffect::Read {
+                    key_space: SECONDARY_ID_KEYSPACE.to_string(),
+                    key: ByteView::from(identifier.index_key()),
+                    txn_id: None,
+                }))
+                .await;
+            match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    value.into_iter().collect()
+                }
+                _ => return Err(MetadataApiError::ServiceUnavailable),
+            }
+        }
+        None => scan_all(
+            &ctx.storage_handle,
+            SECONDARY_ID_KEYSPACE,
+            Some(ByteView::from(secondary_id_prefix(kind, value))),
+        )
+        .await
+        .map_err(MetadataApiError::Internal)?
+        .into_iter()
+        .map(|(_, document)| document)
+        .collect::<Vec<_>>(),
+    };
+    for document in candidates {
+        let Ok(bytes) = <[u8; 16]>::try_from(document.as_ref()) else {
+            continue;
+        };
+        let document_id = Ulid::from_bytes(bytes);
+        let record = load_document_record(ctx, document_id)
+            .await
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        let Some(record) = record else {
+            continue;
+        };
+        if !can_read_record(ctx, realm_id, auth, &record).await? {
+            continue;
+        }
+        let pid = read_mapping(ctx, document_id)
+            .await
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+            .filter(PersistentIdMapping::is_active)
+            .map(|mapping| mapping.pid);
+        return Ok(Some((document_id, pid)));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SECONDARY_ID_KEYSPACE};
+    use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
     use aruna_core::structs::PersistentIdRevision;
     use aruna_core::structs::execution::job::JobId;
-    use aruna_core::structs::secondary_id::SecondaryIdKind;
-    use byteview::ByteView;
 
     fn mapping(document_id: Ulid) -> PersistentIdMapping {
         PersistentIdMapping::requested(

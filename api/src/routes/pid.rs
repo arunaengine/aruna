@@ -6,17 +6,18 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::secondary_id::{SecondaryIdKind, normalize_endpoint, normalize_value};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{
     PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
@@ -29,6 +30,7 @@ use aruna_operations::metadata::get_document::load_document_record;
 use aruna_operations::metadata::persistent_id::forward::{
     read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
+use aruna_operations::metadata::secondary_ids::lookup_identifier as lookup_document;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -49,6 +51,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(resolve_pid, withdraw_pid))
         .routes(routes!(resolve_profile_pid))
         .routes(routes!(list_persistent_ids))
+        .routes(routes!(lookup_identifier))
 }
 
 fn rocrate_location(document_id: Ulid) -> String {
@@ -193,7 +196,7 @@ struct PersistentFailureView {
 
 #[derive(Debug, Serialize, ToSchema)]
 #[schema(as = PersistentIdView)]
-struct PersistentView {
+pub(crate) struct PersistentView {
     kind: String,
     provider: String,
     value: Option<String>,
@@ -204,6 +207,47 @@ struct PersistentView {
     requested_at_ms: Option<u64>,
     minted_at_ms: Option<u64>,
     withdrawn_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    secondary_identifiers: Vec<SecondaryView>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = SecondaryIdentifierKind)]
+pub(crate) enum SecondaryKindView {
+    Doi,
+    InvenioRecord,
+    InvenioParent,
+}
+
+impl From<SecondaryIdKind> for SecondaryKindView {
+    fn from(kind: SecondaryIdKind) -> Self {
+        match kind {
+            SecondaryIdKind::Doi => Self::Doi,
+            SecondaryIdKind::InvenioRecord => Self::InvenioRecord,
+            SecondaryIdKind::InvenioParent => Self::InvenioParent,
+        }
+    }
+}
+
+impl From<SecondaryKindView> for SecondaryIdKind {
+    fn from(kind: SecondaryKindView) -> Self {
+        match kind {
+            SecondaryKindView::Doi => Self::Doi,
+            SecondaryKindView::InvenioRecord => Self::InvenioRecord,
+            SecondaryKindView::InvenioParent => Self::InvenioParent,
+        }
+    }
+}
+
+/// An external identifier; Invenio ids carry the repository API root they belong to.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(as = SecondaryIdentifierView)]
+struct SecondaryView {
+    kind: SecondaryKindView,
+    value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
 }
 
 fn status_view(mapping: &PersistentIdMapping) -> PersistentView {
@@ -240,6 +284,15 @@ fn status_view(mapping: &PersistentIdMapping) -> PersistentView {
         requested_at_ms: mapping.requested_at_ms,
         minted_at_ms: mapping.minted_at_ms,
         withdrawn_at_ms: mapping.withdrawn_at_ms,
+        secondary_identifiers: mapping
+            .secondary_identifiers
+            .iter()
+            .map(|identifier| SecondaryView {
+                kind: identifier.kind.into(),
+                value: identifier.value.clone(),
+                endpoint: identifier.endpoint.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -259,6 +312,7 @@ fn synthetic_status_view(
         requested_at_ms: None,
         minted_at_ms: None,
         withdrawn_at_ms: None,
+        secondary_identifiers: Vec::new(),
     }
 }
 
@@ -301,7 +355,9 @@ needs READ on the document's frozen permission path and answers 404 anonymously.
 - The stored mapping is authoritative for the `requested`, `processing`, `active`, `failed`,
   `admin-withdrawn` and `tombstoned` states and for the job and failure fields, so a failed job
   read is never reported as unminted.
-- A missing or unavailable authority mapping is reported as `unknown`."#,
+- A missing or unavailable authority mapping is reported as `unknown`.
+- `secondary_identifiers` lists external identifiers such as repository DOIs and is omitted
+  when there are none."#,
     params(("document_id" = String, Path, description = "Metadata document ULID")),
     responses(
         (
@@ -319,7 +375,11 @@ needs READ on the document's frozen permission path and answers 404 anonymously.
                     "failure": null,
                     "requested_at_ms": 1755500000000u64,
                     "minted_at_ms": 1755500001000u64,
-                    "withdrawn_at_ms": null
+                    "withdrawn_at_ms": null,
+                    "secondary_identifiers": [
+                        {"kind": "doi", "value": "10.5281/zenodo.1234567"},
+                        {"kind": "invenio_parent", "value": "abcde-12345", "endpoint": "https://zenodo.org/api"}
+                    ]
                 }
             ])
         ),
@@ -329,7 +389,7 @@ needs READ on the document's frozen permission path and answers 404 anonymously.
     ),
     security(("bearer_auth" = []), ())
 )]
-async fn list_persistent_ids(
+pub(crate) async fn list_persistent_ids(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(document_id): Path<String>,
@@ -365,6 +425,85 @@ async fn list_persistent_ids(
             )]))
         }
     }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct LookupQuery {
+    /// Identifier kind.
+    pub(crate) kind: SecondaryKindView,
+    /// Identifier value; DOIs may carry a `doi:` or resolver URL prefix.
+    pub(crate) value: String,
+    /// Repository API root that narrows an Invenio id to one repository.
+    pub(crate) endpoint: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(as = PidLookupResponse)]
+pub(crate) struct LookupView {
+    pub(crate) document_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pid: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/pid/lookup",
+    tag = "metadata/pids",
+    summary = "Find a document by an external identifier",
+    description = r#"Returns the document that holds a secondary identifier, such as a DOI.
+
+**Authentication**: optional bearer token; the same read rules as reading the document apply.
+
+**Behavior**
+- DOIs are compared case-insensitively without `doi:` or resolver prefixes.
+- Invenio ids are unique per repository; without `endpoint` the first readable match is returned.
+- `pid` is present once the document's w3id identifier is active.
+- Answers from this node's reverse index, which holders of the document mapping keep.
+
+**Errors**
+- 404 when no readable document holds the identifier, so private documents stay hidden."#,
+    params(LookupQuery),
+    responses(
+        (status = 200, description = "The readable document holding the identifier", body = LookupView, example = json!({
+            "document_id": "01JMETADATA0123456789ABCDE",
+            "pid": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE"
+        })),
+        (status = 400, description = "Unknown kind or malformed value", body = ErrorResponse),
+        (status = 404, description = "No readable document holds the identifier", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ())
+)]
+pub(crate) async fn lookup_identifier(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<LookupQuery>,
+) -> ServerResult<Json<LookupView>> {
+    let kind = SecondaryIdKind::from(query.kind);
+    let value = normalize_value(kind, &query.value)
+        .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+    let endpoint = query
+        .endpoint
+        .as_deref()
+        .map(normalize_endpoint)
+        .transpose()
+        .map_err(|error| ServerError::BadRequestReason(error.to_string()))?
+        .filter(|_| kind != SecondaryIdKind::Doi);
+    let found = lookup_document(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        auth.as_ref(),
+        kind,
+        &value,
+        endpoint.as_deref(),
+    )
+    .await
+    .map_err(map_api_error)?;
+    let (document_id, pid) = found.ok_or(ServerError::NotFound)?;
+    Ok(Json(LookupView {
+        document_id: document_id.to_string(),
+        pid,
+    }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

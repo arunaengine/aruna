@@ -60,12 +60,7 @@ impl SecondaryIdentifier {
         value: &str,
         endpoint: Option<&str>,
     ) -> Result<Self, SecondaryIdError> {
-        let value = match kind {
-            SecondaryIdKind::Doi => normalize_doi(value)?,
-            SecondaryIdKind::InvenioRecord | SecondaryIdKind::InvenioParent => {
-                checked_text(value.trim())?.to_string()
-            }
-        };
+        let value = normalize_value(kind, value)?;
         let endpoint = match kind {
             SecondaryIdKind::Doi => None,
             SecondaryIdKind::InvenioRecord | SecondaryIdKind::InvenioParent => {
@@ -96,6 +91,15 @@ pub fn secondary_id_prefix(kind: SecondaryIdKind, value: &str) -> Vec<u8> {
     key.extend_from_slice(value.as_bytes());
     key.push(0);
     key
+}
+
+pub fn normalize_value(kind: SecondaryIdKind, value: &str) -> Result<String, SecondaryIdError> {
+    match kind {
+        SecondaryIdKind::Doi => normalize_doi(value),
+        SecondaryIdKind::InvenioRecord | SecondaryIdKind::InvenioParent => {
+            Ok(checked_text(value.trim())?.to_string())
+        }
+    }
 }
 
 /// Lowercases a DOI and strips the `doi:` and resolver URL prefixes.

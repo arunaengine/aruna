@@ -269,6 +269,7 @@ pub(crate) mod tests {
         ("GET", "/oai"),
         ("GET", "/access/onboarding/secrets/{id}/status"),
         ("GET", "/pid/{document_id}"),
+        ("GET", "/pid/lookup"),
         ("GET", "/profile/{document_id}"),
         ("GET", "/access/policies/effective"),
         ("GET", "/access/policies/group/{group_id}"),
