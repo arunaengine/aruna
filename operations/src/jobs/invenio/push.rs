@@ -12,7 +12,6 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
 use http::Method;
-use serde_json::Value;
 
 use super::links::{ChangeLinkOperation, LinkChange, LinkError, read_link, read_secret};
 use super::{TransferError, connect};
@@ -118,7 +117,7 @@ async fn check_lineage(
     let page = read(url).await?;
     let hit = &page["hits"]["hits"][0];
     match hit["id"].as_str() {
-        Some(id) if hit["parent"]["id"] == Value::from(parent.as_str()) => {
+        Some(id) if hit["parent"]["id"] == parent.as_str() => {
             validate_id(id)?;
             Ok(Some(id.to_string()))
         }

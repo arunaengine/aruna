@@ -431,10 +431,11 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
             serde_json::from_str(native).map_err(|_| InvenioError("invalid native metadata"))?;
         let baseline = record_entity(&json!({"metadata": native}), "./")?;
         for (key, field) in [("description", "description"), ("rights", "license")] {
-            if native.get(key).is_none() && schema_value(root, field) == &baseline[field] {
-                if let Some(metadata) = metadata.as_object_mut() {
-                    metadata.remove(key);
-                }
+            if native.get(key).is_none()
+                && schema_value(root, field) == &baseline[field]
+                && let Some(metadata) = metadata.as_object_mut()
+            {
+                metadata.remove(key);
             }
         }
         for (key, value) in native
