@@ -215,6 +215,14 @@ pub(super) async fn change(
     if drop_empty {
         graph.retain(|entity| !empty(entity));
     }
+    replace_crate(fixture, &document).await
+}
+
+/// Stores `document` as the dataset's new crate and materializes it.
+async fn replace_crate(
+    fixture: &Fixture,
+    document: &Value,
+) -> Result<(), Box<dyn std::error::Error>> {
     drive(
         UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: fixture.actor.clone(),
@@ -693,6 +701,60 @@ async fn admins_read_pushes() -> Result<(), Box<dyn std::error::Error>> {
     );
     let report = read_report_routed(&fixture.context, &stranger, job_id, None, None, 10, None);
     assert!(matches!(report.await?, JobReportLookup::NotFound));
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_file_fails() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    // The crate names a stored object that does not exist in this realm.
+    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
+        .await?
+        .ok_or("revision missing")?;
+    let document: Value = serde_json::from_str(&revision.jsonld)?;
+    let entity = document["@graph"]
+        .as_array()
+        .ok_or("graph missing")?
+        .iter()
+        .find(|entity| {
+            entity["@id"]
+                .as_str()
+                .is_some_and(|id| id.contains("/empty.txt@"))
+        })
+        .ok_or("file entity missing")?;
+    // Neither the key nor the content hashes resolve, so no candidate holds the bytes.
+    let content = entity["contentUrl"].as_str().ok_or("content url missing")?;
+    let hash = content.rsplit('/').next().ok_or("hash missing")?;
+    let present = entity["@id"].as_str().ok_or("id missing")?;
+    let arn_hash = present.split(':').nth(4).ok_or("arn hash missing")?;
+    let unknown = hex::encode([0x11; 32]);
+    let gone = present
+        .replace(arn_hash, &unknown)
+        .replace("/empty.txt@", "/gone.txt@");
+    let jsonld = revision
+        .jsonld
+        .replace(present, &gone)
+        .replace(hash, &unknown);
+    let document: Value = serde_json::from_str(&jsonld)?;
+    Box::pin(replace_crate(&fixture, &document)).await?;
+
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    let outcome = run_push(&fixture, &link).await?;
+    assert!(matches!(outcome, JobRunOutcome::Failed(_)));
+    let (failed, _) = current(&fixture, &link).await;
+    assert_eq!(
+        failed.status,
+        LinkStatus::Failed {
+            reason: LinkFailure::SourceUnavailable
+        }
+    );
+    let state = server.state.lock().unwrap();
+    assert!(state.records.is_empty(), "no partial record was pushed");
+    drop(state);
     fixture.stop().await;
     Ok(())
 }
