@@ -16,6 +16,7 @@ use aruna_core::invenio::{
 use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE};
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
@@ -36,6 +37,7 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::raw_revision::load_raw_revision;
+use crate::metadata::repository::{parse_registry_read, read_document_registry};
 use crate::placement::holds_placement;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 
@@ -45,6 +47,7 @@ const ACTIVE_RETRY_MS: u64 = 30_000;
 const ERROR_RETRY_MS: u64 = 60_000;
 
 /// Push-check rows for the enabled links of changed documents that have none queued yet.
+/// A deleted document queues all its links, so the check removes them.
 pub(crate) async fn queue_rows(
     storage: &StorageHandle,
     documents: impl IntoIterator<Item = Ulid>,
@@ -66,9 +69,10 @@ pub(crate) async fn queue_rows(
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => return Err(LinkError::Unexpected(format!("{other:?}"))),
         };
+        let gone = !values.is_empty() && document_gone(storage, document_id).await?;
         for (_, value) in values {
             let link = InvenioLink::from_bytes(&value)?;
-            if link.status == LinkStatus::Enabled {
+            if gone || link.status == LinkStatus::Enabled {
                 candidates.push((link.link_id, document_id));
             }
         }
@@ -192,13 +196,17 @@ async fn check_link(
     let storage = &context.storage_handle;
     let local = context.net_handle.as_ref().map(|net| net.node_id());
     let link = match read_link(storage, entry.document_id, link_id).await? {
-        Some(link)
-            if link.status == LinkStatus::Enabled && local.is_none_or(|n| n == link.owner_node) =>
-        {
-            link
-        }
+        Some(link) if local.is_none_or(|n| n == link.owner_node) => link,
         _ => return drop_entry(storage, link_id).await,
     };
+    // A deleted dataset takes its links and their sealed tokens along; remote records stay.
+    if document_gone(storage, entry.document_id).await? {
+        change_link(context, &link, LinkChange::Delete).await?;
+        return Ok(None);
+    }
+    if link.status != LinkStatus::Enabled {
+        return drop_entry(storage, link_id).await;
+    }
     if let Err(LinkError::NotHolder) = ensure_holder(context, &link).await {
         return drop_entry(storage, link_id).await;
     }
@@ -347,6 +355,16 @@ async fn push_revision(
     Ok(record.map(|record| (record.last_event_id, None)))
 }
 
+/// Whether the dataset was deleted, which removes its registry record.
+async fn document_gone(storage: &StorageHandle, document_id: Ulid) -> Result<bool, LinkError> {
+    let event = storage
+        .send_effect(read_document_registry(document_id, None))
+        .await;
+    parse_registry_read(event)
+        .map(|record| record.is_none())
+        .map_err(|error| LinkError::Unexpected(format!("{error:?}")))
+}
+
 async fn drop_entry(storage: &StorageHandle, link_id: Ulid) -> Result<Option<u64>, LinkError> {
     delete_entry(storage, id_key(link_id)).await?;
     Ok(None)
@@ -381,6 +399,31 @@ async fn write_row(storage: &StorageHandle, row: (String, Key, Value)) -> Result
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(LinkError::Unexpected(format!("{other:?}"))),
     }
+}
+
+/// Queues checks for the links of the deleted document behind `graph_iri`; each check
+/// then removes its link and token.
+pub async fn queue_deleted(context: &DriverContext, graph_iri: &str) -> Result<(), LinkError> {
+    let document_id = graph_iri
+        .rsplit('/')
+        .next()
+        .and_then(|id| Ulid::from_string(id).ok())
+        .filter(|id| MetadataRegistryRecord::graph_iri_for(*id) == graph_iri);
+    let Some(document_id) = document_id else {
+        return Ok(());
+    };
+    let storage = &context.storage_handle;
+    let rows = queue_rows(storage, [document_id]).await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    for row in rows {
+        write_row(storage, row).await?;
+    }
+    if let Some(task_handle) = &context.task_handle {
+        restore_link_timer(storage, task_handle).await;
+    }
+    Ok(())
 }
 
 /// Arms the drain for the earliest queued check; the queue itself is the durable state.

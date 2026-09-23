@@ -7,7 +7,7 @@ use super::*;
 use aruna_core::invenio::{
     InvenioLink, LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, link_key,
 };
-use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE};
+use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE};
 use aruna_core::structs::secondary_id::SecondaryIdKind;
 use aruna_operations::jobs::invenio::link_queue::drain_links;
 use aruna_operations::jobs::invenio::links::{ChangeLinkOperation, LinkChange, list_links};
@@ -18,6 +18,8 @@ use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
+use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
+use aruna_operations::metadata::prune_queue::process_prune_batch;
 use aruna_operations::metadata::raw_revision::load_raw_revision;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
