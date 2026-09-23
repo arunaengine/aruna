@@ -267,6 +267,13 @@ pub async fn process_materialization_batch(
         .max()
         .unwrap_or(0);
     let timings = process_job_groups(context, jobs).await?;
+    // Finished jobs may queue link pushes, and the link drain stops once its queue is empty.
+    if timings.processed > 0
+        && let Some(task_handle) = &context.task_handle
+    {
+        crate::jobs::invenio::link_queue::restore_link_timer(&context.storage_handle, task_handle)
+            .await;
+    }
     if job_count > 0 {
         info!(
             event = "pipeline.materialization.summary",
