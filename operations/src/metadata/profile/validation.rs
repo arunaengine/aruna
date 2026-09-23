@@ -47,7 +47,7 @@ const SCHEMA_TEXT: &str = "http://schema.org/text";
 const SCHEMA_HTTPS_TEXT: &str = "https://schema.org/text";
 const DX_PROFILE: &str = "http://www.w3.org/ns/dx/prof/Profile";
 const PROFILE_PUBLIC_PREFIX: &str = "https://w3id.org/aruna/profile/";
-const EVALUATOR_NAME: &str = "craqle-shacl-core/0.2";
+const EVALUATOR_NAME: &str = "craqle-shacl-core/0.3";
 
 /// Authoritative backend SHACL support for Profile validation: craqle's native
 /// SHACL Core Subset v1 engine. Anything outside it (SHACL-SPARQL/JS/AF, custom
