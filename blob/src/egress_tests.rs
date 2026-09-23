@@ -234,6 +234,23 @@ fn refuses_scheme_downgrade() {
 }
 
 #[tokio::test]
+async fn sends_user_agent() {
+    let server = TestServer::spawn(ok_body("data")).await;
+    let guard = EgressGuard::build(EgressPolicy::loopback(), fixed_lookup(server.address)).unwrap();
+
+    let response = guard
+        .request(server.url("/"))
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let request = server.seen()[0].to_ascii_lowercase();
+    assert!(request.contains("user-agent: aruna/"), "{request}");
+}
+
+#[tokio::test]
 async fn strips_redirect_auth() {
     // reqwest drops Authorization across hosts; pin it instead of assuming it.
     let target = TestServer::spawn(ok_body("data")).await;

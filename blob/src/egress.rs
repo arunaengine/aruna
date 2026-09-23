@@ -206,7 +206,9 @@ fn guarded_client(
         }),
     };
 
+    // Some repositories, such as Zenodo, refuse requests without a user agent.
     Ok(reqwest::Client::builder()
+        .user_agent(concat!("aruna/", env!("CARGO_PKG_VERSION")))
         .dns_resolver(Arc::new(ScreenedResolver { policy, lookup }))
         .redirect(redirect)
         .no_proxy()
