@@ -800,7 +800,9 @@ impl OperationsTaskHandler {
             TaskKey::SettleJobTerminals => Box::pin(async move {
                 self.settle_job_terminals().await;
             }),
-            TaskKey::DrainLinkQueue => Box::pin(async {}),
+            TaskKey::DrainLinkQueue => Box::pin(async move {
+                self.drain_link_queue().await;
+            }),
             TaskKey::ReconcileSyncedFolders => Box::pin(async move {
                 let after = match crate::device::sync::reconcile_folders(&self.context).await {
                     DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,

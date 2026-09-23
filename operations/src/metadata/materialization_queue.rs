@@ -788,6 +788,11 @@ async fn plan_finish_chunk(
         }
     }
 
+    // Linked repositories learn of the change in the same commit as the new status.
+    match crate::jobs::invenio::link_queue::queue_rows(storage, superseding.keys().copied()).await {
+        Ok(rows) => plan.writes.extend(rows),
+        Err(error) => warn!(%error, "Failed to queue Invenio link pushes after materialization"),
+    }
     plan.superseding = superseding;
     Ok(plan)
 }

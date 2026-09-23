@@ -428,7 +428,6 @@ pub async fn read_link(
     }
 }
 
-
 #[cfg(test)]
 #[path = "links_tests.rs"]
 mod tests;

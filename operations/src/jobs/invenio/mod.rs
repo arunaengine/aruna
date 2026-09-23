@@ -22,6 +22,7 @@ use super::executor::JobContext;
 
 pub(crate) mod export;
 pub(crate) mod import;
+pub mod link_queue;
 pub mod links;
 mod query;
 pub(crate) mod reference;

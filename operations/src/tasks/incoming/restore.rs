@@ -4,6 +4,8 @@
 
 use super::*;
 
+const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 fn spawn_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle, shutdown: &Shutdown) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
@@ -57,6 +59,8 @@ async fn durable_rearm_loop(
         restore_drain_timer(&context.storage_handle, &task_handle).await;
         restore_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
+        crate::jobs::invenio::link_queue::restore_link_timer(&context.storage_handle, &task_handle)
+            .await;
     }
 }
 
@@ -517,6 +521,22 @@ impl OperationsTaskHandler {
                 self.reschedule_timer(TaskKey::DrainRefreshQueue, REFRESH_RETRY_AFTER)
                     .await;
             }
+        }
+    }
+}
+
+impl OperationsTaskHandler {
+    /// Starts the Invenio link pushes whose debounce elapsed and re-arms for the next one.
+    pub(super) async fn drain_link_queue(&self) {
+        let after = match crate::jobs::invenio::link_queue::drain_links(&self.context).await {
+            Ok(after) => after,
+            Err(error) => {
+                warn!(task_id = ?TaskKey::DrainLinkQueue, %error, "Failed to drain Invenio link queue");
+                Some(LINK_RETRY_AFTER)
+            }
+        };
+        if let Some(after) = after {
+            self.reschedule_timer(TaskKey::DrainLinkQueue, after).await;
         }
     }
 }
