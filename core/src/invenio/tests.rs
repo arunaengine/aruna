@@ -321,3 +321,26 @@ fn keeps_requested_fields() {
     normalize_metadata(&mut shorter, Some(&expected));
     assert_eq!(shorter, json!({"subjects": []}));
 }
+
+#[test]
+fn record_identifiers_normalized() {
+    let record = json!({"id": "abc-12", "parent": {"id": "par-34"},
+        "pids": {"doi": {"identifier": "10.5281/Zenodo.12", "provider": "datacite"}}});
+    let identifiers = record_identifiers("https://zenodo.org/api/", &record);
+    let values = identifiers
+        .iter()
+        .map(|id| (id.kind.as_str(), id.value.as_str(), id.endpoint.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        vec![
+            ("doi", "10.5281/zenodo.12", None),
+            ("invenio_record", "abc-12", Some("https://zenodo.org/api")),
+            ("invenio_parent", "par-34", Some("https://zenodo.org/api")),
+        ]
+    );
+    assert_eq!(
+        record_identifiers("https://zenodo.org/api/", &json!({"doi": "bad"})).len(),
+        0
+    );
+}

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -278,6 +279,25 @@ pub fn import_crate(
     root["hasPart"] = Value::Array(parts);
     graph.push(root);
     Ok(json!({"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": graph}))
+}
+
+/// The record's DOI, id and parent id as secondary identifiers of an imported crate.
+/// Values the repository does not provide or that fail validation are left out.
+pub fn record_identifiers(endpoint: &str, record: &Value) -> Vec<SecondaryIdentifier> {
+    let doi = record["pids"]["doi"]["identifier"]
+        .as_str()
+        .or_else(|| record["doi"].as_str());
+    [
+        (SecondaryIdKind::Doi, doi),
+        (SecondaryIdKind::InvenioRecord, record["id"].as_str()),
+        (
+            SecondaryIdKind::InvenioParent,
+            record["parent"]["id"].as_str(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(kind, value)| SecondaryIdentifier::new(kind, value?, Some(endpoint)).ok())
+    .collect()
 }
 
 /// Supplied native fields override mapped crate fields; missing mandatory fields fail closed.

@@ -30,6 +30,24 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
         JobRunOutcome::Failed(error) => panic!("{}", error.message),
         _ => panic!("unexpected import outcome"),
     }
+    let mapping =
+        aruna_operations::metadata::persistent_id::read_mapping(&fixture.context, doc_id(1))
+            .await?
+            .expect("created document has a mapping");
+    let identifiers = mapping
+        .secondary_identifiers
+        .iter()
+        .map(|id| (id.kind.as_str(), id.value.as_str(), id.endpoint.clone()))
+        .collect::<Vec<_>>();
+    let endpoint = Some(server.endpoint.trim_end_matches('/').to_string());
+    assert_eq!(
+        identifiers,
+        vec![
+            ("doi", "10.1234/2", None),
+            ("invenio_record", "2", endpoint.clone()),
+            ("invenio_parent", "parent", endpoint),
+        ]
+    );
     for id in ["1", "2"] {
         let key = format!(
             "imported/{}",

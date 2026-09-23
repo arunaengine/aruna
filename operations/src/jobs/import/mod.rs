@@ -33,6 +33,7 @@ use aruna_core::structs::execution::job::{
     RoCrateMediaType, SYSTEM_ENTRY_PREFIX, job_entry_key, rocrate_plan_key,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, object_permission_path,
 };
@@ -60,10 +61,12 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::AuthToken;
+use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
 use crate::metadata::forward::route_metadata_create;
+use crate::metadata::persistent_id::forward::add_identifiers_routed;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
@@ -137,6 +140,8 @@ struct ImportCheckpoint {
     rolled_back: u64,
     failure: Option<String>,
     cancelled: bool,
+    /// Repository identifiers registered on the created document during cleanup.
+    identifiers: Vec<SecondaryIdentifier>,
 }
 
 impl Default for ImportCheckpoint {
@@ -157,6 +162,7 @@ impl Default for ImportCheckpoint {
             rolled_back: 0,
             failure: None,
             cancelled: false,
+            identifiers: Vec::new(),
         }
     }
 }
@@ -218,11 +224,13 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
         }
 
         let result = match checkpoint.phase {
-            ImportPhase::Acquire => acquire_source(ctx, spec).await.map(|input| {
-                checkpoint.refs.hidden_locations = vec![input.location.clone()];
-                checkpoint.input = Some(input);
-                checkpoint.phase = ImportPhase::Inspect;
-            }),
+            ImportPhase::Acquire => acquire_source(ctx, spec, &mut checkpoint.identifiers)
+                .await
+                .map(|input| {
+                    checkpoint.refs.hidden_locations = vec![input.location.clone()];
+                    checkpoint.input = Some(input);
+                    checkpoint.phase = ImportPhase::Inspect;
+                }),
             ImportPhase::Inspect => {
                 inspect_source(ctx, spec, &checkpoint)
                     .await
@@ -373,6 +381,7 @@ fn transfer_failure(error: super::invenio::TransferError) -> ImportFailure {
 async fn acquire_source(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
+    identifiers: &mut Vec<SecondaryIdentifier>,
 ) -> Result<ImportInput, ImportFailure> {
     match &spec.source {
         ImportRoCrateSource::Invenio {
@@ -381,7 +390,7 @@ async fn acquire_source(
             record_id,
             options,
         } => {
-            let artifact = super::invenio::import::acquire(
+            let (artifact, found) = super::invenio::import::acquire(
                 ctx,
                 spec,
                 *group_id,
@@ -391,6 +400,7 @@ async fn acquire_source(
             )
             .await
             .map_err(transfer_failure)?;
+            *identifiers = found;
             Ok(ImportInput {
                 location: artifact.location,
                 size: artifact.size,
@@ -1119,12 +1129,44 @@ async fn create_document(
     }
 }
 
+/// Records the source repository identifiers on the created document through its PID authority.
+async fn register_identifiers(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    identifiers: &[SecondaryIdentifier],
+) -> Result<(), ImportFailure> {
+    let result = add_identifiers_routed(
+        &ctx.driver,
+        spec.auth_context.realm_id,
+        spec.document_id,
+        identifiers.to_vec(),
+        aruna_core::time::unix_timestamp_millis(),
+        Some(AuthToken::internal(spec.auth_context.clone())),
+    )
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        // The imported data stays valid without the lookup entries, so a refusal is not fatal.
+        Err(error @ (MetadataApiError::Forbidden | MetadataApiError::Unauthorized)) => {
+            tracing::warn!(document_id = %spec.document_id, %error, "import identifiers refused");
+            Ok(())
+        }
+        Err(error) => Err(ImportFailure::Retryable(format!(
+            "registering repository identifiers failed: {error}"
+        ))),
+    }
+}
+
 async fn cleanup_source(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
     plan: Option<&ImportPlan>,
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<(), ImportFailure> {
+    if checkpoint.created && !checkpoint.identifiers.is_empty() {
+        register_identifiers(ctx, spec, &checkpoint.identifiers).await?;
+        checkpoint.identifiers.clear();
+    }
     if let Some(plan) = plan.filter(|_| rollback_required(checkpoint)) {
         checkpoint.rolled_back = rollback_writes(ctx, spec, plan, checkpoint).await?;
     }

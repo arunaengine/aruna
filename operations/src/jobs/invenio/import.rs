@@ -10,11 +10,13 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::invenio::{
-    InvenioMode, InvenioOptions, file_path, import_crate, record_id, validate_id,
+    InvenioMode, InvenioOptions, file_path, import_crate, record_id, record_identifiers,
+    validate_id,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
 use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use async_zip::{Compression, ZipEntryBuilder};
 use futures_util::io::AsyncWriteExt;
 use http::Method;
@@ -32,7 +34,7 @@ pub(crate) async fn acquire(
     connector_id: Ulid,
     selected: &str,
     options: &InvenioOptions,
-) -> Result<ArtifactRef, TransferError> {
+) -> Result<(ArtifactRef, Vec<SecondaryIdentifier>), TransferError> {
     validate_id(selected)?;
     let client = connect(
         &ctx.driver,
@@ -47,6 +49,11 @@ pub(crate) async fn acquire(
     let (selected, records) =
         interruptible(ctx, history(&client, selected, &spec.limits, options)).await?;
     let document = import_crate(client.endpoint(), &selected, &records)?;
+    let identifiers = records
+        .iter()
+        .find(|(record, _)| record["id"] == selected.as_str())
+        .map(|(record, _)| record_identifiers(client.endpoint(), record))
+        .unwrap_or_default();
     let metadata = document.to_string();
     if metadata.len() as u64 > spec.limits.metadata_bytes {
         return Err(TransferError::Permanent(
@@ -89,12 +96,15 @@ pub(crate) async fn acquire(
                 let _ = delete_hidden(&ctx.driver, &location).await;
                 return Err(error);
             }
-            Ok(ArtifactRef {
-                location,
-                size,
-                blake3,
-                expires_at_ms: 0,
-            })
+            Ok((
+                ArtifactRef {
+                    location,
+                    size,
+                    blake3,
+                    expires_at_ms: 0,
+                },
+                identifiers,
+            ))
         }
         Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { .. })) => {
             Err(invalid("repository archive exceeds import source limit"))
