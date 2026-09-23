@@ -34,6 +34,7 @@ use crate::jobs::store::read_job_record;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
+use crate::metadata::get_document::load_document_record;
 use crate::metadata::raw_revision::load_raw_revision;
 use crate::placement::holds_placement;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
@@ -212,12 +213,9 @@ async fn check_link(
             record => settle_stale(context, &link, job_id, record.as_ref()).await,
         };
     }
-    let revision = load_raw_revision(context, entry.document_id, None)
-        .await
-        .map_err(|error| LinkError::Unexpected(error.to_string()))?;
-    match revision {
-        Some(revision) if link.changed(revision.winning_event_id, revision.dataset_digest) => {
-            match start_push(context, &link, revision.winning_event_id, false).await {
+    match push_revision(context, entry.document_id).await? {
+        Some((event_id, digest)) if link.changed(event_id, digest) => {
+            match start_push(context, &link, event_id, false).await {
                 Ok(_) => Ok(None),
                 // The check stays queued, so the link shows pending until a job slot frees up.
                 Err(LinkError::JobLimit(_)) => Ok(Some(now.saturating_add(ACTIVE_RETRY_MS))),
@@ -325,11 +323,28 @@ async fn ensure_holder(context: &DriverContext, link: &InvenioLink) -> Result<()
 
 /// The current revision event of a held document, for push keys and change checks.
 pub async fn current_event(context: &DriverContext, document_id: Ulid) -> Result<Ulid, LinkError> {
-    load_raw_revision(context, document_id, None)
-        .await
-        .map_err(|error| LinkError::Unexpected(error.to_string()))?
-        .map(|revision| revision.winning_event_id)
+    push_revision(context, document_id)
+        .await?
+        .map(|(event_id, _)| event_id)
         .ok_or(LinkError::NoRevision)
+}
+
+/// The revision a push exports: the raw revision, else a scaffold's rendered graph at its last
+/// event, the same crate the export job and the dataset view use.
+async fn push_revision(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<Option<(Ulid, Option<[u8; 32]>)>, LinkError> {
+    let raw = load_raw_revision(context, document_id, None)
+        .await
+        .map_err(|error| LinkError::Unexpected(error.to_string()))?;
+    if let Some(revision) = raw {
+        return Ok(Some((revision.winning_event_id, revision.dataset_digest)));
+    }
+    let record = load_document_record(context, document_id)
+        .await
+        .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?;
+    Ok(record.map(|record| (record.last_event_id, None)))
 }
 
 async fn drop_entry(storage: &StorageHandle, link_id: Ulid) -> Result<Option<u64>, LinkError> {

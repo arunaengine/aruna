@@ -531,36 +531,49 @@ async fn snapshot_export(
 ) -> Result<(), ExportFailure> {
     // Route the raw revision from a document holder; a job on a job-control bucket
     // rarely holds the document's bucket. The holder re-checks READ for this peer.
-    let export = export_rocrate_routed(
-        &ctx.driver,
-        spec.auth_context.realm_id,
-        ExportMetadataRequest {
-            document_id: spec.document_id,
-            auth: Some(spec.auth_context.clone()),
-            view: RoCrateExportView::Raw,
-            limit: None,
-            offset: None,
-            after: None,
-        },
-        Some(AuthToken::internal(spec.auth_context.clone())),
-        spec.limits.metadata_bytes,
-    )
-    .await
-    .map_err(snapshot_read_failure)?;
-    let ExportMetadataResult::Raw { raw, .. } = export else {
-        return Err(ExportFailure::Permanent(
-            "raw export returned an unexpected view".to_string(),
-        ));
+    let routed = |view| {
+        export_rocrate_routed(
+            &ctx.driver,
+            spec.auth_context.realm_id,
+            ExportMetadataRequest {
+                document_id: spec.document_id,
+                auth: Some(spec.auth_context.clone()),
+                view,
+                limit: None,
+                offset: None,
+                after: None,
+            },
+            Some(AuthToken::internal(spec.auth_context.clone())),
+            spec.limits.metadata_bytes,
+        )
     };
-    if raw.revision.jsonld.len() as u64 > spec.limits.metadata_bytes {
+    // A scaffold keeps no authored text, so its crate is the rendered graph the display shows.
+    let (jsonld, winning_event_id, context_digest) = match routed(RoCrateExportView::Raw).await {
+        Ok(ExportMetadataResult::Raw { raw, .. }) => (
+            raw.revision.jsonld,
+            raw.revision.winning_event_id,
+            raw.revision.context_digest,
+        ),
+        Err(MetadataApiError::NotFound) => match routed(RoCrateExportView::Full).await {
+            Ok(ExportMetadataResult::Full { record, jsonld }) => {
+                let digest = aruna_core::metadata::raw_context_digest(&jsonld)
+                    .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+                (jsonld, record.last_event_id, digest)
+            }
+            Ok(_) => return Err(unexpected_view()),
+            Err(error) => return Err(snapshot_read_failure(error)),
+        },
+        Ok(_) => return Err(unexpected_view()),
+        Err(error) => return Err(snapshot_read_failure(error)),
+    };
+    if jsonld.len() as u64 > spec.limits.metadata_bytes {
         return Err(ExportFailure::Permanent(format!(
             "RO-Crate metadata exceeds the {} byte limit",
             spec.limits.metadata_bytes
         )));
     }
-    let canonical =
-        craqle::validate_rocrate_jsonld(&raw.revision.jsonld).map_err(map_crate_error)?;
-    let document: JsonValue = serde_json::from_str(&raw.revision.jsonld)
+    let canonical = craqle::validate_rocrate_jsonld(&jsonld).map_err(map_crate_error)?;
+    let document: JsonValue = serde_json::from_str(&jsonld)
         .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
     let entities = recognize_entities(&document, &canonical.nquads, spec.auth_context.realm_id)?;
     if entities.len() as u64 > spec.limits.max_entries {
@@ -570,10 +583,10 @@ async fn snapshot_export(
         )));
     }
 
-    checkpoint.winning_event_id = Some(raw.revision.winning_event_id);
-    checkpoint.context_digest = Some(raw.revision.context_digest);
+    checkpoint.winning_event_id = Some(winning_event_id);
+    checkpoint.context_digest = Some(context_digest);
     checkpoint.dataset_digest = Some(canonical.digest);
-    checkpoint.raw_jsonld = Some(raw.revision.jsonld);
+    checkpoint.raw_jsonld = Some(jsonld);
     checkpoint.entities = entities;
     checkpoint.phase = ExportPhase::Resolve;
     ctx.progress.set_total(checkpoint.entities.len() as u64);
@@ -1112,6 +1125,10 @@ async fn resolve_alias_txn(
         resolved_version: Some(alias.version_id),
         expected_blake3: Some(alias.blake3_hash),
     }))
+}
+
+fn unexpected_view() -> ExportFailure {
+    ExportFailure::Permanent("metadata export returned an unexpected view".to_string())
 }
 
 fn snapshot_read_failure(error: MetadataApiError) -> ExportFailure {

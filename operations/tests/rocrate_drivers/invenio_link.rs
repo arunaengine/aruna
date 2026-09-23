@@ -5,7 +5,7 @@
 use super::remote::{RemoteServer, remote};
 use super::*;
 use aruna_core::invenio::{
-    InvenioLink, LinkFailure, LinkQueueEntry, LinkRemote, LinkStatus, link_key,
+    InvenioLink, LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, link_key,
 };
 use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE};
 use aruna_core::structs::secondary_id::SecondaryIdKind;
@@ -15,6 +15,9 @@ use aruna_operations::jobs::invenio::seal_link_token;
 use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::jobs::store::{complete_job, fail_job};
 use aruna_operations::jobs::submit::SubmitJobError;
+use aruna_operations::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
+};
 use aruna_operations::metadata::raw_revision::load_raw_revision;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
@@ -38,6 +41,17 @@ pub(super) async fn linked(
     ));
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    Box::pin(attach(fixture, endpoint, token, auto_publish, parent_id)).await
+}
+
+/// Links the existing dataset `doc_id(1)` to a new connector of `endpoint`.
+async fn attach(
+    fixture: &Fixture,
+    endpoint: &str,
+    token: &str,
+    auto_publish: bool,
+    parent_id: Option<&str>,
+) -> Result<InvenioLink, Box<dyn std::error::Error>> {
     let connector_id = drive(
         CreateConnectorOperation::new(CreateConnectorInput {
             group_id: fixture.group_id,
@@ -581,6 +595,55 @@ async fn lost_holder_fails() -> Result<(), Box<dyn std::error::Error>> {
         server.state.lock().unwrap().calls.is_empty(),
         "nothing was pushed"
     );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scaffold_link_pushes() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    drive(
+        CreateDocumentOperation::new(CreateDocumentConfig {
+            actor: fixture.actor.clone(),
+            group_id: fixture.group_id,
+            document_id: doc_id(1),
+            document_path: "datasets/scaffold".into(),
+            public: false,
+            payload: CreateDocumentPayload::Scaffold {
+                name: "Scaffold".into(),
+                description: "Created from fields".into(),
+                date_published: "2026-01-01".into(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".into()),
+            },
+        }),
+        &fixture.context,
+    )
+    .await?;
+    replay_event_log(fixture.context.as_ref()).await?;
+    process_materialization_batch(fixture.context.as_ref()).await?;
+    let raw = load_raw_revision(&fixture.context, doc_id(1), None).await?;
+    assert!(raw.is_none(), "a scaffold keeps no raw revision");
+
+    let link = Box::pin(attach(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    // Scaffold fields name no creator, so the link supplies one as a native override.
+    let creators = json!({"creators": [{"person_or_org": {
+        "type": "personal", "given_name": "Ada", "family_name": "Lovelace"}}]});
+    let patch = LinkPatch {
+        metadata_json: Some(creators.to_string()),
+        ..LinkPatch::default()
+    };
+    let change = ChangeLinkOperation::new(link.document_id, link.link_id, LinkChange::Patch(patch));
+    drive(change, &fixture.context).await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let (pushed, _) = current(&fixture, &link).await;
+    assert_eq!(pushed.remote.draft_id.as_deref(), Some("1"));
+    assert_eq!(keys(&server, "1"), ["ro-crate-metadata.json"]);
+    // The pushed revision counts as current, so an unchanged scaffold starts no second push.
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    assert_eq!(current(&fixture, &link).await, (pushed, false));
     fixture.stop().await;
     Ok(())
 }
