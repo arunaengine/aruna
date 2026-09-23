@@ -89,6 +89,7 @@ use aruna_core::structs::{
     QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
     SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
     persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
+    secondary_index_entries,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};

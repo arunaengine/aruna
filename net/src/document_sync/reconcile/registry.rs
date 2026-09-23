@@ -435,6 +435,7 @@ pub(in crate::document_sync) async fn store_pid_mapping(
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?,
             ),
         )];
+        writes.extend(secondary_index_entries(&merged));
         writes.push(
             sync_revision_entry(&target, &change)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?,

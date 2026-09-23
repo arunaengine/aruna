@@ -95,7 +95,14 @@ async fn pid_placement_fence() {
     let forged_document = document(4, 3_111);
     let uncanonical_document = document(6, 3_112);
     let forged_actor_document = document(6, 3_113);
-    let valid = mapping(valid_document, local_node, 3_120);
+    let mut valid = mapping(valid_document, local_node, 3_120);
+    let doi = aruna_core::structs::secondary_id::SecondaryIdentifier::new(
+        aruna_core::structs::secondary_id::SecondaryIdKind::Doi,
+        "10.5281/zenodo.3120",
+        None,
+    )
+    .unwrap();
+    valid.secondary_identifiers.insert(doi.clone());
     let forged = mapping(forged_document, local_node, 3_121);
     let mut uncanonical = mapping(uncanonical_document, local_node, 3_122);
     uncanonical.pid = "https://w3id.org/aruna/not-this-document".to_string();
@@ -163,6 +170,17 @@ async fn pid_placement_fence() {
         )
         .await
         .is_some()
+    );
+    assert_eq!(
+        read_storage_value(
+            &storage,
+            aruna_core::keyspaces::SECONDARY_ID_KEYSPACE,
+            ByteView::from(doi.index_key()),
+        )
+        .await
+        .as_deref(),
+        Some(valid_document.to_bytes().as_slice()),
+        "a replicated mapping indexes its identifiers in the same batch"
     );
     for (document_id, placement) in [
         (forged_document, placed(9)),

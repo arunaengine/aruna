@@ -21,7 +21,7 @@ use aruna_core::structs::storage::metadata_registry::{
 };
 use aruna_core::structs::{
     PersistentIdFailure, PersistentIdMapping, PersistentIdRevision, persistent_id_change,
-    persistent_id_key, persistent_id_target,
+    persistent_id_key, persistent_id_target, secondary_index_entries,
 };
 use aruna_core::types::TxnId;
 use byteview::ByteView;
@@ -435,7 +435,7 @@ pub fn tombstone_transition(
 
 pub type TransitionEntry = (String, ByteView, ByteView);
 
-/// Row, sync sidecar, shard-manifest entry, and outbox publish, so an accepted
+/// Row, identifier index, sync sidecar, shard-manifest entry and outbox publish, so an accepted
 /// transition is either fully durable and replicated or not taken.
 pub fn transition_entries(
     route: &Option<MappingRoute>,
@@ -447,6 +447,7 @@ pub fn transition_entries(
         ByteView::from(persistent_id_key(mapping.target)),
         ByteView::from(mapping.to_bytes().map_err(PersistentIdError::Conversion)?),
     )];
+    writes.extend(secondary_index_entries(mapping));
     if let Some(route) = route {
         let change = persistent_id_change(mapping, route.placement);
         writes.push(sync_revision_entry(&target, &change).map_err(PersistentIdError::Conversion)?);
