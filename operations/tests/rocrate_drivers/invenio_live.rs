@@ -349,3 +349,144 @@ fn require_import(outcome: JobRunOutcome) -> Result<u64, Box<dyn std::error::Err
         _ => Err("unexpected import outcome".into()),
     }
 }
+
+/// Imports a public Zenodo record in every mode and checks the files against Zenodo.
+#[tokio::test]
+#[ignore = "requires network access to zenodo.org"]
+async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint =
+        std::env::var("ARUNA_ZENODO_ENDPOINT").unwrap_or("https://zenodo.org/api/".into());
+    let record = std::env::var("ARUNA_ZENODO_RECORD").unwrap_or("16623955".into());
+    let client = reqwest::Client::builder()
+        .user_agent("aruna-acceptance")
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let get = async |url: String| -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+        Ok(client
+            .get(url)
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .error_for_status()?)
+    };
+    // Zenodo itself is the reference: every version with its files and bytes.
+    let versions: Value = get(format!("{endpoint}records/{record}/versions?size=25"))
+        .await?
+        .json()
+        .await?;
+    let mut expected = Vec::new();
+    for version in versions["hits"]["hits"].as_array().ok_or("no versions")? {
+        let id = version["id"].to_string().trim_matches('"').to_string();
+        for file in version["files"].as_array().ok_or("no files")? {
+            let key = file["key"].as_str().ok_or("file key missing")?.to_string();
+            let url = format!("{endpoint}records/{id}/files/{key}/content");
+            let bytes = get(url).await?.bytes().await?.to_vec();
+            expected.push((id.clone(), key, bytes));
+        }
+    }
+    assert!(!expected.is_empty());
+    let current: Value = get(format!("{endpoint}records/{record}"))
+        .await?
+        .json()
+        .await?;
+    let doi = current["doi"]
+        .as_str()
+        .ok_or("record has no DOI")?
+        .to_string();
+
+    let fixture = build_fixture(false).await?;
+    let connector = live_connector(&fixture, &endpoint, None).await?;
+    let auth = import_spec(&fixture, Ulid::generate(), doc_id(1)).auth_context;
+    let title = current["metadata"]["title"].as_str().ok_or("no title")?;
+    let query = InvenioQuery {
+        group_id: fixture.group_id,
+        connector_id: connector,
+        q: format!("\"{title}\""),
+        page: 1,
+        size: 10,
+        all_versions: false,
+    };
+    let page = search_records(&fixture.context, &auth, &query, 1024 * 1024).await?;
+    let hits = page["hits"]["hits"]
+        .as_array()
+        .ok_or("search hits missing")?;
+    assert!(
+        hits.iter()
+            .any(|hit| hit["id"].to_string().trim_matches('"') == record)
+    );
+
+    for (index, mode) in [
+        InvenioMode::Copy,
+        InvenioMode::Reference,
+        InvenioMode::Metadata,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let document = doc_id(index as u64 + 1);
+        let mut import = spec_with_source(
+            &fixture,
+            ImportRoCrateSource::Invenio {
+                group_id: fixture.group_id,
+                connector_id: connector,
+                record_id: record.clone(),
+                options: InvenioOptions {
+                    mode,
+                    all_versions: true,
+                },
+            },
+            document,
+        );
+        import.target.prefix = format!("zenodo-{index}");
+        let ctx = claim_context(
+            &fixture,
+            job_id(),
+            JobPayload::ImportRoCrate(import.clone()),
+        )
+        .await?;
+        let count = require_import(run_rocrate_import(&ctx, &import).await)?;
+        assert!(count > 0, "{mode:?} imported nothing");
+        replay_event_log(fixture.context.as_ref()).await?;
+        process_materialization_batch(fixture.context.as_ref()).await?;
+        let crate_json = aruna_operations::metadata::raw_revision::load_raw_revision(
+            &fixture.context,
+            document,
+            None,
+        )
+        .await?
+        .ok_or("imported crate missing")?
+        .jsonld;
+        assert!(crate_json.contains(&doi), "{mode:?} crate lacks {doi}");
+        for (version, key, bytes) in &expected {
+            let key = format!(
+                "zenodo-{index}/{}",
+                aruna_core::invenio::file_path(version, key)?
+            );
+            let object = drive(
+                GetObjectOperation::new(GetObjectInput {
+                    bucket: BUCKET.into(),
+                    key: key.clone(),
+                    version_id: None,
+                    range: None,
+                    group_id: fixture.group_id,
+                    user_identity: fixture.actor.user_id,
+                    node_id: fixture.actor.node_id,
+                }),
+                &fixture.context,
+            )
+            .await;
+            if mode == InvenioMode::Metadata {
+                assert!(object.is_err(), "metadata import stored {key}");
+                continue;
+            }
+            let mut object = object?;
+            let mut read = Vec::new();
+            while let Some(chunk) = object.blob.next().await {
+                read.extend_from_slice(&chunk?);
+            }
+            assert_eq!(&read, bytes, "{mode:?} bytes differ for {key}");
+        }
+    }
+    fixture.stop().await;
+    Ok(())
+}
