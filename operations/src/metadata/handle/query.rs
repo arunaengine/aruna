@@ -1,25 +1,27 @@
-//! Runs local SPARQL queries over the graphs a caller may read, with row and byte limits.
+//! Runs local SPARQL queries through craqle over the graphs a caller may read, with limits.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::effects::warn_slow_call;
 use super::lifecycle::list_read_records;
 use super::search::{LocalReadScope, resolve_visibility_scope};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use aruna_core::metadata::{MetadataError, MetadataQueryResults};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms};
-use craqle::{CraqleNode, GraphId};
-use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use spareval::{CancellationToken, QueryEvaluator};
+use craqle::{
+    CraqleError, CraqleErrorKind, CraqleNode, GraphId, QueryCancellation, QueryOptions,
+    QueryRequest, QueryResults,
+};
+use oxrdf::{NamedNode, Term};
 use spargebra::{Query, SparqlParser};
 use tracing::{Span, debug_span, field};
 
 use super::effects::{graph_ids, record_error, record_query_counts};
-use super::search::select_authorized_graphs;
+use super::search::{AllowedGraphAuthorizer, ScopeAuthorizer, select_authorized_graphs};
 use super::{
     MAX_RESULT_BYTES, METADATA_QUERY_DEADLINE, MetadataHandle, MetadataInner, QUERY_MAX_BYTES,
     QUERY_MAX_ROWS, QUERY_PREFIXES, REGISTRY_CANDIDATE_LIMIT,
@@ -52,7 +54,7 @@ pub(super) async fn query_local_graphs(
 ) -> Result<MetadataQueryResults, MetadataError> {
     let span = Span::current();
     let total_started = Instant::now();
-    let query = parse_metadata_query(&sparql)?;
+    parse_metadata_query(&sparql)?;
     if graph_iris
         .as_ref()
         .is_some_and(|graphs| graphs.len() > REGISTRY_CANDIDATE_LIMIT)
@@ -152,13 +154,12 @@ pub(super) async fn query_local_graphs(
         ))
     })?
     .ok();
-    let cancellation = CancellationToken::new();
+    let cancellation = QueryCancellation::new();
     let _cancel_on_drop = MetadataCancellationGuard(cancellation.clone());
     let blocking_cancellation = cancellation.clone();
     let mut blocking = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        blocking_span
-            .in_scope(|| evaluate_query_snapshot(&inner, scope, &query, &blocking_cancellation))
+        blocking_span.in_scope(|| evaluate_query(&inner, scope, &sparql, blocking_cancellation))
     });
     let result = match tokio::time::timeout_at(query_deadline, &mut blocking).await {
         Ok(Ok(result)) => result,
@@ -204,7 +205,7 @@ pub(super) async fn query_local_graphs(
     result
 }
 
-struct MetadataCancellationGuard(CancellationToken);
+struct MetadataCancellationGuard(QueryCancellation);
 
 impl Drop for MetadataCancellationGuard {
     fn drop(&mut self) {
@@ -237,88 +238,59 @@ pub(super) fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError>
     Ok(query)
 }
 
-fn evaluate_query_snapshot(
+fn evaluate_query(
     inner: &MetadataInner,
     scope: LocalReadScope<Vec<String>>,
-    query: &Query,
-    cancellation: &CancellationToken,
+    sparql: &str,
+    cancellation: QueryCancellation,
 ) -> Result<MetadataQueryResults, MetadataError> {
-    let graphs = match scope {
-        LocalReadScope::Eager(allowed) => graph_ids(&allowed),
-        LocalReadScope::Lazy(scope) => inner
-            .node
-            .graphs()
-            .map_err(|error| MetadataError::Backend(error.to_string()))?
-            .into_iter()
-            .filter(|graph| scope.graph_visible(&inner.visibility_cache, graph.as_str()))
-            .collect(),
-    };
-    let mut dataset = Dataset::new();
-    for graph in graphs {
-        ensure_not_cancelled(cancellation)?;
-        if !inner
-            .node
-            .contains_graph(&graph)
-            .map_err(|error| MetadataError::Backend(error.to_string()))?
-        {
-            return Err(MetadataError::GraphNotFound);
-        }
-        let snapshot = inner
-            .node
-            .graph_snapshot(&graph)
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        let orphaned = inner
-            .node
-            .graph_diagnostics(&graph)
-            .map_err(|error| MetadataError::Backend(error.to_string()))?
-            .orphaned_entities
-            .into_iter()
-            .map(|entity| craqle::EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity)))
-            .collect::<HashSet<_>>();
-        for quad in snapshot.quads {
-            ensure_not_cancelled(cancellation)?;
-            if orphaned.contains(&quad.subject) || orphaned.contains(&quad.object) {
-                continue;
+    let sparql = format!("{QUERY_PREFIXES}{sparql}");
+    let mut options = QueryOptions::results_only();
+    options.cancellation = cancellation;
+    options.limits.max_query_bytes = sparql.len();
+    options.limits.max_result_rows = QUERY_MAX_ROWS;
+    options.limits.max_result_bytes = MAX_RESULT_BYTES;
+    let execution = match scope {
+        LocalReadScope::Eager(allowed) => {
+            let graphs = graph_ids(&allowed);
+            for graph in &graphs {
+                if !inner.node.contains_graph(graph).map_err(query_error)? {
+                    return Err(MetadataError::GraphNotFound);
+                }
             }
-            let subject = match quad.subject.to_term() {
-                Some(Term::NamedNode(subject)) => NamedOrBlankNode::NamedNode(subject),
-                Some(Term::BlankNode(subject)) => NamedOrBlankNode::BlankNode(subject),
-                _ => return Err(invalid_snapshot_term(&quad.subject.0)),
+            let authorizer = AllowedGraphAuthorizer {
+                graph_iris: allowed.into_iter().collect(),
             };
-            let predicate = quad
-                .predicate
-                .to_named_node()
-                .ok_or_else(|| invalid_snapshot_term(&quad.predicate.0))?;
-            let object = quad
-                .object
-                .to_term()
-                .ok_or_else(|| invalid_snapshot_term(&quad.object.0))?;
-            dataset.insert(&Quad::new(
-                subject.clone(),
-                predicate.clone(),
-                object.clone(),
-                snapshot.graph.0.clone(),
-            ));
-            dataset.insert(&Quad::new(
-                subject,
-                predicate,
-                object,
-                GraphName::DefaultGraph,
-            ));
+            inner
+                .node
+                .query_in_graphs_with_options(&authorizer, &graphs, &sparql, &options)
+        }
+        LocalReadScope::Lazy(scope) => {
+            let authorizer = ScopeAuthorizer {
+                scope: &scope,
+                visibility_cache: &inner.visibility_cache,
+            };
+            let request = QueryRequest {
+                sparql: &sparql,
+                options: &options,
+            };
+            inner.node.query_with_options(&authorizer, request)
         }
     }
-
-    ensure_not_cancelled(cancellation)?;
-    let evaluator = QueryEvaluator::new().with_cancellation_token(cancellation.clone());
-    let mut prepared = evaluator.prepare(query);
-    prepared
-        .dataset_mut()
-        .set_default_graph(vec![GraphName::DefaultGraph]);
-    let evaluated = prepared
-        .execute(&dataset)
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    let results = collect_query_results(evaluated)?;
-    ensure_not_cancelled(cancellation)?;
+    .map_err(query_error)?;
+    let results = match execution.results {
+        QueryResults::Solutions(rows) => MetadataQueryResults::Solutions(
+            rows.into_iter()
+                .map(|row| row.into_iter().map(|(name, term)| (name, term.0)).collect())
+                .collect(),
+        ),
+        QueryResults::Boolean(value) => MetadataQueryResults::Boolean(value),
+        QueryResults::Graph(_) => {
+            return Err(MetadataError::InvalidInput(
+                "only SELECT and ASK metadata queries are supported".to_string(),
+            ));
+        }
+    };
     let serialized =
         serde_json::to_vec(&results).map_err(|error| MetadataError::Backend(error.to_string()))?;
     if serialized.len() > MAX_RESULT_BYTES {
@@ -329,63 +301,15 @@ fn evaluate_query_snapshot(
     Ok(results)
 }
 
-fn collect_query_results(
-    results: spareval::QueryResults<'_>,
-) -> Result<MetadataQueryResults, MetadataError> {
-    match results {
-        spareval::QueryResults::Solutions(solutions) => {
-            let mut rows = Vec::new();
-            let mut serialized_bytes = 32usize;
-            for solution in solutions {
-                let solution =
-                    solution.map_err(|error| MetadataError::Backend(error.to_string()))?;
-                if rows.len() == QUERY_MAX_ROWS {
-                    return Err(MetadataError::InvalidInput(format!(
-                        "metadata query result exceeds the {QUERY_MAX_ROWS}-row limit"
-                    )));
-                }
-                let row = solution
-                    .iter()
-                    .map(|(variable, term)| {
-                        let encoded = craqle::EncodedTerm::from_term(term)
-                            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-                        Ok((variable.as_str().to_string(), encoded.0))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, MetadataError>>()?;
-                serialized_bytes = serialized_bytes.saturating_add(
-                    serde_json::to_vec(&row)
-                        .map_err(|error| MetadataError::Backend(error.to_string()))?
-                        .len()
-                        .saturating_add(1),
-                );
-                if serialized_bytes > MAX_RESULT_BYTES {
-                    return Err(MetadataError::InvalidInput(format!(
-                        "metadata query result exceeds the {MAX_RESULT_BYTES}-byte limit"
-                    )));
-                }
-                rows.push(row);
-            }
-            Ok(MetadataQueryResults::Solutions(rows))
-        }
-        spareval::QueryResults::Boolean(value) => Ok(MetadataQueryResults::Boolean(value)),
-        spareval::QueryResults::Graph(_) => Err(MetadataError::InvalidInput(
-            "only SELECT and ASK metadata queries are supported".to_string(),
-        )),
+// Limits, cancellation and rejected queries are the caller's input, not a backend fault.
+fn query_error(error: CraqleError) -> MetadataError {
+    match error.kind() {
+        CraqleErrorKind::InvalidInput
+        | CraqleErrorKind::Unsupported
+        | CraqleErrorKind::QueryLimit
+        | CraqleErrorKind::Cancelled => MetadataError::InvalidInput(error.to_string()),
+        _ => MetadataError::Backend(error.to_string()),
     }
-}
-
-fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), MetadataError> {
-    if cancellation.is_cancelled() {
-        Err(MetadataError::InvalidInput(
-            "metadata query was cancelled".to_string(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn invalid_snapshot_term(term: &str) -> MetadataError {
-    MetadataError::Backend(format!("invalid RDF term in metadata snapshot: {term}"))
 }
 
 pub(super) fn snapshot_iri_references(
