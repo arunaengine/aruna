@@ -47,6 +47,7 @@ mod admin_validation;
 mod fanout;
 mod group_targets;
 mod lifecycle;
+mod links;
 mod publish_eviction;
 mod quarantine;
 mod realm_config;

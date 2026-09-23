@@ -9,6 +9,7 @@ mod apply;
 mod batch;
 pub(crate) mod cursor;
 mod document;
+mod links;
 mod materialize;
 mod metadata;
 mod registry;
