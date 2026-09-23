@@ -154,9 +154,15 @@ async fn resolves_session_alias() {
     crate::jobs::store::insert_job(&ctx.storage_handle, &physical)
         .await
         .unwrap();
+    let auth = |user_id: aruna_core::UserId| aruna_core::structs::identity::auth::AuthContext {
+        user_id,
+        realm_id: REALM,
+        path_restrictions: None,
+        session: None,
+    };
     let report = crate::jobs::service::read_report_routed(
         &ctx,
-        spec.created_by,
+        &auth(spec.created_by),
         spec.job_id,
         None,
         None,
@@ -171,8 +177,16 @@ async fn resolves_session_alias() {
     );
     let stranger = aruna_core::UserId::new(ulid::Ulid(42), REALM);
     assert!(matches!(
-        crate::jobs::service::read_report_routed(&ctx, stranger, spec.job_id, None, None, 1, None)
-            .await,
+        crate::jobs::service::read_report_routed(
+            &ctx,
+            &auth(stranger),
+            spec.job_id,
+            None,
+            None,
+            1,
+            None
+        )
+        .await,
         Ok(crate::jobs::service::JobReportLookup::NotFound)
     ));
     assert!(matches!(

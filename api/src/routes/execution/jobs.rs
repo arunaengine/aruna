@@ -1299,8 +1299,9 @@ pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused. Reads are
 self-scoped: only the job's own submitter may read it, and anybody else's job answers 404, so the
-surface never confirms that an id exists. The one exception is a persistent-id minting job the
-caller joined, readable while the caller holds WRITE on the document it mints for.
+surface never confirms that an id exists. There are two exceptions. A persistent-id minting job
+the caller joined is readable while the caller holds WRITE on the document it mints for. A
+repository link push is readable by admins of the link's group, who may manage the link.
 
 **Behavior**
 - `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or
@@ -1565,7 +1566,8 @@ fn decode_report_row(
     description = r#"Pages the frozen per-entry report of a finished RO-Crate import, export or notebook session job.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
-Self-scoped like the status read: a job submitted by somebody else answers 404.
+Self-scoped like the status read, with the same exceptions: a job submitted by somebody else
+answers 404.
 
 **Behavior**
 - RO-Crate imports, exports and notebook sessions keep per-entry reports; other jobs answer 404.
@@ -1662,7 +1664,7 @@ pub async fn get_job_report(
     let last_key = cursor.map(|cursor| cursor.last_key);
     match read_report_routed(
         &state.get_ctx(),
-        auth.user_id,
+        &auth,
         job_id,
         expected_digest,
         last_key,

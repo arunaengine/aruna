@@ -647,3 +647,52 @@ async fn scaffold_link_pushes() -> Result<(), Box<dyn std::error::Error>> {
     fixture.stop().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn admins_read_pushes() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_operations::jobs::service::{JobReportLookup, read_job_routed, read_report_routed};
+
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    let mut link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    // Another member created the link, so its pushes run as that member.
+    let realm_id = fixture.actor.realm_id;
+    link.created_by = UserId::local(Ulid::generate(), realm_id);
+    write_value(
+        &fixture.context.storage_handle,
+        INVENIO_LINK_KEYSPACE,
+        link_key(link.document_id, link.link_id),
+        link.to_bytes()?,
+    )
+    .await?;
+    drain(&fixture).await?;
+    let job_id = current(&fixture, &link)
+        .await
+        .0
+        .active_job
+        .ok_or("push missing")?;
+    let auth = |user_id| AuthContext {
+        user_id,
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+
+    // The fixture actor administers the link's group.
+    let admin = auth(fixture.actor.user_id);
+    let status = read_job_routed(&fixture.context, &admin, job_id, None).await?;
+    assert_eq!(status.job.job_id, job_id);
+    let report = read_report_routed(&fixture.context, &admin, job_id, None, None, 10, None).await?;
+    assert!(matches!(report, JobReportLookup::Pending(_)));
+
+    let stranger = auth(UserId::local(Ulid::generate(), realm_id));
+    let hidden = read_job_routed(&fixture.context, &stranger, job_id, None).await;
+    assert!(
+        hidden.is_err(),
+        "a non-admin cannot read another member's push"
+    );
+    let report = read_report_routed(&fixture.context, &stranger, job_id, None, None, 10, None);
+    assert!(matches!(report.await?, JobReportLookup::NotFound));
+    fixture.stop().await;
+    Ok(())
+}
