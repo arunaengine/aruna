@@ -191,6 +191,17 @@ Onboarding only takes effect on a fresh data directory. Once a node has persiste
 
 For a ready-made multi-node onboarding flow, use `just local-cluster` instead of walking through the onboarding APIs manually.
 
+### Stored credentials
+
+Secrets of source connectors, repository connectors and group storage backends are encrypted at
+rest. So are Invenio link tokens and S3 secret keys. The encryption key is derived from the
+node's secret key, which the node keeps in its state under `STORAGE_PATH`. Only the same node
+can decrypt these secrets, and a restart derives the same key again. Back up `STORAGE_PATH` as a
+whole to keep them usable. A node restored without its state, or with another identity, cannot
+decrypt them: register the connector and backend secrets again with their `PUT` routes and
+replace each link token with `PUT .../token`. Nodes that stored secrets before this encryption
+need one `aruna-doctor migrate` run with the node stopped, which encrypts those rows.
+
 ## Interactive Session Networking
 
 Interactive notebook sessions run in a container that must reach this node's S3 plane and nothing
@@ -278,7 +289,7 @@ Import a record with `POST /api/v1/metadata/invenio/imports`:
 ```json
 {
   "group_id": "<connector-group-id>",
-  "connector_id": "<http-connector-id>",
+  "connector_id": "<repository-connector-id>",
   "record_id": "1234567",
   "mode": "copy",
   "all_versions": true,
@@ -313,7 +324,7 @@ Export with `POST /api/v1/metadata/{document_id}/invenio/exports`:
 {
   "repository": {
     "group_id": "<connector-group-id>",
-    "connector_id": "<http-connector-id>",
+    "connector_id": "<repository-connector-id>",
     "access_token": "<personal-access-token>",
     "publish": false
   },
@@ -361,6 +372,24 @@ automatic creation; inspect the repository and supply `repository.draft_id` in a
 to reuse the unpublished draft. Failed or cancelled transfers leave remote drafts available
 for inspection. Import requires connector-group READ and destination WRITE; export requires
 crate READ and connector-group WRITE.
+
+A link keeps a dataset in sync with one Invenio record lineage. Create it with
+`POST /api/v1/metadata/{document_id}/invenio/links` and a body with `group_id`, `connector_id`
+and the user's `access_token`. Set `parent_id` to continue an existing record, for example the
+imported source. The node that creates the link must hold the dataset; it seals the token for
+that link and becomes the link's owner. The first push is queued right away. Every later change to
+the dataset starts a push about 10 seconds after the last change, as one `export_rocrate` job.
+Pushes update one open draft; publish it with `POST .../links/{link_id}/publish` or set
+`auto_publish`. After a publish, the next push creates a new version. A push fails the link
+instead of leaving out files: reasons are `remote_changed` when the remote lineage has a newer
+version, `token_rejected`, `source_unavailable` when a file has no readable copy or a referenced
+origin changed, and `owner_not_holder`. `PATCH` pauses or resumes a link and changes its
+options, `PUT .../token` replaces the token, and `DELETE` removes the link and its token.
+Deleting the dataset removes its links and their tokens as well. Remote records always stay.
+
+Imports and pushes record the repository DOI and record IDs as secondary identifiers of the
+dataset. `GET /api/v1/metadata/{document_id}/pids` lists them, and
+`GET /api/v1/pid/lookup?kind=doi&value=<doi>` finds the dataset for one identifier.
 
 The opt-in `invenio::live::native_repository` test exercises a real local Invenio instance.
 Set `ARUNA_INVENIO_ENDPOINT` to its loopback API URL, `ARUNA_INVENIO_TOKEN_FILE` to an
