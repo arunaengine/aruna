@@ -14,7 +14,7 @@ use ::irokle::Storage as _;
 use ::irokle::TopicControl;
 use ::irokle::net::{decode_sync_message, encode_frame, encode_sync_message};
 use ::irokle::oplog::Oplog;
-use ::irokle::sync::{SyncData, SyncMessage, SyncRequest};
+use ::irokle::sync::SyncMessage;
 use ::irokle::{
     EventEnvelope, PeerId, ReplicationPolicy, TopicEviction, TopicGenesis, TopicPayload,
 };
@@ -394,9 +394,6 @@ pub struct DocumentSyncService {
     shard_publishers: Arc<RwLock<BTreeMap<::irokle::TopicId, ShardPublisherPolicy>>>,
     storage_path: PathBuf,
     reconcile_lock: Arc<tokio::sync::Mutex<()>>,
-    // Genesis tie-break evictions from all admission paths funnel into this
-    // sender; the embedder drains it once and re-emits the payloads.
-    eviction_tx: tokio::sync::mpsc::UnboundedSender<TopicEviction>,
     eviction_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>>>>,
     // Buckets each unreleased journal entry may re-emit onto, so a bucket's
     // drain need not rescan the journal; `None` marks an undecoded recovery.
@@ -482,7 +479,7 @@ impl DocumentSyncService {
                 node.clone(),
                 alpns,
                 runtime,
-                Some(eviction_tx.clone()),
+                Some(eviction_tx),
             )
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
         );
@@ -508,7 +505,6 @@ impl DocumentSyncService {
             shard_publishers: Arc::new(RwLock::new(BTreeMap::new())),
             storage_path,
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
-            eviction_tx,
             eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
             eviction_buckets: Arc::new(RwLock::new(eviction_buckets)),
             realm_id,

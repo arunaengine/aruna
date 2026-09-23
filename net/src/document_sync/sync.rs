@@ -276,6 +276,8 @@ impl DocumentSyncService {
                 async move {
                     match timeout(PEER_SYNC_TIMEOUT, net.sync_peer_now(peer, topic_id)).await {
                         Ok(Ok(())) => Ok(()),
+                        // Irokle schedules the pages left after its budget.
+                        Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
                         Ok(Err(error)) => Err(NetError::Bootstrap(error.to_string())),
                         Err(_) => Err(NetError::Timeout(PEER_SYNC_TIMEOUT)),
                     }
@@ -352,145 +354,9 @@ impl DocumentSyncService {
     }
 
     async fn sync_batch_with(&self, peer: PeerId, topic_ids: Vec<::irokle::TopicId>) -> Result<()> {
-        let batch_started = Instant::now();
-        let topic_count = topic_ids.len();
         let peer_addr = peer_endpoint_addr(peer)?;
-        let mut known_topics = BTreeSet::new();
-        let mut local_fingerprints = BTreeMap::new();
-        let mut initial_messages = Vec::with_capacity(topic_ids.len().saturating_mul(2));
-        for topic_id in topic_ids {
-            let fingerprint = self
-                .node
-                .sync_fingerprint(topic_id)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            known_topics.insert(topic_id);
-            local_fingerprints.insert(topic_id, fingerprint.fingerprint);
-            initial_messages.push(SyncMessage::Open(self.node.sync_open(topic_id)));
-            initial_messages.push(SyncMessage::Fingerprint(fingerprint));
-        }
-        let r1_build = batch_started.elapsed();
-
-        let r1_io_started = Instant::now();
-        let responses = timeout(
-            PEER_SYNC_TIMEOUT,
-            self.net.sync_with(peer_addr.clone(), &initial_messages),
-        )
-        .await
-        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
-        .map_err(NetError::from)?;
-        let r1_io = r1_io_started.elapsed();
-        let r1_process_started = Instant::now();
-        let node = self.node.clone();
-        let summary_known = known_topics.clone();
-        let (responded_topics, failed_topics, sync_messages) =
-            tokio::task::spawn_blocking(move || {
-                process_summary_responses(
-                    &node,
-                    peer,
-                    &summary_known,
-                    &local_fingerprints,
-                    responses,
-                )
-            })
-            .await
-            .map_err(|error| NetError::Bootstrap(error.to_string()))??;
-        let r1_process = r1_process_started.elapsed();
-        if responded_topics.len() != known_topics.len() {
-            let refused: Vec<String> = known_topics
-                .iter()
-                .filter(|topic| !responded_topics.contains(*topic))
-                .map(|topic| topic.to_string())
-                .collect();
-            return Err(NetError::Bootstrap(format!(
-                "peer {peer} responded for {}/{} document sync batch topics (refused: {refused:?})",
-                responded_topics.len(),
-                known_topics.len()
-            )));
-        }
-        if sync_messages.is_empty() {
-            log_batch_summary(
-                peer,
-                topic_count,
-                r1_build,
-                r1_io,
-                r1_process,
-                Duration::ZERO,
-                Duration::ZERO,
-                Duration::ZERO,
-                0,
-                batch_started.elapsed(),
-            );
-            return finish_batch_sync(peer, &known_topics, &failed_topics);
-        }
-
-        let r2_message_count = sync_messages.len();
-        let r2_io_started = Instant::now();
-        let responses = timeout(
-            PEER_SYNC_TIMEOUT,
-            self.net.sync_with(peer_addr.clone(), &sync_messages),
-        )
-        .await
-        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
-        .map_err(NetError::from)?;
-        let r2_io = r2_io_started.elapsed();
-        let r2_process_started = Instant::now();
-        let node = self.node.clone();
-        let net = self.net.clone();
-        let data_known = known_topics.clone();
-        let eviction_tx = self.eviction_tx.clone();
-        let (mut failed_topics, followup) = tokio::task::spawn_blocking(move || {
-            process_data_responses(
-                &node,
-                &net,
-                peer,
-                &data_known,
-                failed_topics,
-                responses,
-                &eviction_tx,
-            )
-        })
-        .await
-        .map_err(|error| NetError::Bootstrap(error.to_string()))??;
-        let r2_process = r2_process_started.elapsed();
-        let fu_io_started = Instant::now();
-        if !followup.is_empty() {
-            let responses = timeout(PEER_SYNC_TIMEOUT, self.net.sync_with(peer_addr, &followup))
-                .await
-                .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
-                .map_err(NetError::from)?;
-            for response in responses {
-                match response {
-                    SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
-                    SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
-                        failed_topics.insert(failure.topic_id);
-                        warn!(
-                            %peer,
-                            topic_id = %failure.topic_id,
-                            code = ?failure.code,
-                            "Skipping document sync batch topic: peer rejected the sync ack"
-                        );
-                    }
-                    other => {
-                        return Err(NetError::Bootstrap(format!(
-                            "unexpected document sync batch ack response from {peer}: {other:?}"
-                        )));
-                    }
-                }
-            }
-        }
-        log_batch_summary(
-            peer,
-            topic_count,
-            r1_build,
-            r1_io,
-            r1_process,
-            r2_io,
-            r2_process,
-            fu_io_started.elapsed(),
-            r2_message_count,
-            batch_started.elapsed(),
-        );
-        finish_batch_sync(peer, &known_topics, &failed_topics)
+        let results = self.net.sync_topics_now(peer_addr, &topic_ids).await;
+        finish_batch_sync(peer, &results)
     }
 
     pub(in crate::document_sync) async fn bootstrap_from_peers(
@@ -610,7 +476,7 @@ impl DocumentSyncService {
             .await
             .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
             .map_err(NetError::from)?;
-            probe.merge(classify_probe_responses(&wanted, responses));
+            probe.merge(classify_probe_responses(&wanted, responses.messages()));
         }
         Ok(probe)
     }
@@ -628,7 +494,8 @@ impl DocumentSyncService {
         .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
         .map_err(NetError::from)?;
         let summary = responses
-            .into_iter()
+            .messages()
+            .iter()
             .find_map(|response| match response {
                 SyncMessage::Summary(summary) if summary.topic_id == topic_id => Some(summary),
                 _ => None,
@@ -638,7 +505,7 @@ impl DocumentSyncService {
                     "peer {peer} did not return a document sync summary for topic {topic_id}"
                 ))
             })?;
-        if summary_is_empty(&summary) {
+        if summary_is_empty(summary) {
             return Ok(());
         }
         if summary.event_type_id.as_deref() != Some(DocumentEvent::TYPE_ID) {
@@ -648,69 +515,7 @@ impl DocumentSyncService {
             )));
         }
 
-        let request = SyncRequest {
-            topic_id,
-            known: BTreeSet::new(),
-            wants: summary.heads,
-            actor_range_hints: Vec::new(),
-        };
-        let responses = timeout(
-            PEER_SYNC_TIMEOUT,
-            self.net.sync_with(
-                peer_addr.clone(),
-                &[
-                    SyncMessage::Open(self.node.sync_open(topic_id)),
-                    SyncMessage::Request(request),
-                ],
-            ),
-        )
-        .await
-        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
-        .map_err(NetError::from)?;
-
-        let mut followup = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
-        let mut received_data = false;
-        for response in responses {
-            match response {
-                SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
-                SyncMessage::Data(data) if data.topic_id == topic_id => {
-                    let (ack, evictions) = self
-                        .node
-                        .receive_sync_data_from_evicting(peer, data)
-                        .map_err(|error| {
-                            report_journal_full(topic_id, &error);
-                            NetError::Bootstrap(error.to_string())
-                        })?;
-                    self.forward_evictions(evictions);
-                    received_data = true;
-                    followup.push(SyncMessage::Ack(ack));
-                }
-                other => {
-                    return Err(NetError::Bootstrap(format!(
-                        "unexpected document sync bootstrap response: {other:?}"
-                    )));
-                }
-            }
-        }
-        if received_data {
-            self.net.schedule_topic_recheck(topic_id)?;
-        }
-        if followup.len() > 1 {
-            let responses = timeout(PEER_SYNC_TIMEOUT, self.net.sync_with(peer_addr, &followup))
-                .await
-                .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?
-                .map_err(NetError::from)?;
-            for response in responses {
-                match response {
-                    SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
-                    other => {
-                        return Err(NetError::Bootstrap(format!(
-                            "unexpected document sync bootstrap ack response: {other:?}"
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(())
+        let results = self.net.sync_topics_now(peer_addr, &[topic_id]).await;
+        finish_batch_sync(peer, &results)
     }
 }

@@ -105,12 +105,6 @@ impl DocumentSyncService {
         documents
     }
 
-    /// Forwards evictions produced by this service's own admission paths into
-    /// the shared eviction sink.
-    pub(in crate::document_sync) fn forward_evictions(&self, evictions: Vec<TopicEviction>) {
-        forward_evictions_to(&self.eviction_tx, evictions);
-    }
-
     /// Decodes an eviction Irokle already journalled with its reset and drops
     /// the replaced chain's cursors. The journal remains until every replacement
     /// outbox row is committed.
