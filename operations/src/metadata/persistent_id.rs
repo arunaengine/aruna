@@ -137,6 +137,33 @@ pub async fn mint_persistent_id(
     ))
 }
 
+/// Adds external identifiers on this node's row; callers route to the PID authority first.
+pub async fn add_secondary_ids(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    document_id: Ulid,
+    identifiers: Vec<aruna_core::structs::secondary_id::SecondaryIdentifier>,
+    occurred_at_ms: u64,
+) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
+    let route = mapping_route(ctx, realm_id, document_id).await?;
+    let result = crate::driver::drive(
+        crate::metadata::secondary_ids::AddIdentifiersOperation::new(
+            crate::metadata::secondary_ids::AddIdentifiersInput {
+                document_id,
+                identifiers,
+                route,
+                occurred_at_ms,
+            },
+        ),
+        ctx,
+    )
+    .await?;
+    if result.1 {
+        schedule_drain(ctx).await;
+    }
+    Ok(result)
+}
+
 /// Record a terminal provider failure on the same intent. Projection absence
 /// must never call this path; the mint handler uses the non-terminal Processing
 /// transition above for that condition.

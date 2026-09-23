@@ -27,6 +27,7 @@ pub mod raw_revision;
 pub mod repository;
 mod search_cursor;
 mod search_enrichment;
+pub mod secondary_ids;
 pub mod stats;
 mod summary_cache;
 #[cfg(test)]
