@@ -400,6 +400,10 @@ records, checks ownership and restricted access, creates another version, and te
 copy imports, reference reads and metadata-only imports. Use a disposable repository with
 external DOI registration and email disabled.
 
+The opt-in `invenio::live::zenodo_reference` test imports a public Zenodo record in copy,
+reference and metadata modes and compares every file with the bytes Zenodo serves. It needs
+network access to zenodo.org. `ARUNA_ZENODO_RECORD` selects the record, default `16623955`.
+
 ## License
 
 Aruna is licensed under either of
