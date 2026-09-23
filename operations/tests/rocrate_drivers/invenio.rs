@@ -18,6 +18,8 @@ use std::sync::Mutex;
 mod export;
 #[path = "invenio_import.rs"]
 mod import;
+#[path = "invenio_remote.rs"]
+mod remote;
 #[path = "invenio_live.rs"]
 mod live;
 
