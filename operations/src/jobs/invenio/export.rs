@@ -201,6 +201,7 @@ pub(crate) async fn create_draft(
         doi: record["pids"]["doi"]["identifier"]
             .as_str()
             .map(str::to_string),
+        html_url: None,
     })
 }
 
@@ -554,6 +555,7 @@ async fn finish(
         doi: current["pids"]["doi"]["identifier"]
             .as_str()
             .map(str::to_string),
+        html_url: None,
     })
 }
 

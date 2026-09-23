@@ -326,6 +326,7 @@ pub async fn submit_rocrate_export(
                 publish: destination.publish,
                 public_files: destination.public_files,
                 credential: None,
+                link: None,
             })
         })
         .transpose()?;

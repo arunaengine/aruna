@@ -10,6 +10,8 @@ use ulid::Ulid;
 
 mod credential;
 pub use credential::InvenioCredential;
+mod link;
+pub use link::*;
 mod projection;
 pub use projection::normalize_metadata;
 
@@ -66,6 +68,8 @@ pub struct InvenioDestination {
     pub publish: bool,
     pub public_files: bool,
     pub credential: Option<InvenioCredential>,
+    /// Set when a lasting link pushes; its token then comes from the link's sealed secret.
+    pub link: Option<LinkTarget>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -76,6 +80,8 @@ pub struct InvenioRecord {
     pub parent_id: String,
     pub revision_id: u64,
     pub doi: Option<String>,
+    /// The repository's page for people, when it names one on its own origin.
+    pub html_url: Option<String>,
 }
 
 #[derive(Debug, Error)]

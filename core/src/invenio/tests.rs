@@ -85,6 +85,7 @@ fn binds_repository_login() {
                     InvenioCredential::seal(&key, user, group, connector, endpoint.into(), token)
                         .unwrap(),
                 ),
+                link: None,
             }),
         })
     };

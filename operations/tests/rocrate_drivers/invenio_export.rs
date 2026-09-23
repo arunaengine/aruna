@@ -28,6 +28,7 @@ async fn export_spec(
         publish,
         public_files: false,
         credential: None,
+        link: None,
     };
     destination.credential = Some(
         aruna_operations::jobs::invenio::seal_credential(

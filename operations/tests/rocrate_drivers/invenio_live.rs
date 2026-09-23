@@ -44,6 +44,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
         publish: false,
         public_files: false,
         credential: None,
+        link: None,
     };
     destination.credential = Some(
         seal_credential(
