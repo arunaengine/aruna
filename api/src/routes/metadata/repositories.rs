@@ -325,6 +325,7 @@ pub async fn replace_repository(
 
 **Behavior**
 - Repeating the call answers 404.
+- A connector that Invenio links on this node still use is kept and answers 409.
 - Existing reference imports keep their repository file URLs and read them without the removed
   token from then on."#,
     params(
@@ -336,7 +337,8 @@ pub async fn replace_repository(
         (status = 400, description = "An id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's metadata path", body = ErrorResponse),
-        (status = 404, description = "No such connector in this group", body = ErrorResponse)
+        (status = 404, description = "No such connector in this group", body = ErrorResponse),
+        (status = 409, description = "Invenio links still use the connector", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -416,6 +418,7 @@ fn update_error(error: UpdateConnectorError) -> ServerError {
             ServerError::Conflict(error.to_string())
         }
         UpdateConnectorError::NotFound => ServerError::NotFound,
+        UpdateConnectorError::InUse => ServerError::Conflict(error.to_string()),
         UpdateConnectorError::SecretEndpoint => ServerError::BadRequestReason(error.to_string()),
         UpdateConnectorError::GroupWrite(_)
         | UpdateConnectorError::Storage(_)

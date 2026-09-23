@@ -4,9 +4,12 @@
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE};
+use aruna_core::keyspaces::{
+    CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, LINK_CONNECTOR_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::types::{Effects, GroupId, TxnId};
+use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
 
@@ -20,13 +23,14 @@ enum State {
     Init,
     Start,
     ReadRecord,
+    ReadLinks,
     Delete,
     Commit,
     Aborting,
     Finish,
 }
 
-/// Removes a connector and its secret together; a second delete is not found.
+/// Removes a connector and its secret together unless a link uses it; a second delete is not found.
 #[derive(Debug, PartialEq)]
 pub struct DeleteRepositoryOperation {
     group_id: GroupId,
@@ -84,24 +88,37 @@ impl Operation for DeleteRepositoryOperation {
             }
             (State::ReadRecord, event) => match parse_connector_read(event) {
                 Ok(Some(_)) => {
-                    self.state = State::Delete;
-                    smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: vec![
-                            (
-                                CONNECTOR_INDEX_KEYSPACE.to_string(),
-                                connector_key(self.group_id, self.connector_id),
-                            ),
-                            (
-                                CONNECTOR_SECRET_KEYSPACE.to_string(),
-                                connector_secret_key(self.connector_id),
-                            ),
-                        ],
+                    self.state = State::ReadLinks;
+                    smallvec![Effect::Storage(StorageEffect::Iter {
+                        key_space: LINK_CONNECTOR_KEYSPACE.to_string(),
+                        prefix: Some(ByteView::from(self.connector_id.to_bytes().to_vec())),
+                        start: None,
+                        limit: 1,
                         txn_id: self.txn_id,
                     })]
                 }
                 Ok(None) => self.fail(UpdateConnectorError::NotFound),
                 Err(_) => self.fail(UpdateConnectorError::Unexpected),
             },
+            (State::ReadLinks, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                if !values.is_empty() {
+                    return self.fail(UpdateConnectorError::InUse);
+                }
+                self.state = State::Delete;
+                smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                    deletes: vec![
+                        (
+                            CONNECTOR_INDEX_KEYSPACE.to_string(),
+                            connector_key(self.group_id, self.connector_id),
+                        ),
+                        (
+                            CONNECTOR_SECRET_KEYSPACE.to_string(),
+                            connector_secret_key(self.connector_id),
+                        ),
+                    ],
+                    txn_id: self.txn_id,
+                })]
+            }
             (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 match self.txn_id {
                     Some(txn_id) => {
@@ -177,5 +194,46 @@ mod tests {
         )
         .await;
         assert_eq!(again.unwrap_err(), UpdateConnectorError::NotFound);
+    }
+
+    #[tokio::test]
+    async fn keeps_linked_connector() {
+        let (_dir, context) = context();
+        let group_id = Ulid::generate();
+        let connector = create(&context, group_id).await.connector_id;
+        let key = aruna_core::invenio::connector_link_key(connector, Ulid::generate());
+        let written = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: LINK_CONNECTOR_KEYSPACE.to_string(),
+                key: ByteView::from(key.clone()),
+                value: ByteView::from(Ulid::generate().to_bytes().to_vec()),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            written,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let refused = drive(
+            DeleteRepositoryOperation::new(group_id, connector),
+            &context,
+        )
+        .await;
+        assert_eq!(refused.unwrap_err(), UpdateConnectorError::InUse);
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: LINK_CONNECTOR_KEYSPACE.to_string(),
+                key: ByteView::from(key),
+                txn_id: None,
+            })
+            .await;
+        drive(
+            DeleteRepositoryOperation::new(group_id, connector),
+            &context,
+        )
+        .await
+        .unwrap();
     }
 }

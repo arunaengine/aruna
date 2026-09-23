@@ -50,6 +50,8 @@ pub enum UpdateConnectorError {
     NotFound,
     #[error("a changed endpoint needs a new secret or an explicit secret removal")]
     SecretEndpoint,
+    #[error("repository connector is used by Invenio links; remove them first")]
+    InUse,
     #[error("unexpected event while changing a repository connector")]
     Unexpected,
 }
