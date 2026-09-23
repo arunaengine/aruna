@@ -23,6 +23,8 @@ fn summary_for(
         heads,
         actor_clock: ::irokle::ActorClock::default(),
         actor_tips: BTreeMap::new(),
+        genesis: None,
+        staged: None,
     }
 }
 
@@ -40,7 +42,7 @@ fn empty_confirms_unknown() {
         )),
         // topic(3) omitted entirely: refused (held, prober not a member).
     ];
-    let probe = classify_probe_responses(&wanted, responses);
+    let probe = classify_probe_responses(&wanted, &responses);
     assert_eq!(probe.confirmed_unknown, BTreeSet::from([topic(1)]));
     assert_eq!(probe.known, BTreeSet::from([topic(2)]));
     assert!(!probe.confirmed_unknown.contains(&topic(3)));
@@ -56,7 +58,7 @@ fn unwanted_summaries_ignored() {
         BTreeSet::new(),
     ))];
     assert_eq!(
-        classify_probe_responses(&wanted, responses),
+        classify_probe_responses(&wanted, &responses),
         PeerTopicProbe::default()
     );
 }
@@ -180,70 +182,14 @@ async fn fanout_propagates_failure() {
     assert!(message.contains("offline peer"));
 }
 
-fn batch_test_node(seed: u8) -> (TempDir, ::irokle::Irokle<::irokle::FjallStorage>) {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db = fjall::OptimisticTxDatabase::builder(dir.path())
-        .open()
-        .expect("fjall database opens");
-    let node = ::irokle::Irokle::builder()
-        .with_iroh_secret_key(&iroh::SecretKey::from_bytes(&[seed; 32]))
-        .with_fjall_database_and_persist_mode(db, fjall::PersistMode::Buffer)
-        .expect("fjall storage")
-        .build()
-        .expect("irokle node builds");
-    (dir, node)
-}
-
-#[test]
-fn batch_failure_scoped() {
-    // A per-topic failure frame must not abort the batch: the topics after
-    // it in the same response still get negotiated.
-    let (_dir, node) = batch_test_node(21);
-    let known_topics = BTreeSet::from([topic(1), topic(2)]);
-    let local_fingerprints = BTreeMap::from([(topic(2), [0; 32])]);
-    let responses = vec![
-        SyncMessage::Failure(::irokle::sync::SyncFailure {
-            topic_id: topic(1),
-            code: ::irokle::sync::SyncFailureCode::Fingerprint,
-        }),
-        SyncMessage::Fingerprint(::irokle::sync::SyncFingerprint {
-            topic_id: topic(2),
-            fingerprint: [0; 32],
-        }),
-    ];
-
-    let (responded, failed, _messages) = process_summary_responses(
-        &node,
-        peer(9),
-        &known_topics,
-        &local_fingerprints,
-        responses,
-    )
-    .expect("a per-topic failure must not fail the whole batch");
-
-    assert_eq!(responded, known_topics);
-    assert_eq!(failed, BTreeSet::from([topic(1)]));
-}
-
-#[test]
-fn unknown_failure_errors() {
-    let (_dir, node) = batch_test_node(22);
-    let known_topics = BTreeSet::from([topic(1)]);
-    let responses = vec![SyncMessage::Failure(::irokle::sync::SyncFailure {
-        topic_id: topic(7),
-        code: ::irokle::sync::SyncFailureCode::Open,
-    })];
-
-    process_summary_responses(&node, peer(9), &known_topics, &BTreeMap::new(), responses)
-        .expect_err("a failure for an unrequested topic indicts the peer");
-}
-
 #[test]
 fn known_failure_rejected() {
-    let known_topics = BTreeSet::from([topic(3), topic(4)]);
-    let failed_topics = BTreeSet::from([topic(4)]);
+    let results = BTreeMap::from([
+        (topic(3), Ok(())),
+        (topic(4), Err(std::io::Error::other("peer refused"))),
+    ]);
 
-    let error = finish_batch_sync(peer(5), &known_topics, &failed_topics)
+    let error = finish_batch_sync(peer(5), &results)
         .expect_err("partial topic failure must fail the batch");
 
     let NetError::Bootstrap(message) = error else {
@@ -254,11 +200,20 @@ fn known_failure_rejected() {
 
 #[test]
 fn clean_batch_succeeds() {
-    let known_topics = BTreeSet::from([topic(6), topic(7)]);
-    let failed_topics = BTreeSet::new();
+    let results = BTreeMap::from([(topic(6), Ok(())), (topic(7), Ok(()))]);
 
-    finish_batch_sync(peer(8), &known_topics, &failed_topics)
-        .expect("batch with no failed topics should succeed");
+    finish_batch_sync(peer(8), &results).expect("batch with no failed topics should succeed");
+}
+
+#[test]
+fn paged_batch_succeeds() {
+    // Irokle reports WouldBlock when it scheduled the pages left after its budget.
+    let results = BTreeMap::from([(
+        topic(6),
+        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+    )]);
+
+    finish_batch_sync(peer(8), &results).expect("scheduled pages are progress, not failure");
 }
 
 #[test]
