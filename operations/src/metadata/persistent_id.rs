@@ -298,7 +298,7 @@ pub struct MappingRoute {
     pub generation: u64,
 }
 
-async fn mapping_route(
+pub(crate) async fn mapping_route(
     ctx: &DriverContext,
     realm_id: RealmId,
     document_id: Ulid,

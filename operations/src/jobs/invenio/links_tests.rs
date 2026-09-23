@@ -6,9 +6,13 @@ use super::*;
 use aruna_core::UserId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::invenio::{InvenioRecord, LinkFailure, LinkRemote};
+use aruna_core::keyspaces::{
+    SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, WRITE_FENCE_KEYSPACE,
+};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
 
@@ -170,7 +174,18 @@ fn create_writes_rows() {
         message: "no task handle".into(),
     }));
     assert!(op.is_complete());
-    assert_eq!(op.finalize(), Ok(Some(link)));
+    let created = op.finalize().unwrap().unwrap();
+    assert!(
+        created.generation > 0,
+        "the stored row carries a sync generation"
+    );
+    assert_eq!(
+        InvenioLink {
+            generation: 0,
+            ..created
+        },
+        link
+    );
 }
 
 #[test]
@@ -369,4 +384,111 @@ fn patch_pauses_quietly() {
     let effects = commit(&mut op, effects);
     assert!(effects.is_empty());
     assert_eq!(op.finalize().unwrap().unwrap().status, LinkStatus::Paused);
+}
+
+fn route(generation: u64) -> MappingRoute {
+    MappingRoute {
+        realm_id: RealmId::from_bytes([3; 32]),
+        placement: PlacementRef {
+            strategy_id: Ulid::from_bytes([8; 16]),
+            shard: 2,
+        },
+        peers: vec![iroh::SecretKey::from_bytes(&[9; 32]).public()],
+        actor: link().owner_node,
+        generation,
+    }
+}
+
+/// Answers the fence read of a routed change with the stored fence value.
+fn fenced(
+    op: &mut ChangeLinkOperation,
+    stored: Option<&InvenioLink>,
+    fence: Option<u64>,
+) -> Effects {
+    let effects = read(op, stored);
+    assert!(matches!(
+        &effects[..],
+        [Effect::Storage(StorageEffect::Read { key_space, txn_id: Some(TXN), .. })]
+            if key_space == WRITE_FENCE_KEYSPACE
+    ));
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: ByteView::from(vec![]),
+        value: fence.map(|closed| ByteView::from(closed.to_be_bytes().to_vec())),
+    }))
+}
+
+fn outbox_event(rows: &[(String, Key, Value)]) -> DocumentOutboxEvent {
+    let row = rows
+        .iter()
+        .find(|row| row.0 == SYNC_OUTBOX_KEYSPACE)
+        .expect("outbox row");
+    postcard::from_bytes::<aruna_core::document::DocumentOutboxRecord>(&row.2)
+        .unwrap()
+        .event
+}
+
+#[test]
+fn routed_changes_replicate() {
+    let link = link();
+    let route = route(3);
+    let mut op = operation(LinkChange::Create {
+        link: Box::new(link.clone()),
+        secret: secret(link.link_id),
+    })
+    .routed(Some(route.clone()));
+    let effects = fenced(&mut op, None, Some(2));
+    let rows = written(&effects);
+    for keyspace in [
+        SYNC_REVISION_KEYSPACE,
+        SHARD_MANIFEST_KEYSPACE,
+        SYNC_OUTBOX_KEYSPACE,
+    ] {
+        assert!(
+            keyspaces(&rows).contains(&keyspace),
+            "{keyspace} row missing"
+        );
+    }
+    let effects = commit(&mut op, effects);
+    assert_eq!(effects.len(), 2, "link and outbox drains are scheduled");
+    for _ in 0..2 {
+        op.step(Event::Task(TaskEvent::Error {
+            key: None,
+            message: "no task handle".into(),
+        }));
+    }
+    let created = op.finalize().unwrap().unwrap();
+    assert!(created.generation > 0);
+    let DocumentOutboxEvent::Upsert { bytes, change } = outbox_event(&rows) else {
+        panic!("create publishes an upsert");
+    };
+    assert_eq!(InvenioLink::from_bytes(&bytes).unwrap(), created);
+    assert_eq!(change, created.sync_change(route.placement));
+
+    // A delete keeps a tombstone that orders after the last stored change.
+    let mut op = operation(LinkChange::Delete).routed(Some(route.clone()));
+    let effects = fenced(&mut op, Some(&created), None);
+    let rows = written(&effects);
+    let DocumentOutboxEvent::Delete { change } = outbox_event(&rows) else {
+        panic!("delete publishes a delete");
+    };
+    assert_eq!(change, created.delete_change(route.placement));
+    assert!(keyspaces(&rows).contains(&SHARD_MANIFEST_KEYSPACE));
+    assert!(!keyspaces(&rows).contains(&INVENIO_LINK_KEYSPACE));
+}
+
+#[test]
+fn closed_fence_refuses() {
+    let link = link();
+    let mut op = operation(LinkChange::Patch(LinkPatch::default())).routed(Some(route(3)));
+    let effects = fenced(&mut op, Some(&link), Some(3));
+    assert!(matches!(
+        effects[..],
+        [Effect::Storage(StorageEffect::AbortTransaction {
+            txn_id: TXN
+        })]
+    ));
+    op.step(Event::Storage(StorageEvent::TransactionAborted {
+        txn_id: TXN,
+    }));
+    assert_eq!(op.finalize(), Err(LinkError::Fenced));
 }

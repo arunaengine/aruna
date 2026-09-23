@@ -13,9 +13,8 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
 use http::Method;
 
-use super::links::{ChangeLinkOperation, LinkChange, LinkError, read_link, read_secret};
+use super::links::{LinkChange, LinkError, change_link, read_link, read_secret};
 use super::{TransferError, connect};
-use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::export::{ExportCheckpoint, persist_checkpoint, read_export_checkpoint};
 use crate::metadata::AuthToken;
@@ -176,8 +175,7 @@ pub(crate) async fn settle(
         outcome: Box::new(push),
         requeue,
     };
-    let operation = ChangeLinkOperation::new(spec.document_id, target.link_id, change);
-    match drive(operation, ctx.driver.as_ref()).await {
+    match change_link(ctx.driver.as_ref(), &link, change).await {
         Ok(_) | Err(LinkError::NotFound) => outcome,
         // A cancelled job cannot retry; the queue drain settles its link later.
         Err(_) if matches!(outcome, JobRunOutcome::Cancelled) => outcome,

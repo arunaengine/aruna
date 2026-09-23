@@ -12,6 +12,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_SECRET_KEYSPACE};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
+use aruna_operations::driver::drive;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
 use std::collections::HashMap;
 

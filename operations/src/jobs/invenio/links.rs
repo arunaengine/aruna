@@ -4,17 +4,19 @@
 
 use std::time::{Duration, SystemTime};
 
+use aruna_core::document::{DocumentChange, DocumentOutboxEvent};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::invenio::{
-    InvenioCredential, InvenioLink, LinkBusy, LinkPatch, LinkQueueEntry, LinkStatus, PushOutcome,
-    connector_link_key, link_key, link_prefix,
+    InvenioCredential, InvenioLink, LinkBusy, LinkFailure, LinkPatch, LinkQueueEntry, LinkStatus,
+    PushOutcome, connector_link_key, link_key, link_prefix,
 };
 use aruna_core::keyspaces::{
     INVENIO_LINK_KEYSPACE, LINK_CONNECTOR_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
@@ -23,6 +25,11 @@ use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
+
+use crate::driver::{DriverContext, drive};
+use crate::metadata::persistent_id::{MappingRoute, mapping_route};
+use crate::placement::fence;
+use crate::sync::document_outbox::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
 const LINK_PAGE: usize = 256;
 
@@ -42,6 +49,8 @@ pub enum LinkChange {
         requeue: bool,
     },
     Delete,
+    /// Stops pushing with this reason; only an enabled link changes.
+    Fail(LinkFailure),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -64,6 +73,12 @@ pub enum LinkError {
     NoRevision,
     #[error("unexpected link storage event: {0}")]
     Unexpected(String),
+    #[error("this link is managed on its owner node {0}")]
+    NotOwner(String),
+    #[error("the dataset placement is moving; retry the link change")]
+    Fenced,
+    #[error("active job limit of {0} reached; the push waits for a free slot")]
+    JobLimit(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -71,6 +86,7 @@ enum State {
     Init,
     Start,
     Read,
+    Fence,
     Write,
     Delete,
     Commit,
@@ -90,6 +106,9 @@ pub struct ChangeLinkOperation {
     txn_id: Option<TxnId>,
     deletes: Vec<(String, Key)>,
     schedule: bool,
+    route: Option<MappingRoute>,
+    stored: Option<InvenioLink>,
+    pending: usize,
     output: Option<Result<Option<InvenioLink>, LinkError>>,
 }
 
@@ -104,8 +123,17 @@ impl ChangeLinkOperation {
             txn_id: None,
             deletes: Vec::new(),
             schedule: false,
+            route: None,
+            stored: None,
+            pending: 0,
             output: None,
         }
+    }
+
+    /// Replicates the change to the document's holders along `route`.
+    pub fn routed(mut self, route: Option<MappingRoute>) -> Self {
+        self.route = route;
+        self
     }
 
     fn fail(&mut self, error: LinkError) -> Effects {
@@ -169,6 +197,13 @@ impl ChangeLinkOperation {
                 queue = applied && requeue && link.status == LinkStatus::Enabled;
                 Some(link)
             }
+            (LinkChange::Fail(reason), Some(mut link)) => {
+                if link.status == LinkStatus::Enabled {
+                    link.status = LinkStatus::Failed { reason };
+                    link.updated_at = self.now;
+                }
+                Some(link)
+            }
             (LinkChange::Delete, Some(link)) => {
                 self.deletes.extend([
                     link_row.clone(),
@@ -179,11 +214,25 @@ impl ChangeLinkOperation {
                         ByteView::from(connector_link_key(link.connector_id, link.link_id)),
                     ),
                 ]);
+                if let Some(route) = &self.route {
+                    let change = link.delete_change(route.placement);
+                    writes.extend(sync_rows(route, &link, change, None)?);
+                }
                 None
             }
         };
+        let now_ms = millis(self.now);
+        let result = result.map(|mut link| {
+            link.stamp(now_ms);
+            link
+        });
         if let Some(link) = &result {
-            writes.push((link_row.0, link_row.1, ByteView::from(link.to_bytes()?)));
+            let bytes = link.to_bytes()?;
+            if let Some(route) = &self.route {
+                let change = link.sync_change(route.placement);
+                writes.extend(sync_rows(route, link, change, Some(bytes.clone()))?);
+            }
+            writes.push((link_row.0, link_row.1, ByteView::from(bytes)));
         }
         if queue {
             let entry = LinkQueueEntry {
@@ -258,12 +307,35 @@ impl Operation for ChangeLinkOperation {
                 })]
             }
             (State::Read, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let planned = value
+                let stored = match value
                     .map(|bytes| InvenioLink::from_bytes(&bytes))
                     .transpose()
-                    .map_err(LinkError::from)
-                    .and_then(|stored| self.plan(stored));
-                planned.unwrap_or_else(|error| self.fail(error))
+                {
+                    Ok(stored) => stored,
+                    Err(error) => return self.fail(error.into()),
+                };
+                // A departing holder's close either rejects this write or conflicts with it.
+                match self.route.as_ref().filter(|route| route.generation > 0) {
+                    Some(route) => {
+                        let (key_space, key) = fence::fence_read(&route.realm_id, &route.placement);
+                        self.stored = stored;
+                        self.state = State::Fence;
+                        smallvec![Effect::Storage(StorageEffect::Read {
+                            key_space,
+                            key,
+                            txn_id: self.txn_id,
+                        })]
+                    }
+                    None => self.plan(stored).unwrap_or_else(|error| self.fail(error)),
+                }
+            }
+            (State::Fence, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let generation = self.route.as_ref().map_or(0, |route| route.generation);
+                if !fence::admits(value.as_ref(), generation) {
+                    return self.fail(LinkError::Fenced);
+                }
+                let stored = self.stored.take();
+                self.plan(stored).unwrap_or_else(|error| self.fail(error))
             }
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 self.delete_rows()
@@ -273,16 +345,31 @@ impl Operation for ChangeLinkOperation {
             }
             (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
                 self.txn_id = None;
-                if !self.schedule {
-                    self.state = State::Done;
-                    return smallvec![];
+                let mut effects = Effects::new();
+                if self.schedule {
+                    effects.push(schedule_drain(Duration::ZERO));
                 }
-                self.state = State::Schedule;
-                smallvec![schedule_drain(Duration::ZERO)]
+                if self
+                    .route
+                    .as_ref()
+                    .is_some_and(|route| !route.peers.is_empty())
+                {
+                    effects.push(schedule_drain_effect());
+                }
+                self.pending = effects.len();
+                self.state = if effects.is_empty() {
+                    State::Done
+                } else {
+                    State::Schedule
+                };
+                effects
             }
-            // The queue row is durable, so the periodic rearm covers a lost timer.
+            // Queue and outbox rows are durable, so the periodic rearm covers a lost timer.
             (State::Schedule, Event::Task(_)) => {
-                self.state = State::Done;
+                self.pending = self.pending.saturating_sub(1);
+                if self.pending == 0 {
+                    self.state = State::Done;
+                }
                 smallvec![]
             }
             (_, other) => self.fail(LinkError::Unexpected(format!("{other:?}"))),
@@ -323,6 +410,60 @@ pub fn schedule_drain(after: Duration) -> Effect {
         key: TaskKey::DrainLinkQueue,
         after,
     })
+}
+
+fn millis(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// Sidecar, manifest entry and outbox publish that replicate one stored link change.
+/// Without `bytes` the change removes the row.
+fn sync_rows(
+    route: &MappingRoute,
+    link: &InvenioLink,
+    change: DocumentChange,
+    bytes: Option<Vec<u8>>,
+) -> Result<Vec<(String, Key, Value)>, ConversionError> {
+    let event = match bytes {
+        Some(bytes) => DocumentOutboxEvent::Upsert { bytes, change },
+        None => DocumentOutboxEvent::Delete { change },
+    };
+    let target = link.target();
+    let mut rows = vec![sync_revision_entry(&target, &change)?];
+    rows.extend(shard_manifest_entry(&target, &change)?);
+    if !route.peers.is_empty() {
+        let record = new_outbox_record(
+            route.actor,
+            target,
+            route.peers.clone(),
+            event,
+            route.placement,
+            false,
+        )
+        .fenced_at(route.generation);
+        rows.push(outbox_write_entry(&record)?);
+    }
+    Ok(rows)
+}
+
+/// Applies a change on the link's owner node and replicates it to the document's holders.
+pub async fn change_link(
+    context: &DriverContext,
+    link: &InvenioLink,
+    change: LinkChange,
+) -> Result<Option<InvenioLink>, LinkError> {
+    let route = match context.net_handle.as_ref() {
+        Some(net) if net.node_id() != link.owner_node => {
+            return Err(LinkError::NotOwner(link.owner_node_url.clone()));
+        }
+        Some(net) => mapping_route(context, *net.realm_id(), link.document_id)
+            .await
+            .map_err(|error| LinkError::Unexpected(error.to_string()))?,
+        None => None,
+    };
+    let operation = ChangeLinkOperation::new(link.document_id, link.link_id, change).routed(route);
+    drive(operation, context).await
 }
 
 pub(crate) fn id_key(id: Ulid) -> Key {

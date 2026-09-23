@@ -25,8 +25,8 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::links::{ChangeLinkOperation, LinkChange, LinkError, id_key, read_link, schedule_drain};
-use crate::driver::{DriverContext, drive};
+use super::links::{LinkChange, LinkError, change_link, id_key, read_link, schedule_drain};
+use crate::driver::DriverContext;
 use crate::jobs::service::submit_export_job;
 use crate::jobs::store::read_job_record;
 use crate::metadata::raw_revision::load_raw_revision;
@@ -241,11 +241,7 @@ async fn settle_stale(
         outcome: Box::new(outcome),
         requeue: false,
     };
-    drive(
-        ChangeLinkOperation::new(link.document_id, link.link_id, change),
-        context.as_ref(),
-    )
-    .await?;
+    change_link(context, link, change).await?;
     // A cancelled push skips its change; the next change queues a new check.
     if cancelled {
         return drop_entry(&context.storage_handle, link.link_id).await;
@@ -278,15 +274,7 @@ pub async fn start_push(
     let submitted = submit_export_job(context, spec, owner, Some(link.push_key(event_id, publish)))
         .await
         .map_err(|error| LinkError::Submit(error.to_string()))?;
-    drive(
-        ChangeLinkOperation::new(
-            link.document_id,
-            link.link_id,
-            LinkChange::Begin(submitted.job_id),
-        ),
-        context.as_ref(),
-    )
-    .await?;
+    change_link(context, link, LinkChange::Begin(submitted.job_id)).await?;
     Ok(submitted.job_id)
 }
 

@@ -8,9 +8,8 @@ use std::time::SystemTime;
 use aruna_core::invenio::{InvenioLink, LinkRemote, LinkStatus, validate_id};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
 use aruna_operations::jobs::invenio::links::{
-    ChangeLinkOperation, LinkChange, LinkError, list_links, read_link,
+    LinkChange, LinkError, change_link, list_links, read_link,
 };
 use aruna_operations::jobs::invenio::{TransferError, seal_link_token};
 use axum::extract::{Path, State};
@@ -208,10 +207,14 @@ pub(super) fn response(link: InvenioLink, queued: bool) -> InvenioLinkResponse {
 pub(super) fn link_error(error: LinkError) -> ServerError {
     match error {
         LinkError::NotFound => ServerError::NotFound,
-        LinkError::Exists | LinkError::Busy(_) | LinkError::NoRevision => {
-            ServerError::Conflict(error.to_string())
+        LinkError::Exists
+        | LinkError::Busy(_)
+        | LinkError::NoRevision
+        | LinkError::NotOwner(_)
+        | LinkError::JobLimit(_) => ServerError::Conflict(error.to_string()),
+        LinkError::Submit(_) | LinkError::Fenced => {
+            ServerError::ServiceUnavailableReason(error.to_string())
         }
-        LinkError::Submit(_) => ServerError::ServiceUnavailableReason(error.to_string()),
         LinkError::ForeignToken
         | LinkError::Storage(_)
         | LinkError::Conversion(_)
@@ -290,12 +293,9 @@ pub(super) async fn change(
     link: &InvenioLink,
     change: LinkChange,
 ) -> ServerResult<Option<InvenioLink>> {
-    drive(
-        ChangeLinkOperation::new(link.document_id, link.link_id, change),
-        state.get_ctx().as_ref(),
-    )
-    .await
-    .map_err(link_error)
+    change_link(state.get_ctx().as_ref(), link, change)
+        .await
+        .map_err(link_error)
 }
 
 pub(super) async fn view(
@@ -432,20 +432,14 @@ pub async fn create_link(
         updated_at: now,
         generation: 0,
     };
-    let created = drive(
-        ChangeLinkOperation::new(
-            document_id,
-            link_id,
-            LinkChange::Create {
-                link: Box::new(link),
-                secret,
-            },
-        ),
-        context.as_ref(),
-    )
-    .await
-    .map_err(link_error)?
-    .ok_or_else(|| ServerError::InternalError("created link missing".into()))?;
+    let change = LinkChange::Create {
+        link: Box::new(link.clone()),
+        secret,
+    };
+    let created = change_link(context.as_ref(), &link, change)
+        .await
+        .map_err(link_error)?
+        .ok_or_else(|| ServerError::InternalError("created link missing".into()))?;
     Ok((StatusCode::CREATED, Json(response(created, true))))
 }
 
