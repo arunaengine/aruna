@@ -430,6 +430,7 @@ pub async fn create_link(
         limits: state.rocrate_limits().clone(),
         created_at: now,
         updated_at: now,
+        generation: 0,
     };
     let created = drive(
         ChangeLinkOperation::new(

@@ -86,6 +86,7 @@ pub(super) async fn linked(
         limits: RoCrateLimits::default(),
         created_at: now,
         updated_at: now,
+        generation: 0,
     };
     let change = LinkChange::Create {
         link: Box::new(link),

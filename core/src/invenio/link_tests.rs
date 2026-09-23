@@ -41,6 +41,7 @@ fn link() -> InvenioLink {
         limits: RoCrateLimits::default(),
         created_at: SystemTime::UNIX_EPOCH,
         updated_at: SystemTime::UNIX_EPOCH,
+        generation: 0,
     }
 }
 
@@ -232,4 +233,25 @@ fn binds_link_token() {
     assert!(open(&unbound).is_err());
     assert!(!format!("{sealed:?}").contains("link-token"));
     assert!(!format!("{link:?}").contains("link-token"));
+}
+
+#[test]
+fn orders_sync_changes() {
+    let mut link = link();
+    link.stamp(5_000);
+    let first = link.sync_change(PlacementRef::NIL);
+    // A clock that went back still moves the generation forward.
+    link.stamp(10);
+    let second = link.sync_change(PlacementRef::NIL);
+    assert_eq!(second.current.generation, 5_001);
+    assert!(second.current > first.current);
+    assert_eq!(first, {
+        let mut copy = link.clone();
+        copy.generation = 5_000;
+        copy.sync_change(PlacementRef::NIL)
+    });
+    let delete = link.delete_change(PlacementRef::NIL);
+    assert_eq!(delete.kind, DocumentChangeKind::Delete);
+    assert!(delete.current > second.current);
+    assert_eq!(delete.current.actor, link.owner_node);
 }

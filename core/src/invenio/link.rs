@@ -9,8 +9,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::{InvenioDestination, InvenioRecord};
+use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
 use crate::structs::execution::job::{JobId, RoCrateLimits};
+use crate::structs::placement::record::PlacementRef;
 use crate::{NodeId, UserId};
 
 /// Quiet time after a change before a link pushes, so a burst of edits becomes one push.
@@ -22,6 +24,8 @@ pub enum LinkFailure {
     TokenRejected,
     SourceUnavailable,
     Other(String),
+    /// The owner node no longer holds the dataset, so it cannot push it.
+    OwnerNotHolder,
 }
 
 impl LinkFailure {
@@ -31,6 +35,7 @@ impl LinkFailure {
             Self::TokenRejected => "token_rejected",
             Self::SourceUnavailable => "source_unavailable",
             Self::Other(reason) => reason,
+            Self::OwnerNotHolder => "owner_not_holder",
         }
     }
 }
@@ -85,6 +90,8 @@ pub struct InvenioLink {
     pub limits: RoCrateLimits,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+    /// Sync generation of the stored row; it grows with every change the owner stores.
+    pub generation: u64,
 }
 
 /// Link identity and lineage a push job checks before it touches the repository.
@@ -126,6 +133,48 @@ pub struct LinkQueueEntry {
 pub struct LinkBusy;
 
 impl InvenioLink {
+    pub fn target(&self) -> DocumentTarget {
+        DocumentTarget::InvenioLink {
+            document_id: self.document_id,
+            link_id: self.link_id,
+        }
+    }
+
+    /// Moves the sync generation past the stored one before the owner writes the row.
+    pub fn stamp(&mut self, now_ms: u64) {
+        self.generation = now_ms.max(self.generation.saturating_add(1));
+    }
+
+    /// Sync change of the stored row, derived from the row alone so every holder derives the same.
+    pub fn sync_change(&self, placement: PlacementRef) -> DocumentChange {
+        self.change_at(self.generation, DocumentChangeKind::Upsert, placement)
+    }
+
+    /// Sync change that removes the row; it orders after the last stored generation.
+    pub fn delete_change(&self, placement: PlacementRef) -> DocumentChange {
+        let generation = self.generation.saturating_add(1);
+        self.change_at(generation, DocumentChangeKind::Delete, placement)
+    }
+
+    fn change_at(
+        &self,
+        generation: u64,
+        kind: DocumentChangeKind,
+        placement: PlacementRef,
+    ) -> DocumentChange {
+        DocumentChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation,
+                event_id: Ulid::from_parts(generation, self.link_id.random()),
+                actor: self.owner_node,
+                updated_at_ms: generation,
+            },
+            kind,
+            placement,
+        }
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }

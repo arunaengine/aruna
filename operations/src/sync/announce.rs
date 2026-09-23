@@ -11,6 +11,7 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::invenio::InvenioLink;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
 use aruna_core::operation::Operation;
@@ -358,6 +359,19 @@ impl AnnounceTopicOperation {
                     )));
                 }
                 Ok(placement_policy_change(&document, self.placement))
+            }
+            DocumentTarget::InvenioLink {
+                document_id,
+                link_id,
+            } => {
+                let link =
+                    InvenioLink::from_bytes(bytes).map_err(AnnounceTopicError::ConversionError)?;
+                if link.document_id != *document_id || link.link_id != *link_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "invenio link target {document_id}/{link_id} does not match its payload"
+                    )));
+                }
+                Ok(link.sync_change(self.placement))
             }
             // Single-writer upserts need only this node's monotonic wall-clock generation.
             DocumentTarget::NodeUsage { .. }
