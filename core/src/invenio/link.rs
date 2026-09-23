@@ -286,3 +286,7 @@ pub fn connector_link_key(connector_id: Ulid, link_id: Ulid) -> Vec<u8> {
     key.extend_from_slice(&link_id.to_bytes());
     key
 }
+
+#[cfg(test)]
+#[path = "link_tests.rs"]
+mod tests;
