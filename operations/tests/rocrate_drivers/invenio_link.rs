@@ -14,6 +14,7 @@ use aruna_operations::jobs::invenio::links::{ChangeLinkOperation, LinkChange, li
 use aruna_operations::jobs::invenio::seal_link_token;
 use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::jobs::store::{complete_job, fail_job};
+use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::raw_revision::load_raw_revision;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
@@ -478,6 +479,108 @@ async fn queued_push_recovers() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(pushed.remote.draft_id.as_deref(), Some("2"));
     assert_eq!(server.state.lock().unwrap().records["2"].parent, "p1");
     assert_eq!(server.state.lock().unwrap().records.len(), 2);
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_job_slots_wait() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    // Other exports of the creator take every active job slot.
+    let spec = ExportRoCrateSpec {
+        destination: None,
+        auth_context: AuthContext {
+            user_id: link.created_by,
+            realm_id: link.created_by.realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        document_id: link.document_id,
+        limits: link.limits.clone(),
+    };
+    let mut fillers = Vec::new();
+    for slot in 0..link.limits.max_active_jobs {
+        let key = Some(format!("filler-{slot}"));
+        let job = submit_export_job(&fixture.context, spec.clone(), fixture.actor.node_id, key);
+        match job.await {
+            Ok(job) => fillers.push(job.job_id),
+            Err(SubmitJobError::ActiveJobLimit { .. }) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    drain(&fixture).await?;
+    let (waiting, queued) = current(&fixture, &link).await;
+    assert_eq!(
+        waiting.status,
+        LinkStatus::Enabled,
+        "a full job queue is no failure"
+    );
+    assert!(
+        queued && waiting.active_job.is_none(),
+        "the push stays pending"
+    );
+
+    let filler = fillers[0];
+    let payload = JobPayload::ExportRoCrate(spec);
+    let ctx = claim_context(&fixture, filler, payload).await?;
+    let error = aruna_core::structs::execution::job::JobError::retryable("freed".to_string());
+    let now = unix_timestamp_millis();
+    fail_job(
+        &fixture.context.storage_handle,
+        filler,
+        ctx.claim_token,
+        error,
+        now,
+    )
+    .await?;
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    let (started, queued) = current(&fixture, &link).await;
+    assert!(
+        started.active_job.is_some() && !queued,
+        "the push starts once a slot frees up"
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lost_holder_fails() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    // The placement moves the dataset to another node; this node keeps only its old link row.
+    let other = iroh::SecretKey::from_bytes(&[42; 32]).public();
+    let mut config = RealmConfigDocument::new(fixture.actor.realm_id, Vec::new(), 3);
+    config.seed_default_placement();
+    config.ensure_node(other, RealmNodeKind::Server);
+    config.seed_job_control(other, 0);
+    write_value(
+        &fixture.context.storage_handle,
+        REALM_CONFIG_KEYSPACE,
+        fixture.actor.realm_id.as_bytes().to_vec(),
+        config.to_bytes(&fixture.actor)?,
+    )
+    .await?;
+    assert!(
+        !aruna_operations::jobs::invenio::link_queue::owner_holds(&fixture.context, &link).await
+    );
+
+    drain(&fixture).await?;
+    let (failed, queued) = current(&fixture, &link).await;
+    assert_eq!(
+        failed.status,
+        LinkStatus::Failed {
+            reason: LinkFailure::OwnerNotHolder
+        }
+    );
+    assert!(!queued && failed.active_job.is_none());
+    assert!(
+        server.state.lock().unwrap().calls.is_empty(),
+        "nothing was pushed"
+    );
     fixture.stop().await;
     Ok(())
 }

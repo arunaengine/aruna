@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use aruna_core::invenio::{InvenioLink, LinkRemote, LinkStatus, validate_id};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::jobs::invenio::link_queue::owner_holds;
 use aruna_operations::jobs::invenio::links::{
     LinkChange, LinkError, change_link, list_links, read_link,
 };
@@ -120,7 +121,8 @@ pub struct InvenioLinkResponse {
     pub created_by: String,
     /// enabled, paused or failed.
     pub status: String,
-    /// Failure reason such as remote_changed, token_rejected or source_unavailable.
+    /// Failure reason such as remote_changed, token_rejected, source_unavailable or
+    /// owner_not_holder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub auto_publish: bool,
@@ -159,8 +161,10 @@ fn timestamp(value: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()
 }
 
-pub(super) fn response(link: InvenioLink, queued: bool) -> InvenioLinkResponse {
+/// `holds` is false once the owner node lost the dataset; such a link cannot push any more.
+pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioLinkResponse {
     let (status, reason) = match &link.status {
+        LinkStatus::Enabled if !holds => ("failed", Some("owner_not_holder".to_string())),
         LinkStatus::Enabled => ("enabled", None),
         LinkStatus::Paused => ("paused", None),
         LinkStatus::Failed { reason } => ("failed", Some(reason.reason().to_string())),
@@ -211,7 +215,8 @@ pub(super) fn link_error(error: LinkError) -> ServerError {
         | LinkError::Busy(_)
         | LinkError::NoRevision
         | LinkError::NotOwner(_)
-        | LinkError::JobLimit(_) => ServerError::Conflict(error.to_string()),
+        | LinkError::JobLimit(_)
+        | LinkError::NotHolder => ServerError::Conflict(error.to_string()),
         LinkError::Submit(_) | LinkError::Fenced => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
@@ -267,7 +272,8 @@ pub(super) async fn readable(
     Ok((auth, document_id))
 }
 
-/// Managing needs metadata WRITE in the connector group, as the creator or a group admin.
+/// Managing needs metadata WRITE in the connector group, as the creator or a group admin,
+/// on the link's owner node.
 pub(super) async fn managed(
     state: &ServerState,
     auth: Option<AuthContext>,
@@ -285,6 +291,10 @@ pub(super) async fn managed(
         let admin = format!("/{}/g/{}/admin", state.get_realm_id(), link.group_id);
         ensure_permission(state, &auth, admin, Permission::WRITE).await?;
     }
+    // Holders keep copies; only the owner node can open the token and change the link.
+    if link.owner_node != state.get_node_id() {
+        return Err(link_error(LinkError::NotOwner(link.owner_node_url)));
+    }
     Ok((auth, link))
 }
 
@@ -298,17 +308,35 @@ pub(super) async fn change(
         .map_err(link_error)
 }
 
+/// The links a node keeps for the dataset. Holders keep replicas; only the owner queues checks.
+async fn responses(
+    state: &ServerState,
+    document_id: Ulid,
+) -> ServerResult<Vec<InvenioLinkResponse>> {
+    let context = state.get_ctx();
+    let mut views = Vec::new();
+    for (link, queued) in list_links(&context.storage_handle, document_id)
+        .await
+        .map_err(link_error)?
+    {
+        let holds = owner_holds(&context, &link).await;
+        let queued = queued && link.owner_node == state.get_node_id();
+        views.push(response(link, queued, holds));
+    }
+    Ok(views)
+}
+
 pub(super) async fn view(
     state: &ServerState,
     document_id: Ulid,
     link_id: Ulid,
 ) -> ServerResult<Json<InvenioLinkResponse>> {
-    list_links(&state.get_ctx().storage_handle, document_id)
-        .await
-        .map_err(link_error)?
+    let link_id = link_id.to_string();
+    responses(state, document_id)
+        .await?
         .into_iter()
-        .find(|(link, _)| link.link_id == link_id)
-        .map(|(link, queued)| Json(response(link, queued)))
+        .find(|link| link.link_id == link_id)
+        .map(Json)
         .ok_or(ServerError::NotFound)
 }
 
@@ -341,7 +369,7 @@ The link starts with a push. Without parent_id the first push creates a record d
 
 **Limits**
 
-Links live on the node that created them, and that node must hold the dataset. Only that node can open the token.
+The node that creates a link owns it and must hold the dataset. Only that node can open the token, pushes and changes the link. The other holders keep a copy of the link without the token.
 
 **Errors**
 
@@ -440,7 +468,7 @@ pub async fn create_link(
         .await
         .map_err(link_error)?
         .ok_or_else(|| ServerError::InternalError("created link missing".into()))?;
-    Ok((StatusCode::CREATED, Json(response(created, true))))
+    Ok((StatusCode::CREATED, Json(response(created, true, true))))
 }
 
 #[utoipa::path(
@@ -458,10 +486,10 @@ Each link shows its state, failure reason, the repository draft or record it pus
 
 **Limits**
 
-Only links created on this node are listed; owner_node_url names the node of each link."#,
+Every holder of the dataset lists its links. owner_node_url names the node that pushes and manages each link. pending covers queued pushes only on that node. A link whose node no longer holds the dataset shows status failed with reason owner_not_holder."#,
     params(("document_id" = String, Path, description = "Metadata document identifier")),
     responses(
-        (status = 200, description = "Links of the dataset on this node", body = Vec<InvenioLinkResponse>, example = json!([link_example()])),
+        (status = 200, description = "Links of the dataset", body = Vec<InvenioLinkResponse>, example = json!([link_example()])),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Dataset access denied", body = ErrorResponse),
         (status = 404, description = "Dataset not found", body = ErrorResponse)
@@ -473,15 +501,7 @@ pub async fn list_repository_links(
     Path(document_id): Path<String>,
 ) -> ServerResult<Json<Vec<InvenioLinkResponse>>> {
     let (_, document_id) = readable(&state, auth, &document_id).await?;
-    let links = list_links(&state.get_ctx().storage_handle, document_id)
-        .await
-        .map_err(link_error)?;
-    Ok(Json(
-        links
-            .into_iter()
-            .map(|(link, queued)| response(link, queued))
-            .collect(),
-    ))
+    Ok(Json(responses(&state, document_id).await?))
 }
 
 #[cfg(test)]

@@ -303,3 +303,76 @@ async fn connector_delete_conflicts() {
     .unwrap();
     assert_eq!(remove_connector().await.unwrap(), StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn holder_copy_refuses() {
+    let linked = setup().await;
+    let state = || State(linked.test.state.clone());
+    let owner = || Extension(Some(linked.test.auth.clone()));
+    let document_id = parse_document_id(&linked.document_id).unwrap();
+    // A replicated copy of a link another node owns; that node is not a holder of the dataset.
+    let now = std::time::SystemTime::now();
+    let copy = InvenioLink {
+        link_id: Ulid::generate(),
+        document_id,
+        group_id: linked.test.group_id,
+        connector_id: linked.connector_id,
+        endpoint: "https://zenodo.example/api/".into(),
+        owner_node: iroh::SecretKey::from_bytes(&[42; 32]).public(),
+        owner_node_url: "https://owner.example/api/v1".into(),
+        created_by: linked.test.auth.user_id,
+        status: LinkStatus::Enabled,
+        auto_publish: false,
+        public_files: false,
+        metadata_json: "{}".into(),
+        remote: LinkRemote::default(),
+        last_push: None,
+        active_job: None,
+        sequence: 0,
+        limits: aruna_core::structs::execution::job::RoCrateLimits::default(),
+        created_at: now,
+        updated_at: now,
+        generation: 1,
+    };
+    let written = linked
+        .test
+        .state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: INVENIO_LINK_KEYSPACE.into(),
+            key: copy.target().storage_key(),
+            value: copy.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        written,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+
+    let Json(listed) = list_repository_links(state(), owner(), Path(linked.document_id.clone()))
+        .await
+        .unwrap();
+    let [shown] = &listed[..] else {
+        panic!("the holder lists the copy");
+    };
+    assert_eq!(shown.owner_node_url, "https://owner.example/api/v1");
+    assert_eq!(shown.status, "failed");
+    assert_eq!(shown.reason.as_deref(), Some("owner_not_holder"));
+    let pause = Json(PatchLinkRequest {
+        paused: Some(true),
+        ..PatchLinkRequest::default()
+    });
+    match patch_link(state(), owner(), paths(&linked, shown), pause).await {
+        Err(ServerError::Conflict(message)) => {
+            assert!(
+                message.contains("https://owner.example/api/v1"),
+                "{message}"
+            );
+        }
+        other => panic!("a copy must be managed on its owner node: {other:?}"),
+    }
+    let pushed = push_link(state(), owner(), paths(&linked, shown)).await;
+    assert!(matches!(pushed, Err(ServerError::Conflict(_))));
+}

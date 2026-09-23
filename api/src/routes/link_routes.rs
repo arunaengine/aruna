@@ -88,7 +88,8 @@ A metadata value that is not an object returns 400."#,
         (status = 400, description = "Invalid metadata overrides", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
-        (status = 404, description = "Dataset or link not found", body = ErrorResponse)
+        (status = 404, description = "Dataset or link not found", body = ErrorResponse),
+        (status = 409, description = "The link is managed on its owner node", body = ErrorResponse)
     ), security(("bearer_auth" = []))
 )]
 pub async fn patch_link(
@@ -132,7 +133,8 @@ Records and drafts in the repository stay. A push that is still running fails on
         (status = 204, description = "Link and token removed"),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
-        (status = 404, description = "Dataset or link not found", body = ErrorResponse)
+        (status = 404, description = "Dataset or link not found", body = ErrorResponse),
+        (status = 409, description = "The link is managed on its owner node", body = ErrorResponse)
     ), security(("bearer_auth" = []))
 )]
 pub async fn delete_link(
@@ -160,7 +162,7 @@ A failed link is retried. While a push runs, its job is returned instead of a ne
 
 **Errors**
 
-A paused link or a dataset without a revision on this node returns 409."#,
+A paused link, a dataset without a revision, a creator at the active job limit or a node that is not the link's owner returns 409. The message of the last case names owner_node_url. A node that no longer holds the dataset fails the link with owner_not_holder and returns 409."#,
     params(
         ("document_id" = String, Path, description = "Metadata document identifier"),
         ("link_id" = String, Path, description = "Link identifier")
@@ -173,7 +175,7 @@ A paused link or a dataset without a revision on this node returns 409."#,
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse),
-        (status = 409, description = "Link paused or dataset revision unavailable", body = ErrorResponse),
+        (status = 409, description = "Link paused, dataset revision unavailable, job limit reached, or the link is managed on its owner node", body = ErrorResponse),
         (status = 503, description = "Job could not be started", body = ErrorResponse)
     ), security(("bearer_auth" = []))
 )]
@@ -216,7 +218,7 @@ Publishing is permanent in the repository and assigns its DOI. The next dataset 
 
 **Errors**
 
-A link without an open draft or with a running push returns 409."#,
+A link without an open draft, a running push, a creator at the active job limit or a node that is not the link's owner returns 409."#,
     params(
         ("document_id" = String, Path, description = "Metadata document identifier"),
         ("link_id" = String, Path, description = "Link identifier")
@@ -229,7 +231,7 @@ A link without an open draft or with a running push returns 409."#,
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse),
-        (status = 409, description = "No open draft or a push is running", body = ErrorResponse),
+        (status = 409, description = "No open draft, a push is running, job limit reached, or the link is managed on its owner node", body = ErrorResponse),
         (status = 503, description = "Job could not be started", body = ErrorResponse)
     ), security(("bearer_auth" = []))
 )]
@@ -286,7 +288,7 @@ An empty token returns 400; a connector whose endpoint changed since the link wa
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the link creator", body = ErrorResponse),
         (status = 404, description = "Dataset, link or connector not found", body = ErrorResponse),
-        (status = 409, description = "Connector endpoint changed", body = ErrorResponse)
+        (status = 409, description = "Connector endpoint changed or the link is managed on its owner node", body = ErrorResponse)
     ), security(("bearer_auth" = []))
 )]
 pub async fn rotate_token(

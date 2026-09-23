@@ -25,11 +25,17 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::links::{LinkChange, LinkError, change_link, id_key, read_link, schedule_drain};
-use crate::driver::DriverContext;
+use super::links::{
+    ChangeLinkOperation, LinkChange, LinkError, change_link, id_key, read_link, schedule_drain,
+};
+use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
 use crate::jobs::store::read_job_record;
+use crate::jobs::submit::SubmitJobError;
+use crate::metadata::api::load_realm_config;
+use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::raw_revision::load_raw_revision;
+use crate::placement::holds_placement;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 
 const QUEUE_PAGE: usize = 256;
@@ -192,6 +198,9 @@ async fn check_link(
         }
         _ => return drop_entry(storage, link_id).await,
     };
+    if let Err(LinkError::NotHolder) = ensure_holder(context, &link).await {
+        return drop_entry(storage, link_id).await;
+    }
     if let Some(job_id) = link.active_job {
         let record = read_job_record(storage, job_id, None)
             .await
@@ -208,8 +217,12 @@ async fn check_link(
         .map_err(|error| LinkError::Unexpected(error.to_string()))?;
     match revision {
         Some(revision) if link.changed(revision.winning_event_id, revision.dataset_digest) => {
-            start_push(context, &link, revision.winning_event_id, false).await?;
-            Ok(None)
+            match start_push(context, &link, revision.winning_event_id, false).await {
+                Ok(_) => Ok(None),
+                // The check stays queued, so the link shows pending until a job slot frees up.
+                Err(LinkError::JobLimit(_)) => Ok(Some(now.saturating_add(ACTIVE_RETRY_MS))),
+                Err(error) => Err(error),
+            }
         }
         _ => drop_entry(storage, link_id).await,
     }
@@ -267,15 +280,47 @@ pub async fn start_push(
         document_id: link.document_id,
         limits: link.limits.clone(),
     };
+    ensure_holder(context, link).await?;
     let owner = context
         .net_handle
         .as_ref()
         .map_or(link.owner_node, |net| net.node_id());
-    let submitted = submit_export_job(context, spec, owner, Some(link.push_key(event_id, publish)))
-        .await
-        .map_err(|error| LinkError::Submit(error.to_string()))?;
+    let key = Some(link.push_key(event_id, publish));
+    let submitted =
+        submit_export_job(context, spec, owner, key)
+            .await
+            .map_err(|error| match error {
+                SubmitJobError::ActiveJobLimit { limit } => LinkError::JobLimit(limit),
+                error => LinkError::Submit(error.to_string()),
+            })?;
     change_link(context, link, LinkChange::Begin(submitted.job_id)).await?;
     Ok(submitted.job_id)
+}
+
+/// Whether the link's owner still holds the dataset; an unknown placement counts as held.
+pub async fn owner_holds(context: &DriverContext, link: &InvenioLink) -> bool {
+    let realm_id = link.created_by.realm_id;
+    let Some(config) = load_realm_config(context, realm_id).await else {
+        return true;
+    };
+    resolve_metadata_id(&config, realm_id, None, link.document_id).map_or(true, |placement| {
+        holds_placement(&config, &placement, link.owner_node)
+    })
+}
+
+/// Fails the link with owner_not_holder once this node lost the dataset. The change stays local:
+/// a node outside the holder set cannot publish to them, and holders derive the same state.
+async fn ensure_holder(context: &DriverContext, link: &InvenioLink) -> Result<(), LinkError> {
+    if owner_holds(context, link).await {
+        return Ok(());
+    }
+    let change = LinkChange::Fail(LinkFailure::OwnerNotHolder);
+    drive(
+        ChangeLinkOperation::new(link.document_id, link.link_id, change),
+        context,
+    )
+    .await?;
+    Err(LinkError::NotHolder)
 }
 
 /// The current revision event of a held document, for push keys and change checks.

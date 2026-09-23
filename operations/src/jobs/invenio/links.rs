@@ -77,8 +77,10 @@ pub enum LinkError {
     NotOwner(String),
     #[error("the dataset placement is moving; retry the link change")]
     Fenced,
-    #[error("active job limit of {0} reached; the push waits for a free slot")]
+    #[error("the link creator has {0} active jobs; push again once one has finished")]
     JobLimit(u32),
+    #[error("the link's node no longer holds the dataset (owner_not_holder)")]
+    NotHolder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
