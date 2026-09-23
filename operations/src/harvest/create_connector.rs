@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::endpoint_screening;
 use crate::harvest::repository::connector_writes;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CreateConnectorInput {
     pub group_id: GroupId,
     pub created_by: UserId,
@@ -28,6 +28,24 @@ pub struct CreateConnectorInput {
     pub endpoint: String,
     pub public_config: HashMap<String, String>,
     pub secret_config: HashMap<String, String>,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for CreateConnectorInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateConnectorInput")
+            .field("group_id", &self.group_id)
+            .field("created_by", &self.created_by)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("endpoint", &self.endpoint)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self.secret_config.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

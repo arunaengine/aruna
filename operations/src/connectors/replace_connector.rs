@@ -25,7 +25,7 @@ use crate::connectors::repository::{
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReplaceSourceInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
@@ -33,6 +33,23 @@ pub struct ReplaceSourceInput {
     pub kind: SourceConnectorKind,
     pub public_config: HashMap<String, String>,
     pub secret_config: HashMap<String, String>,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for ReplaceSourceInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplaceSourceInput")
+            .field("group_id", &self.group_id)
+            .field("connector_id", &self.connector_id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self.secret_config.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

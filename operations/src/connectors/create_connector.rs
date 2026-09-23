@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::connectors::repository::{connector_secret_key, source_connector_key};
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SourceConnectorInput {
     pub group_id: GroupId,
     pub created_by: UserId,
@@ -27,6 +27,23 @@ pub struct SourceConnectorInput {
     pub kind: SourceConnectorKind,
     pub public_config: HashMap<String, String>,
     pub secret_config: HashMap<String, String>,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for SourceConnectorInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceConnectorInput")
+            .field("group_id", &self.group_id)
+            .field("created_by", &self.created_by)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self.secret_config.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

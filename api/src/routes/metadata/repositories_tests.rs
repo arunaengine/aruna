@@ -200,3 +200,20 @@ async fn rejects_invalid_config() {
         assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
     }
 }
+
+#[test]
+fn request_hides_secrets() {
+    let request = RepositoryRequest {
+        name: "n".into(),
+        kind: ApiRepositoryKind::Invenio,
+        endpoint: "https://example.org/api/".into(),
+        community: None,
+        secret_config: Some(HashMap::from([(
+            "token".to_string(),
+            "canary-2c9d".to_string(),
+        )])),
+    };
+    let text = format!("{request:?}");
+    assert!(!text.contains("canary-2c9d"), "{text}");
+    assert!(text.contains("token"), "{text}");
+}

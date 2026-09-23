@@ -402,3 +402,41 @@ async fn setup_state() -> TestState {
         state,
     }
 }
+
+#[test]
+fn requests_hide_secrets() {
+    let secret = || HashMap::from([("token".to_string(), "canary-5b1e".to_string())]);
+    let texts = [
+        format!(
+            "{:?}",
+            CreateConnectorRequest {
+                name: "n".into(),
+                kind: ApiConnectorKind::Http,
+                public_config: HashMap::new(),
+                secret_config: secret(),
+            }
+        ),
+        format!(
+            "{:?}",
+            ReplaceConnectorRequest {
+                name: "n".into(),
+                kind: ApiConnectorKind::Http,
+                public_config: HashMap::new(),
+                secret_config: secret(),
+            }
+        ),
+        format!(
+            "{:?}",
+            SourceConnectorRequest {
+                name: "n".into(),
+                kind: ApiConnectorKind::Http,
+                public_config: HashMap::new(),
+                secret_config: secret(),
+            }
+        ),
+    ];
+    for text in texts {
+        assert!(!text.contains("canary-5b1e"), "{text}");
+        assert!(text.contains("token"), "{text}");
+    }
+}

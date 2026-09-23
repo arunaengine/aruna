@@ -117,7 +117,7 @@ impl From<SourceConnectorKind> for ApiConnectorKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 #[schema(as = CreateSourceConnectorRequest)]
 pub struct CreateConnectorRequest {
     pub name: String,
@@ -127,7 +127,22 @@ pub struct CreateConnectorRequest {
     pub secret_config: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for CreateConnectorRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateConnectorRequest")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self.secret_config.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 #[schema(as = ReplaceSourceConnectorRequest)]
 pub struct ReplaceConnectorRequest {
     pub name: String,
@@ -137,13 +152,43 @@ pub struct ReplaceConnectorRequest {
     pub secret_config: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for ReplaceConnectorRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplaceConnectorRequest")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self.secret_config.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct SourceConnectorRequest {
     pub name: String,
     pub kind: ApiConnectorKind,
     pub public_config: HashMap<String, String>,
     #[serde(default)]
     pub secret_config: HashMap<String, String>,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for SourceConnectorRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceConnectorRequest")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self.secret_config.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]

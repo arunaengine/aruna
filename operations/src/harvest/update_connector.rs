@@ -26,7 +26,7 @@ use crate::harvest::repository::{
     connector_key, connector_secret_key, connector_writes, read_secret_effect,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpdateConnectorInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
@@ -36,6 +36,27 @@ pub struct UpdateConnectorInput {
     pub public_config: HashMap<String, String>,
     /// `None` keeps the stored secret; an empty map removes it.
     pub secret_config: Option<HashMap<String, String>>,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for UpdateConnectorInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateConnectorInput")
+            .field("group_id", &self.group_id)
+            .field("connector_id", &self.connector_id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("endpoint", &self.endpoint)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self
+                    .secret_config
+                    .as_ref()
+                    .map(|config| config.keys().collect::<Vec<_>>()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]

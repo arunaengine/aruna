@@ -58,7 +58,7 @@ impl From<RepositoryConnectorKind> for ApiRepositoryKind {
 }
 
 /// Body of both create and replace; only `token` is accepted as a secret.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryRequest {
     pub name: String,
@@ -69,6 +69,25 @@ pub struct RepositoryRequest {
     /// Omitted on replace keeps the stored secret; an empty object removes it.
     #[serde(default)]
     pub secret_config: Option<HashMap<String, String>>,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for RepositoryRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepositoryRequest")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("endpoint", &self.endpoint)
+            .field("community", &self.community)
+            .field(
+                "secret_keys",
+                &self
+                    .secret_config
+                    .as_ref()
+                    .map(|config| config.keys().collect::<Vec<_>>()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
