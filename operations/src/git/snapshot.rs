@@ -1,13 +1,14 @@
-//! Materializes each document's accepted metadata as an ARC on its fixed Git owner.
+//! Publishes signed ARC snapshots and checkpoints as Git records on document holders.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{GitError, document, records};
-use crate::driver::{DriverContext, drive};
-use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use super::project::{Projection, author, lock, project};
+use super::{GitError, document, objects, publish, records};
+use crate::driver::DriverContext;
+use aruna_blob::git::GitStore;
 use aruna_core::git::{
-    GitEffect, GitEvent, GitRepository, GitSnapshot, GitStatus, REPOSITORIES, STATUS,
+    CHECKPOINT_AFTER, GitChange, GitCheckpoint, GitEffect, GitEvent, GitSnapshot, GitStatus,
+    RefUpdate, STATUS, ZERO_OID,
 };
 use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
 use aruna_core::metadata::{
@@ -15,11 +16,226 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{event_log_key, materialization_status_key};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use std::time::{Duration, UNIX_EPOCH};
+use aruna_core::{NodeId, UserId};
+use bytes::Bytes;
 use ulid::Ulid;
 
+/// How long other holders leave a new revision to the first holder before generating it.
+const FAILOVER_MS: u64 = 60_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn first(context: &DriverContext, holders: &[NodeId]) -> bool {
+    context.net_handle.as_ref().map(|net| net.node_id()) == holders.first().copied()
+}
+
+async fn execute(store: &GitStore, effect: GitEffect, actor: UserId) -> Result<GitEvent, GitError> {
+    store
+        .execute(effect, actor)
+        .await
+        .map_err(|_| GitError::Unavailable)
+}
+
+/// The materialized graph this node would snapshot, if it is ready.
+async fn current(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    revision: Option<&MetadataRawRevision>,
+) -> Result<Option<(Ulid, String)>, GitError> {
+    let raw = match revision {
+        Some(revision) => Some(revision.clone()),
+        None => crate::metadata::raw_revision::load_raw_view(context, document.document_id, None)
+            .await
+            .map_err(|_| GitError::Unavailable)?
+            .map(|view| view.revision),
+    };
+    if let Some(raw) = raw {
+        return Ok(Some((raw.winning_event_id, raw.jsonld)));
+    }
+    let projected: Option<MaterializationStatusRecord> = records::load(
+        context,
+        MATERIALIZATION_STATUS_KEYSPACE,
+        materialization_status_key(document.document_id).to_vec(),
+    )
+    .await?;
+    if !projected.is_some_and(|status| {
+        status.state == MaterializationState::Materialized
+            && status.event_id == document.last_event_id
+    }) {
+        return Ok(None);
+    }
+    let handle = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(GitError::Unavailable)?;
+    let jsonld = handle
+        .export_rocrate_jsonld(document.graph_iri.clone())
+        .await
+        .map_err(|_| GitError::Unavailable)?;
+    Ok(Some((document.last_event_id, jsonld)))
+}
+
+async fn generate(
+    context: &DriverContext,
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+    projection: &Projection,
+    source: (Ulid, String),
+) -> Result<(), GitError> {
+    let (event_id, jsonld) = source;
+    let event: Option<MetadataEventRecord> = records::load(
+        context,
+        EVENT_LOG_KEYSPACE,
+        event_log_key(document.document_id, event_id).to_vec(),
+    )
+    .await?;
+    let user = event
+        .as_ref()
+        .map_or(UserId::nil(document.realm_id), |event| event.user_id);
+    let occurred_at_ms = event.map_or(document.updated_at_ms, |event| event.occurred_at_ms);
+    let refs = &projection.state.refs;
+    let effect = GitEffect::Generate {
+        snapshot: GitSnapshot {
+            document_id: document.document_id,
+            event_id,
+            occurred_at_ms,
+            jsonld,
+        },
+        refs: refs.clone(),
+    };
+    let status_key = document.document_id.to_bytes().to_vec();
+    let (aruna, main) = match execute(store, effect, user).await? {
+        GitEvent::Generated { aruna, main } => (aruna, main),
+        GitEvent::GenerateFailed(error) => {
+            let status = GitStatus {
+                event_id,
+                commit: refs.get("refs/heads/aruna").cloned(),
+                error: Some(error),
+            };
+            return records::save(context, STATUS, status_key, &status).await;
+        }
+        _ => return Err(GitError::Unavailable),
+    };
+    let unchanged = refs.get("refs/heads/aruna") == Some(&aruna) && main.is_none();
+    let pack = if unchanged {
+        None
+    } else {
+        let mut include = vec![aruna.clone()];
+        include.extend(main.iter().cloned());
+        let effect = GitEffect::Pack {
+            document_id: document.document_id,
+            include,
+            exclude: refs.values().cloned().collect(),
+        };
+        let GitEvent::Packed(pack) = execute(store, effect, user).await? else {
+            return Err(GitError::Unavailable);
+        };
+        Some(objects::store_pack(context, &author(user), document, pack).await?)
+    };
+    let update = |name: &str, new: String| RefUpdate {
+        name: name.into(),
+        old: refs.get(name).cloned().unwrap_or_else(|| ZERO_OID.into()),
+        new,
+    };
+    let mut updates = vec![update("refs/heads/aruna", aruna.clone())];
+    updates.extend(main.map(|main| update("refs/heads/main", main)));
+    updates.retain(|update| update.old != update.new);
+    let change = GitChange::Objects {
+        pack,
+        refs: updates,
+        lfs: Vec::new(),
+        revision: Some(event_id),
+    };
+    publish::publish(context, document, user, change).await?;
+    let status = GitStatus {
+        event_id,
+        commit: Some(aruna),
+        error: None,
+    };
+    records::save(context, STATUS, status_key, &status).await
+}
+
+/// Folds the records covered so far into one checkpoint so history never hits its cap.
+async fn checkpoint(
+    context: &DriverContext,
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+    projection: &Projection,
+) -> Result<(), GitError> {
+    let state = &projection.state;
+    let user = UserId::nil(document.realm_id);
+    let effect = GitEffect::Pack {
+        document_id: document.document_id,
+        include: state.refs.values().cloned().collect(),
+        exclude: Vec::new(),
+    };
+    let GitEvent::Packed(pack) = execute(store, effect, user).await? else {
+        return Err(GitError::Unavailable);
+    };
+    let owner = projection
+        .records
+        .last()
+        .map_or(user, |record| record.user_id);
+    let pack = objects::store_pack(context, &author(owner), document, pack).await?;
+    let change = GitChange::Checkpoint(Box::new(GitCheckpoint {
+        pack,
+        refs: state.refs.clone().into_iter().collect(),
+        lfs: state.lfs.values().cloned().collect(),
+        locks: state.locks.values().cloned().collect(),
+        revision: state.revision,
+        covered: state.applied.clone(),
+    }));
+    publish::publish(context, document, owner, change)
+        .await
+        .map(|_| ())
+}
+
+/// Projects the records, then publishes a missing snapshot or a due checkpoint. The first
+/// holder acts at once; the others take over when a revision stays unpublished too long.
+/// The caller holds the document lock.
+pub async fn refresh(
+    context: &DriverContext,
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+) -> Result<Projection, GitError> {
+    update(context, store, document, None).await
+}
+
+async fn update(
+    context: &DriverContext,
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+    revision: Option<&MetadataRawRevision>,
+) -> Result<Projection, GitError> {
+    let mut projection = project(context, store, document).await?;
+    let leading = first(context, &projection.holders);
+    let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
+    if let Some(source) = current(context, document, revision).await?
+        && projection
+            .state
+            .revision
+            .is_none_or(|applied| applied < source.0)
+        && (leading || overdue)
+    {
+        generate(context, store, document, &projection, source).await?;
+        projection = project(context, store, document).await?;
+    }
+    let uncovered = publish::uncovered(&projection.records).len();
+    if uncovered > CHECKPOINT_AFTER && (leading || uncovered > 2 * CHECKPOINT_AFTER) {
+        checkpoint(context, store, document, &projection).await?;
+        projection = project(context, store, document).await?;
+    }
+    Ok(projection)
+}
+
+/// Called after materialization; nodes that do not hold the document have nothing to do.
 pub async fn capture(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
@@ -32,197 +248,41 @@ pub async fn capture(
     else {
         return Ok(());
     };
-    let origin: MetadataEventRecord = records::load(
-        context,
-        EVENT_LOG_KEYSPACE,
-        event_log_key(record.document_id, record.establishing_event_id).to_vec(),
-    )
-    .await?
-    .ok_or(GitError::Unavailable)?;
-    if origin.record.document_id != record.document_id
-        || origin.event_id != record.establishing_event_id
-    {
-        return Err(GitError::Unavailable);
+    let _guard = lock(record.document_id).await;
+    match update(context, store, record, revision).await {
+        Ok(_) | Err(GitError::NotHolder) => Ok(()),
+        Err(error) => Err(error),
     }
-    let owner = if origin.record.holder_node_ids.contains(&origin.node_id) {
-        origin.node_id
-    } else {
-        *origin
-            .record
-            .holder_node_ids
-            .first()
-            .ok_or(GitError::Unavailable)?
-    };
-    if context.net_handle.as_ref().map(|net| net.node_id()) != Some(owner) {
-        return Ok(());
-    }
-    let (event_id, jsonld) = match revision {
-        Some(revision) => (revision.winning_event_id, revision.jsonld.clone()),
-        None => {
-            let handle = context
-                .metadata_handle
-                .as_ref()
-                .ok_or(GitError::Unavailable)?;
-            let jsonld = handle
-                .export_rocrate_jsonld(record.graph_iri.clone())
-                .await
-                .map_err(|_| GitError::Unavailable)?;
-            let projected: MaterializationStatusRecord = records::load(
-                context,
-                MATERIALIZATION_STATUS_KEYSPACE,
-                materialization_status_key(record.document_id).to_vec(),
-            )
-            .await?
-            .ok_or(GitError::Unavailable)?;
-            if projected.event_id != record.last_event_id {
-                return Ok(());
-            }
-            (record.last_event_id, jsonld)
-        }
-    };
-    let id = record.document_id;
-    let existing: Option<GitRepository> =
-        records::load(context, REPOSITORIES, id.to_bytes().to_vec()).await?;
-    let repository = existing.unwrap_or_else(|| GitRepository {
-        document_id: id,
-        group_id: record.group_id,
-        bucket: format!("arc-{}", record.group_id.to_string().to_lowercase()),
-        arc: true,
-    });
-    if repository.group_id != record.group_id || !repository.arc {
-        return Err(GitError::Conflict);
-    }
-    match drive(GetBucketOperation::new(repository.bucket.clone()), context).await {
-        Ok(bucket) if bucket.group_id == record.group_id => {}
-        Ok(_) => return Err(GitError::Conflict),
-        Err(GetBucketError::NotFound) => {
-            let bucket = BucketInfo {
-                group_id: record.group_id,
-                created_at: UNIX_EPOCH + Duration::from_millis(record.created_at_ms),
-                created_by: origin.user_id,
-                cors_configuration: None,
-                storage_routing: Vec::new(),
-                placement_policies: Vec::new(),
-                placement_policy_generation: 0,
-            };
-            match drive(
-                CreateBucketOperation::new(repository.bucket.clone(), bucket),
-                context,
-            )
-            .await
-            {
-                Ok(_) | Err(CreateBucketError::BucketAlreadyExists) => {}
-                Err(_) => return Err(GitError::Unavailable),
-            }
-            let bucket = drive(GetBucketOperation::new(repository.bucket.clone()), context)
-                .await
-                .map_err(|_| GitError::Unavailable)?;
-            if bucket.group_id != record.group_id {
-                return Err(GitError::Conflict);
-            }
-        }
-        Err(_) => return Err(GitError::Unavailable),
-    }
-    store
-        .execute(GitEffect::Initialize(id), origin.user_id)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    let bound: GitRepository =
-        records::insert(context, REPOSITORIES, id.to_bytes().to_vec(), &repository).await?;
-    if bound != repository {
-        return Err(GitError::Conflict);
-    }
-    let GitEvent::Snapshot(status) = store
-        .execute(
-            GitEffect::Snapshot(GitSnapshot {
-                document_id: id,
-                event_id,
-                occurred_at_ms: record.updated_at_ms,
-                jsonld,
-            }),
-            origin.user_id,
-        )
-        .await
-        .map_err(|_| GitError::Unavailable)?
-    else {
-        return Err(GitError::Unavailable);
-    };
-    records::save(context, STATUS, id.to_bytes().to_vec(), &status).await
-}
-
-pub async fn ensure(
-    context: &DriverContext,
-    auth: &AuthContext,
-    id: Ulid,
-    permission: Permission,
-) -> Result<GitRepository, GitError> {
-    let record = document(context, auth, id, permission).await?;
-    let current: Option<GitRepository> =
-        records::load(context, REPOSITORIES, id.to_bytes().to_vec()).await?;
-    let status: Option<GitStatus> = records::load(context, STATUS, id.to_bytes().to_vec()).await?;
-    if let Some(repository) = current
-        && status.is_some_and(|status| status.error.is_none())
-    {
-        if repository.document_id != id || repository.group_id != record.group_id {
-            return Err(GitError::Unavailable);
-        }
-        return Ok(repository);
-    }
-    let raw = crate::metadata::raw_revision::load_raw_view(context, id, None)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    if raw.is_none() {
-        let projected: MaterializationStatusRecord = records::load(
-            context,
-            MATERIALIZATION_STATUS_KEYSPACE,
-            materialization_status_key(id).to_vec(),
-        )
-        .await?
-        .ok_or(GitError::Unavailable)?;
-        if projected.state != MaterializationState::Materialized
-            || projected.event_id != record.last_event_id
-        {
-            return Err(GitError::Unavailable);
-        }
-    }
-    capture(context, &record, raw.as_ref().map(|value| &value.revision)).await?;
-    let repository: GitRepository = records::load(context, REPOSITORIES, id.to_bytes().to_vec())
-        .await?
-        .ok_or(GitError::NotFound)?;
-    if repository.document_id != id || repository.group_id != record.group_id {
-        return Err(GitError::Unavailable);
-    }
-    Ok(repository)
 }
 
 pub async fn status(
     context: &DriverContext,
+    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-) -> Result<Option<GitStatus>, GitError> {
-    document(context, auth, id, Permission::READ).await?;
-    records::load(context, STATUS, id.to_bytes().to_vec()).await
+) -> Result<(Option<GitStatus>, Projection), GitError> {
+    let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
+    let _guard = lock(id).await;
+    let projection = refresh(context, store, &document).await?;
+    let status = records::load(context, STATUS, id.to_bytes().to_vec()).await?;
+    Ok((status, projection))
 }
 
 pub async fn export(
     context: &DriverContext,
-    store: &aruna_blob::git::GitStore,
+    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     revision: String,
-) -> Result<bytes::Bytes, GitError> {
-    ensure(context, auth, id, Permission::READ).await?;
-    let GitEvent::Exported(bytes) = store
-        .execute(
-            GitEffect::Export {
-                document_id: id,
-                revision,
-            },
-            auth.user_id,
-        )
-        .await
-        .map_err(|_| GitError::Unavailable)?
-    else {
+) -> Result<Bytes, GitError> {
+    let document = document(context, auth, id, Permission::READ).await?;
+    let _guard = lock(id).await;
+    refresh(context, store, &document).await?;
+    let effect = GitEffect::Export {
+        document_id: id,
+        revision,
+    };
+    let GitEvent::Exported(bytes) = execute(store, effect, auth.user_id).await? else {
         return Err(GitError::Unavailable);
     };
     let result: serde_json::Value =

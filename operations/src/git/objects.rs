@@ -165,6 +165,7 @@ pub async fn store(
         .ok_or(GitError::Unavailable)?;
     let stored = StoredObject {
         node_id: node,
+        group_id: document.group_id,
         bucket: name,
         key,
         version_id: result.version_id,
@@ -173,6 +174,27 @@ pub async fn store(
         blake3,
     };
     records::insert(context, LOCAL_OBJECTS, index_key(document, sha256), &stored).await
+}
+
+/// Stores a pack in this node's ARC bucket and returns its location for a record.
+pub async fn store_pack(
+    context: &DriverContext,
+    auth: &AuthContext,
+    document: &MetadataRegistryRecord,
+    pack: Bytes,
+) -> Result<StoredObject, GitError> {
+    let hashes = aruna_blob::hash::Hasher::new_with_bytes(&pack).to_map();
+    let sha256 = hashes
+        .get("sha256")
+        .map(hex::encode)
+        .ok_or(GitError::Unavailable)?;
+    let key = format!("git-packs/{}/{sha256}.pack", document.document_id);
+    let size = pack.len() as u64;
+    let body = aruna_core::stream::BackendStream::new(futures_util::stream::iter([Ok::<
+        _,
+        aruna_core::stream::StreamError,
+    >(pack)]));
+    store(context, auth, document, (key, size, &sha256), body).await
 }
 
 /// Opens exact bytes: this node's copy, the recording node's version, or any holder's copy.
@@ -191,7 +213,7 @@ pub async fn open(
             key: own.key.clone(),
             version_id: Some(own.version_id),
             range: None,
-            group_id: document.group_id,
+            group_id: own.group_id,
             user_identity: auth.user_id,
             node_id: node,
         };

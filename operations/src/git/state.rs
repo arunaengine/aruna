@@ -20,16 +20,10 @@ pub struct GitState {
 /// Known answers to "is the first commit an ancestor of the second".
 pub type Ancestry = BTreeMap<(String, String), bool>;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Reduction {
-    Done(GitState),
-    /// Commit pairs whose ancestry decides the result; answer them and reduce again.
-    Needs(Vec<(String, String)>),
-}
-
 /// Folds records in id order from the newest checkpoint. A ref update applies when its old
 /// value matches or it fast-forwards a branch; otherwise its commit is kept as a conflict ref.
-pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> Reduction {
+/// The state is final only when no commit pairs are returned; answer them and reduce again.
+pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(String, String)>) {
     let mut ordered: Vec<_> = records.iter().collect();
     ordered.sort_by_key(|record| record.event_id);
     let mut state = GitState::default();
@@ -124,13 +118,9 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> Reduction {
             GitChange::Checkpoint(_) => {}
         }
     }
-    if needs.is_empty() {
-        Reduction::Done(state)
-    } else {
-        needs.sort();
-        needs.dedup();
-        Reduction::Needs(needs)
-    }
+    needs.sort();
+    needs.dedup();
+    (state, needs)
 }
 
 #[cfg(test)]
@@ -177,10 +167,9 @@ mod tests {
     }
 
     fn done(records: &[GitRecord], ancestry: &Ancestry) -> GitState {
-        match reduce(records, ancestry) {
-            Reduction::Done(state) => state,
-            other => panic!("unexpected {other:?}"),
-        }
+        let (state, needs) = reduce(records, ancestry);
+        assert!(needs.is_empty(), "unanswered ancestry {needs:?}");
+        state
     }
 
     #[test]
@@ -202,10 +191,7 @@ mod tests {
             update(30, "refs/heads/main", &oid('b'), &oid('d'), None),
         ];
         let pair = (oid('c'), oid('d'));
-        assert_eq!(
-            reduce(&records, &Ancestry::new()),
-            Reduction::Needs(vec![pair.clone()])
-        );
+        assert_eq!(reduce(&records, &Ancestry::new()).1, vec![pair.clone()]);
         let state = done(&records, &Ancestry::from([(pair.clone(), false)]));
         assert_eq!(state.refs.get("refs/heads/main"), Some(&oid('c')));
         let conflict = format!("refs/conflicts/heads/main/{}", Ulid::from(30));
@@ -244,6 +230,7 @@ mod tests {
     fn checkpoint_keeps_late() {
         let pack = StoredObject {
             node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            group_id: Ulid::from(1),
             bucket: "arc".into(),
             key: "pack".into(),
             version_id: Ulid::from(1),
