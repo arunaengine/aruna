@@ -342,12 +342,19 @@ crate fields are unchanged. Custom fields are also restored; the destination mus
 their vocabulary. Override controlled vocabulary fields for the target repository as needed.
 Source identifiers become provenance relations;
 the transfer does not claim an existing source DOI as a newly issued repository DOI.
-Exports with omitted files fail.
+Exports with omitted files fail. Web data entities, `File` entities with an `https://` identifier
+and no Aruna bytes, stay in the crate and become `references` relations. A record holds at most
+100 files; larger crates fail with `too_many_files` before a draft is created. The request
+fails with 400 and a `missing` list when the mapped metadata lacks title, publication date,
+resource type or creators. Creator identifiers are sent only for ORCID, GND, ISNI and ROR.
+Every new draft reserves its DOI, which `result.repository.doi` shows.
 `publish: false` (the default) leaves an unpublished draft with restricted file access;
 `publish: true` publishes after verifying every uploaded file. Repository validation and
 publication permissions still apply. Set `repository.public_files: true` explicitly to make
-the files public when publishing; otherwise files remain restricted. Existing drafts retain
-their configured access, with their metadata replaced by the mapped crate metadata.
+the files public; otherwise files remain restricted. This also applies to existing drafts,
+whose metadata is replaced by the mapped crate metadata. When the connector names a
+`community`, publishing a record's first version submits it to that community for review
+instead, and `result.repository.in_review` is true.
 
 Set `repository.new_version` to an existing published record ID to create its next version
 under the same parent identifier. This requires permission on that record. A new-version draft
@@ -377,15 +384,28 @@ A link keeps a dataset in sync with one Invenio record lineage. Create it with
 `POST /api/v1/metadata/{document_id}/invenio/links` and a body with `group_id`, `connector_id`
 and the user's `access_token`. Set `parent_id` to continue an existing record, for example the
 imported source. The node that creates the link must hold the dataset; it seals the token for
-that link and becomes the link's owner. The first push is queued right away. Every later change to
-the dataset starts a push about 10 seconds after the last change, as one `export_rocrate` job.
-Pushes update one open draft; publish it with `POST .../links/{link_id}/publish` or set
-`auto_publish`. After a publish, the next push creates a new version. A push fails the link
-instead of leaving out files: reasons are `remote_changed` when the remote lineage has a newer
-version, `token_rejected`, `source_unavailable` when a file has no readable copy or a referenced
-origin changed, and `owner_not_holder`. `PATCH` pauses or resumes a link and changes its
-options, `PUT .../token` replaces the token, and `DELETE` removes the link and its token.
-Deleting the dataset removes its links and their tokens as well. Remote records always stay.
+that link and becomes the link's owner. Creation fails with 400 and a `missing` list when the
+mapped metadata lacks required fields. The first push is queued right away. Later changes push
+10 seconds after the last change, at most 5 minutes after the first waiting one, as one
+`export_rocrate` job. Pushes update one open draft, which keeps its reserved DOI
+(`remote.doi` with `remote.doi_reserved`) and is kept even when a push fails. Publish it with
+`POST .../links/{link_id}/publish`, or set `auto_publish` to publish once the draft has been
+quiet for 15 minutes. With a connector community, the first version goes to community review
+and `remote.review` shows `pending`, then `accepted` or `declined`. After a publish, the next
+push creates a new version. A check that fails after the repository published becomes
+`warning`; the published record and DOI are always kept.
+
+A push fails the link instead of leaving out files or overwriting remote edits. Reasons are
+`remote_changed` when the draft was edited in the repository, a file appeared there or the
+lineage has a newer version, `token_rejected`, `source_unavailable` when a file has no
+readable copy or a referenced origin changed, `too_many_files` and `owner_not_holder`.
+`POST .../links/{link_id}/accept-remote` makes the repository's current state the new base and
+enables the link again. `PATCH` pauses or resumes a link and changes its options,
+`PUT .../token` replaces the token, and `DELETE` removes the link and its token. Pausing or
+deleting cancels a running push. Only the link creator may publish, replace the token or change
+`auto_publish`, `public_files` and `metadata`; group admins may pause, resume, push, accept
+remote changes and delete. Deleting the dataset removes its links and their tokens as well.
+Remote records always stay.
 
 Imports and pushes record the repository DOI and record IDs as secondary identifiers of the
 dataset. `GET /api/v1/metadata/{document_id}/pids` lists them, and
