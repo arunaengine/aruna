@@ -20,7 +20,7 @@ use crate::harvest::repository::{parse_secret_read, read_secret_effect};
 
 use super::executor::JobContext;
 
-pub(crate) mod export;
+pub mod export;
 pub(crate) mod import;
 pub mod link_queue;
 pub mod links;
@@ -28,6 +28,7 @@ pub(crate) mod push;
 mod query;
 pub(crate) mod reference;
 mod verify;
+pub use push::remote_state;
 pub use query::search_records;
 
 #[derive(Debug, thiserror::Error)]

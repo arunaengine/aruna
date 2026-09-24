@@ -17,6 +17,11 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskEvent;
 
 const TXN: Ulid = Ulid::from_bytes([7; 16]);
+const NOW_MS: u64 = 1_700_000_000_000;
+
+fn now() -> SystemTime {
+    SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(NOW_MS)
+}
 
 fn job(nonce: u64) -> JobId {
     JobId::from_parts(
@@ -50,6 +55,7 @@ fn link() -> InvenioLink {
         created_at: SystemTime::UNIX_EPOCH,
         updated_at: SystemTime::UNIX_EPOCH,
         generation: 0,
+        warning: None,
     }
 }
 
@@ -69,11 +75,20 @@ fn secret(link_id: Ulid) -> InvenioCredential {
 
 fn operation(change: LinkChange) -> ChangeLinkOperation {
     let link = link();
-    ChangeLinkOperation::new(link.document_id, link.link_id, change)
+    ChangeLinkOperation::new(link.document_id, link.link_id, change, now())
 }
 
 /// Runs the operation up to the effects that follow reading the stored link.
 fn read(op: &mut ChangeLinkOperation, stored: Option<&InvenioLink>) -> Effects {
+    read_queued(op, stored, None)
+}
+
+/// Like `read`, with a push check already queued for the link.
+fn read_queued(
+    op: &mut ChangeLinkOperation,
+    stored: Option<&InvenioLink>,
+    queued: Option<&LinkQueueEntry>,
+) -> Effects {
     assert!(matches!(
         op.start()[..],
         [Effect::Storage(StorageEffect::StartTransaction {
@@ -83,15 +98,36 @@ fn read(op: &mut ChangeLinkOperation, stored: Option<&InvenioLink>) -> Effects {
     let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: TXN,
     }));
-    assert!(matches!(
-        &effects[..],
-        [Effect::Storage(StorageEffect::Read { key_space, txn_id: Some(TXN), .. })]
-            if key_space == INVENIO_LINK_KEYSPACE
-    ));
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: ByteView::from(vec![]),
-        value: stored.map(|link| ByteView::from(link.to_bytes().unwrap())),
+    let [
+        Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(TXN),
+        }),
+    ] = &effects[..]
+    else {
+        panic!("expected the link and queue read, got {effects:?}");
+    };
+    let read = reads.iter().map(|row| row.0.as_str()).collect::<Vec<_>>();
+    assert_eq!(read, [INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]);
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (
+                ByteView::from(vec![]),
+                stored.map(|link| ByteView::from(link.to_bytes().unwrap())),
+            ),
+            (
+                ByteView::from(vec![]),
+                queued.map(|entry| ByteView::from(postcard::to_allocvec(entry).unwrap())),
+            ),
+        ],
     }))
+}
+
+fn queued_entry(effects: &Effects) -> Option<LinkQueueEntry> {
+    written(effects)
+        .into_iter()
+        .find(|row| row.0 == LINK_QUEUE_KEYSPACE)
+        .map(|row| postcard::from_bytes(&row.2).unwrap())
 }
 
 fn keyspaces<T>(rows: &[(String, Key, T)]) -> Vec<&str> {
@@ -312,6 +348,8 @@ fn finish_requeues_enabled() {
         doi: None,
         html_url: None,
         concept_doi: None,
+        in_review: false,
+        warning: None,
     };
     for (paused, requeue, queued) in [
         (false, true, true),
@@ -326,9 +364,10 @@ fn finish_requeues_enabled() {
         let mut op = operation(LinkChange::Finish {
             job_id: job(1),
             outcome: Box::new(PushOutcome::Pushed {
-                record: record.clone(),
+                record: Box::new(record.clone()),
                 event_id: Ulid::from_bytes([9; 16]),
                 dataset_digest: None,
+                files: Vec::new(),
             }),
             requeue,
         });
@@ -492,4 +531,101 @@ fn closed_fence_refuses() {
         txn_id: TXN,
     }));
     assert_eq!(op.finalize(), Err(LinkError::Fenced));
+}
+
+#[test]
+fn aborting_rejects_events() {
+    let mut op = operation(LinkChange::Delete);
+    read(&mut op, None);
+    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: vec![],
+    }));
+    assert!(effects.is_empty() && op.is_complete());
+    assert!(matches!(op.finalize(), Err(LinkError::Unexpected(_))));
+}
+
+#[test]
+fn finish_schedules_follow_ups() {
+    let mut record = InvenioRecord {
+        id: "draft-1".into(),
+        url: "https://zenodo.org/api/records/draft-1/draft".into(),
+        published: false,
+        parent_id: "parent-1".into(),
+        revision_id: 2,
+        doi: Some("10.5281/zenodo.2".into()),
+        html_url: None,
+        concept_doi: None,
+        in_review: true,
+        warning: None,
+    };
+    let finish = |record: &InvenioRecord| LinkChange::Finish {
+        job_id: job(1),
+        outcome: Box::new(PushOutcome::Pushed {
+            record: Box::new(record.clone()),
+            event_id: Ulid::from_bytes([9; 16]),
+            dataset_digest: None,
+            files: vec!["data.txt".into()],
+        }),
+        requeue: false,
+    };
+    let mut stored = link();
+    stored.active_job = Some(job(1));
+    let effects = read(&mut operation(finish(&record)), Some(&stored));
+    let entry = queued_entry(&effects).expect("a pending review is polled");
+    assert_eq!(entry.due_at_ms, NOW_MS + REVIEW_POLL_MS);
+
+    record.in_review = false;
+    stored.auto_publish = true;
+    let effects = read(&mut operation(finish(&record)), Some(&stored));
+    let entry = queued_entry(&effects).expect("auto_publish waits for a quiet draft");
+    assert_eq!(
+        entry.due_at_ms,
+        NOW_MS + aruna_core::invenio::AUTO_PUBLISH_QUIET_MS
+    );
+
+    // A change queued during the push keeps its earlier check.
+    let earlier = LinkQueueEntry {
+        document_id: stored.document_id,
+        due_at_ms: NOW_MS + 5,
+        first_at_ms: NOW_MS - 5,
+    };
+    let mut op = operation(finish(&record));
+    let effects = read_queued(&mut op, Some(&stored), Some(&earlier));
+    assert_eq!(queued_entry(&effects), Some(earlier));
+}
+
+#[test]
+fn draft_needs_running_push() {
+    let record = InvenioRecord {
+        id: "draft-1".into(),
+        url: "https://zenodo.org/api/records/draft-1/draft".into(),
+        published: false,
+        parent_id: "parent-1".into(),
+        revision_id: 4,
+        doi: None,
+        html_url: None,
+        concept_doi: None,
+        in_review: false,
+        warning: None,
+    };
+    let change = || LinkChange::Draft {
+        job_id: job(1),
+        record: Box::new(record.clone()),
+    };
+    let mut op = operation(change());
+    read(&mut op, Some(&link()));
+    op.step(Event::Storage(StorageEvent::TransactionAborted {
+        txn_id: TXN,
+    }));
+    assert_eq!(op.finalize(), Err(LinkError::Busy(LinkBusy)));
+
+    let mut stored = link();
+    stored.active_job = Some(job(1));
+    let mut op = operation(change());
+    let effects = read(&mut op, Some(&stored));
+    assert_eq!(keyspaces(&written(&effects)), [INVENIO_LINK_KEYSPACE]);
+    commit(&mut op, effects);
+    let link = op.finalize().unwrap().unwrap();
+    assert_eq!(link.remote.draft_id.as_deref(), Some("draft-1"));
+    assert_eq!(link.remote.revision_id, Some(4));
 }

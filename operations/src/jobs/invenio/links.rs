@@ -9,8 +9,9 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::invenio::{
-    InvenioCredential, InvenioLink, LinkBusy, LinkFailure, LinkPatch, LinkQueueEntry, LinkStatus,
-    PushOutcome, connector_link_key, link_key, link_prefix,
+    InvenioCredential, InvenioLink, InvenioRecord, LinkBusy, LinkFailure, LinkPatch,
+    LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS, RemoteState,
+    connector_link_key, link_key, link_prefix,
 };
 use aruna_core::keyspaces::{
     INVENIO_LINK_KEYSPACE, LINK_CONNECTOR_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE,
@@ -19,7 +20,6 @@ use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -51,6 +51,13 @@ pub enum LinkChange {
     Delete,
     /// Stops pushing with this reason; only an enabled link changes.
     Fail(LinkFailure),
+    /// Stores the draft the running push created, before it uploads anything.
+    Draft {
+        job_id: JobId,
+        record: Box<InvenioRecord>,
+    },
+    /// Takes the repository's current state as the base, after a review or remote edits.
+    Accept(Box<RemoteState>),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -110,23 +117,25 @@ pub struct ChangeLinkOperation {
     schedule: bool,
     route: Option<MappingRoute>,
     stored: Option<InvenioLink>,
+    queued: Option<LinkQueueEntry>,
     pending: usize,
     output: Option<Result<Option<InvenioLink>, LinkError>>,
 }
 
 impl ChangeLinkOperation {
-    pub fn new(document_id: Ulid, link_id: Ulid, change: LinkChange) -> Self {
+    pub fn new(document_id: Ulid, link_id: Ulid, change: LinkChange, now: SystemTime) -> Self {
         Self {
             document_id,
             link_id,
             change,
-            now: SystemTime::now(),
+            now,
             state: State::Init,
             txn_id: None,
             deletes: Vec::new(),
             schedule: false,
             route: None,
             stored: None,
+            queued: None,
             pending: 0,
             output: None,
         }
@@ -149,8 +158,10 @@ impl ChangeLinkOperation {
             ByteView::from(link_key(self.document_id, self.link_id)),
         );
         let queue_row = (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id));
+        let now_ms = millis(self.now);
         let mut writes = Vec::new();
-        let mut queue = false;
+        // When the drain should look at the link next, if this change needs a look.
+        let mut queue = None;
         let result = match (
             std::mem::replace(&mut self.change, LinkChange::Delete),
             stored,
@@ -165,13 +176,18 @@ impl ChangeLinkOperation {
                     ByteView::from(connector_link_key(link.connector_id, link.link_id)),
                     ByteView::from(link.document_id.to_bytes().to_vec()),
                 ));
-                queue = true;
+                queue = Some(now_ms);
                 Some(*link)
             }
             (LinkChange::Create { .. }, Some(_)) => return Err(LinkError::Exists),
             (_, None) => return Err(LinkError::NotFound),
             (LinkChange::Patch(patch), Some(mut link)) => {
-                queue = link.patch(&patch, self.now);
+                queue = if link.patch(&patch, self.now) {
+                    Some(now_ms)
+                } else {
+                    link.publish_due_ms()
+                        .filter(|_| patch.auto_publish == Some(true))
+                };
                 Some(link)
             }
             (LinkChange::Rotate(secret), Some(mut link)) => {
@@ -179,7 +195,7 @@ impl ChangeLinkOperation {
                     return Err(LinkError::ForeignToken);
                 }
                 writes.push(secret_row(self.link_id, &secret)?);
-                queue = link.rotate(self.now);
+                queue = link.rotate(self.now).then_some(now_ms);
                 Some(link)
             }
             (LinkChange::Begin(job_id), Some(mut link)) => {
@@ -196,7 +212,25 @@ impl ChangeLinkOperation {
                 Some(mut link),
             ) => {
                 let applied = link.finish(job_id, &outcome, self.now);
-                queue = applied && requeue && link.status == LinkStatus::Enabled;
+                if applied && link.status == LinkStatus::Enabled {
+                    let review = (link.remote.review == LinkReview::Pending)
+                        .then(|| now_ms.saturating_add(REVIEW_POLL_MS));
+                    queue = requeue
+                        .then_some(now_ms)
+                        .or(review)
+                        .or(link.publish_due_ms());
+                }
+                Some(link)
+            }
+            (LinkChange::Draft { job_id, record }, Some(mut link)) => {
+                if !link.draft(job_id, &record, self.now) {
+                    return Err(LinkError::Busy(LinkBusy));
+                }
+                Some(link)
+            }
+            (LinkChange::Accept(state), Some(mut link)) => {
+                link.accept(&state, self.now);
+                queue = Some(now_ms);
                 Some(link)
             }
             (LinkChange::Fail(reason), Some(mut link)) => {
@@ -223,7 +257,6 @@ impl ChangeLinkOperation {
                 None
             }
         };
-        let now_ms = millis(self.now);
         let result = result.map(|mut link| {
             link.stamp(now_ms);
             link
@@ -236,10 +269,15 @@ impl ChangeLinkOperation {
             }
             writes.push((link_row.0, link_row.1, ByteView::from(bytes)));
         }
-        if queue {
+        if let Some(due_at_ms) = queue {
+            // A change queued meanwhile keeps its earlier due time.
+            let queued = self.queued.take();
             let entry = LinkQueueEntry {
                 document_id: self.document_id,
-                due_at_ms: unix_timestamp_millis(),
+                due_at_ms: queued
+                    .as_ref()
+                    .map_or(due_at_ms, |q| q.due_at_ms.min(due_at_ms)),
+                first_at_ms: queued.map_or(now_ms, |queued| queued.first_at_ms),
             };
             let value = postcard::to_allocvec(&entry).map_err(ConversionError::from)?;
             writes.push((queue_row.0, queue_row.1, ByteView::from(value)));
@@ -292,8 +330,19 @@ impl Operation for ChangeLinkOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if self.state == State::Aborting {
-            self.state = State::Done;
-            return smallvec![];
+            return match event {
+                Event::Storage(
+                    StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. },
+                ) => {
+                    self.state = State::Done;
+                    smallvec![]
+                }
+                other => {
+                    self.state = State::Done;
+                    self.output = Some(Err(LinkError::Unexpected(format!("{other:?}"))));
+                    smallvec![]
+                }
+            };
         }
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return self.fail(error.into());
@@ -302,20 +351,31 @@ impl Operation for ChangeLinkOperation {
             (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn_id = Some(txn_id);
                 self.state = State::Read;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: INVENIO_LINK_KEYSPACE.to_string(),
-                    key: ByteView::from(link_key(self.document_id, self.link_id)),
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads: vec![
+                        (
+                            INVENIO_LINK_KEYSPACE.to_string(),
+                            ByteView::from(link_key(self.document_id, self.link_id)),
+                        ),
+                        (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id)),
+                    ],
                     txn_id: Some(txn_id),
                 })]
             }
-            (State::Read, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let stored = match value
+            (State::Read, Event::Storage(StorageEvent::BatchReadResult { mut values }))
+                if values.len() == 2 =>
+            {
+                let queued = values.pop().and_then(|(_, value)| value);
+                let link = values.pop().and_then(|(_, value)| value);
+                let stored = match link
                     .map(|bytes| InvenioLink::from_bytes(&bytes))
                     .transpose()
                 {
                     Ok(stored) => stored,
                     Err(error) => return self.fail(error.into()),
                 };
+                // An unreadable queue row is replaced like a missing one.
+                self.queued = queued.and_then(|bytes| postcard::from_bytes(&bytes).ok());
                 // A departing holder's close either rejects this write or conflicts with it.
                 match self.route.as_ref().filter(|route| route.generation > 0) {
                     Some(route) => {
@@ -464,7 +524,9 @@ pub async fn change_link(
             .map_err(|error| LinkError::Unexpected(error.to_string()))?,
         None => None,
     };
-    let operation = ChangeLinkOperation::new(link.document_id, link.link_id, change).routed(route);
+    let operation =
+        ChangeLinkOperation::new(link.document_id, link.link_id, change, SystemTime::now())
+            .routed(route);
     drive(operation, context).await
 }
 
