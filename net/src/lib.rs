@@ -879,6 +879,8 @@ impl NetHandle {
                 "Gave up joining inbound stream handlers during shutdown"
             );
         }
+        // The handler holds the node context, which holds this handle; release the cycle.
+        self.clear_inbound_handler();
         NetShutdownOutcome {
             inbound_pending_deadline,
             effects_pending,
