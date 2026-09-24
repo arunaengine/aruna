@@ -143,6 +143,7 @@ pub async fn patch_link(
         auto_publish: request.auto_publish,
         public_files: request.public_files,
         metadata_json,
+        auto_update: None,
     };
     let pause = patch.paused == Some(true);
     change(&state, &link, LinkChange::Patch(patch)).await?;

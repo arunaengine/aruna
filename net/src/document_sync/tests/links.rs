@@ -31,6 +31,7 @@ fn link(document_id: Ulid, owner: NodeId, realm_id: RealmId, generation: u64) ->
         updated_at: std::time::SystemTime::UNIX_EPOCH,
         generation,
         warning: None,
+        direction: aruna_core::invenio::LinkDirection::Push,
     }
 }
 

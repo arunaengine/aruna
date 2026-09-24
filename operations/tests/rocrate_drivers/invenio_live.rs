@@ -170,6 +170,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
                     mode,
                     all_versions: true,
                 },
+                pull: None,
             },
             doc_id(index as u64 + 2),
         );
@@ -621,6 +622,7 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
                     mode,
                     all_versions: true,
                 },
+                pull: None,
             },
             document,
         );

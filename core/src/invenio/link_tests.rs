@@ -43,6 +43,7 @@ fn link() -> InvenioLink {
         updated_at: SystemTime::UNIX_EPOCH,
         generation: 0,
         warning: None,
+        direction: LinkDirection::Push,
     }
 }
 
@@ -363,4 +364,117 @@ fn orders_sync_changes() {
     assert_eq!(delete.kind, DocumentChangeKind::Delete);
     assert!(delete.current > second.current);
     assert_eq!(delete.current.actor, link.owner_node);
+}
+
+fn pulling(auto_update: bool) -> InvenioLink {
+    let mut link = link();
+    link.direction = LinkDirection::Pull(Box::new(LinkPull {
+        auto_update,
+        options: InvenioOptions::default(),
+        target: ImportRoCrateTarget {
+            bucket: "research".into(),
+            prefix: "zenodo".into(),
+        },
+        latest_remote_id: None,
+        latest_revision: None,
+        last_checked_at: None,
+        next_check_ms: 0,
+        failures: 0,
+        revision: None,
+        local_changed: false,
+    }));
+    link.hold(
+        &record("v1", true, Some("10.5281/zenodo.1")),
+        Ulid::from_bytes([20; 16]),
+        SystemTime::UNIX_EPOCH,
+    );
+    link
+}
+
+fn found(latest_id: &str, revision: u64, local: u8) -> PullCheck {
+    PullCheck::Found {
+        latest_id: latest_id.into(),
+        revision,
+        local: Some(Ulid::from_bytes([local; 16])),
+    }
+}
+
+#[test]
+fn pull_checks_versions() {
+    let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+    let mut link = pulling(true);
+    assert!(!link.checked(&found("v1", 3, 20), now));
+    assert_eq!(link.pull_reason(), None);
+    let pull = link.pull().unwrap();
+    assert_eq!(pull.next_check_ms, 1_000_000 + PULL_CHECK_MS);
+    assert_eq!(pull.last_checked_at, Some(now));
+    // A repository edit of the held version counts as an update.
+    assert!(link.checked(&found("v1", 4, 20), now));
+    assert!(link.checked(&found("v2", 1, 20), now));
+    assert_eq!(link.pull_reason(), Some("update_available"));
+    // A local edit holds the update back until the user pulls.
+    assert!(!link.checked(&found("v2", 1, 21), now));
+    assert_eq!(link.pull_reason(), Some("local_changed"));
+    let mut manual = pulling(false);
+    assert!(!manual.checked(&found("v2", 1, 20), now));
+    assert_eq!(manual.pull_reason(), Some("update_available"));
+    manual.status = LinkStatus::Paused;
+    assert_eq!(manual.pull_reason(), None);
+}
+
+#[test]
+fn pull_checks_back_off() {
+    let mut link = pulling(true);
+    let now = SystemTime::UNIX_EPOCH;
+    let waits = (0..12)
+        .map(|_| {
+            link.checked(&PullCheck::Unavailable, now);
+            link.pull().unwrap().next_check_ms
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        waits[..3],
+        [PULL_RETRY_MS, 2 * PULL_RETRY_MS, 4 * PULL_RETRY_MS]
+    );
+    assert_eq!(waits[11], PULL_CHECK_MS);
+    link.checked(&found("v1", 3, 20), now);
+    assert_eq!(link.pull().unwrap().failures, 0);
+}
+
+#[test]
+fn pull_records_version() {
+    let now = SystemTime::now();
+    let mut link = pulling(false);
+    link.checked(&found("v2", 5, 21), now);
+    let v2 = InvenioRecord {
+        revision_id: 5,
+        ..record("v2", true, Some("10.5281/zenodo.2"))
+    };
+    let revision = Ulid::from_bytes([22; 16]);
+    assert!(!link.pulled(job(1), &v2, revision, now), "only its own job");
+    link.begin(job(1), now).unwrap();
+    assert!(link.pulled(job(1), &v2, revision, now));
+    assert_eq!(link.active_job, None);
+    assert_eq!(link.remote.record_id.as_deref(), Some("v2"));
+    assert_eq!(link.remote.doi.as_deref(), Some("10.5281/zenodo.2"));
+    assert_eq!(link.pull().unwrap().revision, Some(revision));
+    assert!(!link.update_available() && !link.pull().unwrap().local_changed);
+    let patch = LinkPatch {
+        auto_update: Some(true),
+        ..LinkPatch::default()
+    };
+    link.patch(&patch, now);
+    assert!(link.pull().unwrap().auto_update);
+}
+
+#[test]
+fn matches_same_lineage() {
+    let pull = pulling(false);
+    let mut push = link();
+    assert!(!push.same_lineage(&pull));
+    push.remote.parent_id = Some("parent-1".into());
+    push.endpoint = "https://zenodo.org/api".into();
+    assert!(push.same_lineage(&pull));
+    push.endpoint = "https://sandbox.zenodo.org/api/".into();
+    assert!(!push.same_lineage(&pull));
 }

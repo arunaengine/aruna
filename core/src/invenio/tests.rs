@@ -434,3 +434,54 @@ fn record_identifiers_normalized() {
         0
     );
 }
+
+#[test]
+fn pull_adds_versions() {
+    let version = |id: &str| {
+        (
+            json!({"id": id, "metadata": {"title": format!("Version {id}"), "publication_date": "2024-01-01"},
+                "pids": {"doi": {"identifier": format!("10.1234/{id}")}}}),
+            json!({"entries": [{"key": "data.csv", "size": 4, "file_id": format!("file-{id}")}]}),
+        )
+    };
+    let mut current = import_crate("https://zenodo.org/api/", "1", &[version("1")]).unwrap();
+    // The stored crate names imported files by their Aruna identifiers.
+    let graph = current["@graph"].as_array_mut().unwrap();
+    for entity in graph.iter_mut() {
+        if entity["@id"] == file_path("1", "data.csv").unwrap() {
+            entity["@id"] = json!("https://w3id.org/aruna/object/1");
+        }
+    }
+    let (latest, files) = version("2");
+    let merged = pull_crate(
+        &current,
+        "https://zenodo.org/api/",
+        &latest,
+        &[(latest.clone(), files)],
+    )
+    .unwrap();
+    assert_eq!(crate_versions(&merged), ["1", "2"]);
+    let graph = merged["@graph"].as_array().unwrap();
+    let root = graph.iter().find(|entry| entry["@id"] == "./").unwrap();
+    assert_eq!(root["name"], "Version 2");
+    assert_eq!(
+        root["hasPart"],
+        json!([{"@id": "versions/1/"}, {"@id": "versions/2/"}])
+    );
+    assert!(
+        graph
+            .iter()
+            .any(|entry| entry["@id"] == "https://w3id.org/aruna/object/1")
+    );
+    assert!(
+        graph
+            .iter()
+            .any(|entry| entry["@id"] == file_path("2", "data.csv").unwrap())
+    );
+    // A metadata edit of a version already present only changes the root.
+    let (mut edited, _) = version("2");
+    edited["metadata"]["title"] = json!("Edited");
+    let again = pull_crate(&merged, "https://zenodo.org/api/", &edited, &[]).unwrap();
+    assert_eq!(crate_versions(&again), ["1", "2"]);
+    assert_eq!(again["@graph"].as_array().unwrap().len(), graph.len());
+}

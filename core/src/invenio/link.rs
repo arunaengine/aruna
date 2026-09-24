@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{InvenioDestination, InvenioRecord};
+use super::{InvenioDestination, InvenioOptions, InvenioRecord};
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
-use crate::structs::execution::job::{JobId, RoCrateLimits};
+use crate::structs::execution::job::{ImportRoCrateTarget, JobId, RoCrateLimits};
 use crate::structs::placement::record::PlacementRef;
 use crate::{NodeId, UserId};
 
@@ -25,6 +25,10 @@ pub const AUTO_PUBLISH_QUIET_MS: u64 = 900_000;
 pub const REVIEW_POLL_MS: u64 = 3_600_000;
 /// Zenodo accepts at most this many files per record.
 pub const MAX_RECORD_FILES: usize = 100;
+/// How often a pull link asks the repository for a new version.
+pub const PULL_CHECK_MS: u64 = 86_400_000;
+/// First wait after a pull check found the repository busy or unreachable; it doubles per failure.
+pub const PULL_RETRY_MS: u64 = 300_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LinkFailure {
@@ -134,6 +138,50 @@ pub struct InvenioLink {
     pub generation: u64,
     /// A problem found after the repository already published, such as a failed check.
     pub warning: Option<String>,
+    pub direction: LinkDirection,
+}
+
+/// Which way a link carries changes: from the dataset to the repository, or back.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LinkDirection {
+    #[default]
+    Push,
+    Pull(Box<LinkPull>),
+}
+
+/// A pull link's import settings and what its checks found. The link's `remote` names the
+/// version the dataset holds and its revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LinkPull {
+    pub auto_update: bool,
+    /// The mode and version choice of the import; updates import the same way.
+    pub options: InvenioOptions,
+    /// Where the import wrote its files; updates add new versions there.
+    pub target: ImportRoCrateTarget,
+    /// The lineage's latest published version at the last check, with its revision.
+    pub latest_remote_id: Option<String>,
+    pub latest_revision: Option<u64>,
+    pub last_checked_at: Option<SystemTime>,
+    pub next_check_ms: u64,
+    /// Checks in a row that found the repository busy or unreachable.
+    pub failures: u32,
+    /// The dataset revision the last pull wrote; another revision means a local edit.
+    pub revision: Option<Ulid>,
+    /// An update waits because the dataset changed since the last pull.
+    pub local_changed: bool,
+}
+
+/// What a pull check learned from the repository.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PullCheck {
+    /// The latest published version and its revision; `local` is the dataset's revision now.
+    Found {
+        latest_id: String,
+        revision: u64,
+        local: Option<Ulid>,
+    },
+    /// The repository was busy or unreachable; the next check waits longer.
+    Unavailable,
 }
 
 /// Link identity and lineage a push job checks before it touches the repository.
@@ -152,6 +200,8 @@ pub struct LinkPatch {
     pub auto_publish: Option<bool>,
     pub public_files: Option<bool>,
     pub metadata_json: Option<String>,
+    /// Pull links only: import new versions without asking.
+    pub auto_update: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -268,6 +318,9 @@ impl InvenioLink {
         }
         if let Some(metadata) = &patch.metadata_json {
             self.metadata_json = metadata.clone();
+        }
+        if let (Some(auto_update), Some(pull)) = (patch.auto_update, self.pull_mut()) {
+            pull.auto_update = auto_update;
         }
         self.updated_at = now;
         match patch.paused {
@@ -465,6 +518,129 @@ impl InvenioLink {
             self.link_id, self.sequence
         )
     }
+}
+
+impl InvenioLink {
+    pub fn pull(&self) -> Option<&LinkPull> {
+        match &self.direction {
+            LinkDirection::Pull(pull) => Some(pull),
+            LinkDirection::Push => None,
+        }
+    }
+
+    fn pull_mut(&mut self) -> Option<&mut LinkPull> {
+        match &mut self.direction {
+            LinkDirection::Pull(pull) => Some(pull),
+            LinkDirection::Push => None,
+        }
+    }
+
+    /// Whether the last check found a version or revision the dataset does not hold yet.
+    pub fn update_available(&self) -> bool {
+        self.pull().is_some_and(|pull| {
+            pull.latest_remote_id.is_some()
+                && (pull.latest_remote_id != self.remote.record_id
+                    || pull.latest_revision != self.remote.revision_id)
+        })
+    }
+
+    /// Information on an enabled pull link: update_available, or local_changed when a local
+    /// edit holds the update back.
+    pub fn pull_reason(&self) -> Option<&'static str> {
+        let pull = self.pull()?;
+        if self.status != LinkStatus::Enabled || !self.update_available() {
+            return None;
+        }
+        Some(if pull.local_changed {
+            "local_changed"
+        } else {
+            "update_available"
+        })
+    }
+
+    /// Records a check at `now`; true when auto_update should import the new version now.
+    pub fn checked(&mut self, check: &PullCheck, now: SystemTime) -> bool {
+        let now_ms = millis(now);
+        let Some(pull) = self.pull_mut() else {
+            return false;
+        };
+        match check {
+            PullCheck::Found {
+                latest_id,
+                revision,
+                local,
+            } => {
+                pull.latest_remote_id = Some(latest_id.clone());
+                pull.latest_revision = Some(*revision);
+                pull.last_checked_at = Some(now);
+                pull.failures = 0;
+                pull.next_check_ms = now_ms.saturating_add(PULL_CHECK_MS);
+                pull.local_changed = pull.revision.is_some() && *local != pull.revision;
+            }
+            PullCheck::Unavailable => {
+                pull.failures = pull.failures.saturating_add(1);
+                let wait = PULL_RETRY_MS
+                    .saturating_mul(1 << pull.failures.saturating_sub(1).min(16))
+                    .min(PULL_CHECK_MS);
+                pull.next_check_ms = now_ms.saturating_add(wait);
+            }
+        }
+        self.updated_at = now;
+        let auto = self
+            .pull()
+            .is_some_and(|pull| pull.auto_update && !pull.local_changed);
+        auto && self.update_available()
+            && self.status == LinkStatus::Enabled
+            && self.active_job.is_none()
+    }
+
+    /// Takes `record` as the version the dataset now holds, written as dataset `revision`.
+    pub fn pulled(
+        &mut self,
+        job_id: JobId,
+        record: &InvenioRecord,
+        revision: Ulid,
+        now: SystemTime,
+    ) -> bool {
+        if self.active_job != Some(job_id) || self.pull().is_none() {
+            return false;
+        }
+        self.active_job = None;
+        self.hold(record, revision, now);
+        true
+    }
+
+    /// Makes `record` and dataset `revision` the pull link's base.
+    pub fn hold(&mut self, record: &InvenioRecord, revision: Ulid, now: SystemTime) {
+        self.adopt(record);
+        self.remote.revision_id = Some(record.revision_id);
+        if let Some(pull) = self.pull_mut() {
+            pull.revision = Some(revision);
+            pull.local_changed = false;
+            if pull.latest_remote_id.is_none()
+                || pull.latest_remote_id.as_deref() == Some(record.id.as_str())
+            {
+                pull.latest_remote_id = Some(record.id.clone());
+                pull.latest_revision = Some(record.revision_id);
+            }
+        }
+        if matches!(self.status, LinkStatus::Failed { .. }) {
+            self.status = LinkStatus::Enabled;
+        }
+        self.updated_at = now;
+    }
+
+    /// Whether both links follow the same record lineage of one repository.
+    pub fn same_lineage(&self, other: &Self) -> bool {
+        self.remote.parent_id.is_some()
+            && self.remote.parent_id == other.remote.parent_id
+            && self.endpoint.trim_end_matches('/') == other.endpoint.trim_end_matches('/')
+    }
+}
+
+fn millis(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 pub fn link_key(document_id: Ulid, link_id: Ulid) -> Vec<u8> {

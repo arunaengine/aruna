@@ -300,6 +300,8 @@ pub enum ImportRoCrateSource {
         connector_id: Ulid,
         record_id: String,
         options: crate::invenio::InvenioOptions,
+        /// Set when the import keeps a pull link or updates one.
+        pull: Option<crate::invenio::InvenioPull>,
     },
 }
 

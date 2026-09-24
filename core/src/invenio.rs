@@ -60,6 +60,18 @@ impl Default for InvenioOptions {
     }
 }
 
+/// How an Invenio import relates to a pull link.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum InvenioPull {
+    /// After the import, a new pull link keeps the dataset updated from the lineage.
+    Keep {
+        auto_update: bool,
+        owner_node_url: String,
+    },
+    /// Imports the lineage's new versions into the dataset of this pull link.
+    Update { link_id: Ulid },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InvenioDestination {
     pub group_id: Ulid,
@@ -398,6 +410,68 @@ pub fn import_crate(
     root["hasPart"] = Value::Array(parts);
     graph.push(root);
     Ok(json!({"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": graph}))
+}
+
+/// The dataset crate after a pull: the root takes `latest`'s metadata and keeps its parts, and
+/// each version in `added` becomes a new part with its files. Parts already present stay as they are.
+pub fn pull_crate(
+    current: &Value,
+    endpoint: &str,
+    latest: &Value,
+    added: &[(Value, Value)],
+) -> Result<Value, InvenioError> {
+    let root = crate_root(current).ok_or(InvenioError("missing crate root"))?;
+    let root_id = root["@id"]
+        .as_str()
+        .ok_or(InvenioError("missing crate root"))?;
+    let mut parts = values(&root["hasPart"]).to_vec();
+    let mut graph = current["@graph"]
+        .as_array()
+        .ok_or(InvenioError("missing crate graph"))?
+        .clone();
+    let known = graph
+        .iter()
+        .filter_map(|entity| entity["@id"].as_str().map(str::to_string))
+        .collect::<std::collections::HashSet<_>>();
+    if let Some((first, _)) = added.first() {
+        let fresh = import_crate(endpoint, record_id(first)?, added)?;
+        for entity in fresh["@graph"].as_array().into_iter().flatten() {
+            match entity["@id"].as_str() {
+                Some("./") => parts.extend(
+                    values(&entity["hasPart"])
+                        .iter()
+                        .filter(|part| !parts.contains(part))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                Some("ro-crate-metadata.json") => {}
+                Some(id) if !known.contains(id) => graph.push(entity.clone()),
+                _ => {}
+            }
+        }
+    }
+    let mut entity = record_entity(latest, root_id)?;
+    entity["hasPart"] = Value::Array(parts);
+    let slot = graph
+        .iter_mut()
+        .find(|candidate| candidate["@id"] == root_id)
+        .ok_or(InvenioError("missing crate root"))?;
+    *slot = entity;
+    Ok(json!({"@context": current["@context"].clone(), "@graph": graph}))
+}
+
+/// Version ids whose `versions/{id}/` part the crate already holds.
+pub fn crate_versions(document: &Value) -> Vec<String> {
+    document["@graph"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entity| {
+            let id = entity["@id"].as_str()?.strip_prefix("versions/")?;
+            let id = id.strip_suffix('/')?;
+            validate_id(id).ok().map(|_| id.to_string())
+        })
+        .collect()
 }
 
 /// The record's version DOI, concept DOI, id and parent id as secondary identifiers.

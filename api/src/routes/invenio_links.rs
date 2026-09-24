@@ -513,6 +513,7 @@ pub async fn create_link(
         updated_at: now,
         generation: 0,
         warning: None,
+        direction: aruna_core::invenio::LinkDirection::Push,
     };
     let change = LinkChange::Create {
         link: Box::new(link.clone()),

@@ -56,6 +56,7 @@ fn link() -> InvenioLink {
         updated_at: SystemTime::UNIX_EPOCH,
         generation: 0,
         warning: None,
+        direction: aruna_core::invenio::LinkDirection::Push,
     }
 }
 

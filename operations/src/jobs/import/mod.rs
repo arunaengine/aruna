@@ -388,6 +388,7 @@ async fn acquire_source(
             connector_id,
             record_id,
             options,
+            ..
         } => {
             let (artifact, found) = super::invenio::import::acquire(
                 ctx,

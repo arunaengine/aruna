@@ -409,6 +409,7 @@ fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrat
                 group_id: parse_ulid(&group_id)?,
                 connector_id: parse_ulid(&connector_id)?,
                 record_id,
+                pull: None,
             })
         }
         ImportSourceRequest::Upload { upload_id } => Ok(ImportRoCrateSource::Upload {

@@ -16,6 +16,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
             connector_id,
             record_id: "2".into(),
             options: Default::default(),
+            pull: None,
         },
         doc_id(1),
     );
@@ -133,6 +134,7 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
                     mode,
                     all_versions: false,
                 },
+                pull: None,
             },
             doc_id(1),
         );
@@ -206,6 +208,7 @@ async fn invenio_import_modes() -> Result<(), Box<dyn std::error::Error>> {
                     mode,
                     all_versions: false,
                 },
+                pull: None,
             },
             doc_id(1),
         );
@@ -347,6 +350,7 @@ async fn invenio_rejects_corruption() -> Result<(), Box<dyn std::error::Error>> 
                 connector_id,
                 record_id: "2".into(),
                 options: Default::default(),
+                pull: None,
             },
             doc_id(1),
         );
@@ -385,6 +389,7 @@ async fn invenio_cancels_reference() -> Result<(), Box<dyn std::error::Error>> {
                 mode: aruna_core::invenio::InvenioMode::Reference,
                 all_versions: false,
             },
+            pull: None,
         },
         doc_id(1),
     );

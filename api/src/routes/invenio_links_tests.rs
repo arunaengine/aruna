@@ -335,6 +335,7 @@ async fn holder_copy_refuses() {
         updated_at: now,
         generation: 1,
         warning: None,
+        direction: aruna_core::invenio::LinkDirection::Push,
     };
     let written = linked
         .test
