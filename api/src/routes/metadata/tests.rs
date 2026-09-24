@@ -4389,7 +4389,9 @@ async fn pid_lookup_hides_private() {
     use crate::routes::pid::{
         LookupQuery, SecondaryKindView, list_persistent_ids, lookup_identifier,
     };
-    use aruna_core::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
+    use aruna_core::structs::secondary_id::{
+        IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier,
+    };
     let test = setup_network_state().await;
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
@@ -4410,11 +4412,18 @@ async fn pid_lookup_hides_private() {
     drain_metadata_background(test.state.as_ref()).await;
     let document_id = Ulid::from_string(&created.summary.document_id).unwrap();
     let identifiers = vec![
-        SecondaryIdentifier::new(SecondaryIdKind::Doi, "10.5281/Zenodo.42", None).unwrap(),
+        SecondaryIdentifier::new(
+            SecondaryIdKind::Doi,
+            "10.5281/Zenodo.42",
+            None,
+            IdentifierOrigin::Imported,
+        )
+        .unwrap(),
         SecondaryIdentifier::new(
             SecondaryIdKind::InvenioParent,
             "abcde-12345",
             Some("https://zenodo.org/api/"),
+            IdentifierOrigin::Published,
         )
         .unwrap(),
     ];
@@ -4434,6 +4443,7 @@ async fn pid_lookup_hides_private() {
         lookup_identifier(
             State(test.state.clone()),
             Extension(auth),
+            Extension(None),
             Query(LookupQuery {
                 kind: SecondaryKindView::Doi,
                 value: value.to_string(),
@@ -4444,7 +4454,11 @@ async fn pid_lookup_hides_private() {
     let Json(found) = lookup(Some(test.auth.clone()), "https://doi.org/10.5281/zenodo.42")
         .await
         .unwrap();
-    assert_eq!(found.document_id, document_id.to_string());
+    let found = serde_json::to_value(found).unwrap();
+    assert_eq!(
+        found,
+        serde_json::json!({"matches": [{"document_id": document_id.to_string(), "origin": "imported"}]})
+    );
     let stranger = AuthContext {
         user_id: aruna_core::UserId::local(Ulid::generate(), test.auth.realm_id),
         ..test.auth.clone()
@@ -4467,8 +4481,9 @@ async fn pid_lookup_hides_private() {
     assert_eq!(
         listed[0]["secondary_identifiers"],
         serde_json::json!([
-            {"kind": "doi", "value": "10.5281/zenodo.42"},
-            {"kind": "invenio_parent", "value": "abcde-12345", "endpoint": "https://zenodo.org/api"}
+            {"kind": "doi", "value": "10.5281/zenodo.42", "origin": "imported"},
+            {"kind": "invenio_parent", "value": "abcde-12345", "endpoint": "https://zenodo.org/api",
+                "origin": "published"}
         ])
     );
 }
