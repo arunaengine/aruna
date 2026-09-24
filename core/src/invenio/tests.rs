@@ -265,6 +265,7 @@ fn relates_registered_identifiers() {
             doi("10.1/own-version", IdentifierOrigin::Published).unwrap(),
             doi("10.1/own-concept", IdentifierOrigin::Published).unwrap(),
         ],
+        references: vec!["https://example.org/data.csv".into()],
     };
     let mut document = json!({"@graph": [
         {"@id": "ro-crate-metadata.json", "about": {"@id": "./"}},
@@ -289,9 +290,43 @@ fn relates_registered_identifiers() {
         json!([
             {"scheme": "doi", "identifier": "10.1/SOURCE", "relation_type": {"id": "isderivedfrom"}},
             {"scheme": "url", "identifier": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
-                "relation_type": {"id": "isidenticalto"}}
+                "relation_type": {"id": "isidenticalto"}},
+            {"scheme": "url", "identifier": "https://example.org/data.csv",
+                "relation_type": {"id": "references"}}
         ])
     );
+}
+
+#[test]
+fn keeps_creator_schemes() {
+    let document = json!({"@graph": [{"@id": "./", "name": "Title", "datePublished": "2024",
+        "creator": {"@type": "Person", "familyName": "Doe", "identifier": [
+            "https://orcid.org/0000-0002-1825-0097",
+            {"@type": "PropertyValue", "propertyID": "ISNI", "value": "0000000121032683"},
+            "https://ror.org/03yrm5c26/",
+            "https://example.org/people/doe",
+            {"@type": "PropertyValue", "propertyID": "email", "value": "doe@example.org"}]}}]});
+    let metadata = export_metadata(&document, &Value::Null, &ExportIdentity::default()).unwrap();
+    assert_eq!(
+        metadata["creators"][0]["person_or_org"]["identifiers"],
+        json!([
+            {"scheme": "orcid", "identifier": "0000-0002-1825-0097"},
+            {"scheme": "isni", "identifier": "0000000121032683"},
+            {"scheme": "ror", "identifier": "03yrm5c26"}
+        ])
+    );
+}
+
+#[test]
+fn lists_missing_fields() {
+    let document = json!({"@graph": [{"@id": "./", "name": "Scaffold"}]});
+    assert_eq!(
+        missing_metadata(&document, &Value::Null).unwrap(),
+        ["publication_date", "creators"]
+    );
+    let overrides = json!({"publication_date": "2024-01-01",
+        "creators": [{"person_or_org": {"type": "personal", "family_name": "Doe"}}]});
+    assert!(missing_metadata(&document, &overrides).unwrap().is_empty());
 }
 
 #[test]

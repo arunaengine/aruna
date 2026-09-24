@@ -86,6 +86,10 @@ pub struct InvenioRecord {
     pub html_url: Option<String>,
     /// DOI of the record's parent, which names every version.
     pub concept_doi: Option<String>,
+    /// Submitted to the connector's community for review instead of published.
+    pub in_review: bool,
+    /// A check that failed after the repository had already published the record.
+    pub warning: Option<String>,
 }
 
 impl InvenioRecord {
@@ -120,6 +124,9 @@ pub struct ExportIdentity {
     pub own: Vec<String>,
     /// Registered repository identifiers of the dataset.
     pub identifiers: Vec<SecondaryIdentifier>,
+    /// Web data entities the crate names without Aruna bytes; exports relate them as
+    /// `references`.
+    pub references: Vec<String>,
 }
 
 impl ExportIdentity {
@@ -202,22 +209,44 @@ pub fn file_path(id: &str, key: &str) -> Result<String, InvenioError> {
 }
 
 pub fn validate_metadata(metadata: &Value) -> Result<(), InvenioError> {
-    if !metadata["title"]
-        .as_str()
-        .is_some_and(|value| !value.trim().is_empty())
-        || !metadata["publication_date"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
-        || !metadata["resource_type"]["id"].is_string()
-        || !metadata["creators"]
-            .as_array()
-            .is_some_and(|value| !value.is_empty())
-    {
+    if !missing_fields(metadata).is_empty() {
         return Err(InvenioError(
             "title, publication_date, resource_type and creators are required",
         ));
     }
     Ok(())
+}
+
+/// The mandatory repository fields that `metadata` lacks.
+pub fn missing_fields(metadata: &Value) -> Vec<&'static str> {
+    let text = |name: &str| {
+        metadata[name]
+            .as_str()
+            .is_some_and(|v| !v.trim().is_empty())
+    };
+    [
+        ("title", text("title")),
+        ("publication_date", text("publication_date")),
+        ("resource_type", metadata["resource_type"]["id"].is_string()),
+        (
+            "creators",
+            metadata["creators"]
+                .as_array()
+                .is_some_and(|value| !value.is_empty()),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| (!present).then_some(name))
+    .collect()
+}
+
+/// The mandatory fields the mapped crate still lacks after `overrides`, before any draft exists.
+pub fn missing_metadata(
+    document: &Value,
+    overrides: &Value,
+) -> Result<Vec<&'static str>, InvenioError> {
+    let metadata = map_metadata(document, overrides, &ExportIdentity::default())?;
+    Ok(missing_fields(&metadata))
 }
 
 /// Maps searchable fields; the companion JSON files retain every unmapped field.
@@ -422,6 +451,16 @@ pub fn export_metadata(
     overrides: &Value,
     identity: &ExportIdentity,
 ) -> Result<Value, InvenioError> {
+    let metadata = map_metadata(document, overrides, identity)?;
+    validate_metadata(&metadata)?;
+    Ok(metadata)
+}
+
+fn map_metadata(
+    document: &Value,
+    overrides: &Value,
+    identity: &ExportIdentity,
+) -> Result<Value, InvenioError> {
     let mut metadata = json!({"resource_type": {"id": "dataset"}, "rights": []});
     let graph = document["@graph"]
         .as_array()
@@ -485,7 +524,7 @@ pub fn export_metadata(
                 person["identifiers"] = Value::Array(
                     values(schema_value(creator, "identifier"))
                         .iter()
-                        .filter_map(identifier)
+                        .filter_map(creator_identifier)
                         .collect(),
                 );
                 let affiliations = values(schema_value(creator, "affiliation"))
@@ -534,6 +573,10 @@ pub fn export_metadata(
                 identifiers.push(json!({"scheme": "url", "identifier": own,
                     "relation_type": {"id": "isidenticalto"}}));
             }
+        }
+        for reference in &identity.references {
+            identifiers.push(json!({"scheme": "url", "identifier": reference,
+                "relation_type": {"id": "references"}}));
         }
         if !identifiers.is_empty() {
             metadata["related_identifiers"] = Value::Array(identifiers);
@@ -615,7 +658,6 @@ pub fn export_metadata(
     } else if !overrides.is_null() {
         return Err(InvenioError("metadata overrides must be an object"));
     }
-    validate_metadata(&metadata)?;
     Ok(metadata)
 }
 
@@ -715,6 +757,32 @@ fn values(value: &Value) -> &[Value] {
         Value::Array(values) => values,
         value => std::slice::from_ref(value),
     }
+}
+
+/// Keeps the person and organization schemes Invenio accepts; their URL forms are recognized.
+fn creator_identifier(value: &Value) -> Option<Value> {
+    let id = identifier(value)?;
+    let text = id["identifier"].as_str()?;
+    let text = text
+        .strip_prefix("https://")
+        .or_else(|| text.strip_prefix("http://"));
+    let url_form = text.and_then(|text| {
+        [
+            ("orcid", "orcid.org/"),
+            ("gnd", "d-nb.info/gnd/"),
+            ("isni", "isni.org/isni/"),
+            ("ror", "ror.org/"),
+        ]
+        .into_iter()
+        .find_map(|(scheme, prefix)| Some((scheme, text.strip_prefix(prefix)?)))
+    });
+    let (scheme, value) = match url_form {
+        Some((scheme, value)) => (scheme, value.trim_end_matches('/')),
+        None => (id["scheme"].as_str()?, id["identifier"].as_str()?),
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    matches!(scheme.as_str(), "orcid" | "gnd" | "isni" | "ror")
+        .then(|| json!({"scheme": scheme, "identifier": value}))
 }
 
 fn identifier(value: &Value) -> Option<Value> {
