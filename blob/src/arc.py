@@ -371,6 +371,14 @@ def merge(request):
         apply(graph, root, json.loads(request["json_base"]), json.loads(request["json_new"]))
     apply(graph, root, request.get("base"), request["new"])
     document["@graph"] = list(graph.values())
+    if canon(document) != before:
+        # ISA terms such as LabProcess need the definitions ARCtrl ships in its own context.
+        contexts = listed(document.get("@context"))
+        known = {key for entry in contexts if isinstance(entry, dict) for key in entry}
+        missing = {key: value for entry in listed((request["new"] or {}).get("@context"))
+                   if isinstance(entry, dict) for key, value in entry.items() if key not in known}
+        if missing:
+            document["@context"] = contexts + [missing]
     return {"jsonld": None if canon(document) == before else json.dumps(document)}
 
 

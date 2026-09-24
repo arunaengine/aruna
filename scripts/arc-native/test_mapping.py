@@ -286,7 +286,7 @@ class MappingTests(unittest.TestCase):
         merged = json.loads(conversion.convert({"mode": "merge", "graph": json.dumps(graph), "base": base, "new": new})["jsonld"])
         entities = {item["@id"]: item for item in merged["@graph"]}
         root = entities["urn:aruna:source"]
-        self.assertEqual(merged["@context"], graph["@context"])
+        self.assertEqual(merged["@context"][0], graph["@context"])
         self.assertEqual(root["name"], "Edited in ARCitect")
         self.assertEqual(root["keywords"], "kept")
         self.assertEqual(root["https://example.org/custom"], graph["@graph"][1]["https://example.org/custom"])
@@ -302,6 +302,22 @@ class MappingTests(unittest.TestCase):
         root = next(item for item in first["@graph"] if item["@id"] == "urn:aruna:source")
         self.assertEqual(root["name"], "Edited in ARCitect")
         self.assertNotIn("license", root)
+
+    def test_assay_roundtrip(self):
+        graph = source()
+        generated = conversion.convert({"mode": "generate", "document_id": "document-id", "jsonld": json.dumps(graph)})
+        base = conversion.convert({"mode": "inspect", "files": generated["files"]})["rocrate"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scaffold(root)
+            pushed = {**generated["files"], **files(root)}
+        new = conversion.convert({"mode": "inspect", "files": pushed})["rocrate"]
+        merged = conversion.convert({"mode": "merge", "graph": json.dumps(graph), "base": base, "new": new})["jsonld"]
+        terms = [entry for entry in json.loads(merged)["@context"] if isinstance(entry, dict)]
+        self.assertEqual(terms[0]["LabProcess"], "https://bioschemas.org/LabProcess")
+        regenerated = conversion.convert({"mode": "generate", "document_id": "document-id", "jsonld": merged})
+        derived = json.loads(base64.b64decode(regenerated["files"]["ro-crate-metadata.json"]))
+        self.assertEqual(sorted(map(json.dumps, derived["@graph"])), sorted(map(json.dumps, new["@graph"])))
 
     def test_git_removals(self):
         graph = source()
