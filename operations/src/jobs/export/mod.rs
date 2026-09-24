@@ -71,6 +71,7 @@ use crate::metadata::api::{
 use crate::metadata::forward::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::structs::identity::auth::AuthContext;
 
 mod archive;
 pub(crate) use archive::*;
@@ -113,6 +114,8 @@ pub(crate) struct ExportCheckpoint {
     /// A link's resolved lineage base: the latest published version it continues.
     pub(crate) repository_base: Option<String>,
     pub(crate) link_failure: Option<aruna_core::invenio::LinkFailure>,
+    /// File keys the repository record holds after the upload.
+    pub(crate) repository_files: Vec<String>,
     /// The dataset's identifiers when the snapshot was taken.
     pub(crate) identity: aruna_core::invenio::ExportIdentity,
     refs: RoCrateCheckpointRefs,
@@ -137,6 +140,7 @@ impl Default for ExportCheckpoint {
             repository: None,
             repository_base: None,
             link_failure: None,
+            repository_files: Vec::new(),
             identity: Default::default(),
             refs: RoCrateCheckpointRefs::default(),
             phase: ExportPhase::Snapshot,
@@ -166,11 +170,25 @@ impl ExportCheckpoint {
         if let Some(failure) = &self.link_failure {
             return failure.clone();
         }
-        let (_, omitted) = report_counts(&self.report);
-        if omitted.external + omitted.denied + omitted.missing + omitted.offline > 0 {
+        if blocking_omissions(&self.report) > 0 {
             return LinkFailure::SourceUnavailable;
         }
         LinkFailure::Other(message.to_string())
+    }
+
+    /// The finished push as a link outcome, once the repository holds the complete record.
+    pub(crate) fn pushed_outcome(&self) -> Option<aruna_core::invenio::PushOutcome> {
+        let record = self
+            .repository
+            .clone()
+            .filter(|_| self.repository_complete)?;
+        let (event_id, dataset_digest) = self.pushed_revision()?;
+        Some(aruna_core::invenio::PushOutcome::Pushed {
+            record: Box::new(record),
+            event_id,
+            dataset_digest,
+            files: self.repository_files.clone(),
+        })
     }
 }
 
@@ -497,15 +515,7 @@ async fn repository_export(
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
     use super::invenio::{TransferError, export};
-    let (_, omitted) = report_counts(&checkpoint.report);
-    if !checkpoint.repository_complete
-        && omitted.external
-            + omitted.denied
-            + omitted.missing
-            + omitted.offline
-            + omitted.unsupported
-            > 0
-    {
+    if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
             "repository export requires a complete crate with no omitted files".into(),
         ));
@@ -564,34 +574,55 @@ async fn export_identity(
             .into_iter()
             .collect(),
         identifiers: mapping.secondary_identifiers.into_iter().collect(),
+        references: Vec::new(),
     })
 }
 
-async fn snapshot_export(
-    ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
-    checkpoint: &mut ExportCheckpoint,
-) -> Result<(), ExportFailure> {
+/// The crate JSON-LD a repository export of the dataset would start from.
+pub(crate) async fn crate_jsonld(
+    context: &std::sync::Arc<DriverContext>,
+    auth: &AuthContext,
+    document_id: Ulid,
+    metadata_bytes: u64,
+) -> Result<String, super::invenio::TransferError> {
+    use super::invenio::TransferError;
+    match read_crate(context, auth, document_id, metadata_bytes).await {
+        Ok((jsonld, _, _)) => Ok(jsonld),
+        Err(ExportFailure::Permanent(message)) => Err(TransferError::Permanent(message)),
+        Err(ExportFailure::Validation(_)) => Err(TransferError::Permanent(
+            "the dataset crate is invalid".into(),
+        )),
+        Err(error) => Err(TransferError::Retryable(format!("{error:?}"))),
+    }
+}
+
+/// The crate a dataset exports with its event and context digest: the raw revision, else a
+/// scaffold's rendered graph, the crate the dataset view shows.
+async fn read_crate(
+    context: &std::sync::Arc<DriverContext>,
+    auth: &AuthContext,
+    document_id: Ulid,
+    metadata_bytes: u64,
+) -> Result<(String, Ulid, [u8; 32]), ExportFailure> {
     // Route the raw revision from a document holder; a job on a job-control bucket
     // rarely holds the document's bucket. The holder re-checks READ for this peer.
     let routed = |view| {
         export_rocrate_routed(
-            &ctx.driver,
-            spec.auth_context.realm_id,
+            context,
+            auth.realm_id,
             ExportMetadataRequest {
-                document_id: spec.document_id,
-                auth: Some(spec.auth_context.clone()),
+                document_id,
+                auth: Some(auth.clone()),
                 view,
                 limit: None,
                 offset: None,
                 after: None,
             },
-            Some(AuthToken::internal(spec.auth_context.clone())),
-            spec.limits.metadata_bytes,
+            Some(AuthToken::internal(auth.clone())),
+            metadata_bytes,
         )
     };
-    // A scaffold keeps no authored text, so its crate is the rendered graph the display shows.
-    let (jsonld, winning_event_id, context_digest) = match routed(RoCrateExportView::Raw).await {
+    Ok(match routed(RoCrateExportView::Raw).await {
         Ok(ExportMetadataResult::Raw { raw, .. }) => (
             raw.revision.jsonld,
             raw.revision.winning_event_id,
@@ -608,7 +639,21 @@ async fn snapshot_export(
         },
         Ok(_) => return Err(unexpected_view()),
         Err(error) => return Err(snapshot_read_failure(error)),
-    };
+    })
+}
+
+async fn snapshot_export(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<(), ExportFailure> {
+    let (jsonld, winning_event_id, context_digest) = read_crate(
+        &ctx.driver,
+        &spec.auth_context,
+        spec.document_id,
+        spec.limits.metadata_bytes,
+    )
+    .await?;
     if jsonld.len() as u64 > spec.limits.metadata_bytes {
         return Err(ExportFailure::Permanent(format!(
             "RO-Crate metadata exceeds the {} byte limit",
@@ -635,6 +680,13 @@ async fn snapshot_export(
         document.to_string()
     };
 
+    let mut identity = identity;
+    identity.references = entities
+        .iter()
+        .filter(|entity| entity.omission == Some(ReasonCode::External))
+        .map(|entity| entity.entity_id.clone())
+        .filter(|id| web_entity(id))
+        .collect();
     checkpoint.winning_event_id = Some(winning_event_id);
     checkpoint.context_digest = Some(context_digest);
     checkpoint.dataset_digest = Some(canonical.digest);
