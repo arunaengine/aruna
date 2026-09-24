@@ -15,6 +15,7 @@ import urllib.request
 from pathlib import Path
 
 from arc import scaffold
+from openpyxl import load_workbook
 import boto3
 from botocore.config import Config
 
@@ -63,6 +64,46 @@ def wait_snapshot(url, previous):
         time.sleep(0.1)
 
 
+def remote_main(directory, env):
+    return command(directory, env, "ls-remote", "origin", "refs/heads/main").decode().split()[0]
+
+
+def wait_main(directory, env, previous):
+    deadline = time.monotonic() + 300
+    while (current := remote_main(directory, env)) == previous:
+        assert time.monotonic() < deadline, "metadata was not merged into main"
+        time.sleep(0.1)
+    return current
+
+
+def graph(metadata_url):
+    status, body = http(metadata_url + "/rocrate?view=raw")
+    assert status == 200, body
+    return json.loads(body)["raw"]
+
+
+def wait_graph(metadata_url, name):
+    deadline = time.monotonic() + 300
+    while root_entity(current := graph(metadata_url))["name"] != name:
+        assert time.monotonic() < deadline, "pushed ISA edit did not reach the metadata graph"
+        time.sleep(0.1)
+    return current
+
+
+def root_entity(document):
+    descriptor = next(item for item in document["@graph"] if item.get("@id") == "ro-crate-metadata.json")
+    return next(item for item in document["@graph"] if item.get("@id") == descriptor["about"]["@id"])
+
+
+def derived_difference(metadata_url, *revisions):
+    graphs = []
+    for revision in revisions:
+        status, body = http(metadata_url + "/git/rocrate?revision=" + revision)
+        assert status == 200, body
+        graphs.append({json.dumps(item, sort_keys=True) for item in json.loads(body)["rocrate"]["@graph"]})
+    return sorted(graphs[0] ^ graphs[1])
+
+
 def exercise(root):
     url = os.environ["ARUNA_GIT_URL"]
     metadata_url = os.environ["ARUNA_API_URL"] + "/api/v1/metadata/" + os.environ["ARUNA_DOCUMENT_ID"]
@@ -105,6 +146,15 @@ def exercise(root):
     oid = hashlib.sha256(original).hexdigest()
     command(source, env, "lfs", "push", "origin", "main")
     command(source, env, "push", "--atomic", "origin", "main")
+    merged = wait_main(source, env, first)
+    command(source, env, "pull", "--ff-only", "origin", "main")
+    assert command(source, env, "rev-parse", "HEAD^1").decode().strip() == first
+    assert not command(source, env, "diff", "--name-only", first, "HEAD", "--", "*.xlsx"), \
+        derived_difference(metadata_url, first, merged)
+    assert any(item.get("additionalType") == "Study" for item in graph(metadata_url)["@graph"])
+    assert any(item.get("additionalType") == "Study"
+               for item in json.loads((source / "aruna-metadata.json").read_text())["@graph"])
+    print("PASS: pushed ISA studies merged into metadata and back without rewriting workbooks", flush=True)
     assert http(url + "/info/refs?service=git-upload-pack", token="invalid")[0] == 401
     if os.environ.get("ARUNA_READ_TOKEN"):
         assert http(url + "/info/refs?service=git-upload-pack", token=os.environ["ARUNA_READ_TOKEN"])[0] == 200
@@ -116,6 +166,7 @@ def exercise(root):
     second = commit(source, env, "test: update native ARC payload")
     command(source, env, "lfs", "push", "origin", "main")
     command(source, env, "push", "--atomic", "origin", "main")
+    command(source, env, "push", "origin", ":main", success=False)
     s3 = boto3.client("s3", endpoint_url=os.environ["ARUNA_S3_URL"],
                       config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
     key = f"git-lfs/{os.environ['ARUNA_DOCUMENT_ID']}/{oid}"
@@ -162,17 +213,43 @@ def exercise(root):
     exported = json.loads(body)
     assert exported["commit"] == first
     assert any(item.get("additionalType") == "Study" for item in exported["rocrate"]["@graph"])
-    descriptor = next(item for item in original_metadata["@graph"] if item.get("@id") == "ro-crate-metadata.json")
-    dataset = next(item for item in original_metadata["@graph"] if item.get("@id") == descriptor["about"]["@id"])
-    dataset["name"] = "Updated native metadata"
-    dataset["https://example.org/custom"] = "preserved extension"
-    assert http(metadata_url + "/rocrate", "PUT", {"rocrate": original_metadata})[0] == 200
-    wait_snapshot(metadata_url, initial)
-    assert second in command(source, env, "ls-remote", "origin", "refs/heads/main").decode()
-    command(source, env, "fetch", "origin", "aruna")
-    preserved = command(source, env, "show", "FETCH_HEAD:aruna-metadata.json").decode()
-    assert "preserved extension" in preserved
-    print("PASS: automatic signed ARC creation, protected graph snapshots and ISA RO-Crate export", flush=True)
+    snapshot = json.loads(http(metadata_url + "/git")[1])["commit"]
+    current = graph(metadata_url)
+    root_entity(current)["name"] = "Updated native metadata"
+    root_entity(current)["https://example.org/custom"] = "preserved extension"
+    assert http(metadata_url + "/rocrate", "PUT", {"rocrate": current})[0] == 200
+    wait_snapshot(metadata_url, snapshot)
+    command(source, env, "checkout", "main")
+    command(source, env, "pull", "--ff-only", "origin", "main")
+    command(source, env, "merge-base", "--is-ancestor", second, "HEAD")
+    assert "preserved extension" in (source / "aruna-metadata.json").read_text()
+    status, body = http(metadata_url + "/git/rocrate?revision=main")
+    assert status == 200 and root_entity(json.loads(body)["rocrate"])["name"] == "Updated native metadata"
+    assert not command(source, env, "diff", "--name-only", second, "HEAD", "--", payload)
+    print("PASS: graph edits merged into the edited main branch with client files intact", flush=True)
+
+    workbook = load_workbook(source / "isa.investigation.xlsx")
+    sheet = workbook["isa_investigation"]
+    row = next(row for row in sheet.iter_rows() if row[0].value == "Investigation Title")
+    row[1].value = "Edited through Git"
+    workbook.save(source / "isa.investigation.xlsx")
+    command(source, env, "add", "isa.investigation.xlsx")
+    edited = commit(source, env, "test: edit investigation title")
+    command(source, env, "push", "origin", "main")
+    current = wait_graph(metadata_url, "Edited through Git")
+    assert root_entity(current)["https://example.org/custom"] == "preserved extension"
+    wait_main(source, env, edited)
+    command(source, env, "pull", "--ff-only", "origin", "main")
+    assert not command(source, env, "diff", "--name-only", edited, "HEAD", "--", "*.xlsx")
+    command(source, env, "checkout", "-b", "draft", "main")
+    row[1].value = "Draft title"
+    workbook.save(source / "isa.investigation.xlsx")
+    command(source, env, "add", "isa.investigation.xlsx")
+    commit(source, env, "test: draft investigation title")
+    command(source, env, "push", "origin", "draft")
+    assert root_entity(graph(metadata_url))["name"] == "Edited through Git"
+    command(source, env, "checkout", "main")
+    print("PASS: ISA edits on main update metadata; branches stay drafts; signed ARC export", flush=True)
 
     if os.environ.get("ARUNA_ARCITECT"):
         subprocess.run(["node", str(Path(__file__).with_name("test_arcitect.mjs")), str(root)],
