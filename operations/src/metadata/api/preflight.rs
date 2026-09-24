@@ -21,6 +21,7 @@ use super::{
 };
 
 use super::read::ensure_permission;
+use crate::metadata::search_cursor::tie_order;
 
 pub(super) async fn resolve_preflight_targets(
     context: &DriverContext,
@@ -439,9 +440,8 @@ pub(crate) async fn references_preflight_local(
         .map(|record| (record.document_id, record))
         .collect::<HashMap<_, _>>();
     let mut readable = HashMap::<Ulid, bool>::new();
-    let mut titles = HashMap::<Ulid, String>::new();
     let mut hidden = BTreeSet::<String>::new();
-    let mut visible = BTreeMap::<(String, Ulid), MetadataVisibleReference>::new();
+    let mut visible = BTreeSet::<(String, Ulid)>::new();
     for (iri, iri_backlinks) in backlinks {
         let Some(content_w3ids) = iri_targets.get(&iri) else {
             continue;
@@ -463,32 +463,33 @@ pub(crate) async fn references_preflight_local(
                     hidden.insert(content_w3id.clone());
                     continue;
                 }
-                let visible_key = (content_w3id.clone(), record.document_id);
-                if visible.contains_key(&visible_key) || visible.len() > request.limit {
-                    continue;
-                }
-                let title = match titles.get(&record.document_id) {
-                    Some(title) => title.clone(),
-                    None => {
-                        let title = reference_document_title(context, record)
-                            .await
-                            .unwrap_or_else(|| record.document_path.clone());
-                        titles.insert(record.document_id, title.clone());
-                        title
-                    }
-                };
-                visible
-                    .entry(visible_key)
-                    .or_insert(MetadataVisibleReference {
-                        content_w3id: content_w3id.clone(),
-                        document_id: record.document_id.to_string(),
-                        title,
-                    });
+                visible.insert((content_w3id.clone(), record.document_id));
             }
         }
     }
-    let saturated = visible.len() > request.limit;
-    let visible_references = visible.into_values().take(request.limit).collect();
+    let (selected, saturated) = visible_prefix(visible, request.limit);
+    let mut titles = HashMap::<Ulid, String>::new();
+    let mut visible_references = Vec::with_capacity(selected.len());
+    for (content_w3id, document_id) in selected {
+        let Some(record) = registry_by_id.get(&document_id) else {
+            continue;
+        };
+        let title = match titles.get(&document_id) {
+            Some(title) => title.clone(),
+            None => {
+                let title = reference_document_title(context, record)
+                    .await
+                    .unwrap_or_else(|| record.document_path.clone());
+                titles.insert(document_id, title.clone());
+                title
+            }
+        };
+        visible_references.push(MetadataVisibleReference {
+            content_w3id,
+            document_id: document_id.to_string(),
+            title,
+        });
+    }
     let targets = request
         .targets
         .into_iter()
@@ -515,6 +516,26 @@ pub(crate) async fn references_preflight_local(
         path_style_available: s3_endpoint.is_some() || !aliases_seen,
         saturated,
     })
+}
+
+/// Keeps the first `limit` references in watermark order and reports whether more exist.
+/// The coordinator pages node prefixes by that order, so a cut in any other order skips hits.
+pub(super) fn visible_prefix(
+    visible: BTreeSet<(String, Ulid)>,
+    limit: usize,
+) -> (Vec<(String, Ulid)>, bool) {
+    let mut keyed = visible
+        .into_iter()
+        .map(|(content_w3id, document_id)| (content_w3id, document_id.to_string(), document_id))
+        .collect::<Vec<_>>();
+    keyed.sort_by(|left, right| tie_order((&left.0, &left.1), (&right.0, &right.1)));
+    let saturated = keyed.len() > limit;
+    keyed.truncate(limit);
+    let selected = keyed
+        .into_iter()
+        .map(|(content_w3id, _, document_id)| (content_w3id, document_id))
+        .collect();
+    (selected, saturated)
 }
 
 pub(super) fn preflight_fingerprint(
