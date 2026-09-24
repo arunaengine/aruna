@@ -105,7 +105,7 @@ fn preflight_cursor_pagination() {
         remove_resolvable_locations: false,
     }];
     let fingerprint = preflight_fingerprint(&targets, Some(ApiQueryMode::Local));
-    let hits = (0..3)
+    let mut hits = (0..3)
         .map(|index| MetadataSearchHit {
             document_id: format!("document-{index}"),
             group_id: String::new(),
@@ -117,6 +117,12 @@ fn preflight_cursor_pagination() {
             snippet: None,
             subject_types: Vec::new(),
         })
+        .collect::<Vec<_>>();
+    // A node returns prefixes of craqle's order, which breaks score ties by hash.
+    hits.sort_by(crate::metadata::search_cursor::compare_hits);
+    let expected = hits
+        .iter()
+        .map(|hit| hit.document_id.clone())
         .collect::<Vec<_>>();
     let mut watermark = None;
     let mut returned = Vec::new();
@@ -148,7 +154,7 @@ fn preflight_cursor_pagination() {
         });
     }
 
-    assert_eq!(returned, vec!["document-0", "document-1", "document-2"]);
+    assert_eq!(returned, expected);
     assert!(watermark.is_none());
 }
 
