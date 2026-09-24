@@ -129,6 +129,7 @@ impl GitStore {
                     .env("ARUNA_GIT_HELPER", &self.helper)
                     .env("ARUNA_GIT_TOKEN", request.token)
                     .env("ARUNA_GIT_LFS_URL", request.lfs_url)
+                    .env("ARUNA_GIT_METADATA_URL", request.metadata_url)
                     .env(
                         "ARUNA_GIT_ARC",
                         if request.repository.arc { "1" } else { "0" },
@@ -192,6 +193,40 @@ pub async fn lfs_exchange(url: &str, token: &str, body: Vec<u8>) -> std::io::Res
         .bytes()
         .await
         .map_err(std::io::Error::other)
+}
+
+/// Reads (`GET`) or replaces (`PUT`) a metadata document's RO-Crate as the pushing user.
+pub async fn metadata_request(
+    url: &str,
+    token: &str,
+    body: Option<Vec<u8>>,
+) -> std::io::Result<Bytes> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(std::io::Error::other)?;
+    let request = match body {
+        Some(body) => client
+            .put(url)
+            .header("Content-Type", "application/json")
+            .body(body),
+        None => client.get(url),
+    };
+    let response = request
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(std::io::Error::other)?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(std::io::Error::other)?;
+    if !status.is_success() {
+        let detail = String::from_utf8_lossy(&bytes[..bytes.len().min(1000)]).into_owned();
+        return Err(std::io::Error::other(format!(
+            "metadata update refused with {status}: {detail}"
+        )));
+    }
+    Ok(bytes)
 }
 
 #[cfg(unix)]

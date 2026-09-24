@@ -34,6 +34,10 @@ fn main() {
             .enable_all()
             .build()
             .and_then(|runtime| runtime.block_on(aruna_operations::git::hook::validate()));
+        if let Err(error) = &result {
+            // Git relays hook stderr to the pushing client as its rejection reason.
+            eprintln!("aruna: {error}");
+        }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     run_runtime();

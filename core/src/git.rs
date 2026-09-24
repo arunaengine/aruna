@@ -52,6 +52,7 @@ pub struct GitRequest {
     pub body: Bytes,
     pub token: String,
     pub lfs_url: String,
+    pub metadata_url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -79,13 +79,17 @@ fn map_error(error: GitError) -> ServerError {
     }
 }
 
-async fn base_url(state: &ServerState, id: Ulid) -> ServerResult<String> {
+async fn api_url(state: &ServerState) -> ServerResult<String> {
     let rest = state
         .interface_state()
         .await
         .rest
         .ok_or(ServerError::ServiceUnavailable)?;
-    Ok(format!("{}/git/{id}.git", rest.api_base_url))
+    Ok(rest.api_base_url)
+}
+
+async fn base_url(state: &ServerState, id: Ulid) -> ServerResult<String> {
+    Ok(format!("{}/git/{id}.git", api_url(state).await?))
 }
 
 #[derive(Deserialize, ToSchema)]

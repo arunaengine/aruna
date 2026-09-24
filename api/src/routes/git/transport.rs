@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{base_url, map_error, repository_id};
+use super::{api_url, base_url, map_error, repository_id};
 use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -165,6 +165,7 @@ async fn serve(
         body,
         token: token.ok_or(ServerError::Unauthorized)?.as_str().to_string(),
         lfs_url: format!("{}/info/lfs/objects/batch", base_url(&state, id).await?),
+        metadata_url: format!("{}/metadata/{id}", api_url(&state).await?),
     };
     let result = git::transport(
         &state.get_ctx(),
