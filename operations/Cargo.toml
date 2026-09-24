@@ -43,7 +43,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 spargebra = { workspace = true }
-spareval = { workspace = true }
 sysinfo = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

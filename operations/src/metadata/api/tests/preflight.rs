@@ -6,7 +6,7 @@ use super::*;
 
 use super::super::preflight::{
     assemble_preflight_execution, plan_preflight_request, resolve_preflight_targets,
-    verify_preflight_cursor,
+    verify_preflight_cursor, visible_prefix,
 };
 
 #[tokio::test]
@@ -105,28 +105,39 @@ fn preflight_cursor_pagination() {
         remove_resolvable_locations: false,
     }];
     let fingerprint = preflight_fingerprint(&targets, Some(ApiQueryMode::Local));
-    let hits = (0..3)
-        .map(|index| MetadataSearchHit {
-            document_id: format!("document-{index}"),
-            group_id: String::new(),
-            document_path: String::new(),
-            graph_iri: content_w3id.clone(),
-            subject_iri: format!("document-{index}"),
-            score: 0.0,
-            title: format!("Document {index}"),
-            snippet: None,
-            subject_types: Vec::new(),
-        })
-        .collect::<Vec<_>>();
+    let visible = [0x11_u128, 0x22, 0x33, 0x44]
+        .map(|value| (content_w3id.clone(), Ulid::from(value)))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    // Each fetch gets the node's real prefix, as `visible_prefix` cuts it.
+    let node_page = |depth: usize| {
+        let (selected, saturated) = visible_prefix(visible.clone(), depth);
+        let hits = selected
+            .into_iter()
+            .map(|(graph_iri, document_id)| MetadataSearchHit {
+                document_id: document_id.to_string(),
+                group_id: String::new(),
+                document_path: String::new(),
+                graph_iri,
+                subject_iri: document_id.to_string(),
+                score: 0.0,
+                title: String::new(),
+                snippet: None,
+                subject_types: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        (hits, saturated)
+    };
     let mut watermark = None;
     let mut returned = Vec::new();
 
-    for depth in 1..=3 {
+    for depth in 1..=visible.len() {
+        let (hits, saturated) = node_page(depth);
         let page = paginate(
             vec![NodeSearchResult {
                 node_id,
-                hits: hits[..depth].to_vec(),
-                saturated: depth < hits.len(),
+                hits,
+                saturated,
             }],
             watermark,
             1,
@@ -148,7 +159,17 @@ fn preflight_cursor_pagination() {
         });
     }
 
-    assert_eq!(returned, vec!["document-0", "document-1", "document-2"]);
+    let by_id = visible
+        .iter()
+        .map(|(_, document_id)| document_id.to_string())
+        .collect::<Vec<_>>();
+    assert_ne!(
+        returned, by_id,
+        "the fixture must order ties unlike document ids"
+    );
+    let mut emitted = returned.clone();
+    emitted.sort();
+    assert_eq!(emitted, by_id, "every reference is emitted exactly once");
     assert!(watermark.is_none());
 }
 

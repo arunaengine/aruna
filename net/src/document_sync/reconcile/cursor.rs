@@ -1,5 +1,5 @@
 //! Reads and writes sync cursors per topic and drops one whose history was rebuilt.
-//! Also frames sync messages on a stream and processes summary and data responses.
+//! Also frames sync messages on a stream and folds batch sync results.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -262,111 +262,20 @@ pub(in crate::document_sync) async fn write_sync_messages(
         .map_err(|error| NetError::Stream(error.to_string()))
 }
 
-type BatchSummaryOutcome = (
-    BTreeSet<::irokle::TopicId>,
-    BTreeSet<::irokle::TopicId>,
-    Vec<SyncMessage>,
-);
-
-pub(in crate::document_sync) fn process_summary_responses(
-    node: &::irokle::Irokle<::irokle::FjallStorage>,
-    peer: PeerId,
-    known_topics: &BTreeSet<::irokle::TopicId>,
-    local_fingerprints: &BTreeMap<::irokle::TopicId, [u8; 32]>,
-    responses: Vec<SyncMessage>,
-) -> Result<BatchSummaryOutcome> {
-    let mut responded_topics = BTreeSet::new();
-    let mut failed_topics = BTreeSet::new();
-    let mut sync_messages = Vec::new();
-    for response in responses {
-        match response {
-            // A terminal failure still answers for this topic: only it stays
-            // dirty; the rest of the batch keeps summaries, data and acks.
-            SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
-                responded_topics.insert(failure.topic_id);
-                failed_topics.insert(failure.topic_id);
-                warn!(
-                    %peer,
-                    topic_id = %failure.topic_id,
-                    code = ?failure.code,
-                    "Skipping document sync batch topic: peer reported a sync failure"
-                );
-            }
-            SyncMessage::Fingerprint(remote) if known_topics.contains(&remote.topic_id) => {
-                responded_topics.insert(remote.topic_id);
-                if local_fingerprints.get(&remote.topic_id) != Some(&remote.fingerprint) {
-                    warn!(
-                        %peer,
-                        topic_id = %remote.topic_id,
-                        "Skipping document sync batch topic: peer returned mismatched fingerprint"
-                    );
-                    failed_topics.insert(remote.topic_id);
-                }
-            }
-            SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {
-                responded_topics.insert(summary.topic_id);
-                if let Some(event_type_id) = summary.event_type_id.as_deref()
-                    && event_type_id != DocumentEvent::TYPE_ID
-                {
-                    warn!(
-                        %peer,
-                        topic_id = %summary.topic_id,
-                        event_type_id,
-                        "Skipping document sync batch topic: peer advertised unexpected event type"
-                    );
-                    failed_topics.insert(summary.topic_id);
-                    continue;
-                }
-                let plan = match node.negotiate_sync(peer, &summary) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        warn!(
-                            %peer,
-                            topic_id = %summary.topic_id,
-                            error = %error,
-                            "Skipping document sync batch topic: sync negotiation failed"
-                        );
-                        failed_topics.insert(summary.topic_id);
-                        continue;
-                    }
-                };
-                let wants_remote_data = !plan.need.is_empty() || !plan.actor_range_hints.is_empty();
-                if !plan.send.is_empty() || wants_remote_data {
-                    sync_messages.push(SyncMessage::Open(node.sync_open(plan.topic_id)));
-                    if !plan.send.is_empty() {
-                        sync_messages.push(SyncMessage::Data(SyncData {
-                            topic_id: plan.topic_id,
-                            ops: plan.send,
-                        }));
-                    }
-                    if wants_remote_data {
-                        sync_messages.push(SyncMessage::Request(SyncRequest {
-                            topic_id: plan.topic_id,
-                            known: plan.common,
-                            wants: plan.need,
-                            actor_range_hints: plan.actor_range_hints,
-                        }));
-                    }
-                }
-            }
-            other => {
-                return Err(NetError::Bootstrap(format!(
-                    "unexpected document sync batch response from {peer}: {other:?}"
-                )));
-            }
-        }
-    }
-    Ok((responded_topics, failed_topics, sync_messages))
-}
-
 /// Names the bounded-journal refusal. Past Irokle's cap on unreleased records
 /// every genesis tie-break reset is refused, which otherwise reaches operators
 /// only as an opaque admission failure.
 pub(in crate::document_sync) fn report_journal_full(
     topic_id: ::irokle::TopicId,
-    error: &::irokle::Error,
+    error: &std::io::Error,
 ) {
-    if matches!(error, ::irokle::Error::EvictionJournalFull) {
+    let inner = error
+        .get_ref()
+        .map(|inner| inner as &(dyn std::error::Error + 'static));
+    let cause = std::iter::successors(inner, |error| error.source())
+        .find_map(|error| error.downcast_ref::<::irokle::Error>())
+        .map(::irokle::Error::cause);
+    if matches!(cause, Some(::irokle::Error::EvictionJournalFull)) {
         error!(
             %topic_id,
             "Eviction journal is full; genesis tie-break resets stay refused until the eviction consumer drains it"
@@ -374,134 +283,25 @@ pub(in crate::document_sync) fn report_journal_full(
     }
 }
 
-pub(in crate::document_sync) fn forward_evictions_to(
-    sink: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
-    evictions: Vec<TopicEviction>,
-) {
-    for eviction in evictions {
-        if sink.send(eviction).is_err() {
-            warn!("Document sync eviction consumer closed; dropping re-emitted payloads");
-        }
-    }
-}
-
-pub(in crate::document_sync) fn process_data_responses(
-    node: &::irokle::Irokle<::irokle::FjallStorage>,
-    net: &::irokle::net::IrohNet<::irokle::FjallStorage>,
-    peer: PeerId,
-    known_topics: &BTreeSet<::irokle::TopicId>,
-    mut failed_topics: BTreeSet<::irokle::TopicId>,
-    responses: Vec<SyncMessage>,
-    eviction_tx: &tokio::sync::mpsc::UnboundedSender<TopicEviction>,
-) -> Result<(BTreeSet<::irokle::TopicId>, Vec<SyncMessage>)> {
-    let mut followup = Vec::new();
-    let mut acks = Vec::new();
-    for response in responses {
-        match response {
-            SyncMessage::Ack(ack)
-                if ack.peer_id == peer && known_topics.contains(&ack.topic_id) =>
-            {
-                acks.push(ack);
-            }
-            SyncMessage::Failure(failure) if known_topics.contains(&failure.topic_id) => {
-                failed_topics.insert(failure.topic_id);
-                warn!(
-                    %peer,
-                    topic_id = %failure.topic_id,
-                    code = ?failure.code,
-                    "Skipping document sync batch topic: peer reported a sync failure"
-                );
-            }
-            SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}
-            SyncMessage::Data(data) if known_topics.contains(&data.topic_id) => {
-                let topic_id = data.topic_id;
-                let ack = match node.receive_sync_data_from_evicting(peer, data) {
-                    Ok((ack, evictions)) => {
-                        forward_evictions_to(eviction_tx, evictions);
-                        ack
-                    }
-                    Err(error) => {
-                        report_journal_full(topic_id, &error);
-                        warn!(
-                            %peer,
-                            topic_id = %topic_id,
-                            error = %error,
-                            "Skipping document sync batch topic: receiving sync data failed"
-                        );
-                        failed_topics.insert(topic_id);
-                        continue;
-                    }
-                };
-                net.schedule_topic_recheck(topic_id)?;
-                followup.push(SyncMessage::Open(node.sync_open(topic_id)));
-                followup.push(SyncMessage::Ack(ack));
-            }
-            other => {
-                return Err(NetError::Bootstrap(format!(
-                    "unexpected document sync batch data response from {peer}: {other:?}"
-                )));
-            }
-        }
-    }
-    for (ack, result) in acks.iter().zip(node.apply_sync_acks(&acks)) {
-        if let Err(error) = result {
-            warn!(
-                %peer,
-                topic_id = %ack.topic_id,
-                error = %error,
-                "Skipping document sync batch topic: applying sync ack failed"
-            );
-            failed_topics.insert(ack.topic_id);
-        }
-    }
-    Ok((failed_topics, followup))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(in crate::document_sync) fn log_batch_summary(
-    peer: PeerId,
-    topics: usize,
-    r1_build: Duration,
-    r1_io: Duration,
-    r1_process: Duration,
-    r2_io: Duration,
-    r2_process: Duration,
-    fu_io: Duration,
-    r2_messages: usize,
-    total: Duration,
-) {
-    info!(
-        event = "pipeline.peer_batch.summary",
-        peer = %peer,
-        topics,
-        r1_build_ms = duration_ms(r1_build),
-        r1_io_ms = duration_ms(r1_io),
-        r1_process_ms = duration_ms(r1_process),
-        r2_io_ms = duration_ms(r2_io),
-        r2_process_ms = duration_ms(r2_process),
-        fu_io_ms = duration_ms(fu_io),
-        r2_messages,
-        total_ms = duration_ms(total),
-        "Document sync peer batch sync round breakdown"
-    );
-}
-
 pub(in crate::document_sync) fn finish_batch_sync(
     peer: PeerId,
-    known_topics: &BTreeSet<::irokle::TopicId>,
-    failed_topics: &BTreeSet<::irokle::TopicId>,
+    results: &BTreeMap<::irokle::TopicId, std::io::Result<()>>,
 ) -> Result<()> {
-    if !failed_topics.is_empty() {
-        warn!(
-            %peer,
-            failed = failed_topics.len(),
-            total = known_topics.len(),
-            "Document sync batch sync failed for one or more topics"
-        );
+    let mut failed = 0usize;
+    for (topic_id, result) in results {
+        // WouldBlock means Irokle scheduled the pages left after its budget.
+        let Err(error) = result else { continue };
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            continue;
+        }
+        report_journal_full(*topic_id, error);
+        warn!(%peer, %topic_id, %error, "Document sync batch topic failed to sync");
+        failed += 1;
+    }
+    if failed > 0 {
         return Err(NetError::Bootstrap(format!(
-            "peer {peer}: {}/{} document sync batch topics failed to sync",
-            failed_topics.len(),
-            known_topics.len()
+            "peer {peer}: {failed}/{} document sync batch topics failed to sync",
+            results.len()
         )));
     }
     Ok(())
@@ -516,6 +316,8 @@ pub(in crate::document_sync) fn message_topic_id(message: &SyncMessage) -> ::iro
         SyncMessage::Data(data) => data.topic_id,
         SyncMessage::Ack(ack) => ack.topic_id,
         SyncMessage::Failure(failure) => failure.topic_id,
+        SyncMessage::Page(page) => page.topic_id,
+        SyncMessage::Receipt(receipt) => receipt.topic_id,
     }
 }
 
@@ -535,14 +337,14 @@ impl PeerTopicProbe {
 /// but the prober may not open it yet, so it is not unknown).
 pub(in crate::document_sync) fn classify_probe_responses(
     wanted: &BTreeSet<::irokle::TopicId>,
-    responses: Vec<SyncMessage>,
+    responses: &[SyncMessage],
 ) -> PeerTopicProbe {
     let mut probe = PeerTopicProbe::default();
     for response in responses {
         if let SyncMessage::Summary(summary) = response
             && wanted.contains(&summary.topic_id)
         {
-            if summary_is_empty(&summary) {
+            if summary_is_empty(summary) {
                 probe.confirmed_unknown.insert(summary.topic_id);
             } else {
                 probe.known.insert(summary.topic_id);

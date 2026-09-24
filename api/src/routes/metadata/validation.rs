@@ -56,7 +56,7 @@ use std::sync::Arc;
         description = "Evaluator identity, exact supported constraints, fail-closed policy, and accepted Profile IRI forms",
         body = ProfileCapabilitiesResponse,
         example = json!({
-            "evaluator": "craqle-shacl-core/0.2",
+            "evaluator": "craqle-shacl-core/0.3",
             "supported_constraints": [
                 "sh:targetClass",
                 "sh:property",
@@ -158,7 +158,7 @@ metadata path, because the group's own Profiles resolve for it.
                 "profile_id": "01JPROFILE0000000000000000",
                 "profile_iri": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000",
                 "profile_revision": "01JPROFILEREVISION00000000",
-                "evaluator": "craqle-shacl-core/0.2",
+                "evaluator": "craqle-shacl-core/0.3",
                 "findings": [
                     {
                         "code": "constraint_violation",
@@ -253,7 +253,7 @@ apply.
                 "profile_id": "01JPROFILE0000000000000000",
                 "profile_iri": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000",
                 "profile_revision": "01JPROFILEREVISION00000000",
-                "evaluator": "craqle-shacl-core/0.2",
+                "evaluator": "craqle-shacl-core/0.3",
                 "validated_at_ms": 1787000000000_u64,
                 "findings": [
                     {
@@ -320,7 +320,7 @@ pub async fn get_validation_status(
                 "profile_id": "01JPROFILE0000000000000000",
                 "profile_iri": "https://w3id.org/aruna/profile/01JPROFILE0000000000000000",
                 "profile_revision": "01JPROFILEREVISION00000000",
-                "evaluator": "craqle-shacl-core/0.2",
+                "evaluator": "craqle-shacl-core/0.3",
                 "validated_at_ms": 1787000000000_u64,
                 "findings": [],
                 "completeness": "complete",

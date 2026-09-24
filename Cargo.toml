@@ -21,7 +21,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.92"
+version = "3.0.0-alpha.93"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -71,9 +71,8 @@ cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
-# Pinned to the craqle revision carrying the merged irokle sync fixes with the
-# relaxed smallvec requirement, which the kube serde-saphyr cap needs.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "1803d8ba1376cc2a3285ab009738ed7194c610ec", features = [
+# Pinned to craqle 0.3.0 main with the legacy topic cursor replay; it resolves the irokle below.
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "1d82db828e870a2bd5a8e6c623cb662d7dc0fd01", features = [
     "iroh",
     "shacl-core",
 ] }
@@ -105,7 +104,7 @@ hyper-util = { version = "0.1.20", features = [
 ipnet = "2.12.2"
 iroh = "1.2.0"
 # Pinned to the exact revision craqle uses so one irokle crate is resolved.
-irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "dcce9593adf21b14c8c8214c7ad7c180777be303", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "f3770c5186d34603753e26912b6450d077680205", features = [
     "fjall",
     "iroh",
 ] }
@@ -174,7 +173,6 @@ sha1 = "0.11.0"
 sha2 = "0.11.0"
 smallvec = "1.15.2"
 spargebra = "0.4.7"
-spareval = "0.2.7"
 sysinfo = { version = "0.39.6", default-features = false, features = [
     "system",
 ] }

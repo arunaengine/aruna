@@ -65,7 +65,7 @@ impl DocumentSyncService {
             .map_err(|error| NetError::Stream(error.to_string()))?;
         let handle_elapsed = handle_started.elapsed();
         let write_started = Instant::now();
-        write_sync_messages(&mut send, &responses).await?;
+        write_sync_messages(&mut send, responses.messages()).await?;
         let write_elapsed = write_started.elapsed();
         let flush_started = Instant::now();
         self.flush_database()?;

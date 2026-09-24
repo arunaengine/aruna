@@ -472,8 +472,18 @@ pub(super) fn error_from_craqle(error: CraqleError) -> MetadataError {
         error @ (CraqleError::Io(_) | CraqleError::Store(_) | CraqleError::SearchWorker(_)) => {
             MetadataError::Persist(error.to_string())
         }
+        error if transient_kind(error.kind()) => MetadataError::Persist(error.to_string()),
         other => MetadataError::Backend(other.to_string()),
     }
+}
+
+// Search waits, memory budgets and cancelled work clear on retry, like storage faults.
+fn transient_kind(kind: craqle::CraqleErrorKind) -> bool {
+    use craqle::CraqleErrorKind::*;
+    matches!(
+        kind,
+        Storage | CorruptDerivedData | DependencyUnavailable | Cancelled | ResourceLimit
+    )
 }
 
 fn metadata_violations(violations: Vec<craqle::CrateViolation>) -> MetadataError {
