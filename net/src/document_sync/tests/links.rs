@@ -30,6 +30,7 @@ fn link(document_id: Ulid, owner: NodeId, realm_id: RealmId, generation: u64) ->
         created_at: std::time::SystemTime::UNIX_EPOCH,
         updated_at: std::time::SystemTime::UNIX_EPOCH,
         generation,
+        warning: None,
     }
 }
 

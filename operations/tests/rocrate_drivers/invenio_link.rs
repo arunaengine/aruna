@@ -25,7 +25,7 @@ use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 
-const LINK_TOKEN: &str = "link-token";
+pub(super) const LINK_TOKEN: &str = "link-token";
 
 pub(super) async fn linked(
     fixture: &Fixture,
@@ -34,25 +34,44 @@ pub(super) async fn linked(
     auto_publish: bool,
     parent_id: Option<&str>,
 ) -> Result<InvenioLink, Box<dyn std::error::Error>> {
-    let upload = create_upload(fixture, native_archive().await?).await?;
+    Box::pin(import_dataset(fixture, native_archive().await?)).await?;
+    Box::pin(attach(
+        fixture,
+        endpoint,
+        token,
+        auto_publish,
+        parent_id,
+        None,
+    ))
+    .await
+}
+
+/// Imports `archive` as the dataset `doc_id(1)`.
+pub(super) async fn import_dataset(
+    fixture: &Fixture,
+    archive: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upload = create_upload(fixture, archive).await?;
     let import = import_spec(fixture, upload, doc_id(1));
     let ctx = claim_context(fixture, job_id(), JobPayload::ImportRoCrate(import.clone())).await?;
-    assert!(matches!(
-        run_rocrate_import(&ctx, &import).await,
-        JobRunOutcome::Succeeded(_)
-    ));
+    match run_rocrate_import(&ctx, &import).await {
+        JobRunOutcome::Succeeded(_) => {}
+        JobRunOutcome::Failed(error) => return Err(error.message.into()),
+        _ => return Err("import did not finish".into()),
+    }
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
-    Box::pin(attach(fixture, endpoint, token, auto_publish, parent_id)).await
+    Ok(())
 }
 
 /// Links the existing dataset `doc_id(1)` to a new connector of `endpoint`.
-async fn attach(
+pub(super) async fn attach(
     fixture: &Fixture,
     endpoint: &str,
     token: &str,
     auto_publish: bool,
     parent_id: Option<&str>,
+    community: Option<&str>,
 ) -> Result<InvenioLink, Box<dyn std::error::Error>> {
     let connector_id = drive(
         CreateConnectorOperation::new(CreateConnectorInput {
@@ -61,7 +80,9 @@ async fn attach(
             name: "linked".into(),
             kind: RepositoryConnectorKind::Invenio,
             endpoint: endpoint.into(),
-            public_config: HashMap::new(),
+            public_config: community
+                .map(|community| HashMap::from([("community".into(), community.into())]))
+                .unwrap_or_default(),
             secret_config: HashMap::new(),
         }),
         &fixture.context,
@@ -104,13 +125,14 @@ async fn attach(
         created_at: now,
         updated_at: now,
         generation: 0,
+        warning: None,
     };
     let change = LinkChange::Create {
         link: Box::new(link),
         secret,
     };
     Ok(drive(
-        ChangeLinkOperation::new(doc_id(1), link_id, change),
+        ChangeLinkOperation::new(doc_id(1), link_id, change, SystemTime::now()),
         &fixture.context,
     )
     .await?
@@ -134,6 +156,7 @@ pub(super) async fn due_now(
     let entry = LinkQueueEntry {
         document_id: link.document_id,
         due_at_ms: 0,
+        first_at_ms: 0,
     };
     write_value(
         &fixture.context.storage_handle,
@@ -142,6 +165,24 @@ pub(super) async fn due_now(
         postcard::to_allocvec(&entry)?,
     )
     .await
+}
+
+/// Moves the last push back past the auto_publish quiet time and makes the check due.
+pub(super) async fn quiet_draft(
+    fixture: &Fixture,
+    link: &InvenioLink,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stored = current(fixture, link).await.0;
+    let push = stored.last_push.as_mut().ok_or("nothing pushed yet")?;
+    push.pushed_at = SystemTime::UNIX_EPOCH;
+    write_value(
+        &fixture.context.storage_handle,
+        INVENIO_LINK_KEYSPACE,
+        link_key(link.document_id, link.link_id),
+        stored.to_bytes()?,
+    )
+    .await?;
+    due_now(fixture, link).await
 }
 
 /// Runs the push job the link recorded, as the job runtime would.
@@ -469,7 +510,12 @@ async fn token_rejection_recovers() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     drive(
-        ChangeLinkOperation::new(link.document_id, link.link_id, LinkChange::Rotate(secret)),
+        ChangeLinkOperation::new(
+            link.document_id,
+            link.link_id,
+            LinkChange::Rotate(secret),
+            SystemTime::now(),
+        ),
         &fixture.context,
     )
     .await?;
@@ -477,12 +523,29 @@ async fn token_rejection_recovers() -> Result<(), Box<dyn std::error::Error>> {
     assert!(queued && rotated.status == LinkStatus::Enabled);
     drain(&fixture).await?;
     succeeded(run_push(&fixture, &link).await?);
+    let (pushed, queued) = current(&fixture, &link).await;
+    assert!(
+        !pushed.remote.published,
+        "auto publish waits for a quiet draft"
+    );
+    assert!(queued && pushed.active_job.is_none());
+    assert_eq!(pushed.remote.doi.as_deref(), Some("10.1234/1"));
+    assert!(pushed.remote.doi_reserved);
+    drain(&fixture).await?;
+    assert!(current(&fixture, &link).await.0.active_job.is_none());
+
+    quiet_draft(&fixture, &link).await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
     let (published, _) = current(&fixture, &link).await;
     assert!(
         published.remote.published,
-        "auto publish published the push"
+        "auto publish published the quiet draft"
     );
     assert_eq!(published.remote.record_id.as_deref(), Some("1"));
+    assert_eq!(published.remote.doi.as_deref(), Some("10.1234/1"));
+    assert!(!published.remote.doi_reserved);
+    assert_eq!(published.remote.concept_doi.as_deref(), Some("10.1234/p1"));
     fixture.stop().await;
     Ok(())
 }
@@ -683,7 +746,15 @@ async fn scaffold_link_pushes() -> Result<(), Box<dyn std::error::Error>> {
     let raw = load_raw_revision(&fixture.context, doc_id(1), None).await?;
     assert!(raw.is_none(), "a scaffold keeps no raw revision");
 
-    let link = Box::pin(attach(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    let link = Box::pin(attach(
+        &fixture,
+        &server.endpoint,
+        LINK_TOKEN,
+        false,
+        None,
+        None,
+    ))
+    .await?;
     // Scaffold fields name no creator, so the link supplies one as a native override.
     let creators = json!({"creators": [{"person_or_org": {
         "type": "personal", "given_name": "Ada", "family_name": "Lovelace"}}]});
@@ -691,7 +762,12 @@ async fn scaffold_link_pushes() -> Result<(), Box<dyn std::error::Error>> {
         metadata_json: Some(creators.to_string()),
         ..LinkPatch::default()
     };
-    let change = ChangeLinkOperation::new(link.document_id, link.link_id, LinkChange::Patch(patch));
+    let change = ChangeLinkOperation::new(
+        link.document_id,
+        link.link_id,
+        LinkChange::Patch(patch),
+        SystemTime::now(),
+    );
     drive(change, &fixture.context).await?;
     drain(&fixture).await?;
     succeeded(run_push(&fixture, &link).await?);

@@ -22,6 +22,8 @@ mod import;
 mod link;
 #[path = "invenio_live.rs"]
 mod live;
+#[path = "invenio_publish.rs"]
+mod publish;
 #[path = "invenio_remote.rs"]
 mod remote;
 

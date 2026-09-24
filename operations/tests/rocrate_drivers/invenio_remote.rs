@@ -10,8 +10,10 @@ pub(super) struct Rec {
     pub(super) parent: String,
     index: u64,
     pub(super) published: bool,
-    revision: u64,
-    metadata: Value,
+    pub(super) revision: u64,
+    reserved: bool,
+    pub(super) review: Option<String>,
+    pub(super) metadata: Value,
     custom_fields: Value,
     pub(super) files: BTreeMap<String, (Option<Vec<u8>>, bool)>,
 }
@@ -20,6 +22,10 @@ pub(super) struct Rec {
 pub(super) struct Remote {
     origin: String,
     pub(super) token: String,
+    /// Community submissions go here; the fixture answers for this one community only.
+    pub(super) community: Option<String>,
+    /// Refuses file content like a repository that rejects the upload.
+    pub(super) reject_uploads: bool,
     next: u64,
     pub(super) records: BTreeMap<String, Rec>,
     pub(super) calls: Vec<(Method, String)>,
@@ -28,12 +34,18 @@ pub(super) struct Remote {
 impl Remote {
     fn json(&self, id: &str) -> Value {
         let rec = &self.records[id];
-        let pids = if rec.published {
+        let pids = if rec.published || rec.reserved {
             json!({"doi": {"identifier": format!("10.1234/{id}"), "provider": "datacite"}})
         } else {
             json!({})
         };
-        json!({"id": id, "parent": {"id": rec.parent}, "revision_id": rec.revision,
+        let review = rec
+            .review
+            .as_ref()
+            .map_or(Value::Null, |status| json!({"status": status}));
+        json!({"id": id, "parent": {"id": rec.parent, "review": review,
+                "pids": {"doi": {"identifier": format!("10.1234/{}", rec.parent)}}},
+            "revision_id": rec.revision,
             "is_published": rec.published, "metadata": rec.metadata,
             "custom_fields": rec.custom_fields, "files": {"enabled": true},
             "versions": {"index": rec.index, "is_latest": self.lineage(&rec.parent).first().is_some_and(|latest| latest == id)},
@@ -89,6 +101,8 @@ impl Remote {
                 index,
                 published: false,
                 revision: 1,
+                reserved: false,
+                review: None,
                 metadata,
                 custom_fields,
                 files: BTreeMap::new(),
@@ -156,8 +170,48 @@ async fn remote_request(State(state): State<Arc<Mutex<Remote>>>, request: Reques
             }
             rec.metadata = body["metadata"].clone();
             rec.custom_fields = body["custom_fields"].clone();
-            rec.revision += 1;
+            // Like Zenodo, a body without pids drops the reserved DOI.
+            rec.reserved &= body["pids"]["doi"]["identifier"].is_string();
+            rec.revision += 2;
             state.json(id)
+        }
+        (Method::POST, ["api", "records", id, "draft", "pids", "doi"]) if draft(&state, id) => {
+            let rec = state.records.get_mut(*id).unwrap();
+            if rec.reserved {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            rec.reserved = true;
+            rec.revision += 2;
+            state.json(id)
+        }
+        (Method::PUT, ["api", "records", id, "draft", "review"]) if draft(&state, id) => {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            if Some(body["receiver"]["community"].as_str().unwrap()) != state.community.as_deref() {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            state.records.get_mut(*id).unwrap().review = Some("created".into());
+            json!({"status": "created"})
+        }
+        (Method::POST, ["api", "records", id, "draft", "actions", "submit-review"])
+            if draft(&state, id) =>
+        {
+            let rec = state.records.get_mut(*id).unwrap();
+            assert_eq!(rec.review.as_deref(), Some("created"));
+            rec.review = Some("submitted".into());
+            return (
+                StatusCode::ACCEPTED,
+                axum::Json(json!({"status": "submitted"})),
+            )
+                .into_response();
+        }
+        (Method::GET, ["api", "communities", slug]) if state.community.is_some() => {
+            json!({"id": state.community, "slug": slug})
+        }
+        (Method::GET, ["api", "records", id, "versions"]) => {
+            let Some(parent) = state.records.get(*id).map(|rec| rec.parent.clone()) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            state.page(state.lineage(&parent))
         }
         (Method::GET, ["api", "records", id])
             if state.records.get(*id).is_some_and(|r| r.published) =>
@@ -190,6 +244,9 @@ async fn remote_request(State(state): State<Arc<Mutex<Remote>>>, request: Reques
             json!({"entries": [{"key": key, "status": "pending"}]})
         }
         (Method::PUT, ["api", "records", id, "draft", "files", key, "content"]) => {
+            if state.reject_uploads {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
             let rec = state.records.get_mut(*id).unwrap();
             rec.files.get_mut(*key).unwrap().0 = Some(body.to_vec());
             json!({})
@@ -207,7 +264,12 @@ async fn remote_request(State(state): State<Arc<Mutex<Remote>>>, request: Reques
         (Method::POST, ["api", "records", id, "draft", "actions", "publish"])
             if draft(&state, id) =>
         {
-            state.records.get_mut(*id).unwrap().published = true;
+            let rec = state.records.get_mut(*id).unwrap();
+            assert!(
+                rec.review.is_none(),
+                "a draft in review is published by its community"
+            );
+            rec.published = true;
             state.json(id)
         }
         _ => return StatusCode::NOT_FOUND.into_response(),
