@@ -32,7 +32,7 @@ RUN mkdir -p /git-runtime/usr/bin /git-runtime/usr/lib/git-core \
     && ldd /usr/bin/git /usr/lib/git-core/git-http-backend /usr/bin/gpg /usr/bin/gpg-agent \
        /usr/bin/gpgconf /usr/bin/python3 /usr/lib/python3.13/lib-dynload/*.so \
        | awk '/=> \// { print $3 }' | sort -u \
-       | xargs -I '{}' cp --parents '{}' /git-runtime/
+       | sed 's#^/lib/#/usr/lib/#' | xargs -I '{}' cp --parents '{}' /git-runtime/
 
 FROM gcr.io/distroless/cc-debian13@sha256:ed7c407fd64eb0af9dddb9456b94cee188a40a7f53cf38c9836e1e9ae14fca02
 WORKDIR /run
