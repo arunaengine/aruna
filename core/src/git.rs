@@ -73,7 +73,7 @@ pub enum GitEffect {
     Initialize(Ulid),
     Snapshot(GitSnapshot),
     Export { document_id: Ulid, revision: String },
-    Http(GitRequest),
+    Http(Box<GitRequest>),
 }
 
 pub enum GitEvent {

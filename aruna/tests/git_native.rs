@@ -93,7 +93,7 @@ async fn native_clients() -> TestResult<()> {
             .env("ARUNA_GIT_URL", repository["clone_url"].as_str().ok_or_else(|| std::io::Error::other("Git URL missing"))?)
             .env("ARUNA_TOKEN", &token).env("ARUNA_API_URL", &base).env("ARUNA_DOCUMENT_ID", id)
             .env("ARUNA_READ_TOKEN", read_token)
-            .env("ARUNA_GROUP_ID", &group.group_id).env("ARUNA_BUCKET", &bucket)
+            .env("ARUNA_GROUP_ID", &group.group_id).env("ARUNA_BUCKET", bucket)
             .env("ARUNA_S3_URL", &endpoint.endpoint_url).env("AWS_ACCESS_KEY_ID", &credentials.access_key_id)
             .env("AWS_SECRET_ACCESS_KEY", &credentials.access_secret).env("AWS_DEFAULT_REGION", shared::AWS_REGION)
             .kill_on_drop(true).spawn()?;

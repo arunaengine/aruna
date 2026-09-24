@@ -151,7 +151,7 @@ pub async fn transport(
         return Err(GitError::Conflict);
     }
     store
-        .execute(GitEffect::Http(request), auth.user_id)
+        .execute(GitEffect::Http(Box::new(request)), auth.user_id)
         .await
         .map_err(|_| GitError::Unavailable)
 }
