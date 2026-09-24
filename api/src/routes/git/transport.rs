@@ -45,7 +45,7 @@ pub async fn advertise(
         return Err(ServerError::BadRequest);
     }
     let auth = require_realm_auth(&state, auth)?;
-    git::snapshot::ensure(
+    git::repository(
         &state.get_ctx(),
         &auth,
         repository_id(&repository)?,
@@ -139,7 +139,7 @@ async fn serve(
     } else {
         Permission::READ
     };
-    let repository = git::repository(&state.get_ctx(), &auth, id, permission)
+    let (_, repository) = git::repository(&state.get_ctx(), &auth, id, permission)
         .await
         .map_err(map_error)?;
     let request = GitRequest {

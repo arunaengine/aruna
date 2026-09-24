@@ -1,21 +1,19 @@
-//! Transfers LFS content through Aruna's authorized, quota-governed object operations.
+//! Transfers LFS content through Aruna object operations on any document holder.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{GitError, records, repository};
+use super::objects::{self, Blob};
+use super::state::{Ancestry, reduce};
+use super::{GitError, publish, records, repository};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, bucket_snapshot, drive, gate_context, now_ms};
-use crate::realm::get_config::GetConfigOperation;
-use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::object::get::{GetObjectInput, GetObjectResult, get_object_info, get_object_routed};
-use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use aruna_core::NodeId;
-use aruna_core::git::{GitRepository, LFS_OBJECTS, LfsObject, LfsVersion};
-use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
+use crate::driver::DriverContext;
+use aruna_core::git::{LfsObject, StoredObject};
+use aruna_core::stream::BackendStream;
+use aruna_core::stream::StreamError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
 use ulid::Ulid;
 
@@ -23,188 +21,128 @@ fn key(id: Ulid, oid: &str) -> String {
     format!("git-lfs/{id}/{oid}")
 }
 
-fn record_key(id: Ulid, oid: &str) -> Vec<u8> {
-    [id.to_bytes().as_slice(), oid.as_bytes()].concat()
+/// This node's copy, or the location a replicated record names.
+async fn locate(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    oid: &str,
+) -> Result<Option<StoredObject>, GitError> {
+    if let Some(copy) = objects::copy(context, document, oid).await? {
+        return Ok(Some(copy));
+    }
+    let records = records::scan(context, document.document_id).await?;
+    Ok(reduce(&records, &Ancestry::new()).0.lfs.remove(oid))
 }
 
-async fn access(
+async fn permit(
     context: &DriverContext,
     auth: &AuthContext,
-    node: NodeId,
-    id: Ulid,
-    oid: &str,
+    object: &StoredObject,
     permission: Permission,
-) -> Result<GitRepository, GitError> {
-    if !(LfsObject {
-        oid: oid.to_string(),
-        size: 0,
-    })
-    .valid()
-    {
-        return Err(GitError::Invalid);
-    }
-    let repository = repository(context, auth, id, permission.clone()).await?;
+) -> Result<(), GitError> {
+    let path = object_permission_path(
+        auth.realm_id,
+        object.group_id,
+        object.node_id,
+        &object.bucket,
+        &object.key,
+    );
     authorize(
         context,
         auth.realm_id,
         auth,
-        &object_permission_path(
-            auth.realm_id,
-            repository.group_id,
-            node,
-            &repository.bucket,
-            &key(id, oid),
-        ),
+        &path,
         &permission,
         PolicyRequestExtras::rest(),
     )
     .await?;
-    Ok(repository)
-}
-
-fn input(
-    repository: &GitRepository,
-    auth: &AuthContext,
-    node: NodeId,
-    version: &LfsVersion,
-) -> GetObjectInput {
-    GetObjectInput {
-        bucket: repository.bucket.clone(),
-        key: key(repository.document_id, &version.object.oid),
-        version_id: Some(version.version_id),
-        range: None,
-        group_id: repository.group_id,
-        user_identity: auth.user_id,
-        node_id: node,
-    }
+    Ok(())
 }
 
 pub async fn inspect(
     context: &DriverContext,
     auth: &AuthContext,
-    node: NodeId,
     id: Ulid,
     object: &LfsObject,
     permission: Permission,
-) -> Result<Option<LfsVersion>, GitError> {
-    let repository = access(context, auth, node, id, &object.oid, permission).await?;
-    let record: Option<LfsVersion> =
-        records::load(context, LFS_OBJECTS, record_key(id, &object.oid)).await?;
-    if let Some(version) = &record {
-        if version.object != *object {
-            return Err(GitError::Invalid);
-        }
-        let info = get_object_info(
-            context,
-            input(&repository, auth, node, version),
-            auth.path_restrictions.clone(),
-        )
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-        if info.size != object.size
-            || info.hashes.get("sha256").map(hex::encode).as_deref() != Some(&object.oid)
-        {
-            return Err(GitError::Unavailable);
-        }
+) -> Result<Option<StoredObject>, GitError> {
+    if !object.valid() {
+        return Err(GitError::Invalid);
     }
-    Ok(record)
+    let (document, _) = repository(context, auth, id, permission).await?;
+    let location = locate(context, &document, &object.oid).await?;
+    if location
+        .as_ref()
+        .is_some_and(|location| location.size != object.size)
+    {
+        return Err(GitError::Invalid);
+    }
+    Ok(location)
 }
 
 pub async fn upload(
     context: &DriverContext,
     auth: &AuthContext,
-    node: NodeId,
     id: Ulid,
     object: LfsObject,
     body: BackendStream<Result<Bytes, StreamError>>,
 ) -> Result<(), GitError> {
-    let repository = access(context, auth, node, id, &object.oid, Permission::WRITE).await?;
-    if inspect(context, auth, node, id, &object, Permission::WRITE)
+    if !object.valid() {
+        return Err(GitError::Invalid);
+    }
+    let (document, repository) = repository(context, auth, id, Permission::WRITE).await?;
+    if objects::copy(context, &document, &object.oid)
         .await?
         .is_some()
     {
         return Ok(());
     }
-    let bucket = drive(GetBucketOperation::new(repository.bucket.clone()), context)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    if bucket.group_id != repository.group_id {
-        return Err(GitError::Conflict);
-    }
-    let routing = bucket_snapshot(context, &bucket)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    let gate = gate_context(context, auth.realm_id, now_ms())
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    let quota = drive(GetConfigOperation::new(auth.realm_id), context)
-        .await
-        .map_err(|_| GitError::Unavailable)?
-        .quota
-        .effective_group_ceiling(&repository.group_id);
-    let mut operation = PutObjectOperation::new(PutObjectConfig {
-        user_id: auth.user_id,
-        group_id: repository.group_id,
-        realm_id: auth.realm_id,
+    let node = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or(GitError::Unavailable)?;
+    let target = StoredObject {
         node_id: node,
-        request: PutObjectInput {
-            bucket: repository.bucket.clone(),
-            key: key(id, &object.oid),
-            content_length: Some(object.size),
-            body: Some(body),
-        },
-        expected_checksums: vec![ExpectedChecksum {
-            algorithm: ChecksumAlgorithm::Sha256,
-            digest: hex::decode(&object.oid).map_err(|_| GitError::Invalid)?,
-        }],
-        checksum_type: None,
-        exists: false,
-        version_source: None,
-        preassigned_version_id: None,
-        quota_ceiling: quota,
-        routing,
-    })
-    .with_bucket_guard(bucket)
-    .with_restrictions(auth.path_restrictions.clone());
-    if let Some(gate) = gate {
-        operation = operation.with_gate(gate);
-    }
-    let result = drive(operation, context)
-        .await
-        .map_err(|error| match error {
-            PutObjectError::IncompleteBody
-            | PutObjectError::MissingBody
-            | PutObjectError::ChecksumMismatch(_) => GitError::Invalid,
-            _ => GitError::Unavailable,
-        })?;
-    let version = LfsVersion {
-        object: object.clone(),
-        version_id: result.version_id,
+        group_id: document.group_id,
+        bucket: repository.bucket,
+        key: key(id, &object.oid),
+        version_id: Ulid::nil(),
+        size: object.size,
+        sha256: object.oid.clone(),
+        blake3: [0; 32],
     };
-    let _: LfsVersion =
-        records::insert(context, LFS_OBJECTS, record_key(id, &object.oid), &version).await?;
-    Ok(())
+    permit(context, auth, &target, Permission::WRITE).await?;
+    let content = (target.key, object.size, object.oid.as_str());
+    objects::store(context, auth, &document, content, body)
+        .await
+        .map(|_| ())
 }
 
+/// Streams LFS content. Content held elsewhere is first copied to this node, whose copy
+/// then serves this and later requests even if the original node leaves.
 pub async fn download(
     context: &DriverContext,
     auth: &AuthContext,
-    node: NodeId,
     id: Ulid,
     oid: &str,
-) -> Result<GetObjectResult, GitError> {
-    let repository = access(context, auth, node, id, oid, Permission::READ).await?;
-    let version: LfsVersion = records::load(context, LFS_OBJECTS, record_key(id, oid))
+) -> Result<(Blob, u64), GitError> {
+    let (document, _) = repository(context, auth, id, Permission::READ).await?;
+    let mut object = locate(context, &document, oid)
         .await?
         .ok_or(GitError::NotFound)?;
-    if version.object.oid != oid {
-        return Err(GitError::Unavailable);
+    let node = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or(GitError::Unavailable)?;
+    if object.node_id != node {
+        let holders = publish::holders(context, &document).await?;
+        let blob = objects::open(context, auth, &document, &object, &holders).await?;
+        let content = (format!("git-copies/{id}/{oid}"), object.size, oid);
+        object = objects::store(context, auth, &document, content, blob).await?;
     }
-    get_object_routed(
-        context,
-        input(&repository, auth, node, &version),
-        auth.path_restrictions.clone(),
-    )
-    .await
-    .map_err(|_| GitError::Unavailable)
+    permit(context, auth, &object, Permission::READ).await?;
+    let blob = objects::open(context, auth, &document, &object, &[]).await?;
+    Ok((blob, object.size))
 }

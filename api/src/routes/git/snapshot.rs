@@ -25,16 +25,18 @@ pub struct RepositoryStatus {
     pub revision: Option<String>,
     pub commit: Option<String>,
     pub error: Option<String>,
+    /// Branches, tags and any `refs/conflicts/...` refs replicated for this document.
+    pub refs: std::collections::BTreeMap<String, String>,
 }
 
 #[utoipa::path(get, path = "/metadata/{document_id}/git", tag = "metadata/git",
     security(("bearer_auth" = [])), summary = "Get the automatic ARC repository",
-    description = "Returns the automatic ARC repository and its conversion status.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: missing repositories are generated on their fixed owner. The protected aruna branch tracks graph snapshots, which are also merged into main. A conversion error means no new valid snapshot was published.",
+    description = "Returns the automatic ARC repository and its conversion status.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: any current holder of the document serves the repository from replicated Git records and rebuilds a missing local copy. The protected aruna branch tracks graph snapshots, which are also merged into main. Concurrent pushes to one branch on different holders keep the first; the other is listed under refs/conflicts/. A conversion error means no new valid snapshot was published.",
     params(("document_id" = String, Path, description = "Metadata document ID")),
     responses((status = 200, description = "Repository and conversion status", body = RepositoryStatus,
-               example = json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","bucket":"arc-storage","revision":"01M000000000000000000000001","commit":"1111111111111111111111111111111111111111","error":null})),
+               example = json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","bucket":"arc-storage","revision":"01M000000000000000000000001","commit":"1111111111111111111111111111111111111111","error":null,"refs":{"refs/heads/aruna":"1111111111111111111111111111111111111111","refs/heads/main":"1111111111111111111111111111111111111111"}})),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
-              (status = 404, description = "Document missing or Git belongs to another node"),
+              (status = 404, description = "Document missing or not held by this node"),
               (status = 503, description = "Metadata or conversion runtime unavailable")))]
 pub async fn repository_status(
     State(state): State<Arc<ServerState>>,
@@ -42,12 +44,17 @@ pub async fn repository_status(
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<RepositoryStatus>> {
     let auth = require_realm_auth(&state, auth)?;
-    let repository = git::snapshot::ensure(&state.get_ctx(), &auth, id, Permission::READ)
+    let (_, repository) = git::repository(&state.get_ctx(), &auth, id, Permission::READ)
         .await
         .map_err(map_error)?;
-    let status = git::snapshot::status(&state.get_ctx(), &auth, id)
-        .await
-        .map_err(map_error)?;
+    let (status, projection) = git::snapshot::status(
+        &state.get_ctx(),
+        state.git().ok_or(ServerError::ServiceUnavailable)?,
+        &auth,
+        id,
+    )
+    .await
+    .map_err(map_error)?;
     let clone_url = base_url(&state, id).await?;
     Ok(Json(RepositoryStatus {
         document_id: id.to_string(),
@@ -57,6 +64,7 @@ pub async fn repository_status(
         revision: status.as_ref().map(|value| value.event_id.to_string()),
         commit: status.as_ref().and_then(|value| value.commit.clone()),
         error: status.and_then(|value| value.error),
+        refs: projection.state.refs,
     }))
 }
 

@@ -1,27 +1,27 @@
-//! Authorizes native Git repositories and executes their storage and transport effects.
+//! Authorizes native Git repositories and serves them from records on any document holder.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod hook;
 pub mod lfs;
+pub mod locks;
 pub mod objects;
+pub mod project;
 pub mod publish;
+pub mod push;
 mod records;
 pub mod snapshot;
 pub mod state;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
+use crate::driver::DriverContext;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::{parse_lifecycle_read, read_lifecycle_effect};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_blob::git::GitStore;
-use aruna_core::NodeId;
-use aruna_core::git::{GitEffect, GitEvent, GitRepository, GitRequest, REPOSITORIES};
+use aruna_core::git::{GitEffect, GitEvent, GitRepository, GitRequest};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use thiserror::Error;
 use ulid::Ulid;
@@ -32,7 +32,7 @@ pub enum GitError {
     NotFound,
     #[error("invalid Git or LFS request")]
     Invalid,
-    #[error("repository binding already exists")]
+    #[error("repository state conflicts with the request")]
     Conflict,
     #[error(transparent)]
     Authorization(#[from] AuthorizeError),
@@ -42,6 +42,8 @@ pub enum GitError {
     NotHolder,
     #[error("the document's Git history needs a checkpoint before more changes")]
     Full,
+    #[error("{0} is locked by another user")]
+    Locked(String),
 }
 
 pub async fn document(
@@ -76,71 +78,25 @@ pub async fn document(
     Ok(record)
 }
 
+/// The document's repository on this holder; its LFS content lives in the node's ARC bucket.
 pub async fn repository(
     context: &DriverContext,
     auth: &AuthContext,
     id: Ulid,
     permission: Permission,
-) -> Result<GitRepository, GitError> {
+) -> Result<(MetadataRegistryRecord, GitRepository), GitError> {
     let document = document(context, auth, id, permission).await?;
-    let record: GitRepository = records::load(context, REPOSITORIES, id.to_bytes().to_vec())
-        .await?
-        .ok_or(GitError::NotFound)?;
-    if record.document_id != id || record.group_id != document.group_id {
-        return Err(GitError::Unavailable);
-    }
-    Ok(record)
-}
-
-pub async fn create(
-    context: &DriverContext,
-    store: &GitStore,
-    auth: &AuthContext,
-    node: NodeId,
-    id: Ulid,
-    bucket: String,
-    arc: bool,
-) -> Result<GitRepository, GitError> {
-    let document = document(context, auth, id, Permission::WRITE).await?;
-    if !arc {
-        return Err(GitError::Invalid);
-    }
-    authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &bucket_permission_path(auth.realm_id, document.group_id, node, &bucket),
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
-    .await?;
-    let info = drive(GetBucketOperation::new(bucket.clone()), context)
-        .await
-        .map_err(|error| match error {
-            GetBucketError::NotFound => GitError::NotFound,
-            _ => GitError::Unavailable,
-        })?;
-    if info.group_id != document.group_id {
-        return Err(GitError::NotFound);
-    }
+    publish::holders(context, &document).await?;
     let repository = GitRepository {
         document_id: id,
-        group_id: info.group_id,
-        bucket,
-        arc,
+        group_id: document.group_id,
+        bucket: format!("arc-{}", document.group_id.to_string().to_lowercase()),
+        arc: true,
     };
-    store
-        .execute(GitEffect::Initialize(id), auth.user_id)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    let existing =
-        records::insert(context, REPOSITORIES, id.to_bytes().to_vec(), &repository).await?;
-    if existing != repository {
-        return Err(GitError::Conflict);
-    }
-    Ok(existing)
+    Ok((document, repository))
 }
 
+/// Serves Git over HTTP after bringing the local cache up to date from the records.
 pub async fn transport(
     context: &DriverContext,
     store: &GitStore,
@@ -153,10 +109,13 @@ pub async fn transport(
         } else {
             Permission::READ
         };
-    let record = repository(context, auth, request.repository.document_id, permission).await?;
-    if record != request.repository {
+    let (document, repository) =
+        repository(context, auth, request.repository.document_id, permission).await?;
+    if repository != request.repository {
         return Err(GitError::Conflict);
     }
+    let _guard = project::lock(document.document_id).await;
+    snapshot::refresh(context, store, &document).await?;
     store
         .execute(GitEffect::Http(Box::new(request)), auth.user_id)
         .await

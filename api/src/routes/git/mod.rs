@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod lfs;
+mod locks;
 mod snapshot;
 mod transport;
 
@@ -11,21 +12,22 @@ use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::git::{self, GitError};
+use axum::Extension;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
-use axum::{Extension, Json};
 use base64::Engine;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
-use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
-        .routes(routes!(create_repository))
+        .routes(routes!(push))
+        .routes(routes!(locks::create, locks::list))
+        .routes(routes!(locks::verify))
+        .routes(routes!(locks::unlock))
         .routes(routes!(snapshot::repository_status))
         .routes(routes!(snapshot::export_revision))
         .routes(routes!(transport::advertise))
@@ -77,6 +79,9 @@ fn map_error(error: GitError) -> ServerError {
         GitError::Authorization(error) => map_authorize_error(error),
         GitError::Unavailable | GitError::Full => ServerError::ServiceUnavailable,
         GitError::NotHolder => ServerError::NotFound,
+        GitError::Locked(path) => {
+            ServerError::Conflict(format!("{path} is locked by another user"))
+        }
     }
 }
 
@@ -93,59 +98,27 @@ async fn base_url(state: &ServerState, id: Ulid) -> ServerResult<String> {
     Ok(format!("{}/git/{id}.git", api_url(state).await?))
 }
 
-#[derive(Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CreateRepository {
-    pub bucket: String,
-    #[serde(default = "arc_enabled")]
-    pub arc: bool,
-}
-
-fn arc_enabled() -> bool {
-    true
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct RepositoryResponse {
-    pub document_id: String,
-    pub clone_url: String,
-    pub lfs_url: String,
-    pub arc: bool,
-}
-
-#[utoipa::path(post, path = "/metadata/{document_id}/git", tag = "metadata/git",
+#[utoipa::path(post, path = "/metadata/{document_id}/git/push", tag = "metadata/git",
     security(("bearer_auth" = [])),
-    summary = "Bind an ARC repository to LFS storage",
-    description = "Binds a repository to an explicit same-group LFS bucket.\n\n**Authentication**: realm bearer token with WRITE on the document and bucket.\n\n**Behavior**: automatic repositories already have an immutable binding. ARC validation cannot be disabled. Normal clients discover the automatic repository with GET on this route.",
-    params(("document_id" = String, Path, description = "Existing crate document ID")),
-    request_body(content = CreateRepository, example = json!({"bucket":"arc-storage","arc":true})),
-    responses((status = 200, description = "Repository enabled", body = RepositoryResponse,
-               example = json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","arc":true})),
+    summary = "Record a validated native Git push",
+    description = "Stores the objects of one push and publishes its ref updates to every holder of the document.\n\n**Authentication**: realm bearer token with WRITE on the document.\n\n**Behavior**: called by the node's own receive hook before Git moves refs. The body is a four-byte big-endian length, a JSON object with `refs`, `lfs` and `paths`, then the Git pack. Paths locked by another user or unknown LFS objects refuse the push.",
+    params(("document_id" = String, Path, description = "Metadata document ID")),
+    request_body(content = Vec<u8>, content_type = "application/x-aruna-git-push"),
+    responses((status = 204, description = "Push recorded"), (status = 400, description = "Malformed push"),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
-              (status = 404, description = "Document or bucket missing"), (status = 409, description = "Different binding exists")))]
-pub async fn create_repository(
+              (status = 404, description = "Document missing or not held by this node"),
+              (status = 409, description = "A changed path is locked by another user"),
+              (status = 503, description = "Records or storage unavailable")))]
+pub async fn push(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<Ulid>,
-    Json(request): Json<CreateRepository>,
-) -> ServerResult<Json<RepositoryResponse>> {
+    body: axum::body::Bytes,
+) -> ServerResult<StatusCode> {
     let auth = require_realm_auth(&state, auth)?;
-    let record = git::create(
-        &state.get_ctx(),
-        state.git().ok_or(ServerError::ServiceUnavailable)?,
-        &auth,
-        state.get_node_id(),
-        id,
-        request.bucket,
-        request.arc,
-    )
-    .await
-    .map_err(map_error)?;
-    let clone_url = base_url(&state, id).await?;
-    Ok(Json(RepositoryResponse {
-        document_id: id.to_string(),
-        lfs_url: format!("{clone_url}/info/lfs"),
-        clone_url,
-        arc: record.arc,
-    }))
+    let (request, pack) = git::push::decode(body).map_err(map_error)?;
+    git::push::accept(&state.get_ctx(), &auth, id, request, pack)
+        .await
+        .map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
