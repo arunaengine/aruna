@@ -318,6 +318,39 @@ class MappingTests(unittest.TestCase):
         regenerated = conversion.convert({"mode": "generate", "document_id": "document-id", "jsonld": merged})
         derived = json.loads(base64.b64decode(regenerated["files"]["ro-crate-metadata.json"]))
         self.assertEqual(sorted(map(json.dumps, derived["@graph"])), sorted(map(json.dumps, new["@graph"])))
+        root = next(item for item in json.loads(merged)["@graph"] if item["@id"] == "urn:aruna:source")
+        self.assertIn({"@id": "assays/assay/dataset/measurements.bin"}, root["hasPart"])
+        stored = self.stored(json.loads(merged), terms[0])
+        edited = json.loads(json.dumps(new))
+        next(item for item in edited["@graph"] if item["@id"] == "assays/assay/")["name"] = "Renamed assay"
+        again = json.loads(conversion.convert({"mode": "merge", "graph": json.dumps(stored), "base": new, "new": edited})["jsonld"])
+        entities = {item["@id"]: item for item in again["@graph"]}
+        self.assertEqual(len(entities), len(stored["@graph"]))
+        self.assertEqual(entities["./assays/assay/"]["name"], "Renamed assay")
+
+    def stored(self, document, terms):
+        """Mimics Aruna storage: ./ relative ids, expanded ISA terms and no extra context."""
+        def local(value):
+            if isinstance(value, str) and not value.startswith(("#", "./", "urn:", "http", "ro-crate-metadata.json")):
+                return "./" + value
+            return value
+
+        def walk(value):
+            if isinstance(value, list):
+                return [walk(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            result = {}
+            for key, item in value.items():
+                if key == "@id":
+                    item = local(item)
+                elif key == "@type":
+                    item = [terms.get(kind, kind) for kind in item] if isinstance(item, list) else terms.get(item, item)
+                else:
+                    item = walk(item)
+                result[terms.get(key, key)] = item
+            return result
+        return {"@context": document["@context"][0], "@graph": walk(document["@graph"])}
 
     def test_git_removals(self):
         graph = source()

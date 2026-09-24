@@ -260,7 +260,13 @@ def canon(value):
     return json.dumps(value, sort_keys=True)
 
 
+TERMS = {}
+
+
 def term(key):
+    if not isinstance(key, str):
+        return key
+    key = TERMS.get(key, key)
     for prefix in ("http://schema.org/", "https://schema.org/", "schema:"):
         if key.startswith(prefix):
             return key[len(prefix):]
@@ -273,7 +279,8 @@ def entities(document):
 
 
 def properties(entity):
-    return {term(key): listed(value) for key, value in (entity or {}).items() if key != "@id"}
+    return {term(key): [term(item) for item in listed(value)] if key == "@type" else listed(value)
+            for key, value in (entity or {}).items() if key != "@id"}
 
 
 def literals(entity):
@@ -285,15 +292,17 @@ def identities(graph, root, wanted):
     """Maps ISA-derived ids to graph ids: same id, the root, or one best unique literal match."""
     mapping, claimed = {"./": root}, {root}
     for identifier, _ in wanted:
-        if identifier in graph:
-            mapping[identifier] = identifier
-            claimed.add(identifier)
-    candidates = {key: (set(map(str, listed(entity.get("@type")))), literals(entity))
+        # Stored crates may spell relative ids with a leading "./".
+        for candidate in (identifier, "./" + identifier):
+            if identifier not in mapping and candidate in graph:
+                mapping[identifier] = candidate
+                claimed.add(candidate)
+    candidates = {key: (set(properties(entity).get("@type", [])), literals(entity))
                   for key, entity in graph.items()}
     for identifier, entity in wanted:
         if identifier in mapping:
             continue
-        types, values = set(map(str, listed(entity.get("@type")))), literals(entity)
+        types, values = set(properties(entity).get("@type", [])), literals(entity)
         scores = sorted(((len(values & known), key) for key, (kinds, known) in candidates.items()
                          if key not in claimed and types & kinds), reverse=True)
         if scores and scores[0][0] > 0 and (len(scores) == 1 or scores[1][0] < scores[0][0]):
@@ -334,15 +343,16 @@ def apply(graph, root, base, new):
         old, current = properties(before.get(identifier)), properties(current)
         for name in sorted(set(old) | set(current)):
             key = next((key for key in entity if key != "@id" and term(key) == name), name)
-            previous = {canon(local(value)) for value in old.get(name, [])}
+            same = (lambda value: canon(term(value))) if name == "@type" else canon
+            previous = {same(local(value)) for value in old.get(name, [])}
             if base is None and name in current:
-                previous = {canon(value) for value in listed(entity.get(key))}
+                previous = {same(value) for value in listed(entity.get(key))}
             values = [local(value) for value in current.get(name, [])]
-            if previous == {canon(value) for value in values}:
+            if previous == {same(value) for value in values}:
                 continue
-            kept = [value for value in listed(entity.get(key)) if canon(value) not in previous]
+            kept = [value for value in listed(entity.get(key)) if same(value) not in previous]
             for value in values:
-                if canon(value) not in {canon(item) for item in kept}:
+                if same(value) not in {same(item) for item in kept}:
                     kept.append(value)
             if kept:
                 entity[key] = kept if len(kept) > 1 or isinstance(entity.get(key), list) else kept[0]
@@ -367,9 +377,21 @@ def merge(request):
     if root not in graph:
         raise ValueError("RO-Crate root Dataset is required")
     before = canon(document)
+    TERMS.clear()
+    TERMS.update({key: value for entry in listed((request["new"] or {}).get("@context"))
+                  if isinstance(entry, dict) for key, value in entry.items() if isinstance(value, str)})
     if None not in (request.get("json_base"), request.get("json_new")):
         apply(graph, root, json.loads(request["json_base"]), json.loads(request["json_new"]))
     apply(graph, root, request.get("base"), request["new"])
+    # RO-Crate links every data entity from the root; Aruna exports only those files.
+    parts = listed(graph[root].get("hasPart"))
+    for identifier, entity in entities(request["new"]).items():
+        target = next((key for key in (identifier, "./" + identifier) if key in graph), None)
+        if target and "File" in properties(entity).get("@type", []) \
+                and {"@id": target} not in parts:
+            parts.append({"@id": target})
+    if parts:
+        graph[root]["hasPart"] = parts
     document["@graph"] = list(graph.values())
     if canon(document) != before:
         # ISA terms such as LabProcess need the definitions ARCtrl ships in its own context.
