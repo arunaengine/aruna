@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::git::{command, exchange};
-use aruna_core::git::{GitSnapshot, GitStatus, MAX_GIT_BYTES};
+use aruna_core::git::{GitSnapshot, MAX_GIT_BYTES, Refs};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -65,26 +65,8 @@ pub async fn export(directory: &Path, revision: &str) -> std::io::Result<Value> 
     Ok(result)
 }
 
-async fn reference(directory: &Path, name: &str) -> std::io::Result<Option<String>> {
-    let refs = command(directory, &["for-each-ref", "--format=%(objectname)", name]).await?;
-    let value = std::str::from_utf8(&refs)
-        .map_err(std::io::Error::other)?
-        .trim();
-    Ok((!value.is_empty()).then(|| value.to_string()))
-}
-
 fn failed(error: &str) -> std::io::Error {
     std::io::Error::other(error.to_string())
-}
-
-async fn revision(directory: &Path, commit: &str) -> std::io::Result<ulid::Ulid> {
-    let format = "--format=%(trailers:key=Aruna-Revision,valueonly)";
-    let value = command(directory, &["log", "-1", format, commit]).await?;
-    std::str::from_utf8(&value)
-        .map_err(std::io::Error::other)?
-        .trim()
-        .parse()
-        .map_err(std::io::Error::other)
 }
 
 type Files = BTreeMap<String, (String, Vec<u8>)>;
@@ -230,33 +212,19 @@ async fn reconcile(directory: &Path, main: &str, files: &Files) -> std::io::Resu
         .map(Some)
 }
 
-pub async fn snapshot(directory: &Path, source: GitSnapshot) -> std::io::Result<GitStatus> {
-    let previous = reference(directory, "refs/heads/aruna").await?;
-    if let Some(previous) = &previous {
-        let event_id = revision(directory, previous).await?;
-        let stored_json = command(
-            directory,
-            &["show", &format!("{previous}:aruna-metadata.json")],
-        )
-        .await?;
-        if event_id > source.event_id
-            || (event_id == source.event_id && stored_json.as_ref() == source.jsonld.as_bytes())
-        {
-            return Ok(GitStatus {
-                event_id,
-                commit: Some(previous.clone()),
-                error: None,
-            });
-        }
-    }
+/// Builds the signed `aruna` commit for `source` and, when main must follow, the main commit.
+/// No ref moves: refs change only through replicated records. Unrepresentable metadata is an
+/// `Err` value, never a fabricated commit.
+pub async fn generate(
+    directory: &Path,
+    source: GitSnapshot,
+    refs: &Refs,
+) -> std::io::Result<Result<(String, Option<String>), String>> {
+    let previous = refs.get("refs/heads/aruna").cloned();
+    let main = refs.get("refs/heads/main").cloned();
     let conversion = convert(json!({"mode":"generate", "document_id":source.document_id.to_string(), "jsonld":source.jsonld})).await?;
-    let status = |error: &str| GitStatus {
-        event_id: source.event_id,
-        commit: previous.clone(),
-        error: Some(error.into()),
-    };
     if let Some(error) = conversion["error"].as_str() {
-        return Ok(status(error));
+        return Ok(Err(error.into()));
     }
     let mut files = Files::new();
     for (path, content) in conversion["files"]
@@ -268,7 +236,6 @@ pub async fn snapshot(directory: &Path, source: GitSnapshot) -> std::io::Result<
             .map_err(std::io::Error::other)?;
         files.insert(path.clone(), ("100644".into(), data));
     }
-    let main = reference(directory, "refs/heads/main").await?;
     let mut total: usize = files.values().map(|(_, data)| data.len()).sum();
     for path in conversion["required"].as_array().into_iter().flatten() {
         let path = path
@@ -284,13 +251,15 @@ pub async fn snapshot(directory: &Path, source: GitSnapshot) -> std::io::Result<
             None => None,
         };
         let (Some(main), Some(data)) = (&main, data) else {
-            return Ok(status(
-                "Referenced ARC data is missing; upload it through native Git/LFS",
+            return Ok(Err(
+                "Referenced ARC data is missing; upload it through native Git/LFS".into(),
             ));
         };
         total = total.saturating_add(data.len());
         if total > MAX_GIT_BYTES / 2 || files.len() >= 9999 {
-            return Ok(status("ARC Git files exceed limit; use LFS for large data"));
+            return Ok(Err(
+                "ARC Git files exceed limit; use LFS for large data".into()
+            ));
         }
         let entry = command(
             directory,
@@ -306,43 +275,30 @@ pub async fn snapshot(directory: &Path, source: GitSnapshot) -> std::io::Result<
     }
     let trailer = format!("\n\nAruna-Revision: {}\n", source.event_id);
     let tree = write_tree(directory, None, &files, &[]).await?;
+    if let Some(previous) = &previous {
+        let unchanged = command(directory, &["rev-parse", &format!("{previous}^{{tree}}")]).await?;
+        if std::str::from_utf8(&unchanged)
+            .map_err(std::io::Error::other)?
+            .trim()
+            == tree
+        {
+            return Ok(Ok((previous.clone(), None)));
+        }
+    }
     let parents: Vec<&str> = previous.iter().map(String::as_str).collect();
     let message = format!("feat: capture Aruna metadata{trailer}");
     let commit = commit_tree(directory, &tree, &parents, message, source.occurred_at_ms).await?;
-    let zero = "0000000000000000000000000000000000000000";
-    let mut transaction = format!(
-        "start\nupdate refs/heads/aruna {commit} {}\n",
-        previous.as_deref().unwrap_or(zero)
-    );
-    match main.as_deref() {
-        None => transaction.push_str(&format!("update refs/heads/main {commit} {zero}\n")),
-        Some(main) if previous.as_deref() == Some(main) => {
-            transaction.push_str(&format!("update refs/heads/main {commit} {main}\n"))
-        }
-        Some(main) => {
-            if let Some(tree) = reconcile(directory, main, &files).await? {
+    let main = match main.as_deref() {
+        None => Some(commit.clone()),
+        Some(main) if previous.as_deref() == Some(main) => Some(commit.clone()),
+        Some(main) => match reconcile(directory, main, &files).await? {
+            Some(tree) => {
                 let message = format!("Merge Aruna metadata into main{trailer}");
-                let merged = commit_tree(
-                    directory,
-                    &tree,
-                    &[main, &commit],
-                    message,
-                    source.occurred_at_ms,
-                )
-                .await?;
-                transaction.push_str(&format!("update refs/heads/main {merged} {main}\n"));
+                let parents = [main, commit.as_str()];
+                Some(commit_tree(directory, &tree, &parents, message, source.occurred_at_ms).await?)
             }
-        }
-    }
-    transaction.push_str("prepare\ncommit\n");
-    let mut process = Command::new("git");
-    process
-        .current_dir(directory)
-        .args(["update-ref", "--stdin"]);
-    exchange(process, transaction.into(), false).await?;
-    Ok(GitStatus {
-        event_id: source.event_id,
-        commit: Some(commit),
-        error: None,
-    })
+            None => None,
+        },
+    };
+    Ok(Ok((commit, main)))
 }

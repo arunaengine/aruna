@@ -12,8 +12,6 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-pub const REPOSITORIES: &str = "git_repositories";
-pub const LFS_OBJECTS: &str = "git_lfs_objects";
 /// This node's own stored copies of Git packs and LFS content, keyed by document and SHA-256.
 pub const LOCAL_OBJECTS: &str = "git_local_objects";
 pub const STATUS: &str = "git_status";
@@ -49,12 +47,6 @@ impl LfsObject {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LfsVersion {
-    pub object: LfsObject,
-    pub version_id: Ulid,
-}
-
 pub struct GitRequest {
     pub repository: GitRepository,
     pub method: String,
@@ -84,16 +76,61 @@ pub struct GitStatus {
     pub error: Option<String>,
 }
 
+pub type Refs = std::collections::BTreeMap<String, String>;
+
 pub enum GitEffect {
     Initialize(Ulid),
-    Snapshot(GitSnapshot),
-    Export { document_id: Ulid, revision: String },
+    /// SHA-256 digests of the packs the local cache already holds.
+    Imported(Ulid),
+    /// Adds a verified pack's objects to the local cache under its SHA-256 digest.
+    Import {
+        document_id: Ulid,
+        digest: String,
+        pack: Bytes,
+    },
+    Refs(Ulid),
+    /// Whether each first commit is an ancestor of the second; missing objects answer false.
+    Ancestry {
+        document_id: Ulid,
+        pairs: Vec<(String, String)>,
+    },
+    /// Moves every local ref from `expected` to `target` in one transaction.
+    SetRefs {
+        document_id: Ulid,
+        expected: Refs,
+        target: Refs,
+    },
+    /// Packs the objects reachable from `include` but not from `exclude`.
+    Pack {
+        document_id: Ulid,
+        include: Vec<String>,
+        exclude: Vec<String>,
+    },
+    /// Builds signed snapshot commits on the given refs without moving any ref.
+    Generate {
+        snapshot: GitSnapshot,
+        refs: Refs,
+    },
+    Export {
+        document_id: Ulid,
+        revision: String,
+    },
     Http(Box<GitRequest>),
 }
 
 pub enum GitEvent {
     Initialized,
-    Snapshot(GitStatus),
+    Imported(std::collections::BTreeSet<String>),
+    Refs(Refs),
+    Ancestry(Vec<bool>),
+    Packed(Bytes),
+    /// The new `aruna` commit and, when main must follow, the new main commit.
+    Generated {
+        aruna: String,
+        main: Option<String>,
+    },
+    /// The graph cannot be represented as a valid ARC yet; nothing was built.
+    GenerateFailed(String),
     Exported(Bytes),
     Response {
         status: u16,
@@ -162,6 +199,7 @@ pub struct LfsLock {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredObject {
     pub node_id: NodeId,
+    pub group_id: GroupId,
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
@@ -238,7 +276,7 @@ impl GitRecord {
                     lfs,
                     revision,
                 } => {
-                    !refs.is_empty()
+                    (!refs.is_empty() || revision.is_some())
                         && refs.iter().all(|update| {
                             valid_ref(&update.name, revision.is_some())
                                 && hex(&update.old, 40)
@@ -381,6 +419,7 @@ mod tests {
         if let GitChange::Objects { lfs, .. } = &mut large.change {
             let object = StoredObject {
                 node_id: large.node_id,
+                group_id: large.group_id,
                 bucket: "b".into(),
                 key: "k".repeat(1000),
                 version_id: Ulid::from(1),

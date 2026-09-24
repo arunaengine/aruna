@@ -36,17 +36,46 @@ impl GitStore {
     ) -> std::io::Result<GitEvent> {
         let _slot = self.slots.try_acquire().map_err(std::io::Error::other)?;
         let id = match &effect {
-            GitEffect::Initialize(id) => *id,
-            GitEffect::Snapshot(source) => source.document_id,
-            GitEffect::Export { document_id, .. } => *document_id,
+            GitEffect::Initialize(id) | GitEffect::Refs(id) | GitEffect::Imported(id) => *id,
+            GitEffect::Generate { snapshot, .. } => snapshot.document_id,
+            GitEffect::Import { document_id, .. }
+            | GitEffect::Ancestry { document_id, .. }
+            | GitEffect::SetRefs { document_id, .. }
+            | GitEffect::Pack { document_id, .. }
+            | GitEffect::Export { document_id, .. } => *document_id,
             GitEffect::Http(request) => request.repository.document_id,
         };
         let _lock = self.locks[id.to_bytes()[15] as usize % 64].lock().await;
         let repository = self.root.join(format!("{id}.git"));
         match effect {
-            GitEffect::Snapshot(source) => crate::arc::snapshot(&repository, source)
+            GitEffect::Generate { snapshot, refs } => Ok(
+                match crate::arc::generate(&repository, snapshot, &refs).await? {
+                    Ok((aruna, main)) => GitEvent::Generated { aruna, main },
+                    Err(error) => GitEvent::GenerateFailed(error),
+                },
+            ),
+            GitEffect::Imported(_) => crate::repo::imported(&repository)
                 .await
-                .map(GitEvent::Snapshot),
+                .map(GitEvent::Imported),
+            GitEffect::Import { digest, pack, .. } => {
+                crate::repo::import(&repository, &digest, pack)
+                    .await
+                    .map(|_| GitEvent::Initialized)
+            }
+            GitEffect::Refs(_) => crate::repo::refs(&repository).await.map(GitEvent::Refs),
+            GitEffect::Ancestry { pairs, .. } => Ok(GitEvent::Ancestry(
+                crate::repo::ancestry(&repository, &pairs).await,
+            )),
+            GitEffect::SetRefs {
+                expected, target, ..
+            } => crate::repo::set_refs(&repository, &expected, &target)
+                .await
+                .map(|_| GitEvent::Refs(target)),
+            GitEffect::Pack {
+                include, exclude, ..
+            } => crate::repo::pack(&repository, &include, &exclude)
+                .await
+                .map(GitEvent::Packed),
             GitEffect::Export { revision, .. } => {
                 let result = crate::arc::export(&repository, &revision).await?;
                 Ok(GitEvent::Exported(
@@ -195,21 +224,26 @@ pub async fn lfs_exchange(url: &str, token: &str, body: Vec<u8>) -> std::io::Res
         .map_err(std::io::Error::other)
 }
 
-/// Reads (`GET`) or replaces (`PUT`) a metadata document's RO-Crate as the pushing user.
+/// Calls the node's own metadata API as the pushing user: `GET` without a body, otherwise
+/// `PUT` for JSON or `POST` for other content.
 pub async fn metadata_request(
     url: &str,
     token: &str,
-    body: Option<Vec<u8>>,
+    body: Option<(&str, Vec<u8>)>,
 ) -> std::io::Result<Bytes> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(std::io::Error::other)?;
     let request = match body {
-        Some(body) => client
+        Some(("application/json", body)) => client
             .put(url)
             .header("Content-Type", "application/json")
+            .body(body),
+        Some((content_type, body)) => client
+            .post(url)
+            .header("Content-Type", content_type)
             .body(body),
         None => client.get(url),
     };
