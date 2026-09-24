@@ -453,3 +453,133 @@ async fn admin_rights_limited() {
         StatusCode::NO_CONTENT
     );
 }
+
+/// Stores a pull link on the dataset the way a keep_updated import creates it.
+async fn pull_link_for(linked: &Linked) -> InvenioLink {
+    use aruna_core::invenio::{InvenioRecord, LinkDirection, LinkPull};
+    let now = std::time::SystemTime::now();
+    let mut link = InvenioLink {
+        link_id: Ulid::generate(),
+        document_id: parse_document_id(&linked.document_id).unwrap(),
+        group_id: linked.test.group_id,
+        connector_id: linked.connector_id,
+        endpoint: "https://zenodo.example/api/".into(),
+        owner_node: linked.test.state.get_node_id(),
+        owner_node_url: "http://127.0.0.1:3000/api/v1".into(),
+        created_by: linked.test.auth.user_id,
+        status: LinkStatus::Enabled,
+        auto_publish: false,
+        public_files: false,
+        metadata_json: "{}".into(),
+        remote: LinkRemote::default(),
+        last_push: None,
+        active_job: None,
+        sequence: 0,
+        limits: aruna_core::structs::execution::job::RoCrateLimits::default(),
+        created_at: now,
+        updated_at: now,
+        generation: 0,
+        warning: None,
+        direction: LinkDirection::Pull(Box::new(LinkPull {
+            auto_update: false,
+            options: Default::default(),
+            target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+                bucket: "research".into(),
+                prefix: "zenodo".into(),
+            },
+            latest_remote_id: None,
+            latest_revision: None,
+            last_checked_at: None,
+            next_check_ms: u64::MAX,
+            failures: 0,
+            revision: None,
+            local_changed: false,
+        })),
+    };
+    let record = InvenioRecord {
+        id: "v1".into(),
+        url: "https://zenodo.example/api/records/v1".into(),
+        published: true,
+        parent_id: "abcde-12345".into(),
+        revision_id: 2,
+        doi: Some("10.1234/v1".into()),
+        html_url: None,
+        concept_doi: None,
+        in_review: false,
+        warning: None,
+    };
+    link.hold(&record, Ulid::generate(), now);
+    let change = LinkChange::Create {
+        link: Box::new(link.clone()),
+        secret: None,
+    };
+    change_link(linked.test.state.get_ctx().as_ref(), &link, change)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn pull_link_routes() {
+    let linked = setup().await;
+    let state = || State(linked.test.state.clone());
+    let owner = || Extension(Some(linked.test.auth.clone()));
+    let link = pull_link_for(&linked).await;
+    let path = || Path((linked.document_id.clone(), link.link_id.to_string()));
+    let Json(view) = get_link(state(), owner(), path()).await.unwrap();
+    assert_eq!(view.direction, "pull");
+    assert_eq!(view.auto_update, Some(false));
+    assert_eq!(view.remote.record_id.as_deref(), Some("v1"));
+    assert_eq!(view.remote.latest_remote_id.as_deref(), Some("v1"));
+    assert_eq!((view.reason, view.pending), (None, false));
+    // Push actions and push settings do not apply to a pull link.
+    assert!(matches!(
+        push_link(state(), owner(), path()).await,
+        Err(ServerError::Conflict(_))
+    ));
+    assert!(matches!(
+        accept_remote(state(), owner(), path()).await,
+        Err(ServerError::Conflict(_))
+    ));
+    let settings = |request: PatchLinkRequest| patch_link(state(), owner(), path(), Json(request));
+    let push_settings = PatchLinkRequest {
+        auto_publish: Some(true),
+        ..PatchLinkRequest::default()
+    };
+    assert!(matches!(
+        settings(push_settings).await,
+        Err(ServerError::BadRequestReason(_))
+    ));
+    let auto = PatchLinkRequest {
+        auto_update: Some(true),
+        ..PatchLinkRequest::default()
+    };
+    let Json(view) = settings(auto).await.unwrap();
+    assert_eq!(view.auto_update, Some(true));
+    // One lineage cannot be pushed and pulled at once on one dataset.
+    assert!(matches!(
+        create(&linked, Some(linked.test.auth.clone())).await,
+        Err(ServerError::Conflict(_))
+    ));
+    let pause = PatchLinkRequest {
+        paused: Some(true),
+        ..PatchLinkRequest::default()
+    };
+    settings(pause).await.unwrap();
+    assert!(matches!(
+        pull_link(state(), owner(), path()).await,
+        Err(ServerError::Conflict(_))
+    ));
+    let push = create(&linked, Some(linked.test.auth.clone()))
+        .await
+        .unwrap();
+    assert_eq!(push.direction, "push");
+    let resume = PatchLinkRequest {
+        paused: Some(false),
+        ..PatchLinkRequest::default()
+    };
+    assert!(matches!(
+        settings(resume).await,
+        Err(ServerError::Conflict(_))
+    ));
+}

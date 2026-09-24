@@ -8,6 +8,7 @@ use aruna_core::invenio::{InvenioLink, LinkPatch, LinkStatus};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::jobs::invenio::link_queue::{current_event, refresh_review, start_push};
 use aruna_operations::jobs::invenio::links::LinkChange;
+use aruna_operations::jobs::invenio::pull::{check_now, start_pull};
 use aruna_operations::jobs::invenio::{TransferError, remote_state, seal_link_token};
 use aruna_operations::jobs::service::cancel_owned_job;
 use axum::extract::{Path, State};
@@ -30,6 +31,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(publish_link))
         .routes(routes!(rotate_token))
         .routes(routes!(accept_remote))
+        .routes(routes!(pull_link))
 }
 
 /// Publishing and the push settings act for the creator's repository account, so only the
@@ -37,6 +39,16 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 fn ensure_creator(auth: &AuthContext, link: &InvenioLink) -> ServerResult<()> {
     if link.created_by != auth.user_id {
         return Err(ServerError::Forbidden);
+    }
+    Ok(())
+}
+
+/// Push actions do not apply to a link that pulls.
+fn ensure_push(link: &InvenioLink) -> ServerResult<()> {
+    if link.pull().is_some() {
+        return Err(ServerError::Conflict(
+            "this link pulls from the repository; use the pull route".into(),
+        ));
     }
     Ok(())
 }
@@ -104,9 +116,11 @@ Requires READ on the dataset and WRITE on the metadata path of the connector gro
 
 paused true stops pushing and cancels a running push. paused false resumes a paused or failed link and pushes when the dataset differs from the last push. Omitted fields stay unchanged. public_files applies to the open draft with the next push.
 
+On a pull link, paused true cancels a running pull and paused false checks the repository again. auto_update, which only the creator may change, imports new versions without asking.
+
 **Errors**
 
-A metadata value that is not an object returns 400."#,
+A metadata value that is not an object returns 400. auto_update on a push link, or auto_publish, public_files or metadata on a pull link, returns 400."#,
     params(
         ("document_id" = String, Path, description = "Metadata document identifier"),
         ("link_id" = String, Path, description = "Link identifier")
@@ -114,7 +128,7 @@ A metadata value that is not an object returns 400."#,
     request_body(content = PatchLinkRequest, example = json!({"paused": true})),
     responses(
         (status = 200, description = "The changed link", body = InvenioLinkResponse, example = json!(link_example())),
-        (status = 400, description = "Invalid metadata overrides", body = ErrorResponse),
+        (status = 400, description = "Invalid metadata overrides, or settings of the other link direction", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the creator or a group admin, or settings changed by someone else than the creator", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse),
@@ -128,10 +142,16 @@ pub async fn patch_link(
     Json(request): Json<PatchLinkRequest>,
 ) -> ServerResult<Json<InvenioLinkResponse>> {
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
-    if request.auto_publish.is_some()
+    let push_settings = request.auto_publish.is_some()
         || request.public_files.is_some()
-        || request.metadata.is_some()
-    {
+        || request.metadata.is_some();
+    if push_settings == link.pull().is_some() && (push_settings || request.auto_update.is_some()) {
+        return Err(ServerError::BadRequestReason(
+            "auto_update applies to pull links; auto_publish, public_files and metadata to push links"
+                .into(),
+        ));
+    }
+    if push_settings || request.auto_update.is_some() {
         ensure_creator(&auth, &link)?;
     }
     let metadata_json = match request.metadata {
@@ -143,7 +163,7 @@ pub async fn patch_link(
         auto_publish: request.auto_publish,
         public_files: request.public_files,
         metadata_json,
-        auto_update: None,
+        auto_update: request.auto_update,
     };
     let pause = patch.paused == Some(true);
     change(&state, &link, LinkChange::Patch(patch)).await?;
@@ -226,6 +246,7 @@ pub async fn push_link(
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
+    ensure_push(&link)?;
     let link = refresh_review(state.get_ctx().as_ref(), &link)
         .await
         .map_err(link_error)?;
@@ -286,6 +307,7 @@ pub async fn publish_link(
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_creator(&auth, &link)?;
+    ensure_push(&link)?;
     let link = refresh_review(state.get_ctx().as_ref(), &link)
         .await
         .map_err(link_error)?;
@@ -347,6 +369,7 @@ pub async fn rotate_token(
 ) -> ServerResult<StatusCode> {
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_creator(&auth, &link)?;
+    ensure_push(&link)?;
     let secret = seal_link_token(
         &state.get_ctx(),
         link.created_by,
@@ -402,6 +425,7 @@ pub async fn accept_remote(
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<Json<InvenioLinkResponse>> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
+    ensure_push(&link)?;
     if link.active_job.is_some() {
         return Err(ServerError::Conflict(
             "a push of this link is running; accept after it finished".into(),
@@ -416,4 +440,82 @@ pub async fn accept_remote(
         })?;
     change(&state, &link, LinkChange::Accept(Box::new(remote))).await?;
     view(&state, link.document_id, link.link_id).await
+}
+
+#[utoipa::path(
+    post, path = "/metadata/{document_id}/invenio/links/{link_id}/pull", tag = "metadata/invenio",
+    summary = "Import the repository's new version now",
+    description = r#"Checks the record lineage of a pull link and imports its latest version into the dataset as an import_rocrate job.
+
+**Authentication**
+
+Requires READ on the dataset and WRITE on the metadata path of the connector group, as the link creator or a group admin. The job runs as the link creator and needs WRITE on the dataset and its target bucket.
+
+**Behavior**
+
+The new version becomes a new versions/{id}/ part with its files, in the mode of the first import. The dataset root takes the new version's metadata through a normal metadata update, and the version's DOIs and ids are registered as imported identifiers.
+
+This also applies an update that local_changed held back: the root metadata is overwritten, while local parts and files stay. A running pull returns its job.
+
+**Errors**
+
+A paused or push link, a dataset that already holds the latest version, a refused repository request, a creator at the active job limit or a node that is not the link's owner returns 409. An unreachable repository returns 503."#,
+    params(
+        ("document_id" = String, Path, description = "Metadata document identifier"),
+        ("link_id" = String, Path, description = "Link identifier")
+    ),
+    responses(
+        (status = 202, description = "Pull job accepted", body = LinkJobResponse, example = json!({
+            "job_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            "status_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        })),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
+        (status = 404, description = "Dataset or link not found", body = ErrorResponse),
+        (status = 409, description = "Nothing to pull, link paused or pushing, repository refused, job limit reached, or the link is managed on its owner node", body = ErrorResponse),
+        (status = 503, description = "Repository unavailable or job could not be started", body = ErrorResponse)
+    ), security(("bearer_auth" = []))
+)]
+pub async fn pull_link(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((document_id, link_id)): Path<(String, String)>,
+) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
+    let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
+    if link.pull().is_none() {
+        return Err(ServerError::Conflict(
+            "this link pushes to the repository; use the push route".into(),
+        ));
+    }
+    if link.status == LinkStatus::Paused {
+        return Err(ServerError::Conflict(
+            "resume the link before pulling".into(),
+        ));
+    }
+    if let Some(job_id) = link.active_job {
+        return job_response(&state, job_id).await;
+    }
+    let context = state.get_ctx();
+    let checked = check_now(&context, &link)
+        .await
+        .map_err(link_error)?
+        .ok_or(ServerError::NotFound)?;
+    if let LinkStatus::Failed { reason } = &checked.status {
+        return Err(ServerError::Conflict(format!(
+            "the repository refused the check ({})",
+            reason.reason()
+        )));
+    }
+    if checked.pull().is_some_and(|pull| pull.failures > 0) {
+        return Err(ServerError::ServiceUnavailableReason(
+            "the repository is unavailable".into(),
+        ));
+    }
+    if !checked.update_available() {
+        return Err(ServerError::Conflict(
+            "the dataset already holds the latest version".into(),
+        ));
+    }
+    let job_id = start_pull(&context, &checked).await.map_err(link_error)?;
+    job_response(&state, job_id).await
 }

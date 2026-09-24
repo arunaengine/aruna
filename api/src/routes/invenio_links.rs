@@ -91,6 +91,9 @@ pub struct PatchLinkRequest {
     pub public_files: Option<bool>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Pull links only: import new versions without asking.
+    #[serde(default)]
+    pub auto_update: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -108,6 +111,9 @@ pub struct LinkRemoteResponse {
     pub published: bool,
     /// Community review of the first version: none, pending, accepted or declined.
     pub review: String,
+    /// Pull links: the lineage's latest published version at the last check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_remote_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -126,10 +132,13 @@ pub struct InvenioLinkResponse {
     pub endpoint: String,
     pub owner_node_url: String,
     pub created_by: String,
+    /// push sends dataset changes to the repository; pull imports new repository versions.
+    pub direction: String,
     /// enabled, paused or failed.
     pub status: String,
     /// Failure reason such as remote_changed, token_rejected, source_unavailable,
-    /// too_many_files or owner_not_holder.
+    /// too_many_files or owner_not_holder. An enabled pull link shows update_available, or
+    /// local_changed when a local edit holds the update back; both are information, not failures.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// A check that failed after the repository had already published the last push.
@@ -137,8 +146,14 @@ pub struct InvenioLinkResponse {
     pub warning: Option<String>,
     pub auto_publish: bool,
     pub public_files: bool,
-    /// A push is queued or running.
+    /// A push is queued or running, or a pull is running.
     pub pending: bool,
+    /// Pull links only: new versions are imported without asking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<bool>,
+    /// Pull links only: when the repository was last asked for a new version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<String>,
     pub remote: LinkRemoteResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_push: Option<LastPushResponse>,
@@ -158,6 +173,7 @@ pub(super) fn link_example() -> serde_json::Value {
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
         "endpoint": "https://zenodo.org/api/", "owner_node_url": "https://node.example/api/v1",
         "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "direction": "push",
         "status": "enabled", "auto_publish": false, "public_files": false, "pending": false,
         "remote": {"parent_id": "abcde-12345", "draft_id": "fghij-67890", "record_id": null,
             "doi": "10.5281/zenodo.123457", "doi_reserved": true,
@@ -176,9 +192,11 @@ fn timestamp(value: SystemTime) -> String {
 
 /// `holds` is false once the owner node lost the dataset; such a link cannot push any more.
 pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioLinkResponse {
+    let info = link.pull_reason().map(str::to_string);
+    let pull = link.pull().cloned();
     let (status, reason) = match &link.status {
         LinkStatus::Enabled if !holds => ("failed", Some("owner_not_holder".to_string())),
-        LinkStatus::Enabled => ("enabled", None),
+        LinkStatus::Enabled => ("enabled", info),
         LinkStatus::Paused => ("paused", None),
         LinkStatus::Failed { reason } => ("failed", Some(reason.reason().to_string())),
     };
@@ -202,12 +220,18 @@ pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioL
         endpoint: link.endpoint,
         owner_node_url: link.owner_node_url,
         created_by: link.created_by.to_string(),
+        direction: if pull.is_some() { "pull" } else { "push" }.to_string(),
         status: status.to_string(),
         reason,
         warning: link.warning,
         auto_publish: link.auto_publish,
         public_files: link.public_files,
         pending: queued || link.active_job.is_some(),
+        auto_update: pull.as_ref().map(|pull| pull.auto_update),
+        last_checked_at: pull
+            .as_ref()
+            .and_then(|pull| pull.last_checked_at)
+            .map(timestamp),
         remote: LinkRemoteResponse {
             parent_id,
             draft_id,
@@ -218,6 +242,7 @@ pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioL
             record_url,
             published,
             review: review.name().to_string(),
+            latest_remote_id: pull.and_then(|pull| pull.latest_remote_id),
         },
         last_push: link.last_push.map(|push| LastPushResponse {
             event_id: push.event_id.to_string(),
@@ -237,7 +262,8 @@ pub(super) fn link_error(error: LinkError) -> ServerError {
         | LinkError::NoRevision
         | LinkError::NotOwner(_)
         | LinkError::JobLimit(_)
-        | LinkError::NotHolder => ServerError::Conflict(error.to_string()),
+        | LinkError::NotHolder
+        | LinkError::Lineage => ServerError::Conflict(error.to_string()),
         LinkError::Submit(_) | LinkError::Fenced => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
@@ -537,7 +563,11 @@ Requires READ on the dataset.
 
 **Behavior**
 
-Each link shows its state, failure reason, the repository draft or record it pushes to, the last DOI and the last push. pending is true while a push is queued or running. Tokens are never returned.
+Each link shows its direction, state, failure reason, the repository draft or record it pushes to, the last DOI and the last push. pending is true while a push is queued or running. Tokens are never returned.
+
+A pull link (direction pull) comes from an import with keep_updated. remote names the version the dataset holds, remote.latest_remote_id the latest version at last_checked_at, and auto_update whether new versions are imported without asking.
+
+An enabled pull link shows reason update_available when a newer version or a repository edit waits, and local_changed when a local edit since the last pull stopped the automatic update.
 
 **Limits**
 
