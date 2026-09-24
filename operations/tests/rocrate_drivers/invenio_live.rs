@@ -40,7 +40,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
         connector_id: connector,
         draft_id: None,
         new_version: None,
-        metadata_json: json!({"title": title}).to_string(),
+        metadata_json: json!({"title": title, "publisher": "Aruna acceptance"}).to_string(),
         publish: false,
         public_files: false,
         credential: None,
@@ -215,11 +215,24 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
+    use aruna_core::invenio::{LinkFailure, LinkPatch, LinkStatus};
+    use aruna_operations::jobs::invenio::links::{LinkChange, change_link};
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
     let fixture = build_fixture(false).await?;
     let link = Box::pin(linked(&fixture, &endpoint, token, false, None)).await?;
+    // DOI registration needs a publisher, which the crate does not name.
+    let publisher = LinkPatch {
+        metadata_json: Some(json!({"publisher": "Aruna acceptance"}).to_string()),
+        ..LinkPatch::default()
+    };
+    Box::pin(change_link(
+        fixture.context.as_ref(),
+        &link,
+        LinkChange::Patch(publisher),
+    ))
+    .await?;
     drain(&fixture).await?;
     succeeded(run_push(&fixture, &link).await?);
     let first = current(&fixture, &link).await.0;
@@ -229,6 +242,8 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .ok_or("first push left no draft")?;
     assert!(!first.remote.published);
+    let reserved = first.remote.doi.clone().ok_or("no DOI reserved")?;
+    assert!(first.remote.doi_reserved);
 
     Box::pin(change(&fixture, "Live second revision", true)).await?;
     due_now(&fixture, &link).await?;
@@ -252,6 +267,11 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     };
     let record = get(format!("records/{draft}/draft")).await?;
     assert_eq!(record["metadata"]["description"], "Live second revision");
+    assert_eq!(
+        record["pids"]["doi"]["identifier"].as_str(),
+        Some(reserved.as_str())
+    );
+    assert_eq!(record["access"]["files"], "restricted");
     let files = get(format!("records/{draft}/draft/files")).await?;
     let mut keys = files["entries"]
         .as_array()
@@ -261,6 +281,67 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
     keys.sort();
     assert_eq!(keys, ["nested/data.txt", "ro-crate-metadata.json"]);
+
+    // An edit in the repository stops the link until the user accepts it.
+    let put = client
+        .put(format!("{endpoint}records/{draft}/draft"))
+        .bearer_auth(token)
+        .header("Accept", "application/json")
+        .header("If-Match", record["revision_id"].to_string())
+        .json(
+            &json!({"metadata": record["metadata"], "custom_fields": record["custom_fields"],
+            "access": {"record": "public", "files": "restricted"}, "pids": record["pids"],
+            "files": {"enabled": true}}),
+        )
+        .send()
+        .await?;
+    put.error_for_status()?;
+    Box::pin(change(&fixture, "Live revision after remote edit", false)).await?;
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    assert!(matches!(
+        run_push(&fixture, &link).await?,
+        JobRunOutcome::Failed(_)
+    ));
+    let failed = current(&fixture, &link).await.0;
+    assert_eq!(
+        failed.status,
+        LinkStatus::Failed {
+            reason: LinkFailure::RemoteChanged
+        }
+    );
+    let state = Box::pin(aruna_operations::jobs::invenio::remote_state(
+        fixture.context.as_ref(),
+        &failed,
+    ))
+    .await?;
+    Box::pin(change_link(
+        fixture.context.as_ref(),
+        &failed,
+        LinkChange::Accept(Box::new(state)),
+    ))
+    .await?;
+    let public = LinkPatch {
+        public_files: Some(true),
+        ..LinkPatch::default()
+    };
+    let accepted = current(&fixture, &link).await.0;
+    Box::pin(change_link(
+        fixture.context.as_ref(),
+        &accepted,
+        LinkChange::Patch(public),
+    ))
+    .await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let continued = current(&fixture, &link).await.0;
+    assert_eq!(continued.remote.draft_id.as_deref(), Some(draft.as_str()));
+    let record = get(format!("records/{draft}/draft")).await?;
+    assert_eq!(record["access"]["files"], "public");
+    assert_eq!(
+        record["metadata"]["description"],
+        "Live revision after remote edit"
+    );
 
     let event = aruna_operations::metadata::raw_revision::load_raw_revision(
         &fixture.context,
@@ -272,15 +353,18 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     .winning_event_id;
     Box::pin(aruna_operations::jobs::invenio::link_queue::start_push(
         &fixture.context,
-        &second,
+        &continued,
         event,
         true,
     ))
     .await?;
     succeeded(run_push(&fixture, &link).await?);
     let published = current(&fixture, &link).await.0;
-    assert!(published.remote.published);
+    assert!(published.remote.published && !published.remote.doi_reserved);
     assert_eq!(published.remote.record_id.as_deref(), Some(draft.as_str()));
+    assert_eq!(published.remote.doi.as_deref(), Some(reserved.as_str()));
+    assert!(published.remote.concept_doi.is_some());
+    assert_eq!(published.warning, None);
 
     Box::pin(change(&fixture, "Live third revision", false)).await?;
     due_now(&fixture, &link).await?;
@@ -300,6 +384,109 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         published.remote.parent_id.as_deref()
     );
     assert_eq!(record["metadata"]["description"], "Live third revision");
+    // Every version reserves its own DOI.
+    let doi = version
+        .remote
+        .doi
+        .as_deref()
+        .ok_or("new version has no DOI")?;
+    assert!(version.remote.doi_reserved && doi != reserved);
+    assert_eq!(record["pids"]["doi"]["identifier"].as_str(), Some(doi));
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable loopback Invenio instance and personal token file"]
+async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
+    use super::link::{attach, current, drain, due_now, import_dataset, run_push, succeeded};
+    use aruna_core::invenio::{LinkPatch, LinkReview};
+    use aruna_operations::jobs::invenio::links::{LinkChange, change_link};
+    let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
+    let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
+    let token = token.trim();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let call = async |method: reqwest::Method, path: String, body: Option<Value>| {
+        let mut request = client
+            .request(method, format!("{endpoint}{path}"))
+            .bearer_auth(token)
+            .header("Accept", "application/json");
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let value: Value = request.send().await?.error_for_status()?.json().await?;
+        Ok::<_, Box<dyn std::error::Error>>(value)
+    };
+    let slug = format!("aruna-{}", Ulid::generate()).to_lowercase();
+    call(
+        reqwest::Method::POST,
+        "communities".into(),
+        Some(json!({"slug": slug, "access": {"visibility": "public"},
+            "metadata": {"title": "Aruna acceptance"}})),
+    )
+    .await?;
+
+    let fixture = build_fixture(false).await?;
+    Box::pin(import_dataset(&fixture, native_archive().await?)).await?;
+    let link = Box::pin(attach(&fixture, &endpoint, token, false, None, Some(&slug))).await?;
+    let publisher = LinkPatch {
+        metadata_json: Some(json!({"publisher": "Aruna acceptance"}).to_string()),
+        ..LinkPatch::default()
+    };
+    Box::pin(change_link(
+        fixture.context.as_ref(),
+        &link,
+        LinkChange::Patch(publisher),
+    ))
+    .await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let pushed = current(&fixture, &link).await.0;
+    let draft = pushed.remote.draft_id.clone().ok_or("no draft")?;
+    let event = aruna_operations::metadata::raw_revision::load_raw_revision(
+        &fixture.context,
+        doc_id(1),
+        None,
+    )
+    .await?
+    .ok_or("revision missing")?
+    .winning_event_id;
+    Box::pin(aruna_operations::jobs::invenio::link_queue::start_push(
+        &fixture.context,
+        &pushed,
+        event,
+        true,
+    ))
+    .await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let submitted = current(&fixture, &link).await.0;
+    assert_eq!(submitted.remote.review, LinkReview::Pending);
+    assert!(!submitted.remote.published);
+    let review = call(
+        reqwest::Method::GET,
+        format!("records/{draft}/draft/review"),
+        None,
+    )
+    .await?;
+    assert_eq!(review["status"], "submitted");
+
+    // The token's owner also owns the community, so it can accept its own submission.
+    let request = review["id"].as_str().ok_or("review request id missing")?;
+    call(
+        reqwest::Method::POST,
+        format!("requests/{request}/actions/accept"),
+        Some(json!({})),
+    )
+    .await?;
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    let accepted = current(&fixture, &link).await.0;
+    assert_eq!(accepted.remote.review, LinkReview::Accepted);
+    assert!(accepted.remote.published);
+    assert_eq!(accepted.remote.record_id.as_deref(), Some(draft.as_str()));
+    assert!(accepted.remote.doi.is_some() && !accepted.remote.doi_reserved);
     fixture.stop().await;
     Ok(())
 }
@@ -333,7 +520,7 @@ async fn transfer(
     spec: &ExportRoCrateSpec,
 ) -> Result<InvenioRecord, Box<dyn std::error::Error>> {
     let ctx = claim_context(fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
-    match run_export_job(&ctx, spec).await {
+    match Box::pin(run_export_job(&ctx, spec)).await {
         JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) => result
             .repository
             .ok_or_else(|| "missing repository result".into()),
