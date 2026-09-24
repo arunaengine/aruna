@@ -4,6 +4,7 @@
 
 pub mod hook;
 pub mod lfs;
+pub mod publish;
 mod records;
 pub mod snapshot;
 
@@ -35,6 +36,10 @@ pub enum GitError {
     Authorization(#[from] AuthorizeError),
     #[error("Git storage unavailable")]
     Unavailable,
+    #[error("this node does not hold the document")]
+    NotHolder,
+    #[error("the document's Git history needs a checkpoint before more changes")]
+    Full,
 }
 
 pub async fn document(

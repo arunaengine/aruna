@@ -75,7 +75,8 @@ fn map_error(error: GitError) -> ServerError {
         GitError::Invalid => ServerError::BadRequest,
         GitError::Conflict => ServerError::Conflict("repository binding differs".into()),
         GitError::Authorization(error) => map_authorize_error(error),
-        GitError::Unavailable => ServerError::ServiceUnavailable,
+        GitError::Unavailable | GitError::Full => ServerError::ServiceUnavailable,
+        GitError::NotHolder => ServerError::NotFound,
     }
 }
 

@@ -136,3 +136,85 @@ pub(super) async fn insert<T: Serialize + DeserializeOwned>(
     }
     result
 }
+
+/// Every stored Git record of one document, in record id order.
+pub(super) async fn scan(
+    context: &DriverContext,
+    document_id: ulid::Ulid,
+) -> Result<Vec<aruna_core::git::GitRecord>, GitError> {
+    let prefix = aruna_core::git::git_record_prefix(document_id);
+    let mut records = Vec::new();
+    let mut start = None;
+    loop {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: aruna_core::keyspaces::GIT_RECORD_KEYSPACE.into(),
+                prefix: Some(prefix.clone()),
+                start: start.take().map(aruna_core::effects::IterStart::After),
+                limit: 256,
+                txn_id: None,
+            }))
+            .await
+        else {
+            return Err(GitError::Unavailable);
+        };
+        for (_, value) in values {
+            records.push(postcard::from_bytes(&value).map_err(|_| GitError::Unavailable)?);
+        }
+        if records.len() > 64 * aruna_core::git::MAX_RECORDS {
+            return Err(GitError::Unavailable);
+        }
+        match next_start_after {
+            Some(key) => start = Some(key),
+            None => return Ok(records),
+        }
+    }
+}
+
+/// Writes all entries in one transaction and syncs them before returning.
+pub(super) async fn commit(
+    context: &DriverContext,
+    writes: Vec<(String, byteview::ByteView, byteview::ByteView)>,
+) -> Result<(), GitError> {
+    let storage = &context.storage_handle;
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
+        .send_effect(Effect::Storage(StorageEffect::StartTransaction {
+            read: false,
+        }))
+        .await
+    else {
+        return Err(GitError::Unavailable);
+    };
+    if !matches!(
+        storage
+            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(txn_id),
+            }))
+            .await,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ) {
+        storage
+            .send_effect(Effect::Storage(StorageEffect::AbortTransaction { txn_id }))
+            .await;
+        return Err(GitError::Unavailable);
+    }
+    if !matches!(
+        storage
+            .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
+            .await,
+        Event::Storage(StorageEvent::TransactionCommitted { .. })
+    ) || !matches!(
+        storage
+            .send_effect(Effect::Storage(StorageEffect::SyncAll))
+            .await,
+        Event::Storage(StorageEvent::SyncAllFinished)
+    ) {
+        return Err(GitError::Unavailable);
+    }
+    Ok(())
+}
