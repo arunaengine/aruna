@@ -298,16 +298,16 @@ pub struct SearchPage {
     pub truncated: bool,
 }
 
-/// Deduplicate hits on `(graph_iri, subject_iri)`, keeping the highest
-/// quantized score (smallest `document_id` on ties) and any title, snippet or
-/// subject types; final order is score descending, then graph and subject IRI.
+/// Deduplicate hits on `(graph_iri, subject_iri)`, keeping the highest score
+/// (smallest `document_id` on ties) and any title, snippet or subject types;
+/// final order is craqle's: score descending, then a hash of graph and subject.
 pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit> {
     let mut deduped: HashMap<(String, String), MetadataSearchHit> = HashMap::new();
     for hit in hits {
         let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
         match deduped.get_mut(&key) {
             Some(existing) => {
-                let replace = match score_key(hit.score).cmp(&score_key(existing.score)) {
+                let replace = match hit.score.total_cmp(&existing.score) {
                     Ordering::Greater => true,
                     Ordering::Less => false,
                     Ordering::Equal => hit.document_id < existing.document_id,
@@ -340,17 +340,31 @@ pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit>
     hits
 }
 
-// Must mirror craqle's quantized-score ordering or watermarks can skip hits
-// at fetch boundaries; truncated BM25 ties may resurface later.
-fn score_key(score: f32) -> i64 {
-    (score as f64 * 1_000_000.0) as i64
+// Must mirror craqle's hit order or watermarks can skip hits at fetch boundaries.
+fn rank_order(left: (f32, &str, &str), right: (f32, &str, &str)) -> Ordering {
+    right
+        .0
+        .total_cmp(&left.0)
+        .then_with(|| stable_hit_key(left.1, left.2).cmp(&stable_hit_key(right.1, right.2)))
+        .then_with(|| left.1.cmp(right.1))
+        .then_with(|| left.2.cmp(right.2))
+}
+
+// Same tie-break key craqle hashes from the graph and subject of a hit.
+fn stable_hit_key(graph_iri: &str, subject_iri: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(graph_iri.len() as u64).to_be_bytes());
+    hasher.update(graph_iri.as_bytes());
+    hasher.update(&(subject_iri.len() as u64).to_be_bytes());
+    hasher.update(subject_iri.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 pub(super) fn compare_hits(left: &MetadataSearchHit, right: &MetadataSearchHit) -> Ordering {
-    score_key(right.score)
-        .cmp(&score_key(left.score))
-        .then_with(|| left.graph_iri.cmp(&right.graph_iri))
-        .then_with(|| left.subject_iri.cmp(&right.subject_iri))
+    rank_order(
+        (left.score, &left.graph_iri, &left.subject_iri),
+        (right.score, &right.graph_iri, &right.subject_iri),
+    )
 }
 
 /// Turn merged node results into one page plus an optional continuation.
@@ -457,11 +471,14 @@ pub fn resume_fetch_limit(
 }
 
 fn hit_after_watermark(hit: &MetadataSearchHit, watermark: &SearchWatermark) -> bool {
-    score_key(watermark.score)
-        .cmp(&score_key(hit.score))
-        .then_with(|| hit.graph_iri.cmp(&watermark.graph_iri))
-        .then_with(|| hit.subject_iri.cmp(&watermark.subject_iri))
-        == Ordering::Greater
+    rank_order(
+        (hit.score, &hit.graph_iri, &hit.subject_iri),
+        (
+            watermark.score,
+            &watermark.graph_iri,
+            &watermark.subject_iri,
+        ),
+    ) == Ordering::Greater
 }
 
 fn watermark_of(hit: &MetadataSearchHit) -> SearchWatermark {
@@ -776,50 +793,52 @@ mod pure_tests {
             .collect();
         assert_eq!(
             keys,
+            // Equal scores follow craqle's hash tie-break, not IRI order.
             vec![
                 ("https://w3id.org/aruna/01C", "./file-c.txt"),
+                ("https://w3id.org/aruna/01B", "./file-b.txt"),
                 ("https://w3id.org/aruna/01A", "./file-a.txt"),
                 ("https://w3id.org/aruna/01A", "./file-b.txt"),
-                ("https://w3id.org/aruna/01B", "./file-b.txt"),
             ]
         );
     }
 
     #[test]
-    fn merge_quantized_ties() {
+    fn merge_exact_scores() {
         let make = |document_id: &str, score: f32, title: &str| {
             let mut copy = hit("01A", "./file.txt", score);
             copy.document_id = document_id.to_string();
             copy.title = title.to_string();
             copy
         };
-        // Same 1e-6 quantization bucket, raw scores differ.
+        // Craqle ranks exact scores, so a slightly higher score beats a smaller id.
         let low_id = make("01AAA", 0.100_000_1, "low-id");
         let high_id = make("01BBB", 0.100_000_4, "high-id");
-        assert_eq!(score_key(low_id.score), score_key(high_id.score));
+        let merged = merge_search_hits(vec![low_id.clone(), high_id.clone()]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].document_id, "01BBB");
 
-        let merged_one = merge_search_hits(vec![low_id.clone(), high_id.clone()]);
-        let merged_two = merge_search_hits(vec![high_id, low_id]);
-        assert_eq!(merged_one.len(), 1);
-        assert_eq!(merged_one[0].document_id, "01AAA");
-        assert_eq!(merged_two[0].document_id, "01AAA");
+        let tied = make("01CCC", 0.100_000_4, "tied");
+        let merged_one = merge_search_hits(vec![high_id.clone(), tied.clone()]);
+        let merged_two = merge_search_hits(vec![tied, high_id]);
+        assert_eq!(merged_one[0].document_id, "01BBB");
+        assert_eq!(merged_two[0].document_id, "01BBB");
         assert_eq!(merged_one[0].title, merged_two[0].title);
     }
 
     #[test]
-    fn paginate_keeps_bucket() {
-        // Raw f32 order opposes the IRI tie-break inside one 1e-6 score bucket;
-        // the coordinator must follow craqle's quantized ordering or page one drops b.
-        let a = hit("01A", "./a", 0.100_000_1);
-        let b = hit("01B", "./b", 0.100_000_4);
-        assert_eq!(score_key(a.score), score_key(b.score));
-        assert!(b.score > a.score);
+    fn paginate_hashed_ties() {
+        // Craqle's hash tie-break puts b before a although a has the smaller IRIs;
+        // the coordinator must follow it or page two drops a.
+        let a = hit("01A", "./a", 0.5);
+        let b = hit("01B", "./b", 0.5);
+        assert_eq!(compare_hits(&b, &a), Ordering::Less);
 
         // Page 1: the node returns its craqle-ordered top-1 prefix.
         let page1 = paginate(
             vec![NodeSearchResult {
                 node_id: node_id(1),
-                hits: vec![a.clone()],
+                hits: vec![b.clone()],
                 saturated: true,
             }],
             None,
@@ -827,14 +846,14 @@ mod pure_tests {
             MAX_PAGINATION_DEPTH,
         );
         assert_eq!(page1.hits.len(), 1);
-        assert_eq!(page1.hits[0].subject_iri, "./a");
+        assert_eq!(page1.hits[0].subject_iri, "./b");
         let next = page1.next.expect("node was saturated");
 
-        // Page 2: the deeper fetch surfaces b, which must still be emitted.
+        // Page 2: the deeper fetch surfaces a, which must still be emitted.
         let page2 = paginate(
             vec![NodeSearchResult {
                 node_id: node_id(1),
-                hits: vec![a, b],
+                hits: vec![b, a],
                 saturated: false,
             }],
             Some(next.watermark),
@@ -846,7 +865,7 @@ mod pure_tests {
             .iter()
             .map(|hit| hit.subject_iri.as_str())
             .collect();
-        assert_eq!(subjects, vec!["./b"]);
+        assert_eq!(subjects, vec!["./a"]);
     }
 
     #[test]
