@@ -33,7 +33,7 @@ use aruna_core::structs::execution::job::{
     RoCrateMediaType, SYSTEM_ENTRY_PREFIX, job_entry_key, rocrate_plan_key,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::secondary_id::SecondaryIdentifier;
+use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdentifier};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, object_permission_path,
 };
@@ -61,12 +61,10 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::AuthToken;
-use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
 use crate::metadata::forward::route_metadata_create;
-use crate::metadata::persistent_id::forward::add_identifiers_routed;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
@@ -1130,32 +1128,28 @@ async fn create_document(
     }
 }
 
-/// Records the source repository identifiers on the created document through its PID authority.
+/// Queues the source repository identifiers for the created document. The queued job waits
+/// for the PID authority, so cleanup never does.
 async fn register_identifiers(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
-    identifiers: &[SecondaryIdentifier],
+    identifiers: Vec<SecondaryIdentifier>,
 ) -> Result<(), ImportFailure> {
-    let result = add_identifiers_routed(
+    crate::jobs::service::submit_identifiers(
         &ctx.driver,
-        spec.auth_context.realm_id,
-        spec.document_id,
-        identifiers.to_vec(),
-        aruna_core::time::unix_timestamp_millis(),
-        Some(AuthToken::internal(spec.auth_context.clone())),
+        RegisterIdentifiersSpec {
+            document_id: spec.document_id,
+            identifiers,
+            auth_context: spec.auth_context.clone(),
+        },
+        ctx.owner_node_id,
+        ctx.job_id,
     )
-    .await;
-    match result {
-        Ok(_) => Ok(()),
-        // The imported data stays valid without the lookup entries, so a refusal is not fatal.
-        Err(error @ (MetadataApiError::Forbidden | MetadataApiError::Unauthorized)) => {
-            tracing::warn!(document_id = %spec.document_id, %error, "import identifiers refused");
-            Ok(())
-        }
-        Err(error) => Err(ImportFailure::Retryable(format!(
-            "registering repository identifiers failed: {error}"
-        ))),
-    }
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        ImportFailure::Retryable(format!("queueing repository identifiers failed: {error}"))
+    })
 }
 
 async fn cleanup_source(
@@ -1164,27 +1158,24 @@ async fn cleanup_source(
     plan: Option<&ImportPlan>,
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<(), ImportFailure> {
-    if checkpoint.created && !checkpoint.identifiers.is_empty() {
-        register_identifiers(ctx, spec, &checkpoint.identifiers).await?;
-        checkpoint.identifiers.clear();
-    }
     if let Some(plan) = plan.filter(|_| rollback_required(checkpoint)) {
         checkpoint.rolled_back = rollback_writes(ctx, spec, plan, checkpoint).await?;
     }
-    let Some(input) = checkpoint.input.as_ref() else {
-        checkpoint.refs.hidden_locations.clear();
-        checkpoint.phase = ImportPhase::Done;
-        return Ok(());
-    };
-    crate::blob::hidden::delete_hidden(&ctx.driver, &input.location)
-        .await
-        .map_err(ImportFailure::Retryable)?;
-    if let Some(upload_id) = input.upload_id {
-        delete_rocrate_upload(&ctx.driver.storage_handle, upload_id, ctx.job_id)
+    if let Some(input) = checkpoint.input.as_ref() {
+        crate::blob::hidden::delete_hidden(&ctx.driver, &input.location)
             .await
             .map_err(ImportFailure::Retryable)?;
+        if let Some(upload_id) = input.upload_id {
+            delete_rocrate_upload(&ctx.driver.storage_handle, upload_id, ctx.job_id)
+                .await
+                .map_err(ImportFailure::Retryable)?;
+        }
     }
     checkpoint.refs.hidden_locations.clear();
+    if checkpoint.created && !checkpoint.identifiers.is_empty() {
+        register_identifiers(ctx, spec, checkpoint.identifiers.clone()).await?;
+        checkpoint.identifiers.clear();
+    }
     checkpoint.phase = ImportPhase::Done;
     Ok(())
 }

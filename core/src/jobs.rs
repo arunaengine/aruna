@@ -27,6 +27,7 @@ pub enum JobKind {
     MintPersistentId,
     StoragePurge,
     CopyObject,
+    RegisterIdentifiers,
 }
 
 impl JobKind {
@@ -43,11 +44,15 @@ impl JobKind {
             Self::MintPersistentId => "mint_persistent_id",
             Self::StoragePurge => "storage_purge",
             Self::CopyObject => "copy_object",
+            Self::RegisterIdentifiers => "register_identifiers",
         }
     }
 
     pub fn is_internal(self) -> bool {
-        matches!(self, Self::WriteRunCrate | Self::TerminalCleanup)
+        matches!(
+            self,
+            Self::WriteRunCrate | Self::TerminalCleanup | Self::RegisterIdentifiers
+        )
     }
 
     pub fn is_report(self) -> bool {
@@ -69,6 +74,7 @@ impl From<&JobPayload> for JobKind {
             JobPayload::MintPersistentId(_) => Self::MintPersistentId,
             JobPayload::StoragePurge(_) => Self::StoragePurge,
             JobPayload::CopyObject(_) => Self::CopyObject,
+            JobPayload::RegisterIdentifiers(_) => Self::RegisterIdentifiers,
         }
     }
 }

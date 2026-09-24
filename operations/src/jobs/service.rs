@@ -415,6 +415,41 @@ pub(crate) async fn submit_mint_local(
     .await
 }
 
+/// Queues identifier registration on this node. The key names the calling job, so a replayed
+/// step joins the job it already queued.
+pub(crate) async fn submit_identifiers(
+    context: &DriverContext,
+    spec: aruna_core::structs::secondary_id::RegisterIdentifiersSpec,
+    owner_node_id: NodeId,
+    for_job: JobId,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.auth_context.user_id;
+    let dedup_key = Some(format!("identifiers/{for_job}").into_bytes());
+    let job_id = mint_local_job(
+        context,
+        created_by.realm_id,
+        owner_node_id,
+        dedup_key.as_deref(),
+    )
+    .await?;
+    submit_local_job(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::RegisterIdentifiers(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            retention_ms: crate::jobs::JOB_RETENTION_MS,
+            workspace_mode: WorkspaceMode::None,
+            workspace_bucket: None,
+            active_cap: None,
+        },
+        job_id,
+    )
+    .await
+}
+
 pub async fn submit_rocrate_import(
     context: &DriverContext,
     spec: ImportRoCrateSpec,

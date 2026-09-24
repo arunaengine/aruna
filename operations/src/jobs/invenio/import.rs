@@ -16,7 +16,7 @@ use aruna_core::invenio::{
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::secondary_id::SecondaryIdentifier;
+use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
 use async_zip::{Compression, ZipEntryBuilder};
 use futures_util::io::AsyncWriteExt;
 use http::Method;
@@ -51,9 +51,10 @@ pub(crate) async fn acquire(
     let document = import_crate(client.endpoint(), &selected, &records)?;
     let identifiers = records
         .iter()
-        .find(|(record, _)| record["id"] == selected.as_str())
-        .map(|(record, _)| record_identifiers(client.endpoint(), record))
-        .unwrap_or_default();
+        .flat_map(|(record, _)| {
+            record_identifiers(client.endpoint(), record, IdentifierOrigin::Imported)
+        })
+        .collect();
     let metadata = document.to_string();
     if metadata.len() as u64 > spec.limits.metadata_bytes {
         return Err(TransferError::Permanent(

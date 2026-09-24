@@ -30,6 +30,12 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
         JobRunOutcome::Failed(error) => panic!("{}", error.message),
         _ => panic!("unexpected import outcome"),
     }
+    Box::pin(super::link::run_registration(
+        &fixture,
+        ctx.job_id,
+        spec.auth_context.user_id,
+    ))
+    .await?;
     let mapping =
         aruna_operations::metadata::persistent_id::read_mapping(&fixture.context, doc_id(1))
             .await?
@@ -43,7 +49,10 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         identifiers,
         vec![
+            ("doi", "10.1234/1", None),
             ("doi", "10.1234/2", None),
+            ("doi", "10.1234/all", None),
+            ("invenio_record", "1", endpoint.clone()),
             ("invenio_record", "2", endpoint.clone()),
             ("invenio_parent", "parent", endpoint),
         ]

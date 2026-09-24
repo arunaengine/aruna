@@ -600,6 +600,8 @@ pub enum JobPayload {
     /// One object copy the request path handed off because its source must be
     /// pulled from a reference first. Safe to requeue: a rerun copies again.
     CopyObject(CopyJobSpec),
+    /// Adds repository identifiers to a document's PID mapping. Internal and idempotent.
+    RegisterIdentifiers(crate::structs::secondary_id::RegisterIdentifiersSpec),
 }
 
 impl ExecutionSpec {
@@ -630,7 +632,8 @@ impl JobPayload {
             | Self::WriteRunCrate { .. }
             | Self::TerminalCleanup { .. }
             | Self::ExportRoCrate(_)
-            | Self::MintPersistentId(_) => None,
+            | Self::MintPersistentId(_)
+            | Self::RegisterIdentifiers(_) => None,
         }
     }
 
@@ -648,6 +651,7 @@ impl JobPayload {
             JobPayload::MintPersistentId(_) => "mint_persistent_id",
             JobPayload::StoragePurge(_) => "storage_purge",
             JobPayload::CopyObject(_) => "copy_object",
+            JobPayload::RegisterIdentifiers(_) => "register_identifiers",
         }
     }
 
@@ -664,7 +668,8 @@ impl JobPayload {
             JobPayload::CopyObject(_) => "bytes",
             JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
-            | JobPayload::TerminalCleanup { .. } => "steps",
+            | JobPayload::TerminalCleanup { .. }
+            | JobPayload::RegisterIdentifiers(_) => "steps",
         }
     }
 
@@ -681,7 +686,8 @@ impl JobPayload {
             | JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. }
-            | JobPayload::CopyObject(_) => JobExecutionClass::InProcess,
+            | JobPayload::CopyObject(_)
+            | JobPayload::RegisterIdentifiers(_) => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }
@@ -689,7 +695,9 @@ impl JobPayload {
     pub fn is_internal(&self) -> bool {
         matches!(
             self,
-            JobPayload::WriteRunCrate { .. } | JobPayload::TerminalCleanup { .. }
+            JobPayload::WriteRunCrate { .. }
+                | JobPayload::TerminalCleanup { .. }
+                | JobPayload::RegisterIdentifiers(_)
         )
     }
 
