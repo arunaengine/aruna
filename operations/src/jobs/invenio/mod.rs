@@ -30,7 +30,7 @@ mod query;
 pub(crate) mod reference;
 mod verify;
 pub use push::remote_state;
-pub use query::search_records;
+pub use query::{RecordReference, resolve_record, search_records};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {

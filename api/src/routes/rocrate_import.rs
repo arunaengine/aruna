@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::StructuredId;
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
+use aruna_core::invenio::InvenioPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
@@ -80,6 +81,12 @@ pub enum ImportSourceRequest {
         record_id: String,
         #[serde(flatten)]
         options: super::invenio::InvenioOptionsRequest,
+        /// Creates a pull link that keeps the new dataset updated from the record lineage.
+        #[serde(default)]
+        keep_updated: bool,
+        /// With keep_updated, imports new versions without asking; default false.
+        #[serde(default)]
+        auto_update: Option<bool>,
     },
     Upload {
         upload_id: String,
@@ -322,7 +329,21 @@ pub async fn submit_import(
     Json(request): Json<SubmitImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let source = parse_import_source(request.source)?;
+    let mut source = parse_import_source(request.source)?;
+    if let ImportRoCrateSource::Invenio {
+        pull: Some(InvenioPull::Keep { owner_node_url, .. }),
+        ..
+    } = &mut source
+    {
+        *owner_node_url = state
+            .interface_state()
+            .await
+            .rest
+            .map(|rest| rest.api_base_url)
+            .ok_or_else(|| {
+                ServerError::InternalError("REST interface URL is unavailable".into())
+            })?;
+    }
     let target = parse_import_target(request.target, state.rocrate_limits().key_bytes)?;
     let metadata = parse_import_metadata(request.metadata, state.rocrate_limits().key_bytes)?;
     let mut spec = ImportRoCrateSpec {
@@ -401,15 +422,27 @@ fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrat
             connector_id,
             record_id,
             options,
+            keep_updated,
+            auto_update,
         } => {
             aruna_core::invenio::validate_id(&record_id)
                 .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+            if auto_update.is_some() && !keep_updated {
+                return Err(ServerError::BadRequestReason(
+                    "auto_update needs keep_updated".into(),
+                ));
+            }
+            // The owner node URL is filled in once the request is accepted.
+            let pull = keep_updated.then(|| InvenioPull::Keep {
+                auto_update: auto_update.unwrap_or(false),
+                owner_node_url: String::new(),
+            });
             Ok(ImportRoCrateSource::Invenio {
                 options: options.into(),
                 group_id: parse_ulid(&group_id)?,
                 connector_id: parse_ulid(&connector_id)?,
                 record_id,
-                pull: None,
+                pull,
             })
         }
         ImportSourceRequest::Upload { upload_id } => Ok(ImportRoCrateSource::Upload {

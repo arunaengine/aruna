@@ -128,14 +128,28 @@ pub async fn search_records(
     })
 }
 
+/// Names the record by exactly one of record_id, doi or url.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InvenioImportRequest {
     pub group_id: String,
     pub connector_id: String,
-    pub record_id: String,
+    #[serde(default)]
+    pub record_id: Option<String>,
+    /// A version DOI names that version; a concept DOI names the latest version.
+    #[serde(default)]
+    pub doi: Option<String>,
+    /// A record page or API URL on the connector's repository.
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(flatten)]
     pub options: InvenioOptionsRequest,
+    /// Creates a pull link that keeps the new dataset updated from the record lineage.
+    #[serde(default)]
+    pub keep_updated: bool,
+    /// With keep_updated, imports new versions without asking; default false.
+    #[serde(default)]
+    pub auto_update: Option<bool>,
     pub target: ImportTargetRequest,
     pub metadata: ImportMetadataRequest,
     #[serde(default)]
@@ -206,7 +220,11 @@ Requires READ on the metadata path of the repository connector group and WRITE o
 
 Mode copy verifies and stores file bytes. Mode reference creates native object references and reads bytes on demand; target and connector must share a group. Mode metadata skips attached files. Source record JSON is retained in every mode.
 
+Name the record by exactly one of record_id, doi or url. A version DOI selects that version and a concept DOI the latest one. A url is a record page or API URL on the connector's repository, such as https://zenodo.org/records/1234567.
+
 All published versions are included by default. Set all_versions to false for the selected version. Source identifiers remain provenance. Partial dates use their earliest day for crate validation and retain their exact original value.
+
+keep_updated creates a pull link on the new dataset once the import succeeded. It asks the repository once a day for a new version, reading with the connector's token if the connector has one. With auto_update new versions are imported into the dataset without asking; otherwise the link shows update_available and the pull route imports them.
 
 **Limits**
 
@@ -214,11 +232,12 @@ Crate limits apply. Hidden edits and inaccessible or deleted versions cannot be 
 
 **Errors**
 
-The returned job exposes progress, cancellation and failure details. Copy imports fail on missing data or checksum mismatches."#,
+None or several of record_id, doi and url, a DOI no published record has, a URL on another origin, or auto_update without keep_updated return 400. The returned job exposes progress, cancellation and failure details. Copy imports fail on missing data or checksum mismatches."#,
     request_body(content = InvenioImportRequest, example = json!({
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
-        "record_id": "1234567", "target": {"bucket": "research", "prefix": "zenodo/1234567"},
-        "metadata": {"group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "path": "datasets/zenodo", "public": false}
+        "doi": "10.5281/zenodo.1234567", "target": {"bucket": "research", "prefix": "zenodo/1234567"},
+        "metadata": {"group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "path": "datasets/zenodo", "public": false},
+        "keep_updated": true, "auto_update": false
     })),
     responses(
         (status = 202, description = "Transfer accepted", body = SubmitImportResponse, example = json!({
@@ -227,12 +246,12 @@ The returned job exposes progress, cancellation and failure details. Copy import
             "status_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX",
             "report_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/report"
         })),
-        (status = 400, description = "Invalid transfer request", body = ErrorResponse),
+        (status = 400, description = "Invalid transfer request or record name, or no record with this DOI", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Connector or destination access denied", body = ErrorResponse),
         (status = 404, description = "Destination not found", body = ErrorResponse),
         (status = 409, description = "Job conflict or quota refusal", body = ErrorResponse),
-        (status = 503, description = "Transfer placement unavailable", body = ErrorResponse)
+        (status = 503, description = "Transfer placement or repository unavailable", body = ErrorResponse)
     ), security(("bearer_auth" = []))
 )]
 pub async fn import_record(
@@ -240,6 +259,50 @@ pub async fn import_record(
     auth: Extension<Option<AuthContext>>,
     Json(request): Json<InvenioImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
+    use aruna_operations::jobs::invenio::{RecordReference, TransferError, resolve_record};
+    let reference = match (request.record_id, request.doi, request.url) {
+        (Some(id), None, None) => RecordReference::Id(id),
+        (None, Some(doi), None) => RecordReference::Doi(doi),
+        (None, None, Some(url)) => RecordReference::Url(url),
+        _ => {
+            return Err(ServerError::BadRequestReason(
+                "give exactly one of record_id, doi or url".into(),
+            ));
+        }
+    };
+    let record_id = match reference {
+        RecordReference::Id(id) => id,
+        reference => {
+            let caller = crate::auth::require_unrestricted_auth(&state, auth.0.clone())?;
+            let group_id =
+                ulid::Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
+            let connector_id = ulid::Ulid::from_string(&request.connector_id)
+                .map_err(|_| ServerError::BadRequest)?;
+            crate::metadata::ensure_metadata_scope(
+                &state,
+                &caller,
+                group_id,
+                aruna_core::structs::identity::auth::Permission::READ,
+            )
+            .await?;
+            resolve_record(
+                &state.get_ctx(),
+                &caller,
+                group_id,
+                connector_id,
+                &reference,
+                state.rocrate_limits().metadata_bytes,
+            )
+            .await
+            .map_err(|error| match error {
+                TransferError::Permanent(message) => ServerError::BadRequestReason(message),
+                error @ TransferError::Refused(_) => {
+                    ServerError::BadRequestReason(error.to_string())
+                }
+                _ => ServerError::ServiceUnavailableReason("repository unavailable".into()),
+            })?
+        }
+    };
     super::rocrate_import::submit_import(
         state,
         auth,
@@ -247,8 +310,10 @@ pub async fn import_record(
             source: ImportSourceRequest::Invenio {
                 group_id: request.group_id,
                 connector_id: request.connector_id,
-                record_id: request.record_id,
+                record_id,
                 options: request.options,
+                keep_updated: request.keep_updated,
+                auto_update: request.auto_update,
             },
             target: request.target,
             metadata: request.metadata,

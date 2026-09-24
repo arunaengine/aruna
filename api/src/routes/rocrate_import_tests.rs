@@ -45,8 +45,12 @@ async fn invenio_requires_auth() {
         let import = InvenioImportRequest {
             group_id: group_id.clone(),
             connector_id: Ulid::generate().to_string(),
-            record_id: "42".into(),
+            record_id: Some("42".into()),
+            doi: None,
+            url: None,
             options: Default::default(),
+            keep_updated: false,
+            auto_update: None,
             target: ImportTargetRequest {
                 bucket: "target".into(),
                 prefix: String::new(),
@@ -116,8 +120,12 @@ async fn invenio_denies_connector() {
     let request = InvenioImportRequest {
         group_id: Ulid::generate().to_string(),
         connector_id: Ulid::generate().to_string(),
-        record_id: "42".into(),
+        record_id: Some("42".into()),
+        doi: None,
+        url: None,
         options: Default::default(),
+        keep_updated: false,
+        auto_update: None,
         target: ImportTargetRequest {
             bucket: "target".into(),
             prefix: "import".into(),
@@ -131,6 +139,50 @@ async fn invenio_denies_connector() {
     };
     let result = import_record(State(state), Extension(auth(user)), Json(request)).await;
     assert!(matches!(result, Err(ServerError::Forbidden)));
+}
+
+#[tokio::test]
+async fn invenio_names_one_record() {
+    use crate::routes::invenio::{InvenioImportRequest, import_record};
+    let (_root, state, user, group) = submit_state().await;
+    let request = |record_id: Option<&str>, doi: Option<&str>| InvenioImportRequest {
+        group_id: group.to_string(),
+        connector_id: Ulid::generate().to_string(),
+        record_id: record_id.map(str::to_string),
+        doi: doi.map(str::to_string),
+        url: None,
+        options: Default::default(),
+        keep_updated: false,
+        auto_update: None,
+        target: ImportTargetRequest {
+            bucket: "target".into(),
+            prefix: "import".into(),
+        },
+        metadata: ImportMetadataRequest {
+            group_id: group.to_string(),
+            path: "crate".into(),
+            public: false,
+        },
+        idempotency_key: None,
+    };
+    for (record_id, doi) in [(None, None), (Some("42"), Some("10.5281/zenodo.42"))] {
+        let result = import_record(
+            State(state.clone()),
+            Extension(auth(user)),
+            Json(request(record_id, doi)),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
+    }
+    let lone = parse_import_source(ImportSourceRequest::Invenio {
+        group_id: group.to_string(),
+        connector_id: Ulid::generate().to_string(),
+        record_id: "42".into(),
+        options: Default::default(),
+        keep_updated: false,
+        auto_update: Some(true),
+    });
+    assert!(matches!(lone, Err(ServerError::BadRequestReason(_))));
 }
 
 #[test]
