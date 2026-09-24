@@ -5,6 +5,7 @@
 import base64
 import datetime
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
@@ -51,6 +52,8 @@ class MappingTests(unittest.TestCase):
             with patch("datetime.datetime", Clock), patch("zipfile.time.localtime", return_value=(year, 2, 3, 4, 5, 6, 0, 1, 0)):
                 results.append(conversion.convert(request))
         self.assertEqual(results[0], results[1])
+        with zipfile.ZipFile(io.BytesIO(base64.b64decode(results[0]["files"]["isa.investigation.xlsx"]))) as book:
+            self.assertTrue(book.read("docProps/core.xml").startswith(b"<cp:coreProperties"))
         parsed = conversion.convert({"mode": "inspect", "files": results[0]["files"]})
         root = next(item for item in parsed["rocrate"]["@graph"] if item.get("@id") == "./")
         self.assertEqual(root["name"], "Supplied title")

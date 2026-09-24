@@ -6,11 +6,11 @@ import base64
 import importlib.metadata
 import io
 import json
+import re
 import resource
 import sys
 import tempfile
 import zipfile
-import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
@@ -217,12 +217,9 @@ def canonical_workbook(path):
         for name in sorted(source.namelist()):
             content = source.read(name)
             if name == "docProps/core.xml":
-                properties = ET.fromstring(content)
-                for field in ("created", "modified"):
-                    value = properties.find("{http://purl.org/dc/terms/}" + field)
-                    if value is not None:
-                        value.text = "1980-01-01T00:00:00Z"
-                content = ET.tostring(properties, encoding="utf-8")
+                # Re-serializing renames namespace prefixes, which ARCitect's reader rejects.
+                content = re.sub(rb"(<(\w+):(created|modified)\b[^>]*>)[^<]*(</\2:\3>)",
+                                 rb"\g<1>1980-01-01T00:00:00Z\g<4>", content)
             entry = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
             entry.create_system = 3
             entry.external_attr = 0o600 << 16
