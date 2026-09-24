@@ -54,6 +54,7 @@ fn record(id: &str, published: bool, doi: Option<&str>) -> InvenioRecord {
         revision_id: 3,
         doi: doi.map(str::to_string),
         html_url: None,
+        concept_doi: None,
     }
 }
 

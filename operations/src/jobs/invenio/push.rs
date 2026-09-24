@@ -3,23 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_blob::invenio::InvenioError;
-use aruna_core::invenio::{
-    InvenioDestination, InvenioRecord, LinkFailure, LinkTarget, PushOutcome, validate_id,
-};
+use aruna_core::invenio::{InvenioDestination, LinkFailure, LinkTarget, PushOutcome, validate_id};
 use aruna_core::structs::execution::job::{
     ExportRoCrateSpec, JobError, JobErrorKind, JobResultPayload,
 };
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
 use http::Method;
 
 use super::links::{LinkChange, LinkError, change_link, read_link, read_secret};
 use super::{TransferError, connect};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::export::{ExportCheckpoint, persist_checkpoint, read_export_checkpoint};
-use crate::metadata::AuthToken;
-use crate::metadata::api::MetadataApiError;
-use crate::metadata::persistent_id::forward::add_identifiers_routed;
 
 /// The destination with the link's token, after the link confirmed this job and lineage.
 pub(super) async fn prepare(
@@ -148,9 +142,6 @@ pub(crate) async fn settle(
             else {
                 return outcome;
             };
-            if let Err(error) = register(ctx, spec, &link.endpoint, &record).await {
-                return retry(error);
-            }
             PushOutcome::Pushed {
                 record,
                 event_id,
@@ -180,46 +171,6 @@ pub(crate) async fn settle(
         // A cancelled job cannot retry; the queue drain settles its link later.
         Err(_) if matches!(outcome, JobRunOutcome::Cancelled) => outcome,
         Err(error) => retry(format!("recording the link push failed: {error}")),
-    }
-}
-
-/// Registers the record's DOI, id and parent id as secondary identifiers of the dataset.
-async fn register(
-    ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
-    endpoint: &str,
-    record: &InvenioRecord,
-) -> Result<(), String> {
-    let identifiers = [
-        (SecondaryIdKind::Doi, record.doi.as_deref()),
-        (SecondaryIdKind::InvenioRecord, Some(record.id.as_str())),
-        (
-            SecondaryIdKind::InvenioParent,
-            Some(record.parent_id.as_str()),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(kind, value)| SecondaryIdentifier::new(kind, value?, Some(endpoint)).ok())
-    .collect();
-    let result = add_identifiers_routed(
-        &ctx.driver,
-        spec.auth_context.realm_id,
-        spec.document_id,
-        identifiers,
-        aruna_core::time::unix_timestamp_millis(),
-        Some(AuthToken::internal(spec.auth_context.clone())),
-    )
-    .await;
-    match result {
-        Ok(_) => Ok(()),
-        // The pushed record stays valid without the lookup entries.
-        Err(error @ (MetadataApiError::Forbidden | MetadataApiError::Unauthorized)) => {
-            tracing::warn!(document_id = %spec.document_id, %error, "push identifiers refused");
-            Ok(())
-        }
-        Err(error) => Err(format!(
-            "registering repository identifiers failed: {error}"
-        )),
     }
 }
 

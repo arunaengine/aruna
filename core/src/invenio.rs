@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
+use crate::structs::secondary_id::{
+    IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier, normalize_doi,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -82,11 +84,93 @@ pub struct InvenioRecord {
     pub doi: Option<String>,
     /// The repository's page for people, when it names one on its own origin.
     pub html_url: Option<String>,
+    /// DOI of the record's parent, which names every version.
+    pub concept_doi: Option<String>,
+}
+
+impl InvenioRecord {
+    /// The version DOI, concept DOI, record id and parent id as secondary identifiers.
+    pub fn identifiers(
+        &self,
+        endpoint: &str,
+        origin: IdentifierOrigin,
+    ) -> Vec<SecondaryIdentifier> {
+        build_identifiers(
+            endpoint,
+            origin,
+            [
+                self.doi.as_deref(),
+                self.concept_doi.as_deref(),
+                Some(self.id.as_str()),
+                Some(self.parent_id.as_str()),
+            ],
+        )
+    }
 }
 
 #[derive(Debug, Error)]
 #[error("invalid Invenio record: {0}")]
 pub struct InvenioError(pub &'static str);
+
+/// The dataset's own identifiers, read when an export starts. Exports add them to what they
+/// send, so the document itself is never edited and a push never causes another push.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExportIdentity {
+    /// The dataset's active w3id PID; Invenio exports relate it as `isidenticalto`.
+    pub own: Vec<String>,
+    /// Registered repository identifiers of the dataset.
+    pub identifiers: Vec<SecondaryIdentifier>,
+}
+
+impl ExportIdentity {
+    fn published_doi(&self, doi: &str) -> bool {
+        normalize_doi(doi).is_ok_and(|doi| {
+            self.identifiers.iter().any(|known| {
+                known.kind == SecondaryIdKind::Doi
+                    && known.origin == IdentifierOrigin::Published
+                    && known.value == doi
+            })
+        })
+    }
+}
+
+/// Adds the registered DOIs to the crate root `identifier`, skipping DOIs it already names.
+pub fn add_root_identifiers(document: &mut Value, identity: &ExportIdentity) {
+    let Some(id) = crate_root(document).and_then(|root| root["@id"].as_str().map(str::to_string))
+    else {
+        return;
+    };
+    let Some(root) = document["@graph"]
+        .as_array_mut()
+        .and_then(|graph| graph.iter_mut().find(|entity| entity["@id"] == id.as_str()))
+    else {
+        return;
+    };
+    let key = [
+        "identifier",
+        "schema:identifier",
+        "http://schema.org/identifier",
+    ]
+    .into_iter()
+    .find(|key| root.get(*key).is_some())
+    .unwrap_or("identifier");
+    let mut current = values(&root[key]).to_vec();
+    let known = current
+        .iter()
+        .filter_map(identifier)
+        .filter(|id| id["scheme"] == "doi")
+        .filter_map(|id| normalize_doi(id["identifier"].as_str()?).ok())
+        .collect::<Vec<_>>();
+    for doi in &identity.identifiers {
+        if doi.kind == SecondaryIdKind::Doi && !known.contains(&doi.value) {
+            current.push(json!({
+                "@type": "PropertyValue", "propertyID": "doi",
+                "value": format!("https://doi.org/{}", doi.value)
+            }));
+        }
+    }
+    root[key] = Value::Array(current);
+}
 
 pub fn validate_id(id: &str) -> Result<(), InvenioError> {
     if id.is_empty()
@@ -287,27 +371,57 @@ pub fn import_crate(
     Ok(json!({"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": graph}))
 }
 
-/// The record's DOI, id and parent id as secondary identifiers of an imported crate.
+/// The record's version DOI, concept DOI, id and parent id as secondary identifiers.
 /// Values the repository does not provide or that fail validation are left out.
-pub fn record_identifiers(endpoint: &str, record: &Value) -> Vec<SecondaryIdentifier> {
+pub fn record_identifiers(
+    endpoint: &str,
+    record: &Value,
+    origin: IdentifierOrigin,
+) -> Vec<SecondaryIdentifier> {
     let doi = record["pids"]["doi"]["identifier"]
         .as_str()
         .or_else(|| record["doi"].as_str());
-    [
-        (SecondaryIdKind::Doi, doi),
-        (SecondaryIdKind::InvenioRecord, record["id"].as_str()),
-        (
-            SecondaryIdKind::InvenioParent,
+    build_identifiers(
+        endpoint,
+        origin,
+        [
+            doi,
+            record["parent"]["pids"]["doi"]["identifier"].as_str(),
+            record["id"].as_str(),
             record["parent"]["id"].as_str(),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(kind, value)| SecondaryIdentifier::new(kind, value?, Some(endpoint)).ok())
-    .collect()
+        ],
+    )
+}
+
+/// Takes the version DOI, concept DOI, record id and parent id in this order.
+fn build_identifiers(
+    endpoint: &str,
+    origin: IdentifierOrigin,
+    values: [Option<&str>; 4],
+) -> Vec<SecondaryIdentifier> {
+    let kinds = [
+        SecondaryIdKind::Doi,
+        SecondaryIdKind::Doi,
+        SecondaryIdKind::InvenioRecord,
+        SecondaryIdKind::InvenioParent,
+    ];
+    kinds
+        .into_iter()
+        .zip(values)
+        .filter_map(|(kind, value)| {
+            SecondaryIdentifier::new(kind, value?, Some(endpoint), origin).ok()
+        })
+        .collect()
 }
 
 /// Supplied native fields override mapped crate fields; missing mandatory fields fail closed.
-pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, InvenioError> {
+/// Root identifiers become `isderivedfrom`, the dataset's own PID `isidenticalto`, and DOIs
+/// this dataset published are left out.
+pub fn export_metadata(
+    document: &Value,
+    overrides: &Value,
+    identity: &ExportIdentity,
+) -> Result<Value, InvenioError> {
     let mut metadata = json!({"resource_type": {"id": "dataset"}, "rights": []});
     let graph = document["@graph"]
         .as_array()
@@ -391,14 +505,36 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
         if !creators.is_empty() && creators.len() == expected_creators {
             metadata["creators"] = Value::Array(creators);
         }
-        let identifiers = values(schema_value(root, "identifier"))
+        let mut identifiers = values(schema_value(root, "identifier"))
             .iter()
             .filter_map(identifier)
+            .filter(|id| {
+                id["scheme"] != "doi"
+                    || !identity.published_doi(id["identifier"].as_str().unwrap_or_default())
+            })
             .map(|mut id| {
-                id["relation_type"] = json!({"id": "isderivedfrom"});
+                let own = identity
+                    .own
+                    .iter()
+                    .any(|own| id["identifier"] == own.as_str());
+                let relation = if own {
+                    "isidenticalto"
+                } else {
+                    "isderivedfrom"
+                };
+                id["relation_type"] = json!({"id": relation});
                 id
             })
             .collect::<Vec<_>>();
+        for own in &identity.own {
+            if !identifiers
+                .iter()
+                .any(|id| id["identifier"] == own.as_str())
+            {
+                identifiers.push(json!({"scheme": "url", "identifier": own,
+                    "relation_type": {"id": "isidenticalto"}}));
+            }
+        }
         if !identifiers.is_empty() {
             metadata["related_identifiers"] = Value::Array(identifiers);
         }
@@ -484,9 +620,15 @@ pub fn export_metadata(document: &Value, overrides: &Value) -> Result<Value, Inv
 }
 
 /// Returns native descriptive fields without copying source ownership, access settings or managed PIDs.
-pub fn export_fields(document: &Value, overrides: &Value) -> Result<Value, InvenioError> {
-    let mut result =
-        json!({"metadata": export_metadata(document, overrides)?, "custom_fields": {}});
+pub fn export_fields(
+    document: &Value,
+    overrides: &Value,
+    identity: &ExportIdentity,
+) -> Result<Value, InvenioError> {
+    let mut result = json!({
+        "metadata": export_metadata(document, overrides, identity)?,
+        "custom_fields": {}
+    });
     if let Some(fields) = crate_root(document).and_then(|root| root[CUSTOM_FIELDS].as_str()) {
         let fields: Value =
             serde_json::from_str(fields).map_err(|_| InvenioError("invalid custom fields"))?;

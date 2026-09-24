@@ -311,6 +311,7 @@ fn finish_requeues_enabled() {
         revision_id: 2,
         doi: None,
         html_url: None,
+        concept_doi: None,
     };
     for (paused, requeue, queued) in [
         (false, true, true),

@@ -113,6 +113,8 @@ pub(crate) struct ExportCheckpoint {
     /// A link's resolved lineage base: the latest published version it continues.
     pub(crate) repository_base: Option<String>,
     pub(crate) link_failure: Option<aruna_core::invenio::LinkFailure>,
+    /// The dataset's identifiers when the snapshot was taken.
+    pub(crate) identity: aruna_core::invenio::ExportIdentity,
     refs: RoCrateCheckpointRefs,
     phase: ExportPhase,
     winning_event_id: Option<Ulid>,
@@ -135,6 +137,7 @@ impl Default for ExportCheckpoint {
             repository: None,
             repository_base: None,
             link_failure: None,
+            identity: Default::default(),
             refs: RoCrateCheckpointRefs::default(),
             phase: ExportPhase::Snapshot,
             winning_event_id: None,
@@ -494,18 +497,33 @@ async fn repository_export(
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
     use super::invenio::{TransferError, export};
-    if checkpoint.repository_complete {
-        return Ok(());
-    }
     let (_, omitted) = report_counts(&checkpoint.report);
-    if omitted.external + omitted.denied + omitted.missing + omitted.offline + omitted.unsupported
-        > 0
+    if !checkpoint.repository_complete
+        && omitted.external
+            + omitted.denied
+            + omitted.missing
+            + omitted.offline
+            + omitted.unsupported
+            > 0
     {
         return Err(ExportFailure::Permanent(
             "repository export requires a complete crate with no omitted files".into(),
         ));
     }
-    match export::repository_export(ctx, spec, destination, checkpoint).await {
+    let exported = if checkpoint.repository_complete {
+        Ok(())
+    } else {
+        export::repository_export(ctx, spec, destination, checkpoint).await
+    };
+    // Queued on every run of this phase, so a failed queue is retried; the dedup key joins.
+    let result = match exported {
+        Ok(()) => match checkpoint.repository.as_ref() {
+            Some(record) => export::register_published(ctx, spec, destination, record).await,
+            None => Ok(()),
+        },
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => Ok(()),
         Err(TransferError::Permanent(message)) => Err(ExportFailure::Permanent(message)),
         Err(TransferError::Retryable(message)) => Err(ExportFailure::Retryable(message)),
@@ -522,6 +540,31 @@ async fn repository_export(
             Err(ExportFailure::Permanent(message))
         }
     }
+}
+
+/// Reads the dataset's PID and live identifiers from its PID authority.
+async fn export_identity(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+) -> Result<aruna_core::invenio::ExportIdentity, ExportFailure> {
+    let mapping = crate::metadata::persistent_id::forward::read_pid_routed(
+        &ctx.driver,
+        spec.auth_context.realm_id,
+        spec.document_id,
+    )
+    .await
+    .map_err(|error| ExportFailure::Retryable(format!("reading identifiers failed: {error}")))?;
+    let Some(mapping) = mapping.filter(|mapping| !mapping.is_retired()) else {
+        return Ok(Default::default());
+    };
+    Ok(aruna_core::invenio::ExportIdentity {
+        own: mapping
+            .is_active()
+            .then(|| mapping.pid.clone())
+            .into_iter()
+            .collect(),
+        identifiers: mapping.secondary_identifiers.into_iter().collect(),
+    })
 }
 
 async fn snapshot_export(
@@ -583,9 +626,19 @@ async fn snapshot_export(
         )));
     }
 
+    let identity = export_identity(ctx, spec).await?;
+    let jsonld = if identity.identifiers.is_empty() {
+        jsonld
+    } else {
+        let mut document = document;
+        aruna_core::invenio::add_root_identifiers(&mut document, &identity);
+        document.to_string()
+    };
+
     checkpoint.winning_event_id = Some(winning_event_id);
     checkpoint.context_digest = Some(context_digest);
     checkpoint.dataset_digest = Some(canonical.digest);
+    checkpoint.identity = identity;
     checkpoint.raw_jsonld = Some(jsonld);
     checkpoint.entities = entities;
     checkpoint.phase = ExportPhase::Resolve;

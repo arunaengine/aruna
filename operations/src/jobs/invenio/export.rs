@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex};
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::invenio::{
-    InvenioDestination, InvenioRecord, export_fields, record_id, validate_id,
+    ExportIdentity, InvenioDestination, InvenioRecord, export_fields, record_id, validate_id,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
 use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::secondary_id::{IdentifierOrigin, RegisterIdentifiersSpec};
 use futures_util::StreamExt;
 use http::Method;
 use serde_json::{Value, json};
@@ -51,14 +52,15 @@ pub(crate) async fn repository_export(
             .raw_jsonld
             .clone()
             .ok_or_else(|| TransferError::Permanent("source crate metadata missing".into()))?;
+        let identity = checkpoint.identity.clone();
         let fence = async || {
             checkpoint.repository_started = true;
             persist_checkpoint(ctx, checkpoint)
                 .await
                 .map_err(TransferError::Retryable)
         };
-        let record =
-            interruptible(ctx, create_draft(ctx, spec, destination, &jsonld, fence)).await?;
+        let draft = create_draft(ctx, spec, destination, &jsonld, &identity, fence);
+        let record = interruptible(ctx, draft).await?;
         checkpoint.repository = Some(record);
         persist_checkpoint(ctx, checkpoint)
             .await
@@ -73,8 +75,12 @@ pub(crate) async fn repository_export(
             .raw_jsonld
             .as_deref()
             .ok_or_else(|| TransferError::Permanent("source crate metadata missing".into()))?;
-        let (record, digest) =
-            interruptible(ctx, prepare_draft(ctx, spec, destination, record, jsonld)).await?;
+        let identity = &checkpoint.identity;
+        let (record, digest) = interruptible(
+            ctx,
+            prepare_draft(ctx, spec, destination, record, jsonld, identity),
+        )
+        .await?;
         checkpoint.repository = Some(record);
         checkpoint.repository_metadata = Some(digest);
         persist_checkpoint(ctx, checkpoint)
@@ -110,11 +116,41 @@ pub(crate) async fn repository_export(
         .map_err(TransferError::Retryable)
 }
 
+/// Queues the record's DOIs and ids as `Published` identifiers of the exported dataset.
+/// The dedup key names this job, so a rerun of the publish phase joins the queued job.
+pub(crate) async fn register_published(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &InvenioDestination,
+    record: &InvenioRecord,
+) -> Result<(), TransferError> {
+    let view =
+        super::repository(&ctx.driver, destination.group_id, destination.connector_id).await?;
+    let identifiers = record.identifiers(&view.connector.endpoint, IdentifierOrigin::Published);
+    if identifiers.is_empty() {
+        return Ok(());
+    }
+    crate::jobs::service::submit_identifiers(
+        &ctx.driver,
+        RegisterIdentifiersSpec {
+            document_id: spec.document_id,
+            identifiers,
+            auth_context: spec.auth_context.clone(),
+        },
+        ctx.owner_node_id,
+        ctx.job_id,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| TransferError::Retryable(format!("queueing identifiers failed: {error}")))
+}
+
 pub(crate) async fn create_draft(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     destination: &InvenioDestination,
     jsonld: &str,
+    identity: &ExportIdentity,
     fence: impl AsyncFnOnce() -> Result<(), TransferError>,
 ) -> Result<InvenioRecord, TransferError> {
     let credential = destination
@@ -138,7 +174,7 @@ pub(crate) async fn create_draft(
         .map_err(|_| invalid("invalid repository metadata"))?;
     let document: Value =
         serde_json::from_str(jsonld).map_err(|_| invalid("invalid source crate"))?;
-    let mut fields = export_fields(&document, &overrides)?;
+    let mut fields = export_fields(&document, &overrides, identity)?;
     if fields.to_string().len() as u64 > spec.limits.metadata_bytes {
         return Err(invalid("mapped repository metadata exceeds limit"));
     }
@@ -210,6 +246,9 @@ pub(crate) async fn create_draft(
             .as_str()
             .map(str::to_string),
         html_url: None,
+        concept_doi: record["parent"]["pids"]["doi"]["identifier"]
+            .as_str()
+            .map(str::to_string),
     })
 }
 
@@ -219,6 +258,7 @@ pub(crate) async fn prepare_draft(
     destination: &InvenioDestination,
     record: &InvenioRecord,
     jsonld: &str,
+    identity: &ExportIdentity,
 ) -> Result<(InvenioRecord, [u8; 32]), TransferError> {
     let credential = destination
         .credential
@@ -238,7 +278,7 @@ pub(crate) async fn prepare_draft(
         serde_json::from_str(jsonld).map_err(|_| invalid("invalid crate metadata"))?;
     let overrides: Value = serde_json::from_str(&destination.metadata_json)
         .map_err(|_| invalid("invalid metadata overrides"))?;
-    let mut fields = export_fields(&document, &overrides)?;
+    let mut fields = export_fields(&document, &overrides, identity)?;
     fields["files"] = json!({"enabled": true});
     let url = client.url(&["records", &record.id, "draft"])?;
     let current = client.json(Method::GET, url.clone(), None).await?;
@@ -585,6 +625,9 @@ async fn finish(
             .as_str()
             .map(str::to_string),
         html_url: page_url(client, &current),
+        concept_doi: current["parent"]["pids"]["doi"]["identifier"]
+            .as_str()
+            .map(str::to_string),
     })
 }
 

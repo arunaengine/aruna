@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::structs::secondary_id::IdentifierOrigin::{self, Imported};
+use crate::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
 
 #[test]
 fn binds_repository_login() {
@@ -183,7 +185,7 @@ fn preserves_date_precision() {
         assert_eq!(root["datePublished"], start);
         assert_eq!(root[PUBLICATION_DATE], date);
         assert_eq!(
-            export_metadata(&document, &Value::Null).unwrap()["publication_date"],
+            export_metadata(&document, &Value::Null, &ExportIdentity::default()).unwrap()["publication_date"],
             date
         );
     }
@@ -231,7 +233,12 @@ fn derives_export_metadata() {
         {"@id": "#author", "@type": "Person", "name": "Researcher, A", "familyName": "Researcher",
             "givenName": "A", "identifier": {"@type": "PropertyValue", "propertyID": "orcid", "value": "0000-0002-1825-0097"}}
     ]});
-    let metadata = export_metadata(&document, &json!({"title": "Chosen title"})).unwrap();
+    let metadata = export_metadata(
+        &document,
+        &json!({"title": "Chosen title"}),
+        &ExportIdentity::default(),
+    )
+    .unwrap();
     assert_eq!(metadata["title"], "Chosen title");
     assert_eq!(metadata["description"], "Source description");
     assert_eq!(metadata["publication_date"], "2024-01-01");
@@ -245,7 +252,46 @@ fn derives_export_metadata() {
     );
     assert_eq!(metadata["subjects"], json!([{"subject": "genomics"}]));
     assert_eq!(metadata["rights"][0]["link"], "https://example.org/license");
-    assert!(export_metadata(&json!({}), &json!({})).is_err());
+    assert!(export_metadata(&json!({}), &json!({}), &ExportIdentity::default()).is_err());
+}
+
+#[test]
+fn relates_registered_identifiers() {
+    let doi = |value, origin| SecondaryIdentifier::new(SecondaryIdKind::Doi, value, None, origin);
+    let identity = ExportIdentity {
+        own: vec!["https://w3id.org/aruna/01JMETADATA0123456789ABCDE".into()],
+        identifiers: vec![
+            doi("10.1/source", Imported).unwrap(),
+            doi("10.1/own-version", IdentifierOrigin::Published).unwrap(),
+            doi("10.1/own-concept", IdentifierOrigin::Published).unwrap(),
+        ],
+    };
+    let mut document = json!({"@graph": [
+        {"@id": "ro-crate-metadata.json", "about": {"@id": "./"}},
+        {"@id": "./", "name": "Title", "datePublished": "2024-01-01",
+            "creator": {"@type": "Person", "familyName": "Doe"},
+            "identifier": [{"@type": "PropertyValue", "propertyID": "doi", "value": "10.1/SOURCE"},
+                "https://w3id.org/aruna/01JMETADATA0123456789ABCDE"]}
+    ]});
+    add_root_identifiers(&mut document, &identity);
+    // The imported DOI was already named; the two published ones are added once.
+    assert_eq!(
+        document["@graph"][1]["identifier"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let related =
+        export_metadata(&document, &Value::Null, &identity).unwrap()["related_identifiers"].clone();
+    assert_eq!(
+        related,
+        json!([
+            {"scheme": "doi", "identifier": "10.1/SOURCE", "relation_type": {"id": "isderivedfrom"}},
+            {"scheme": "url", "identifier": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                "relation_type": {"id": "isidenticalto"}}
+        ])
+    );
 }
 
 #[test]
@@ -270,13 +316,18 @@ fn retains_native_fields() {
     let validated = craqle::validate_rocrate_jsonld(&document.to_string()).unwrap();
     assert!(validated.nquads.contains("metadata/funding/0/award/number"));
     assert!(validated.nquads.contains("12345"));
-    let exported = export_fields(&document, &Value::Null).unwrap();
+    let exported = export_fields(&document, &Value::Null, &ExportIdentity::default()).unwrap();
     let mut request = metadata.clone();
     normalize_metadata(&mut request, None);
     assert_eq!(exported["metadata"], request);
     assert_eq!(exported["custom_fields"], fields);
     assert_eq!(
-        export_fields(&document, &json!({"title": "Edited"})).unwrap()["metadata"]["title"],
+        export_fields(
+            &document,
+            &json!({"title": "Edited"}),
+            &ExportIdentity::default()
+        )
+        .unwrap()["metadata"]["title"],
         "Edited"
     );
 }
@@ -325,9 +376,11 @@ fn keeps_requested_fields() {
 
 #[test]
 fn record_identifiers_normalized() {
-    let record = json!({"id": "abc-12", "parent": {"id": "par-34"},
+    let record = json!({"id": "abc-12",
+        "parent": {"id": "par-34", "pids": {"doi": {"identifier": "10.5281/zenodo.11"}}},
         "pids": {"doi": {"identifier": "10.5281/Zenodo.12", "provider": "datacite"}}});
-    let identifiers = record_identifiers("https://zenodo.org/api/", &record);
+    let identifiers = record_identifiers("https://zenodo.org/api/", &record, Imported);
+    assert!(identifiers.iter().all(|id| id.origin == Imported));
     let values = identifiers
         .iter()
         .map(|id| (id.kind.as_str(), id.value.as_str(), id.endpoint.as_deref()))
@@ -336,12 +389,13 @@ fn record_identifiers_normalized() {
         values,
         vec![
             ("doi", "10.5281/zenodo.12", None),
+            ("doi", "10.5281/zenodo.11", None),
             ("invenio_record", "abc-12", Some("https://zenodo.org/api")),
             ("invenio_parent", "par-34", Some("https://zenodo.org/api")),
         ]
     );
     assert_eq!(
-        record_identifiers("https://zenodo.org/api/", &json!({"doi": "bad"})).len(),
+        record_identifiers("https://zenodo.org/api/", &json!({"doi": "bad"}), Imported).len(),
         0
     );
 }

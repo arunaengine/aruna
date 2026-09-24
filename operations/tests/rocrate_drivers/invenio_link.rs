@@ -8,7 +8,7 @@ use aruna_core::invenio::{
     InvenioLink, LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, link_key,
 };
 use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE};
-use aruna_core::structs::secondary_id::SecondaryIdKind;
+use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_operations::jobs::invenio::link_queue::drain_links;
 use aruna_operations::jobs::invenio::links::{ChangeLinkOperation, LinkChange, list_links};
 use aruna_operations::jobs::invenio::seal_link_token;
@@ -243,6 +243,33 @@ async fn replace_crate(
     Ok(())
 }
 
+/// Runs the identifier registration a job queued, as the job runtime would.
+/// Returns the caller the registration acts for.
+pub(super) async fn run_registration(
+    fixture: &Fixture,
+    for_job: JobId,
+    created_by: UserId,
+) -> Result<AuthContext, Box<dyn std::error::Error>> {
+    let storage = &fixture.context.storage_handle;
+    let key = format!("identifiers/{for_job}");
+    let (job_id, _) =
+        aruna_operations::jobs::store::find_dedup_plan(storage, created_by, key.as_bytes(), None)
+            .await?
+            .ok_or("no registration queued")?;
+    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+        .await?
+        .ok_or("registration job missing")?;
+    let JobPayload::RegisterIdentifiers(spec) = record.payload.clone() else {
+        return Err("queued job is not a registration".into());
+    };
+    let ctx = claim_context(fixture, job_id, record.payload).await?;
+    succeeded(
+        Box::pin(aruna_operations::jobs::persistent_id::run_register_identifiers(&ctx, &spec))
+            .await,
+    );
+    Ok(spec.auth_context)
+}
+
 pub(super) async fn drain(fixture: &Fixture) -> Result<(), Box<dyn std::error::Error>> {
     Box::pin(drain_links(&fixture.context)).await?;
     Ok(())
@@ -332,21 +359,42 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
         true,
     ))
     .await?;
+    let push_job = current(&fixture, &link)
+        .await
+        .0
+        .active_job
+        .ok_or("no push")?;
+    let pusher = aruna_operations::jobs::store::read_job_record(
+        &fixture.context.storage_handle,
+        push_job,
+        None,
+    )
+    .await?
+    .ok_or("push job missing")?
+    .created_by;
     succeeded(run_push(&fixture, &link).await?);
     let (published, _) = current(&fixture, &link).await;
     assert!(published.remote.published && published.remote.draft_id.is_none());
     assert_eq!(published.remote.record_id.as_deref(), Some("1"));
     assert_eq!(published.remote.doi.as_deref(), Some("10.1234/1"));
-    let found = aruna_operations::metadata::secondary_ids::lookup_identifier(
+    let auth = Box::pin(run_registration(&fixture, push_job, pusher)).await?;
+    let found = Box::pin(aruna_operations::metadata::secondary_ids::lookup_local(
         &fixture.context,
         fixture.actor.realm_id,
-        None,
+        Some(&auth),
         SecondaryIdKind::Doi,
         "10.1234/1",
         None,
-    )
-    .await;
-    assert!(found.is_ok());
+    ))
+    .await?;
+    assert_eq!(
+        found
+            .iter()
+            .map(|found| (found.document_id, found.origin))
+            .collect::<Vec<_>>(),
+        [(doc_id(1), IdentifierOrigin::Published)],
+        "the push queued its DOI as a published identifier"
+    );
 
     Box::pin(change(&fixture, "Third revision", false)).await?;
     due_now(&fixture, &link).await?;
