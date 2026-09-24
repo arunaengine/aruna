@@ -2,8 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::push::{PushRequest, encode};
 use aruna_blob::git::command;
-use aruna_core::git::LfsObject;
+use aruna_core::git::{LfsObject, RefUpdate, ZERO_OID};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -26,6 +27,7 @@ pub async fn validate() -> std::io::Result<()> {
     let mut revisions = BTreeSet::new();
     let mut main = None;
     let mut derived = Value::Null;
+    let mut updates = Vec::new();
     for update in input.lines() {
         let parts: Vec<_> = update.split_whitespace().collect();
         if parts.len() != 3
@@ -35,6 +37,11 @@ pub async fn validate() -> std::io::Result<()> {
         {
             return Err(invalid());
         }
+        updates.push(RefUpdate {
+            name: parts[2].to_string(),
+            old: parts[0].to_string(),
+            new: parts[1].to_string(),
+        });
         if parts[1].bytes().all(|byte| byte == b'0') {
             if parts[2] == "refs/heads/main" {
                 return Err(std::io::Error::other("the main branch cannot be deleted"));
@@ -168,6 +175,8 @@ pub async fn validate() -> std::io::Result<()> {
     }
     let url = std::env::var("ARUNA_GIT_LFS_URL").map_err(|_| invalid())?;
     let token = std::env::var("ARUNA_GIT_TOKEN").map_err(|_| invalid())?;
+    objects.sort_by(|left, right| left.oid.cmp(&right.oid));
+    objects.dedup();
     for chunk in objects.chunks(100) {
         let body = serde_json::to_vec(&json!({"operation": "upload", "objects": chunk}))
             .map_err(std::io::Error::other)?;
@@ -188,7 +197,85 @@ pub async fn validate() -> std::io::Result<()> {
     if arc && let Some((old, new)) = main {
         merge(directory, &old, &new, derived, &token).await?;
     }
-    Ok(())
+    publish(directory, updates, objects, &token).await
+}
+
+/// Files that the updates change, for LFS lock checks.
+async fn changed(directory: &Path, updates: &[RefUpdate]) -> std::io::Result<Vec<String>> {
+    let mut paths = BTreeSet::new();
+    for update in updates.iter().filter(|update| update.new != ZERO_OID) {
+        let listing = if update.old == ZERO_OID {
+            command(
+                directory,
+                &["ls-tree", "-r", "-z", "--name-only", &update.new],
+            )
+            .await?
+        } else {
+            let range = [update.old.as_str(), update.new.as_str()];
+            let arguments = [
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                range[0],
+                range[1],
+            ];
+            match command(directory, &arguments).await {
+                Ok(listing) => listing,
+                // Tags may name non-commit objects; they carry no file changes to check.
+                Err(_) => continue,
+            }
+        };
+        for path in listing
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            paths.insert(String::from_utf8(path.to_vec()).map_err(|_| invalid())?);
+            if paths.len() > 100_000 {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// Stores the pushed objects and publishes the ref updates as a replicated record. Git
+/// moves the refs only after this succeeds; a refusal, such as a lock, rejects the push.
+async fn publish(
+    directory: &Path,
+    updates: Vec<RefUpdate>,
+    objects: Vec<LfsObject>,
+    token: &str,
+) -> std::io::Result<()> {
+    let url = std::env::var("ARUNA_GIT_METADATA_URL").map_err(|_| invalid())?;
+    let paths = changed(directory, &updates).await?;
+    let include: Vec<String> = updates
+        .iter()
+        .filter(|update| update.new != ZERO_OID)
+        .map(|update| update.new.clone())
+        .collect();
+    let pack = if include.is_empty() {
+        bytes::Bytes::new()
+    } else {
+        let existing: Vec<String> = aruna_blob::repo::refs(directory)
+            .await?
+            .into_values()
+            .collect();
+        aruna_blob::repo::pack(directory, &include, &existing).await?
+    };
+    let request = PushRequest {
+        refs: updates,
+        lfs: objects.into_iter().map(|object| object.oid).collect(),
+        paths,
+    };
+    let body = encode(&request, &pack).map_err(std::io::Error::other)?;
+    aruna_blob::git::metadata_request(
+        &format!("{url}/git/push"),
+        token,
+        Some(("application/x-aruna-git-push", body)),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Merges ISA and `aruna-metadata.json` edits on main into the document before refs move.
@@ -232,7 +319,12 @@ async fn merge(
     };
     let rocrate: Value = serde_json::from_str(jsonld)?;
     let body = serde_json::to_vec(&json!({ "rocrate": rocrate }))?;
-    aruna_blob::git::metadata_request(&format!("{url}/rocrate"), token, Some(body)).await?;
+    aruna_blob::git::metadata_request(
+        &format!("{url}/rocrate"),
+        token,
+        Some(("application/json", body)),
+    )
+    .await?;
     Ok(())
 }
 
