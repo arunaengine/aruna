@@ -3,14 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::ConversionError;
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::invenio::{
-    InvenioLink, LINK_DEBOUNCE_MS, LinkFailure, LinkQueueEntry, LinkStatus, PushOutcome,
+    InvenioLink, LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
     link_prefix,
 };
 use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE};
@@ -19,13 +19,14 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::TransferError;
 use super::links::{
     ChangeLinkOperation, LinkChange, LinkError, change_link, id_key, read_link, schedule_drain,
 };
@@ -46,13 +47,13 @@ const QUEUE_PAGE: usize = 256;
 const ACTIVE_RETRY_MS: u64 = 30_000;
 const ERROR_RETRY_MS: u64 = 60_000;
 
-/// Push-check rows for the enabled links of changed documents that have none queued yet.
+/// Push-check rows for the enabled links of changed documents; each change moves the due time.
 /// A deleted document queues all its links, so the check removes them.
 pub(crate) async fn queue_rows(
     storage: &StorageHandle,
     documents: impl IntoIterator<Item = Ulid>,
 ) -> Result<Vec<(String, Key, Value)>, LinkError> {
-    let due_at_ms = unix_timestamp_millis().saturating_add(LINK_DEBOUNCE_MS);
+    let now_ms = unix_timestamp_millis();
     let mut candidates = Vec::new();
     for document_id in documents {
         let event = storage
@@ -97,26 +98,21 @@ pub(crate) async fn queue_rows(
     };
     let mut rows = Vec::new();
     for ((link_id, document_id), (_, existing)) in candidates.into_iter().zip(queued) {
-        if existing.is_none() {
-            rows.push(queue_row(link_id, document_id, due_at_ms)?);
-        }
+        let existing = existing.and_then(|bytes| postcard::from_bytes(&bytes).ok());
+        let entry = LinkQueueEntry::debounce(document_id, existing.as_ref(), now_ms);
+        rows.push(queue_row(link_id, &entry)?);
     }
     Ok(rows)
 }
 
 fn queue_row(
     link_id: Ulid,
-    document_id: Ulid,
-    due_at_ms: u64,
+    entry: &LinkQueueEntry,
 ) -> Result<(String, Key, Value), ConversionError> {
-    let entry = LinkQueueEntry {
-        document_id,
-        due_at_ms,
-    };
     Ok((
         LINK_QUEUE_KEYSPACE.to_string(),
         id_key(link_id),
-        ByteView::from(postcard::to_allocvec(&entry)?),
+        ByteView::from(postcard::to_allocvec(entry)?),
     ))
 }
 
@@ -165,7 +161,7 @@ pub async fn drain_links(context: &Arc<DriverContext>) -> Result<Option<Duration
                 continue;
             }
             let link_id = Ulid::from_bytes(link_id);
-            let retry_at = match check_link(context, link_id, &entry, now).await {
+            let retry_at = match check_link(context, link_id, &entry, &value, now).await {
                 Ok(retry_at) => retry_at,
                 Err(error) => {
                     warn!(%link_id, %error, "Invenio link push check failed");
@@ -173,8 +169,11 @@ pub async fn drain_links(context: &Arc<DriverContext>) -> Result<Option<Duration
                 }
             };
             if let Some(retry_at) = retry_at {
-                let row = queue_row(link_id, entry.document_id, retry_at)?;
-                write_row(storage, row).await?;
+                let entry = LinkQueueEntry {
+                    due_at_ms: retry_at,
+                    ..entry
+                };
+                write_row(storage, queue_row(link_id, &entry)?).await?;
                 next = min_due_at(next, retry_at);
             }
         }
@@ -191,13 +190,15 @@ async fn check_link(
     context: &Arc<DriverContext>,
     link_id: Ulid,
     entry: &LinkQueueEntry,
+    queued: &Value,
     now: u64,
 ) -> Result<Option<u64>, LinkError> {
     let storage = &context.storage_handle;
     let local = context.net_handle.as_ref().map(|net| net.node_id());
+    let drop_entry = async || drop_unchanged(storage, link_id, queued).await;
     let link = match read_link(storage, entry.document_id, link_id).await? {
         Some(link) if local.is_none_or(|n| n == link.owner_node) => link,
-        _ => return drop_entry(storage, link_id).await,
+        _ => return drop_entry().await,
     };
     // A deleted dataset takes its links and their sealed tokens along; remote records stay.
     if document_gone(storage, entry.document_id).await? {
@@ -205,10 +206,10 @@ async fn check_link(
         return Ok(None);
     }
     if link.status != LinkStatus::Enabled {
-        return drop_entry(storage, link_id).await;
+        return drop_entry().await;
     }
     if let Err(LinkError::NotHolder) = ensure_holder(context, &link).await {
-        return drop_entry(storage, link_id).await;
+        return drop_entry().await;
     }
     if let Some(job_id) = link.active_job {
         let record = read_job_record(storage, job_id, None)
@@ -221,16 +222,27 @@ async fn check_link(
             record => settle_stale(context, &link, job_id, record.as_ref()).await,
         };
     }
-    match push_revision(context, entry.document_id).await? {
-        Some((event_id, digest)) if link.changed(event_id, digest) => {
-            match start_push(context, &link, event_id, false).await {
-                Ok(_) => Ok(None),
-                // The check stays queued, so the link shows pending until a job slot frees up.
-                Err(LinkError::JobLimit(_)) => Ok(Some(now.saturating_add(ACTIVE_RETRY_MS))),
-                Err(error) => Err(error),
-            }
+    // A decided review stores the repository's answer, which queues another check.
+    if refresh_review(context, &link).await? != link {
+        return Ok(None);
+    }
+    let Some((event_id, digest)) = push_revision(context, entry.document_id).await? else {
+        return drop_entry().await;
+    };
+    let publish = match link.publish_due_ms() {
+        _ if link.changed(event_id, digest) => false,
+        Some(due) if due <= now => true,
+        Some(due) => return Ok(Some(due)),
+        None if link.remote.review == LinkReview::Pending => {
+            return Ok(Some(now.saturating_add(REVIEW_POLL_MS)));
         }
-        _ => drop_entry(storage, link_id).await,
+        None => return drop_entry().await,
+    };
+    match start_push(context, &link, event_id, publish).await {
+        Ok(_) => Ok(None),
+        // The check stays queued, so the link shows pending until a job slot frees up.
+        Err(LinkError::JobLimit(_)) => Ok(Some(now.saturating_add(ACTIVE_RETRY_MS))),
+        Err(error) => Err(error),
     }
 }
 
@@ -241,18 +253,27 @@ async fn settle_stale(
     job_id: JobId,
     record: Option<&JobRecord>,
 ) -> Result<Option<u64>, LinkError> {
-    let outcome = match record {
-        Some(record) if record.state == JobState::Failed => {
+    // A push that finished remotely but failed to record it still counts as pushed.
+    let checkpoint = crate::jobs::export::stored_checkpoint(&context.storage_handle, job_id)
+        .await
+        .map_err(LinkError::Unexpected)?;
+    let pushed = checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.pushed_outcome());
+    let outcome = match (pushed, record) {
+        (Some(pushed), _) => pushed,
+        (None, Some(record)) if record.state == JobState::Failed => {
             let message = record
                 .last_error
                 .as_ref()
-                .map(|error| error.message.clone());
-            PushOutcome::Failed(LinkFailure::Other(
-                message.unwrap_or_else(|| "push job failed".into()),
-            ))
+                .map_or("push job failed", |error| error.message.as_str());
+            PushOutcome::Failed(match &checkpoint {
+                Some(checkpoint) => checkpoint.push_failure(message),
+                None => LinkFailure::Other(message.to_string()),
+            })
         }
-        Some(_) => PushOutcome::Cancelled,
-        None => PushOutcome::Failed(LinkFailure::Other("push job missing".into())),
+        (None, Some(_)) => PushOutcome::Cancelled,
+        (None, None) => PushOutcome::Failed(LinkFailure::Other("push job missing".into())),
     };
     let cancelled = record.is_some_and(|record| record.state == JobState::Cancelled);
     let change = LinkChange::Finish {
@@ -263,9 +284,30 @@ async fn settle_stale(
     change_link(context, link, change).await?;
     // A cancelled push skips its change; the next change queues a new check.
     if cancelled {
-        return drop_entry(&context.storage_handle, link.link_id).await;
+        delete_entry(&context.storage_handle, id_key(link.link_id)).await?;
+        return Ok(None);
     }
     Ok(Some(unix_timestamp_millis()))
+}
+
+/// Asks the repository about a pending review and stores a decided one; returns the link as
+/// stored afterwards. A refused request fails the link.
+pub async fn refresh_review(
+    context: &DriverContext,
+    link: &InvenioLink,
+) -> Result<InvenioLink, LinkError> {
+    if link.remote.review != LinkReview::Pending {
+        return Ok(link.clone());
+    }
+    let change = match super::push::review_state(context, link).await {
+        Ok(Some(state)) => LinkChange::Accept(Box::new(state)),
+        Ok(None) => return Ok(link.clone()),
+        Err(TransferError::Refused(reason)) => LinkChange::Fail(reason),
+        Err(error) => return Err(LinkError::Unexpected(error.to_string())),
+    };
+    change_link(context, link, change)
+        .await?
+        .ok_or(LinkError::NotFound)
 }
 
 /// Submits the push job as the link's creator and records it as the running push.
@@ -322,7 +364,7 @@ async fn ensure_holder(context: &DriverContext, link: &InvenioLink) -> Result<()
     }
     let change = LinkChange::Fail(LinkFailure::OwnerNotHolder);
     drive(
-        ChangeLinkOperation::new(link.document_id, link.link_id, change),
+        ChangeLinkOperation::new(link.document_id, link.link_id, change, SystemTime::now()),
         context,
     )
     .await?;
@@ -365,9 +407,75 @@ async fn document_gone(storage: &StorageHandle, document_id: Ulid) -> Result<boo
         .map_err(|error| LinkError::Unexpected(format!("{error:?}")))
 }
 
-async fn drop_entry(storage: &StorageHandle, link_id: Ulid) -> Result<Option<u64>, LinkError> {
-    delete_entry(storage, id_key(link_id)).await?;
-    Ok(None)
+/// Deletes the queued check unless a change rewrote it since `queued` was read.
+async fn drop_unchanged(
+    storage: &StorageHandle,
+    link_id: Ulid,
+    queued: &Value,
+) -> Result<Option<u64>, LinkError> {
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+    };
+    let result = drop_in(storage, link_id, queued, txn_id).await;
+    if result.is_err() {
+        storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+    }
+    match result {
+        // A conflicting write queued a newer change; its check runs later.
+        Err(LinkError::Storage(StorageError::TransactionConflict)) => Ok(None),
+        result => result.map(|_| None),
+    }
+}
+
+async fn drop_in(
+    storage: &StorageHandle,
+    link_id: Ulid,
+    queued: &Value,
+    txn_id: TxnId,
+) -> Result<(), LinkError> {
+    let current = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: LINK_QUEUE_KEYSPACE.to_string(),
+            key: id_key(link_id),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+    };
+    let effect = if current.as_ref() == Some(queued) {
+        StorageEffect::Delete {
+            key_space: LINK_QUEUE_KEYSPACE.to_string(),
+            key: id_key(link_id),
+            txn_id: Some(txn_id),
+        }
+    } else {
+        StorageEffect::AbortTransaction { txn_id }
+    };
+    let aborting = matches!(effect, StorageEffect::AbortTransaction { .. });
+    match storage.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::TransactionAborted { .. }) if aborting => return Ok(()),
+        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+    }
 }
 
 async fn delete_entry(storage: &StorageHandle, key: Key) -> Result<(), LinkError> {
