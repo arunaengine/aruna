@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from arctrl import ARC, CompositeCell, CompositeHeader, OntologyAnnotation, Person
+from arctrl import ARC, ArcStudy, CompositeCell, CompositeHeader, OntologyAnnotation, Person
 from openpyxl import load_workbook
 from schema_salad.exceptions import ValidationException
 from arc import scaffold
@@ -252,6 +252,87 @@ class MappingTests(unittest.TestCase):
                 with patch("requests.sessions.Session.request", side_effect=AssertionError("network access forbidden")):
                     with self.subTest(target=target), self.assertRaises((ValueError, ValidationException)):
                         conversion.cwl(root)
+
+    def edited(self, graph, change):
+        generated = conversion.convert({"mode": "generate", "document_id": "document-id", "jsonld": json.dumps(graph)})
+        base = conversion.convert({"mode": "inspect", "files": generated["files"]})["rocrate"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, content in generated["files"].items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_bytes(base64.b64decode(content))
+            arc = ARC.load(directory)
+            change(arc)
+            arc.Write(str(root / "edited"))
+            new = conversion.convert({"mode": "inspect", "files": files(root / "edited")})["rocrate"]
+        return base, new
+
+    def test_git_edits(self):
+        graph = source()
+        graph["@graph"][1].update({"creator": {"@id": "#person-ada"}, "keywords": "kept",
+                                   "hasPart": [{"@id": "data/raw.csv"}]})
+        graph["@graph"] += [{"@id": "#person-ada", "@type": "Person", "givenName": "Ada",
+                             "familyName": "Lovelace", "email": "ada@example.org"},
+                            {"@id": "data/raw.csv", "@type": "File", "name": "raw.csv"}]
+
+        def change(arc):
+            arc.Title = "Edited in ARCitect"
+            arc.Contacts[0].EMail = "ada@example.com"
+            study = ArcStudy.init("first")
+            study.Title = "First study"
+            arc.AddRegisteredStudy(study)
+
+        base, new = self.edited(graph, change)
+        merged = json.loads(conversion.convert({"mode": "merge", "graph": json.dumps(graph), "base": base, "new": new})["jsonld"])
+        entities = {item["@id"]: item for item in merged["@graph"]}
+        root = entities["urn:aruna:source"]
+        self.assertEqual(merged["@context"], graph["@context"])
+        self.assertEqual(root["name"], "Edited in ARCitect")
+        self.assertEqual(root["keywords"], "kept")
+        self.assertEqual(root["https://example.org/custom"], graph["@graph"][1]["https://example.org/custom"])
+        self.assertEqual(root["creator"], {"@id": "#person-ada"})
+        self.assertEqual(root["hasPart"], [{"@id": "data/raw.csv"}, {"@id": "studies/first/"}])
+        self.assertEqual(entities["#person-ada"]["email"], "ada@example.com")
+        self.assertEqual(entities["studies/first/"]["name"], "First study")
+        self.assertNotIn("./", entities)
+        self.assertEqual(entities["ro-crate-metadata.json"], graph["@graph"][0])
+        repeated = conversion.convert({"mode": "merge", "graph": json.dumps(merged), "base": new, "new": new})
+        self.assertIsNone(repeated["jsonld"])
+
+    def test_git_removals(self):
+        graph = source()
+        graph["@graph"][1]["creator"] = [{"@id": "#person-ada"}, {"@id": "#person-bob"}]
+        graph["@graph"] += [{"@id": "#person-ada", "@type": "Person", "givenName": "Ada", "familyName": "Lovelace"},
+                            {"@id": "#person-bob", "@type": "Person", "givenName": "Bob", "familyName": "Builder"}]
+
+        def change(arc):
+            arc.Contacts.pop(1)
+
+        base, new = self.edited(graph, change)
+        merged = json.loads(conversion.convert({"mode": "merge", "graph": json.dumps(graph), "base": base, "new": new})["jsonld"])
+        entities = {item["@id"]: item for item in merged["@graph"]}
+        self.assertNotIn("#person-bob", entities)
+        self.assertEqual(entities["urn:aruna:source"]["creator"], [{"@id": "#person-ada"}])
+        self.assertEqual(entities["#context"], graph["@graph"][2])
+
+    def test_metadata_edits(self):
+        graph = source()
+        edited = source()
+        edited["@graph"][1]["https://example.org/custom"] = "edited in Git"
+        edited["@graph"].append({"@id": "#new", "@type": "Thing", "name": "Added in Git"})
+        current = source()
+        current["@graph"][1]["name"] = "Concurrent graph edit"
+        base = conversion.convert({"mode": "inspect", "files": conversion.convert(
+            {"mode": "generate", "document_id": "document-id", "jsonld": json.dumps(graph)})["files"]})["rocrate"]
+        merged = json.loads(conversion.convert({"mode": "merge", "graph": json.dumps(current), "base": base, "new": base,
+                                                "json_base": json.dumps(graph), "json_new": json.dumps(edited)})["jsonld"])
+        entities = {item["@id"]: item for item in merged["@graph"]}
+        self.assertEqual(entities["urn:aruna:source"]["https://example.org/custom"], "edited in Git")
+        self.assertEqual(entities["urn:aruna:source"]["name"], "Concurrent graph edit")
+        self.assertEqual(entities["#new"]["name"], "Added in Git")
+        unchanged = conversion.convert({"mode": "merge", "graph": json.dumps(current), "base": base, "new": base,
+                                        "json_base": json.dumps(graph), "json_new": json.dumps(graph)})
+        self.assertIsNone(unchanged["jsonld"])
 
 
 if __name__ == "__main__":

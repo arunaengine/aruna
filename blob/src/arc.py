@@ -195,11 +195,13 @@ def inspect(root, require_data=True):
             if identifier not in assays or not (root / "assays" / identifier / "isa.assay.xlsx").is_file():
                 raise ValueError("registered ISA assay is missing")
     document = json.loads(arc.ToROCrateJsonString())
+    root_entity = next(item for item in document["@graph"] if item.get("@id") == "./")
+    # ARCtrl adds wall-clock export time, which cannot define a stable Git object.
+    root_entity.pop("sdDatePublished", None)
     if arc.License is not None:
         content = arc.License.Content.strip()
         url = urlsplit(content)
         if url.scheme in ("http", "https") and url.netloc and not any(char.isspace() for char in content):
-            root_entity = next(item for item in document["@graph"] if item.get("@id") == "./")
             root_entity["license"] = {"@id": content}
     if require_data and any(not (root / path).is_file() for path in data_paths(document)):
         raise ValueError("referenced ARC data is missing")
@@ -235,10 +237,6 @@ def generate(request, root):
         confined(contract.path)
     arc.Write(str(root))
     document = inspect(root, require_data=False)
-    for entity in document["@graph"]:
-        if entity.get("@id") == "./":
-            # ARCtrl adds wall-clock export time, which cannot define a stable Git object.
-            entity.pop("sdDatePublished", None)
     for workbook in root.rglob("*.xlsx"):
         canonical_workbook(workbook)
     (root / "ro-crate-metadata.json").write_text(json.dumps(document, indent=2) + "\n")
@@ -251,7 +249,129 @@ def generate(request, root):
             "required": data_paths(document)}
 
 
+def listed(value):
+    return [] if value is None else value if isinstance(value, list) else [value]
+
+
+def canon(value):
+    return json.dumps(value, sort_keys=True)
+
+
+def term(key):
+    for prefix in ("http://schema.org/", "https://schema.org/", "schema:"):
+        if key.startswith(prefix):
+            return key[len(prefix):]
+    return key
+
+
+def entities(document):
+    return {item["@id"]: item for item in (document or {}).get("@graph", [])
+            if isinstance(item, dict) and isinstance(item.get("@id"), str)}
+
+
+def properties(entity):
+    return {term(key): listed(value) for key, value in (entity or {}).items() if key != "@id"}
+
+
+def literals(entity):
+    return {(key, canon(value)) for key, values in properties(entity).items() if key != "@type"
+            for value in values if not (isinstance(value, dict) and "@id" in value)}
+
+
+def identities(graph, root, wanted):
+    """Maps ISA-derived ids to graph ids: same id, the root, or one best unique literal match."""
+    mapping, claimed = {"./": root}, {root}
+    for identifier, _ in wanted:
+        if identifier in graph:
+            mapping[identifier] = identifier
+            claimed.add(identifier)
+    candidates = {key: (set(map(str, listed(entity.get("@type")))), literals(entity))
+                  for key, entity in graph.items()}
+    for identifier, entity in wanted:
+        if identifier in mapping:
+            continue
+        types, values = set(map(str, listed(entity.get("@type")))), literals(entity)
+        scores = sorted(((len(values & known), key) for key, (kinds, known) in candidates.items()
+                         if key not in claimed and types & kinds), reverse=True)
+        if scores and scores[0][0] > 0 and (len(scores) == 1 or scores[1][0] < scores[0][0]):
+            mapping[identifier] = scores[0][1]
+            claimed.add(scores[0][1])
+        else:
+            mapping[identifier] = identifier
+    return mapping
+
+
+def apply(graph, root, base, new):
+    """Applies the values changed from base to new onto graph; other graph values stay."""
+    before, after = entities(base), entities(new)
+    changed = [identifier for identifier in sorted(set(before) | set(after))
+               if identifier != "ro-crate-metadata.json"
+               and properties(before.get(identifier)) != properties(after.get(identifier))]
+    referenced = {value["@id"] for identifier in changed
+                  for entity in (before.get(identifier), after.get(identifier))
+                  for values in properties(entity).values() for value in values
+                  if isinstance(value, dict) and isinstance(value.get("@id"), str)}
+    wanted = [(identifier, source[identifier]) for source in (before, after)
+              for identifier in sorted(set(changed) | referenced) if identifier in source]
+    mapping = identities(graph, root, wanted)
+
+    def local(value):
+        if isinstance(value, dict) and isinstance(value.get("@id"), str):
+            return {**value, "@id": mapping.get(value["@id"], value["@id"])}
+        return value
+
+    removed = set()
+    for identifier in changed:
+        target, current = mapping[identifier], after.get(identifier)
+        if current is None:
+            if target != root and graph.pop(target, None) is not None:
+                removed.add(target)
+            continue
+        entity = graph.setdefault(target, {"@id": target})
+        old, current = properties(before.get(identifier)), properties(current)
+        for name in sorted(set(old) | set(current)):
+            previous = {canon(local(value)) for value in old.get(name, [])}
+            values = [local(value) for value in current.get(name, [])]
+            if previous == {canon(value) for value in values}:
+                continue
+            key = next((key for key in entity if key != "@id" and term(key) == name), name)
+            kept = [value for value in listed(entity.get(key)) if canon(value) not in previous]
+            for value in values:
+                if canon(value) not in {canon(item) for item in kept}:
+                    kept.append(value)
+            if kept:
+                entity[key] = kept if len(kept) > 1 or isinstance(entity.get(key), list) else kept[0]
+            else:
+                entity.pop(key, None)
+    for entity in graph.values():
+        for key in [key for key in entity if key != "@id"]:
+            values = listed(entity[key])
+            kept = [value for value in values if not (isinstance(value, dict) and value.get("@id") in removed)]
+            if len(kept) != len(values):
+                if kept:
+                    entity[key] = kept if isinstance(entity[key], list) else kept[0]
+                else:
+                    del entity[key]
+
+
+def merge(request):
+    document = json.loads(request["graph"])
+    graph = entities(document)
+    about = graph.get("ro-crate-metadata.json", {}).get("about")
+    root = about.get("@id") if isinstance(about, dict) else about
+    if root not in graph:
+        raise ValueError("RO-Crate root Dataset is required")
+    before = canon(document)
+    if request.get("json_new") is not None and request.get("json_base") != request["json_new"]:
+        apply(graph, root, json.loads(request["json_base"] or "{}"), json.loads(request["json_new"]))
+    apply(graph, root, request.get("base"), request["new"])
+    document["@graph"] = list(graph.values())
+    return {"jsonld": None if canon(document) == before else json.dumps(document)}
+
+
 def convert(request):
+    if request["mode"] == "merge":
+        return merge(request)
     with tempfile.TemporaryDirectory(prefix="aruna-isa-") as directory:
         root = Path(directory)
         if request["mode"] == "generate":
