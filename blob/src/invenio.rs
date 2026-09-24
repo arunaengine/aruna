@@ -134,6 +134,7 @@ impl<'a> InvenioClient<'a> {
         url: Url,
         body: Option<&Value>,
     ) -> Result<Value, InvenioError> {
+        let get = method == Method::GET;
         let mut request = self
             .request(method, url)?
             .header("Accept", JSON_ACCEPT)
@@ -141,7 +142,28 @@ impl<'a> InvenioClient<'a> {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = request.send().await.map_err(|_| InvenioError::Transport)?;
+        let mut response = request.send().await.map_err(|_| InvenioError::Transport)?;
+        // A GET follows redirects that stay on the repository API, such as a parent to its latest.
+        let mut hops = 0;
+        while get && is_redirect(&response) {
+            hops += 1;
+            if hops > REDIRECT_HOPS {
+                return Err(InvenioError::Redirects);
+            }
+            let next = response
+                .headers()
+                .get("location")
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| response.url().join(location).ok())
+                .ok_or(InvenioError::InvalidUrl)?;
+            response = self
+                .request(Method::GET, self.link(next.as_str())?)?
+                .header("Accept", JSON_ACCEPT)
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await
+                .map_err(|_| InvenioError::Transport)?;
+        }
         self.read_json(response).await
     }
 
@@ -401,6 +423,10 @@ fn secure_transport(url: &Url) -> bool {
             .trim_end_matches(']')
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+fn is_redirect(response: &Response) -> bool {
+    matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
 }
 
 fn check_status(response: &Response) -> Result<(), InvenioError> {

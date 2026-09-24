@@ -179,3 +179,70 @@ async fn reference_gone_fails() {
         assert!(expected(&error), "{head}: {error}");
     }
 }
+
+/// Answers each GET by its request path.
+async fn routes(route: fn(&str) -> String) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/api/", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let text = String::from_utf8_lossy(&request);
+            let path = text.split(' ').nth(1).unwrap_or_default().to_string();
+            let _ = socket.write_all(route(&path).as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (endpoint, task)
+}
+
+#[tokio::test]
+async fn json_follows_redirects() {
+    let (endpoint, task) = routes(|path| match path {
+        "/api/records/parent" => answer(
+            "302 Found",
+            "Location: /api/records/latest\r\nContent-Length: 0\r\n",
+            "",
+        ),
+        "/api/records/latest" => answer("200 OK", "Content-Length: 13\r\n", r#"{"id":"late"}"#),
+        "/api/records/foreign" => answer(
+            "302 Found",
+            "Location: http://127.0.0.2:9/api/records/x\r\nContent-Length: 0\r\n",
+            "",
+        ),
+        "/api/records/html" => answer(
+            "301 Moved",
+            "Location: /records/latest\r\nContent-Length: 0\r\n",
+            "",
+        ),
+        _ => answer(
+            "302 Found",
+            "Location: /api/records/loop\r\nContent-Length: 0\r\n",
+            "",
+        ),
+    })
+    .await;
+    let guard = EgressGuard::new(EgressPolicy::loopback()).unwrap();
+    let client = InvenioClient::with_guard(&guard, &endpoint, Some("token".into()), 1024).unwrap();
+    let get = async |id: &str| {
+        client
+            .json(Method::GET, client.url(&["records", id]).unwrap(), None)
+            .await
+    };
+    assert_eq!(get("parent").await.unwrap()["id"], "late");
+    // Other origins and pages outside the API are refused, so the token never leaves it.
+    assert!(matches!(
+        get("foreign").await,
+        Err(InvenioError::InvalidUrl)
+    ));
+    assert!(matches!(get("html").await, Err(InvenioError::InvalidUrl)));
+    assert!(matches!(get("loop").await, Err(InvenioError::Redirects)));
+    task.abort();
+}
