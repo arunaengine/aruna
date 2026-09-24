@@ -371,6 +371,10 @@ pub(crate) mod tests {
             "/metadata/{document_id}/invenio/links/{link_id}/publish",
         ),
         (
+            "POST",
+            "/metadata/{document_id}/invenio/links/{link_id}/accept-remote",
+        ),
+        (
             "PUT",
             "/metadata/{document_id}/invenio/links/{link_id}/token",
         ),

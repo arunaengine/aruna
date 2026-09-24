@@ -45,6 +45,7 @@ async fn setup() -> Linked {
                         "about": {"@id": "./"}},
                     {"@id": "./", "@type": "Dataset", "name": "Linked",
                         "description": "Pushed to a repository", "datePublished": "2026-01-01",
+                        "creator": {"@type": "Person", "familyName": "Doe"},
                         "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}}
                 ]
             }),
@@ -89,12 +90,12 @@ fn request(linked: &Linked) -> CreateLinkRequest {
 }
 
 async fn create(linked: &Linked, auth: Option<AuthContext>) -> ServerResult<InvenioLinkResponse> {
-    create_link(
+    Box::pin(create_link(
         State(linked.test.state.clone()),
         Extension(auth),
         Path(linked.document_id.clone()),
         Json(request(linked)),
-    )
+    ))
     .await
     .map(|(status, Json(link))| {
         assert_eq!(status, StatusCode::CREATED);
@@ -333,6 +334,7 @@ async fn holder_copy_refuses() {
         created_at: now,
         updated_at: now,
         generation: 1,
+        warning: None,
     };
     let written = linked
         .test
@@ -375,4 +377,78 @@ async fn holder_copy_refuses() {
     }
     let pushed = push_link(state(), owner(), paths(&linked, shown)).await;
     assert!(matches!(pushed, Err(ServerError::Conflict(_))));
+}
+
+#[tokio::test]
+async fn missing_metadata_refused() {
+    let linked = setup().await;
+    let mut request = request(&linked);
+    request.metadata = Some(serde_json::json!({"creators": []}));
+    let refused = create_link(
+        State(linked.test.state.clone()),
+        Extension(Some(linked.test.auth.clone())),
+        Path(linked.document_id.clone()),
+        Json(request),
+    )
+    .await;
+    let Err(error) = refused else {
+        panic!("a link without creators was created");
+    };
+    assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+    let body = serde_json::to_value(error.response_body()).unwrap();
+    assert_eq!(body["missing"], serde_json::json!(["creators"]));
+}
+
+#[tokio::test]
+async fn admin_rights_limited() {
+    let linked = setup().await;
+    let state = || State(linked.test.state.clone());
+    let admin = || Extension(Some(linked.test.auth.clone()));
+    let link = create(&linked, Some(linked.test.auth.clone()))
+        .await
+        .unwrap();
+    // Another member created the link; the caller only administers the group.
+    let document_id = parse_document_id(&linked.document_id).unwrap();
+    let link_id = Ulid::from_string(&link.link_id).unwrap();
+    let context = linked.test.state.get_ctx();
+    let mut stored = aruna_operations::jobs::invenio::links::read_link(
+        &context.storage_handle,
+        document_id,
+        link_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    stored.created_by = stranger(&linked).user_id;
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: INVENIO_LINK_KEYSPACE.into(),
+            key: aruna_core::invenio::link_key(document_id, link_id).into(),
+            value: stored.to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    let settings = Json(PatchLinkRequest {
+        auto_publish: Some(true),
+        ..PatchLinkRequest::default()
+    });
+    let refused = patch_link(state(), admin(), paths(&linked, &link), settings).await;
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
+    let published = publish_link(state(), admin(), paths(&linked, &link)).await;
+    assert!(matches!(published, Err(ServerError::Forbidden)));
+    let pause = Json(PatchLinkRequest {
+        paused: Some(true),
+        ..PatchLinkRequest::default()
+    });
+    let Json(paused) = patch_link(state(), admin(), paths(&linked, &link), pause)
+        .await
+        .unwrap();
+    assert_eq!(paused.status, "paused");
+    assert_eq!(
+        delete_link(state(), admin(), paths(&linked, &link))
+            .await
+            .unwrap(),
+        StatusCode::NO_CONTENT
+    );
 }

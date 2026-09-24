@@ -4,11 +4,12 @@
 
 use std::sync::Arc;
 
-use aruna_core::invenio::{LinkPatch, LinkStatus};
+use aruna_core::invenio::{InvenioLink, LinkPatch, LinkStatus};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::jobs::invenio::link_queue::{current_event, start_push};
+use aruna_operations::jobs::invenio::link_queue::{current_event, refresh_review, start_push};
 use aruna_operations::jobs::invenio::links::LinkChange;
-use aruna_operations::jobs::invenio::seal_link_token;
+use aruna_operations::jobs::invenio::{TransferError, remote_state, seal_link_token};
+use aruna_operations::jobs::service::cancel_owned_job;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -28,6 +29,34 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(push_link))
         .routes(routes!(publish_link))
         .routes(routes!(rotate_token))
+        .routes(routes!(accept_remote))
+}
+
+/// Publishing and the push settings act for the creator's repository account, so only the
+/// creator may change them.
+fn ensure_creator(auth: &AuthContext, link: &InvenioLink) -> ServerResult<()> {
+    if link.created_by != auth.user_id {
+        return Err(ServerError::Forbidden);
+    }
+    Ok(())
+}
+
+/// Stops the link's running push; the job also stops by itself at its next remote write.
+async fn cancel_push(state: &ServerState, link: &InvenioLink) {
+    let Some(job_id) = link.active_job else {
+        return;
+    };
+    let runtime = state.jobs_runtime();
+    let context = state.get_ctx();
+    let cancelled = Box::pin(cancel_owned_job(
+        &context,
+        &runtime,
+        link.created_by,
+        job_id,
+    ));
+    if let Err(error) = cancelled.await {
+        tracing::warn!(%job_id, %error, "Cancelling the link push failed");
+    }
 }
 
 #[utoipa::path(
@@ -69,11 +98,11 @@ pub async fn get_link(
 
 **Authentication**
 
-Requires READ on the dataset and WRITE on the metadata path of the connector group, as the link creator or a group admin.
+Requires READ on the dataset and WRITE on the metadata path of the connector group. The link creator or a group admin may pause and resume; only the creator may change auto_publish, public_files or metadata.
 
 **Behavior**
 
-paused true stops pushing. paused false resumes a paused or failed link and pushes when the dataset differs from the last push. Omitted fields stay unchanged. File access applies to newly created records only.
+paused true stops pushing and cancels a running push. paused false resumes a paused or failed link and pushes when the dataset differs from the last push. Omitted fields stay unchanged. public_files applies to the open draft with the next push.
 
 **Errors**
 
@@ -87,7 +116,7 @@ A metadata value that is not an object returns 400."#,
         (status = 200, description = "The changed link", body = InvenioLinkResponse, example = json!(link_example())),
         (status = 400, description = "Invalid metadata overrides", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
+        (status = 403, description = "Not the creator or a group admin, or settings changed by someone else than the creator", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse),
         (status = 409, description = "The link is managed on its owner node", body = ErrorResponse)
     ), security(("bearer_auth" = []))
@@ -98,7 +127,13 @@ pub async fn patch_link(
     Path((document_id, link_id)): Path<(String, String)>,
     Json(request): Json<PatchLinkRequest>,
 ) -> ServerResult<Json<InvenioLinkResponse>> {
-    let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
+    let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
+    if request.auto_publish.is_some()
+        || request.public_files.is_some()
+        || request.metadata.is_some()
+    {
+        ensure_creator(&auth, &link)?;
+    }
     let metadata_json = match request.metadata {
         Some(value) => Some(metadata_json(&state, Some(value))?),
         None => None,
@@ -109,7 +144,11 @@ pub async fn patch_link(
         public_files: request.public_files,
         metadata_json,
     };
+    let pause = patch.paused == Some(true);
     change(&state, &link, LinkChange::Patch(patch)).await?;
+    if pause {
+        cancel_push(&state, &link).await;
+    }
     view(&state, link.document_id, link.link_id).await
 }
 
@@ -124,7 +163,7 @@ Requires READ on the dataset and WRITE on the metadata path of the connector gro
 
 **Behavior**
 
-Records and drafts in the repository stay. A push that is still running fails once it needs the removed token."#,
+Records and drafts in the repository stay. A running push is cancelled and stops before its next repository write."#,
     params(
         ("document_id" = String, Path, description = "Metadata document identifier"),
         ("link_id" = String, Path, description = "Link identifier")
@@ -144,6 +183,7 @@ pub async fn delete_link(
 ) -> ServerResult<StatusCode> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
     change(&state, &link, LinkChange::Delete).await?;
+    cancel_push(&state, &link).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -185,6 +225,9 @@ pub async fn push_link(
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
+    let link = refresh_review(state.get_ctx().as_ref(), &link)
+        .await
+        .map_err(link_error)?;
     if link.status == LinkStatus::Paused {
         return Err(ServerError::Conflict(
             "resume the link before pushing".into(),
@@ -210,11 +253,11 @@ pub async fn push_link(
 
 **Authentication**
 
-Requires READ on the dataset and WRITE on the metadata path of the connector group, as the link creator or a group admin. The job runs as the link creator.
+Requires READ on the dataset and WRITE on the metadata path of the connector group, as the link creator. The job runs as the link creator.
 
 **Behavior**
 
-Publishing is permanent in the repository and assigns its DOI. The next dataset change starts a new version draft in the same record lineage.
+Publishing is permanent in the repository and registers the reserved DOI. With a connector community the first version is submitted for review instead, and review shows pending until the community decides. The next dataset change starts a new version draft in the same record lineage.
 
 **Errors**
 
@@ -229,7 +272,7 @@ A link without an open draft, a running push, a creator at the active job limit 
             "status_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX"
         })),
         (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
+        (status = 403, description = "Not the link creator", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse),
         (status = 409, description = "No open draft, a push is running, job limit reached, or the link is managed on its owner node", body = ErrorResponse),
         (status = 503, description = "Job could not be started", body = ErrorResponse)
@@ -240,7 +283,11 @@ pub async fn publish_link(
     Extension(auth): Extension<Option<AuthContext>>,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
-    let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
+    let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
+    ensure_creator(&auth, &link)?;
+    let link = refresh_review(state.get_ctx().as_ref(), &link)
+        .await
+        .map_err(link_error)?;
     if link.remote.draft_id.is_none() {
         return Err(ServerError::Conflict(
             "the link has no open draft to publish".into(),
@@ -298,9 +345,7 @@ pub async fn rotate_token(
     Json(request): Json<RotateTokenRequest>,
 ) -> ServerResult<StatusCode> {
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
-    if link.created_by != auth.user_id {
-        return Err(ServerError::Forbidden);
-    }
+    ensure_creator(&auth, &link)?;
     let secret = seal_link_token(
         &state.get_ctx(),
         link.created_by,
@@ -318,4 +363,56 @@ pub async fn rotate_token(
     }
     change(&state, &link, LinkChange::Rotate(secret)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post, path = "/metadata/{document_id}/invenio/links/{link_id}/accept-remote", tag = "metadata/invenio",
+    summary = "Accept the repository's current state",
+    description = r#"Makes the repository's current draft and latest published version the link's new base.
+
+**Authentication**
+
+Requires READ on the dataset and WRITE on the metadata path of the connector group, as the link creator or a group admin. The repository is read with the creator's token.
+
+**Behavior**
+
+Use it after remote_changed: edits made in the repository become the base, a failed link is enabled again and the next dataset change pushes on top of them. Files in the open draft count as pushed, so later pushes may replace or remove them.
+
+**Errors**
+
+A running push returns 409. A rejected token returns 409 with reason token_rejected; an unreachable repository 503."#,
+    params(
+        ("document_id" = String, Path, description = "Metadata document identifier"),
+        ("link_id" = String, Path, description = "Link identifier")
+    ),
+    responses(
+        (status = 200, description = "The link with its new base", body = InvenioLinkResponse, example = json!(link_example())),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
+        (status = 404, description = "Dataset or link not found", body = ErrorResponse),
+        (status = 409, description = "A push is running, the token was rejected, or the link is managed on its owner node", body = ErrorResponse),
+        (status = 502, description = "The repository answered unexpectedly", body = ErrorResponse),
+        (status = 503, description = "The repository is unavailable", body = ErrorResponse)
+    ), security(("bearer_auth" = []))
+)]
+pub async fn accept_remote(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((document_id, link_id)): Path<(String, String)>,
+) -> ServerResult<Json<InvenioLinkResponse>> {
+    let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
+    if link.active_job.is_some() {
+        return Err(ServerError::Conflict(
+            "a push of this link is running; accept after it finished".into(),
+        ));
+    }
+    let remote = remote_state(state.get_ctx().as_ref(), &link)
+        .await
+        .map_err(|error| match error {
+            TransferError::Refused(_) => ServerError::Conflict(error.to_string()),
+            TransferError::Permanent(message) => ServerError::BadGatewayReason(message),
+            error => ServerError::ServiceUnavailableReason(error.to_string()),
+        })?;
+    change(&state, &link, LinkChange::Accept(Box::new(remote))).await?;
+    view(&state, link.document_id, link.link_id).await
 }

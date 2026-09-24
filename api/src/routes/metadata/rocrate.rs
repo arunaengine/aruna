@@ -338,6 +338,13 @@ pub async fn submit_rocrate_export(
             Permission::WRITE,
         )
         .await?;
+        Box::pin(crate::routes::invenio_links::check_mapping(
+            &state,
+            &auth,
+            document_id,
+            &destination.metadata_json,
+        ))
+        .await?;
         destination.credential = Some(
             aruna_operations::jobs::invenio::seal_credential(
                 &state.get_ctx(),

@@ -271,11 +271,13 @@ Requires READ on the crate, WRITE on the metadata path of the repository connect
 
 Creates a draft or uses draft_id for recovery. Set new_version to a published record ID to continue its version lineage. Native source metadata and custom fields survive import/export; repository.metadata overrides mapped fields. RO-Crate JSON remains a provenance file.
 
-Publication and public_files both default to false. Existing and new-version drafts retain repository access settings. Draft metadata updates use revision preconditions; files and metadata are verified before and after publication. Results include record ID, parent ID, DOI when assigned, URL and publication state.
+Publication and public_files both default to false; public_files also applies to existing drafts. New drafts reserve their DOI. With a connector community, publishing a first version submits it for review instead.
+
+Draft metadata updates use revision preconditions; files and metadata are verified before and after publication. Results include record ID, parent ID, DOI, concept DOI, URL, publication and review state, and a warning when a check failed after publication.
 
 **Limits**
 
-Every referenced file must be readable. Reference imports fetch their bytes when exported. Repository vocabularies and publication permissions apply. The upstream publish endpoint has no atomic revision precondition.
+Every referenced file must be readable; web data entities become references instead. A record holds at most 100 files. Reference imports fetch their bytes when exported. Repository vocabularies and publication permissions apply. The upstream publish endpoint has no atomic revision precondition.
 
 **Errors**
 
@@ -293,7 +295,7 @@ Incomplete files, conflicting revisions or rejected metadata fail the job. An am
             "report_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/report",
             "artifact_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/artifacts/rocrate"
         })),
-        (status = 400, description = "Missing personal repository token, invalid metadata or draft identifier", body = ErrorResponse),
+        (status = 400, description = "Missing personal repository token, invalid metadata or draft identifier, or missing required metadata listed in `missing`", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Crate or connector access denied", body = ErrorResponse),
         (status = 404, description = "Crate not found", body = ErrorResponse),

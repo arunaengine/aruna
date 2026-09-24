@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use aruna_core::invenio::{InvenioLink, LinkRemote, LinkStatus, validate_id};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::jobs::invenio::export::missing_metadata;
 use aruna_operations::jobs::invenio::link_queue::owner_holds;
 use aruna_operations::jobs::invenio::links::{
     LinkChange, LinkError, change_link, list_links, read_link,
@@ -98,9 +99,15 @@ pub struct LinkRemoteResponse {
     pub draft_id: Option<String>,
     /// The last version this link published.
     pub record_id: Option<String>,
+    /// The open draft's reserved DOI while doi_reserved is true, else the published DOI.
     pub doi: Option<String>,
+    pub doi_reserved: bool,
+    /// The DOI that names every version of the record.
+    pub concept_doi: Option<String>,
     pub record_url: Option<String>,
     pub published: bool,
+    /// Community review of the first version: none, pending, accepted or declined.
+    pub review: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -121,10 +128,13 @@ pub struct InvenioLinkResponse {
     pub created_by: String,
     /// enabled, paused or failed.
     pub status: String,
-    /// Failure reason such as remote_changed, token_rejected, source_unavailable or
-    /// owner_not_holder.
+    /// Failure reason such as remote_changed, token_rejected, source_unavailable,
+    /// too_many_files or owner_not_holder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A check that failed after the repository had already published the last push.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     pub auto_publish: bool,
     pub public_files: bool,
     /// A push is queued or running.
@@ -150,7 +160,10 @@ pub(super) fn link_example() -> serde_json::Value {
         "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
         "status": "enabled", "auto_publish": false, "public_files": false, "pending": false,
         "remote": {"parent_id": "abcde-12345", "draft_id": "fghij-67890", "record_id": null,
-            "doi": null, "record_url": "https://zenodo.org/uploads/fghij-67890", "published": false},
+            "doi": "10.5281/zenodo.123457", "doi_reserved": true,
+            "concept_doi": "10.5281/zenodo.123456",
+            "record_url": "https://zenodo.org/uploads/fghij-67890", "published": false,
+            "review": "none"},
         "last_push": {"event_id": "01ARZ3NDEKTSV4RRFFQ69G5FB0", "job_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
             "pushed_at": "2026-09-23T10:00:00+00:00"},
         "created_at": "2026-09-23T09:00:00+00:00", "updated_at": "2026-09-23T10:00:00+00:00"
@@ -176,6 +189,10 @@ pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioL
         doi,
         record_url,
         published,
+        concept_doi,
+        doi_reserved,
+        review,
+        ..
     } = link.remote;
     InvenioLinkResponse {
         link_id: link.link_id.to_string(),
@@ -187,6 +204,7 @@ pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioL
         created_by: link.created_by.to_string(),
         status: status.to_string(),
         reason,
+        warning: link.warning,
         auto_publish: link.auto_publish,
         public_files: link.public_files,
         pending: queued || link.active_job.is_some(),
@@ -195,8 +213,11 @@ pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioL
             draft_id,
             record_id,
             doi,
+            doi_reserved,
+            concept_doi,
             record_url,
             published,
+            review: review.name().to_string(),
         },
         last_push: link.last_push.map(|push| LastPushResponse {
             event_id: push.event_id.to_string(),
@@ -225,6 +246,33 @@ pub(super) fn link_error(error: LinkError) -> ServerError {
         | LinkError::Conversion(_)
         | LinkError::Unexpected(_) => ServerError::InternalError(error.to_string()),
     }
+}
+
+/// Answers 400 with the missing fields when the dataset cannot become a repository record.
+pub(crate) async fn check_mapping(
+    state: &ServerState,
+    auth: &AuthContext,
+    document_id: Ulid,
+    metadata_json: &str,
+) -> ServerResult<()> {
+    let missing = Box::pin(missing_metadata(
+        &state.get_ctx(),
+        auth,
+        document_id,
+        metadata_json,
+        state.rocrate_limits().metadata_bytes,
+    ))
+    .await
+    .map_err(|error| match error {
+        TransferError::Permanent(message) => ServerError::BadRequestReason(message),
+        _ => ServerError::ServiceUnavailableReason("the dataset crate is unavailable".into()),
+    })?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(ServerError::MissingMetadata(
+        missing.into_iter().map(str::to_string).collect(),
+    ))
 }
 
 pub(super) fn seal_error(error: TransferError) -> ServerError {
@@ -365,7 +413,11 @@ Requires READ on the dataset, WRITE on the metadata path of the repository conne
 
 **Behavior**
 
-The link starts with a push. Without parent_id the first push creates a record draft; with parent_id it starts a new version of that record lineage. Later changes update the open draft. Publishing happens through the publish route or, with auto_publish, after each push. After a publish the next change starts a new version.
+The link starts with a push. Without parent_id the first push creates a record draft and reserves its DOI; with parent_id it starts a new version of that record lineage.
+
+Changes push 10 s after the last change, at the latest 5 minutes after the first one, and update the open draft. Publishing happens through the publish route or, with auto_publish, once the draft has been quiet for 15 minutes.
+
+With a connector community the first version is submitted for review instead. After a publish the next change starts a new version.
 
 **Limits**
 
@@ -373,7 +425,7 @@ The node that creates a link owns it and must hold the dataset. Only that node c
 
 **Errors**
 
-Invalid input returns 400, denied access 403, an unknown dataset or connector 404 and a node that does not hold the dataset 409."#,
+Invalid input returns 400. A dataset whose mapped metadata lacks title, publication_date, resource_type or creators returns 400 with `missing` listing them. Denied access returns 403, an unknown dataset or connector 404 and a node that does not hold the dataset 409."#,
     params(("document_id" = String, Path, description = "Metadata document identifier")),
     request_body(content = CreateLinkRequest, example = json!({
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
@@ -381,7 +433,7 @@ Invalid input returns 400, denied access 403, an unknown dataset or connector 40
     })),
     responses(
         (status = 201, description = "Link created and first push queued", body = InvenioLinkResponse, example = json!(link_example())),
-        (status = 400, description = "Invalid token, metadata or identifier", body = ErrorResponse),
+        (status = 400, description = "Invalid token, metadata or identifier, or missing required metadata", body = ErrorResponse, example = json!({"error": "the dataset lacks required repository metadata", "code": "missing_metadata", "missing": ["creators"]})),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Dataset or connector access denied", body = ErrorResponse),
         (status = 404, description = "Dataset or connector not found", body = ErrorResponse),
@@ -403,6 +455,7 @@ pub async fn create_link(
         validate_id(parent).map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     }
     let metadata_json = metadata_json(&state, request.metadata)?;
+    Box::pin(check_mapping(&state, &auth, document_id, &metadata_json)).await?;
     let context = state.get_ctx();
     let holds = aruna_operations::forward::routing::origin_holds_document(
         &context,
@@ -459,6 +512,7 @@ pub async fn create_link(
         created_at: now,
         updated_at: now,
         generation: 0,
+        warning: None,
     };
     let change = LinkChange::Create {
         link: Box::new(link.clone()),
