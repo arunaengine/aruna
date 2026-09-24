@@ -287,7 +287,7 @@ pub async fn missing_metadata(
     metadata_json: &str,
     metadata_bytes: u64,
 ) -> Result<Vec<&'static str>, TransferError> {
-    let jsonld =
+    let (jsonld, _) =
         crate::jobs::export::crate_jsonld(context, auth, document_id, metadata_bytes).await?;
     let document: Value =
         serde_json::from_str(&jsonld).map_err(|_| invalid("invalid source crate"))?;

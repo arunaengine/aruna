@@ -578,16 +578,16 @@ async fn export_identity(
     })
 }
 
-/// The crate JSON-LD a repository export of the dataset would start from.
+/// The crate JSON-LD a repository export of the dataset would start from, with its revision.
 pub(crate) async fn crate_jsonld(
     context: &std::sync::Arc<DriverContext>,
     auth: &AuthContext,
     document_id: Ulid,
     metadata_bytes: u64,
-) -> Result<String, super::invenio::TransferError> {
+) -> Result<(String, Ulid), super::invenio::TransferError> {
     use super::invenio::TransferError;
     match read_crate(context, auth, document_id, metadata_bytes).await {
-        Ok((jsonld, _, _)) => Ok(jsonld),
+        Ok((jsonld, event_id, _)) => Ok((jsonld, event_id)),
         Err(ExportFailure::Permanent(message)) => Err(TransferError::Permanent(message)),
         Err(ExportFailure::Validation(_)) => Err(TransferError::Permanent(
             "the dataset crate is invalid".into(),

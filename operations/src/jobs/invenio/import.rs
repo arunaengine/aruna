@@ -10,22 +10,46 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::invenio::{
-    InvenioMode, InvenioOptions, file_path, import_crate, record_id, record_identifiers,
-    validate_id,
+    InvenioLink, InvenioMode, InvenioOptions, InvenioPull, InvenioRecord, LinkDirection,
+    LinkFailure, LinkPull, LinkRemote, LinkStatus, PULL_CHECK_MS, PushOutcome, crate_versions,
+    file_path, import_crate, pull_crate, record_id, record_identifiers, validate_id,
 };
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
+use aruna_core::structs::execution::job::{
+    ArtifactRef, ImportRoCrateSource, ImportRoCrateSpec, RoCrateLimits,
+};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
+use aruna_core::time::unix_timestamp_millis;
 use async_zip::{Compression, ZipEntryBuilder};
 use futures_util::io::AsyncWriteExt;
 use http::Method;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ulid::Ulid;
 
+use super::links::{LinkChange, LinkError, change_link, read_link};
 use super::{TransferError, connect, interruptible};
 use crate::blob::hidden::delete_hidden;
 use crate::jobs::executor::JobContext;
+
+/// What an import that keeps or updates a pull link carries to its cleanup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PullProgress {
+    /// The version the dataset holds after the import.
+    pub(super) record: InvenioRecord,
+    pub(super) endpoint: String,
+    /// The dataset revision an update merged into.
+    base: Option<Ulid>,
+    /// The dataset revision the import wrote.
+    pub(crate) revision: Option<Ulid>,
+}
+
+impl PullProgress {
+    pub(crate) fn base(&self) -> Option<Ulid> {
+        self.base
+    }
+}
 
 pub(crate) async fn acquire(
     ctx: &JobContext,
@@ -34,8 +58,12 @@ pub(crate) async fn acquire(
     connector_id: Ulid,
     selected: &str,
     options: &InvenioOptions,
-) -> Result<(ArtifactRef, Vec<SecondaryIdentifier>), TransferError> {
+    pull: Option<&InvenioPull>,
+) -> Result<(ArtifactRef, Vec<SecondaryIdentifier>, Option<PullProgress>), TransferError> {
     validate_id(selected)?;
+    if let Some(InvenioPull::Update { link_id }) = pull {
+        running(ctx, spec, *link_id).await?;
+    }
     let client = connect(
         &ctx.driver,
         &spec.auth_context,
@@ -48,13 +76,58 @@ pub(crate) async fn acquire(
     .await?;
     let (selected, records) =
         interruptible(ctx, history(&client, selected, &spec.limits, options)).await?;
-    let document = import_crate(client.endpoint(), &selected, &records)?;
-    let identifiers = records
+    let latest = records
         .iter()
-        .flat_map(|(record, _)| {
-            record_identifiers(client.endpoint(), record, IdentifierOrigin::Imported)
-        })
-        .collect();
+        .find(|(record, _)| record["id"] == selected.as_str())
+        .map(|(record, _)| record.clone())
+        .ok_or_else(|| invalid("requested record absent from history"))?;
+    let (document, records, base) = match pull {
+        Some(InvenioPull::Update { .. }) => {
+            let (jsonld, base) = crate::jobs::export::crate_jsonld(
+                &ctx.driver,
+                &spec.auth_context,
+                spec.document_id,
+                spec.limits.metadata_bytes,
+            )
+            .await?;
+            let current: Value =
+                serde_json::from_str(&jsonld).map_err(|_| invalid("invalid dataset crate"))?;
+            let known = crate_versions(&current);
+            let added = records
+                .into_iter()
+                .filter(|(record, _)| {
+                    record_id(record).is_ok_and(|id| !known.iter().any(|k| k == id))
+                })
+                .collect::<Vec<_>>();
+            (
+                pull_crate(&current, client.endpoint(), &latest, &added)?,
+                added,
+                Some(base),
+            )
+        }
+        _ => (
+            import_crate(client.endpoint(), &selected, &records)?,
+            records,
+            None,
+        ),
+    };
+    let progress = match pull {
+        Some(_) => Some(PullProgress {
+            record: super::export::record_from(&client, &latest)?,
+            endpoint: client.endpoint().to_string(),
+            base,
+            revision: None,
+        }),
+        None => None,
+    };
+    let mut identifiers = Vec::new();
+    for record in records.iter().map(|(record, _)| record).chain([&latest]) {
+        for id in record_identifiers(client.endpoint(), record, IdentifierOrigin::Imported) {
+            if !identifiers.contains(&id) {
+                identifiers.push(id);
+            }
+        }
+    }
     let metadata = document.to_string();
     if metadata.len() as u64 > spec.limits.metadata_bytes {
         return Err(TransferError::Permanent(
@@ -105,6 +178,7 @@ pub(crate) async fn acquire(
                     expires_at_ms: 0,
                 },
                 identifiers,
+                progress,
             ))
         }
         Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { .. })) => {
@@ -330,4 +404,130 @@ fn checked_size(size: u64, added: u64, limit: u64) -> Result<u64, TransferError>
 
 fn invalid(message: &str) -> TransferError {
     TransferError::Permanent(message.into())
+}
+
+/// Stops an update once its link is gone, paused or runs another job.
+async fn running(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    link_id: Ulid,
+) -> Result<(), TransferError> {
+    let link = read_link(&ctx.driver.storage_handle, spec.document_id, link_id)
+        .await
+        .map_err(|error| TransferError::Retryable(error.to_string()))?
+        .filter(|link| link.status != LinkStatus::Paused && link.pull().is_some())
+        .ok_or(TransferError::Cancelled)?;
+    match link.active_job {
+        Some(job_id) if job_id == ctx.job_id => Ok(()),
+        None => Err(TransferError::Retryable(
+            "the link has not started this pull".into(),
+        )),
+        Some(_) => Err(TransferError::Permanent(
+            "a newer pull of this link replaced this job".into(),
+        )),
+    }
+}
+
+/// Records the end of an import on its pull link: a new link after an import that keeps one,
+/// the held version after an update, or the failed or cancelled update.
+pub(crate) async fn settle_import(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    progress: Option<&PullProgress>,
+    failure: Option<&str>,
+) -> Result<(), LinkError> {
+    let ImportRoCrateSource::Invenio {
+        group_id,
+        connector_id,
+        options,
+        pull: Some(pull),
+        ..
+    } = &spec.source
+    else {
+        return Ok(());
+    };
+    let done = progress.and_then(|progress| Some((progress, progress.revision?)));
+    let now = std::time::SystemTime::now();
+    match pull {
+        InvenioPull::Keep {
+            auto_update,
+            owner_node_url,
+        } => {
+            let Some((progress, revision)) = done else {
+                return Ok(());
+            };
+            let mut link = InvenioLink {
+                link_id: ctx.job_id.as_ulid(),
+                document_id: spec.document_id,
+                group_id: *group_id,
+                connector_id: *connector_id,
+                endpoint: progress.endpoint.clone(),
+                owner_node: ctx.owner_node_id,
+                owner_node_url: owner_node_url.clone(),
+                created_by: spec.auth_context.user_id,
+                status: LinkStatus::Enabled,
+                auto_publish: false,
+                public_files: false,
+                metadata_json: "{}".into(),
+                remote: LinkRemote::default(),
+                last_push: None,
+                active_job: None,
+                sequence: 0,
+                limits: spec.limits.clone(),
+                created_at: now,
+                updated_at: now,
+                generation: 0,
+                warning: None,
+                direction: LinkDirection::Pull(Box::new(LinkPull {
+                    auto_update: *auto_update,
+                    options: options.clone(),
+                    target: spec.target.clone(),
+                    latest_remote_id: None,
+                    latest_revision: None,
+                    last_checked_at: None,
+                    next_check_ms: unix_timestamp_millis().saturating_add(PULL_CHECK_MS),
+                    failures: 0,
+                    revision: None,
+                    local_changed: false,
+                })),
+            };
+            link.hold(&progress.record, revision, now);
+            let change = LinkChange::Create {
+                link: Box::new(link.clone()),
+                secret: None,
+            };
+            match change_link(&ctx.driver, &link, change).await {
+                Ok(_) | Err(LinkError::Exists) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        InvenioPull::Update { link_id } => {
+            let storage = &ctx.driver.storage_handle;
+            let Some(link) = read_link(storage, spec.document_id, *link_id)
+                .await?
+                .filter(|link| link.active_job == Some(ctx.job_id))
+            else {
+                return Ok(());
+            };
+            let change = match (done, failure) {
+                (Some((progress, revision)), _) => LinkChange::Pulled {
+                    job_id: ctx.job_id,
+                    record: Box::new(progress.record.clone()),
+                    revision,
+                },
+                (None, failure) => LinkChange::Finish {
+                    job_id: ctx.job_id,
+                    outcome: Box::new(match failure {
+                        Some(message) => PushOutcome::Failed(LinkFailure::Other(message.into())),
+                        None => PushOutcome::Cancelled,
+                    }),
+                    requeue: false,
+                },
+            };
+            match change_link(&ctx.driver, &link, change).await {
+                Ok(_) | Err(LinkError::NotFound) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
 }

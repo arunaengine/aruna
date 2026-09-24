@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::invenio::InvenioPull;
 use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, JOB_STATE_KEYSPACE};
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::BackendStream;
@@ -64,7 +65,8 @@ use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::route_metadata_create;
+use crate::metadata::forward::{route_metadata_create, route_metadata_update};
+use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
@@ -140,6 +142,8 @@ struct ImportCheckpoint {
     cancelled: bool,
     /// Repository identifiers registered on the created document during cleanup.
     identifiers: Vec<SecondaryIdentifier>,
+    /// Set when the import keeps or updates a pull link.
+    pull: Option<super::invenio::import::PullProgress>,
 }
 
 impl Default for ImportCheckpoint {
@@ -161,6 +165,7 @@ impl Default for ImportCheckpoint {
             failure: None,
             cancelled: false,
             identifiers: Vec::new(),
+            pull: None,
         }
     }
 }
@@ -222,7 +227,7 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
         }
 
         let result = match checkpoint.phase {
-            ImportPhase::Acquire => acquire_source(ctx, spec, &mut checkpoint.identifiers)
+            ImportPhase::Acquire => acquire_source(ctx, spec, &mut checkpoint)
                 .await
                 .map(|input| {
                     checkpoint.refs.hidden_locations = vec![input.location.clone()];
@@ -253,6 +258,12 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
             },
             ImportPhase::Rewrite => match plan.as_ref() {
                 Some(plan) => rewrite_crate(ctx, spec, &mut checkpoint, plan).await,
+                None => Err(ImportFailure::Permanent(
+                    "import plan is missing".to_string(),
+                )),
+            },
+            ImportPhase::Create if updates_link(spec) => match plan.as_ref() {
+                Some(plan) => update_document(ctx, spec, &mut checkpoint, plan).await,
                 None => Err(ImportFailure::Permanent(
                     "import plan is missing".to_string(),
                 )),
@@ -380,7 +391,7 @@ fn transfer_failure(error: super::invenio::TransferError) -> ImportFailure {
 async fn acquire_source(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
-    identifiers: &mut Vec<SecondaryIdentifier>,
+    checkpoint: &mut ImportCheckpoint,
 ) -> Result<ImportInput, ImportFailure> {
     match &spec.source {
         ImportRoCrateSource::Invenio {
@@ -388,19 +399,21 @@ async fn acquire_source(
             connector_id,
             record_id,
             options,
-            ..
+            pull,
         } => {
-            let (artifact, found) = super::invenio::import::acquire(
+            let (artifact, found, progress) = super::invenio::import::acquire(
                 ctx,
                 spec,
                 *group_id,
                 *connector_id,
                 record_id,
                 options,
+                pull.as_ref(),
             )
             .await
             .map_err(transfer_failure)?;
-            *identifiers = found;
+            checkpoint.identifiers = found;
+            checkpoint.pull = progress;
             Ok(ImportInput {
                 location: artifact.location,
                 size: artifact.size,
@@ -1113,6 +1126,9 @@ async fn create_document(
         Ok(created) => {
             checkpoint.created = true;
             checkpoint.phase = ImportPhase::Cleanup;
+            if let Some(pull) = checkpoint.pull.as_mut() {
+                pull.revision = Some(created.event_id);
+            }
             emit_metadata_created(
                 &ctx.driver,
                 spec.auth_context.realm_id,
@@ -1127,6 +1143,86 @@ async fn create_document(
         }
         Err(error) => Err(classify_metadata(error)),
     }
+}
+
+fn updates_link(spec: &ImportRoCrateSpec) -> bool {
+    matches!(
+        &spec.source,
+        ImportRoCrateSource::Invenio {
+            pull: Some(InvenioPull::Update { .. }),
+            ..
+        }
+    )
+}
+
+/// Replaces the linked dataset's crate with the merged one through the normal update, unless the
+/// dataset changed since the pull read it. A retry finds its own update by the minted versions.
+async fn update_document(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    checkpoint: &mut ImportCheckpoint,
+    plan: &ImportPlan,
+) -> Result<(), ImportFailure> {
+    ensure_metadata_permission(ctx, spec).await?;
+    let jsonld = checkpoint
+        .rewritten_json
+        .clone()
+        .ok_or_else(|| ImportFailure::Permanent("rewritten RO-Crate is missing".to_string()))?;
+    let base = checkpoint
+        .pull
+        .as_ref()
+        .and_then(|pull| pull.base())
+        .ok_or_else(|| ImportFailure::Permanent("pull base revision is missing".to_string()))?;
+    let (current, event_id) = crate::jobs::export::crate_jsonld(
+        &ctx.driver,
+        &spec.auth_context,
+        spec.document_id,
+        spec.limits.metadata_bytes,
+    )
+    .await
+    .map_err(transfer_failure)?;
+    let revision = if event_id == base {
+        let actor = Actor {
+            node_id: ctx.owner_node_id,
+            user_id: spec.auth_context.user_id,
+            realm_id: spec.auth_context.realm_id,
+        };
+        let record =
+            crate::metadata::get_document::load_document_record(&ctx.driver, spec.document_id)
+                .await
+                .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
+        route_metadata_update(
+            &ctx.driver,
+            actor,
+            record.as_ref(),
+            spec.document_id,
+            None,
+            UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+            Some(AuthToken::internal(spec.auth_context.clone())),
+        )
+        .await
+        .map_err(classify_metadata)?
+        .last_event_id
+    } else {
+        let own = plan
+            .entries
+            .iter()
+            .find(|entry| entry.described_id.is_some())
+            .map(|entry| entry_arn(spec, ctx.owner_node_id, entry).map(|arn| arn.to_w3id()))
+            .transpose()?;
+        if !own.is_some_and(|w3id| current.contains(&w3id)) {
+            return Err(ImportFailure::Permanent(
+                "the dataset changed while the pull ran; pull again".to_string(),
+            ));
+        }
+        event_id
+    };
+    if let Some(pull) = checkpoint.pull.as_mut() {
+        pull.revision = Some(revision);
+    }
+    checkpoint.created = true;
+    checkpoint.phase = ImportPhase::Cleanup;
+    Ok(())
 }
 
 /// Queues the source repository identifiers for the created document. The queued job waits
@@ -1177,6 +1273,16 @@ async fn cleanup_source(
         register_identifiers(ctx, spec, checkpoint.identifiers.clone()).await?;
         checkpoint.identifiers.clear();
     }
+    super::invenio::import::settle_import(
+        ctx,
+        spec,
+        checkpoint.pull.as_ref(),
+        checkpoint.failure.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        ImportFailure::Retryable(format!("recording the pull link failed: {error}"))
+    })?;
     checkpoint.phase = ImportPhase::Done;
     Ok(())
 }
