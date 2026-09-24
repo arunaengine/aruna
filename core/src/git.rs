@@ -199,7 +199,8 @@ pub struct LfsLock {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredObject {
     pub node_id: NodeId,
-    pub group_id: GroupId,
+    /// The bucket's group when known; otherwise only the source node can check access.
+    pub group_id: Option<GroupId>,
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
@@ -419,7 +420,7 @@ mod tests {
         if let GitChange::Objects { lfs, .. } = &mut large.change {
             let object = StoredObject {
                 node_id: large.node_id,
-                group_id: large.group_id,
+                group_id: Some(large.group_id),
                 bucket: "b".into(),
                 key: "k".repeat(1000),
                 version_id: Ulid::from(1),

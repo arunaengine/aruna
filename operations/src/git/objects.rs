@@ -165,7 +165,7 @@ pub async fn store(
         .ok_or(GitError::Unavailable)?;
     let stored = StoredObject {
         node_id: node,
-        group_id: document.group_id,
+        group_id: Some(document.group_id),
         bucket: name,
         key,
         version_id: result.version_id,
@@ -213,7 +213,7 @@ pub async fn open(
             key: own.key.clone(),
             version_id: Some(own.version_id),
             range: None,
-            group_id: own.group_id,
+            group_id: own.group_id.ok_or(GitError::Unavailable)?,
             user_identity: auth.user_id,
             node_id: node,
         };

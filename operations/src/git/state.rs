@@ -230,7 +230,7 @@ mod tests {
     fn checkpoint_keeps_late() {
         let pack = StoredObject {
             node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
-            group_id: Ulid::from(1),
+            group_id: Some(Ulid::from(1)),
             bucket: "arc".into(),
             key: "pack".into(),
             version_id: Ulid::from(1),
