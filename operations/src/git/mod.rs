@@ -7,6 +7,7 @@ pub mod lfs;
 pub mod publish;
 mod records;
 pub mod snapshot;
+pub mod state;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;

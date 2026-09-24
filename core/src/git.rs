@@ -165,6 +165,8 @@ pub struct StoredObject {
     pub version_id: Ulid,
     pub size: u64,
     pub sha256: String,
+    /// Lets any holder with a copy serve these bytes when the original node is gone.
+    pub blake3: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +384,7 @@ mod tests {
                 version_id: Ulid::from(1),
                 size: 1,
                 sha256: "b".repeat(64),
+                blake3: [0; 32],
             };
             lfs.extend(std::iter::repeat_n(object, 5000));
         }
