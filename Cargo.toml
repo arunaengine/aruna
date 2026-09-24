@@ -71,8 +71,8 @@ cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
-# Pinned to craqle 0.3.0 with interval receipt trimming; it resolves the irokle below.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "9100687b19c6b2184c444a86fe6ad6ef4282e1ed", features = [
+# Pinned to craqle 0.3.0 with the write latency fixes; it resolves the irokle below.
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "ed25a3f3844fa3a747627046d9a5bc9ef1918640", features = [
     "iroh",
     "shacl-core",
 ] }
