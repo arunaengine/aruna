@@ -361,8 +361,8 @@ async fn process_prune_job(
     };
 
     match metadata_handle.prune_if_deleted(graph_iri.clone()).await {
-        Ok(_) => {
-            if let Err(error) = queue_deleted(context, &graph_iri).await {
+        Ok(pruned) => {
+            if pruned && let Err(error) = queue_deleted(context, &graph_iri).await {
                 warn!(%graph_iri, %error, "Failed to queue Invenio links of a deleted dataset");
             }
             Ok(ProcessedJobGroup {
