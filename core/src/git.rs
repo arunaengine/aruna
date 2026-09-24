@@ -14,6 +14,8 @@ use ulid::Ulid;
 
 pub const REPOSITORIES: &str = "git_repositories";
 pub const LFS_OBJECTS: &str = "git_lfs_objects";
+/// This node's own stored copies of Git packs and LFS content, keyed by document and SHA-256.
+pub const LOCAL_OBJECTS: &str = "git_local_objects";
 pub const STATUS: &str = "git_status";
 pub const MAX_GIT_BYTES: usize = 64 * 1024 * 1024;
 /// Upper bound for one replicated Git record.

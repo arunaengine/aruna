@@ -4,6 +4,7 @@
 
 pub mod hook;
 pub mod lfs;
+pub mod objects;
 pub mod publish;
 mod records;
 pub mod snapshot;
