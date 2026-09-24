@@ -517,7 +517,7 @@ pub async fn create_link(
     };
     let change = LinkChange::Create {
         link: Box::new(link.clone()),
-        secret,
+        secret: Some(secret),
     };
     let created = change_link(context.as_ref(), &link, change)
         .await

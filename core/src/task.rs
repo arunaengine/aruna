@@ -58,6 +58,7 @@ pub enum TaskKey {
     DrainUploadOutbox,
     SettleJobTerminals,
     DrainLinkQueue,
+    CheckPullLinks,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

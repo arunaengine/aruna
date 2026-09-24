@@ -528,7 +528,7 @@ impl InvenioLink {
         }
     }
 
-    fn pull_mut(&mut self) -> Option<&mut LinkPull> {
+    pub fn pull_mut(&mut self) -> Option<&mut LinkPull> {
         match &mut self.direction {
             LinkDirection::Pull(pull) => Some(pull),
             LinkDirection::Push => None,
@@ -586,10 +586,14 @@ impl InvenioLink {
             }
         }
         self.updated_at = now;
-        let auto = self
-            .pull()
-            .is_some_and(|pull| pull.auto_update && !pull.local_changed);
-        auto && self.update_available()
+        self.auto_pulls()
+    }
+
+    /// Whether auto_update imports the available version now.
+    pub fn auto_pulls(&self) -> bool {
+        self.pull()
+            .is_some_and(|pull| pull.auto_update && !pull.local_changed)
+            && self.update_available()
             && self.status == LinkStatus::Enabled
             && self.active_job.is_none()
     }

@@ -186,7 +186,7 @@ fn create_writes_rows() {
     let link = link();
     let mut op = operation(LinkChange::Create {
         link: Box::new(link.clone()),
-        secret: secret(link.link_id),
+        secret: Some(secret(link.link_id)),
     });
     let effects = read(&mut op, None);
     let rows = written(&effects);
@@ -230,7 +230,7 @@ fn create_refuses_duplicates() {
     let link = link();
     let mut op = operation(LinkChange::Create {
         link: Box::new(link.clone()),
-        secret: secret(link.link_id),
+        secret: Some(secret(link.link_id)),
     });
     let effects = read(&mut op, Some(&link));
     assert!(matches!(
@@ -246,7 +246,7 @@ fn create_refuses_duplicates() {
 
     let mut foreign = operation(LinkChange::Create {
         link: Box::new(link),
-        secret: secret(Ulid::from_bytes([9; 16])),
+        secret: Some(secret(Ulid::from_bytes([9; 16]))),
     });
     read(&mut foreign, None);
     foreign.step(Event::Storage(StorageEvent::TransactionAborted {
@@ -474,7 +474,7 @@ fn routed_changes_replicate() {
     let route = route(3);
     let mut op = operation(LinkChange::Create {
         link: Box::new(link.clone()),
-        secret: secret(link.link_id),
+        secret: Some(secret(link.link_id)),
     })
     .routed(Some(route.clone()));
     let effects = fenced(&mut op, None, Some(2));

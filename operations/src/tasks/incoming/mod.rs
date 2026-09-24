@@ -803,6 +803,9 @@ impl OperationsTaskHandler {
             TaskKey::DrainLinkQueue => Box::pin(async move {
                 self.drain_link_queue().await;
             }),
+            TaskKey::CheckPullLinks => Box::pin(async move {
+                self.check_pull_links().await;
+            }),
             TaskKey::ReconcileSyncedFolders => Box::pin(async move {
                 let after = match crate::device::sync::reconcile_folders(&self.context).await {
                     DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,

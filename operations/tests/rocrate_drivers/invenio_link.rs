@@ -130,7 +130,7 @@ pub(super) async fn attach(
     };
     let change = LinkChange::Create {
         link: Box::new(link),
-        secret,
+        secret: Some(secret),
     };
     Ok(drive(
         ChangeLinkOperation::new(doc_id(1), link_id, change, SystemTime::now()),

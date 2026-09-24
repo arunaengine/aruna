@@ -47,7 +47,7 @@ const QUEUE_PAGE: usize = 256;
 const ACTIVE_RETRY_MS: u64 = 30_000;
 const ERROR_RETRY_MS: u64 = 60_000;
 
-/// Push-check rows for the enabled links of changed documents; each change moves the due time.
+/// Push-check rows for the enabled push links of changed documents; each change moves the due time.
 /// A deleted document queues all its links, so the check removes them.
 pub(crate) async fn queue_rows(
     storage: &StorageHandle,
@@ -73,7 +73,7 @@ pub(crate) async fn queue_rows(
         let gone = !values.is_empty() && document_gone(storage, document_id).await?;
         for (_, value) in values {
             let link = InvenioLink::from_bytes(&value)?;
-            if gone || link.status == LinkStatus::Enabled {
+            if gone || (link.status == LinkStatus::Enabled && link.pull().is_none()) {
                 candidates.push((link.link_id, document_id));
             }
         }
@@ -205,7 +205,7 @@ async fn check_link(
         change_link(context, &link, LinkChange::Delete).await?;
         return Ok(None);
     }
-    if link.status != LinkStatus::Enabled {
+    if link.status != LinkStatus::Enabled || link.pull().is_some() {
         return drop_entry().await;
     }
     if let Err(LinkError::NotHolder) = ensure_holder(context, &link).await {
@@ -358,7 +358,10 @@ pub async fn owner_holds(context: &DriverContext, link: &InvenioLink) -> bool {
 
 /// Fails the link with owner_not_holder once this node lost the dataset. The change stays local:
 /// a node outside the holder set cannot publish to them, and holders derive the same state.
-async fn ensure_holder(context: &DriverContext, link: &InvenioLink) -> Result<(), LinkError> {
+pub(super) async fn ensure_holder(
+    context: &DriverContext,
+    link: &InvenioLink,
+) -> Result<(), LinkError> {
     if owner_holds(context, link).await {
         return Ok(());
     }
@@ -398,7 +401,10 @@ async fn push_revision(
 }
 
 /// Whether the dataset was deleted, which removes its registry record.
-async fn document_gone(storage: &StorageHandle, document_id: Ulid) -> Result<bool, LinkError> {
+pub(super) async fn document_gone(
+    storage: &StorageHandle,
+    document_id: Ulid,
+) -> Result<bool, LinkError> {
     let event = storage
         .send_effect(read_document_registry(document_id, None))
         .await;

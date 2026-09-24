@@ -10,7 +10,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::invenio::{
     InvenioCredential, InvenioLink, InvenioRecord, LinkBusy, LinkFailure, LinkPatch,
-    LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS, RemoteState,
+    LinkQueueEntry, LinkReview, LinkStatus, PullCheck, PushOutcome, REVIEW_POLL_MS, RemoteState,
     connector_link_key, link_key, link_prefix,
 };
 use aruna_core::keyspaces::{
@@ -35,9 +35,10 @@ const LINK_PAGE: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkChange {
+    /// Pull links read with the connector's token and have no secret of their own.
     Create {
         link: Box<InvenioLink>,
-        secret: InvenioCredential,
+        secret: Option<InvenioCredential>,
     },
     Patch(LinkPatch),
     Rotate(InvenioCredential),
@@ -58,6 +59,14 @@ pub enum LinkChange {
     },
     /// Takes the repository's current state as the base, after a review or remote edits.
     Accept(Box<RemoteState>),
+    /// Records what a pull check found.
+    Checked(PullCheck),
+    /// Records the version the running pull imported and the dataset revision it wrote.
+    Pulled {
+        job_id: JobId,
+        record: Box<InvenioRecord>,
+        revision: Ulid,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -88,6 +97,8 @@ pub enum LinkError {
     JobLimit(u32),
     #[error("the link's node no longer holds the dataset (owner_not_holder)")]
     NotHolder,
+    #[error("an enabled link already pushes or pulls this record lineage in the other direction")]
+    Lineage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -115,6 +126,8 @@ pub struct ChangeLinkOperation {
     txn_id: Option<TxnId>,
     deletes: Vec<(String, Key)>,
     schedule: bool,
+    /// The change needs a pull check soon, so the pull timer fires now.
+    pull_check: bool,
     route: Option<MappingRoute>,
     stored: Option<InvenioLink>,
     queued: Option<LinkQueueEntry>,
@@ -133,6 +146,7 @@ impl ChangeLinkOperation {
             txn_id: None,
             deletes: Vec::new(),
             schedule: false,
+            pull_check: false,
             route: None,
             stored: None,
             queued: None,
@@ -167,16 +181,20 @@ impl ChangeLinkOperation {
             stored,
         ) {
             (LinkChange::Create { link, secret }, None) => {
-                if secret.link_id != Some(link.link_id) {
-                    return Err(LinkError::ForeignToken);
+                if let Some(secret) = secret {
+                    if secret.link_id != Some(link.link_id) {
+                        return Err(LinkError::ForeignToken);
+                    }
+                    writes.push(secret_row(self.link_id, &secret)?);
                 }
-                writes.push(secret_row(self.link_id, &secret)?);
                 writes.push((
                     LINK_CONNECTOR_KEYSPACE.to_string(),
                     ByteView::from(connector_link_key(link.connector_id, link.link_id)),
                     ByteView::from(link.document_id.to_bytes().to_vec()),
                 ));
-                queue = Some(now_ms);
+                queue = link.pull().is_none().then_some(now_ms);
+                // A new pull link arms the check, which then waits for its first due time.
+                self.pull_check = link.pull().is_some();
                 Some(*link)
             }
             (LinkChange::Create { .. }, Some(_)) => return Err(LinkError::Exists),
@@ -233,6 +251,21 @@ impl ChangeLinkOperation {
                 queue = Some(now_ms);
                 Some(link)
             }
+            (LinkChange::Checked(check), Some(mut link)) => {
+                link.checked(&check, self.now);
+                Some(link)
+            }
+            (
+                LinkChange::Pulled {
+                    job_id,
+                    record,
+                    revision,
+                },
+                Some(mut link),
+            ) => {
+                link.pulled(job_id, &record, revision, self.now);
+                Some(link)
+            }
             (LinkChange::Fail(reason), Some(mut link)) => {
                 if link.status == LinkStatus::Enabled {
                     link.status = LinkStatus::Failed { reason };
@@ -257,10 +290,17 @@ impl ChangeLinkOperation {
                 None
             }
         };
-        let result = result.map(|mut link| {
+        let mut result = result.map(|mut link| {
             link.stamp(now_ms);
             link
         });
+        // Pull links never push; a change that would look for work checks the repository instead.
+        if let Some(pull) = result.as_mut().and_then(InvenioLink::pull_mut)
+            && queue.take().is_some()
+        {
+            pull.next_check_ms = pull.next_check_ms.min(now_ms);
+            self.pull_check = true;
+        }
         if let Some(link) = &result {
             let bytes = link.to_bytes()?;
             if let Some(route) = &self.route {
@@ -411,6 +451,9 @@ impl Operation for ChangeLinkOperation {
                 if self.schedule {
                     effects.push(schedule_drain(Duration::ZERO));
                 }
+                if self.pull_check {
+                    effects.push(schedule_pulls(Duration::ZERO));
+                }
                 if self
                     .route
                     .as_ref()
@@ -474,6 +517,13 @@ pub fn schedule_drain(after: Duration) -> Effect {
     })
 }
 
+pub fn schedule_pulls(after: Duration) -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::CheckPullLinks,
+        after,
+    })
+}
+
 fn millis(time: SystemTime) -> u64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
@@ -524,10 +574,36 @@ pub async fn change_link(
             .map_err(|error| LinkError::Unexpected(error.to_string()))?,
         None => None,
     };
+    let enabled = match &change {
+        LinkChange::Create { link, .. } => Some(link.as_ref()),
+        LinkChange::Patch(patch) if patch.paused == Some(false) => Some(link),
+        _ => None,
+    };
+    if let Some(enabled) = enabled {
+        ensure_lineage(&context.storage_handle, enabled).await?;
+    }
     let operation =
         ChangeLinkOperation::new(link.document_id, link.link_id, change, SystemTime::now())
             .routed(route);
     drive(operation, context).await
+}
+
+/// One lineage cannot have an enabled push link and an enabled pull link on one dataset.
+async fn ensure_lineage(storage: &StorageHandle, link: &InvenioLink) -> Result<(), LinkError> {
+    let pulls = link.pull().is_some();
+    let conflict = list_links(storage, link.document_id)
+        .await?
+        .into_iter()
+        .any(|(other, _)| {
+            other.link_id != link.link_id
+                && other.status == LinkStatus::Enabled
+                && other.pull().is_some() != pulls
+                && other.same_lineage(link)
+        });
+    if conflict {
+        return Err(LinkError::Lineage);
+    }
+    Ok(())
 }
 
 pub(crate) fn id_key(id: Ulid) -> Key {
