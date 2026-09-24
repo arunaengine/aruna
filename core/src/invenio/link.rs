@@ -17,6 +17,14 @@ use crate::{NodeId, UserId};
 
 /// Quiet time after a change before a link pushes, so a burst of edits becomes one push.
 pub const LINK_DEBOUNCE_MS: u64 = 10_000;
+/// Longest wait after the first queued change, so constant editing still pushes.
+pub const LINK_DEBOUNCE_CAP_MS: u64 = 300_000;
+/// Quiet time after the last push before auto_publish publishes the draft.
+pub const AUTO_PUBLISH_QUIET_MS: u64 = 900_000;
+/// How often a link asks the repository about a pending community review.
+pub const REVIEW_POLL_MS: u64 = 3_600_000;
+/// Zenodo accepts at most this many files per record.
+pub const MAX_RECORD_FILES: usize = 100;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LinkFailure {
@@ -26,6 +34,8 @@ pub enum LinkFailure {
     Other(String),
     /// The owner node no longer holds the dataset, so it cannot push it.
     OwnerNotHolder,
+    /// The crate has more files than one repository record accepts.
+    TooManyFiles,
 }
 
 impl LinkFailure {
@@ -36,6 +46,7 @@ impl LinkFailure {
             Self::SourceUnavailable => "source_unavailable",
             Self::Other(reason) => reason,
             Self::OwnerNotHolder => "owner_not_holder",
+            Self::TooManyFiles => "too_many_files",
         }
     }
 }
@@ -47,7 +58,29 @@ pub enum LinkStatus {
     Failed { reason: LinkFailure },
 }
 
+/// State of the community review that the first version of a record waits for.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LinkReview {
+    #[default]
+    None,
+    Pending,
+    Accepted,
+    Declined,
+}
+
+impl LinkReview {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Declined => "declined",
+        }
+    }
+}
+
 /// The repository side: `record_id` is the last version this link published.
+/// `doi` is the open draft's reserved DOI while `doi_reserved` is set.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LinkRemote {
     pub parent_id: Option<String>,
@@ -56,6 +89,13 @@ pub struct LinkRemote {
     pub doi: Option<String>,
     pub record_url: Option<String>,
     pub published: bool,
+    pub concept_doi: Option<String>,
+    pub doi_reserved: bool,
+    /// Draft revision after this link's last write; another revision means a remote edit.
+    pub revision_id: Option<u64>,
+    pub review: LinkReview,
+    /// File keys of the last push, so a push only deletes files this link put there.
+    pub files: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -92,6 +132,8 @@ pub struct InvenioLink {
     pub updated_at: SystemTime,
     /// Sync generation of the stored row; it grows with every change the owner stores.
     pub generation: u64,
+    /// A problem found after the repository already published, such as a failed check.
+    pub warning: Option<String>,
 }
 
 /// Link identity and lineage a push job checks before it touches the repository.
@@ -100,6 +142,8 @@ pub struct LinkTarget {
     pub link_id: Ulid,
     pub published_id: Option<String>,
     pub parent_id: Option<String>,
+    pub revision_id: Option<u64>,
+    pub files: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -113,9 +157,11 @@ pub struct LinkPatch {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PushOutcome {
     Pushed {
-        record: InvenioRecord,
+        record: Box<InvenioRecord>,
         event_id: Ulid,
         dataset_digest: Option<[u8; 32]>,
+        /// The file keys the record holds after the push.
+        files: Vec<String>,
     },
     Failed(LinkFailure),
     Cancelled,
@@ -126,6 +172,35 @@ pub enum PushOutcome {
 pub struct LinkQueueEntry {
     pub document_id: Ulid,
     pub due_at_ms: u64,
+    /// When the oldest change still waiting was queued; it caps the debounce.
+    pub first_at_ms: u64,
+}
+
+impl LinkQueueEntry {
+    /// Queues a change at `now_ms`: each change moves the due time, up to the cap.
+    pub fn debounce(document_id: Ulid, previous: Option<&Self>, now_ms: u64) -> Self {
+        let first_at_ms = previous.map_or(now_ms, |entry| entry.first_at_ms.min(now_ms));
+        Self {
+            document_id,
+            due_at_ms: now_ms
+                .saturating_add(LINK_DEBOUNCE_MS)
+                .min(first_at_ms.saturating_add(LINK_DEBOUNCE_CAP_MS)),
+            first_at_ms,
+        }
+    }
+}
+
+/// What the repository says about a link's record, read when a review ends or the user
+/// accepts remote changes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteState {
+    /// The open draft with its revision, if one remains.
+    pub draft: Option<InvenioRecord>,
+    /// The latest published version of the lineage.
+    pub latest: Option<InvenioRecord>,
+    pub review: LinkReview,
+    /// File keys of the open draft; accepting them lets later pushes replace them.
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -250,20 +325,14 @@ impl InvenioLink {
                 record,
                 event_id,
                 dataset_digest,
+                files,
             } => {
-                let remote = &mut self.remote;
-                remote.parent_id = Some(record.parent_id.clone());
-                if record.published {
-                    remote.record_id = Some(record.id.clone());
-                    remote.draft_id = None;
-                } else {
-                    remote.draft_id = Some(record.id.clone());
+                self.adopt(record);
+                if record.in_review {
+                    self.remote.review = LinkReview::Pending;
                 }
-                remote.published = record.published;
-                if record.doi.is_some() {
-                    remote.doi = record.doi.clone();
-                }
-                remote.record_url = Some(record.html_url.clone().unwrap_or(record.url.clone()));
+                self.remote.files = files.clone();
+                self.warning = record.warning.clone();
                 self.last_push = Some(LinkPush {
                     event_id: *event_id,
                     dataset_digest: *dataset_digest,
@@ -279,6 +348,76 @@ impl InvenioLink {
             PushOutcome::Failed(_) | PushOutcome::Cancelled => {}
         }
         true
+    }
+
+    /// Takes the repository's view of the draft or published record as the link's remote.
+    pub fn adopt(&mut self, record: &InvenioRecord) {
+        let remote = &mut self.remote;
+        remote.parent_id = Some(record.parent_id.clone());
+        if record.published {
+            remote.record_id = Some(record.id.clone());
+            remote.draft_id = None;
+            remote.revision_id = None;
+        } else {
+            remote.draft_id = Some(record.id.clone());
+            remote.revision_id = Some(record.revision_id);
+        }
+        remote.published = record.published;
+        remote.doi_reserved = !record.published && record.doi.is_some();
+        if record.doi.is_some() || !record.published {
+            remote.doi = record.doi.clone();
+        }
+        if record.concept_doi.is_some() {
+            remote.concept_doi = record.concept_doi.clone();
+        }
+        remote.record_url = Some(record.html_url.clone().unwrap_or(record.url.clone()));
+    }
+
+    /// Stores the draft of the running push as soon as it exists, so a retry continues it.
+    pub fn draft(&mut self, job_id: JobId, record: &InvenioRecord, now: SystemTime) -> bool {
+        if self.active_job != Some(job_id) || record.published {
+            return false;
+        }
+        self.adopt(record);
+        self.updated_at = now;
+        true
+    }
+
+    /// Makes the repository's current state the new base and ends a remote change failure.
+    pub fn accept(&mut self, state: &RemoteState, now: SystemTime) {
+        if let Some(latest) = &state.latest {
+            self.adopt(latest);
+        }
+        match &state.draft {
+            Some(draft) => self.adopt(draft),
+            None => self.remote.draft_id = None,
+        }
+        self.remote.review = state.review;
+        self.remote.files = state.files.clone();
+        if matches!(self.status, LinkStatus::Failed { .. }) {
+            self.status = LinkStatus::Enabled;
+        }
+        self.warning = None;
+        self.updated_at = now;
+    }
+
+    /// Whether auto_publish still has an open draft to publish once the dataset is quiet.
+    pub fn publish_waits(&self) -> bool {
+        self.auto_publish
+            && self.status == LinkStatus::Enabled
+            && self.remote.draft_id.is_some()
+            && self.remote.review != LinkReview::Pending
+            && self.last_push.is_some()
+    }
+
+    /// When auto_publish may publish: a quiet period after the last push.
+    pub fn publish_due_ms(&self) -> Option<u64> {
+        let pushed = self.last_push.as_ref()?.pushed_at;
+        let pushed_ms = pushed
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        self.publish_waits()
+            .then(|| pushed_ms.saturating_add(AUTO_PUBLISH_QUIET_MS))
     }
 
     /// Whether the displayed revision differs from the last pushed one.
@@ -301,13 +440,15 @@ impl InvenioLink {
                 .flatten(),
             draft_id: draft,
             metadata_json: self.metadata_json.clone(),
-            publish: publish || self.auto_publish,
+            publish,
             public_files: self.public_files,
             credential: None,
             link: Some(LinkTarget {
                 link_id: self.link_id,
                 published_id: self.remote.record_id.clone(),
                 parent_id: self.remote.parent_id.clone(),
+                revision_id: self.remote.revision_id,
+                files: self.remote.files.clone(),
             }),
         }
     }

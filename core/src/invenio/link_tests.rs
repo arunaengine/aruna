@@ -42,6 +42,7 @@ fn link() -> InvenioLink {
         created_at: SystemTime::UNIX_EPOCH,
         updated_at: SystemTime::UNIX_EPOCH,
         generation: 0,
+        warning: None,
     }
 }
 
@@ -55,14 +56,17 @@ fn record(id: &str, published: bool, doi: Option<&str>) -> InvenioRecord {
         doi: doi.map(str::to_string),
         html_url: None,
         concept_doi: None,
+        in_review: false,
+        warning: None,
     }
 }
 
 fn pushed(id: &str, published: bool, doi: Option<&str>) -> PushOutcome {
     PushOutcome::Pushed {
-        record: record(id, published, doi),
+        record: Box::new(record(id, published, doi)),
         event_id: Ulid::from_bytes([9; 16]),
         dataset_digest: Some([8; 32]),
+        files: vec!["data.txt".into()],
     }
 }
 
@@ -93,12 +97,116 @@ fn plans_lineage_pushes() {
     assert_eq!(next.link.unwrap().published_id.as_deref(), Some("draft-1"));
 
     link.begin(job(3), SystemTime::now()).unwrap();
-    link.finish(job(3), &pushed("draft-2", false, None), SystemTime::now());
-    assert_eq!(link.remote.doi.as_deref(), Some("10.1/x"));
+    link.finish(
+        job(3),
+        &pushed("draft-2", false, Some("10.1/y")),
+        SystemTime::now(),
+    );
+    assert_eq!(link.remote.doi.as_deref(), Some("10.1/y"));
+    assert!(link.remote.doi_reserved && !link.remote.published);
     assert_eq!(link.remote.parent_id.as_deref(), Some("parent-1"));
-    assert!(!link.remote.published);
+    assert_eq!(link.remote.files, ["data.txt"]);
+    let target = link.destination(false).link.unwrap();
+    assert_eq!((target.revision_id, target.files.len()), (Some(3), 1));
     link.auto_publish = true;
-    assert!(link.destination(false).publish);
+    assert!(!link.destination(false).publish, "auto_publish waits");
+}
+
+#[test]
+fn stores_draft_early() {
+    let mut link = link();
+    let draft = record("draft-1", false, Some("10.1/r"));
+    assert!(!link.draft(job(1), &draft, SystemTime::now()));
+    link.begin(job(1), SystemTime::now()).unwrap();
+    assert!(link.draft(job(1), &draft, SystemTime::now()));
+    assert!(!link.draft(job(1), &record("x", true, None), SystemTime::now()));
+    link.finish(
+        job(1),
+        &PushOutcome::Failed(LinkFailure::Other("upload failed".into())),
+        SystemTime::now(),
+    );
+    assert_eq!(link.remote.draft_id.as_deref(), Some("draft-1"));
+    assert_eq!(link.remote.revision_id, Some(3));
+    assert!(link.remote.doi_reserved);
+    assert_eq!(link.destination(false).draft_id.as_deref(), Some("draft-1"));
+}
+
+#[test]
+fn review_blocks_publishing() {
+    let mut link = link();
+    link.auto_publish = true;
+    link.begin(job(1), SystemTime::now()).unwrap();
+    let mut submitted = record("draft-1", false, Some("10.1/r"));
+    submitted.in_review = true;
+    let outcome = PushOutcome::Pushed {
+        record: Box::new(submitted),
+        event_id: Ulid::from_bytes([9; 16]),
+        dataset_digest: None,
+        files: Vec::new(),
+    };
+    link.finish(job(1), &outcome, SystemTime::UNIX_EPOCH);
+    assert_eq!(link.remote.review, LinkReview::Pending);
+    assert_eq!(link.publish_due_ms(), None);
+    let state = RemoteState {
+        draft: None,
+        latest: Some(record("draft-1", true, Some("10.1/r"))),
+        review: LinkReview::Accepted,
+        files: Vec::new(),
+    };
+    link.accept(&state, SystemTime::now());
+    assert_eq!(link.remote.review, LinkReview::Accepted);
+    assert!(link.remote.published && !link.remote.doi_reserved);
+    assert_eq!(link.remote.record_id.as_deref(), Some("draft-1"));
+}
+
+#[test]
+fn auto_publish_waits() {
+    let mut link = link();
+    link.auto_publish = true;
+    assert_eq!(link.publish_due_ms(), None);
+    link.begin(job(1), SystemTime::now()).unwrap();
+    link.finish(job(1), &pushed("d", false, None), SystemTime::UNIX_EPOCH);
+    assert_eq!(link.publish_due_ms(), Some(AUTO_PUBLISH_QUIET_MS));
+    link.status = LinkStatus::Paused;
+    assert_eq!(link.publish_due_ms(), None);
+}
+
+#[test]
+fn accepts_remote_base() {
+    let mut link = link();
+    link.status = LinkStatus::Failed {
+        reason: LinkFailure::RemoteChanged,
+    };
+    link.warning = Some("checksum".into());
+    let mut edited = record("draft-2", false, None);
+    edited.revision_id = 9;
+    let state = RemoteState {
+        draft: Some(edited),
+        latest: Some(record("v1", true, Some("10.1/v1"))),
+        review: LinkReview::None,
+        files: vec!["remote.txt".into()],
+    };
+    link.accept(&state, SystemTime::now());
+    assert_eq!(link.status, LinkStatus::Enabled);
+    assert_eq!(link.warning, None);
+    assert_eq!(link.remote.record_id.as_deref(), Some("v1"));
+    assert_eq!(link.remote.draft_id.as_deref(), Some("draft-2"));
+    assert_eq!(link.remote.revision_id, Some(9));
+    assert_eq!(link.remote.files, ["remote.txt"]);
+}
+
+#[test]
+fn debounces_queued_changes() {
+    let document = Ulid::from_bytes([2; 16]);
+    let first = LinkQueueEntry::debounce(document, None, 1_000);
+    assert_eq!(first.due_at_ms, 1_000 + LINK_DEBOUNCE_MS);
+    let next = LinkQueueEntry::debounce(document, Some(&first), 5_000);
+    assert_eq!(
+        (next.due_at_ms, next.first_at_ms),
+        (5_000 + LINK_DEBOUNCE_MS, 1_000)
+    );
+    let late = LinkQueueEntry::debounce(document, Some(&next), 1_000 + LINK_DEBOUNCE_CAP_MS);
+    assert_eq!(late.due_at_ms, 1_000 + LINK_DEBOUNCE_CAP_MS);
 }
 
 #[test]
