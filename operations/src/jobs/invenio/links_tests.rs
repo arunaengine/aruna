@@ -630,3 +630,67 @@ fn draft_needs_running_push() {
     assert_eq!(link.remote.draft_id.as_deref(), Some("draft-1"));
     assert_eq!(link.remote.revision_id, Some(4));
 }
+
+fn pulling() -> InvenioLink {
+    let mut link = link();
+    link.direction =
+        aruna_core::invenio::LinkDirection::Pull(Box::new(aruna_core::invenio::LinkPull {
+            auto_update: false,
+            options: Default::default(),
+            target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+                bucket: "research".into(),
+                prefix: "zenodo".into(),
+            },
+            latest_remote_id: None,
+            latest_revision: None,
+            last_checked_at: None,
+            next_check_ms: u64::MAX,
+            failures: 0,
+            revision: None,
+            local_changed: false,
+        }));
+    link
+}
+
+fn checks_pulls(effects: &Effects) -> bool {
+    matches!(
+        &effects[..],
+        [Effect::Task(TaskEffect::ResetTimer { key: TaskKey::CheckPullLinks, after })]
+            if after.is_zero()
+    )
+}
+
+#[test]
+fn pull_links_never_push() {
+    let link = pulling();
+    let mut op = operation(LinkChange::Create {
+        link: Box::new(link.clone()),
+        secret: None,
+    });
+    let effects = read(&mut op, None);
+    let rows = written(&effects);
+    assert_eq!(
+        keyspaces(&rows),
+        [LINK_CONNECTOR_KEYSPACE, INVENIO_LINK_KEYSPACE]
+    );
+    assert!(checks_pulls(&commit(&mut op, effects)));
+    // Resuming a pull link checks the repository now instead of queueing a push.
+    let mut paused = link.clone();
+    paused.status = LinkStatus::Paused;
+    let mut op = operation(LinkChange::Patch(LinkPatch {
+        paused: Some(false),
+        ..LinkPatch::default()
+    }));
+    let effects = read(&mut op, Some(&paused));
+    let rows = written(&effects);
+    assert_eq!(keyspaces(&rows), [INVENIO_LINK_KEYSPACE]);
+    let stored = InvenioLink::from_bytes(&rows[0].2).unwrap();
+    assert_eq!(
+        stored.pull().unwrap().next_check_ms,
+        now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    );
+    assert!(checks_pulls(&commit(&mut op, effects)));
+}
