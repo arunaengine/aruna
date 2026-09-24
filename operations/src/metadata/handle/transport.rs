@@ -465,6 +465,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedGroupCreated { .. } => "forwarded_group_created",
         MetadataTransportMessage::GroupDeletion { .. } => "group_deletion",
         MetadataTransportMessage::GroupDeletionResult { .. } => "group_deletion_result",
+        MetadataTransportMessage::LookupIdentifier { .. } => "lookup_identifier",
+        MetadataTransportMessage::IdentifierMatches { .. } => "identifier_matches",
         MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
         MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
         MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",
@@ -598,6 +600,35 @@ impl MetadataHandle {
             node_id, auth_token, graph_iris, query, limit, group_id, None,
         )
         .await
+    }
+
+    /// Asks one node which readable documents its reverse index lists for the identifier.
+    pub async fn request_identifier_lookup(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<AuthToken>,
+        kind: aruna_core::structs::secondary_id::SecondaryIdKind,
+        value: String,
+        endpoint: Option<String>,
+    ) -> Result<Vec<crate::metadata::secondary_ids::IdentifierMatch>, MetadataReadError> {
+        let span = Span::current();
+        match send_remote_request(
+            &self.inner,
+            &span,
+            node_id,
+            MetadataTransportMessage::LookupIdentifier {
+                auth_token,
+                kind,
+                value,
+                endpoint,
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::IdentifierMatches { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
     }
 
     #[tracing::instrument(

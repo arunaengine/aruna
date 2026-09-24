@@ -476,6 +476,16 @@ pub enum MetadataTransportMessage {
             aruna_core::structs::identity::group_delete::GroupDeletionError,
         >,
     },
+    /// Readable documents in the node's reverse index that hold one external identifier.
+    LookupIdentifier {
+        auth_token: Option<AuthToken>,
+        kind: aruna_core::structs::secondary_id::SecondaryIdKind,
+        value: String,
+        endpoint: Option<String>,
+    },
+    IdentifierMatches {
+        result: Result<Vec<crate::metadata::secondary_ids::IdentifierMatch>, MetadataReadError>,
+    },
 }
 
 /// One document as a holder serves it to a device.

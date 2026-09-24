@@ -48,11 +48,11 @@ use self::export::export_summary_jsonld;
 pub use self::export::{export_metadata_rocrate, get_visible_document};
 pub use self::fanout::forwarded_bearer;
 pub(crate) use self::fanout::pattern_contains_service;
-pub use self::fanout::search_buckets_distributed;
 use self::fanout::{
     MetadataFanoutOperation, MetadataNodeCall, fanout_bearer, metadata_node_call, query_union_safe,
     run_metadata_fanout,
 };
+pub use self::fanout::{lookup_identifier_distributed, search_buckets_distributed};
 #[cfg(test)]
 use self::list::{
     ANONYMOUS_METADATA_LIMIT, ESTIMATE_MIN_LIMIT, LIST_METADATA_LIMIT, MAX_METADATA_LIMIT,
