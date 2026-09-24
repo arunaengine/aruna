@@ -209,11 +209,19 @@ async fn merge(
             .unwrap_or(Value::Null);
         json_base = metadata_file(directory, old).await;
     }
+    // Scaffolded documents have no raw revision until their first replacement.
     let current =
-        aruna_blob::git::metadata_request(&format!("{url}/rocrate?view=raw"), token, None).await?;
-    let current: Value = serde_json::from_slice(&current)?;
+        match aruna_blob::git::metadata_request(&format!("{url}/rocrate?view=raw"), token, None)
+            .await
+        {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes)?["raw"].take(),
+            Err(_) => serde_json::from_slice::<Value>(
+                &aruna_blob::git::metadata_request(&format!("{url}/rocrate"), token, None).await?,
+            )?["rocrate"]
+                .take(),
+        };
     let merged = aruna_blob::arc::convert(json!({"mode": "merge",
-        "graph": serde_json::to_string(&current["raw"])?, "base": base, "new": derived,
+        "graph": serde_json::to_string(&current)?, "base": base, "new": derived,
         "json_base": json_base, "json_new": metadata_file(directory, new).await}))
     .await?;
     if let Some(error) = merged["error"].as_str() {
