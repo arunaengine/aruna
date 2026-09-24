@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::test_support::test_endpoint;
+use ::irokle::sync::SyncData;
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
