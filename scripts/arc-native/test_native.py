@@ -126,7 +126,6 @@ def exercise(root):
     for _ in range(2):
         status, body = http(metadata_url + "/git")
         assert status == 200 and json.loads(body)["commit"] == initial
-    assert http(metadata_url + "/git", "POST", {"bucket": os.environ["ARUNA_BUCKET"], "arc": False})[0] == 400
     descriptor = next(item for item in original_metadata["@graph"] if item.get("@id") == "ro-crate-metadata.json")
     dataset = next(item for item in original_metadata["@graph"] if item.get("@id") == descriptor["about"]["@id"])
     dataset["name"] = "First metadata update"

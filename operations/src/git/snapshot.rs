@@ -43,11 +43,13 @@ async fn execute(store: &GitStore, effect: GitEffect, actor: UserId) -> Result<G
         .map_err(|_| GitError::Unavailable)
 }
 
-/// The materialized graph this node would snapshot, if it is ready.
+/// The materialized graph this node would snapshot, if it is ready. During materialization
+/// the graph is current before its status says so, which `materializing` states.
 async fn current(
     context: &DriverContext,
     document: &MetadataRegistryRecord,
     revision: Option<&MetadataRawRevision>,
+    materializing: bool,
 ) -> Result<Option<(Ulid, String)>, GitError> {
     let raw = match revision {
         Some(revision) => Some(revision.clone()),
@@ -66,7 +68,7 @@ async fn current(
     )
     .await?;
     if !projected.is_some_and(|status| {
-        status.state == MaterializationState::Materialized
+        (materializing || status.state == MaterializationState::Materialized)
             && status.event_id == document.last_event_id
     }) {
         return Ok(None);
@@ -205,7 +207,7 @@ pub async fn refresh(
     store: &GitStore,
     document: &MetadataRegistryRecord,
 ) -> Result<Projection, GitError> {
-    update(context, store, document, None).await
+    update(context, store, document, None, false).await
 }
 
 async fn update(
@@ -213,11 +215,12 @@ async fn update(
     store: &GitStore,
     document: &MetadataRegistryRecord,
     revision: Option<&MetadataRawRevision>,
+    materializing: bool,
 ) -> Result<Projection, GitError> {
     let mut projection = project(context, store, document).await?;
     let leading = first(context, &projection.holders);
     let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
-    if let Some(source) = current(context, document, revision).await?
+    if let Some(source) = current(context, document, revision, materializing).await?
         && projection
             .state
             .revision
@@ -249,7 +252,7 @@ pub async fn capture(
         return Ok(());
     };
     let _guard = lock(record.document_id).await;
-    match update(context, store, record, revision).await {
+    match update(context, store, record, revision, true).await {
         Ok(_) | Err(GitError::NotHolder) => Ok(()),
         Err(error) => Err(error),
     }
