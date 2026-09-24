@@ -2029,7 +2029,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.3.0"
-source = "git+https://github.com/arunaengine/craqle?rev=280973da1b5b36428633b66f3b6f61832edb95c4#280973da1b5b36428633b66f3b6f61832edb95c4"
+source = "git+https://github.com/arunaengine/craqle?rev=9100687b19c6b2184c444a86fe6ad6ef4282e1ed#9100687b19c6b2184c444a86fe6ad6ef4282e1ed"
 dependencies = [
  "blake3",
  "chrono",
