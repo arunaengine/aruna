@@ -100,6 +100,7 @@ async fn pid_placement_fence() {
         aruna_core::structs::secondary_id::SecondaryIdKind::Doi,
         "10.5281/zenodo.3120",
         None,
+        aruna_core::structs::secondary_id::IdentifierOrigin::Published,
     )
     .unwrap();
     valid.secondary_identifiers.insert(doi.clone());
@@ -175,7 +176,7 @@ async fn pid_placement_fence() {
         read_storage_value(
             &storage,
             aruna_core::keyspaces::SECONDARY_ID_KEYSPACE,
-            ByteView::from(doi.index_key()),
+            ByteView::from(doi.index_key(valid_document)),
         )
         .await
         .as_deref(),

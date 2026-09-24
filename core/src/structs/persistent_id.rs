@@ -9,7 +9,7 @@ use crate::errors::ConversionError;
 use crate::keyspaces::SECONDARY_ID_KEYSPACE;
 use crate::structs::execution::job::JobId;
 use crate::structs::placement::record::PlacementRef;
-use crate::structs::secondary_id::SecondaryIdentifier;
+use crate::structs::secondary_id::{SecondaryIdentifier, insert_identifier};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -97,8 +97,8 @@ pub struct PersistentIdMapping {
     pub withdrawn_by: Option<UserId>,
     pub withdrawal_reason: Option<String>,
     pub revision: PersistentIdRevision,
-    /// External identifiers such as repository DOIs. A grow-only set, so every merge order
-    /// converges; the reverse index is written with each row that carries them.
+    /// External identifiers such as repository DOIs. A grow-only set where `Published` outranks
+    /// `Imported`, so every merge order converges. Live rows keep reverse index rows.
     pub secondary_identifiers: BTreeSet<SecondaryIdentifier>,
 }
 
@@ -274,9 +274,20 @@ impl PersistentIdMapping {
             self.minted_at_ms = Some(minted_at_ms);
             self.minted_by = incoming.minted_by;
         }
-        self.secondary_identifiers
-            .extend(incoming.secondary_identifiers.iter().cloned());
+        self.add_identifiers(incoming.secondary_identifiers.iter().cloned());
         *self != before
+    }
+
+    /// Unions identifiers with the origin rule and returns whether any changed.
+    pub fn add_identifiers(
+        &mut self,
+        identifiers: impl IntoIterator<Item = SecondaryIdentifier>,
+    ) -> bool {
+        let mut changed = false;
+        for identifier in identifiers {
+            changed |= insert_identifier(&mut self.secondary_identifiers, identifier);
+        }
+        changed
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -295,6 +306,10 @@ fn status_supersedes(local: &PersistentIdMapping, incoming: &PersistentIdMapping
         // The first terminal transition wins and remains the durable cause.
         (true, true) => revision_key(incoming.revision) < revision_key(local.revision),
         (false, false) => match (local.status, incoming.status) {
+            // Identifier additions advance an active row, so the later one must win.
+            (PersistentIdStatus::Active, PersistentIdStatus::Active) => {
+                revision_key(incoming.revision) > revision_key(local.revision)
+            }
             (PersistentIdStatus::Active, _) => false,
             (_, PersistentIdStatus::Active) => true,
             _ => revision_key(incoming.revision) > revision_key(local.revision),
@@ -306,20 +321,40 @@ fn revision_key(revision: PersistentIdRevision) -> (u64, Ulid) {
     (revision.occurred_at_ms, revision.event_id)
 }
 
-/// Reverse index rows for every secondary identifier of the mapping, pointing at its document.
-/// Writing them again is idempotent, so each writer of the row writes all of them.
+/// Reverse index rows of a live mapping, pointing at its document. Writing them again is
+/// idempotent, so each writer of the row writes all of them. Retired rows keep none.
 pub fn secondary_index_entries(mapping: &PersistentIdMapping) -> Vec<(String, ByteView, ByteView)> {
-    mapping
-        .secondary_identifiers
-        .iter()
-        .map(|identifier| {
+    if mapping.is_retired() {
+        return Vec::new();
+    }
+    secondary_index_keys(mapping)
+        .map(|(keyspace, key)| {
             (
-                SECONDARY_ID_KEYSPACE.to_string(),
-                ByteView::from(identifier.index_key()),
+                keyspace,
+                key,
                 ByteView::from(mapping.target.to_bytes().to_vec()),
             )
         })
         .collect()
+}
+
+/// Reverse index rows a retired mapping removes; empty while the mapping is live.
+pub fn secondary_index_deletes(mapping: &PersistentIdMapping) -> Vec<(String, ByteView)> {
+    if !mapping.is_retired() {
+        return Vec::new();
+    }
+    secondary_index_keys(mapping).collect()
+}
+
+fn secondary_index_keys(
+    mapping: &PersistentIdMapping,
+) -> impl Iterator<Item = (String, ByteView)> + '_ {
+    mapping.secondary_identifiers.iter().map(|identifier| {
+        (
+            SECONDARY_ID_KEYSPACE.to_string(),
+            ByteView::from(identifier.index_key(mapping.target)),
+        )
+    })
 }
 
 /// Mapping key: the document id alone, so a re-mint resolves the same row.
@@ -362,6 +397,7 @@ pub struct MintPersistentSpec {
 mod tests {
     use super::*;
     use crate::structs::identity::realm::RealmId;
+    use crate::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 
     fn user() -> UserId {
         UserId::local(Ulid::from_bytes([2; 16]), RealmId([3; 32]))
@@ -473,29 +509,67 @@ mod tests {
         assert!(mapping.is_active());
     }
 
+    fn doi(value: &str, origin: IdentifierOrigin) -> SecondaryIdentifier {
+        SecondaryIdentifier::new(SecondaryIdKind::Doi, value, None, origin).unwrap()
+    }
+
     #[test]
     fn merge_unions_identifiers() {
-        use crate::structs::secondary_id::SecondaryIdKind;
         let id = Ulid::from_bytes([1; 16]);
-        let doi = |value| SecondaryIdentifier::new(SecondaryIdKind::Doi, value, None).unwrap();
         let mut left = active_mapping(id, revision(1, 5));
-        left.secondary_identifiers.insert(doi("10.1/a"));
+        left.secondary_identifiers
+            .insert(doi("10.1/a", IdentifierOrigin::Imported));
+        left.revision = revision(2, 6);
         let mut right = active_mapping(id, revision(1, 5));
-        right.secondary_identifiers.insert(doi("10.1/b"));
+        right
+            .secondary_identifiers
+            .insert(doi("10.1/b", IdentifierOrigin::Published));
+        right
+            .secondary_identifiers
+            .insert(doi("10.1/a", IdentifierOrigin::Published));
+        right.revision = revision(3, 7);
 
         let mut forward = left.clone();
         assert!(forward.merge(&right));
         let mut backward = right.clone();
-        assert!(backward.merge(&left));
+        assert!(!backward.merge(&left));
         assert_eq!(forward, backward);
-        assert_eq!(forward.secondary_identifiers.len(), 2);
+        // The later revision wins, so holders record the same sync revision.
+        assert_eq!(forward.revision, revision(3, 7));
+        assert_eq!(
+            forward.secondary_identifiers,
+            BTreeSet::from([
+                doi("10.1/a", IdentifierOrigin::Published),
+                doi("10.1/b", IdentifierOrigin::Published),
+            ])
+        );
         assert!(!forward.clone().merge(&left));
 
         let entries = secondary_index_entries(&forward);
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|(keyspace, _, value)| {
-            keyspace == SECONDARY_ID_KEYSPACE && value.as_ref() == id.to_bytes()
+        assert!(entries.iter().all(|(keyspace, key, value)| {
+            keyspace == SECONDARY_ID_KEYSPACE
+                && key.ends_with(&id.to_bytes())
+                && value.as_ref() == id.to_bytes()
         }));
+        assert!(secondary_index_deletes(&forward).is_empty());
+    }
+
+    #[test]
+    fn retired_drops_index() {
+        let id = Ulid::from_bytes([1; 16]);
+        let mut mapping = active_mapping(id, revision(1, 5));
+        mapping
+            .secondary_identifiers
+            .insert(doi("10.1/a", IdentifierOrigin::Imported));
+        assert!(mapping.mark_tombstoned(revision(2, 6)));
+        assert!(secondary_index_entries(&mapping).is_empty());
+        let deletes = secondary_index_deletes(&mapping);
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(
+            deletes[0].1.as_ref(),
+            doi("10.1/a", IdentifierOrigin::Imported).index_key(id)
+        );
     }
 
     #[test]

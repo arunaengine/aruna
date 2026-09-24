@@ -436,6 +436,7 @@ pub(in crate::document_sync) async fn store_pid_mapping(
             ),
         )];
         writes.extend(secondary_index_entries(&merged));
+        let deletes = secondary_index_deletes(&merged);
         writes.push(
             sync_revision_entry(&target, &change)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -445,7 +446,7 @@ pub(in crate::document_sync) async fn store_pid_mapping(
         {
             writes.push(entry);
         }
-        match replace_batch_in(storage, txn_id, Vec::new(), writes).await {
+        match replace_batch_in(storage, txn_id, deletes, writes).await {
             Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(true)),
             Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = storage

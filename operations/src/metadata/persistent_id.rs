@@ -21,7 +21,7 @@ use aruna_core::structs::storage::metadata_registry::{
 };
 use aruna_core::structs::{
     PersistentIdFailure, PersistentIdMapping, PersistentIdRevision, persistent_id_change,
-    persistent_id_key, persistent_id_target, secondary_index_entries,
+    persistent_id_key, persistent_id_target, secondary_index_deletes, secondary_index_entries,
 };
 use aruna_core::types::TxnId;
 use byteview::ByteView;
@@ -437,6 +437,7 @@ async fn admin_withdraw_txn(
         ),
     ));
     write_entries(ctx, writes, txn_id).await?;
+    delete_entries(ctx, secondary_index_deletes(&mapping), txn_id).await?;
     Ok(Some(mapping))
 }
 
@@ -530,6 +531,30 @@ async fn write_entries(
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
         other => Err(PersistentIdError::Unavailable(format!(
             "unexpected persistent id write event: {other:?}"
+        ))),
+    }
+}
+
+async fn delete_entries(
+    ctx: &DriverContext,
+    deletes: Vec<(String, ByteView)>,
+    txn_id: TxnId,
+) -> Result<(), PersistentIdError> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    match ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
+        other => Err(PersistentIdError::Unavailable(format!(
+            "unexpected persistent id delete event: {other:?}"
         ))),
     }
 }
