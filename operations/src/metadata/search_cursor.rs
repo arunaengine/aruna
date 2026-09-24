@@ -367,6 +367,12 @@ pub(super) fn compare_hits(left: &MetadataSearchHit, right: &MetadataSearchHit) 
     )
 }
 
+/// Orders equal-score `(graph, subject)` candidates as watermarks do; a node
+/// that cuts candidates before paging must cut them in this order.
+pub(super) fn tie_order(left: (&str, &str), right: (&str, &str)) -> Ordering {
+    rank_order((0.0, left.0, left.1), (0.0, right.0, right.1))
+}
+
 /// Turn merged node results into one page plus an optional continuation.
 /// `watermark` drops hits already emitted in merged order; a page continues
 /// while any node is saturated, and paging stops at `max_depth`.
@@ -866,6 +872,44 @@ mod pure_tests {
             .map(|hit| hit.subject_iri.as_str())
             .collect();
         assert_eq!(subjects, vec!["./a"]);
+    }
+
+    #[test]
+    fn tie_cut_pages() {
+        // A node that cuts equal-score candidates in `tie_order` pages without loss,
+        // although 01C precedes 01A there and would be cut after it by document id.
+        let candidates = vec![hit("01A", "./root", 1.0), hit("01C", "./root", 1.0)];
+        let cut = |depth: usize| {
+            let mut hits = candidates.clone();
+            hits.sort_by(|left, right| {
+                tie_order(
+                    (&left.graph_iri, &left.subject_iri),
+                    (&right.graph_iri, &right.subject_iri),
+                )
+            });
+            hits.truncate(depth);
+            hits
+        };
+        assert_eq!(cut(1)[0].document_id, "01C");
+
+        let mut watermark = None;
+        let mut emitted = Vec::new();
+        for depth in 1..=candidates.len() {
+            let page = paginate(
+                vec![NodeSearchResult {
+                    node_id: node_id(1),
+                    hits: cut(depth),
+                    saturated: depth < candidates.len(),
+                }],
+                watermark,
+                1,
+                MAX_PAGINATION_DEPTH,
+            );
+            emitted.extend(page.hits.into_iter().map(|hit| hit.document_id));
+            watermark = page.next.map(|next| next.watermark);
+        }
+        assert_eq!(emitted, vec!["01C", "01A"]);
+        assert!(watermark.is_none());
     }
 
     #[test]

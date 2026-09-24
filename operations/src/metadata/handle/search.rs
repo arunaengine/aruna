@@ -31,7 +31,7 @@ use super::{
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::driver::DriverContext;
 use crate::metadata::query_cache::ScopeDigest;
-use crate::metadata::search_cursor::{MAX_PAGINATION_DEPTH, compare_hits};
+use crate::metadata::search_cursor::{MAX_PAGINATION_DEPTH, compare_hits, tie_order};
 use crate::metadata::search_enrichment::{hit_title, hit_types};
 
 #[tracing::instrument(
@@ -281,8 +281,8 @@ async fn search_candidate_graphs(
                 graph_iris: allowed_graphs,
             }),
         );
-        // The page is ordered by document id alone, so it is cut before the
-        // describes instead of enriching every candidate.
+        // Every hit scores the same, so the page is cut in watermark tie order
+        // before the describes instead of enriching every candidate.
         let mut candidates = allowed_records
             .into_iter()
             .filter_map(|record| {
@@ -290,7 +290,12 @@ async fn search_candidate_graphs(
                 Some((record, subject_iri))
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(record, _)| record.document_id);
+        candidates.sort_by(|(left, left_subject), (right, right_subject)| {
+            tie_order(
+                (&left.graph_iri, left_subject),
+                (&right.graph_iri, right_subject),
+            )
+        });
         candidates.truncate(limit);
         let targets = candidates
             .iter()
