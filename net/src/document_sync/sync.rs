@@ -355,7 +355,13 @@ impl DocumentSyncService {
 
     async fn sync_batch_with(&self, peer: PeerId, topic_ids: Vec<::irokle::TopicId>) -> Result<()> {
         let peer_addr = peer_endpoint_addr(peer)?;
-        let results = self.net.sync_topics_now(peer_addr, &topic_ids).await;
+        // Irokle bounds each exchange, but not the wait for an outbound slot.
+        let results = timeout(
+            PEER_SYNC_TIMEOUT,
+            self.net.sync_topics_now(peer_addr, &topic_ids),
+        )
+        .await
+        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?;
         finish_batch_sync(peer, &results)
     }
 
@@ -515,7 +521,12 @@ impl DocumentSyncService {
             )));
         }
 
-        let results = self.net.sync_topics_now(peer_addr, &[topic_id]).await;
+        let results = timeout(
+            PEER_SYNC_TIMEOUT,
+            self.net.sync_topics_now(peer_addr, &[topic_id]),
+        )
+        .await
+        .map_err(|_| NetError::Timeout(PEER_SYNC_TIMEOUT))?;
         finish_batch_sync(peer, &results)
     }
 }
