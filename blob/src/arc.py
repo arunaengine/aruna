@@ -198,7 +198,10 @@ def inspect(root, require_data=True):
     root_entity = next(item for item in document["@graph"] if item.get("@id") == "./")
     # ARCtrl adds wall-clock export time, which cannot define a stable Git object.
     root_entity.pop("sdDatePublished", None)
-    if arc.License is not None:
+    if not (root / "LICENSE").is_file() and root_entity.pop("license", None) is not None:
+        # Without a LICENSE file ARCtrl reports its own default text, which nobody stated.
+        document["@graph"] = [item for item in document["@graph"] if item.get("@id") != "#LICENSE"]
+    elif arc.License is not None:
         content = arc.License.Content.strip()
         url = urlsplit(content)
         if url.scheme in ("http", "https") and url.netloc and not any(char.isspace() for char in content):
@@ -302,7 +305,7 @@ def identities(graph, root, wanted):
 
 
 def apply(graph, root, base, new):
-    """Applies the values changed from base to new onto graph; other graph values stay."""
+    """Applies the values changed from base to new onto graph; without base, new values win."""
     before, after = entities(base), entities(new)
     changed = [identifier for identifier in sorted(set(before) | set(after))
                if identifier != "ro-crate-metadata.json"
@@ -330,11 +333,13 @@ def apply(graph, root, base, new):
         entity = graph.setdefault(target, {"@id": target})
         old, current = properties(before.get(identifier)), properties(current)
         for name in sorted(set(old) | set(current)):
+            key = next((key for key in entity if key != "@id" and term(key) == name), name)
             previous = {canon(local(value)) for value in old.get(name, [])}
+            if base is None and name in current:
+                previous = {canon(value) for value in listed(entity.get(key))}
             values = [local(value) for value in current.get(name, [])]
             if previous == {canon(value) for value in values}:
                 continue
-            key = next((key for key in entity if key != "@id" and term(key) == name), name)
             kept = [value for value in listed(entity.get(key)) if canon(value) not in previous]
             for value in values:
                 if canon(value) not in {canon(item) for item in kept}:
@@ -362,8 +367,8 @@ def merge(request):
     if root not in graph:
         raise ValueError("RO-Crate root Dataset is required")
     before = canon(document)
-    if request.get("json_new") is not None and request.get("json_base") != request["json_new"]:
-        apply(graph, root, json.loads(request["json_base"] or "{}"), json.loads(request["json_new"]))
+    if None not in (request.get("json_base"), request.get("json_new")):
+        apply(graph, root, json.loads(request["json_base"]), json.loads(request["json_new"]))
     apply(graph, root, request.get("base"), request["new"])
     document["@graph"] = list(graph.values())
     return {"jsonld": None if canon(document) == before else json.dumps(document)}

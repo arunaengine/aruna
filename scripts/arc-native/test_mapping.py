@@ -298,6 +298,10 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(entities["ro-crate-metadata.json"], graph["@graph"][0])
         repeated = conversion.convert({"mode": "merge", "graph": json.dumps(merged), "base": new, "new": new})
         self.assertIsNone(repeated["jsonld"])
+        first = json.loads(conversion.convert({"mode": "merge", "graph": json.dumps(graph), "base": None, "new": new})["jsonld"])
+        root = next(item for item in first["@graph"] if item["@id"] == "urn:aruna:source")
+        self.assertEqual(root["name"], "Edited in ARCitect")
+        self.assertNotIn("license", root)
 
     def test_git_removals(self):
         graph = source()
