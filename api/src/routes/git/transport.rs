@@ -74,7 +74,7 @@ pub async fn advertise(
 #[utoipa::path(post, path = "/git/{repository}/{service}", tag = "metadata/git",
     security(("bearer_auth" = []), ("basic_auth" = [])),
     summary = "Execute native Git fetch or push",
-    description = "Executes the requested Git smart HTTP service.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password; upload-pack requires READ and receive-pack requires WRITE.\n\n**Behavior**: ARC validation and LFS availability checks precede ref publication. Atomic pushes use Git's native transaction support.",
+    description = "Executes the requested Git smart HTTP service.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password; upload-pack requires READ and receive-pack requires WRITE.\n\n**Behavior**: ARC validation and LFS availability checks precede ref publication. A push to main then merges its ISA and aruna-metadata.json changes into the metadata document as the pushing user; a refused update rejects the push. Atomic pushes use Git's native transaction support.",
     params(("repository" = String, Path, description = "Document ID followed by .git"),
            ("service" = String, Path, description = "git-upload-pack or git-receive-pack")),
     responses((status = 200, description = "Git protocol result", content_type = "application/x-git-upload-pack-result"),

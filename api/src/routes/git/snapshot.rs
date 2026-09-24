@@ -29,7 +29,7 @@ pub struct RepositoryStatus {
 
 #[utoipa::path(get, path = "/metadata/{document_id}/git", tag = "metadata/git",
     security(("bearer_auth" = [])), summary = "Get the automatic ARC repository",
-    description = "Returns the automatic ARC repository and its conversion status.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: missing repositories are generated on their fixed owner. The protected aruna branch tracks graph snapshots. A conversion error means no new valid snapshot was published.",
+    description = "Returns the automatic ARC repository and its conversion status.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: missing repositories are generated on their fixed owner. The protected aruna branch tracks graph snapshots, which are also merged into main. A conversion error means no new valid snapshot was published.",
     params(("document_id" = String, Path, description = "Metadata document ID")),
     responses((status = 200, description = "Repository and conversion status", body = RepositoryStatus,
                example = json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","bucket":"arc-storage","revision":"01M000000000000000000000001","commit":"1111111111111111111111111111111111111111","error":null})),

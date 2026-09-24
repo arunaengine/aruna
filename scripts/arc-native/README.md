@@ -32,7 +32,7 @@ Native Git passwords are bearer tokens, not S3 access secrets. Use HTTPS outside
 The server supports multiple branches, merges through normal fast-forward ref updates,
 lightweight and annotated commit tags, atomic pushes, and branch/tag deletion. Non-fast-
 forward branch replacement and replacement of an existing tag are refused. The `aruna`
-branch is reserved for server-generated metadata snapshots. Tags must
+branch is reserved for server-generated metadata snapshots and `main` cannot be deleted. Tags must
 resolve to commits. Symlinks, submodules and alternate `.lfsconfig` endpoints are currently
 rejected. Git request/response bodies are bounded to 64 MiB; LFS uploads use the node's
 RO-Crate source-size limit and stream to storage. Receive validation accepts at most
@@ -80,14 +80,22 @@ The two editing paths have explicit revision boundaries:
 - `aruna-metadata.json` retains the exact selected Aruna JSON-LD, including its original
   1.2/1.3 context, identifiers and fields outside ISA. The ARCtrl-derived representation
   uses its supported RO-Crate 1.2 context. Additional source information is not discarded.
-- The protected `aruna` branch records signed snapshots. `main` starts at the same commit
-  and follows graph updates while it still equals the previous snapshot. If a client has
-  changed `main`, it remains intact; the new graph snapshot stays on `aruna` for an explicit merge.
+- The protected `aruna` branch records signed snapshots. Each commit names its source event in
+  an `Aruna-Revision` trailer. `main` fast-forwards while it still equals the previous snapshot.
+- After a client changed `main`, graph edits arrive as a signed merge commit with parents `main`
+  and `aruna`. It updates `aruna-metadata.json` and the derived `ro-crate-metadata.json`. ISA
+  workbooks are replaced only when their ISA meaning differs from the graph. Client files,
+  data and LFS pointers stay. Pull before the next push, as with any shared Git branch.
+- A push to `main` merges into the metadata document before its refs move. Only values changed
+  between the old and new `main` are applied, from the ISA workbooks and `aruna-metadata.json`.
+  Graph fields that ISA cannot express, such as keywords or custom properties, stay. ISA ids
+  such as `#Person_Ada_Lovelace` are matched to existing graph entities. The update runs as the
+  pushing user through the normal RO-Crate replace operation. If it is refused, so is the push.
 - Push preserves incoming commit IDs and spreadsheet bytes. Obtain current ISA-derived
   metadata for any branch, tag or commit through
   `GET /api/v1/metadata/{id}/git/rocrate?revision=main`. The response names the exact resolved
-  commit. A stale JSON-LD file committed by a client is not used as the ISA source of truth.
-- A pushed branch does not silently replace the collaborative graph or another branch.
+  commit. A stale derived `ro-crate-metadata.json` committed by a client is not used.
+- Other branches are drafts: they never change the metadata document until merged into `main`.
   LFS uploads store bytes and exact versions; ISA annotations determine their scientific role.
 
 Referenced local data must be supplied through Git/LFS. Generation can reuse files already
