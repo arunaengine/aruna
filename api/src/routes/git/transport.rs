@@ -166,6 +166,7 @@ async fn serve(
         token: token.ok_or(ServerError::Unauthorized)?.as_str().to_string(),
         lfs_url: format!("{}/info/lfs/objects/batch", base_url(&state, id).await?),
         metadata_url: format!("{}/metadata/{id}", api_url(&state).await?),
+        push_key: String::new(),
     };
     let result = git::transport(
         &state.get_ctx(),

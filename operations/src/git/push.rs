@@ -6,7 +6,7 @@ use super::state::{Ancestry, GitState, reduce};
 use super::{GitError, objects, publish, records};
 use crate::driver::DriverContext;
 use aruna_core::git::{
-    GitChange, GitRecord, LfsObject, RefUpdate, StoredObject, valid_path, valid_ref,
+    GitChange, GitRecord, LfsObject, RefUpdate, StoredObject, ZERO_OID, valid_path, valid_ref,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -57,11 +57,14 @@ fn objects_in(pack: &[u8]) -> u32 {
 pub async fn accept(
     context: &DriverContext,
     auth: &AuthContext,
-    id: Ulid,
+    (id, key): (Ulid, &str),
     request: PushRequest,
     pack: Bytes,
 ) -> Result<GitRecord, GitError> {
     let (document, _) = super::repository(context, auth, id, Permission::WRITE).await?;
+    if !super::push_key_valid(id, key) {
+        return Err(GitError::NotHook);
+    }
     if request.refs.is_empty()
         || request.lfs.len() + request.paths.len() > MAX_ITEMS
         || !request
@@ -73,6 +76,20 @@ pub async fn accept(
         return Err(GitError::Invalid);
     }
     let (state, _) = reduce(&records::scan(context, id).await?, &Ancestry::new());
+    for update in &request.refs {
+        if update.name == "refs/heads/main" && update.new == ZERO_OID {
+            return Err(GitError::Refused(
+                "the main branch cannot be deleted".into(),
+            ));
+        }
+        let current = state
+            .refs
+            .get(&update.name)
+            .map_or(ZERO_OID, String::as_str);
+        if current != update.old {
+            return Err(GitError::Stale);
+        }
+    }
     unlocked(&state, auth, &request.paths)?;
     let mut lfs = Vec::with_capacity(request.lfs.len());
     for oid in &request.lfs {

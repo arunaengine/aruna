@@ -59,6 +59,8 @@ pub struct GitRequest {
     pub token: String,
     pub lfs_url: String,
     pub metadata_url: String,
+    /// Proves to the push endpoint that a call comes from this push's receive hook.
+    pub push_key: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

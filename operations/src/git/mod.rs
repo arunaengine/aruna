@@ -26,6 +26,8 @@ use aruna_core::git::{GitEffect, GitEvent, GitRepository, GitRequest};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use std::collections::HashMap;
+use std::sync::LazyLock;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -55,6 +57,8 @@ pub enum GitError {
     Refused(String),
     #[error("the merge has conflicts")]
     MergeConflict(Box<MergeConflict>),
+    #[error("only a push's own receive hook may record it")]
+    NotHook,
 }
 
 /// Why a merge could not be completed; nothing was changed.
@@ -137,15 +141,64 @@ pub async fn transport(
         } else {
             Permission::READ
         };
+    let write = permission == Permission::WRITE;
     let (document, repository) =
         repository(context, auth, request.repository.document_id, permission).await?;
     if repository != request.repository {
         return Err(GitError::Conflict);
     }
+    let mut request = request;
     let _guard = project::lock(document.document_id).await;
     snapshot::refresh(context, store, &document).await?;
+    let _key = write.then(|| {
+        let key = PushKey::open(document.document_id);
+        request.push_key = key.value.clone();
+        key
+    });
     store
         .execute(GitEffect::Http(Box::new(request)), auth.user_id)
         .await
         .map_err(|_| GitError::Unavailable)
+}
+
+/// Keys of receive-pack requests running on this node, one per document under its lock.
+static PUSH_KEYS: LazyLock<std::sync::Mutex<HashMap<Ulid, String>>> =
+    LazyLock::new(Default::default);
+
+/// A push key that is valid while the receive-pack request that created it runs.
+struct PushKey {
+    document_id: Ulid,
+    value: String,
+}
+
+impl PushKey {
+    fn open(document_id: Ulid) -> Self {
+        let value = hex::encode(rand::random::<[u8; 32]>());
+        if let Ok(mut keys) = PUSH_KEYS.lock() {
+            keys.insert(document_id, value.clone());
+        }
+        Self { document_id, value }
+    }
+}
+
+impl Drop for PushKey {
+    fn drop(&mut self) {
+        if let Ok(mut keys) = PUSH_KEYS.lock() {
+            keys.remove(&self.document_id);
+        }
+    }
+}
+
+/// Whether `key` belongs to the push now running for the document.
+pub fn push_key_valid(document_id: Ulid, key: &str) -> bool {
+    PUSH_KEYS.lock().is_ok_and(|keys| {
+        keys.get(&document_id).is_some_and(|expected| {
+            expected.len() == key.len()
+                && expected
+                    .bytes()
+                    .zip(key.bytes())
+                    .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+                    == 0
+        })
+    })
 }

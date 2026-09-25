@@ -100,6 +100,7 @@ fn map_error(error: GitError) -> ServerError {
         GitError::Stale => ServerError::PreconditionFailed(error.to_string()),
         GitError::Exists | GitError::MergeConflict(_) => ServerError::Conflict(error.to_string()),
         GitError::Refused(reason) => ServerError::BadRequestMessage(reason),
+        GitError::NotHook => ServerError::Forbidden,
     }
 }
 
@@ -119,23 +120,29 @@ async fn base_url(state: &ServerState, id: Ulid) -> ServerResult<String> {
 #[utoipa::path(post, path = "/metadata/{document_id}/git/push", tag = "metadata/git",
     security(("bearer_auth" = [])),
     summary = "Record a validated native Git push",
-    description = "Stores the objects of one push and publishes its ref updates to every holder of the document.\n\n**Authentication**: realm bearer token with WRITE on the document.\n\n**Behavior**: called by the node's own receive hook before Git moves refs. The body is a four-byte big-endian length, a JSON object with `refs`, `lfs` and `paths`, then the Git pack. Paths locked by another user or unknown LFS objects refuse the push.",
+    description = "Stores the objects of one push and publishes its ref updates to every holder of the document.\n\n**Authentication**: realm bearer token with WRITE on the document.\n\n**Behavior**: only the node's own receive hook may call it, proven by the `X-Aruna-Push-Key` header of the running push; other calls answer 403. It is called before Git moves refs. The body is a four-byte big-endian length, a JSON object with `refs`, `lfs` and `paths`, then the Git pack. Paths locked by another user or unknown LFS objects refuse the push.",
     params(("document_id" = String, Path, description = "Metadata document ID")),
     request_body(content = Vec<u8>, content_type = "application/x-aruna-git-push"),
     responses((status = 204, description = "Push recorded"), (status = 400, description = "Malformed push"),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
               (status = 404, description = "Document missing or not held by this node"),
               (status = 409, description = "A changed path is locked by another user"),
+              (status = 412, description = "A ref moved since the push started"),
               (status = 503, description = "Records or storage unavailable")))]
 pub async fn push(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(id): Path<Ulid>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> ServerResult<StatusCode> {
     let auth = require_realm_auth(&state, auth)?;
     let (request, pack) = git::push::decode(body).map_err(map_error)?;
-    git::push::accept(&state.get_ctx(), &auth, id, request, pack)
+    let key = headers
+        .get("x-aruna-push-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    git::push::accept(&state.get_ctx(), &auth, (id, key), request, pack)
         .await
         .map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
