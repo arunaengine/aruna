@@ -1299,9 +1299,11 @@ pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused. Reads are
 self-scoped: only the job's own submitter may read it, and anybody else's job answers 404, so the
-surface never confirms that an id exists. There are two exceptions. A persistent-id minting job
-the caller joined is readable while the caller holds WRITE on the document it mints for. A
-repository link push is readable by admins of the link's group, who may manage the link.
+surface never confirms that an id exists.
+
+There are two exceptions. A persistent-id minting job the caller joined is readable while the
+caller holds WRITE on the document it mints for. A repository link push is readable by admins of
+the link's group, who may manage the link.
 
 **Behavior**
 - `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or
