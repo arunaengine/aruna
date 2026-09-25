@@ -284,25 +284,36 @@ The native REST API publishes crates to repositories and imports records through
 The routes are generic; Invenio (including Zenodo) is the first repository kind.
 `GET /api/v1/metadata/repository/kinds` lists every kind that can publish, with its
 `capabilities` (`drafts`, `reserve_identifier`, `versions`, `review`, `pull`, `search`,
-`release_date` and `identifier_kind`), its requirement `profiles` and its mapping rule `targets`.
-An action the kind cannot do answers 400 with code `not_supported`. Harvest-only kinds such as
-`oai_pmh` are not listed.
+`import`, `release_date` and `identifier_kind`), its requirement `profiles` and its mapping rule
+`targets`. An action the kind cannot do answers 400 with code `not_supported`: publishing,
+checks and links need a kind that publishes, `parent_id` and `published_id` need `versions`,
+imports need `import`, `keep_updated` needs `pull`, and DOI or URL lookups need `search`. Record
+ids are checked by the kind. A connector keeps its kind; replacing it with another kind answers
+400. Harvest-only kinds such as `oai_pmh` are not listed.
 
 A repository's requirements have three layers, all reported as Profile validation findings
 (`code`, `severity`, `focus_node`, `path`, `rule`, `message`). Built-in SHACL requirement
 Profiles check the crate metadata: `https://w3id.org/aruna/profiles/repository/zenodo` needs the
-DataCite fields (title, publication date, creators with a name or family name, and a license as
-a warning), and `https://w3id.org/aruna/profiles/repository/invenio` also needs a `publisher`,
-as text or as an entity with a `name`. Zenodo endpoints use the first, other InvenioRDM instances
-the second. Mapping rules, embedded as JSON data per kind, say which crate entities become which
-repository objects and fields and report `mapping_violation`. Content rules check the files in
-the export job before any repository write and report `content_violation`; an Invenio record
-holds at most 100 files. Only the crate satisfies requirements; `metadata` overrides never do.
+DataCite fields (one plain text title and publication date, creators from `author` and `creator`
+with a name or family name, and a license as a warning), and
+`https://w3id.org/aruna/profiles/repository/invenio` also needs a `publisher`, as text or as an
+entity with a `name`. Zenodo endpoints use the first, other InvenioRDM instances the second.
+Mapping rules, embedded as JSON data per kind, say which crate entities become which repository
+objects and fields. They can group entities (with file pairs such as `_1` and `_2`) and require
+relations with a minimum, maximum or exact count, in either direction; breaks report
+`mapping_violation`. Content rules limit the files of a target (count, file size, total size and
+a `fastq`, `bam` or `cram` format read from the first bytes, also inside gzip or BGZF) and report
+`content_violation`. The check and the export count the same files: an Invenio record holds at
+most 100 files, and the crate metadata and export report count as two of them. Rules that the
+node would not evaluate never load. Only the crate satisfies requirements; `metadata` overrides
+never do, and a record whose mapped fields lack a required field, for example creators cleared
+by an override, fails the job before any repository write.
 
 `POST /api/v1/metadata/{document_id}/repository/check` with `group_id`, `connector_id` and an
 optional `metadata` object checks the dataset without storing or sending anything. It answers
-`kind`, `profile` (`iri`, `revision`), `ready` (no finding is a violation), `findings` and
-`mapping`, which says what each crate entity becomes. It requires READ on the dataset and on the
+`kind`, `profile` (`iri`, `revision`), `ready` (no finding is a violation), `findings` (at most
+100, violations first, with `omitted_findings` counting the rest; structural crate violations
+have rule `structural`) and `mapping`, which says what each crate entity becomes. It requires READ on the dataset and on the
 connector group's metadata path.
 
 Create an Invenio repository
@@ -387,7 +398,8 @@ and no Aruna bytes, stay in the crate and become `references` relations. The req
 400, code `requirements_unmet` and the `findings` when the crate does not meet the repository's
 requirements. A crate with more files than the record holds fails the job before a draft is
 created. Creator identifiers are sent only for ORCID, GND, ISNI and ROR.
-Every new draft reserves its DOI, which `result.repository.doi` shows.
+Every new draft reserves its DOI, which `result.repository.identifier` shows;
+`result.repository.concept_identifier` is the DOI of every version.
 `publish: false` (the default) leaves an unpublished draft with restricted file access;
 `publish: true` publishes after verifying every uploaded file. Repository validation and
 publication permissions still apply. Set `repository.public_files: true` explicitly to make
@@ -432,8 +444,8 @@ that link and becomes the link's owner. Creation fails with 400, code `requireme
 the `findings` when the crate does not meet the repository's requirements. The first push is queued right away. Later changes push
 10 seconds after the last change, at most 5 minutes after the first waiting one, as one
 `export_rocrate` job, and `POST .../links/{link_id}/push` queues one at once. Pushes update one
-open draft, which keeps its reserved DOI (`remote.doi` with `remote.doi_reserved`) and is kept
-even when a push fails. Publish it with
+open draft, which keeps its reserved DOI (`remote.identifier` with `remote.identifier_reserved`;
+the link's `identifier_kind` is `doi`) and is kept even when a push fails. Publish it with
 `POST .../links/{link_id}/publish`, or set `auto_publish` to publish once the draft has been
 quiet for 15 minutes. With a connector community, the first version goes to community review
 and `remote.review` shows `pending`, then `accepted` or `declined`. A declined review shows
