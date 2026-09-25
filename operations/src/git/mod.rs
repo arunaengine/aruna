@@ -148,8 +148,10 @@ pub async fn transport(
         return Err(GitError::Conflict);
     }
     let mut request = request;
-    let _guard = project::lock(document.document_id).await;
+    let guard = project::lock(document.document_id).await;
     snapshot::refresh(context, store, &document).await?;
+    // Reads need a current cache but not the lock; pushes keep it until their record is out.
+    let _guard = write.then_some(guard);
     let _key = write.then(|| {
         let key = PushKey::open(document.document_id);
         request.push_key = key.value.clone();

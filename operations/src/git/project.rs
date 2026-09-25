@@ -8,20 +8,18 @@ use crate::driver::DriverContext;
 use aruna_blob::git::GitStore;
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::git::{GitChange, GitEffect, GitEvent, GitRecord};
+use aruna_core::git::{DocumentLocks, GitChange, GitEffect, GitEvent, GitRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::sync::LazyLock;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::OwnedMutexGuard;
 use ulid::Ulid;
 
-static LOCKS: LazyLock<[Mutex<()>; 64]> = LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
+static LOCKS: LazyLock<DocumentLocks> = LazyLock::new(DocumentLocks::default);
 
 /// Serializes projection, snapshots and pushes of one document on this node.
-pub async fn lock(document_id: Ulid) -> MutexGuard<'static, ()> {
-    LOCKS[usize::from(document_id.to_bytes()[15]) % 64]
-        .lock()
-        .await
+pub async fn lock(document_id: Ulid) -> OwnedMutexGuard<()> {
+    LOCKS.lock(document_id).await
 }
 
 pub struct Projection {

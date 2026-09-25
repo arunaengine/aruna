@@ -88,6 +88,33 @@ pub struct GitStatus {
 
 pub type Refs = std::collections::BTreeMap<String, String>;
 
+/// One async lock per document, created on first use and dropped once nobody holds it.
+#[derive(Debug, Default)]
+pub struct DocumentLocks(
+    std::sync::Mutex<std::collections::HashMap<Ulid, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+);
+
+impl DocumentLocks {
+    pub async fn lock(&self, document_id: Ulid) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(&document_id).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(document_id, std::sync::Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+}
+
 /// One commit as read from the repository, without verifying its signature.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitInfo {

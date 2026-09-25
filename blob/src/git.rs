@@ -2,20 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::git::{GitEffect, GitEvent, MAX_GIT_BYTES};
+use aruna_core::git::{DocumentLocks, GitEffect, GitEvent, MAX_GIT_BYTES};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 
 #[derive(Debug)]
 pub struct GitStore {
     root: PathBuf,
     helper: PathBuf,
-    locks: [Mutex<()>; 64],
+    locks: DocumentLocks,
     slots: Semaphore,
 }
 
@@ -24,7 +24,7 @@ impl GitStore {
         Self {
             root,
             helper,
-            locks: std::array::from_fn(|_| Mutex::new(())),
+            locks: DocumentLocks::default(),
             slots: Semaphore::new(2),
         }
     }
@@ -34,7 +34,8 @@ impl GitStore {
         effect: GitEffect,
         actor: aruna_core::UserId,
     ) -> std::io::Result<GitEvent> {
-        let _slot = self.slots.try_acquire().map_err(std::io::Error::other)?;
+        // Waits for a free slot, so a burst of requests queues instead of failing.
+        let _slot = self.slots.acquire().await.map_err(std::io::Error::other)?;
         let id = match &effect {
             GitEffect::Initialize(id) | GitEffect::Refs(id) | GitEffect::Imported(id) => *id,
             GitEffect::Generate { snapshot, .. } | GitEffect::Edit { snapshot, .. } => {
@@ -53,7 +54,7 @@ impl GitStore {
             | GitEffect::Export { document_id, .. } => *document_id,
             GitEffect::Http(request) => request.repository.document_id,
         };
-        let _lock = self.locks[id.to_bytes()[15] as usize % 64].lock().await;
+        let _lock = self.locks.lock(id).await;
         let repository = self.root.join(format!("{id}.git"));
         match effect {
             GitEffect::Generate { snapshot, refs } => Ok(

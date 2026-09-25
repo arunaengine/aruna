@@ -17,7 +17,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use tokio::sync::MutexGuard;
+use tokio::sync::OwnedMutexGuard;
 use ulid::Ulid;
 
 /// Branches that only the server moves or that hold the live metadata.
@@ -65,7 +65,7 @@ pub struct Named {
     pub version: String,
 }
 
-pub(super) type Guard = MutexGuard<'static, ()>;
+pub(super) type Guard = OwnedMutexGuard<()>;
 
 pub(super) async fn open(
     context: &DriverContext,
