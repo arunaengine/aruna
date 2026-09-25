@@ -299,6 +299,10 @@ Import a record with `POST /api/v1/metadata/invenio/imports`:
 }
 ```
 
+Instead of `record_id`, name the record by `doi` (a version DOI selects that version, a concept
+DOI the latest one) or by `url`, a record page or API URL on the connector's repository. Give
+exactly one of the three.
+
 Every accessible published version becomes a separate dataset within the imported crate by
 default. Set `all_versions: false` to import only the selected version. Mode `copy` copies files
 and checks their source sizes and checksums. Mode `reference` creates native Aruna object
@@ -407,6 +411,19 @@ deleting cancels a running push. Only the link creator may publish, replace the 
 remote changes and delete. Deleting the dataset removes its links and their tokens as well.
 Remote records always stay.
 
+Set `keep_updated: true` on an import to keep the new dataset updated from the record lineage.
+The import then creates a pull link (`direction: "pull"`) owned by the importing node. It asks
+the repository once a day for a new version, with the connector's token if the connector has
+one, and waits longer after busy or unreachable answers. A new version or repository edit shows
+as reason `update_available` on the enabled link. `POST .../links/{link_id}/pull` imports it as
+an `import_rocrate` job, and with `auto_update: true` (on import or through `PATCH`) this
+happens by itself. The new version becomes a new `versions/{id}/` part with its files in the
+first import's mode, the dataset root takes its metadata through a normal metadata update and
+its identifiers are registered. After a local edit of the dataset, automatic updates stop and
+the link shows `local_changed`; an explicit pull then overwrites the root metadata but keeps
+local parts and files. One dataset cannot have an enabled push link and an enabled pull link
+for the same record lineage.
+
 Imports and pushes record the repository DOI and record IDs as secondary identifiers of the
 dataset. `GET /api/v1/metadata/{document_id}/pids` lists them, and
 `GET /api/v1/pid/lookup?kind=doi&value=<doi>` finds the dataset for one identifier.
@@ -419,6 +436,9 @@ invenio::live::native_repository -- --ignored --exact`. It creates and publishes
 records, checks ownership and restricted access, creates another version, and tests search,
 copy imports, reference reads and metadata-only imports. Use a disposable repository with
 external DOI registration and email disabled.
+
+The opt-in `invenio::live::pull_update` test publishes two versions on the same instance, imports
+the first with `keep_updated` and checks that the daily check pulls the second with its DOI.
 
 The opt-in `invenio::live::zenodo_reference` test imports a public Zenodo record in copy,
 reference and metadata modes and compares every file with the bytes Zenodo serves. It needs
