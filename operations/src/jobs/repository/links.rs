@@ -19,7 +19,7 @@ use aruna_core::repository::{
 };
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::secondary_id::{IdentifierOrigin, RegisterIdentifiersSpec};
+use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_storage::StorageHandle;
@@ -610,7 +610,7 @@ async fn register_accepted(
     link: &RepositoryLink,
     record: &RepositoryRecord,
 ) -> Result<(), LinkError> {
-    let identifiers = record.identifiers(&link.endpoint, IdentifierOrigin::Published);
+    let identifiers = record.identifiers.clone();
     if identifiers.is_empty() {
         return Ok(());
     }

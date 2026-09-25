@@ -136,6 +136,8 @@ pub struct InvenioLinkResponse {
     pub endpoint: String,
     pub owner_node_url: String,
     pub created_by: String,
+    /// The connector's repository kind, such as invenio.
+    pub kind: String,
     /// push sends dataset changes to the repository; pull imports new repository versions.
     pub direction: String,
     /// enabled, paused or failed.
@@ -178,7 +180,7 @@ pub(super) fn link_example() -> serde_json::Value {
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
         "endpoint": "https://zenodo.org/api/", "owner_node_url": "https://node.example/api/v1",
         "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
-        "direction": "push",
+        "kind": "invenio", "direction": "push",
         "status": "enabled", "auto_publish": false, "public_files": false, "pending": false,
         "remote": {"parent_id": "abcde-12345", "draft_id": "fghij-67890", "record_id": null,
             "doi": "10.5281/zenodo.123457", "doi_reserved": true,
@@ -225,6 +227,7 @@ pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> Inven
         endpoint: link.endpoint,
         owner_node_url: link.owner_node_url,
         created_by: link.created_by.to_string(),
+        kind: link.kind.as_str().to_string(),
         direction: if pull.is_some() { "pull" } else { "push" }.to_string(),
         status: status.to_string(),
         reason,
@@ -582,6 +585,7 @@ pub async fn create_link(
         generation: 0,
         warning: None,
         direction: aruna_core::repository::LinkDirection::Push,
+        kind: connector.connector.kind,
     };
     let change = LinkChange::Create {
         link: Box::new(link.clone()),

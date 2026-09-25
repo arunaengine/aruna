@@ -5,13 +5,17 @@
 use std::future::Future;
 
 use aruna_core::repository::{
-    ImportOptions, LinkFailure, PullCheck, RemoteState, RepositoryCredential,
-    RepositoryDestination, RepositoryLink, RepositoryPull, RepositoryQuery,
+    ImportMode, ImportOptions, LinkFailure, LinkTarget, PullCheck, RemoteState,
+    RepositoryCredential, RepositoryDestination, RepositoryLink, RepositoryPull, RepositoryQuery,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec, ImportRoCrateSpec};
+use aruna_core::structs::execution::job::{
+    ArtifactRef, ExportRoCrateSpec, ImportRoCrateSource, ImportRoCrateSpec,
+};
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
+use aruna_core::structs::storage::blob::BucketInfo;
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -90,6 +94,49 @@ pub(crate) async fn acquire(
                 .await
         }
         RepositoryConnectorKind::OaiPmh => Err(not_supported("import")),
+    }
+}
+
+/// Fails as remote changed when a link's lineage moved outside Aruna; returns the published
+/// version a parent-only link continues.
+pub(crate) async fn check_lineage(
+    kind: RepositoryConnectorKind,
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &RepositoryDestination,
+    target: &LinkTarget,
+) -> Result<Option<String>, TransferError> {
+    match kind {
+        RepositoryConnectorKind::Invenio => {
+            invenio::remote::check_lineage(ctx, spec, destination, target).await
+        }
+        RepositoryConnectorKind::OaiPmh => Err(not_supported("links")),
+    }
+}
+
+/// Whether an import entry is a reference descriptor instead of file bytes.
+pub(crate) fn is_reference(spec: &ImportRoCrateSpec, path: &str) -> bool {
+    matches!(&spec.source, ImportRoCrateSource::Repository { options, .. } if options.mode == ImportMode::Reference)
+        && path.starts_with("versions/")
+        && path.contains("/files/")
+}
+
+/// Writes a reference object whose bytes stay in the repository.
+pub(crate) async fn write_reference(
+    kind: RepositoryConnectorKind,
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    bucket: BucketInfo,
+    key: &str,
+    version_id: Ulid,
+    descriptor: &Value,
+) -> Result<SourceMetadata, TransferError> {
+    match kind {
+        RepositoryConnectorKind::Invenio => {
+            invenio::reference::write_reference(ctx, spec, bucket, key, version_id, descriptor)
+                .await
+        }
+        RepositoryConnectorKind::OaiPmh => Err(not_supported("references")),
     }
 }
 
@@ -228,7 +275,19 @@ pub async fn seal_link_token(
     )?)
 }
 
-/// Reads the group's Invenio repository connector; other kinds are refused.
+/// The repository kind of the group's connector.
+pub async fn connector_kind(
+    context: &DriverContext,
+    group_id: Ulid,
+    connector_id: Ulid,
+) -> Result<RepositoryConnectorKind, TransferError> {
+    Ok(repository(context, group_id, connector_id)
+        .await?
+        .connector
+        .kind)
+}
+
+/// Reads the group's repository connector.
 pub(crate) async fn repository(
     context: &DriverContext,
     group_id: Ulid,
@@ -244,11 +303,6 @@ pub(crate) async fn repository(
                 TransferError::Retryable("repository connector storage unavailable".into())
             }
         })?;
-    if view.connector.kind != RepositoryConnectorKind::Invenio {
-        return Err(TransferError::Permanent(
-            "repository requires an Invenio repository connector".into(),
-        ));
-    }
     Ok(view)
 }
 

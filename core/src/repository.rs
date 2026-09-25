@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::secondary_id::{
     IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier, normalize_doi,
 };
@@ -92,25 +93,39 @@ pub struct RepositoryRecord {
     pub in_review: bool,
     /// A check that failed after the repository had already published the record.
     pub warning: Option<String>,
+    /// The record's identifiers as `Published`, filled by the adapter of its repository kind.
+    pub identifiers: Vec<SecondaryIdentifier>,
 }
 
-impl RepositoryRecord {
-    /// The version DOI, concept DOI, record id and parent id as secondary identifiers.
-    pub fn identifiers(
-        &self,
-        endpoint: &str,
-        origin: IdentifierOrigin,
-    ) -> Vec<SecondaryIdentifier> {
-        invenio::build_identifiers(
-            endpoint,
-            origin,
-            [
-                self.doi.as_deref(),
-                self.concept_doi.as_deref(),
-                Some(self.id.as_str()),
-                Some(self.parent_id.as_str()),
-            ],
-        )
+/// What a repository kind supports; the kind refuses every other action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Capabilities {
+    pub drafts: bool,
+    pub reserve_identifier: bool,
+    pub versions: bool,
+    pub review: bool,
+    pub pull: bool,
+    pub search: bool,
+    /// A record can wait for a release date before it becomes public.
+    pub release_date: bool,
+    /// The identifier a published record receives, such as `doi`.
+    pub identifier_kind: &'static str,
+}
+
+/// The capabilities of a kind that publishes records; `None` for kinds that only harvest.
+pub const fn capabilities(kind: RepositoryConnectorKind) -> Option<Capabilities> {
+    match kind {
+        RepositoryConnectorKind::Invenio => Some(Capabilities {
+            drafts: true,
+            reserve_identifier: true,
+            versions: true,
+            review: true,
+            pull: true,
+            search: true,
+            release_date: false,
+            identifier_kind: "doi",
+        }),
+        RepositoryConnectorKind::OaiPmh => None,
     }
 }
 

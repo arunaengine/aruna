@@ -337,6 +337,7 @@ async fn holder_copy_refuses() {
         generation: 1,
         warning: None,
         direction: aruna_core::repository::LinkDirection::Push,
+        kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     };
     let written = linked
         .test
@@ -481,6 +482,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         updated_at: now,
         generation: 0,
         warning: None,
+        kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
         direction: LinkDirection::Pull(Box::new(LinkPull {
             auto_update: false,
             options: Default::default(),
@@ -507,6 +509,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         html_url: None,
         concept_doi: None,
         in_review: false,
+        identifiers: Vec::new(),
         warning: None,
     };
     link.hold(&record, Ulid::generate(), now);

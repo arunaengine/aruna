@@ -32,6 +32,7 @@ fn link(document_id: Ulid, owner: NodeId, realm_id: RealmId, generation: u64) ->
         generation,
         warning: None,
         direction: aruna_core::repository::LinkDirection::Push,
+        kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     }
 }
 

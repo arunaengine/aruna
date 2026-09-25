@@ -14,6 +14,7 @@ use aruna_core::repository::invenio::{
 };
 use aruna_core::repository::{ImportMode, ImportOptions, RepositoryPull};
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
@@ -95,6 +96,7 @@ pub(crate) async fn acquire(
             endpoint: client.endpoint().to_string(),
             base,
             revision: None,
+            kind: RepositoryConnectorKind::Invenio,
         }),
         None => None,
     };

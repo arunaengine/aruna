@@ -57,6 +57,7 @@ fn link() -> RepositoryLink {
         generation: 0,
         warning: None,
         direction: aruna_core::repository::LinkDirection::Push,
+        kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     }
 }
 
@@ -350,6 +351,7 @@ fn finish_requeues_enabled() {
         html_url: None,
         concept_doi: None,
         in_review: false,
+        identifiers: Vec::new(),
         warning: None,
     };
     for (paused, requeue, queued) in [
@@ -557,6 +559,7 @@ fn finish_schedules_follow_ups() {
         html_url: None,
         concept_doi: None,
         in_review: true,
+        identifiers: Vec::new(),
         warning: None,
     };
     let finish = |record: &RepositoryRecord| LinkChange::Finish {
@@ -607,6 +610,7 @@ fn draft_needs_running_push() {
         html_url: None,
         concept_doi: None,
         in_review: false,
+        identifiers: Vec::new(),
         warning: None,
     };
     let change = || LinkChange::Draft {

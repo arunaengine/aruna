@@ -8,9 +8,8 @@ use aruna_core::repository::{
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobError, JobErrorKind};
 use aruna_core::structs::identity::auth::AuthContext;
 
-use super::TransferError;
-use super::invenio::remote::check_lineage;
 use super::links::{LinkChange, LinkError, change_link, read_link, read_secret};
+use super::{TransferError, check_lineage};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::export::{ExportCheckpoint, persist_checkpoint, read_export_checkpoint};
 
@@ -47,7 +46,7 @@ pub(super) async fn prepare(
     destination.credential = Some(credential);
     if checkpoint.repository.is_none()
         && checkpoint.repository_base.is_none()
-        && let Some(base) = check_lineage(ctx, spec, &destination, target).await?
+        && let Some(base) = check_lineage(link.kind, ctx, spec, &destination, target).await?
     {
         checkpoint.repository_base = Some(base);
         persist_checkpoint(ctx, checkpoint)

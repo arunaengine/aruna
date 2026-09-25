@@ -14,7 +14,6 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportReportSource,
     ExportRoCrateResult, ExportRoCrateSpec, JobError, JobId, JobResultPayload, ReasonCode,
@@ -516,7 +515,7 @@ async fn repository_export(
     destination: &aruna_core::repository::RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    use super::repository::{TransferError, deposit, invenio::export};
+    use super::repository::{TransferError, connector_kind, deposit};
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
             "repository export requires a complete crate with no omitted files".into(),
@@ -525,19 +524,15 @@ async fn repository_export(
     let exported = if checkpoint.repository_complete {
         Ok(())
     } else {
-        deposit(
-            RepositoryConnectorKind::Invenio,
-            ctx,
-            spec,
-            destination,
-            checkpoint,
-        )
-        .await
+        match connector_kind(&ctx.driver, destination.group_id, destination.connector_id).await {
+            Ok(kind) => deposit(kind, ctx, spec, destination, checkpoint).await,
+            Err(error) => Err(error),
+        }
     };
     // Queued on every run of this phase, so a failed queue is retried; the dedup key joins.
     let result = match exported {
         Ok(()) => match checkpoint.repository.as_ref() {
-            Some(record) => export::register_published(ctx, spec, destination, record).await,
+            Some(record) => register_published(ctx, spec, record).await,
             None => Ok(()),
         },
         Err(error) => Err(error),
@@ -559,6 +554,33 @@ async fn repository_export(
             Err(ExportFailure::Permanent(message))
         }
     }
+}
+
+/// Queues the record's identifiers as `Published` identifiers of the exported dataset.
+/// The dedup key names this job, so a rerun of the publish phase joins the queued job.
+async fn register_published(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    record: &aruna_core::repository::RepositoryRecord,
+) -> Result<(), super::repository::TransferError> {
+    if record.identifiers.is_empty() {
+        return Ok(());
+    }
+    crate::jobs::service::submit_identifiers(
+        &ctx.driver,
+        aruna_core::structs::secondary_id::RegisterIdentifiersSpec {
+            document_id: spec.document_id,
+            identifiers: record.identifiers.clone(),
+            auth_context: spec.auth_context.clone(),
+        },
+        ctx.owner_node_id,
+        format!("identifiers/{}", ctx.job_id),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        super::repository::TransferError::Retryable(format!("queueing identifiers failed: {error}"))
+    })
 }
 
 /// Reads the dataset's PID and live identifiers from its PID authority.

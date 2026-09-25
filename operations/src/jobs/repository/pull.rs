@@ -91,7 +91,7 @@ pub async fn check_now(
     context: &DriverContext,
     link: &RepositoryLink,
 ) -> Result<Option<RepositoryLink>, LinkError> {
-    let change = match latest_version(RepositoryConnectorKind::Invenio, context, link).await {
+    let change = match latest_version(link.kind, context, link).await {
         Ok(check) => LinkChange::Checked(check),
         Err(TransferError::Refused(reason)) => LinkChange::Fail(reason),
         Err(TransferError::Permanent(message)) => LinkChange::Fail(LinkFailure::Other(message)),
@@ -170,6 +170,7 @@ pub(crate) struct PullProgress {
     pub(crate) base: Option<Ulid>,
     /// The dataset revision the import wrote.
     pub(crate) revision: Option<Ulid>,
+    pub(crate) kind: RepositoryConnectorKind,
 }
 
 /// Stops an update once its link is gone, paused or runs another job.
@@ -244,6 +245,7 @@ pub(crate) async fn settle_import(
                 updated_at: now,
                 generation: 0,
                 warning: None,
+                kind: progress.kind,
                 direction: LinkDirection::Pull(Box::new(LinkPull {
                     auto_update: *auto_update,
                     options: options.clone(),

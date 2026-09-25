@@ -11,6 +11,7 @@ use ulid::Ulid;
 use super::{ImportOptions, RepositoryDestination, RepositoryRecord};
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::execution::job::{ImportRoCrateTarget, JobId, RoCrateLimits};
 use crate::structs::placement::record::PlacementRef;
 use crate::{NodeId, UserId};
@@ -139,6 +140,8 @@ pub struct RepositoryLink {
     /// A problem found after the repository already published, such as a failed check.
     pub warning: Option<String>,
     pub direction: LinkDirection,
+    /// The connector's repository kind when the link was made; it never changes.
+    pub kind: RepositoryConnectorKind,
 }
 
 /// Which way a link carries changes: from the dataset to the repository, or back.

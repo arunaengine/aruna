@@ -28,7 +28,6 @@ use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::repository::RepositoryPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
     ImportRoCrateSpec, JobError, JobResultPayload, ReasonCode, RoCrateCheckpointRefs,
@@ -405,8 +404,11 @@ async fn acquire_source(
             options,
             pull,
         } => {
+            let kind = super::repository::connector_kind(&ctx.driver, *group_id, *connector_id)
+                .await
+                .map_err(transfer_failure)?;
             let (artifact, found, progress) = super::repository::acquire(
-                RepositoryConnectorKind::Invenio,
+                kind,
                 ctx,
                 spec,
                 *group_id,
@@ -885,7 +887,7 @@ async fn write_next(
         ctx.shutdown.clone(),
     )
     .await?;
-    if super::repository::invenio::reference::is_reference(spec, &entry.path) {
+    if super::repository::is_reference(spec, &entry.path) {
         let mut bytes = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|error| ImportFailure::Retryable(error.to_string()))?;
@@ -898,7 +900,21 @@ async fn write_next(
         }
         let descriptor = serde_json::from_slice(&bytes)
             .map_err(|_| ImportFailure::Permanent("invalid reference descriptor".into()))?;
-        let metadata = super::repository::invenio::reference::write_reference(
+        let ImportRoCrateSource::Repository {
+            group_id,
+            connector_id,
+            ..
+        } = &spec.source
+        else {
+            return Err(ImportFailure::Permanent(
+                "reference requires repository source".into(),
+            ));
+        };
+        let kind = super::repository::connector_kind(&ctx.driver, *group_id, *connector_id)
+            .await
+            .map_err(transfer_failure)?;
+        let metadata = super::repository::write_reference(
+            kind,
             ctx,
             spec,
             bucket_info,
@@ -1045,7 +1061,7 @@ async fn rewrite_crate(
             .get(&entry.path)
             .ok_or_else(|| ImportFailure::Permanent("import report row is missing".to_string()))?;
         let w3id = entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id();
-        let hash_w3id = if super::repository::invenio::reference::is_reference(spec, &entry.path) {
+        let hash_w3id = if super::repository::is_reference(spec, &entry.path) {
             w3id.clone()
         } else {
             let hash: [u8; 32] = report

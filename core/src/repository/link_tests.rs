@@ -44,6 +44,7 @@ fn link() -> RepositoryLink {
         generation: 0,
         warning: None,
         direction: LinkDirection::Push,
+        kind: RepositoryConnectorKind::Invenio,
     }
 }
 
@@ -59,6 +60,7 @@ fn record(id: &str, published: bool, doi: Option<&str>) -> RepositoryRecord {
         concept_doi: None,
         in_review: false,
         warning: None,
+        identifiers: Vec::new(),
     }
 }
 

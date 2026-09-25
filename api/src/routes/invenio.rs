@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::AuthContext;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -110,13 +109,19 @@ pub async fn search_records(
         aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
-    aruna_operations::jobs::repository::search(
-        RepositoryConnectorKind::Invenio,
-        &state.get_ctx(),
-        &auth,
-        &query,
-        state.rocrate_limits().metadata_bytes,
-    )
+    let context = state.get_ctx();
+    async {
+        use aruna_operations::jobs::repository::{connector_kind, search};
+        let kind = connector_kind(&context, query.group_id, query.connector_id).await?;
+        search(
+            kind,
+            &context,
+            &auth,
+            &query,
+            state.rocrate_limits().metadata_bytes,
+        )
+        .await
+    }
     .await
     .map(Json)
     .map_err(|error| match error {
@@ -261,7 +266,9 @@ pub async fn import_record(
     auth: Extension<Option<AuthContext>>,
     Json(request): Json<InvenioImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    use aruna_operations::jobs::repository::{RecordReference, TransferError, resolve};
+    use aruna_operations::jobs::repository::{
+        RecordReference, TransferError, connector_kind, resolve,
+    };
     let reference = match (request.record_id, request.doi, request.url) {
         (Some(id), None, None) => RecordReference::Id(id),
         (None, Some(doi), None) => RecordReference::Doi(doi),
@@ -287,15 +294,20 @@ pub async fn import_record(
                 aruna_core::structs::identity::auth::Permission::READ,
             )
             .await?;
-            resolve(
-                RepositoryConnectorKind::Invenio,
-                &state.get_ctx(),
-                &caller,
-                group_id,
-                connector_id,
-                &reference,
-                state.rocrate_limits().metadata_bytes,
-            )
+            let context = state.get_ctx();
+            async {
+                let kind = connector_kind(&context, group_id, connector_id).await?;
+                resolve(
+                    kind,
+                    &context,
+                    &caller,
+                    group_id,
+                    connector_id,
+                    &reference,
+                    state.rocrate_limits().metadata_bytes,
+                )
+                .await
+            }
             .await
             .map_err(|error| match error {
                 TransferError::Permanent(message) => ServerError::BadRequestReason(message),

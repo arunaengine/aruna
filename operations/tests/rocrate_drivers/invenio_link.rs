@@ -127,6 +127,7 @@ pub(super) async fn attach(
         generation: 0,
         warning: None,
         direction: aruna_core::repository::LinkDirection::Push,
+        kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     };
     let change = LinkChange::Create {
         link: Box::new(link),

@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::repository::ImportMode;
 use aruna_core::repository::invenio::{
     REFERENCE_FILE, REFERENCE_GROUP, REFERENCE_RECORD, validate_id,
 };
@@ -23,12 +22,6 @@ use crate::jobs::executor::JobContext;
 use crate::jobs::repository::{TransferError, interruptible};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::reference::{ReferenceWrite, write_reference_version};
-
-pub(crate) fn is_reference(spec: &ImportRoCrateSpec, path: &str) -> bool {
-    matches!(&spec.source, ImportRoCrateSource::Repository { options, .. } if options.mode == ImportMode::Reference)
-        && path.starts_with("versions/")
-        && path.contains("/files/")
-}
 
 pub(crate) async fn write_reference(
     ctx: &JobContext,

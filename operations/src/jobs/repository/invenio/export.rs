@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
-use aruna_core::repository::invenio::{export_fields, record_id, validate_id};
+use aruna_core::repository::invenio::{export_fields, record_id, record_identifiers, validate_id};
 use aruna_core::repository::{
     ExportIdentity, LinkFailure, LinkTarget, MAX_RECORD_FILES, RepositoryDestination,
     RepositoryRecord,
@@ -14,7 +14,7 @@ use aruna_core::repository::{
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::secondary_id::{IdentifierOrigin, RegisterIdentifiersSpec};
+use aruna_core::structs::secondary_id::IdentifierOrigin;
 use futures_util::StreamExt;
 use http::Method;
 use serde_json::{Value, json};
@@ -203,39 +203,6 @@ async fn observe_revision(
     if let Err(error) = record_draft(ctx, spec, target, &current).await {
         tracing::warn!(%error, "Recording the draft revision after a failed push failed");
     }
-}
-
-/// Queues the record's DOIs and ids as `Published` identifiers of the exported dataset.
-/// The dedup key names this job, so a rerun of the publish phase joins the queued job.
-pub(crate) async fn register_published(
-    ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
-    destination: &RepositoryDestination,
-    record: &RepositoryRecord,
-) -> Result<(), TransferError> {
-    let view = crate::jobs::repository::repository(
-        &ctx.driver,
-        destination.group_id,
-        destination.connector_id,
-    )
-    .await?;
-    let identifiers = record.identifiers(&view.connector.endpoint, IdentifierOrigin::Published);
-    if identifiers.is_empty() {
-        return Ok(());
-    }
-    crate::jobs::service::submit_identifiers(
-        &ctx.driver,
-        RegisterIdentifiersSpec {
-            document_id: spec.document_id,
-            identifiers,
-            auth_context: spec.auth_context.clone(),
-        },
-        ctx.owner_node_id,
-        format!("identifiers/{}", ctx.job_id),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| TransferError::Retryable(format!("queueing identifiers failed: {error}")))
 }
 
 pub(crate) async fn create_draft(
@@ -431,6 +398,7 @@ pub(super) fn record_from(
             .map(str::to_string),
         in_review: false,
         warning: None,
+        identifiers: record_identifiers(client.endpoint(), record, IdentifierOrigin::Published),
         id,
     })
 }

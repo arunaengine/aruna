@@ -397,7 +397,7 @@ pub fn record_identifiers(
 }
 
 /// Takes the version DOI, concept DOI, record id and parent id in this order.
-pub(crate) fn build_identifiers(
+fn build_identifiers(
     endpoint: &str,
     origin: IdentifierOrigin,
     values: [Option<&str>; 4],
