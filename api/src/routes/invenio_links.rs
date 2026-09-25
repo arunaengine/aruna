@@ -6,8 +6,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aruna_core::invenio::{InvenioLink, LinkRemote, LinkStatus, validate_id};
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::driver::drive;
+use aruna_operations::harvest::read_connector::{GetRepositoryOperation, ReadConnectorError};
 use aruna_operations::jobs::invenio::export::missing_metadata;
 use aruna_operations::jobs::invenio::link_queue::owner_holds;
 use aruna_operations::jobs::invenio::links::{
@@ -457,7 +460,7 @@ The node that creates a link owns it and must hold the dataset. Only that node c
 
 **Errors**
 
-Invalid input returns 400. A dataset whose mapped metadata lacks title, publication_date, resource_type or creators returns 400 with `missing` listing them. Denied access returns 403, an unknown dataset or connector 404 and a node that does not hold the dataset 409."#,
+Invalid input returns 400. A dataset whose mapped metadata lacks title, publication_date, resource_type or creators returns 400 with `missing` listing them. Denied access returns 403. An unknown dataset, or a connector that does not exist in the group or is no Invenio connector, returns 404. A node that does not hold the dataset returns 409, as does an enabled pull link of the dataset that follows the same record lineage (parent_id) or an existing link with the same id."#,
     params(("document_id" = String, Path, description = "Metadata document identifier")),
     request_body(content = CreateLinkRequest, example = json!({
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
@@ -468,8 +471,8 @@ Invalid input returns 400. A dataset whose mapped metadata lacks title, publicat
         (status = 400, description = "Invalid token, metadata or identifier, or missing required metadata", body = ErrorResponse, example = json!({"error": "the dataset lacks required repository metadata", "code": "missing_metadata", "missing": ["creators"]})),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Dataset or connector access denied", body = ErrorResponse),
-        (status = 404, description = "Dataset or connector not found", body = ErrorResponse),
-        (status = 409, description = "This node does not hold the dataset", body = ErrorResponse),
+        (status = 404, description = "Dataset or Invenio connector not found", body = ErrorResponse),
+        (status = 409, description = "This node does not hold the dataset, or an enabled pull link follows the same record lineage", body = ErrorResponse),
         (status = 503, description = "Node credential key unavailable", body = ErrorResponse)
     ), security(("bearer_auth" = []))
 )]
@@ -492,6 +495,19 @@ pub async fn create_link(
         Permission::WRITE,
     ))
     .await?;
+    let context = state.get_ctx();
+    let connector = Box::pin(drive(
+        GetRepositoryOperation::new(group_id, connector_id),
+        &context,
+    ))
+    .await
+    .map_err(|error| match error {
+        ReadConnectorError::NotFound => ServerError::NotFound,
+        _ => ServerError::ServiceUnavailableReason("repository connector unavailable".into()),
+    })?;
+    if connector.connector.kind != RepositoryConnectorKind::Invenio {
+        return Err(ServerError::NotFound);
+    }
     if let Some(parent) = &request.parent_id {
         validate_id(parent).map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     }

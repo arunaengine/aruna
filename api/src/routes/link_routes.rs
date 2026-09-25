@@ -145,7 +145,8 @@ pub async fn patch_link(
     let push_settings = request.auto_publish.is_some()
         || request.public_files.is_some()
         || request.metadata.is_some();
-    if push_settings == link.pull().is_some() && (push_settings || request.auto_update.is_some()) {
+    let pulls = link.pull().is_some();
+    if (pulls && push_settings) || (!pulls && request.auto_update.is_some()) {
         return Err(ServerError::BadRequestReason(
             "auto_update applies to pull links; auto_publish, public_files and metadata to push links"
                 .into(),

@@ -585,3 +585,37 @@ async fn pull_link_routes() {
         Err(ServerError::Conflict(_))
     ));
 }
+
+#[tokio::test]
+async fn link_requests_checked() {
+    let linked = setup().await;
+    let owner = || Extension(Some(linked.test.auth.clone()));
+    let mut unknown = request(&linked);
+    unknown.connector_id = Ulid::generate().to_string();
+    let missing = Box::pin(create_link(
+        State(linked.test.state.clone()),
+        owner(),
+        Path(linked.document_id.clone()),
+        Json(unknown),
+    ))
+    .await;
+    assert!(matches!(missing, Err(ServerError::NotFound)));
+
+    // auto_update belongs to pull links, even next to valid push settings.
+    let link = create(&linked, Some(linked.test.auth.clone()))
+        .await
+        .unwrap();
+    let mixed = Json(PatchLinkRequest {
+        auto_publish: Some(true),
+        auto_update: Some(true),
+        ..PatchLinkRequest::default()
+    });
+    let refused = patch_link(
+        State(linked.test.state.clone()),
+        owner(),
+        paths(&linked, &link),
+        mixed,
+    )
+    .await;
+    assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
+}
