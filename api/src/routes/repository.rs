@@ -222,7 +222,7 @@ pub struct SubmitRepositoryExport {
 
 **Authentication**
 
-Requires READ on the metadata path of the repository connector group and WRITE on destination data and metadata. keep_updated also requires WRITE on the connector group's metadata path, as managing a link does. The connector is an Invenio repository connector whose endpoint is the API root, such as https://zenodo.org/api/.
+Requires READ on the metadata path of the repository connector group and WRITE on destination data and metadata. keep_updated also requires WRITE on the connector group's metadata path, as managing a link does. The connector's kind must support imports; an Invenio connector's endpoint is the API root, such as https://zenodo.org/api/.
 
 **Behavior**
 
@@ -240,7 +240,9 @@ Crate limits apply. Hidden edits and inaccessible or deleted versions cannot be 
 
 **Errors**
 
-None or several of record_id, doi and url, a doi or url on a repository kind without search (code not_supported), a DOI no published record has, a URL on another origin, or auto_update without keep_updated return 400. The returned job exposes progress, cancellation and failure details. Copy imports fail on missing data or checksum mismatches."#,
+None or several of record_id, doi and url, a record_id the kind does not accept, a DOI no published record has, a URL on another origin, or auto_update without keep_updated return 400.
+
+A kind without imports, a doi or url on a kind without search, or keep_updated on a kind without pull links return 400 with code not_supported. An unknown connector returns 404. The returned job exposes progress, cancellation and failure details. Copy imports fail on missing data or checksum mismatches."#,
     request_body(content = RepositoryImportRequest, example = json!({
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
         "doi": "10.5281/zenodo.1234567", "target": {"bucket": "research", "prefix": "zenodo/1234567"},
@@ -257,7 +259,7 @@ None or several of record_id, doi and url, a doi or url on a repository kind wit
         (status = 400, description = "Invalid transfer request or record name, or no record with this DOI", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Connector or destination access denied", body = ErrorResponse),
-        (status = 404, description = "Destination not found", body = ErrorResponse),
+        (status = 404, description = "Destination or repository connector not found", body = ErrorResponse),
         (status = 409, description = "Job conflict or quota refusal", body = ErrorResponse),
         (status = 503, description = "Transfer placement or repository unavailable", body = ErrorResponse)
     ), security(("bearer_auth" = []))
@@ -347,7 +349,7 @@ Requires WRITE on the crate, WRITE on the metadata path of the repository connec
 
 **Behavior**
 
-Creates a draft or uses draft_id for recovery. Set published_id to a published record ID to continue its version lineage. Native source metadata and custom fields survive import/export; repository.metadata overrides mapped fields. RO-Crate JSON remains a provenance file.
+Creates a draft or uses draft_id for recovery. Set published_id to a published record ID to continue its version lineage; a kind without versions refuses it. Native source metadata and custom fields survive import/export; repository.metadata overrides mapped fields. RO-Crate JSON remains a provenance file.
 
 Publication and public_files both default to false; public_files also applies to existing drafts. New drafts reserve their DOI. With a connector community, publishing a first version submits it for review instead.
 
@@ -359,7 +361,11 @@ Every referenced file must be readable; web data entities become references inst
 
 **Errors**
 
-A repository kind that cannot publish returns 400 with code not_supported. A crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; repository.metadata does not satisfy them.
+A repository kind that cannot publish, or published_id on a kind without versions, returns 400 with code not_supported. draft_id and published_id must be record ids the kind accepts.
+
+A crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and at most 100 findings, violations first; omitted_findings counts the rest. repository.metadata does not satisfy them.
+
+A record whose mapped fields still lack a required field after repository.metadata is applied, such as creators cleared by an override, fails the job before any repository write.
 
 Incomplete files, conflicting revisions or rejected metadata fail the job. An ambiguous creation outcome requires inspecting the repository and supplying draft_id. Cancellation retains remote drafts."#,
     params(("document_id" = String, Path, description = "Aruna metadata document identifier")),

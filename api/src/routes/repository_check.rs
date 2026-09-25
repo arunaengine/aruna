@@ -160,7 +160,7 @@ Requires authentication.
 
 **Behavior**
 
-Returns a bare array. capabilities names the supported actions; other actions answer 400 with code not_supported. profiles lists the built-in requirement Profiles with their SHACL shapes as Turtle sources. A crate can name one of them in conformsTo to be validated like any Profile. targets are the mapping rules: which crate entities become which repository objects and fields.
+Returns a bare array. capabilities names the supported actions, including import; other actions answer 400 with code not_supported. profiles lists the built-in requirement Profiles with their SHACL shapes as Turtle sources. A crate can name one of them in conformsTo to be validated like any Profile. targets are the mapping rules: which crate entities become which repository objects and fields.
 
 Kinds that only harvest, such as oai_pmh, are not listed."#,
     responses(
@@ -199,7 +199,9 @@ Requires READ on the dataset and READ on the metadata path of the connector grou
 
 **Behavior**
 
-profile names the requirement Profile the repository needs; it is one of the Profiles the kinds route lists. findings uses the Profile validation format. ready is true when no finding is a violation; warnings, such as a missing license, do not block. mapping says what each crate entity becomes.
+profile names the requirement Profile the repository needs; it is one of the Profiles the kinds route lists. findings uses the Profile validation format and also lists structural crate violations (rule structural).
+
+At most 100 findings are returned, violations first; omitted_findings counts the rest. ready is true when no finding is a violation; warnings, such as a missing license, do not block. mapping says what each crate entity becomes. A target that takes the crate files also lists ro-crate-metadata.json and aruna-export-report.json, which the export uploads with the data files; file limits count them.
 
 Only the crate counts: metadata is checked to be an object but never satisfies a requirement.
 

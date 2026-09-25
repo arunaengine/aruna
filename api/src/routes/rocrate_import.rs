@@ -313,10 +313,10 @@ taken: READ on the source, WRITE on the target bucket, and WRITE on the metadata
                 "report_url": "https://node.example.test/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHIJ/report"
             })
         ),
-        (status = 400, description = "Malformed ids, an empty or oversized bucket, prefix or metadata path, an unsafe path segment, or an expired or oversized source", body = ErrorResponse),
+        (status = 400, description = "Malformed ids, an empty or oversized bucket, prefix or metadata path, an unsafe path segment, an expired or oversized source, or a repository source whose kind cannot import (code not_supported) or does not accept the record id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, is a path-restricted delegated token, names another user's upload, or lacks READ on the source or WRITE on the target bucket or metadata path", body = ErrorResponse),
-        (status = 404, description = "The upload, source object or version, connector source, or target bucket does not exist", body = ErrorResponse),
+        (status = 404, description = "The upload, source object or version, connector source, repository connector, or target bucket does not exist", body = ErrorResponse),
         (status = 409, description = "Idempotency key bound to a different plan, an upload already claimed by another job, a reached active-job cap, or a standing compute quota refusal, which reports the exact scope, dimension and numbers in `quota`", body = ErrorResponse),
         (status = 502, description = "The connector source's staging backend could not be reached; retryable", body = ErrorResponse),
         (status = 503, description = "The job could not be placed right now; the unchanged request may be retried", body = ErrorResponse)

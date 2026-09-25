@@ -533,7 +533,7 @@ Requires WRITE on the dataset, WRITE on the metadata path of the repository conn
 
 **Behavior**
 
-The link starts with a push. Without parent_id the first push creates a record draft and reserves its DOI; with parent_id it starts a new version of that record lineage.
+The link starts with a push. Without parent_id the first push creates a record draft and reserves its identifier (a DOI for Invenio); with parent_id it starts a new version of that record lineage.
 
 Changes push 10 s after the last change, at the latest 5 minutes after the first one, and update the open draft. Publishing happens through the publish route or, with auto_publish, once the draft has been quiet for 15 minutes.
 
@@ -545,7 +545,9 @@ The node that creates a link owns it and must hold the dataset. Only that node c
 
 **Errors**
 
-Invalid input returns 400, with code not_supported for a repository kind that cannot publish. A dataset crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; metadata overrides do not satisfy them. Denied access returns 403.
+Invalid input returns 400, with code not_supported for a repository kind that cannot publish, or parent_id on a kind without versions. A parent_id the kind does not accept as a record id returns 400.
+
+A dataset crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; metadata overrides do not satisfy them. At most 100 findings are returned, violations first, and omitted_findings counts the rest. Denied access returns 403.
 
 An unknown dataset, or a connector that does not exist in the group, returns 404. A node that does not hold the dataset returns 409, as does an enabled pull link of the dataset that follows the same record lineage (parent_id) or an existing link with the same id."#,
     params(("document_id" = String, Path, description = "Metadata document identifier")),
@@ -671,7 +673,7 @@ Requires READ on the dataset.
 
 **Behavior**
 
-Each link shows its direction, state, failure reason, the repository draft or record it pushes to, the last DOI and the last push. pending is true while a push is queued or running. Tokens are never returned.
+Each link shows its direction, state, failure reason, the repository draft or record it pushes to, its identifier (identifier_kind names the kind, such as doi) and the last push. pending is true while a push is queued or running. Tokens are never returned.
 
 A pull link (direction pull) comes from an import with keep_updated. remote names the version the dataset holds, remote.latest_remote_id the latest version at last_checked_at, and auto_update whether new versions are imported without asking.
 
