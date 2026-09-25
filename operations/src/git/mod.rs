@@ -6,6 +6,7 @@ pub mod changes;
 pub mod hook;
 pub mod lfs;
 pub mod locks;
+pub mod merge;
 pub mod objects;
 pub mod project;
 pub mod publish;
