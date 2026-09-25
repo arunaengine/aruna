@@ -441,7 +441,7 @@ pub(super) async fn job_response(
 
 **Authentication**
 
-Requires READ on the dataset, WRITE on the metadata path of the repository connector group and the caller's personal access_token. The token is sealed for this link, the caller, this node and the connector endpoint. It is never returned or logged.
+Requires WRITE on the dataset, WRITE on the metadata path of the repository connector group and the caller's personal access_token. The token is sealed for this link, the caller, this node and the connector endpoint. It is never returned or logged.
 
 **Behavior**
 
@@ -483,6 +483,9 @@ pub async fn create_link(
     let group_id = parse_ulid(&request.group_id)?;
     let connector_id = parse_ulid(&request.connector_id)?;
     ensure_metadata_scope(&state, &auth, group_id, Permission::WRITE).await?;
+    // Publishing the dataset as a repository record needs WRITE on it.
+    let record = load_document_record(&state, document_id).await?;
+    ensure_permission(&state, &auth, record.permission_path, Permission::WRITE).await?;
     if let Some(parent) = &request.parent_id {
         validate_id(parent).map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     }

@@ -331,10 +331,13 @@ pub async fn submit_import(
     let auth = require_unrestricted_auth(&state, auth)?;
     let mut source = parse_import_source(request.source)?;
     if let ImportRoCrateSource::Invenio {
+        group_id,
         pull: Some(InvenioPull::Keep { owner_node_url, .. }),
         ..
     } = &mut source
     {
+        // A pull link is managed like any link of the connector group.
+        crate::metadata::ensure_metadata_scope(&state, &auth, *group_id, Permission::WRITE).await?;
         *owner_node_url = state
             .interface_state()
             .await

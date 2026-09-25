@@ -395,12 +395,15 @@ support `idempotency_key`.
 An ambiguous draft-creation response stops
 automatic creation; inspect the repository and supply `repository.draft_id` in a new request
 to reuse the unpublished draft. Failed or cancelled transfers leave remote drafts available
-for inspection. Import requires connector-group READ and destination WRITE; export requires
-crate READ and connector-group WRITE.
+for inspection. Import requires connector-group READ and destination WRITE, and with
+`keep_updated` also connector-group WRITE, as managing a link does. Export requires crate WRITE,
+because it publishes the dataset under a repository record, and connector-group WRITE. Queued
+identifier registration checks WRITE on the dataset as the submitting user.
 
 A link keeps a dataset in sync with one Invenio record lineage. Create it with
 `POST /api/v1/metadata/{document_id}/invenio/links` and a body with `group_id`, `connector_id`
-and the user's `access_token`. Set `parent_id` to continue an existing record, for example the
+and the user's `access_token`. It requires WRITE on the dataset and on the connector group's
+metadata path. Set `parent_id` to continue an existing record, for example the
 imported source. The node that creates the link must hold the dataset; it seals the token for
 that link and becomes the link's owner. Creation fails with 400 and a `missing` list when the
 mapped metadata lacks required fields. The first push is queued right away. Later changes push
