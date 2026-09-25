@@ -321,6 +321,18 @@ pub async fn preview_submission(
     assess_write(context, Ulid::nil(), group_id.into(), jsonld).await
 }
 
+/// Evaluates a crate against the Profile `iri` whether or not the crate names it, and stores
+/// nothing. Built-in and public Profiles resolve.
+pub async fn check_profile(
+    context: &DriverContext,
+    iri: &str,
+    jsonld: &str,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    let preview =
+        evaluate_tagged(context, Ulid::nil(), ProfileScope::PublicOnly, iri, jsonld).await?;
+    Ok(preview.status)
+}
+
 struct ProfileAssessment {
     findings: Vec<ProfileValidationFinding>,
     structural: Vec<MetadataValidationViolation>,
@@ -746,7 +758,7 @@ async fn resolve_profile(
             requested_iri: requested_iri.to_string(),
             revision: BUILTIN_REVISION.to_string(),
             shapes_graph_iri: format!("{requested_iri}#shapes/{BUILTIN_REVISION}"),
-            shapes: vec![shapes.to_string()],
+            shapes: shapes.iter().map(|shapes| shapes.to_string()).collect(),
         }),
         None => resolve_registered_profile(context, requested_iri, scope).await,
     }

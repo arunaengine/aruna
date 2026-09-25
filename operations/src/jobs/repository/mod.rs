@@ -211,6 +211,14 @@ pub(crate) async fn latest_version(
     }
 }
 
+/// The built-in requirement Profile a record of this kind at `endpoint` must satisfy.
+pub fn requirement_profile(kind: RepositoryConnectorKind, endpoint: &str) -> Option<&'static str> {
+    match kind {
+        RepositoryConnectorKind::Invenio => Some(invenio::requirement_profile(endpoint)),
+        RepositoryConnectorKind::OaiPmh => None,
+    }
+}
+
 fn not_supported(action: &str) -> TransferError {
     TransferError::Permanent(format!("this repository kind does not support {action}"))
 }

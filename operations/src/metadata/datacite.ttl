@@ -1,0 +1,59 @@
+# SHACL shapes for the DataCite fields every repository record needs, embedded in the node binary.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+# The untargeted root shape binds to the crate root. Creators are read from schema:author or
+# schema:creator; a person needs a name or family name, an organization a name.
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix schema: <http://schema.org/> .
+@prefix dc: <https://w3id.org/aruna/profiles/repository/datacite#> .
+
+dc:shape-Dataset a sh:NodeShape ;
+  sh:property dc:shape-Dataset-name, dc:shape-Dataset-datePublished, dc:shape-Dataset-creators,
+    dc:shape-Dataset-license .
+
+dc:shape-Dataset-name a sh:PropertyShape ;
+  sh:path schema:name ;
+  sh:name "Title" ;
+  sh:description "The title of the record." ;
+  sh:order 0 ;
+  sh:minCount 1 ;
+  sh:minLength 1 ;
+  sh:message "The dataset needs a name, which becomes the record title." .
+
+dc:shape-Dataset-datePublished a sh:PropertyShape ;
+  sh:path schema:datePublished ;
+  sh:name "Publication date" ;
+  sh:description "A year, year and month, or full ISO date." ;
+  sh:order 1 ;
+  sh:minCount 1 ;
+  sh:pattern "^\\d{4}(-\\d{2}){0,2}([T/].*)?$" ;
+  sh:message "The dataset needs a publication date such as 2026, 2026-09 or 2026-09-25." .
+
+dc:shape-Dataset-creators a sh:PropertyShape ;
+  sh:path [ sh:alternativePath ( schema:author schema:creator ) ] ;
+  sh:name "Creators" ;
+  sh:description "The people or organizations that created the dataset." ;
+  sh:order 2 ;
+  sh:minCount 1 ;
+  sh:node dc:shape-Creator ;
+  sh:message "The dataset needs creators; each person needs a name or family name and each organization a name." .
+
+# Members are property shapes: craqle skips sh:property of shapes reached through sh:node.
+dc:shape-Creator a sh:NodeShape ;
+  sh:or (
+    [ sh:path schema:name ; sh:minCount 1 ]
+    [ sh:and (
+        [ sh:path schema:familyName ; sh:minCount 1 ]
+        [ sh:not [ sh:class schema:Organization ] ]
+    ) ]
+  ) .
+
+dc:shape-Dataset-license a sh:PropertyShape ;
+  sh:path schema:license ;
+  sh:name "License" ;
+  sh:description "The license under which others may reuse the dataset." ;
+  sh:order 3 ;
+  sh:minCount 1 ;
+  sh:severity sh:Warning ;
+  sh:message "The dataset names no license, so the record will have none." .

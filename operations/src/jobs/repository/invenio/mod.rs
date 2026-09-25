@@ -4,6 +4,7 @@
 
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::handle::Handle;
+use aruna_core::metadata::{INVENIO_PROFILE_IRI, ZENODO_PROFILE_IRI};
 use aruna_core::repository::{LinkFailure, RepositoryCredential};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
@@ -31,6 +32,21 @@ impl From<InvenioError> for TransferError {
             InvenioError::Status(401 | 403) => Self::Refused(LinkFailure::TokenRejected),
             _ => Self::Permanent(error.to_string()),
         }
+    }
+}
+
+/// Zenodo sets the publisher itself; other InvenioRDM instances need one to mint a DOI.
+pub(crate) fn requirement_profile(endpoint: &str) -> &'static str {
+    let host = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match host.as_str() {
+        "zenodo.org" | "sandbox.zenodo.org" => ZENODO_PROFILE_IRI,
+        _ => INVENIO_PROFILE_IRI,
     }
 }
 

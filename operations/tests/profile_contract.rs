@@ -14,8 +14,8 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, EVENT_LOG_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    CRATE_PROFILE_IRI, MetadataEffect, MetadataError, MetadataEvent, ProfileValidationSeverity,
-    ProfileValidationState,
+    CRATE_PROFILE_IRI, INVENIO_PROFILE_IRI, MetadataEffect, MetadataError, MetadataEvent,
+    ProfileValidationSeverity, ProfileValidationState, ZENODO_PROFILE_IRI,
 };
 use aruna_core::storage_entries::event_log_prefix;
 use aruna_core::structs::identity::auth::Actor;
@@ -34,8 +34,8 @@ use aruna_operations::metadata::forward::{
     admits_profile_peer, export_profile_local, route_metadata_create,
 };
 use aruna_operations::metadata::profile::validation::{
-    current_validation_status, load_validation_status, preview_submission, profile_public_iri,
-    revalidate_current,
+    check_profile, current_validation_status, load_validation_status, preview_submission,
+    profile_public_iri, revalidate_current,
 };
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
@@ -475,6 +475,121 @@ async fn builtin_profile_enforced() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(status.state, ProfileValidationState::Valid);
     assert_eq!(status.profile_revision.as_deref(), Some("builtin"));
     Ok(())
+}
+
+#[tokio::test]
+async fn repository_profiles_checked() -> Result<(), Box<dyn std::error::Error>> {
+    // Repository requirements are built in and apply to a crate that does not name them.
+    let test = build_context(false).await?;
+    let document_id = Ulid::generate();
+    let creators = "(<http://schema.org/author> | <http://schema.org/creator>)";
+    let bare = repository_crate(document_id, json!([]), None);
+    let status = check_profile(test.context.as_ref(), ZENODO_PROFILE_IRI, &bare).await?;
+    assert_eq!(status.state, ProfileValidationState::Invalid);
+    assert_eq!(status.profile_revision.as_deref(), Some("builtin"));
+    let paths = |status: &aruna_core::metadata::ProfileValidationStatus| {
+        status
+            .findings
+            .iter()
+            .map(|finding| {
+                assert_eq!(finding.focus_node.as_deref(), Some("./"));
+                (finding.path.clone().unwrap_or_default(), finding.severity)
+            })
+            .collect::<Vec<_>>()
+    };
+    let found = paths(&status);
+    assert!(found.contains(&(creators.to_string(), ProfileValidationSeverity::Violation)));
+    assert!(found.contains(&(
+        "http://schema.org/license".to_string(),
+        ProfileValidationSeverity::Warning
+    )));
+    assert!(!found.iter().any(|(path, _)| path.contains("publisher")));
+
+    // A person needs a name or family name, an organization a name.
+    let named = json!([
+        {"@id": "#ada", "@type": "Person", "familyName": "Lovelace"},
+        {"@id": "#lab", "@type": "Organization", "name": "Lab"}
+    ]);
+    let crate_json = repository_crate(document_id, named, None);
+    let zenodo = check_profile(test.context.as_ref(), ZENODO_PROFILE_IRI, &crate_json).await?;
+    assert_eq!(
+        zenodo.state,
+        ProfileValidationState::Valid,
+        "{:#?}",
+        zenodo.findings
+    );
+    let unnamed = json!([{"@id": "#lab", "@type": "Organization", "familyName": "Lab"}]);
+    let crate_json = repository_crate(document_id, unnamed, None);
+    let refused = check_profile(test.context.as_ref(), ZENODO_PROFILE_IRI, &crate_json).await?;
+    assert!(
+        paths(&refused).contains(&(creators.to_string(), ProfileValidationSeverity::Violation)),
+        "{:#?}",
+        refused.findings
+    );
+
+    // InvenioRDM also needs a publisher, as text or a named entity.
+    let person = json!([{"@id": "#ada", "@type": "Person", "name": "Ada Lovelace"}]);
+    let crate_json = repository_crate(document_id, person.clone(), None);
+    let invenio = check_profile(test.context.as_ref(), INVENIO_PROFILE_IRI, &crate_json).await?;
+    assert_eq!(invenio.state, ProfileValidationState::Invalid);
+    assert!(paths(&invenio).contains(&(
+        "http://schema.org/publisher".to_string(),
+        ProfileValidationSeverity::Violation
+    )));
+    for publisher in [json!("Example Press"), json!({"@id": "#press"})] {
+        let crate_json = repository_crate(document_id, person.clone(), Some(publisher));
+        let status = check_profile(test.context.as_ref(), INVENIO_PROFILE_IRI, &crate_json).await?;
+        assert_eq!(
+            status.state,
+            ProfileValidationState::Valid,
+            "{:#?}",
+            status.findings
+        );
+    }
+    let nameless = Some(json!({"@id": "https://ror.org/000000000"}));
+    let crate_json = repository_crate(document_id, person, nameless);
+    let status = check_profile(test.context.as_ref(), INVENIO_PROFILE_IRI, &crate_json).await?;
+    assert_eq!(status.state, ProfileValidationState::Invalid);
+    assert!(!graph_exists(&test, document_id).await?);
+    Ok(())
+}
+
+/// A crate without a license whose root names `authors` and an optional `publisher`.
+fn repository_crate(
+    document_id: Ulid,
+    authors: serde_json::Value,
+    publisher: Option<serde_json::Value>,
+) -> String {
+    let graph_iri =
+        aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(
+            document_id,
+        );
+    let references = authors
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|author| json!({"@id": author["@id"]}))
+        .collect::<Vec<_>>();
+    let mut root = json!({
+        "@id": graph_iri, "@type": "Dataset", "name": "Repository fixture",
+        "description": "Requirement profile fixture", "datePublished": "2026-09"
+    });
+    if !references.is_empty() {
+        root["author"] = json!(references);
+    }
+    if let Some(publisher) = publisher {
+        root["publisher"] = publisher;
+    }
+    let mut graph = vec![
+        json!({
+            "@id": "ro-crate-metadata.json", "@type": "CreativeWork",
+            "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}, "about": {"@id": graph_iri}
+        }),
+        root,
+        json!({"@id": "#press", "@type": "Organization", "name": "Example Press"}),
+    ];
+    graph.extend(authors.as_array().cloned().unwrap_or_default());
+    json!({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": graph}).to_string()
 }
 
 #[tokio::test]

@@ -847,7 +847,11 @@ mod tests {
             .evaluate(
                 &ProfileShapes {
                     graph_iri: format!("{PROCESS_PROFILE}#shapes/{BUILTIN_REVISION}"),
-                    sources: vec![builtin_shapes(PROCESS_PROFILE).unwrap().to_string()],
+                    sources: builtin_shapes(PROCESS_PROFILE)
+                        .unwrap()
+                        .iter()
+                        .map(|shapes| shapes.to_string())
+                        .collect(),
                 },
                 &jsonld,
             )
