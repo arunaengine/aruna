@@ -169,11 +169,7 @@ pub async fn drain_links(context: &Arc<DriverContext>) -> Result<Option<Duration
                 }
             };
             if let Some(retry_at) = retry_at {
-                let entry = LinkQueueEntry {
-                    due_at_ms: retry_at,
-                    ..entry
-                };
-                write_row(storage, queue_row(link_id, &entry)?).await?;
+                settle_entry(storage, link_id, &value, Some(retry_at)).await?;
                 next = min_due_at(next, retry_at);
             }
         }
@@ -419,6 +415,19 @@ async fn drop_unchanged(
     link_id: Ulid,
     queued: &Value,
 ) -> Result<Option<u64>, LinkError> {
+    settle_entry(storage, link_id, queued, None)
+        .await
+        .map(|_| None)
+}
+
+/// Deletes the queued check, or with `retry_at` moves it there. A change written since `queued`
+/// was read stays, due no later than `retry_at`; a removed check stays removed.
+async fn settle_entry(
+    storage: &StorageHandle,
+    link_id: Ulid,
+    queued: &Value,
+    retry_at: Option<u64>,
+) -> Result<(), LinkError> {
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -427,7 +436,7 @@ async fn drop_unchanged(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => return Err(LinkError::Unexpected(format!("{other:?}"))),
     };
-    let result = drop_in(storage, link_id, queued, txn_id).await;
+    let result = settle_in(storage, link_id, queued, retry_at, txn_id).await;
     if result.is_err() {
         storage
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -435,15 +444,16 @@ async fn drop_unchanged(
     }
     match result {
         // A conflicting write queued a newer change; its check runs later.
-        Err(LinkError::Storage(StorageError::TransactionConflict)) => Ok(None),
-        result => result.map(|_| None),
+        Err(LinkError::Storage(StorageError::TransactionConflict)) => Ok(()),
+        result => result,
     }
 }
 
-async fn drop_in(
+async fn settle_in(
     storage: &StorageHandle,
     link_id: Ulid,
     queued: &Value,
+    retry_at: Option<u64>,
     txn_id: TxnId,
 ) -> Result<(), LinkError> {
     let current = match storage
@@ -458,19 +468,34 @@ async fn drop_in(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => return Err(LinkError::Unexpected(format!("{other:?}"))),
     };
-    let effect = if current.as_ref() == Some(queued) {
-        StorageEffect::Delete {
+    let unchanged = current.as_ref() == Some(queued);
+    let entry = |bytes: &Value| postcard::from_bytes::<LinkQueueEntry>(bytes).ok();
+    let effect = match (current.as_ref(), retry_at) {
+        (Some(_), None) if unchanged => StorageEffect::Delete {
             key_space: LINK_QUEUE_KEYSPACE.to_string(),
             key: id_key(link_id),
             txn_id: Some(txn_id),
+        },
+        (Some(current), Some(retry_at)) => {
+            let base = if unchanged { None } else { entry(current) };
+            let Some(mut next) = base.clone().or_else(|| entry(queued)) else {
+                return Err(LinkError::Unexpected("unreadable link queue entry".into()));
+            };
+            next.due_at_ms = base.map_or(retry_at, |base| base.due_at_ms.min(retry_at));
+            let (key_space, key, value) = queue_row(link_id, &next)?;
+            StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: Some(txn_id),
+            }
         }
-    } else {
-        StorageEffect::AbortTransaction { txn_id }
+        _ => StorageEffect::AbortTransaction { txn_id },
     };
     let aborting = matches!(effect, StorageEffect::AbortTransaction { .. });
     match storage.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::TransactionAborted { .. }) if aborting => return Ok(()),
-        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
+        Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::WriteResult { .. }) => {}
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => return Err(LinkError::Unexpected(format!("{other:?}"))),
     }
@@ -567,5 +592,65 @@ pub async fn restore_link_timer(storage: &StorageHandle, task_handle: &TaskHandl
         .await
     {
         warn!(%message, "Failed to arm the Invenio link queue");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_storage::FjallStorage;
+
+    async fn stored(storage: &StorageHandle, link_id: Ulid) -> Option<LinkQueueEntry> {
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: LINK_QUEUE_KEYSPACE.to_string(),
+                key: id_key(link_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                value.map(|bytes| postcard::from_bytes(&bytes).unwrap())
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_newer_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (link_id, document_id) = (Ulid::from_parts(1, 1), Ulid::from_parts(1, 2));
+        let entry = |due_at_ms, first_at_ms| LinkQueueEntry {
+            document_id,
+            due_at_ms,
+            first_at_ms,
+        };
+        let queued = queue_row(link_id, &entry(100, 90)).unwrap();
+        write_row(&storage, queued.clone()).await.unwrap();
+
+        settle_entry(&storage, link_id, &queued.2, Some(500))
+            .await
+            .unwrap();
+        assert_eq!(stored(&storage, link_id).await, Some(entry(500, 90)));
+
+        // A change queued while the check ran keeps its earlier due time.
+        let newer = queue_row(link_id, &entry(200, 150)).unwrap();
+        write_row(&storage, newer).await.unwrap();
+        settle_entry(&storage, link_id, &queued.2, Some(500))
+            .await
+            .unwrap();
+        assert_eq!(stored(&storage, link_id).await, Some(entry(200, 150)));
+        settle_entry(&storage, link_id, &queued.2, None)
+            .await
+            .unwrap();
+        assert_eq!(stored(&storage, link_id).await, Some(entry(200, 150)));
+
+        // A check removed meanwhile, for example by a started push, stays removed.
+        delete_entry(&storage, id_key(link_id)).await.unwrap();
+        settle_entry(&storage, link_id, &queued.2, Some(500))
+            .await
+            .unwrap();
+        assert_eq!(stored(&storage, link_id).await, None);
     }
 }
