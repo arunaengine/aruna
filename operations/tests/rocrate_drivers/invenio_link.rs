@@ -830,6 +830,46 @@ async fn admins_read_pushes() -> Result<(), Box<dyn std::error::Error>> {
     );
     let report = read_report_routed(&fixture.context, &stranger, job_id, None, None, 10, None);
     assert!(matches!(report.await?, JobReportLookup::NotFound));
+
+    // A group admin who cannot read the dataset does not see its push.
+    let manager = UserId::local(Ulid::generate(), realm_id);
+    let grant = |read_meta: bool| {
+        let mut group = GroupAuthorizationDocument::default_group_doc(
+            fixture.actor.user_id,
+            realm_id,
+            fixture.group_id,
+        );
+        let role_id = Ulid::generate();
+        let mut permissions = HashMap::from([(
+            format!("/{realm_id}/g/{}/admin", fixture.group_id),
+            Permission::WRITE,
+        )]);
+        if read_meta {
+            permissions.insert(
+                format!("/{realm_id}/g/{}/meta/**", fixture.group_id),
+                Permission::READ,
+            );
+        }
+        let role = aruna_core::structs::identity::auth::Role {
+            role_id,
+            name: "link-manager".to_string(),
+            permissions,
+            assigned_users: HashSet::from([manager]),
+        };
+        group.roles.insert(role_id, role);
+        group.to_bytes(&fixture.actor)
+    };
+    let group_key = fixture.group_id.to_bytes().to_vec();
+    let storage = &fixture.context.storage_handle;
+    write_value(storage, AUTH_KEYSPACE, group_key.clone(), grant(false)?).await?;
+    let blind = read_job_routed(&fixture.context, &auth(manager), job_id, None).await;
+    assert!(
+        blind.is_err(),
+        "an admin without dataset READ must not read the push"
+    );
+    write_value(storage, AUTH_KEYSPACE, group_key, grant(true)?).await?;
+    let status = read_job_routed(&fixture.context, &auth(manager), job_id, None).await?;
+    assert_eq!(status.job.job_id, job_id);
     fixture.stop().await;
     Ok(())
 }
