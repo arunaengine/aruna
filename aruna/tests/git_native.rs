@@ -122,6 +122,18 @@ async fn native_clients() -> TestResult<()> {
         if !tokio::time::timeout(Duration::from_secs(1200), child.wait()).await??.success() {
             return Err(std::io::Error::other("native Git/LFS client test failed").into());
         }
+        let event = seed.context.storage_handle.send_storage_effect(StorageEffect::Iter {
+            key_space: aruna_core::keyspaces::GIT_RECORD_KEYSPACE.into(),
+            prefix: Some(aruna_core::git::git_record_prefix(id.parse()?)), start: None, limit: 1000, txn_id: None,
+        }).await;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return Err(std::io::Error::other("Git records unreadable").into());
+        };
+        let checkpoints = values.iter().filter(|(_, value)| {
+            postcard::from_bytes::<aruna_core::git::GitRecord>(value)
+                .is_ok_and(|record| matches!(record.change, aruna_core::git::GitChange::Checkpoint(_)))
+        }).count();
+        assert!(checkpoints > 0, "no Git checkpoint was written");
         Ok(())
     }.await;
     shutdown.cancel();

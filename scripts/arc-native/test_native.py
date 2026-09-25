@@ -291,6 +291,15 @@ def exercise(root):
     wait_graph(metadata_url, "Edited by another user")
     print("PASS: LFS locks block other users' pushes until released", flush=True)
 
+    locks = url + "/info/lfs/locks"
+    for _ in range(140):
+        status, body = http(locks, "POST", {"path": "notes/checkpoint.txt"})
+        assert status == 201, body
+        status, body = http(f"{locks}/{json.loads(body)['lock']['id']}/unlock", "POST", {"force": False})
+        assert status == 200, body
+    assert http(metadata_url + "/git")[0] == 200
+    print("PASS: many Git records fold into a checkpoint instead of reaching the record cap", flush=True)
+
     before = command(source, env, "ls-remote", "origin").decode()
     shutil.rmtree(Path(os.environ["ARUNA_GIT_ROOT"]) / f"{os.environ['ARUNA_DOCUMENT_ID']}.git")
     assert command(source, env, "ls-remote", "origin").decode() == before
