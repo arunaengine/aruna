@@ -138,7 +138,8 @@ pub struct InvenioLinkResponse {
     pub status: String,
     /// Failure reason such as remote_changed, token_rejected, source_unavailable,
     /// too_many_files or owner_not_holder. An enabled pull link shows update_available, or
-    /// local_changed when a local edit holds the update back; both are information, not failures.
+    /// local_changed when a local edit holds the update back. An enabled push link shows
+    /// review_declined after a declined community review. These are information, not failures.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// A check that failed after the repository had already published the last push.
@@ -192,7 +193,7 @@ fn timestamp(value: SystemTime) -> String {
 
 /// `holds` is false once the owner node lost the dataset; such a link cannot push any more.
 pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioLinkResponse {
-    let info = link.pull_reason().map(str::to_string);
+    let info = link.info_reason().map(str::to_string);
     let pull = link.pull().cloned();
     let (status, reason) = match &link.status {
         LinkStatus::Enabled if !holds => ("failed", Some("owner_not_holder".to_string())),
@@ -580,6 +581,8 @@ Each link shows its direction, state, failure reason, the repository draft or re
 A pull link (direction pull) comes from an import with keep_updated. remote names the version the dataset holds, remote.latest_remote_id the latest version at last_checked_at, and auto_update whether new versions are imported without asking.
 
 An enabled pull link shows reason update_available when a newer version or a repository edit waits, and local_changed when a local edit since the last pull stopped the automatic update.
+
+An enabled push link shows reason review_declined when the community declined the first version. Pushes still update the draft, auto_publish waits, and an explicit publish submits the draft for review again.
 
 **Limits**
 

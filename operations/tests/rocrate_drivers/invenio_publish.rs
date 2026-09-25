@@ -375,6 +375,58 @@ async fn community_reviews_first() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn declined_review_waits() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    let community = "419f0df8-f1f4-4d56-8950-7749b800c04c";
+    server.state.lock().unwrap().community = Some(community.into());
+    Box::pin(import_dataset(&fixture, native_archive().await?)).await?;
+    let link = Box::pin(attach(
+        &fixture,
+        &server.endpoint,
+        LINK_TOKEN,
+        true,
+        None,
+        Some("aruna"),
+    ))
+    .await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
+    succeeded(push_now(&fixture, &link, true).await?);
+    server
+        .state
+        .lock()
+        .unwrap()
+        .records
+        .get_mut("1")
+        .unwrap()
+        .review = Some("declined".into());
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    // Storing the answer queues one more check, which finds nothing to do.
+    drain(&fixture).await?;
+    let (declined, queued) = current(&fixture, &link).await;
+    assert_eq!(declined.remote.review, LinkReview::Declined);
+    assert_eq!(declined.info_reason(), Some("review_declined"));
+    assert!(
+        !queued && declined.active_job.is_none(),
+        "auto_publish waits"
+    );
+
+    succeeded(push_now(&fixture, &link, true).await?);
+    assert_eq!(
+        current(&fixture, &link).await.0.remote.review,
+        LinkReview::Pending
+    );
+    assert_eq!(
+        server.state.lock().unwrap().records["1"].review.as_deref(),
+        Some("submitted")
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn removal_cancels_push() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;

@@ -464,7 +464,10 @@ impl InvenioLink {
         self.auto_publish
             && self.status == LinkStatus::Enabled
             && self.remote.draft_id.is_some()
-            && self.remote.review != LinkReview::Pending
+            && !matches!(
+                self.remote.review,
+                LinkReview::Pending | LinkReview::Declined
+            )
             && self.last_push.is_some()
     }
 
@@ -547,6 +550,15 @@ impl InvenioLink {
                 && (pull.latest_remote_id != self.remote.record_id
                     || pull.latest_revision != self.remote.revision_id)
         })
+    }
+
+    /// Information on an enabled link: pull_reason, or review_declined while a declined
+    /// community review holds back auto_publish until an explicit publish resubmits it.
+    pub fn info_reason(&self) -> Option<&'static str> {
+        let declined = self.status == LinkStatus::Enabled
+            && self.remote.review == LinkReview::Declined
+            && self.remote.draft_id.is_some();
+        self.pull_reason().or(declined.then_some("review_declined"))
     }
 
     /// Information on an enabled pull link: update_available, or local_changed when a local

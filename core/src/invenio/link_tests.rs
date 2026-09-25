@@ -168,8 +168,12 @@ fn auto_publish_waits() {
     link.begin(job(1), SystemTime::now()).unwrap();
     link.finish(job(1), &pushed("d", false, None), SystemTime::UNIX_EPOCH);
     assert_eq!(link.publish_due_ms(), Some(AUTO_PUBLISH_QUIET_MS));
-    link.status = LinkStatus::Paused;
+    // A declined review waits for an explicit publish, which submits the draft again.
+    link.remote.review = LinkReview::Declined;
     assert_eq!(link.publish_due_ms(), None);
+    assert_eq!(link.info_reason(), Some("review_declined"));
+    link.status = LinkStatus::Paused;
+    assert_eq!(link.info_reason(), None);
 }
 
 #[test]

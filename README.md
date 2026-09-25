@@ -410,7 +410,9 @@ open draft, which keeps its reserved DOI (`remote.doi` with `remote.doi_reserved
 even when a push fails. Publish it with
 `POST .../links/{link_id}/publish`, or set `auto_publish` to publish once the draft has been
 quiet for 15 minutes. With a connector community, the first version goes to community review
-and `remote.review` shows `pending`, then `accepted` or `declined`. After a publish, the next
+and `remote.review` shows `pending`, then `accepted` or `declined`. A declined review shows
+reason `review_declined` on the enabled link: pushes still update the draft, `auto_publish`
+waits, and an explicit publish submits the draft again. After a publish, the next
 push creates a new version. A check that fails after the repository published becomes
 `warning`; the published record and DOI are always kept.
 
