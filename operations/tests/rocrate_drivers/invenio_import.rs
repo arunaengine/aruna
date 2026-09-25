@@ -350,6 +350,50 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn doi_keeps_case() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_operations::jobs::invenio::{RecordReference, resolve_record};
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let connector_id = connector(&fixture, &server).await;
+    let auth = AuthContext {
+        user_id: fixture.actor.user_id,
+        realm_id: fixture.actor.realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let resolve = async |doi: &str| {
+        let reference = RecordReference::Doi(doi.to_string());
+        let limit = 1024 * 1024;
+        resolve_record(
+            &fixture.context,
+            &auth,
+            fixture.group_id,
+            connector_id,
+            &reference,
+            limit,
+        )
+        .await
+    };
+    let searched = || std::mem::take(&mut server.state.lock().unwrap().searches);
+
+    // A DOI stored with upper case is found only in the case it was given.
+    assert_eq!(resolve("https://doi.org/10.1234/MixedCase").await?, "2");
+    assert_eq!(searched(), ["pids.doi.identifier:\"10.1234/MixedCase\""]);
+    // A lower case DOI given in upper case is found by the lower case search that follows.
+    assert_eq!(resolve("10.1234/LOWER").await?, "1");
+    assert_eq!(
+        searched(),
+        [
+            "pids.doi.identifier:\"10.1234/LOWER\"",
+            "parent.pids.doi.identifier:\"10.1234/LOWER\"",
+            "pids.doi.identifier:\"10.1234/lower\"",
+        ]
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn invenio_rejects_corruption() -> Result<(), Box<dyn std::error::Error>> {
     for repository in [
         Repository {

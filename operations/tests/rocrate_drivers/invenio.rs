@@ -53,6 +53,7 @@ struct Repository {
     redirect: Option<String>,
     content_started: Option<Arc<tokio::sync::Notify>>,
     content_release: Option<Arc<tokio::sync::Notify>>,
+    searches: Vec<String>,
 }
 
 struct Server {
@@ -171,6 +172,25 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
     state.calls.push((method.clone(), path.clone()));
     let parts = path.trim_start_matches('/').split('/').collect::<Vec<_>>();
     let value = match (method, parts.as_slice()) {
+        // DOI resolution searches one hit; like the real index it matches the stored case only.
+        (Method::GET, ["api", "records"]) if query.contains("size=1&") => {
+            let q = url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "q")
+                .map(|(_, value)| value.into_owned())
+                .unwrap();
+            state.searches.push(q.clone());
+            let stored = [("1", "10.1234/lower"), ("2", "10.1234/MixedCase")];
+            let hits = stored
+                .iter()
+                .filter(|(_, doi)| q == format!("pids.doi.identifier:\"{doi}\""))
+                .map(|(id, doi)| {
+                    let mut hit = record(id, true);
+                    hit["pids"]["doi"]["identifier"] = json!(doi);
+                    hit
+                })
+                .collect::<Vec<_>>();
+            json!({"hits": {"total": hits.len(), "hits": hits}})
+        }
         (Method::GET, ["api", "records"]) => {
             assert!(query.contains("size=25"));
             assert!(query.contains("q=doi%3A"));
