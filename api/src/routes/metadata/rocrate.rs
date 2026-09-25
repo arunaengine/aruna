@@ -511,6 +511,7 @@ pub async fn replace_metadata_rocrate(
         UpdateDocumentMutation::ReplaceRoCrate {
             jsonld: serialize_jsonld_object(&request.rocrate)?,
         },
+        None,
         forwarded_auth_token(bearer_token)?,
     )
     .await
@@ -618,6 +619,7 @@ pub async fn add_data_entity(
         UpdateDocumentMutation::UpsertDataEntity {
             jsonld: serialize_jsonld_entity(&entity)?,
         },
+        None,
         forwarded_auth_token(bearer_token)?,
     )
     .await
@@ -722,6 +724,7 @@ pub async fn add_contextual_entity(
         UpdateDocumentMutation::UpsertContextualEntity {
             jsonld: serialize_jsonld_entity(&entity)?,
         },
+        None,
         forwarded_auth_token(bearer_token)?,
     )
     .await
