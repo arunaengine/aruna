@@ -1164,6 +1164,16 @@ async fn update_document(
     checkpoint: &mut ImportCheckpoint,
     plan: &ImportPlan,
 ) -> Result<(), ImportFailure> {
+    // Pausing or deleting the link while the files were imported cancels the update.
+    if let ImportRoCrateSource::Invenio {
+        pull: Some(InvenioPull::Update { link_id }),
+        ..
+    } = &spec.source
+    {
+        super::invenio::import::running(ctx, spec, *link_id)
+            .await
+            .map_err(transfer_failure)?;
+    }
     ensure_metadata_permission(ctx, spec).await?;
     let jsonld = checkpoint
         .rewritten_json

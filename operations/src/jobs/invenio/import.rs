@@ -407,7 +407,7 @@ fn invalid(message: &str) -> TransferError {
 }
 
 /// Stops an update once its link is gone, paused or runs another job.
-async fn running(
+pub(crate) async fn running(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
     link_id: Ulid,
