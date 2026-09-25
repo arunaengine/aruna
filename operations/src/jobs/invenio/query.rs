@@ -83,17 +83,26 @@ pub async fn resolve_record(
     let id = match reference {
         RecordReference::Id(id) => id.clone(),
         RecordReference::Url(url) => url_record(client.endpoint(), url)?,
-        RecordReference::Doi(doi) => {
-            let doi = normalize_doi(doi)
+        RecordReference::Doi(raw) => {
+            let doi = normalize_doi(raw)
                 .ok()
                 .filter(|doi| !doi.contains(['"', '\\']))
                 .ok_or_else(|| invalid("invalid DOI"))?;
+            // The index matches exact case, so the DOI is looked up as given and lowercased.
+            let trimmed = raw.trim();
+            let given = trimmed
+                .get(trimmed.len().saturating_sub(doi.len())..)
+                .filter(|given| *given != doi && given.to_lowercase() == doi);
+            let forms = given.into_iter().chain([doi.as_str()]);
+            let searches = forms.flat_map(|form| {
+                [("pids", "true"), ("parent.pids", "false")].map(|(field, all)| (field, all, form))
+            });
             // A version DOI names one version; a concept DOI names the lineage and its latest.
             let mut found = None;
-            for (field, all_versions) in [("pids", "true"), ("parent.pids", "false")] {
+            for (field, all_versions, form) in searches {
                 let mut url = client.url(&["records"])?;
                 url.query_pairs_mut()
-                    .append_pair("q", &format!("{field}.doi.identifier:\"{doi}\""))
+                    .append_pair("q", &format!("{field}.doi.identifier:\"{form}\""))
                     .append_pair("size", "1")
                     .append_pair("allversions", all_versions);
                 let page = client.json(Method::GET, url, None).await?;
