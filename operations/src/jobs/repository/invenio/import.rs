@@ -30,10 +30,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ulid::Ulid;
 
-use super::links::{LinkChange, LinkError, change_link, read_link};
-use super::{TransferError, connect, interruptible};
+use super::connect;
 use crate::blob::hidden::delete_hidden;
 use crate::jobs::executor::JobContext;
+use crate::jobs::repository::links::{LinkChange, LinkError, change_link, read_link};
+use crate::jobs::repository::{TransferError, interruptible};
 
 /// What an import that keeps or updates a pull link carries to its cleanup.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

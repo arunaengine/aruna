@@ -144,7 +144,7 @@ pub struct ImportCheckpoint {
     /// Repository identifiers registered on the created document during cleanup.
     identifiers: Vec<SecondaryIdentifier>,
     /// Set when the import keeps or updates a pull link.
-    pull: Option<super::repository::import::PullProgress>,
+    pull: Option<super::repository::invenio::import::PullProgress>,
 }
 
 impl Default for ImportCheckpoint {
@@ -404,7 +404,7 @@ async fn acquire_source(
             options,
             pull,
         } => {
-            let (artifact, found, progress) = super::repository::import::acquire(
+            let (artifact, found, progress) = super::repository::invenio::import::acquire(
                 ctx,
                 spec,
                 *group_id,
@@ -883,7 +883,7 @@ async fn write_next(
         ctx.shutdown.clone(),
     )
     .await?;
-    if super::repository::reference::is_reference(spec, &entry.path) {
+    if super::repository::invenio::reference::is_reference(spec, &entry.path) {
         let mut bytes = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|error| ImportFailure::Retryable(error.to_string()))?;
@@ -896,7 +896,7 @@ async fn write_next(
         }
         let descriptor = serde_json::from_slice(&bytes)
             .map_err(|_| ImportFailure::Permanent("invalid reference descriptor".into()))?;
-        let metadata = super::repository::reference::write_reference(
+        let metadata = super::repository::invenio::reference::write_reference(
             ctx,
             spec,
             bucket_info,
@@ -1043,7 +1043,7 @@ async fn rewrite_crate(
             .get(&entry.path)
             .ok_or_else(|| ImportFailure::Permanent("import report row is missing".to_string()))?;
         let w3id = entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id();
-        let hash_w3id = if super::repository::reference::is_reference(spec, &entry.path) {
+        let hash_w3id = if super::repository::invenio::reference::is_reference(spec, &entry.path) {
             w3id.clone()
         } else {
             let hash: [u8; 32] = report
@@ -1172,7 +1172,7 @@ async fn update_document(
         ..
     } = &spec.source
     {
-        super::repository::import::running(ctx, spec, *link_id)
+        super::repository::invenio::import::running(ctx, spec, *link_id)
             .await
             .map_err(transfer_failure)?;
     }
@@ -1296,7 +1296,7 @@ async fn cleanup_source(
         register_identifiers(ctx, spec, checkpoint.identifiers.clone()).await?;
         checkpoint.identifiers.clear();
     }
-    Box::pin(super::repository::import::settle_import(
+    Box::pin(super::repository::invenio::import::settle_import(
         ctx,
         spec,
         checkpoint.pull.as_ref(),

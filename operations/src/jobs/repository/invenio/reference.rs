@@ -18,8 +18,9 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use serde_json::Value;
 use ulid::Ulid;
 
-use super::{TransferError, connect, interruptible};
+use super::connect;
 use crate::jobs::executor::JobContext;
+use crate::jobs::repository::{TransferError, interruptible};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::reference::{ReferenceWrite, write_reference_version};
 

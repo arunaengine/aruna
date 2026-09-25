@@ -11,8 +11,9 @@ use serde_json::Value;
 use ulid::Ulid;
 use url::Url;
 
-use super::{TransferError, connect};
+use super::connect;
 use crate::driver::DriverContext;
+use crate::jobs::repository::TransferError;
 
 pub async fn search_records(
     context: &DriverContext,

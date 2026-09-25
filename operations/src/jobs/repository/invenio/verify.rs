@@ -9,8 +9,8 @@ use aruna_core::repository::invenio::normalize_metadata;
 use http::Method;
 use serde_json::{Value, json};
 
-use super::TransferError;
 use super::export::invalid;
+use crate::jobs::repository::TransferError;
 
 pub(super) async fn verify_files(
     client: &InvenioClient<'_>,

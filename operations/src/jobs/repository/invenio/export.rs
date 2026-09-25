@@ -19,17 +19,18 @@ use futures_util::StreamExt;
 use http::Method;
 use serde_json::{Value, json};
 
-use super::push::{guard, record_draft};
+use super::connect;
 use super::verify::{
     complete_fields, complete_metadata, metadata_digest, verify_file, verify_files, verify_metadata,
 };
-use super::{TransferError, connect, interruptible};
 use crate::harvest::create_connector::INVENIO_COMMUNITY;
 use crate::jobs::executor::JobContext;
 use crate::jobs::export::{ExportCheckpoint, persist_checkpoint};
 use crate::jobs::import::archive::{
     ArchiveCompression, ArchiveEntry, ArchiveInspection, inspect_reader,
 };
+use crate::jobs::repository::push::{guard, record_draft};
+use crate::jobs::repository::{TransferError, interruptible};
 use crate::jobs::service::read_artifact_range;
 
 pub(crate) async fn repository_export(
@@ -41,7 +42,9 @@ pub(crate) async fn repository_export(
     let prepared;
     let destination = match &destination.link {
         Some(target) => {
-            prepared = super::push::prepare(ctx, spec, destination, target, checkpoint).await?;
+            prepared =
+                crate::jobs::repository::push::prepare(ctx, spec, destination, target, checkpoint)
+                    .await?;
             &prepared
         }
         None => destination,
@@ -210,8 +213,12 @@ pub(crate) async fn register_published(
     destination: &RepositoryDestination,
     record: &RepositoryRecord,
 ) -> Result<(), TransferError> {
-    let view =
-        super::repository(&ctx.driver, destination.group_id, destination.connector_id).await?;
+    let view = crate::jobs::repository::repository(
+        &ctx.driver,
+        destination.group_id,
+        destination.connector_id,
+    )
+    .await?;
     let identifiers = record.identifiers(&view.connector.endpoint, IdentifierOrigin::Published);
     if identifiers.is_empty() {
         return Ok(());
@@ -379,7 +386,7 @@ pub async fn missing_metadata(
     metadata_json: &str,
     metadata_bytes: u64,
 ) -> Result<Vec<&'static str>, TransferError> {
-    let view = super::repository(context, group_id, connector_id).await?;
+    let view = crate::jobs::repository::repository(context, group_id, connector_id).await?;
     let (jsonld, _) =
         crate::jobs::export::crate_jsonld(context, auth, document_id, metadata_bytes).await?;
     let document: Value =
@@ -394,7 +401,7 @@ pub async fn missing_metadata(
 }
 
 /// The repository's record as the link and job see it; drafts point at the draft endpoint.
-pub(super) fn record_from(
+pub(crate) fn record_from(
     client: &InvenioClient<'_>,
     record: &Value,
 ) -> Result<RepositoryRecord, TransferError> {
@@ -429,7 +436,7 @@ pub(super) fn record_from(
 }
 
 /// The file keys of a draft or published record.
-pub(super) async fn file_keys(
+pub(crate) async fn file_keys(
     client: &InvenioClient<'_>,
     id: &str,
     published: bool,
@@ -890,8 +897,12 @@ async fn review_community(
     if draft["versions"]["index"] != 1 {
         return Ok(None);
     }
-    let view =
-        super::repository(&ctx.driver, destination.group_id, destination.connector_id).await?;
+    let view = crate::jobs::repository::repository(
+        &ctx.driver,
+        destination.group_id,
+        destination.connector_id,
+    )
+    .await?;
     Ok(view
         .connector
         .public_config

@@ -515,7 +515,7 @@ async fn repository_export(
     destination: &aruna_core::repository::RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    use super::repository::{TransferError, export};
+    use super::repository::{TransferError, invenio::export};
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
             "repository export requires a complete crate with no omitted files".into(),
