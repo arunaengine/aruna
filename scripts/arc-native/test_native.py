@@ -52,6 +52,19 @@ def http(url, method="GET", body=None, token=None):
         return error.code, error.read()
 
 
+def api(url, method="GET", body=None, headers=None):
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(url, method=method, data=data, headers={
+        "Authorization": "Bearer " + os.environ["ARUNA_TOKEN"],
+        "Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            status, text = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, text = error.code, error.read()
+    return status, json.loads(text) if text.startswith(b"{") else text
+
+
 def wait_snapshot(url, previous):
     deadline = time.monotonic() + 300
     while True:
@@ -299,6 +312,61 @@ def exercise(root):
         assert status == 200, body
     assert http(metadata_url + "/git")[0] == 200
     print("PASS: many Git records fold into a checkpoint instead of reaching the record cap", flush=True)
+
+    head = remote_main(source, env)
+    status, page = api(metadata_url + "/versions?limit=2")
+    assert status == 200 and page["versions"][0]["version"] == head, page
+    assert "main" in page["versions"][0]["branches"] and page["next_cursor"], page
+    status, older = api(metadata_url + "/versions?limit=2&cursor=" + page["next_cursor"])
+    assert status == 200 and older["versions"][0]["version"] != page["versions"][1]["version"], older
+    status, detail = api(metadata_url + "/versions/" + head)
+    assert status == 200 and detail["version"] == head and "files" in detail, detail
+    status, created = api(metadata_url + "/branches", "POST", {"name": "rest/draft", "from": "main"})
+    assert status == 201 and created["version"] == head, created
+    assert api(metadata_url + "/branches", "POST", {"name": "rest/draft", "from": "main"})[0] == 409
+    status, tag = api(metadata_url + "/tags", "POST", {"name": "rest-v1", "version": head})
+    assert status == 201, tag
+    draft_url = metadata_url + "/branches/rest%2Fdraft"
+    draft = graph(metadata_url)
+    root_entity(draft)["name"] = "Edited through REST"
+    stale = {"If-Match": '"' + "0" * 40 + '"'}
+    assert api(draft_url + "/rocrate", "PUT", {"rocrate": draft}, stale)[0] == 412
+    status, edited = api(draft_url + "/rocrate", "PUT",
+                         {"rocrate": draft, "message": "Rename through REST"}, {"If-Match": head})
+    assert status == 200 and edited["version"] != head and edited["parents"] == [head], edited
+    assert edited["message"] == "Rename through REST" and edited["author"]["user_id"], edited
+    assert root_entity(graph(metadata_url))["name"] == "Edited by another user"
+    status, comparison = api(metadata_url + "/compare?from=main&to=rest%2Fdraft")
+    assert status == 200 and any(file["path"] == "aruna-metadata.json" for file in comparison["files"])
+    assert "Edited through REST" in json.dumps(comparison["entities"]), comparison
+    status, merged = api(draft_url + "/merge", "POST", {"into": "main"}, {"If-Match": head})
+    assert status == 200, merged
+    wait_graph(metadata_url, "Edited through REST")
+    print("PASS: REST versions, branches, tags, draft edits and merges into the live metadata", flush=True)
+
+    for name in ("rest/one", "rest/two"):
+        assert api(metadata_url + "/branches", "POST", {"name": name, "from": "main"})[0] == 201
+    for name, title in (("rest%2Fone", "First competing title"), ("rest%2Ftwo", "Second competing title")):
+        draft = graph(metadata_url)
+        root_entity(draft)["name"] = title
+        assert api(f"{metadata_url}/branches/{name}/rocrate", "PUT", {"rocrate": draft})[0] == 200
+    assert api(metadata_url + "/branches/rest%2Fone/merge", "POST", {"into": "main"})[0] == 200
+    wait_graph(metadata_url, "First competing title")
+    status, conflict = api(metadata_url + "/branches/rest%2Ftwo/merge", "POST", {"into": "main"})
+    assert status == 409 and any(item["property"] == "name" for item in conflict["properties"]), conflict
+    assert root_entity(graph(metadata_url))["name"] == "First competing title"
+    draft = graph(metadata_url)
+    assert api(metadata_url + "/branches/rest%2Ftwo/rocrate", "PUT", {"rocrate": draft})[0] == 200
+    assert api(metadata_url + "/branches/rest%2Ftwo/merge", "POST", {"into": "main"})[0] == 200
+    for name in ("rest%2Fdraft", "rest%2Fone", "rest%2Ftwo"):
+        assert api(f"{metadata_url}/branches/{name}", "DELETE")[0] == 204
+    assert api(metadata_url + "/branches/main", "DELETE")[0] == 400
+    assert api(metadata_url + "/tags/rest-v1", "DELETE")[0] == 204
+    status, branches = api(metadata_url + "/branches")
+    assert status == 200 and not any(item["name"].startswith("rest/") for item in branches["branches"])
+    status, kept = api(metadata_url + "/conflicts")
+    assert status == 200 and kept["conflicts"] == [], kept
+    print("PASS: conflicting REST merges refuse with the property and succeed once resolved", flush=True)
 
     before = command(source, env, "ls-remote", "origin").decode()
     shutil.rmtree(Path(os.environ["ARUNA_GIT_ROOT"]) / f"{os.environ['ARUNA_DOCUMENT_ID']}.git")
