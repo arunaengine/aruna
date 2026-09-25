@@ -253,6 +253,8 @@ pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
 pub const API_STATE_KEYSPACE: &str = "api_state";
 pub const NODE_STATE_KEYSPACE: &str = "node_state";
+/// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
+pub const NODE_STATE_KEY: &[u8] = b"node_state";
 pub const ONBOARDING_KEYSPACE: &str = "onboarding";
 pub const DHT_KEYSPACE: &str = "dht_v2";
 pub const CRAQLE_TERMS_KEYSPACE: &str = "terms";

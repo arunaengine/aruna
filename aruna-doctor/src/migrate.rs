@@ -11,7 +11,7 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, sea
 use aruna_core::keyspaces::{
     BACKEND_SECRET_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
     FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEYSPACE,
+    ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
     REALM_CONFIG_KEYSPACE, SECONDARY_ID_KEYSPACE, SOURCE_SECRET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
@@ -186,13 +186,12 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
 /// The key the node seals secret rows with, derived like the node does at startup.
 fn node_key(db: &OptimisticTxDatabase) -> Result<Option<CredentialEncryptionKey>, ExplorerError> {
     let rows = db.keyspace(NODE_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
-    for entry in db.read_tx().iter(&rows) {
-        let (_, value) = entry.into_inner()?;
-        if let Ok(state) = postcard::from_bytes::<PersistedNodeState>(&value) {
-            return Ok(Some(CredentialEncryptionKey::derive(&state.net_secret_key)));
-        }
-    }
-    Ok(None)
+    let Some(value) = db.read_tx().get(&rows, NODE_STATE_KEY)? else {
+        return Ok(None);
+    };
+    let state = postcard::from_bytes::<PersistedNodeState>(&value)
+        .map_err(|error| decode_error(NODE_STATE_KEYSPACE, NODE_STATE_KEY, error))?;
+    Ok(Some(CredentialEncryptionKey::derive(&state.net_secret_key)))
 }
 
 /// Seals plain secret rows; rows that already open with the node key stay unchanged.
@@ -740,10 +739,18 @@ mod tests {
                 owner: aruna_core::UserId::nil(REALM),
             },
         };
+        // Only the node_state row holds the identity; another row that decodes must not win.
+        let other = PersistedNodeState {
+            net_secret_key: [99u8; 32],
+            ..state.clone()
+        };
         write(
             &path,
             NODE_STATE_KEYSPACE,
-            vec![(b"node_state", postcard::to_allocvec(&state).unwrap())],
+            vec![
+                (b"another", postcard::to_allocvec(&other).unwrap()),
+                (b"node_state", postcard::to_allocvec(&state).unwrap()),
+            ],
         );
         let plain = SourceConnectorSecret::new(
             Ulid::from_bytes([1u8; 16]),
