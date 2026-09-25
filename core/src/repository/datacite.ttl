@@ -2,9 +2,10 @@
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
-# The untargeted root shape binds to the crate root. Creators are read from schema:author or
-# schema:creator; a person needs a name or family name, an organization a name.
+# The untargeted root shape binds to the crate root; creators come from schema:author and
+# schema:creator. Values are single plain text, as the record mapping drops other forms.
 @prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 @prefix schema: <http://schema.org/> .
 @prefix dc: <https://w3id.org/aruna/profiles/repository/datacite#> .
 
@@ -18,8 +19,10 @@ dc:shape-Dataset-name a sh:PropertyShape ;
   sh:description "The title of the record." ;
   sh:order 0 ;
   sh:minCount 1 ;
+  sh:maxCount 1 ;
+  sh:datatype xsd:string ;
   sh:minLength 1 ;
-  sh:message "The dataset needs a name, which becomes the record title." .
+  sh:message "The dataset needs one plain text name, which becomes the record title." .
 
 dc:shape-Dataset-datePublished a sh:PropertyShape ;
   sh:path schema:datePublished ;
@@ -27,8 +30,10 @@ dc:shape-Dataset-datePublished a sh:PropertyShape ;
   sh:description "A year, year and month, or full ISO date." ;
   sh:order 1 ;
   sh:minCount 1 ;
+  sh:maxCount 1 ;
+  sh:datatype xsd:string ;
   sh:pattern "^\\d{4}(-\\d{2}){0,2}([T/].*)?$" ;
-  sh:message "The dataset needs a publication date such as 2026, 2026-09 or 2026-09-25." .
+  sh:message "The dataset needs one publication date as text, such as 2026, 2026-09 or 2026-09-25." .
 
 dc:shape-Dataset-creators a sh:PropertyShape ;
   sh:path [ sh:alternativePath ( schema:author schema:creator ) ] ;
@@ -42,9 +47,9 @@ dc:shape-Dataset-creators a sh:PropertyShape ;
 # Members are property shapes: craqle skips sh:property of shapes reached through sh:node.
 dc:shape-Creator a sh:NodeShape ;
   sh:or (
-    [ sh:path schema:name ; sh:minCount 1 ]
+    [ sh:path schema:name ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ]
     [ sh:and (
-        [ sh:path schema:familyName ; sh:minCount 1 ]
+        [ sh:path schema:familyName ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ]
         [ sh:not [ sh:class schema:Organization ] ]
     ) ]
   ) .

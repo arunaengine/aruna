@@ -16,8 +16,9 @@ pub:shape-Dataset-publisher a sh:PropertyShape ;
   sh:description "The organization that publishes the record, as text or a named entity." ;
   sh:order 4 ;
   sh:minCount 1 ;
+  sh:maxCount 1 ;
   sh:or (
     [ sh:datatype xsd:string ; sh:minLength 1 ]
-    [ sh:path schema:name ; sh:minCount 1 ]
+    [ sh:path schema:name ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ]
   ) ;
   sh:message "The dataset needs a publisher, as text or an entity with a name." .

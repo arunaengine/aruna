@@ -18,7 +18,7 @@ use crate::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
 
-/// Archive files every export writes besides the data files: the crate metadata and the report.
+/// Archive files an export writes besides the data files: the crate metadata and the report.
 pub const CRATE_FILES: [&str; 2] = ["ro-crate-metadata.json", "aruna-export-report.json"];
 
 /// How many leading bytes of a file a format check reads.
@@ -37,7 +37,8 @@ pub struct Rules {
 pub struct Target {
     pub name: String,
     pub select: Select,
-    /// The target also takes the `CRATE_FILES` every export writes.
+    /// The target also takes the `CRATE_FILES`; limits count the report even when an export
+    /// writes none, so the preview and the export count the same files.
     #[serde(default)]
     pub crate_files: bool,
     #[serde(default)]

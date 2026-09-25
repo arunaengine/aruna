@@ -547,9 +547,43 @@ async fn repository_profiles_checked() -> Result<(), Box<dyn std::error::Error>>
         );
     }
     let nameless = Some(json!({"@id": "https://ror.org/000000000"}));
-    let crate_json = repository_crate(document_id, person, nameless);
+    let crate_json = repository_crate(document_id, person.clone(), nameless);
     let status = check_profile(test.context.as_ref(), INVENIO_PROFILE_IRI, &crate_json).await?;
     assert_eq!(status.state, ProfileValidationState::Invalid);
+
+    // Values the record mapping would drop are refused: lists, typed and language-tagged text.
+    let tagged = json!([{"@id": "#ada", "@type": "Person",
+        "name": {"@value": "Ada", "@language": "en"}}]);
+    let crate_json = repository_crate(document_id, tagged, None);
+    let refused = check_profile(test.context.as_ref(), ZENODO_PROFILE_IRI, &crate_json).await?;
+    assert!(
+        paths(&refused).contains(&(creators.to_string(), ProfileValidationSeverity::Violation))
+    );
+    for (property, value) in [
+        ("name", json!(["One", "Two"])),
+        (
+            "datePublished",
+            json!({"@value": "2026", "@type": "http://www.w3.org/2001/XMLSchema#gYear"}),
+        ),
+    ] {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&repository_crate(document_id, person.clone(), None))?;
+        document["@graph"][1][property] = value;
+        let status = check_profile(
+            test.context.as_ref(),
+            ZENODO_PROFILE_IRI,
+            &document.to_string(),
+        )
+        .await?;
+        assert!(
+            paths(&status).contains(&(
+                format!("http://schema.org/{property}"),
+                ProfileValidationSeverity::Violation
+            )),
+            "{property}: {:#?}",
+            status.findings
+        );
+    }
     assert!(!graph_exists(&test, document_id).await?);
     Ok(())
 }
