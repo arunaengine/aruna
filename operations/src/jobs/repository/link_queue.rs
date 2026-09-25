@@ -14,6 +14,7 @@ use aruna_core::repository::{
     LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
     RepositoryLink, link_prefix,
 };
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -299,7 +300,7 @@ pub async fn refresh_review(
     if link.remote.review != LinkReview::Pending {
         return Ok(link.clone());
     }
-    let change = match super::invenio::remote::review_state(context, link).await {
+    let change = match super::review_state(RepositoryConnectorKind::Invenio, context, link).await {
         Ok(Some(state)) => LinkChange::Accept(Box::new(state)),
         Ok(None) => return Ok(link.clone()),
         Err(TransferError::Refused(reason)) => LinkChange::Fail(reason),

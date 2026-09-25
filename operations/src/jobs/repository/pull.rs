@@ -4,21 +4,18 @@
 
 use std::sync::Arc;
 
-use aruna_blob::invenio::InvenioError;
 use aruna_core::repository::{
     LinkFailure, LinkStatus, PullCheck, PushOutcome, RepositoryLink, RepositoryPull,
 };
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobState,
 };
-use aruna_core::structs::identity::auth::Permission;
-use http::Method;
 
-use super::TransferError;
-use super::invenio::connect;
-use super::link_queue::{current_event, ensure_holder};
+use super::link_queue::ensure_holder;
 use super::links::{LinkChange, LinkError, change_link, ensure_lineage};
 use super::push::creator_auth;
+use super::{TransferError, latest_version};
 use crate::driver::DriverContext;
 use crate::jobs::service::submit_rocrate_import;
 use crate::jobs::store::read_job_record;
@@ -89,66 +86,13 @@ pub async fn check_now(
     context: &DriverContext,
     link: &RepositoryLink,
 ) -> Result<Option<RepositoryLink>, LinkError> {
-    let change = match latest_version(context, link).await {
+    let change = match latest_version(RepositoryConnectorKind::Invenio, context, link).await {
         Ok(check) => LinkChange::Checked(check),
         Err(TransferError::Refused(reason)) => LinkChange::Fail(reason),
         Err(TransferError::Permanent(message)) => LinkChange::Fail(LinkFailure::Other(message)),
         Err(_) => LinkChange::Checked(PullCheck::Unavailable),
     };
     change_link(context, link, change).await
-}
-
-/// The held record's own version flag comes from the database; only a newer version needs the
-/// version listing.
-async fn latest_version(
-    context: &DriverContext,
-    link: &RepositoryLink,
-) -> Result<PullCheck, TransferError> {
-    let held = link
-        .remote
-        .record_id
-        .as_deref()
-        .ok_or_else(|| TransferError::Permanent("the link holds no record".into()))?;
-    aruna_core::repository::invenio::validate_id(held)?;
-    let local = current_event(context, link.document_id).await.ok();
-    let auth = creator_auth(link);
-    let client = connect(
-        context,
-        &auth,
-        link.group_id,
-        link.connector_id,
-        Permission::READ,
-        link.limits.metadata_bytes,
-        None,
-    )
-    .await?;
-    let gone = |error| match error {
-        InvenioError::Status(404 | 410) => TransferError::Refused(LinkFailure::SourceUnavailable),
-        error => error.into(),
-    };
-    let record = client
-        .json(Method::GET, client.url(&["records", held])?, None)
-        .await
-        .map_err(gone)?;
-    let latest = if record["versions"]["is_latest"] == true {
-        record
-    } else {
-        let mut url = client.url(&["records", held, "versions"])?;
-        url.query_pairs_mut()
-            .append_pair("size", "1")
-            .append_pair("sort", "version");
-        let page = client.json(Method::GET, url, None).await.map_err(gone)?;
-        page["hits"]["hits"][0].clone()
-    };
-    let latest_id = aruna_core::repository::invenio::record_id(&latest)?.to_string();
-    let revision = latest["revision_id"]
-        .as_u64()
-        .ok_or_else(|| TransferError::Permanent("missing record revision".into()))?;
-    Ok(PullCheck::Found {
-        latest_id,
-        revision,
-        local,
-    })
 }
 
 /// Submits an import of the lineage's latest version into the linked dataset, as the creator.

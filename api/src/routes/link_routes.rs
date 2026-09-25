@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use aruna_core::repository::{LinkPatch, LinkStatus, RepositoryLink};
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::jobs::repository::link_queue::{current_event, refresh_review, start_push};
 use aruna_operations::jobs::repository::links::LinkChange;
@@ -432,13 +433,17 @@ pub async fn accept_remote(
             "a push of this link is running; accept after it finished".into(),
         ));
     }
-    let remote = remote_state(state.get_ctx().as_ref(), &link)
-        .await
-        .map_err(|error| match error {
-            TransferError::Refused(_) => ServerError::Conflict(error.to_string()),
-            TransferError::Permanent(message) => ServerError::BadGatewayReason(message),
-            error => ServerError::ServiceUnavailableReason(error.to_string()),
-        })?;
+    let remote = remote_state(
+        RepositoryConnectorKind::Invenio,
+        state.get_ctx().as_ref(),
+        &link,
+    )
+    .await
+    .map_err(|error| match error {
+        TransferError::Refused(_) => ServerError::Conflict(error.to_string()),
+        TransferError::Permanent(message) => ServerError::BadGatewayReason(message),
+        error => ServerError::ServiceUnavailableReason(error.to_string()),
+    })?;
     change(&state, &link, LinkChange::Accept(Box::new(remote))).await?;
     view(&state, link.document_id, link.link_id).await
 }

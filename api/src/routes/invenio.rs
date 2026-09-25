@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::AuthContext;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -109,7 +110,8 @@ pub async fn search_records(
         aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
-    aruna_operations::jobs::repository::search_records(
+    aruna_operations::jobs::repository::search(
+        RepositoryConnectorKind::Invenio,
         &state.get_ctx(),
         &auth,
         &query,
@@ -259,7 +261,7 @@ pub async fn import_record(
     auth: Extension<Option<AuthContext>>,
     Json(request): Json<InvenioImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    use aruna_operations::jobs::repository::{RecordReference, TransferError, resolve_record};
+    use aruna_operations::jobs::repository::{RecordReference, TransferError, resolve};
     let reference = match (request.record_id, request.doi, request.url) {
         (Some(id), None, None) => RecordReference::Id(id),
         (None, Some(doi), None) => RecordReference::Doi(doi),
@@ -285,7 +287,8 @@ pub async fn import_record(
                 aruna_core::structs::identity::auth::Permission::READ,
             )
             .await?;
-            resolve_record(
+            resolve(
+                RepositoryConnectorKind::Invenio,
                 &state.get_ctx(),
                 &caller,
                 group_id,

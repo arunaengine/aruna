@@ -28,6 +28,7 @@ use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::repository::RepositoryPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
     ImportRoCrateSpec, JobError, JobResultPayload, ReasonCode, RoCrateCheckpointRefs,
@@ -404,7 +405,8 @@ async fn acquire_source(
             options,
             pull,
         } => {
-            let (artifact, found, progress) = super::repository::invenio::import::acquire(
+            let (artifact, found, progress) = super::repository::acquire(
+                RepositoryConnectorKind::Invenio,
                 ctx,
                 spec,
                 *group_id,

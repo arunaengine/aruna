@@ -10,6 +10,7 @@ use super::link::{
 use super::remote::remote;
 use super::*;
 use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError, change_link};
 use aruna_operations::jobs::repository::remote_state;
@@ -234,7 +235,12 @@ async fn revive_checks_lineage() -> Result<(), Box<dyn std::error::Error>> {
     let event = current_event(&fixture.context, failed.document_id).await?;
     let started = Box::pin(start_push(&fixture.context, &failed, event, false)).await;
     assert_eq!(started, Err(LinkError::Lineage));
-    let state = remote_state(fixture.context.as_ref(), &failed).await?;
+    let state = remote_state(
+        RepositoryConnectorKind::Invenio,
+        fixture.context.as_ref(),
+        &failed,
+    )
+    .await?;
     let accepted = change_link(
         &fixture.context,
         &failed,
@@ -273,7 +279,12 @@ async fn remote_edits_accepted() -> Result<(), Box<dyn std::error::Error>> {
     let (failed, _) = current(&fixture, &link).await;
     assert_eq!(failure(&failed), Some(&LinkFailure::RemoteChanged));
 
-    let state = remote_state(fixture.context.as_ref(), &failed).await?;
+    let state = remote_state(
+        RepositoryConnectorKind::Invenio,
+        fixture.context.as_ref(),
+        &failed,
+    )
+    .await?;
     change_link(
         fixture.context.as_ref(),
         &failed,

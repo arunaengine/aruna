@@ -14,6 +14,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportOmissionCounts, ExportReportDetail, ExportReportRow, ExportReportSource,
     ExportRoCrateResult, ExportRoCrateSpec, JobError, JobId, JobResultPayload, ReasonCode,
@@ -515,7 +516,7 @@ async fn repository_export(
     destination: &aruna_core::repository::RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    use super::repository::{TransferError, invenio::export};
+    use super::repository::{TransferError, deposit, invenio::export};
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
             "repository export requires a complete crate with no omitted files".into(),
@@ -524,7 +525,14 @@ async fn repository_export(
     let exported = if checkpoint.repository_complete {
         Ok(())
     } else {
-        export::repository_export(ctx, spec, destination, checkpoint).await
+        deposit(
+            RepositoryConnectorKind::Invenio,
+            ctx,
+            spec,
+            destination,
+            checkpoint,
+        )
+        .await
     };
     // Queued on every run of this phase, so a failed queue is retried; the dedup key joins.
     let result = match exported {

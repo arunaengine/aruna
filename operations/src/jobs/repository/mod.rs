@@ -1,26 +1,32 @@
-//! Coordinates repository transfers through Invenio repository connectors and crate jobs.
+//! Coordinates repository transfers of crate jobs and dispatches them to the adapter of each kind.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
 
-use aruna_core::repository::{LinkFailure, RepositoryCredential, RepositoryDestination};
+use aruna_core::repository::{
+    ImportOptions, LinkFailure, PullCheck, RemoteState, RepositoryCredential,
+    RepositoryDestination, RepositoryLink, RepositoryPull, RepositoryQuery,
+};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
+use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec, ImportRoCrateSpec};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::secondary_id::SecondaryIdentifier;
+use serde_json::Value;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::harvest::read_connector::{ConnectorView, GetRepositoryOperation, ReadConnectorError};
 
 use super::executor::JobContext;
+use super::export::ExportCheckpoint;
 
 pub mod invenio;
 pub mod link_queue;
 pub mod links;
 pub mod pull;
 pub(crate) mod push;
-pub use invenio::query::{RecordReference, resolve_record, search_records};
-pub use invenio::remote::remote_state;
+pub use invenio::query::RecordReference;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
@@ -41,6 +47,125 @@ impl From<aruna_core::repository::RepositoryError> for TransferError {
     fn from(error: aruna_core::repository::RepositoryError) -> Self {
         Self::Permanent(error.to_string())
     }
+}
+
+/// Runs a one-time or link export's repository deposit.
+pub(crate) async fn deposit(
+    kind: RepositoryConnectorKind,
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &RepositoryDestination,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<(), TransferError> {
+    match kind {
+        RepositoryConnectorKind::Invenio => {
+            invenio::export::repository_export(ctx, spec, destination, checkpoint).await
+        }
+        RepositoryConnectorKind::OaiPmh => Err(not_supported("deposit")),
+    }
+}
+
+/// Downloads a repository record into an import artifact with the identifiers it found.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acquire(
+    kind: RepositoryConnectorKind,
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    group_id: Ulid,
+    connector_id: Ulid,
+    record_id: &str,
+    options: &ImportOptions,
+    pull: Option<&RepositoryPull>,
+) -> Result<
+    (
+        ArtifactRef,
+        Vec<SecondaryIdentifier>,
+        Option<invenio::import::PullProgress>,
+    ),
+    TransferError,
+> {
+    match kind {
+        RepositoryConnectorKind::Invenio => {
+            invenio::import::acquire(ctx, spec, group_id, connector_id, record_id, options, pull)
+                .await
+        }
+        RepositoryConnectorKind::OaiPmh => Err(not_supported("import")),
+    }
+}
+
+/// Searches the repository's records with its native query syntax.
+pub async fn search(
+    kind: RepositoryConnectorKind,
+    context: &DriverContext,
+    auth: &AuthContext,
+    query: &RepositoryQuery,
+    limit: u64,
+) -> Result<Value, TransferError> {
+    match kind {
+        RepositoryConnectorKind::Invenio => {
+            invenio::query::search_records(context, auth, query, limit).await
+        }
+        RepositoryConnectorKind::OaiPmh => Err(not_supported("search")),
+    }
+}
+
+/// Resolves a DOI or record URL to the repository's record id.
+pub async fn resolve(
+    kind: RepositoryConnectorKind,
+    context: &DriverContext,
+    auth: &AuthContext,
+    group_id: Ulid,
+    connector_id: Ulid,
+    reference: &RecordReference,
+    limit: u64,
+) -> Result<String, TransferError> {
+    match kind {
+        RepositoryConnectorKind::Invenio => {
+            invenio::query::resolve_record(context, auth, group_id, connector_id, reference, limit)
+                .await
+        }
+        RepositoryConnectorKind::OaiPmh => Err(not_supported("record lookup")),
+    }
+}
+
+/// The repository's current draft and latest published version, for accepting remote edits.
+pub async fn remote_state(
+    kind: RepositoryConnectorKind,
+    context: &DriverContext,
+    link: &RepositoryLink,
+) -> Result<RemoteState, TransferError> {
+    match kind {
+        RepositoryConnectorKind::Invenio => invenio::remote::remote_state(context, link).await,
+        RepositoryConnectorKind::OaiPmh => Err(not_supported("links")),
+    }
+}
+
+/// The repository's answer to a pending review; `None` while the review is still open.
+pub(crate) async fn review_state(
+    kind: RepositoryConnectorKind,
+    context: &DriverContext,
+    link: &RepositoryLink,
+) -> Result<Option<RemoteState>, TransferError> {
+    match kind {
+        RepositoryConnectorKind::Invenio => invenio::remote::review_state(context, link).await,
+        RepositoryConnectorKind::OaiPmh => Err(not_supported("reviews")),
+    }
+}
+
+/// The latest version of a pull link's record lineage.
+pub(crate) async fn latest_version(
+    kind: RepositoryConnectorKind,
+    context: &DriverContext,
+    link: &RepositoryLink,
+) -> Result<PullCheck, TransferError> {
+    match kind {
+        RepositoryConnectorKind::Invenio => invenio::remote::latest_version(context, link).await,
+        RepositoryConnectorKind::OaiPmh => Err(not_supported("pull links")),
+    }
+}
+
+fn not_supported(action: &str) -> TransferError {
+    TransferError::Permanent(format!("this repository kind does not support {action}"))
 }
 
 impl From<std::io::Error> for TransferError {

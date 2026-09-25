@@ -5,7 +5,8 @@
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::repository::invenio::validate_id;
 use aruna_core::repository::{
-    LinkFailure, LinkReview, LinkTarget, RemoteState, RepositoryDestination, RepositoryLink,
+    LinkFailure, LinkReview, LinkTarget, PullCheck, RemoteState, RepositoryDestination,
+    RepositoryLink,
 };
 use aruna_core::structs::execution::job::ExportRoCrateSpec;
 use aruna_core::structs::identity::auth::Permission;
@@ -17,6 +18,7 @@ use super::export::{file_keys, record_from};
 use crate::driver::DriverContext;
 use crate::jobs::executor::JobContext;
 use crate::jobs::repository::TransferError;
+use crate::jobs::repository::link_queue::current_event;
 use crate::jobs::repository::links::read_secret;
 use crate::jobs::repository::push::creator_auth;
 
@@ -162,7 +164,7 @@ pub(crate) async fn review_state(
 }
 
 /// The repository's current draft and latest published version, for accepting remote edits.
-pub async fn remote_state(
+pub(crate) async fn remote_state(
     context: &DriverContext,
     link: &RepositoryLink,
 ) -> Result<RemoteState, TransferError> {
@@ -216,5 +218,58 @@ pub async fn remote_state(
         latest,
         review,
         files,
+    })
+}
+
+/// The held record's own version flag comes from the database; only a newer version needs the
+/// version listing.
+pub(crate) async fn latest_version(
+    context: &DriverContext,
+    link: &RepositoryLink,
+) -> Result<PullCheck, TransferError> {
+    let held = link
+        .remote
+        .record_id
+        .as_deref()
+        .ok_or_else(|| TransferError::Permanent("the link holds no record".into()))?;
+    aruna_core::repository::invenio::validate_id(held)?;
+    let local = current_event(context, link.document_id).await.ok();
+    let auth = creator_auth(link);
+    let client = connect(
+        context,
+        &auth,
+        link.group_id,
+        link.connector_id,
+        Permission::READ,
+        link.limits.metadata_bytes,
+        None,
+    )
+    .await?;
+    let gone = |error| match error {
+        InvenioError::Status(404 | 410) => TransferError::Refused(LinkFailure::SourceUnavailable),
+        error => error.into(),
+    };
+    let record = client
+        .json(Method::GET, client.url(&["records", held])?, None)
+        .await
+        .map_err(gone)?;
+    let latest = if record["versions"]["is_latest"] == true {
+        record
+    } else {
+        let mut url = client.url(&["records", held, "versions"])?;
+        url.query_pairs_mut()
+            .append_pair("size", "1")
+            .append_pair("sort", "version");
+        let page = client.json(Method::GET, url, None).await.map_err(gone)?;
+        page["hits"]["hits"][0].clone()
+    };
+    let latest_id = aruna_core::repository::invenio::record_id(&latest)?.to_string();
+    let revision = latest["revision_id"]
+        .as_u64()
+        .ok_or_else(|| TransferError::Permanent("missing record revision".into()))?;
+    Ok(PullCheck::Found {
+        latest_id,
+        revision,
+        local,
     })
 }

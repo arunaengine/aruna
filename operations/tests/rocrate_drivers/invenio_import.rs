@@ -331,7 +331,8 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
         size: 25,
         all_versions: false,
     };
-    let page = aruna_operations::jobs::repository::search_records(
+    let page = aruna_operations::jobs::repository::search(
+        aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
         &fixture.context,
         &auth,
         &query,
@@ -341,9 +342,15 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(page["hits"]["hits"][0]["id"], "2");
     let invalid = aruna_core::repository::RepositoryQuery { size: 100, ..query };
     assert!(
-        aruna_operations::jobs::repository::search_records(&fixture.context, &auth, &invalid, 1024)
-            .await
-            .is_err()
+        aruna_operations::jobs::repository::search(
+            aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
+            &fixture.context,
+            &auth,
+            &invalid,
+            1024
+        )
+        .await
+        .is_err()
     );
     fixture.stop().await;
     Ok(())
@@ -351,7 +358,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn doi_keeps_case() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_operations::jobs::repository::{RecordReference, resolve_record};
+    use aruna_operations::jobs::repository::{RecordReference, resolve};
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let connector_id = connector(&fixture, &server).await;
@@ -364,7 +371,8 @@ async fn doi_keeps_case() -> Result<(), Box<dyn std::error::Error>> {
     let resolve = async |doi: &str| {
         let reference = RecordReference::Doi(doi.to_string());
         let limit = 1024 * 1024;
-        resolve_record(
+        resolve(
+            aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
             &fixture.context,
             &auth,
             fixture.group_id,

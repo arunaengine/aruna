@@ -6,7 +6,7 @@ use super::*;
 use aruna_core::repository::{ImportMode, ImportOptions, RepositoryQuery, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
-use aruna_operations::jobs::repository::{seal_credential, search_records};
+use aruna_operations::jobs::repository::{seal_credential, search};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 
 #[tokio::test]
@@ -131,7 +131,8 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
-            let page = search_records(
+            let page = search(
+                RepositoryConnectorKind::Invenio,
                 &fixture.context,
                 &imported.auth_context,
                 &query,
@@ -312,6 +313,7 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     let state = Box::pin(aruna_operations::jobs::repository::remote_state(
+        RepositoryConnectorKind::Invenio,
         fixture.context.as_ref(),
         &failed,
     ))
@@ -621,7 +623,14 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
         size: 10,
         all_versions: false,
     };
-    let page = search_records(&fixture.context, &auth, &query, 1024 * 1024).await?;
+    let page = search(
+        RepositoryConnectorKind::Invenio,
+        &fixture.context,
+        &auth,
+        &query,
+        1024 * 1024,
+    )
+    .await?;
     let hits = page["hits"]["hits"]
         .as_array()
         .ok_or("search hits missing")?;
@@ -854,7 +863,8 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     assert!(revision.jsonld.contains(&format!("{title} v2")));
     // Imports name records by version DOI, concept DOI or page URL as well.
     let resolve = async |reference| {
-        Box::pin(aruna_operations::jobs::repository::resolve_record(
+        Box::pin(aruna_operations::jobs::repository::resolve(
+            RepositoryConnectorKind::Invenio,
             &fixture.context,
             &auth,
             fixture.group_id,
