@@ -82,6 +82,92 @@ fn unknown_rules_refused() {
     assert!(serde_json::from_value::<Rules>(unknown).is_err());
     let misspelled = json!({"targets": [{"name": "x", "select": {"roots": true}}]});
     assert!(serde_json::from_value::<Rules>(misspelled).is_err());
+    // Rules the preview and export would not evaluate never load.
+    for (rules, reason) in [
+        (
+            json!({"targets": [{"name": "run", "select": {}, "content": {"md5": true}}]}),
+            "md5",
+        ),
+        (
+            json!({"targets": [{"name": "run", "select": {}, "content": {"format": "vcf"}}]}),
+            "format vcf",
+        ),
+        (
+            json!({"targets": [{"name": "run", "select": {},
+                "group": {"each": "sample", "property": "about"}}]}),
+            "target sample",
+        ),
+        (
+            json!({"targets": [{"name": "run", "select": {},
+                "relations": [{"property": "about", "target": "run", "min": 2, "max": 1}]}]}),
+            "max below min",
+        ),
+        (
+            json!({"targets": [{"name": "run", "select": {}}, {"name": "run", "select": {}}]}),
+            "repeats",
+        ),
+    ] {
+        let error = load(&rules.to_string()).expect_err(reason);
+        assert!(
+            error.contains(reason.split(' ').next_back().unwrap()),
+            "{error}"
+        );
+    }
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn formats_read_prefix() {
+    let bam = gzip(b"BAM\x01rest of the header");
+    let fastq = gzip(b"@read1\nACGT\n+\n!!!!\n");
+    assert!(has_format("fastq", b"@read1\nACGT"));
+    assert!(has_format("fastq", &fastq));
+    // A truncated prefix of a larger member still shows its first bytes.
+    assert!(has_format("bam", &bam[..bam.len() - 4]));
+    assert!(!has_format("bam", b"BAM\x01"));
+    assert!(has_format("cram", b"CRAM\x03\x00"));
+    assert!(!has_format("cram", &gzip(b"CRAM")));
+    assert!(!has_format("fastq", b">fasta"));
+    assert!(!has_format("vcf", b"##fileformat"));
+}
+
+#[test]
+fn content_rules_checked() {
+    let target: Target = serde_json::from_value(json!({"name": "run", "select": {},
+        "content": {"max_files": 2, "max_file_bytes": 10, "max_total_bytes": 15,
+            "format": "fastq"}}))
+    .unwrap();
+    let file = |path, size, prefix| FileFacts {
+        path,
+        size: Some(size),
+        prefix: Some(prefix),
+    };
+    let ok = [file("a_1.fastq", 8, b"@a"), file("a_2.fastq", 7, b"@b")];
+    assert!(content_findings(&target, &ok).is_empty());
+    let bad = [
+        file("a.fastq", 11, b"@a"),
+        file("b.fastq", 5, b">b"),
+        file("c.fastq", 1, b"@c"),
+    ];
+    let rules = content_findings(&target, &bad)
+        .into_iter()
+        .map(|finding| (finding.rule, finding.focus_node.unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rules,
+        [
+            ("run/max_files".to_string(), "./".to_string()),
+            ("run/max_file_bytes".into(), "a.fastq".into()),
+            ("run/format".into(), "b.fastq".into()),
+            ("run/max_total_bytes".into(), "./".into()),
+        ]
+    );
 }
 
 #[test]
@@ -104,6 +190,9 @@ fn preview_maps_invenio() {
     assert!(mapped.contains(&entry("./", "record", Some("title"))));
     assert!(mapped.contains(&entry("#ada", "record", Some("creators"))));
     assert!(mapped.contains(&entry(&data, "file", None)));
+    // Every export also uploads the crate metadata and its report as files.
+    assert!(mapped.contains(&entry("ro-crate-metadata.json", "file", None)));
+    assert_eq!(target_files("file", &mapped, |id| Some(id.into())).len(), 3);
     // A web data entity stays a reference and the author no record file.
     assert!(
         !mapped
@@ -118,9 +207,26 @@ fn preview_maps_invenio() {
 }
 
 #[test]
+fn creators_take_union() {
+    let rules = rules(RepositoryConnectorKind::Invenio).unwrap().unwrap();
+    let mut document = document(vec![
+        json!({"@id": "#bob", "@type": "Person", "name": "Bob"}),
+    ]);
+    document["@graph"][1]["creator"] = json!([{"@id": "#bob"}, {"@id": "#ada"}]);
+    let (mapped, _) = preview(rules, &document);
+    let creators = mapped
+        .iter()
+        .filter(|m| m.field.as_deref() == Some("creators"))
+        .map(|m| m.entity_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(creators, ["#bob", "#ada"]);
+}
+
+#[test]
 fn preview_reports_violations() {
     let rules = rules(RepositoryConnectorKind::Invenio).unwrap().unwrap();
-    let files = (0..101u8)
+    // With the crate metadata and report, 99 data files already make 101 uploads.
+    let files = (0..99u8)
         .map(|seed| json!({"@id": bytes_id(seed), "@type": "File"}))
         .collect();
     let (_, findings) = preview(rules, &document(files));
@@ -131,28 +237,49 @@ fn preview_reports_violations() {
     let grouped: Rules = serde_json::from_value(json!({"targets": [
         {"name": "sample", "select": {"types": ["Sample"]}, "min": 1},
         {"name": "run", "select": {"types": ["File"]},
-            "group": {"each": "sample", "property": "about"},
-            "relations": [{"property": "about", "target": "sample"}]}
+            "group": {"each": "sample", "property": "about", "pair": ["_1", "_2"]},
+            "relations": [{"property": "about", "target": "sample", "max": 1}]},
+        {"name": "study", "select": {"types": ["Study"]},
+            "relations": [{"property": "isPartOf", "target": "sample", "min": 1,
+                "inverse": true}]}
     ]}))
     .unwrap();
     let document = document(vec![
-        json!({"@id": "#s1", "@type": "Sample"}),
-        json!({"@id": "r1.fastq", "@type": "File", "about": {"@id": "#s1"}}),
-        json!({"@id": "r2.fastq", "@type": "File"}),
+        json!({"@id": "#s1", "@type": "Sample", "isPartOf": {"@id": "#study"}}),
+        json!({"@id": "#s2", "@type": "Sample"}),
+        json!({"@id": "#study", "@type": "Study"}),
+        json!({"@id": "#lonely", "@type": "Study"}),
+        json!({"@id": "r_1.fastq", "@type": "File", "about": {"@id": "#s1"}}),
+        json!({"@id": "r_2.fastq", "@type": "File", "about": {"@id": "#s1"}}),
+        json!({"@id": "x_1.fastq", "@type": "File", "about": [{"@id": "#s1"}, {"@id": "#s2"}]}),
+        json!({"@id": "loose.fastq", "@type": "File"}),
     ]);
     let (mapped, findings) = preview(&grouped, &document);
     assert!(
         mapped
             .iter()
-            .any(|m| m.entity_id == "r1.fastq" && m.group.as_deref() == Some("#s1"))
+            .any(|m| m.entity_id == "r_1.fastq" && m.group.as_deref() == Some("#s1"))
     );
-    // r2.fastq has no sample: no group and no relation.
-    assert_eq!(findings.len(), 2, "{findings:#?}");
-    assert!(
-        findings
-            .iter()
-            .all(|finding| finding.code == "mapping_violation"
-                && finding.focus_node.as_deref() == Some("r2.fastq"))
+    let mut found = findings
+        .iter()
+        .map(|finding| {
+            assert_eq!(finding.code, "mapping_violation");
+            (
+                finding.rule.as_str(),
+                finding.focus_node.as_deref().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    found.sort_unstable();
+    assert_eq!(
+        found,
+        [
+            ("run/group", "loose.fastq"),
+            ("run/pair", "x_1.fastq"),
+            ("run/relation", "loose.fastq"),
+            ("run/relation", "x_1.fastq"),
+            ("study/relation", "#lonely"),
+        ]
     );
     let (_, findings) = preview(&grouped, &json!({"@graph": []}));
     assert_eq!(findings[0].rule, "sample/min");
