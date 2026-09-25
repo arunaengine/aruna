@@ -1202,7 +1202,7 @@ async fn update_document(
             crate::metadata::get_document::load_document_record(&ctx.driver, spec.document_id)
                 .await
                 .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
-        Box::pin(route_metadata_update(
+        let updated = Box::pin(route_metadata_update(
             &ctx.driver,
             actor,
             record.as_ref(),
@@ -1213,7 +1213,23 @@ async fn update_document(
         ))
         .await
         .map_err(classify_metadata)?
-        .last_event_id
+        .last_event_id;
+        // The update takes no expected revision, so a change that raced it shows afterwards.
+        let (_, after) = Box::pin(crate::jobs::export::crate_jsonld(
+            &ctx.driver,
+            &spec.auth_context,
+            spec.document_id,
+            spec.limits.metadata_bytes,
+        ))
+        .await
+        .map_err(transfer_failure)?;
+        if after != updated && after != base {
+            return Err(ImportFailure::Permanent(
+                "the dataset changed while the pull updated it; check it and pull again"
+                    .to_string(),
+            ));
+        }
+        updated
     } else {
         let own = plan
             .entries
