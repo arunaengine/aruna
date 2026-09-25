@@ -2,12 +2,29 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use serde_json::json;
+
 use super::*;
 
 const KINDS: [RepositoryConnectorKind; 2] = [
     RepositoryConnectorKind::Invenio,
     RepositoryConnectorKind::OaiPmh,
 ];
+
+fn bytes_id(seed: u8) -> String {
+    W3idIdentifier::ContentHash([seed; 32]).to_w3id()
+}
+
+fn document(entities: Vec<Value>) -> Value {
+    let mut graph = vec![
+        json!({"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"}}),
+        json!({"@id": "./", "@type": "Dataset", "name": "Data", "author": [{"@id": "#ada"}],
+            "keywords": ["a"]}),
+        json!({"@id": "#ada", "@type": "Person", "name": "Ada"}),
+    ];
+    graph.extend(entities);
+    json!({"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": graph})
+}
 
 #[test]
 fn shipped_rules_consistent() {
@@ -67,4 +84,73 @@ fn unknown_rules_refused() {
     assert!(
         toml::from_str::<Rules>("[[targets]]\nname = \"x\"\nselect = { roots = true }").is_err()
     );
+}
+
+#[test]
+fn preview_maps_invenio() {
+    let rules = rules(RepositoryConnectorKind::Invenio).unwrap().unwrap();
+    let data = bytes_id(1);
+    let document = document(vec![
+        json!({"@id": data, "@type": "File", "name": "data.csv"}),
+        json!({"@id": "https://example.org/web.csv", "@type": "File"}),
+    ]);
+    let (mapped, findings) = preview(rules, &document);
+    assert!(findings.is_empty(), "{findings:#?}");
+    let entry = |id: &str, target: &str, field: Option<&str>| Mapped {
+        entity_id: id.into(),
+        target: target.into(),
+        group: None,
+        field: field.map(str::to_string),
+    };
+    assert!(mapped.contains(&entry("./", "record", None)));
+    assert!(mapped.contains(&entry("./", "record", Some("title"))));
+    assert!(mapped.contains(&entry("#ada", "record", Some("creators"))));
+    assert!(mapped.contains(&entry(&data, "file", None)));
+    // A web data entity stays a reference and the author no record file.
+    assert!(
+        !mapped
+            .iter()
+            .any(|m| m.entity_id == "https://example.org/web.csv")
+    );
+    assert!(
+        !mapped
+            .iter()
+            .any(|m| m.entity_id == "#ada" && m.field.is_none())
+    );
+}
+
+#[test]
+fn preview_reports_violations() {
+    let rules = rules(RepositoryConnectorKind::Invenio).unwrap().unwrap();
+    let files = (0..101u8)
+        .map(|seed| json!({"@id": bytes_id(seed), "@type": "File"}))
+        .collect();
+    let (_, findings) = preview(rules, &document(files));
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].code, "content_violation");
+    assert_eq!(findings[0].rule, "file/max_files");
+
+    let grouped: Rules = toml::from_str(
+        "[[targets]]\nname = \"sample\"\nselect = { types = [\"Sample\"] }\nmin = 1\n\
+         [[targets]]\nname = \"run\"\nselect = { types = [\"File\"] }\n\
+         group = { each = \"sample\", property = \"about\" }\n\
+         relations = [{ property = \"about\", target = \"sample\" }]",
+    )
+    .unwrap();
+    let document = document(vec![
+        json!({"@id": "#s1", "@type": "Sample"}),
+        json!({"@id": "r1.fastq", "@type": "File", "about": {"@id": "#s1"}}),
+        json!({"@id": "r2.fastq", "@type": "File"}),
+    ]);
+    let (mapped, findings) = preview(&grouped, &document);
+    assert!(
+        mapped
+            .iter()
+            .any(|m| m.entity_id == "r1.fastq" && m.group.as_deref() == Some("#s1"))
+    );
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].code, "mapping_violation");
+    assert_eq!(findings[0].focus_node.as_deref(), Some("r2.fastq"));
+    let (_, findings) = preview(&grouped, &json!({"@graph": []}));
+    assert_eq!(findings[0].rule, "sample/min");
 }
