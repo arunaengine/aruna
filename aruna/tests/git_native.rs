@@ -88,11 +88,17 @@ async fn native_clients() -> TestResult<()> {
             .send().await?.error_for_status()?.json().await?;
         assert!(repository["error"].is_null(), "ARC conversion failed");
         let bucket = repository["bucket"].as_str().ok_or_else(|| std::io::Error::other("automatic LFS bucket missing"))?;
+        let other = aruna_core::UserId::local(ulid::Ulid::generate(), seed.realm_id);
+        let other_token = create_bearer_token(seed.context.as_ref(), other, seed.realm_id, seed.capabilities.clone()).await?;
+        client.post(format!("{base}/api/v1/access/groups/{}/members", group.group_id)).bearer_auth(&token)
+            .json(&serde_json::json!({"user_id": other.to_string()})).send().await?.error_for_status()?;
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("workspace root");
         let mut child = Command::new(python).arg(root.join("scripts/arc-native/test_native.py"))
             .env("ARUNA_GIT_URL", repository["clone_url"].as_str().ok_or_else(|| std::io::Error::other("Git URL missing"))?)
             .env("ARUNA_TOKEN", &token).env("ARUNA_API_URL", &base).env("ARUNA_DOCUMENT_ID", id)
-            .env("ARUNA_READ_TOKEN", read_token)
+            .env("ARUNA_READ_TOKEN", read_token).env("ARUNA_OTHER_TOKEN", &other_token)
+            .env("ARUNA_ARN_PREFIX", format!("arn:aruna:{}:{}:s3", seed.realm_id, seed.net.node_id()))
+            .env("ARUNA_GIT_ROOT", directory.path().join("git"))
             .env("ARUNA_GROUP_ID", &group.group_id).env("ARUNA_BUCKET", &bucket)
             .env("ARUNA_S3_URL", &endpoint.endpoint_url).env("AWS_ACCESS_KEY_ID", &credentials.access_key_id)
             .env("AWS_SECRET_ACCESS_KEY", &credentials.access_secret).env("AWS_DEFAULT_REGION", shared::AWS_REGION)

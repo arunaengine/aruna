@@ -250,6 +250,55 @@ def exercise(root):
     command(source, env, "checkout", "main")
     print("PASS: ISA edits on main update metadata; branches stay drafts; signed ARC export", flush=True)
 
+    raw = b"existing Aruna object\n" * 4096
+    version = s3.put_object(Bucket=os.environ["ARUNA_BUCKET"], Key="datasets/raw.bin", Body=raw)["VersionId"]
+    arn = f"{os.environ['ARUNA_ARN_PREFIX']}/{os.environ['ARUNA_BUCKET']}/datasets/raw.bin@{version}"
+    snapshot = json.loads(http(metadata_url + "/git")[1])["commit"]
+    current = graph(metadata_url)
+    current["@graph"].append({"@id": "#raw", "@type": "File", "name": "raw.bin", "contentUrl": arn})
+    parts = root_entity(current).get("hasPart", [])
+    root_entity(current)["hasPart"] = (parts if isinstance(parts, list) else [parts]) + [{"@id": "#raw"}]
+    status, body = http(metadata_url + "/rocrate", "PUT", {"rocrate": current})
+    assert status == 200, body
+    wait_snapshot(metadata_url, snapshot)
+    command(source, env, "pull", "--ff-only", "origin", "main")
+    assert (source / "dataset/raw.bin").read_bytes() == raw
+    assert "/dataset/raw.bin filter=lfs" in (source / ".gitattributes").read_text()
+    print("PASS: an existing Aruna object appears in the ARC as an LFS file with exact content", flush=True)
+
+    other_env = dict(env, ARUNA_TOKEN=os.environ["ARUNA_OTHER_TOKEN"])
+    command(root, other_env, "clone", url, "other")
+    other = root / "other"
+    command(other, other_env, "lfs", "install", "--local", "--skip-repo")
+    command(source, env, "lfs", "lock", "isa.investigation.xlsx")
+    assert "isa.investigation.xlsx" in command(other, other_env, "lfs", "locks").decode()
+    workbook = load_workbook(other / "isa.investigation.xlsx")
+    sheet = workbook["isa_investigation"]
+    row = next(row for row in sheet.iter_rows() if row[0].value == "Investigation Title")
+    row[1].value = "Edited by another user"
+    workbook.save(other / "isa.investigation.xlsx")
+    command(other, other_env, "add", "isa.investigation.xlsx")
+    commit(other, other_env, "test: edit a locked workbook")
+    locked = remote_main(other, other_env)
+    command(other, dict(other_env, GIT_LFS_SKIP_PUSH="1"), "-c", "lfs.locksverify=false",
+            "push", "origin", "main", success=False)
+    assert remote_main(other, other_env) == locked
+    assert root_entity(graph(metadata_url))["name"] != "Edited by another user"
+    command(source, env, "lfs", "unlock", "isa.investigation.xlsx")
+    command(other, other_env, "push", "origin", "main")
+    wait_graph(metadata_url, "Edited by another user")
+    print("PASS: LFS locks block other users' pushes until released", flush=True)
+
+    before = command(source, env, "ls-remote", "origin").decode()
+    shutil.rmtree(Path(os.environ["ARUNA_GIT_ROOT"]) / f"{os.environ['ARUNA_DOCUMENT_ID']}.git")
+    assert command(source, env, "ls-remote", "origin").decode() == before
+    command(root, env, "clone", url, "rebuilt")
+    rebuilt = root / "rebuilt"
+    command(rebuilt, env, "fsck", "--strict")
+    command(rebuilt, env, "fetch", "origin", "aruna")
+    assert command(rebuilt, env, "log", "-1", "--format=%G?", "FETCH_HEAD").strip() == b"G"
+    print("PASS: a deleted repository cache rebuilds with identical refs and signed commits", flush=True)
+
     if os.environ.get("ARUNA_ARCITECT"):
         subprocess.run(["node", str(Path(__file__).with_name("test_arcitect.mjs")), str(root)],
                        env=env, check=True, timeout=600)
