@@ -460,7 +460,9 @@ The node that creates a link owns it and must hold the dataset. Only that node c
 
 **Errors**
 
-Invalid input returns 400. A dataset whose mapped metadata lacks title, publication_date, resource_type or creators returns 400 with `missing` listing them. Denied access returns 403. An unknown dataset, or a connector that does not exist in the group or is no Invenio connector, returns 404. A node that does not hold the dataset returns 409, as does an enabled pull link of the dataset that follows the same record lineage (parent_id) or an existing link with the same id."#,
+Invalid input returns 400. A dataset whose mapped metadata lacks title, publication_date, resource_type or creators returns 400 with `missing` listing them. Denied access returns 403.
+
+An unknown dataset, or a connector that does not exist in the group or is no Invenio connector, returns 404. A node that does not hold the dataset returns 409, as does an enabled pull link of the dataset that follows the same record lineage (parent_id) or an existing link with the same id."#,
     params(("document_id" = String, Path, description = "Metadata document identifier")),
     request_body(content = CreateLinkRequest, example = json!({
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",

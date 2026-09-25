@@ -214,7 +214,7 @@ pub struct SubmitInvenioExport {
 
 **Authentication**
 
-Requires READ on the metadata path of the repository connector group and WRITE on destination data and metadata. The connector is an Invenio repository connector whose endpoint is the API root, such as https://zenodo.org/api/.
+Requires READ on the metadata path of the repository connector group and WRITE on destination data and metadata. keep_updated also requires WRITE on the connector group's metadata path, as managing a link does. The connector is an Invenio repository connector whose endpoint is the API root, such as https://zenodo.org/api/.
 
 **Behavior**
 
@@ -224,7 +224,7 @@ Name the record by exactly one of record_id, doi or url. A version DOI selects t
 
 All published versions are included by default. Set all_versions to false for the selected version. Source identifiers remain provenance. Partial dates use their earliest day for crate validation and retain their exact original value.
 
-keep_updated creates a pull link on the new dataset once the import succeeded. It requires WRITE on the metadata path of the connector group, as managing a link does. It asks the repository once a day for a new version, reading with the connector's token if the connector has one. With auto_update new versions are imported into the dataset without asking; otherwise the link shows update_available and the pull route imports them.
+keep_updated creates a pull link on the new dataset once the import succeeded. It asks the repository once a day for a new version, reading with the connector's token if the connector has one. With auto_update new versions are imported into the dataset without asking; otherwise the link shows update_available and the pull route imports them.
 
 **Limits**
 
