@@ -426,10 +426,18 @@ pub fn delete_projection_entry(document_id: Ulid, event_id: Ulid) -> (KeySpace, 
 pub fn create_projection_entries(
     event: &MetadataEventRecord,
 ) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
-    Ok(vec![
-        create_event_entry(event)?,
-        pending_projection_entry(event),
-    ])
+    let mut entries = vec![create_event_entry(event)?, pending_projection_entry(event)];
+    if matches!(
+        event.payload,
+        crate::metadata::MetadataEventPayload::Checkpoint { .. }
+    ) {
+        entries.push((
+            crate::keyspaces::METADATA_CHECKPOINT_KEYSPACE.to_string(),
+            event_log_key(event.record.document_id, event.event_id),
+            ByteView::from(Vec::new()),
+        ));
+    }
+    Ok(entries)
 }
 
 pub fn graph_lifecycle_entry(

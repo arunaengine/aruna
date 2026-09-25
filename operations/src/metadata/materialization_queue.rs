@@ -17,9 +17,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::{
     ApplyRoCrateRequest, DeadLetterRecord, MaterializationState, MaterializationStatusRecord,
-    MetadataBatch, MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataEventPayload, MetadataEventRecord, MetadataGraphPolicy, MetadataMaterializationRecord,
-    MetadataRawRevision, MetadataRequestDurability, deterministic_materialization_actor,
+    MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
+    MetadataEventRecord, MetadataGraphPolicy, MetadataMaterializationRecord, MetadataRawRevision,
+    MetadataRequestDurability, deterministic_materialization_actor,
 };
 use aruna_core::storage_entries::{
     dead_letter_entry, dead_letter_key, document_job_entry, document_job_key, document_job_prefix,
@@ -2052,8 +2052,11 @@ async fn materialize_create_event(
     event: &MetadataEventRecord,
     raw_state_cache: &mut RawStateCache,
 ) -> Result<MaterializedCreateEvent, MetadataMaterializationError> {
-    if let MetadataEventPayload::ApplyBatch { batch, .. } = &event.payload {
-        return merge_batch_event(context, event, batch, raw_state_cache).await;
+    if let MetadataEventPayload::ApplyBatch { .. } | MetadataEventPayload::Checkpoint { .. } =
+        &event.payload
+    {
+        let change = graph_materialization_effect(event, None, false);
+        return merge_batch_event(context, event, change, raw_state_cache).await;
     }
     let raw_plan =
         crate::metadata::raw_revision::prepare_raw_event(context, event, raw_state_cache).await?;
@@ -2086,13 +2089,13 @@ async fn materialize_create_event(
     }
 }
 
-/// Merges the origin's batch, then re-renders and re-validates the graph. The
-/// merge is order independent and idempotent by dot, so every holder converges
-/// whatever order events arrive in.
+/// Merges the origin's batch or joins a checkpoint's graph state, then re-renders and
+/// re-validates the graph. Both are order independent and idempotent by dot, so every
+/// holder converges whatever order events arrive in.
 async fn merge_batch_event(
     context: &DriverContext,
     event: &MetadataEventRecord,
-    batch: &MetadataBatch,
+    change: Effect,
     raw_state_cache: &mut RawStateCache,
 ) -> Result<MaterializedCreateEvent, MetadataMaterializationError> {
     let metadata_handle = context
@@ -2120,14 +2123,9 @@ async fn merge_batch_event(
             )));
         }
     }
-    match metadata_handle
-        .send_effect(Effect::Metadata(MetadataEffect::MergeBatch {
-            graph_iri: event.record.graph_iri.clone(),
-            batch: batch.clone(),
-        }))
-        .await
-    {
-        Event::Metadata(MetadataEvent::BatchMerged { .. }) => {}
+    match metadata_handle.send_effect(change).await {
+        Event::Metadata(MetadataEvent::BatchMerged { .. })
+        | Event::Metadata(MetadataEvent::SnapshotInstalled { .. }) => {}
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
         other => {
             return Err(MetadataMaterializationError::UnexpectedEvent(format!(
@@ -2274,6 +2272,19 @@ fn graph_materialization_effect(
             Effect::Metadata(MetadataEffect::MergeBatch {
                 graph_iri: event.record.graph_iri.clone(),
                 batch: batch.clone(),
+            })
+        }
+        // A checkpoint without graph state joins an empty snapshot, which changes nothing.
+        MetadataEventPayload::Checkpoint { snapshot } => {
+            Effect::Metadata(MetadataEffect::InstallSnapshot {
+                graph_iri: event.record.graph_iri.clone(),
+                snapshot: snapshot.clone().unwrap_or_else(|| {
+                    Box::new(craqle::GraphReplicaSnapshot {
+                        graph: craqle::GraphId::new(&event.record.graph_iri),
+                        clock: craqle::VectorClock::default(),
+                        quads: Vec::new(),
+                    })
+                }),
             })
         }
     }

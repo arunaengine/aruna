@@ -204,6 +204,11 @@ pub enum MetadataEventPayload {
         batch: MetadataBatch,
         authored: MetadataBatchSource,
     },
+    /// Starts a new history window: raw budgets count events from here on. The graph
+    /// state it carries joins every holder's graph, so holders converge on it.
+    Checkpoint {
+        snapshot: Option<Box<GraphReplicaSnapshot>>,
+    },
 }
 
 /// The author's submission behind a planned batch.
@@ -240,6 +245,7 @@ impl MetadataEventPayload {
             Self::UpsertDataEntity { .. } => MetadataAuditOperation::UpsertDataEntity,
             Self::UpsertContextualEntity { .. } => MetadataAuditOperation::UpsertContextualEntity,
             Self::ApplyBatch { authored, .. } => authored.audit_operation(),
+            Self::Checkpoint { .. } => MetadataAuditOperation::Checkpoint,
         }
     }
 
@@ -250,6 +256,7 @@ impl MetadataEventPayload {
                 | Self::UpsertDataEntity { .. }
                 | Self::UpsertContextualEntity { .. }
                 | Self::ApplyBatch { .. }
+                | Self::Checkpoint { .. }
         )
     }
 
@@ -261,6 +268,7 @@ impl MetadataEventPayload {
             Self::UpsertDataEntity { .. } => "upsert_data_entity",
             Self::UpsertContextualEntity { .. } => "upsert_contextual_entity",
             Self::ApplyBatch { .. } => "apply_batch",
+            Self::Checkpoint { .. } => "checkpoint",
         }
     }
 }

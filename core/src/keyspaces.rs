@@ -23,6 +23,9 @@ pub const VISIBILITY_INDEX_KEYSPACE: &str = "metadata_visibility_index";
 pub const VISIBILITY_STATE_KEYSPACE: &str = "metadata_visibility_state";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const EVENT_LOG_KEYSPACE: &str = "metadata_event_log";
+/// One row per metadata checkpoint, keyed by document and event; the last row starts
+/// the document's current history window.
+pub const METADATA_CHECKPOINT_KEYSPACE: &str = "metadata_checkpoints";
 /// This node's reused CRDT actor per metadata document.
 pub const METADATA_ACTOR_KEYSPACE: &str = "metadata_actors";
 /// Replicated Git records of metadata documents, keyed by document and record id.
@@ -284,6 +287,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     METADATA_AUDIT_KEYSPACE,
     EVENT_LOG_KEYSPACE,
     METADATA_ACTOR_KEYSPACE,
+    METADATA_CHECKPOINT_KEYSPACE,
     GIT_RECORD_KEYSPACE,
     CREATE_ACCEPTANCE_KEYSPACE,
     PENDING_PROJECTION_KEYSPACE,

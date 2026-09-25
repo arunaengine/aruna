@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, METADATA_ACTOR_KEYSPACE, RAW_BUDGET_KEYSPACE,
-    REALM_CONFIG_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, METADATA_ACTOR_KEYSPACE,
+    METADATA_CHECKPOINT_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
     EVENT_LIMIT, MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError,
@@ -97,6 +97,10 @@ pub struct UpdateDocumentOperation {
     raw_budget: Option<RawOriginBudget>,
     next_raw_budget: Option<RawOriginBudget>,
     accepted_create: Option<MetadataEventRecord>,
+    /// The latest checkpoint; raw budgets count events from it on.
+    window: Option<Ulid>,
+    /// This node's quota in the current history window.
+    quota: Option<RawOriginBudget>,
     realm_config: Option<RealmConfigDocument>,
     /// Buckets this update publishes onto and the activation generation each
     /// resolved at, read as a fence inside the write transaction.
@@ -118,6 +122,7 @@ enum UpdateDocumentState {
     StartTransaction,
     ReadFence,
     ReadRawFence,
+    ReadWindow,
     ReadRawEvents,
     WriteUpdateBatch,
     CommitTransaction,
@@ -191,6 +196,8 @@ impl UpdateDocumentOperation {
             raw_budget: None,
             next_raw_budget: None,
             accepted_create: None,
+            window: None,
+            quota: None,
             realm_config: None,
             fenced: Vec::new(),
             route_profile_status,
@@ -464,6 +471,36 @@ impl UpdateDocumentOperation {
         .ok_or(UpdateDocumentError::RawLimit)
     }
 
+    /// A checkpoint splits the create's origins' quotas anew, like a create does.
+    fn window_quota(
+        &self,
+        checkpoint: &MetadataEventRecord,
+    ) -> Result<RawOriginBudget, UpdateDocumentError> {
+        let Some(create) = self.accepted_create.as_ref() else {
+            return Err(UpdateDocumentError::RawLimit);
+        };
+        if checkpoint.record.document_id != self.config.document_id
+            || !matches!(checkpoint.payload, MetadataEventPayload::Checkpoint { .. })
+        {
+            return Err(UpdateDocumentError::RawLimit);
+        }
+        let encoded_bytes = postcard::experimental::serialized_size(checkpoint)
+            .map_err(|_| UpdateDocumentError::RawLimit)
+            .and_then(|size| u64::try_from(size).map_err(|_| UpdateDocumentError::RawLimit))?;
+        raw_quotas(
+            checkpoint.record.document_id,
+            &create.record.holder_node_ids,
+            checkpoint.node_id,
+            encoded_bytes,
+        )
+        .and_then(|budgets| {
+            budgets
+                .into_iter()
+                .find(|budget| budget.node_id == self.config.actor.node_id)
+        })
+        .ok_or(UpdateDocumentError::RawLimit)
+    }
+
     fn valid_budget(&self, budget: &RawOriginBudget, quota: &RawOriginBudget) -> bool {
         budget.document_id == self.config.document_id
             && budget.node_id == self.config.actor.node_id
@@ -486,7 +523,24 @@ impl UpdateDocumentOperation {
         let Some(create) = self.accepted_create.as_ref() else {
             return Err(UpdateDocumentError::RawLimit);
         };
-        let quota = self.origin_quota(create)?;
+        // A window opens at its checkpoint, which then stands in for the create.
+        let opening = match self.window {
+            Some(checkpoint) => {
+                let (_, value) = values.first().ok_or(UpdateDocumentError::RawLimit)?;
+                let event: MetadataEventRecord =
+                    postcard::from_bytes(value).map_err(|_| UpdateDocumentError::RawLimit)?;
+                if event.event_id != checkpoint {
+                    return Err(UpdateDocumentError::RawLimit);
+                }
+                event
+            }
+            None => create.clone(),
+        };
+        let quota = match self.window {
+            Some(_) => self.window_quota(&opening)?,
+            None => self.origin_quota(create)?,
+        };
+        let create = &opening;
         let mut events = 0u32;
         let mut encoded_bytes = 0u64;
         let mut total_bytes = 0u64;
@@ -548,11 +602,10 @@ impl UpdateDocumentOperation {
         let Some(budget) = self.raw_budget.as_ref() else {
             return Err(UpdateDocumentError::RawLimit);
         };
-        let Some(create) = self.accepted_create.as_ref() else {
+        let Some(quota) = self.quota.as_ref() else {
             return Err(UpdateDocumentError::RawLimit);
         };
-        let quota = self.origin_quota(create)?;
-        if !self.valid_budget(budget, &quota) || budget.events >= budget.event_limit {
+        if !self.valid_budget(budget, quota) || budget.events >= budget.event_limit {
             return Err(UpdateDocumentError::RawLimit);
         }
         let event_bytes = postcard::experimental::serialized_size(event)
@@ -716,25 +769,11 @@ impl UpdateDocumentOperation {
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(UpdateDocumentError::MissingTransaction);
                 };
-                self.state = UpdateDocumentState::ReadRawFence;
                 self.fenced = self.fenced_buckets(&record);
-                let mut reads = vec![
-                    (
-                        RAW_BUDGET_KEYSPACE.to_string(),
-                        raw_budget_key(self.config.document_id, self.config.actor.node_id),
-                    ),
-                    (
-                        CREATE_ACCEPTANCE_KEYSPACE.to_string(),
-                        create_acceptance_key(self.config.document_id),
-                    ),
-                ];
-                // The fence joins this transaction's read set, so a
-                // departing holder's close conflicts an uncommitted write.
-                reads.extend(self.fenced.iter().map(|(placement, _)| {
-                    crate::placement::fence::fence_read(&record.realm_id, placement)
-                }));
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
+                self.state = UpdateDocumentState::ReadWindow;
+                smallvec![Effect::Storage(StorageEffect::Last {
+                    key_space: METADATA_CHECKPOINT_KEYSPACE.to_string(),
+                    prefix: Some(event_log_prefix(self.config.document_id)),
                     txn_id: Some(txn_id),
                 })]
             }
@@ -742,6 +781,33 @@ impl UpdateDocumentOperation {
             Err(StorageReadError::Storage(error)) => self.fail(error.into()),
             Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
         }
+    }
+
+    /// Reads this node's budget row, the accepted create and the placement fences.
+    fn raw_fence_effect(&mut self, txn_id: TxnId) -> Effects {
+        let Some(record) = self.record.clone() else {
+            return self.fail(UpdateDocumentError::DocumentNotFound);
+        };
+        self.state = UpdateDocumentState::ReadRawFence;
+        let mut reads = vec![
+            (
+                RAW_BUDGET_KEYSPACE.to_string(),
+                raw_budget_key(self.config.document_id, self.config.actor.node_id),
+            ),
+            (
+                CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+                create_acceptance_key(self.config.document_id),
+            ),
+        ];
+        // The fence joins this transaction's read set, so a
+        // departing holder's close conflicts an uncommitted write.
+        reads.extend(self.fenced.iter().map(|(placement, _)| {
+            crate::placement::fence::fence_read(&record.realm_id, placement)
+        }));
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        })]
     }
 
     fn read_raw_fence(&mut self, event: Event) -> Effects {
@@ -781,36 +847,64 @@ impl UpdateDocumentOperation {
                     Err(error) => return self.fail(error),
                 };
                 self.accepted_create = Some(create);
-                let budget = match raw_budget.clone() {
-                    Some(value) => {
-                        let budget: RawOriginBudget = match postcard::from_bytes(&value) {
-                            Ok(budget) => budget,
-                            Err(_) => {
-                                return self.fail(UpdateDocumentError::RawLimit);
-                            }
-                        };
-                        if !self.valid_budget(&budget, &quota) {
-                            return self.fail(UpdateDocumentError::RawLimit);
-                        }
-                        Some(budget)
-                    }
-                    None => None,
+                self.raw_budget = match raw_budget
+                    .as_deref()
+                    .map(postcard::from_bytes::<RawOriginBudget>)
+                    .transpose()
+                {
+                    Ok(budget) => budget,
+                    Err(_) => return self.fail(UpdateDocumentError::RawLimit),
                 };
-                self.raw_budget = budget;
+                // Within a checkpoint window the log recount replaces the stored row.
+                if self.window.is_some() {
+                    self.raw_budget = None;
+                } else if self
+                    .raw_budget
+                    .as_ref()
+                    .is_some_and(|budget| !self.valid_budget(budget, &quota))
+                {
+                    return self.fail(UpdateDocumentError::RawLimit);
+                }
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(UpdateDocumentError::MissingTransaction);
                 };
+                let start = self.window.map(|checkpoint| {
+                    IterStart::At(event_log_key(self.config.document_id, checkpoint))
+                });
                 self.state = UpdateDocumentState::ReadRawEvents;
                 smallvec![Effect::Storage(StorageEffect::Iter {
                     key_space: EVENT_LOG_KEYSPACE.to_string(),
                     prefix: Some(event_log_prefix(self.config.document_id)),
-                    start: None,
+                    start,
                     limit: RAW_EVENT_LIMIT,
                     txn_id: Some(txn_id),
                 })]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
             other => self.unexpected_event("raw sidecar read result", format!("{other:?}")),
+        }
+    }
+
+    fn read_window(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                self.window = match values.first() {
+                    Some((key, _)) => match key
+                        .get(16..32)
+                        .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                    {
+                        Some(bytes) => Some(Ulid::from_bytes(bytes)),
+                        None => return self.fail(UpdateDocumentError::RawLimit),
+                    },
+                    None => None,
+                };
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(UpdateDocumentError::MissingTransaction);
+                };
+                self.raw_fence_effect(txn_id)
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.unexpected_event("checkpoint window read result", format!("{other:?}")),
         }
     }
 
@@ -836,13 +930,19 @@ impl UpdateDocumentOperation {
                 {
                     return self.fail(UpdateDocumentError::RevisionConflict { expected, current });
                 }
+                let quota = RawOriginBudget {
+                    events: 0,
+                    encoded_bytes: 0,
+                    ..reconstructed.clone()
+                };
                 if self
                     .raw_budget
                     .as_ref()
-                    .is_some_and(|budget| &reconstructed != budget)
+                    .is_some_and(|stored| stored != &reconstructed)
                 {
                     return self.fail(UpdateDocumentError::RawLimit);
                 }
+                self.quota = Some(quota);
                 self.raw_budget = Some(reconstructed);
                 self.next_raw_budget = match self.check_raw_budget(history_events, history_bytes) {
                     Ok(budget) => Some(budget),
@@ -1060,6 +1160,7 @@ impl Operation for UpdateDocumentOperation {
             UpdateDocumentState::StartTransaction => self.start_transaction(event),
             UpdateDocumentState::ReadFence => self.read_fence(event),
             UpdateDocumentState::ReadRawFence => self.read_raw_fence(event),
+            UpdateDocumentState::ReadWindow => self.read_window(event),
             UpdateDocumentState::ReadRawEvents => self.read_raw_events(event),
             UpdateDocumentState::WriteUpdateBatch => self.write_update_batch(event),
             UpdateDocumentState::CommitTransaction => self.commit_transaction(event),
@@ -1272,6 +1373,14 @@ mod pure_tests {
         raw_read_for(record, actor().node_id, budget)
     }
 
+    /// Answers the checkpoint lookup: the document is still in its first window.
+    fn no_window() -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        })
+    }
+
     fn raw_budget_read(record: &MetadataRegistryRecord, events: u32, encoded_bytes: u64) -> Event {
         raw_read(record, Some(budget(record, events, encoded_bytes)))
     }
@@ -1472,6 +1581,7 @@ mod pure_tests {
             })] if *read_txn == txn_id
         ));
         operation.step(registry_read(&record));
+        operation.step(no_window());
         operation.step(raw_budget_read(
             &record,
             1,
@@ -1515,6 +1625,7 @@ mod pure_tests {
         ));
 
         operation.step(registry_read(&fenced));
+        operation.step(no_window());
         operation.step(raw_budget_read(
             &record,
             1,
@@ -1604,7 +1715,8 @@ mod pure_tests {
         assert_plan_batch(configured(operation, config).as_slice());
         assert_start_transaction(operation.step(batch_planned(record)).as_slice());
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let reads = operation.step(registry_read(record));
+        operation.step(registry_read(record));
+        let reads = operation.step(no_window());
         let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = reads.as_slice() else {
             panic!("the transaction batch-reads the raw sidecar and the fences");
         };
@@ -1699,6 +1811,7 @@ mod pure_tests {
         operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
+        operation.step(no_window());
         operation.step(raw_budget_read(
             &record,
             1,
@@ -1739,6 +1852,7 @@ mod pure_tests {
         operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
+        operation.step(no_window());
         operation.step(raw_budget_read(
             &record,
             1,
@@ -1829,6 +1943,7 @@ mod pure_tests {
         operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
+        operation.step(no_window());
         let effects = operation.step(raw_missing_budget(&record));
         assert!(matches!(
             effects.as_slice(),
@@ -1891,6 +2006,7 @@ mod pure_tests {
         operation.step(batch_planned(&current));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&current));
+        operation.step(no_window());
         let effects = operation.step(raw_missing_for(&original, outsider.node_id));
         assert!(matches!(
             effects.as_slice(),
@@ -1920,6 +2036,7 @@ mod pure_tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
         // The exhausted budget is rejected at the sidecar fence read itself.
+        operation.step(no_window());
         let effects = operation.step(raw_budget_read(&record, EVENT_LIMIT, 0));
 
         assert!(
@@ -1996,6 +2113,7 @@ mod pure_tests {
         assert_no_mutation(effects.as_slice());
         let effects = operation.step(registry_read(&record));
         assert_no_mutation(effects.as_slice());
+        operation.step(no_window());
         let effects = operation.step(raw_budget_read(
             &record,
             1,
@@ -2030,6 +2148,7 @@ mod pure_tests {
 
         let _effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
+        operation.step(no_window());
         operation.step(raw_budget_read(
             &record,
             1,
@@ -2061,6 +2180,7 @@ mod pure_tests {
 
         let _effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
+        operation.step(no_window());
         let effects = operation.step(raw_missing_budget(&record));
         assert!(matches!(
             effects.as_slice(),
@@ -2098,6 +2218,71 @@ mod pure_tests {
                 MetadataError::InvalidInput("entity payload must define string `@id`".to_string())
             ))
         );
+    }
+
+    #[test]
+    fn checkpoint_opens_window() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::from_parts(31, 31);
+        let checkpoint = MetadataEventRecord {
+            event_id: Ulid::from_parts(30, 30),
+            payload: MetadataEventPayload::Checkpoint { snapshot: None },
+            ..create_event(&record)
+        };
+        let mut operation = UpdateDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateDocumentMutation::ReplaceRoCrate {
+                jsonld: replace_jsonld(record.document_id, "After Checkpoint"),
+            },
+        ));
+        operation.start();
+        operation.step(registry_read(&record));
+        configured(&mut operation, realm_config_read(&record));
+        operation.step(batch_planned(&record));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(registry_read(&record));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Last { key_space, .. })]
+                if key_space == METADATA_CHECKPOINT_KEYSPACE
+        ));
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                event_log_key(record.document_id, checkpoint.event_id),
+                ByteView::from(Vec::new()),
+            )],
+            next_start_after: None,
+        }));
+        // The earlier window exhausted its quota; the new window starts over.
+        let effects = operation.step(raw_read(&record, Some(budget(&record, EVENT_LIMIT, 0))));
+        let [Effect::Storage(StorageEffect::Iter { start, .. })] = effects.as_slice() else {
+            panic!("expected the window scan, got {effects:?}");
+        };
+        assert_eq!(
+            start,
+            &Some(IterStart::At(event_log_key(
+                record.document_id,
+                checkpoint.event_id
+            )))
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                event_log_key(record.document_id, checkpoint.event_id),
+                postcard::to_allocvec(&checkpoint).unwrap().into(),
+            )],
+            next_start_after: None,
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the update write in the new window, got {effects:?}");
+        };
+        let (_, _, budget) = writes
+            .iter()
+            .find(|(key_space, _, _)| key_space == RAW_BUDGET_KEYSPACE)
+            .expect("budget row written");
+        let budget: RawOriginBudget = postcard::from_bytes(budget).unwrap();
+        assert_eq!(budget.events, 2, "the checkpoint and this update count");
     }
 
     #[test]
@@ -2165,6 +2350,7 @@ mod pure_tests {
         assert_no_mutation(effects.as_slice());
         let effects = operation.step(registry_read(&record));
         assert_no_mutation(effects.as_slice());
+        operation.step(no_window());
         let effects = operation.step(raw_budget_read(
             &record,
             1,
