@@ -619,3 +619,87 @@ async fn link_requests_checked() {
     .await;
     assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
 }
+
+/// A new group member with the default viewer role: READ on the group's data and metadata.
+async fn viewer(linked: &Linked) -> AuthContext {
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+    let context = linked.test.state.get_ctx();
+    let key = linked.test.group_id.to_bytes().to_vec();
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: AUTH_KEYSPACE.into(),
+            key: key.clone().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("group authorization missing");
+    };
+    let mut group = GroupAuthorizationDocument::from_bytes(&value).unwrap();
+    let reader = stranger(linked);
+    group
+        .roles
+        .values_mut()
+        .find(|role| role.name == "viewer")
+        .unwrap()
+        .assigned_users
+        .insert(reader.user_id);
+    let actor = aruna_core::structs::identity::auth::Actor {
+        node_id: linked.test.state.get_node_id(),
+        user_id: linked.test.auth.user_id,
+        realm_id: linked.test.auth.realm_id,
+    };
+    context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: AUTH_KEYSPACE.into(),
+            key: key.into(),
+            value: group.to_bytes(&actor).unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    reader
+}
+
+#[tokio::test]
+async fn readers_cannot_push() {
+    use crate::metadata::InvenioExportRequest;
+    use crate::routes::invenio::{SubmitInvenioExport, export_record};
+    let linked = setup().await;
+    let reader = viewer(&linked).await;
+    // The reader sees the dataset's links, so only the missing WRITE refuses the pushes below.
+    let listed = list_repository_links(
+        State(linked.test.state.clone()),
+        Extension(Some(reader.clone())),
+        Path(linked.document_id.clone()),
+    )
+    .await;
+    assert!(listed.is_ok());
+    let created = create(&linked, Some(reader.clone())).await;
+    assert!(matches!(created, Err(ServerError::Forbidden)));
+    let export = SubmitInvenioExport {
+        repository: InvenioExportRequest {
+            group_id: linked.test.group_id.to_string(),
+            connector_id: linked.connector_id.to_string(),
+            draft_id: None,
+            new_version: None,
+            metadata: serde_json::json!({}),
+            publish: false,
+            public_files: false,
+            access_token: Some(TOKEN.into()),
+        },
+        idempotency_key: None,
+    };
+    let exported = export_record(
+        State(linked.test.state.clone()),
+        Extension(Some(reader)),
+        Path(linked.document_id.clone()),
+        Json(export),
+    )
+    .await;
+    assert!(matches!(exported, Err(ServerError::Forbidden)));
+}

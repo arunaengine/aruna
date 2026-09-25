@@ -185,6 +185,50 @@ async fn invenio_names_one_record() {
     assert!(matches!(lone, Err(ServerError::BadRequestReason(_))));
 }
 
+#[tokio::test]
+async fn keep_updated_needs_write() {
+    use crate::routes::invenio::{InvenioImportRequest, import_record};
+    let (_root, state, user, group) = submit_state().await;
+    seed_bucket(&state, "target", group, user).await;
+    // The connector's group is another owner's; the caller only reads it.
+    let shared = Ulid::generate();
+    grant_reader(&state, user, shared).await;
+    let request = |keep_updated| InvenioImportRequest {
+        group_id: shared.to_string(),
+        connector_id: Ulid::generate().to_string(),
+        record_id: Some("42".into()),
+        doi: None,
+        url: None,
+        options: Default::default(),
+        keep_updated,
+        auto_update: None,
+        target: ImportTargetRequest {
+            bucket: "target".into(),
+            prefix: "import".into(),
+        },
+        metadata: ImportMetadataRequest {
+            group_id: group.to_string(),
+            path: "crate".into(),
+            public: false,
+        },
+        idempotency_key: None,
+    };
+    let import = |keep_updated| {
+        import_record(
+            State(state.clone()),
+            Extension(auth(user)),
+            Json(request(keep_updated)),
+        )
+    };
+    let once = import(false).await;
+    assert!(
+        once.is_ok(),
+        "a one-time import needs only READ on the connector group"
+    );
+    let kept = import(true).await;
+    assert!(matches!(kept, Err(ServerError::Forbidden)));
+}
+
 #[test]
 fn invenio_openapi_contract() {
     let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
@@ -345,6 +389,47 @@ async fn grant(state: &ServerState, user: UserId, group: Ulid) {
         GROUP_KEYSPACE,
         group.to_bytes().into(),
         group_doc.to_bytes(&actor).unwrap().into(),
+    )
+    .await;
+}
+
+/// Creates `group` owned by another user, with `reader` in its default viewer role.
+async fn grant_reader(state: &ServerState, reader: UserId, group: Ulid) {
+    let owner = UserId::local(Ulid::generate(), realm());
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: owner,
+        realm_id: realm(),
+    };
+    let mut group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm(), group);
+    group_auth
+        .roles
+        .values_mut()
+        .find(|role| role.name == "viewer")
+        .unwrap()
+        .assigned_users
+        .insert(reader);
+    let group_doc = Group {
+        display_name: "shared-group".to_string(),
+        group_id: group,
+        realm_id: realm(),
+        roles: group_auth.roles.keys().copied().collect(),
+        owner,
+    };
+    let auth_doc = group_auth.to_bytes(&actor).unwrap();
+    write_doc(
+        state,
+        AUTH_KEYSPACE,
+        group.to_bytes().into(),
+        auth_doc.into(),
+    )
+    .await;
+    let group_bytes = group_doc.to_bytes(&actor).unwrap();
+    write_doc(
+        state,
+        GROUP_KEYSPACE,
+        group.to_bytes().into(),
+        group_bytes.into(),
     )
     .await;
 }
