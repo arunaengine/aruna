@@ -978,3 +978,47 @@ async fn deleted_dataset_unlinks() -> Result<(), Box<dyn std::error::Error>> {
     fixture.stop().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn registration_awaits_mapping() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdentifier};
+    use aruna_operations::jobs::persistent_id::run_register_identifiers;
+    let fixture = build_fixture(false).await?;
+    let doi = SecondaryIdentifier::new(
+        SecondaryIdKind::Doi,
+        "10.1234/awaited",
+        None,
+        IdentifierOrigin::Imported,
+    )?;
+    let spec = RegisterIdentifiersSpec {
+        document_id: doc_id(1),
+        identifiers: vec![doi],
+        auth_context: AuthContext {
+            user_id: fixture.actor.user_id,
+            realm_id: fixture.actor.realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+    };
+    let run = async |job_id| -> Result<JobRunOutcome, Box<dyn std::error::Error>> {
+        let payload = JobPayload::RegisterIdentifiers(spec.clone());
+        let ctx = claim_context(&fixture, job_id, payload).await?;
+        Ok(Box::pin(run_register_identifiers(&ctx, &spec)).await)
+    };
+
+    // The authority holds no mapping for the dataset yet, so a new registration waits for it.
+    assert!(matches!(run(job_id()).await?, JobRunOutcome::Deferred(_)));
+    // Past the wait bound the missing mapping fails the registration.
+    let old = JobId::from_parts(
+        unix_timestamp_millis() - 60 * 60 * 1000,
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE)?,
+        BucketId::new(0)?,
+        7,
+    )?;
+    let JobRunOutcome::Failed(error) = run(old).await? else {
+        return Err("a registration past its wait must fail".into());
+    };
+    assert!(error.message.contains("not found"), "{}", error.message);
+    fixture.stop().await;
+    Ok(())
+}
