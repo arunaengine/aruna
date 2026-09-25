@@ -756,8 +756,8 @@ async fn scaffold_link_pushes() -> Result<(), Box<dyn std::error::Error>> {
         None,
     ))
     .await?;
-    // Scaffold fields name no creator, so the link supplies one as a native override.
-    let creators = json!({"creators": [{"person_or_org": {
+    // Scaffold fields name no creator or publisher, so the link supplies them as overrides.
+    let creators = json!({"publisher": "Aruna test", "creators": [{"person_or_org": {
         "type": "personal", "given_name": "Ada", "family_name": "Lovelace"}}]});
     let patch = LinkPatch {
         metadata_json: Some(creators.to_string()),

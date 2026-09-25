@@ -45,6 +45,7 @@ async fn setup() -> Linked {
                         "about": {"@id": "./"}},
                     {"@id": "./", "@type": "Dataset", "name": "Linked",
                         "description": "Pushed to a repository", "datePublished": "2026-01-01",
+                        "publisher": "Aruna test",
                         "creator": {"@type": "Person", "familyName": "Doe"},
                         "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}}
                 ]

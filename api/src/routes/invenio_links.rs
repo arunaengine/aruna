@@ -279,12 +279,16 @@ pub(crate) async fn check_mapping(
     state: &ServerState,
     auth: &AuthContext,
     document_id: Ulid,
+    group_id: Ulid,
+    connector_id: Ulid,
     metadata_json: &str,
 ) -> ServerResult<()> {
     let missing = Box::pin(missing_metadata(
         &state.get_ctx(),
         auth,
         document_id,
+        group_id,
+        connector_id,
         metadata_json,
         state.rocrate_limits().metadata_bytes,
     ))
@@ -481,7 +485,15 @@ pub async fn create_link(
         validate_id(parent).map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     }
     let metadata_json = metadata_json(&state, request.metadata)?;
-    Box::pin(check_mapping(&state, &auth, document_id, &metadata_json)).await?;
+    Box::pin(check_mapping(
+        &state,
+        &auth,
+        document_id,
+        group_id,
+        connector_id,
+        &metadata_json,
+    ))
+    .await?;
     let context = state.get_ctx();
     let holds = aruna_operations::forward::routing::origin_holds_document(
         &context,

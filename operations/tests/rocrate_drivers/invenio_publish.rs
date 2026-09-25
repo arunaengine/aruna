@@ -46,7 +46,7 @@ async fn archive_with(files: usize) -> Result<Vec<u8>, Box<dyn std::error::Error
         json!({"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"},
             "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}}),
         json!({"@id": "./", "@type": "Dataset", "name": "Exported dataset",
-            "description": "Local and web files", "datePublished": "2026-09-22",
+            "description": "Local and web files", "datePublished": "2026-09-22", "publisher": "Aruna test",
             "creator": {"@type": "Person", "familyName": "Researcher"}, "hasPart": parts}),
         json!({"@id": "https://example.org/remote.csv", "@type": "File"}),
     ];

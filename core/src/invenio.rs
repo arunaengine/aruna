@@ -256,9 +256,33 @@ pub fn missing_fields(metadata: &Value) -> Vec<&'static str> {
 pub fn missing_metadata(
     document: &Value,
     overrides: &Value,
+    endpoint: &str,
 ) -> Result<Vec<&'static str>, InvenioError> {
     let metadata = map_metadata(document, overrides, &ExportIdentity::default())?;
-    Ok(missing_fields(&metadata))
+    let mut missing = missing_fields(&metadata);
+    if lacks_publisher(&metadata, endpoint) {
+        missing.push("publisher");
+    }
+    Ok(missing)
+}
+
+/// Zenodo sets `publisher` itself; other InvenioRDM instances need it to publish with a DOI.
+pub fn requires_publisher(endpoint: &str) -> bool {
+    let host = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !matches!(host.as_str(), "zenodo.org" | "sandbox.zenodo.org")
+}
+
+fn lacks_publisher(metadata: &Value, endpoint: &str) -> bool {
+    requires_publisher(endpoint)
+        && !metadata["publisher"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 /// Maps searchable fields; the companion JSON files retain every unmapped field.
@@ -556,6 +580,16 @@ fn map_metadata(
                 metadata[target] = json!(value);
             }
         }
+        // A publisher entity or reference maps to its name.
+        if let Some(publisher) = values(schema_value(root, "publisher")).first() {
+            let publisher = publisher["@id"]
+                .as_str()
+                .and_then(|id| graph.iter().find(|entity| entity["@id"] == id))
+                .unwrap_or(publisher);
+            if let Some(name) = schema_value(publisher, "name").as_str() {
+                metadata["publisher"] = json!(name);
+            }
+        }
         if let Some(date) = schema_value(root, "datePublished").as_str() {
             let date = date.split('T').next().unwrap_or(date);
             let original = root[PUBLICATION_DATE]
@@ -745,11 +779,13 @@ pub fn export_fields(
     document: &Value,
     overrides: &Value,
     identity: &ExportIdentity,
+    endpoint: &str,
 ) -> Result<Value, InvenioError> {
-    let mut result = json!({
-        "metadata": export_metadata(document, overrides, identity)?,
-        "custom_fields": {}
-    });
+    let metadata = export_metadata(document, overrides, identity)?;
+    if lacks_publisher(&metadata, endpoint) {
+        return Err(InvenioError("publisher is required by this repository"));
+    }
+    let mut result = json!({"metadata": metadata, "custom_fields": {}});
     if let Some(fields) = crate_root(document).and_then(|root| root[CUSTOM_FIELDS].as_str()) {
         let fields: Value =
             serde_json::from_str(fields).map_err(|_| InvenioError("invalid custom fields"))?;

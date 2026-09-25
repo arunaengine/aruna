@@ -381,7 +381,7 @@ async fn native_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let document = json!({"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": [
         {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"}, "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}},
         {"@id": "./", "@type": "Dataset", "name": "Exported dataset", "description": "Native files", "datePublished": "2026-09-22",
-            "creator": {"@id": "#author"}, "hasPart": [{"@id": "nested/data.txt"}, {"@id": "empty.txt"}],
+            "publisher": "Aruna test", "creator": {"@id": "#author"}, "hasPart": [{"@id": "nested/data.txt"}, {"@id": "empty.txt"}],
             "identifier": "https://doi.org/10.1234/source"},
         {"@id": "#author", "@type": "Person", "name": "A Researcher", "familyName": "Researcher", "givenName": "A",
             "identifier": {"@type": "PropertyValue", "propertyID": "orcid", "value": "0000-0002-1825-0097"}},

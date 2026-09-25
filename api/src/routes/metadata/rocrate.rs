@@ -342,6 +342,8 @@ pub async fn submit_rocrate_export(
             &state,
             &auth,
             document_id,
+            destination.group_id,
+            destination.connector_id,
             &destination.metadata_json,
         ))
         .await?;
