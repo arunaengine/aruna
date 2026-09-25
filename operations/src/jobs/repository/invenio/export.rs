@@ -234,7 +234,7 @@ pub(crate) async fn create_draft(
         .map_err(|_| invalid("invalid repository metadata"))?;
     let document: Value =
         serde_json::from_str(jsonld).map_err(|_| invalid("invalid source crate"))?;
-    let mut fields = export_fields(&document, &overrides, identity, client.endpoint())?;
+    let mut fields = export_fields(&document, &overrides, identity)?;
     if fields.to_string().len() as u64 > spec.limits.metadata_bytes {
         return Err(invalid("mapped repository metadata exceeds limit"));
     }
@@ -340,31 +340,6 @@ async fn reserve_doi(
             Ok(record.clone())
         }
     }
-}
-
-/// The mandatory fields the dataset's mapped crate lacks with these overrides for the
-/// connector's repository.
-pub async fn missing_metadata(
-    context: &std::sync::Arc<crate::driver::DriverContext>,
-    auth: &aruna_core::structs::identity::auth::AuthContext,
-    document_id: ulid::Ulid,
-    group_id: ulid::Ulid,
-    connector_id: ulid::Ulid,
-    metadata_json: &str,
-    metadata_bytes: u64,
-) -> Result<Vec<&'static str>, TransferError> {
-    let view = crate::jobs::repository::repository(context, group_id, connector_id).await?;
-    let (jsonld, _) =
-        crate::jobs::export::crate_jsonld(context, auth, document_id, metadata_bytes).await?;
-    let document: Value =
-        serde_json::from_str(&jsonld).map_err(|_| invalid("invalid source crate"))?;
-    let overrides: Value =
-        serde_json::from_str(metadata_json).map_err(|_| invalid("invalid repository metadata"))?;
-    Ok(aruna_core::repository::invenio::missing_metadata(
-        &document,
-        &overrides,
-        &view.connector.endpoint,
-    )?)
 }
 
 /// The repository's record as the link and job see it; drafts point at the draft endpoint.
@@ -475,7 +450,7 @@ pub(crate) async fn prepare_draft(
         serde_json::from_str(jsonld).map_err(|_| invalid("invalid crate metadata"))?;
     let overrides: Value = serde_json::from_str(&destination.metadata_json)
         .map_err(|_| invalid("invalid metadata overrides"))?;
-    let mut fields = export_fields(&document, &overrides, identity, client.endpoint())?;
+    let mut fields = export_fields(&document, &overrides, identity)?;
     fields["files"] = json!({"enabled": true});
     let url = client.url(&["records", &record.id, "draft"])?;
     let current = client.json(Method::GET, url.clone(), None).await?;

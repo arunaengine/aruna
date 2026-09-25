@@ -25,6 +25,15 @@ struct Linked {
 }
 
 async fn setup() -> Linked {
+    let root = serde_json::json!({"@id": "./", "@type": "Dataset", "name": "Linked",
+        "description": "Pushed to a repository", "datePublished": "2026-01-01",
+        "publisher": "Aruna test", "creator": {"@type": "Person", "familyName": "Doe"},
+        "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}});
+    setup_crate(root, "https://zenodo.example/api/").await
+}
+
+/// A dataset with this crate root and an Invenio connector at `endpoint`.
+async fn setup_crate(root: serde_json::Value, endpoint: &str) -> Linked {
     let test = setup_network_state().await;
     test.state
         .register_rest_interface("127.0.0.1:3000".parse().unwrap())
@@ -43,11 +52,7 @@ async fn setup() -> Linked {
                     {"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
                         "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
                         "about": {"@id": "./"}},
-                    {"@id": "./", "@type": "Dataset", "name": "Linked",
-                        "description": "Pushed to a repository", "datePublished": "2026-01-01",
-                        "publisher": "Aruna test",
-                        "creator": {"@type": "Person", "familyName": "Doe"},
-                        "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+                    root
                 ]
             }),
         })),
@@ -61,7 +66,7 @@ async fn setup() -> Linked {
             created_by: test.auth.user_id,
             name: "zenodo".into(),
             kind: RepositoryConnectorKind::Invenio,
-            endpoint: "https://zenodo.example/api/".into(),
+            endpoint: endpoint.into(),
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         }),
@@ -383,10 +388,14 @@ async fn holder_copy_refuses() {
 }
 
 #[tokio::test]
-async fn missing_metadata_refused() {
-    let linked = setup().await;
+async fn requirements_refuse_links() {
+    // Only the crate counts: overrides that name creators do not satisfy the requirement.
+    let root = serde_json::json!({"@id": "./", "@type": "Dataset", "name": "Bare",
+        "description": "No creators", "datePublished": "2026-01-01", "publisher": "Aruna test"});
+    let linked = setup_crate(root, "https://rdm.example.org/api/").await;
     let mut request = request(&linked);
-    request.metadata = Some(serde_json::json!({"creators": []}));
+    request.metadata = Some(serde_json::json!({"creators": [
+        {"person_or_org": {"type": "personal", "family_name": "Doe"}}]}));
     let refused = create_link(
         State(linked.test.state.clone()),
         Extension(Some(linked.test.auth.clone())),
@@ -399,7 +408,44 @@ async fn missing_metadata_refused() {
     };
     assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
     let body = serde_json::to_value(error.response_body()).unwrap();
-    assert_eq!(body["missing"], serde_json::json!(["creators"]));
+    assert_eq!(body["code"], "requirements_unmet");
+    let findings = body["findings"].as_array().unwrap();
+    assert!(findings.iter().any(|finding| {
+        finding["path"] == "(<http://schema.org/author> | <http://schema.org/creator>)"
+            && finding["focus_node"] == "./"
+            && finding["severity"] == "violation"
+    }));
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["severity"] == "warning")
+    );
+}
+
+#[tokio::test]
+async fn publisher_needed_off_zenodo() {
+    // Zenodo sets the publisher itself; another InvenioRDM needs it in the crate.
+    let root = serde_json::json!({"@id": "./", "@type": "Dataset", "name": "No publisher",
+        "description": "Published without a publisher", "datePublished": "2026-01-01",
+        "author": {"@type": "Person", "name": "Ada Lovelace"},
+        "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}});
+    let zenodo = setup_crate(root.clone(), "https://sandbox.zenodo.org/api/").await;
+    create(&zenodo, Some(zenodo.test.auth.clone()))
+        .await
+        .expect("Zenodo needs no publisher");
+    let rdm = setup_crate(root, "https://rdm.example.org/api/").await;
+    let error = create(&rdm, Some(rdm.test.auth.clone()))
+        .await
+        .expect_err("InvenioRDM needs a publisher");
+    let body = serde_json::to_value(error.response_body()).unwrap();
+    assert_eq!(body["code"], "requirements_unmet");
+    let paths = body["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["path"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["http://schema.org/publisher"]);
 }
 
 #[tokio::test]

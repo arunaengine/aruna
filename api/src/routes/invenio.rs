@@ -361,7 +361,7 @@ Every referenced file must be readable; web data entities become references inst
 
 **Errors**
 
-Incomplete files, conflicting revisions or rejected metadata fail the job. An ambiguous creation outcome requires inspecting the repository and supplying draft_id. Cancellation retains remote drafts."#,
+A crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; repository.metadata does not satisfy them. Incomplete files, conflicting revisions or rejected metadata fail the job. An ambiguous creation outcome requires inspecting the repository and supplying draft_id. Cancellation retains remote drafts."#,
     params(("document_id" = String, Path, description = "Aruna metadata document identifier")),
     request_body(content = SubmitInvenioExport, example = json!({"repository": {
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
@@ -375,7 +375,7 @@ Incomplete files, conflicting revisions or rejected metadata fail the job. An am
             "report_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/report",
             "artifact_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/artifacts/rocrate"
         })),
-        (status = 400, description = "Missing personal repository token, invalid metadata or draft identifier, or missing required metadata listed in `missing`", body = ErrorResponse),
+        (status = 400, description = "Missing personal repository token, invalid metadata or draft identifier, or unmet repository requirements (code requirements_unmet with findings)", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Crate or connector access denied", body = ErrorResponse),
         (status = 404, description = "Crate not found", body = ErrorResponse),

@@ -25,6 +25,7 @@ use crate::harvest::read_connector::{ConnectorView, GetRepositoryOperation, Read
 use super::executor::JobContext;
 use super::export::ExportCheckpoint;
 
+pub mod check;
 pub mod invenio;
 pub mod link_queue;
 pub mod links;

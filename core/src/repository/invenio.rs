@@ -93,71 +93,6 @@ pub fn file_path(id: &str, key: &str) -> Result<String, RepositoryError> {
     ))
 }
 
-pub fn validate_metadata(metadata: &Value) -> Result<(), RepositoryError> {
-    if !missing_fields(metadata).is_empty() {
-        return Err(RepositoryError(
-            "title, publication_date, resource_type and creators are required",
-        ));
-    }
-    Ok(())
-}
-
-/// The mandatory repository fields that `metadata` lacks.
-pub fn missing_fields(metadata: &Value) -> Vec<&'static str> {
-    let text = |name: &str| {
-        metadata[name]
-            .as_str()
-            .is_some_and(|v| !v.trim().is_empty())
-    };
-    [
-        ("title", text("title")),
-        ("publication_date", text("publication_date")),
-        ("resource_type", metadata["resource_type"]["id"].is_string()),
-        (
-            "creators",
-            metadata["creators"]
-                .as_array()
-                .is_some_and(|value| !value.is_empty()),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(name, present)| (!present).then_some(name))
-    .collect()
-}
-
-/// The mandatory fields the mapped crate still lacks after `overrides`, before any draft exists.
-pub fn missing_metadata(
-    document: &Value,
-    overrides: &Value,
-    endpoint: &str,
-) -> Result<Vec<&'static str>, RepositoryError> {
-    let metadata = map_metadata(document, overrides, &ExportIdentity::default())?;
-    let mut missing = missing_fields(&metadata);
-    if lacks_publisher(&metadata, endpoint) {
-        missing.push("publisher");
-    }
-    Ok(missing)
-}
-
-/// Zenodo sets `publisher` itself; other InvenioRDM instances need it to publish with a DOI.
-pub fn requires_publisher(endpoint: &str) -> bool {
-    let host = endpoint
-        .split_once("://")
-        .map_or(endpoint, |(_, rest)| rest)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    !matches!(host.as_str(), "zenodo.org" | "sandbox.zenodo.org")
-}
-
-fn lacks_publisher(metadata: &Value, endpoint: &str) -> bool {
-    requires_publisher(endpoint)
-        && !metadata["publisher"]
-            .as_str()
-            .is_some_and(|value| !value.trim().is_empty())
-}
-
 /// Maps searchable fields; the companion JSON files retain every unmapped field.
 pub fn record_entity(record: &Value, id: &str) -> Result<Value, RepositoryError> {
     let metadata = &record["metadata"];
@@ -419,20 +354,9 @@ fn build_identifiers(
         .collect()
 }
 
-/// Supplied native fields override mapped crate fields; missing mandatory fields fail closed.
-/// Root identifiers become `isderivedfrom`, the dataset's own PID `isidenticalto`, and DOIs
-/// this dataset published are left out.
+/// Maps the crate root through the record field table; supplied native fields override mapped
+/// crate fields. The requirement check, not this mapping, refuses crates that lack fields.
 pub fn export_metadata(
-    document: &Value,
-    overrides: &Value,
-    identity: &ExportIdentity,
-) -> Result<Value, RepositoryError> {
-    let metadata = map_metadata(document, overrides, identity)?;
-    validate_metadata(&metadata)?;
-    Ok(metadata)
-}
-
-fn map_metadata(
     document: &Value,
     overrides: &Value,
     identity: &ExportIdentity,
@@ -643,12 +567,8 @@ pub fn export_fields(
     document: &Value,
     overrides: &Value,
     identity: &ExportIdentity,
-    endpoint: &str,
 ) -> Result<Value, RepositoryError> {
     let metadata = export_metadata(document, overrides, identity)?;
-    if lacks_publisher(&metadata, endpoint) {
-        return Err(RepositoryError("publisher is required by this repository"));
-    }
     let mut result = json!({"metadata": metadata, "custom_fields": {}});
     if let Some(fields) = crate_root(document).and_then(|root| root[CUSTOM_FIELDS].as_str()) {
         let fields: Value =

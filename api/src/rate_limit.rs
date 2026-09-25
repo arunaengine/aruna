@@ -290,7 +290,6 @@ fn too_many_requests(retry_after: u64) -> Response {
         violations: None,
         findings: None,
         quota: None,
-        missing: None,
     })
     .unwrap_or_else(|_| b"{\"error\":\"too many requests\"}".to_vec());
     let mut response = Response::new(Body::from(body));

@@ -260,7 +260,6 @@ fn derives_export_metadata() {
     );
     assert_eq!(metadata["subjects"], json!([{"subject": "genomics"}]));
     assert_eq!(metadata["rights"][0]["link"], "https://example.org/license");
-    assert!(export_metadata(&json!({}), &json!({}), &ExportIdentity::default()).is_err());
 }
 
 #[test]
@@ -326,28 +325,6 @@ fn keeps_creator_schemes() {
 }
 
 #[test]
-fn lists_missing_fields() {
-    let zenodo = "https://zenodo.org/api/";
-    let document = json!({"@graph": [{"@id": "./", "name": "Scaffold"}]});
-    assert_eq!(
-        missing_metadata(&document, &Value::Null, zenodo).unwrap(),
-        ["publication_date", "creators"]
-    );
-    let overrides = json!({"publication_date": "2024-01-01",
-        "creators": [{"person_or_org": {"type": "personal", "family_name": "Doe"}}]});
-    assert!(
-        missing_metadata(&document, &overrides, zenodo)
-            .unwrap()
-            .is_empty()
-    );
-    // Other InvenioRDM instances need a publisher to register the DOI.
-    assert_eq!(
-        missing_metadata(&document, &overrides, "https://rdm.example.org/api/").unwrap(),
-        ["publisher"]
-    );
-}
-
-#[test]
 fn maps_publisher_entity() {
     let document = json!({"@graph": [
         {"@id": "./", "name": "Title", "datePublished": "2024-01-01",
@@ -355,28 +332,12 @@ fn maps_publisher_entity() {
             "publisher": {"@id": "https://ror.org/033eqas34"}},
         {"@id": "https://ror.org/033eqas34", "@type": "Organization", "name": "JLU Giessen"}
     ]});
-    let endpoint = "https://rdm.example.org/api/";
-    let fields = export_fields(
-        &document,
-        &Value::Null,
-        &ExportIdentity::default(),
-        endpoint,
-    )
-    .unwrap();
+    let fields = export_fields(&document, &Value::Null, &ExportIdentity::default()).unwrap();
     assert_eq!(fields["metadata"]["publisher"], "JLU Giessen");
-    assert!(
-        missing_metadata(&document, &Value::Null, endpoint)
-            .unwrap()
-            .is_empty()
-    );
-    let mut unnamed = document.clone();
-    unnamed["@graph"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("publisher");
-    assert!(export_fields(&unnamed, &Value::Null, &ExportIdentity::default(), endpoint).is_err());
-    let zenodo = "https://sandbox.zenodo.org/api/";
-    assert!(export_fields(&unnamed, &Value::Null, &ExportIdentity::default(), zenodo).is_ok());
+    let mut text = document.clone();
+    text["@graph"][0]["publisher"] = json!("Example Press");
+    let fields = export_fields(&text, &Value::Null, &ExportIdentity::default()).unwrap();
+    assert_eq!(fields["metadata"]["publisher"], "Example Press");
 }
 
 #[test]
@@ -401,9 +362,7 @@ fn retains_native_fields() {
     let validated = craqle::validate_rocrate_jsonld(&document.to_string()).unwrap();
     assert!(validated.nquads.contains("metadata/funding/0/award/number"));
     assert!(validated.nquads.contains("12345"));
-    let zenodo = "https://zenodo.org/api/";
-    let exported =
-        export_fields(&document, &Value::Null, &ExportIdentity::default(), zenodo).unwrap();
+    let exported = export_fields(&document, &Value::Null, &ExportIdentity::default()).unwrap();
     let mut request = metadata.clone();
     normalize_metadata(&mut request, None);
     assert_eq!(exported["metadata"], request);
@@ -413,7 +372,6 @@ fn retains_native_fields() {
             &document,
             &json!({"title": "Edited"}),
             &ExportIdentity::default(),
-            zenodo
         )
         .unwrap()["metadata"]["title"],
         "Edited"

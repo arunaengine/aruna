@@ -350,13 +350,12 @@ pub async fn submit_rocrate_export(
             Permission::WRITE,
         )
         .await?;
-        Box::pin(crate::routes::invenio_links::check_mapping(
+        Box::pin(crate::routes::invenio_links::ensure_requirements(
             &state,
             &auth,
             document_id,
             destination.group_id,
             destination.connector_id,
-            &destination.metadata_json,
         ))
         .await?;
         destination.credential = Some(

@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::harvest::read_connector::{GetRepositoryOperation, ReadConnectorError};
-use aruna_operations::jobs::repository::invenio::export::missing_metadata;
+use aruna_operations::jobs::repository::check::check_requirements;
 use aruna_operations::jobs::repository::link_queue::owner_holds;
 use aruna_operations::jobs::repository::links::{
     LinkChange, LinkError, change_link, list_links, read_link,
@@ -283,35 +283,32 @@ pub(super) fn link_error(error: LinkError) -> ServerError {
     }
 }
 
-/// Answers 400 with the missing fields when the dataset cannot become a repository record.
-pub(crate) async fn check_mapping(
+/// Answers 400 with the findings when the dataset crate does not meet the repository's
+/// requirements. Metadata overrides never satisfy them.
+pub(crate) async fn ensure_requirements(
     state: &ServerState,
     auth: &AuthContext,
     document_id: Ulid,
     group_id: Ulid,
     connector_id: Ulid,
-    metadata_json: &str,
 ) -> ServerResult<()> {
-    let missing = Box::pin(missing_metadata(
+    let checked = Box::pin(check_requirements(
         &state.get_ctx(),
         auth,
         document_id,
         group_id,
         connector_id,
-        metadata_json,
         state.rocrate_limits().metadata_bytes,
     ))
     .await
     .map_err(|error| match error {
         TransferError::Permanent(message) => ServerError::BadRequestReason(message),
-        _ => ServerError::ServiceUnavailableReason("the dataset crate is unavailable".into()),
+        _ => ServerError::ServiceUnavailableReason("the requirements could not be checked".into()),
     })?;
-    if missing.is_empty() {
+    if checked.ready {
         return Ok(());
     }
-    Err(ServerError::MissingMetadata(
-        missing.into_iter().map(str::to_string).collect(),
-    ))
+    Err(ServerError::RequirementsUnmet(checked.findings))
 }
 
 pub(super) fn seal_error(error: TransferError) -> ServerError {
@@ -464,7 +461,7 @@ The node that creates a link owns it and must hold the dataset. Only that node c
 
 **Errors**
 
-Invalid input returns 400. A dataset whose mapped metadata lacks title, publication_date, resource_type or creators returns 400 with `missing` listing them. Denied access returns 403.
+Invalid input returns 400. A dataset crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; metadata overrides do not satisfy them. Denied access returns 403.
 
 An unknown dataset, or a connector that does not exist in the group or is no Invenio connector, returns 404. A node that does not hold the dataset returns 409, as does an enabled pull link of the dataset that follows the same record lineage (parent_id) or an existing link with the same id."#,
     params(("document_id" = String, Path, description = "Metadata document identifier")),
@@ -474,7 +471,7 @@ An unknown dataset, or a connector that does not exist in the group or is no Inv
     })),
     responses(
         (status = 201, description = "Link created and first push queued", body = InvenioLinkResponse, example = json!(link_example())),
-        (status = 400, description = "Invalid token, metadata or identifier, or missing required metadata", body = ErrorResponse, example = json!({"error": "the dataset lacks required repository metadata", "code": "missing_metadata", "missing": ["creators"]})),
+        (status = 400, description = "Invalid token, metadata or identifier, or unmet repository requirements", body = ErrorResponse, example = json!({"error": "the dataset does not meet the repository's requirements", "code": "requirements_unmet", "findings": [{"code": "constraint_violation", "severity": "violation", "focus_node": "./", "path": "(<http://schema.org/author> | <http://schema.org/creator>)", "rule": "http://www.w3.org/ns/shacl#minCount", "message": "The dataset needs creators; each person needs a name or family name and each organization a name.", "profile_revision": "builtin", "completeness": "complete"}]})),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Dataset or connector access denied", body = ErrorResponse),
         (status = 404, description = "Dataset or Invenio connector not found", body = ErrorResponse),
@@ -518,13 +515,12 @@ pub async fn create_link(
         validate_id(parent).map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     }
     let metadata_json = metadata_json(&state, request.metadata)?;
-    Box::pin(check_mapping(
+    Box::pin(ensure_requirements(
         &state,
         &auth,
         document_id,
         group_id,
         connector_id,
-        &metadata_json,
     ))
     .await?;
     let context = state.get_ctx();
