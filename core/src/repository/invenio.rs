@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::fields::{
-    crate_root, entity, identifier, keywords, licenses, person, publication_start, schema_value,
-    values,
+    Person, crate_root, entity, identifier, keywords, licenses, person, publication_start,
+    schema_value, values,
 };
+use super::rules::{Convert, rules};
 use super::{ExportIdentity, RepositoryError};
+use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::secondary_id::{
     IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier, normalize_doi,
 };
@@ -441,122 +443,20 @@ fn map_metadata(
         .map(Vec::as_slice)
         .unwrap_or_default();
     if let Some(root) = crate_root(document) {
-        for (source, target) in [
-            ("name", "title"),
-            ("description", "description"),
-            ("version", "version"),
-            ("publisher", "publisher"),
-        ] {
-            if let Some(value) = schema_value(root, source).as_str() {
-                metadata[target] = json!(value);
-            }
-        }
-        // A publisher entity or reference maps to its name.
-        if let Some(publisher) = values(schema_value(root, "publisher")).first()
-            && let Some(name) = schema_value(entity(graph, publisher), "name").as_str()
-        {
-            metadata["publisher"] = json!(name);
-        }
-        if let Some(date) = schema_value(root, "datePublished").as_str() {
-            let date = date.split('T').next().unwrap_or(date);
-            let original = root[PUBLICATION_DATE]
-                .as_str()
-                .filter(|original| publication_start(original).is_ok_and(|start| start == date));
-            metadata["publication_date"] = json!(original.unwrap_or(date));
-        }
-        let creators = schema_value(root, "creator");
-        let creators = if creators.is_null() {
-            schema_value(root, "author")
-        } else {
-            creators
-        };
-        let expected_creators = values(creators).len();
-        let creators = values(creators)
-            .iter()
-            .filter_map(|creator| {
-                let creator = person(graph, creator);
-                let mut person = if creator.organization {
-                    json!({"type": "organizational", "name": creator.name?})
-                } else {
-                    let family = creator.family_name.or(creator.name)?;
-                    let mut person = json!({"type": "personal", "family_name": family});
-                    if let Some(given) = creator.given_name {
-                        person["given_name"] = json!(given);
-                    }
-                    person
-                };
-                person["identifiers"] = Value::Array(
-                    creator
-                        .identifiers
-                        .into_iter()
-                        .map(|id| json!({"scheme": id.scheme, "identifier": id.value}))
-                        .collect(),
-                );
-                let affiliations = creator
-                    .affiliations
-                    .into_iter()
-                    .map(|name| json!({"name": name}))
-                    .collect::<Vec<_>>();
-                Some(json!({"person_or_org": person, "affiliations": affiliations}))
-            })
-            .collect::<Vec<_>>();
-        if !creators.is_empty() && creators.len() == expected_creators {
-            metadata["creators"] = Value::Array(creators);
-        }
-        let mut identifiers = values(schema_value(root, "identifier"))
-            .iter()
-            .filter_map(identifier)
-            .filter(|id| id.scheme != "doi" || !identity.published_doi(&id.value))
-            .map(|id| {
-                let mut id = json!({"scheme": id.scheme, "identifier": id.value});
-                let own = identity
-                    .own
-                    .iter()
-                    .any(|own| id["identifier"] == own.as_str());
-                let relation = if own {
-                    "isidenticalto"
-                } else {
-                    "isderivedfrom"
-                };
-                id["relation_type"] = json!({"id": relation});
-                id
-            })
-            .collect::<Vec<_>>();
-        for own in &identity.own {
-            if !identifiers
+        let record = rules(RepositoryConnectorKind::Invenio)?
+            .and_then(|rules| rules.target("record"))
+            .ok_or(RepositoryError("missing Invenio record rules"))?;
+        for field in &record.fields {
+            let value = field
+                .property
                 .iter()
-                .any(|id| id["identifier"] == own.as_str())
-            {
-                identifiers.push(json!({"scheme": "url", "identifier": own,
-                    "relation_type": {"id": "isidenticalto"}}));
+                .map(|property| schema_value(root, property))
+                .find(|value| !value.is_null())
+                .unwrap_or(&Value::Null);
+            if let Some(mapped) = convert(field.convert, graph, root, value, identity) {
+                metadata[&field.field] = mapped;
             }
         }
-        for reference in &identity.references {
-            identifiers.push(json!({"scheme": "url", "identifier": reference,
-                "relation_type": {"id": "references"}}));
-        }
-        if !identifiers.is_empty() {
-            metadata["related_identifiers"] = Value::Array(identifiers);
-        }
-        let subjects = keywords(root)
-            .into_iter()
-            .map(|subject| json!({"subject": subject}))
-            .collect::<Vec<_>>();
-        if !subjects.is_empty() {
-            metadata["subjects"] = Value::Array(subjects);
-        }
-        metadata["rights"] = Value::Array(
-            licenses(root)
-                .into_iter()
-                .map(|text| {
-                    let mut right = json!({"title": {"en": text}});
-                    if text.starts_with("https://") || text.starts_with("http://") {
-                        right["link"] = json!(text);
-                    }
-                    right
-                })
-                .collect(),
-        );
     }
     if let Some(root) = crate_root(document)
         && let Some(native) = root[NATIVE_METADATA].as_str()
@@ -614,6 +514,128 @@ fn map_metadata(
         return Err(RepositoryError("metadata overrides must be an object"));
     }
     Ok(metadata)
+}
+
+/// One field of the record from a crate property value; `None` leaves the field out.
+fn convert(
+    convert: Convert,
+    graph: &[Value],
+    root: &Value,
+    value: &Value,
+    identity: &ExportIdentity,
+) -> Option<Value> {
+    match convert {
+        Convert::Text => value.as_str().map(|text| json!(text)),
+        // A publisher entity or reference maps to its name.
+        Convert::Publisher => values(value)
+            .first()
+            .and_then(|publisher| schema_value(entity(graph, publisher), "name").as_str())
+            .or_else(|| value.as_str())
+            .map(|name| json!(name)),
+        Convert::Date => {
+            let date = value.as_str()?;
+            let date = date.split('T').next().unwrap_or(date);
+            let original = root[PUBLICATION_DATE]
+                .as_str()
+                .filter(|original| publication_start(original).is_ok_and(|start| start == date));
+            Some(json!(original.unwrap_or(date)))
+        }
+        Convert::Persons => {
+            let creators = values(value)
+                .iter()
+                .filter_map(|creator| creator_json(&person(graph, creator)))
+                .collect::<Vec<_>>();
+            (!creators.is_empty() && creators.len() == values(value).len())
+                .then_some(Value::Array(creators))
+        }
+        Convert::Identifiers => {
+            let identifiers = related_identifiers(value, identity);
+            (!identifiers.is_empty()).then_some(Value::Array(identifiers))
+        }
+        Convert::Keywords => {
+            let subjects = keywords(value)
+                .into_iter()
+                .map(|subject| json!({"subject": subject}))
+                .collect::<Vec<_>>();
+            (!subjects.is_empty()).then_some(Value::Array(subjects))
+        }
+        Convert::Licenses => Some(Value::Array(
+            licenses(value)
+                .into_iter()
+                .map(|text| {
+                    let mut right = json!({"title": {"en": text}});
+                    if text.starts_with("https://") || text.starts_with("http://") {
+                        right["link"] = json!(text);
+                    }
+                    right
+                })
+                .collect(),
+        )),
+    }
+}
+
+fn creator_json(creator: &Person) -> Option<Value> {
+    let mut person = if creator.organization {
+        json!({"type": "organizational", "name": creator.name.as_ref()?})
+    } else {
+        let family = creator.family_name.as_ref().or(creator.name.as_ref())?;
+        let mut person = json!({"type": "personal", "family_name": family});
+        if let Some(given) = &creator.given_name {
+            person["given_name"] = json!(given);
+        }
+        person
+    };
+    person["identifiers"] = Value::Array(
+        creator
+            .identifiers
+            .iter()
+            .map(|id| json!({"scheme": id.scheme, "identifier": id.value}))
+            .collect(),
+    );
+    let affiliations = creator
+        .affiliations
+        .iter()
+        .map(|name| json!({"name": name}))
+        .collect::<Vec<_>>();
+    Some(json!({"person_or_org": person, "affiliations": affiliations}))
+}
+
+/// Root identifiers become `isderivedfrom`, the dataset's own PID `isidenticalto` and web data
+/// entities `references`; DOIs this dataset published are left out.
+fn related_identifiers(value: &Value, identity: &ExportIdentity) -> Vec<Value> {
+    let mut identifiers = values(value)
+        .iter()
+        .filter_map(identifier)
+        .filter(|id| id.scheme != "doi" || !identity.published_doi(&id.value))
+        .map(|id| {
+            let mut id = json!({"scheme": id.scheme, "identifier": id.value});
+            let own = identity
+                .own
+                .iter()
+                .any(|own| id["identifier"] == own.as_str());
+            let relation = if own {
+                "isidenticalto"
+            } else {
+                "isderivedfrom"
+            };
+            id["relation_type"] = json!({"id": relation});
+            id
+        })
+        .collect::<Vec<_>>();
+    for own in &identity.own {
+        if !identifiers
+            .iter()
+            .any(|id| id["identifier"] == own.as_str())
+        {
+            identifiers.push(json!({"scheme": "url", "identifier": own,
+                "relation_type": {"id": "isidenticalto"}}));
+        }
+    }
+    for reference in &identity.references {
+        identifiers.push(json!({"scheme": "url", "identifier": reference,
+            "relation_type": {"id": "references"}}));
+    }
+    identifiers
 }
 
 /// Returns native descriptive fields without copying source ownership, access settings or managed PIDs.

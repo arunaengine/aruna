@@ -159,18 +159,18 @@ pub fn identifier(value: &Value) -> Option<Identifier> {
     })
 }
 
-/// Each license as its text or the `@id` it references.
-pub fn licenses(root: &Value) -> Vec<String> {
-    values(schema_value(root, "license"))
+/// Each license of a property value as its text or the `@id` it references.
+pub fn licenses(value: &Value) -> Vec<String> {
+    values(value)
         .iter()
         .filter_map(|license| license.as_str().or_else(|| license["@id"].as_str()))
         .map(str::to_string)
         .collect()
 }
 
-/// The text keywords of an entity; other values are skipped.
-pub fn keywords(root: &Value) -> Vec<String> {
-    values(schema_value(root, "keywords"))
+/// The text keywords of a property value; other values are skipped.
+pub fn keywords(value: &Value) -> Vec<String> {
+    values(value)
         .iter()
         .filter_map(Value::as_str)
         .map(str::to_string)

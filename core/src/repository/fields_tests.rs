@@ -32,9 +32,9 @@ fn reads_prefixed_keys() {
         "http://schema.org/keywords": ["a", 1, "b"],
         "https://schema.org/license": [{"@id": "https://spdx.org/licenses/MIT"}, "CC0-1.0", 2]
     });
-    assert_eq!(keywords(&entity), ["a", "b"]);
+    assert_eq!(keywords(schema_value(&entity, "keywords")), ["a", "b"]);
     assert_eq!(
-        licenses(&entity),
+        licenses(schema_value(&entity, "license")),
         ["https://spdx.org/licenses/MIT", "CC0-1.0"]
     );
     assert!(schema_value(&entity, "name").is_null());
