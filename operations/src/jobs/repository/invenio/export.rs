@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use aruna_blob::hash::Hasher;
@@ -26,10 +27,8 @@ use super::verify::{
 use crate::harvest::create_connector::INVENIO_COMMUNITY;
 use crate::jobs::executor::JobContext;
 use crate::jobs::export::{ExportCheckpoint, persist_checkpoint};
-use crate::jobs::import::archive::{
-    ArchiveCompression, ArchiveEntry, ArchiveInspection, inspect_reader,
-};
-use crate::jobs::repository::check::{check_content, unmet};
+use crate::jobs::import::archive::{ArchiveCompression, ArchiveEntry};
+use crate::jobs::repository::check::{inspect_artifact, uploads};
 use crate::jobs::repository::push::{guard, record_draft};
 use crate::jobs::repository::{Action, TransferError, interruptible, supports};
 use crate::jobs::service::read_artifact_range;
@@ -60,21 +59,6 @@ pub(crate) async fn repository_export(
             return Err(TransferError::Permanent(format!(
                 "draft creation outcome is unknown; {recovery}"
             )));
-        }
-        let artifact = checkpoint
-            .artifact
-            .as_ref()
-            .ok_or_else(|| TransferError::Permanent("export artifact missing".into()))?;
-        let inspection = inspect_artifact(ctx, spec, artifact).await?;
-        let files = inspection
-            .entries
-            .iter()
-            .filter(|entry| !entry.directory)
-            .map(|entry| (entry.path.as_str(), entry.uncompressed_size))
-            .collect::<Vec<_>>();
-        let findings = check_content(RepositoryConnectorKind::Invenio, &files)?;
-        if !findings.is_empty() {
-            return Err(unmet(findings));
         }
         let jsonld = checkpoint
             .raw_jsonld
@@ -150,9 +134,12 @@ pub(crate) async fn repository_export(
     let metadata = checkpoint
         .repository_metadata
         .ok_or_else(|| TransferError::Permanent("repository metadata checkpoint missing".into()))?;
+    let uploads = uploads(RepositoryConnectorKind::Invenio, "file", checkpoint)?
+        .into_iter()
+        .collect::<HashSet<_>>();
     let deposited = interruptible(
         ctx,
-        deposit(ctx, spec, destination, record, artifact, metadata),
+        deposit(ctx, spec, destination, record, artifact, metadata, &uploads),
     )
     .await;
     let (record, files) = match deposited {
@@ -410,32 +397,6 @@ pub(super) async fn file_keys(
         .collect())
 }
 
-async fn inspect_artifact(
-    ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
-    artifact: &ArtifactRef,
-) -> Result<ArchiveInspection, TransferError> {
-    let blob = ctx
-        .driver
-        .blob_handle
-        .as_ref()
-        .ok_or_else(|| TransferError::Retryable("blob handle unavailable".into()))?;
-    let mut limits = spec.limits.clone();
-    limits.import_source_bytes = spec.limits.export_artifact_bytes;
-    limits.expanded_import_bytes = spec.limits.export_artifact_bytes;
-    limits.max_entries = limits.max_entries.saturating_add(2);
-    let (inspection, _) = inspect_reader(
-        blob.clone(),
-        artifact.location.clone(),
-        artifact.size,
-        false,
-        &limits,
-    )
-    .await
-    .map_err(TransferError::Permanent)?;
-    Ok(inspection)
-}
-
 pub(crate) async fn prepare_draft(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
@@ -531,6 +492,7 @@ pub(crate) async fn deposit(
     record: &RepositoryRecord,
     artifact: &ArtifactRef,
     metadata: [u8; 32],
+    uploads: &HashSet<String>,
 ) -> Result<(RepositoryRecord, Vec<String>), TransferError> {
     let credential = destination
         .credential
@@ -590,12 +552,16 @@ pub(crate) async fn deposit(
         let entries = files["entries"]
             .as_array()
             .ok_or_else(|| invalid("missing draft files"))?;
-        let paths = inspection
+        // Only the files the rules' file target takes are uploaded.
+        let local = inspection
             .entries
             .iter()
-            .filter(|entry| !entry.directory)
+            .filter(|entry| !entry.directory && uploads.contains(&entry.path))
+            .collect::<Vec<_>>();
+        let paths = local
+            .iter()
             .map(|entry| entry.path.as_str())
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<HashSet<_>>();
         // A link keeps one draft in step with the dataset, so files the dataset dropped go.
         let replace = destination.link.as_ref().filter(|_| !published);
         let mut remote = std::collections::BTreeMap::new();
@@ -624,12 +590,7 @@ pub(crate) async fn deposit(
         ctx.progress.set_total(paths.len() as u64);
         ctx.progress.set_current(0);
         let mut verified = std::collections::BTreeMap::new();
-        for (index, entry) in inspection
-            .entries
-            .iter()
-            .filter(|entry| !entry.directory)
-            .enumerate()
-        {
+        for (index, entry) in local.into_iter().enumerate() {
             if !published {
                 guard(ctx, spec, destination).await?;
             }

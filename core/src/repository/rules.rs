@@ -515,7 +515,7 @@ pub fn content_findings(target: &Target, files: &[FileFacts<'_>]) -> Vec<Profile
     let mut findings = Vec::new();
     if let Some(max) = content.max_files.filter(|max| files.len() > *max) {
         let message = format!(
-            "The export has {} {} files, more than the {max} allowed.",
+            "The export uploads {} files, more than the {max} allowed for {}.",
             files.len(),
             target.name
         );

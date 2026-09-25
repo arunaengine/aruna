@@ -76,8 +76,8 @@ use aruna_core::structs::identity::auth::AuthContext;
 mod archive;
 pub(crate) use archive::*;
 
-const METADATA_PATH: &str = "ro-crate-metadata.json";
-const REPORT_PATH: &str = "aruna-export-report.json";
+const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
+const REPORT_PATH: &str = aruna_core::repository::rules::CRATE_FILES[1];
 const REMOTE_ATTEMPTS: usize = 8;
 const MAX_LOCAL_CANDIDATES: usize = REMOTE_ATTEMPTS / 2;
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
@@ -175,6 +175,14 @@ impl ExportCheckpoint {
             return LinkFailure::SourceUnavailable;
         }
         LinkFailure::Other(message.to_string())
+    }
+
+    /// Archive paths of the crate's data entities, by entity id.
+    pub(crate) fn archive_paths(&self) -> HashMap<&str, &str> {
+        self.entities
+            .iter()
+            .filter_map(|entity| Some((entity.entity_id.as_str(), entity.zip_path.as_deref()?)))
+            .collect()
     }
 
     /// The finished push as a link outcome, once the repository holds the complete record.
@@ -515,7 +523,7 @@ async fn repository_export(
     destination: &aruna_core::repository::RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    use super::repository::check::{check_crate, unmet};
+    use super::repository::check::{check_content, check_crate, unmet};
     use super::repository::{Action, TransferError, deposit, ensure_supported, repository};
     use aruna_core::repository::LinkFailure;
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
@@ -543,6 +551,10 @@ async fn repository_export(
                 let checked = check_crate(&ctx.driver, kind, endpoint, jsonld).await?;
                 if !checked.ready {
                     return Err(unmet(checked.findings));
+                }
+                let findings = check_content(ctx, spec, kind, checkpoint).await?;
+                if !findings.is_empty() {
+                    return Err(unmet(findings));
                 }
             }
             deposit(kind, ctx, spec, destination, checkpoint).await

@@ -9,6 +9,7 @@ use super::link::{
 };
 use super::remote::remote;
 use super::*;
+use aruna_core::metadata::ProfileValidationSeverity;
 use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
@@ -512,7 +513,8 @@ async fn removal_cancels_push() -> Result<(), Box<dyn std::error::Error>> {
 async fn file_limit_refused() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;
-    Box::pin(import_dataset(&fixture, archive_with(100).await?)).await?;
+    // 99 data files, the crate metadata and the export report make 101 uploads.
+    Box::pin(import_dataset(&fixture, archive_with(99).await?)).await?;
     let link = Box::pin(attach(
         &fixture,
         &server.endpoint,
@@ -531,9 +533,15 @@ async fn file_limit_refused() -> Result<(), Box<dyn std::error::Error>> {
     let Some(LinkFailure::RequirementsUnmet(findings)) = failure(&failed) else {
         panic!("expected unmet requirements, got {:?}", failed.status);
     };
-    assert_eq!(findings.len(), 1);
+    // The missing license stays a warning; the file count is the one violation.
+    let findings = findings
+        .into_iter()
+        .filter(|finding| finding.severity == ProfileValidationSeverity::Violation)
+        .collect::<Vec<_>>();
+    assert_eq!(findings.len(), 1, "{findings:#?}");
     assert_eq!(findings[0].code, "content_violation");
     assert_eq!(findings[0].rule, "file/max_files");
+    assert!(findings[0].message.contains("101 files"), "{findings:?}");
     // Refused before any remote write: no draft was created.
     assert!(server.state.lock().unwrap().records.is_empty());
     assert!(failed.remote.draft_id.is_none());
