@@ -323,29 +323,19 @@ async fn generate(
 /// Folds the records covered so far into one checkpoint so history never hits its cap.
 async fn checkpoint(
     context: &DriverContext,
-    store: &GitStore,
     document: &MetadataRegistryRecord,
     projection: &Projection,
 ) -> Result<(), GitError> {
     let state = &projection.state;
-    let user = UserId::nil(document.realm_id);
-    let effect = GitEffect::Pack {
-        document_id: document.document_id,
-        include: state.refs.values().cloned().collect(),
-        exclude: Vec::new(),
-    };
-    let GitEvent::Packed(pack) = execute(store, effect, user).await? else {
-        return Err(GitError::Unavailable);
-    };
     let owner = projection
         .records
         .last()
-        .map_or(user, |record| record.user_id);
-    let pack = objects::store_pack(context, &author(owner), document, pack).await?;
+        .map_or(UserId::nil(document.realm_id), |record| record.user_id);
     let change = GitChange::Checkpoint(Box::new(GitCheckpoint {
-        pack,
+        previous: state.checkpoint,
+        packs: state.new_packs.clone(),
         refs: state.refs.clone().into_iter().collect(),
-        lfs: state.lfs.values().cloned().collect(),
+        lfs: state.new_lfs.clone(),
         locks: state.locks.values().cloned().collect(),
         revision: state.revision,
         covered: state.applied.clone(),
@@ -388,8 +378,11 @@ async fn update(
     }
     let uncovered = publish::uncovered(&projection.records).len();
     if uncovered > CHECKPOINT_AFTER && (leading || uncovered > 2 * CHECKPOINT_AFTER) {
-        checkpoint(context, store, document, &projection).await?;
-        projection = project(context, store, document).await?;
+        // A missing checkpoint only delays folding; it must never fail the request.
+        match checkpoint(context, document, &projection).await {
+            Ok(()) => projection = project(context, store, document).await?,
+            Err(error) => tracing::warn!(%error, "Git checkpoint not written"),
+        }
     }
     Ok(projection)
 }

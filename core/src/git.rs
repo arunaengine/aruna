@@ -301,14 +301,17 @@ pub enum GitChange {
     Unlock {
         id: Ulid,
     },
-    /// The complete state after the `covered` records. Records it does not list still
-    /// apply on top in order, so a late record is never lost.
+    /// The state after the records it and its previous checkpoints cover. Records the
+    /// chain does not list still apply on top in order, so a late record is never lost.
     Checkpoint(Box<GitCheckpoint>),
 }
 
+/// Refs, locks and revision are complete; packs, LFS objects and covered records are those
+/// added since `previous`, so a checkpoint stays small however long the history grows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCheckpoint {
-    pub pack: StoredObject,
+    pub previous: Option<Ulid>,
+    pub packs: Vec<StoredObject>,
     pub refs: Vec<(String, String)>,
     pub lfs: Vec<StoredObject>,
     pub locks: Vec<LfsLock>,
@@ -422,7 +425,10 @@ impl GitRecord {
                 GitChange::Lock { path, .. } => valid_path(path),
                 GitChange::Unlock { .. } => true,
                 GitChange::Checkpoint(checkpoint) => {
-                    checkpoint.pack.valid()
+                    checkpoint.packs.iter().all(StoredObject::valid)
+                        && checkpoint
+                            .previous
+                            .is_none_or(|previous| previous < self.event_id)
                         && !checkpoint.covered.is_empty()
                         && checkpoint
                             .refs

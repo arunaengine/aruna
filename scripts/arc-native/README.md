@@ -72,8 +72,8 @@ Neither history has a hard cap. Metadata events are counted in windows of 1024 e
 16 MiB per document. Before a window fills, a holder writes a checkpoint event with the
 current graph state, and the next window starts there. Each node writes a document through
 one CRDT actor, so vector clocks grow with the number of writing nodes, not with edits.
-Git records use the same idea: near 1024 records, a holder writes a Git checkpoint with the
-current refs, packs and locks.
+Git records use the same idea: after 256 new records, a holder writes a Git checkpoint with
+the current refs and locks, plus the packs and records added since the previous checkpoint.
 
 ## Versions API
 

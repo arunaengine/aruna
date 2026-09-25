@@ -72,7 +72,7 @@ pub async fn project(
                 GitChange::Objects {
                     pack: Some(own), ..
                 } => **own == *pack,
-                GitChange::Checkpoint(checkpoint) => checkpoint.pack == *pack,
+                GitChange::Checkpoint(checkpoint) => checkpoint.packs.contains(pack),
                 _ => false,
             })
             .map_or(actor, |record| record.user_id);

@@ -165,7 +165,8 @@ pub(super) async fn scan(
         for (_, value) in values {
             records.push(postcard::from_bytes(&value).map_err(|_| GitError::Unavailable)?);
         }
-        if records.len() > 64 * aruna_core::git::MAX_RECORDS {
+        // Checkpoints stay small, but every record is still read; this bounds memory use.
+        if records.len() > 1024 * aruna_core::git::MAX_RECORDS {
             return Err(GitError::Unavailable);
         }
         match next_start_after {

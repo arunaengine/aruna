@@ -14,7 +14,6 @@ use aruna_core::git::{GitChange, GitRecord, MAX_RECORDS, git_record_entry, recor
 use aruna_core::handle::Handle;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use std::collections::BTreeSet;
 use ulid::Ulid;
 
 /// The document's current holders when this node is one of them.
@@ -37,25 +36,9 @@ pub async fn holders(
     Ok(holders)
 }
 
-/// Records not listed by the newest checkpoint, which bound what a replay applies on top.
+/// Records the newest checkpoint chain does not cover, which a replay applies on top.
 pub fn uncovered(records: &[GitRecord]) -> Vec<&GitRecord> {
-    let checkpoint = records
-        .iter()
-        .rev()
-        .find_map(|record| match &record.change {
-            GitChange::Checkpoint(checkpoint) => Some((record.event_id, checkpoint)),
-            _ => None,
-        });
-    let covered: BTreeSet<Ulid> = checkpoint
-        .map(|(id, checkpoint)| {
-            checkpoint
-                .covered
-                .iter()
-                .copied()
-                .chain(std::iter::once(id))
-                .collect()
-        })
-        .unwrap_or_default();
+    let (_, covered) = super::state::chain(records);
     records
         .iter()
         .filter(|record| !covered.contains(&record.event_id))

@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::git::{GitChange, GitRecord, LfsLock, StoredObject, ZERO_OID};
-use std::collections::BTreeMap;
+use aruna_core::git::{GitChange, GitCheckpoint, GitRecord, LfsLock, StoredObject, ZERO_OID};
+use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -13,45 +13,83 @@ pub struct GitState {
     pub locks: BTreeMap<String, LfsLock>,
     pub revision: Option<Ulid>,
     pub packs: Vec<StoredObject>,
-    /// Records this state includes; a checkpoint of it covers exactly these.
+    /// The newest checkpoint the state starts from.
+    pub checkpoint: Option<Ulid>,
+    /// Records applied on top of that checkpoint; the next checkpoint covers exactly these.
     pub applied: Vec<Ulid>,
+    /// Packs and LFS objects those records added.
+    pub new_packs: Vec<StoredObject>,
+    pub new_lfs: Vec<StoredObject>,
 }
 
 /// Known answers to "is the first commit an ancestor of the second".
 pub type Ancestry = BTreeMap<(String, String), bool>;
 
-/// Folds records in id order from the newest checkpoint. A ref update applies when its old
-/// value matches or it fast-forwards a branch; otherwise its commit is kept as a conflict ref.
-/// The state is final only when no commit pairs are returned; answer them and reduce again.
+/// The newest checkpoint whose previous checkpoints are all present, that chain from newest
+/// to oldest, and every record id the chain covers, including the checkpoints themselves.
+pub fn chain(records: &[GitRecord]) -> (Vec<(Ulid, &GitCheckpoint)>, BTreeSet<Ulid>) {
+    let checkpoints: BTreeMap<Ulid, &GitCheckpoint> = records
+        .iter()
+        .filter_map(|record| match &record.change {
+            GitChange::Checkpoint(checkpoint) => Some((record.event_id, checkpoint.as_ref())),
+            _ => None,
+        })
+        .collect();
+    'newest: for &newest in checkpoints.keys().rev() {
+        let mut chain = Vec::new();
+        let mut next = Some(newest);
+        while let Some(id) = next {
+            let Some(checkpoint) = checkpoints.get(&id) else {
+                continue 'newest;
+            };
+            chain.push((id, *checkpoint));
+            next = checkpoint.previous;
+        }
+        let covered = chain
+            .iter()
+            .flat_map(|(id, checkpoint)| {
+                checkpoint
+                    .covered
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(*id))
+            })
+            .collect();
+        return (chain, covered);
+    }
+    (Vec::new(), BTreeSet::new())
+}
+
+/// Folds records in id order from the newest checkpoint chain. A ref update applies when its
+/// old value matches or it fast-forwards a branch; otherwise its commit is kept as a conflict
+/// ref. The state is final only when no commit pairs are returned; answer them and reduce again.
 pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(String, String)>) {
     let mut ordered: Vec<_> = records.iter().collect();
     ordered.sort_by_key(|record| record.event_id);
     let mut state = GitState::default();
-    let mut skip = std::collections::BTreeSet::new();
-    let checkpoint = ordered
-        .iter()
-        .rev()
-        .find_map(|record| match &record.change {
-            GitChange::Checkpoint(checkpoint) => Some((record.event_id, checkpoint)),
-            _ => None,
-        });
-    if let Some((id, checkpoint)) = checkpoint {
-        state.refs = checkpoint.refs.iter().cloned().collect();
-        state.lfs = checkpoint
-            .lfs
-            .iter()
-            .map(|object| (object.sha256.clone(), object.clone()))
-            .collect();
-        state.locks = checkpoint
+    let (chain, skip) = chain(records);
+    if let Some((id, newest)) = chain.first() {
+        state.checkpoint = Some(*id);
+        state.refs = newest.refs.iter().cloned().collect();
+        state.locks = newest
             .locks
             .iter()
             .map(|lock| (lock.path.clone(), lock.clone()))
             .collect();
-        state.revision = checkpoint.revision;
-        state.packs.push(checkpoint.pack.clone());
-        state.applied = checkpoint.covered.clone();
-        state.applied.push(id);
-        skip.extend(state.applied.iter().copied());
+        state.revision = newest.revision;
+        for (_, checkpoint) in chain.iter().rev() {
+            for pack in &checkpoint.packs {
+                if !state.packs.contains(pack) {
+                    state.packs.push(pack.clone());
+                }
+            }
+            for object in &checkpoint.lfs {
+                state
+                    .lfs
+                    .entry(object.sha256.clone())
+                    .or_insert_with(|| object.clone());
+            }
+        }
     }
     let mut needs = Vec::new();
     for record in ordered {
@@ -73,13 +111,18 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                     }
                     state.revision = Some(*revision);
                 }
-                state.packs.extend(pack.as_deref().cloned());
+                if let Some(pack) = pack.as_deref()
+                    && !state.packs.contains(pack)
+                {
+                    state.packs.push(pack.clone());
+                    state.new_packs.push(pack.clone());
+                }
                 // The first recorded location stays; later records name copies of it.
                 for object in lfs {
-                    state
-                        .lfs
-                        .entry(object.sha256.clone())
-                        .or_insert_with(|| object.clone());
+                    if !state.lfs.contains_key(&object.sha256) {
+                        state.lfs.insert(object.sha256.clone(), object.clone());
+                        state.new_lfs.push(object.clone());
+                    }
                 }
                 for update in refs {
                     let current = state.refs.get(&update.name).cloned();
@@ -118,7 +161,7 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                 });
             }
             GitChange::Unlock { id } => state.locks.retain(|_, lock| lock.id != *id),
-            // Only the newest checkpoint seeds the state; its records apply individually.
+            // Only the newest complete chain seeds the state; other checkpoints' records apply.
             GitChange::Checkpoint(_) => {}
         }
     }
@@ -131,7 +174,7 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::git::{GitCheckpoint, RefUpdate};
+    use aruna_core::git::RefUpdate;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
 
@@ -246,7 +289,8 @@ mod tests {
             50,
             1,
             GitChange::Checkpoint(Box::new(GitCheckpoint {
-                pack: pack.clone(),
+                previous: None,
+                packs: vec![pack.clone()],
                 refs: vec![("refs/heads/main".into(), oid('c'))],
                 lfs: Vec::new(),
                 locks: Vec::new(),
@@ -265,7 +309,66 @@ mod tests {
         assert_eq!(state.refs.get("refs/heads/main"), Some(&oid('d')));
         assert_eq!(state.refs.get("refs/heads/feature"), Some(&oid('f')));
         assert_eq!(state.packs, vec![pack]);
-        assert_eq!(state.applied.len(), 5);
+        assert_eq!(state.checkpoint, Some(Ulid::from(50)));
+        assert_eq!(state.applied, vec![Ulid::from(30), Ulid::from(60)]);
+    }
+
+    fn checkpoint(
+        id: u128,
+        previous: Option<u128>,
+        refs: &[(&str, char)],
+        covered: &[u128],
+    ) -> GitRecord {
+        record(
+            id,
+            1,
+            GitChange::Checkpoint(Box::new(GitCheckpoint {
+                previous: previous.map(Ulid::from),
+                packs: Vec::new(),
+                refs: refs
+                    .iter()
+                    .map(|(name, seed)| (name.to_string(), oid(*seed)))
+                    .collect(),
+                lfs: Vec::new(),
+                locks: Vec::new(),
+                revision: None,
+                covered: covered.iter().copied().map(Ulid::from).collect(),
+            })),
+        )
+    }
+
+    #[test]
+    fn checkpoint_chains() {
+        let records = [
+            update(10, "refs/heads/main", ZERO_OID, &oid('b'), None),
+            checkpoint(20, None, &[("refs/heads/main", 'b')], &[10]),
+            update(30, "refs/heads/main", &oid('b'), &oid('c'), None),
+            // A holder that had not seen 30 checkpoints next to one that had.
+            update(35, "refs/heads/side", ZERO_OID, &oid('s'), None),
+            checkpoint(40, Some(20), &[("refs/heads/main", 'c')], &[30]),
+            checkpoint(
+                45,
+                Some(20),
+                &[("refs/heads/main", 'b'), ("refs/heads/side", 's')],
+                &[35],
+            ),
+            update(50, "refs/heads/main", &oid('c'), &oid('d'), None),
+        ];
+        let state = done(&records, &Ancestry::new());
+        // The newest chain (45 -> 20) seeds; what 40 alone covered applies on top.
+        assert_eq!(state.checkpoint, Some(Ulid::from(45)));
+        assert_eq!(state.refs.get("refs/heads/main"), Some(&oid('d')));
+        assert_eq!(state.refs.get("refs/heads/side"), Some(&oid('s')));
+        assert_eq!(
+            state.applied,
+            vec![Ulid::from(30), Ulid::from(40), Ulid::from(50)]
+        );
+        // A chain with a missing previous checkpoint is not used.
+        let partial = [
+            checkpoint(60, Some(55), &[("refs/heads/main", 'x')], &[50]),
+            records[0].clone(),
+        ];
+        assert_eq!(done(&partial, &Ancestry::new()).checkpoint, None);
     }
 
     #[test]
