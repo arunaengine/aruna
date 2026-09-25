@@ -44,7 +44,8 @@ use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::{project_create_events, replay_event_log};
 use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    update_metadata_document,
 };
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
@@ -752,6 +753,121 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     wait_metadata_absence(&nodes, group_id, document_id, &created.record.graph_iri).await?;
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([43u8; 32]);
+    let (nodes, config) = build_realm_nodes(&realm_id, 3).await?;
+    let group_id = Ulid::generate();
+    let document_id = mint_local(
+        &config,
+        nodes[0].net.node_id(),
+        realm_id,
+        group_id,
+        "datasets/long-history",
+    );
+    let actor = |node: &TestNode| Actor {
+        node_id: node.net.node_id(),
+        user_id: UserId::local(Ulid::from_parts(7, 7), realm_id),
+        realm_id,
+    };
+    let created = drive(
+        CreateDocumentOperation::new(CreateDocumentConfig {
+            actor: actor(&nodes[0]),
+            group_id,
+            document_id,
+            document_path: "datasets/long-history".to_string(),
+            public: false,
+            payload: CreateDocumentPayload::Scaffold {
+                name: "Long history".to_string(),
+                description: "More edits than one history window".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            },
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    wait_metadata_state(
+        &nodes,
+        group_id,
+        document_id,
+        &created.record.graph_iri,
+        3,
+        "Long history",
+    )
+    .await?;
+    let origins: Vec<&TestNode> = nodes
+        .iter()
+        .filter(|node| created.record.holder_node_ids.contains(&node.net.node_id()))
+        .collect();
+    // Every origin writes more than its share of one window, so only checkpoints keep
+    // the document writable.
+    let edits = aruna_core::metadata::EVENT_LIMIT as usize + 76;
+    for edit in 0..edits {
+        let node = origins[edit % origins.len()];
+        let jsonld = format!(
+            r#"{{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[
+{{"@id":"ro-crate-metadata.json","@type":"CreativeWork","conformsTo":{{"@id":"https://w3id.org/ro/crate/1.2"}},"about":{{"@id":"https://w3id.org/aruna/{document_id}"}}}},
+{{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"Edit {edit}","description":"Long history","datePublished":"2026-02-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}}}}]}}"#
+        );
+        // A burst can outrun materialization; the window opens again once it catches up.
+        let mut accepted = false;
+        for _ in 0..1200 {
+            let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: actor(node),
+                group_id,
+                document_id,
+                public: false,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: jsonld.clone(),
+                },
+            });
+            match update_metadata_document(operation, node.context.as_ref()).await {
+                Ok(_) => {
+                    accepted = true;
+                    break;
+                }
+                // Backpressure and write conflicts are both answered by retrying.
+                Err(
+                    UpdateDocumentError::RawLimit
+                    | UpdateDocumentError::StorageError(
+                        aruna_core::errors::StorageError::TransactionConflict,
+                    ),
+                ) => sleep(Duration::from_millis(250)).await,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        assert!(accepted, "edit {edit} stayed refused");
+    }
+    let last = format!("Edit {}", edits - 1);
+    wait_metadata_state(
+        &nodes,
+        group_id,
+        document_id,
+        &created.record.graph_iri,
+        3,
+        &last,
+    )
+    .await?;
+    let checkpoints = nodes[0]
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: aruna_core::keyspaces::METADATA_CHECKPOINT_KEYSPACE.to_string(),
+            prefix: Some(aruna_core::storage_entries::event_log_prefix(document_id)),
+            start: None,
+            limit: 100,
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = checkpoints else {
+        return Err("checkpoint rows unreadable".into());
+    };
+    assert!(!values.is_empty(), "no metadata checkpoint was written");
     shutdown_nodes(nodes).await;
     Ok(())
 }
