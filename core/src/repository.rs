@@ -15,6 +15,7 @@ pub use credential::RepositoryCredential;
 pub mod fields;
 pub mod invenio;
 mod link;
+pub mod rules;
 pub use link::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
