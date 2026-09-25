@@ -10,7 +10,6 @@ use ulid::Ulid;
 
 use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
-use crate::invenio::link_key;
 use crate::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
     GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, INVENIO_LINK_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -18,6 +17,7 @@ use crate::keyspaces::{
     USER_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
+use crate::repository::link_key;
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 use crate::structs::identity::realm::RealmId;

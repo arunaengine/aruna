@@ -93,7 +93,7 @@ pub async fn search_records(
     Query(query): Query<InvenioSearch>,
 ) -> ServerResult<Json<serde_json::Value>> {
     let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
-    let query = aruna_core::invenio::InvenioQuery {
+    let query = aruna_core::repository::InvenioQuery {
         group_id: ulid::Ulid::from_string(&query.group_id).map_err(|_| ServerError::BadRequest)?,
         connector_id: ulid::Ulid::from_string(&query.connector_id)
             .map_err(|_| ServerError::BadRequest)?,
@@ -186,9 +186,9 @@ impl Default for InvenioOptionsRequest {
     }
 }
 
-impl From<InvenioOptionsRequest> for aruna_core::invenio::InvenioOptions {
+impl From<InvenioOptionsRequest> for aruna_core::repository::InvenioOptions {
     fn from(value: InvenioOptionsRequest) -> Self {
-        use aruna_core::invenio::InvenioMode;
+        use aruna_core::repository::InvenioMode;
         Self {
             all_versions: value.all_versions,
             mode: match value.mode {

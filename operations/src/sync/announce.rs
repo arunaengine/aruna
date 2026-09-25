@@ -11,10 +11,10 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::invenio::InvenioLink;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
 use aruna_core::operation::Operation;
+use aruna_core::repository::InvenioLink;
 use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::RealmId;

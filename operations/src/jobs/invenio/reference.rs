@@ -5,8 +5,9 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::invenio::{
-    InvenioMode, REFERENCE_FILE, REFERENCE_GROUP, REFERENCE_RECORD, validate_id,
+use aruna_core::repository::InvenioMode;
+use aruna_core::repository::invenio::{
+    REFERENCE_FILE, REFERENCE_GROUP, REFERENCE_RECORD, validate_id,
 };
 use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec};
 use aruna_core::structs::execution::source_access::SourceMetadata;

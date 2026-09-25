@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use aruna_core::errors::StagingSourceError;
-use aruna_core::invenio::{REFERENCE_FILE, REFERENCE_RECORD};
+use aruna_core::repository::invenio::{REFERENCE_FILE, REFERENCE_RECORD};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use bytes::Bytes;

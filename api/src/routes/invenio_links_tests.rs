@@ -164,7 +164,7 @@ async fn link_routes_authorize() {
     for (key_space, key) in [
         (
             INVENIO_LINK_KEYSPACE,
-            aruna_core::invenio::link_key(document_id, link_id),
+            aruna_core::repository::link_key(document_id, link_id),
         ),
         (LINK_SECRET_KEYSPACE, link_id.to_bytes().to_vec()),
     ] {
@@ -336,7 +336,7 @@ async fn holder_copy_refuses() {
         updated_at: now,
         generation: 1,
         warning: None,
-        direction: aruna_core::invenio::LinkDirection::Push,
+        direction: aruna_core::repository::LinkDirection::Push,
     };
     let written = linked
         .test
@@ -426,7 +426,7 @@ async fn admin_rights_limited() {
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: INVENIO_LINK_KEYSPACE.into(),
-            key: aruna_core::invenio::link_key(document_id, link_id).into(),
+            key: aruna_core::repository::link_key(document_id, link_id).into(),
             value: stored.to_bytes().unwrap().into(),
             txn_id: None,
         })
@@ -457,7 +457,7 @@ async fn admin_rights_limited() {
 
 /// Stores a pull link on the dataset the way a keep_updated import creates it.
 async fn pull_link_for(linked: &Linked) -> InvenioLink {
-    use aruna_core::invenio::{InvenioRecord, LinkDirection, LinkPull};
+    use aruna_core::repository::{InvenioRecord, LinkDirection, LinkPull};
     let now = std::time::SystemTime::now();
     let mut link = InvenioLink {
         link_id: Ulid::generate(),

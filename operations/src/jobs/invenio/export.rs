@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
-use aruna_core::invenio::{
+use aruna_core::repository::invenio::{export_fields, record_id, validate_id};
+use aruna_core::repository::{
     ExportIdentity, InvenioDestination, InvenioRecord, LinkFailure, LinkTarget, MAX_RECORD_FILES,
-    export_fields, record_id, validate_id,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
@@ -385,7 +385,7 @@ pub async fn missing_metadata(
         serde_json::from_str(&jsonld).map_err(|_| invalid("invalid source crate"))?;
     let overrides: Value =
         serde_json::from_str(metadata_json).map_err(|_| invalid("invalid repository metadata"))?;
-    Ok(aruna_core::invenio::missing_metadata(
+    Ok(aruna_core::repository::invenio::missing_metadata(
         &document,
         &overrides,
         &view.connector.endpoint,

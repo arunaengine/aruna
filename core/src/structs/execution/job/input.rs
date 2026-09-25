@@ -299,9 +299,9 @@ pub enum ImportRoCrateSource {
         group_id: GroupId,
         connector_id: Ulid,
         record_id: String,
-        options: crate::invenio::InvenioOptions,
+        options: crate::repository::InvenioOptions,
         /// Set when the import keeps a pull link or updates one.
-        pull: Option<crate::invenio::InvenioPull>,
+        pull: Option<crate::repository::InvenioPull>,
     },
 }
 
@@ -367,7 +367,7 @@ pub struct ImportRoCrateSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRoCrateSpec {
-    pub destination: Option<crate::invenio::InvenioDestination>,
+    pub destination: Option<crate::repository::InvenioDestination>,
     pub auth_context: AuthContext,
     pub document_id: Ulid,
     pub limits: RoCrateLimits,
@@ -532,7 +532,7 @@ pub struct ExportOmissionCounts {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRoCrateResult {
-    pub repository: Option<crate::invenio::InvenioRecord>,
+    pub repository: Option<crate::repository::InvenioRecord>,
     pub artifact: Option<ArtifactRef>,
     pub included: u64,
     pub omitted: ExportOmissionCounts,

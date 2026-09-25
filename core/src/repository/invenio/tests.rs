@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::repository::*;
 use crate::structs::secondary_id::IdentifierOrigin::{self, Imported};
 use crate::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
 

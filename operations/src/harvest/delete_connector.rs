@@ -201,7 +201,7 @@ mod tests {
         let (_dir, context) = context();
         let group_id = Ulid::generate();
         let connector = create(&context, group_id).await.connector_id;
-        let key = aruna_core::invenio::connector_link_key(connector, Ulid::generate());
+        let key = aruna_core::repository::connector_link_key(connector, Ulid::generate());
         let written = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {

@@ -23,9 +23,9 @@ use std::sync::{Arc, Mutex};
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::invenio::InvenioPull;
 use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, JOB_STATE_KEYSPACE};
 use aruna_core::metadata::MetadataValidationViolation;
+use aruna_core::repository::InvenioPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::execution::job::{

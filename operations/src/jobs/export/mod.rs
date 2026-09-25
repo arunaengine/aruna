@@ -111,14 +111,14 @@ pub struct ExportCheckpoint {
     pub(crate) repository_started: bool,
     pub(crate) repository_complete: bool,
     pub(crate) repository_metadata: Option<[u8; 32]>,
-    pub(crate) repository: Option<aruna_core::invenio::InvenioRecord>,
+    pub(crate) repository: Option<aruna_core::repository::InvenioRecord>,
     /// A link's resolved lineage base: the latest published version it continues.
     pub(crate) repository_base: Option<String>,
-    pub(crate) link_failure: Option<aruna_core::invenio::LinkFailure>,
+    pub(crate) link_failure: Option<aruna_core::repository::LinkFailure>,
     /// File keys the repository record holds after the upload.
     pub(crate) repository_files: Vec<String>,
     /// The dataset's identifiers when the snapshot was taken.
-    pub(crate) identity: aruna_core::invenio::ExportIdentity,
+    pub(crate) identity: aruna_core::repository::ExportIdentity,
     refs: RoCrateCheckpointRefs,
     phase: ExportPhase,
     winning_event_id: Option<Ulid>,
@@ -166,8 +166,8 @@ impl ExportCheckpoint {
     }
 
     /// Why a push failed: a recorded refusal, left-out files, or the job message.
-    pub(crate) fn push_failure(&self, message: &str) -> aruna_core::invenio::LinkFailure {
-        use aruna_core::invenio::LinkFailure;
+    pub(crate) fn push_failure(&self, message: &str) -> aruna_core::repository::LinkFailure {
+        use aruna_core::repository::LinkFailure;
         if let Some(failure) = &self.link_failure {
             return failure.clone();
         }
@@ -178,13 +178,13 @@ impl ExportCheckpoint {
     }
 
     /// The finished push as a link outcome, once the repository holds the complete record.
-    pub(crate) fn pushed_outcome(&self) -> Option<aruna_core::invenio::PushOutcome> {
+    pub(crate) fn pushed_outcome(&self) -> Option<aruna_core::repository::PushOutcome> {
         let record = self
             .repository
             .clone()
             .filter(|_| self.repository_complete)?;
         let (event_id, dataset_digest) = self.pushed_revision()?;
-        Some(aruna_core::invenio::PushOutcome::Pushed {
+        Some(aruna_core::repository::PushOutcome::Pushed {
             record: Box::new(record),
             event_id,
             dataset_digest,
@@ -512,7 +512,7 @@ async fn run_export(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome
 async fn repository_export(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &aruna_core::invenio::InvenioDestination,
+    destination: &aruna_core::repository::InvenioDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
     use super::invenio::{TransferError, export};
@@ -557,7 +557,7 @@ async fn repository_export(
 async fn export_identity(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-) -> Result<aruna_core::invenio::ExportIdentity, ExportFailure> {
+) -> Result<aruna_core::repository::ExportIdentity, ExportFailure> {
     let mapping = crate::metadata::persistent_id::forward::read_pid_routed(
         &ctx.driver,
         spec.auth_context.realm_id,
@@ -568,7 +568,7 @@ async fn export_identity(
     let Some(mapping) = mapping.filter(|mapping| !mapping.is_retired()) else {
         return Ok(Default::default());
     };
-    Ok(aruna_core::invenio::ExportIdentity {
+    Ok(aruna_core::repository::ExportIdentity {
         own: mapping
             .is_active()
             .then(|| mapping.pid.clone())
@@ -677,7 +677,7 @@ async fn snapshot_export(
         jsonld
     } else {
         let mut document = document;
-        aruna_core::invenio::add_root_identifiers(&mut document, &identity);
+        aruna_core::repository::invenio::add_root_identifiers(&mut document, &identity);
         document.to_string()
     };
 

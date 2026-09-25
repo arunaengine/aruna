@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::credential_encryption::CredentialEncryptionKey;
-use crate::invenio::InvenioCredential;
+use crate::repository::InvenioCredential;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use crate::structured_id::{BucketId, PlacementHandle};

@@ -4,7 +4,7 @@
 
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
-use aruna_core::invenio::{ExportIdentity, InvenioRecord, LinkFailure};
+use aruna_core::repository::{ExportIdentity, InvenioRecord, LinkFailure};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::{

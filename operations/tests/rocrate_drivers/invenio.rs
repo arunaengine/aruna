@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::invenio::InvenioDestination;
+use aruna_core::repository::InvenioDestination;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
 use axum::body::to_bytes;

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use aruna_blob::invenio::InvenioError;
-use aruna_core::invenio::{
+use aruna_core::repository::{
     InvenioLink, InvenioPull, LinkFailure, LinkStatus, PullCheck, PushOutcome,
 };
 use aruna_core::structs::execution::job::{
@@ -108,7 +108,7 @@ async fn latest_version(
         .record_id
         .as_deref()
         .ok_or_else(|| TransferError::Permanent("the link holds no record".into()))?;
-    aruna_core::invenio::validate_id(held)?;
+    aruna_core::repository::invenio::validate_id(held)?;
     let local = current_event(context, link.document_id).await.ok();
     let auth = creator_auth(link);
     let client = connect(
@@ -139,7 +139,7 @@ async fn latest_version(
         let page = client.json(Method::GET, url, None).await.map_err(gone)?;
         page["hits"]["hits"][0].clone()
     };
-    let latest_id = aruna_core::invenio::record_id(&latest)?.to_string();
+    let latest_id = aruna_core::repository::invenio::record_id(&latest)?.to_string();
     let revision = latest["revision_id"]
         .as_u64()
         .ok_or_else(|| TransferError::Permanent("missing record revision".into()))?;

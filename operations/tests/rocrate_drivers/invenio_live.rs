@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::invenio::{InvenioMode, InvenioOptions, InvenioQuery, InvenioRecord};
+use aruna_core::repository::{InvenioMode, InvenioOptions, InvenioQuery, InvenioRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
 use aruna_operations::jobs::invenio::{seal_credential, search_records};
@@ -186,7 +186,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
         if mode != InvenioMode::Metadata {
             let key = format!(
                 "live-{index}/{}",
-                aruna_core::invenio::file_path(&second.id, "nested/data.txt")?
+                aruna_core::repository::invenio::file_path(&second.id, "nested/data.txt")?
             );
             let mut object = drive(
                 GetObjectOperation::new(GetObjectInput {
@@ -216,7 +216,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
-    use aruna_core::invenio::{LinkFailure, LinkPatch, LinkStatus};
+    use aruna_core::repository::{LinkFailure, LinkPatch, LinkStatus};
     use aruna_operations::jobs::invenio::links::{LinkChange, change_link};
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -401,7 +401,7 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     use super::link::{attach, current, drain, due_now, import_dataset, run_push, succeeded};
-    use aruna_core::invenio::{LinkPatch, LinkReview};
+    use aruna_core::repository::{LinkPatch, LinkReview};
     use aruna_operations::jobs::invenio::links::{LinkChange, change_link};
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -676,7 +676,7 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
         for (version, key, bytes) in &expected {
             let key = format!(
                 "zenodo-{index}/{}",
-                aruna_core::invenio::file_path(version, key)?
+                aruna_core::repository::invenio::file_path(version, key)?
             );
             let object = drive(
                 GetObjectOperation::new(GetObjectInput {
@@ -711,7 +711,8 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::invenio::{InvenioPull, LinkPatch, crate_versions};
+    use aruna_core::repository::invenio::crate_versions;
+    use aruna_core::repository::{InvenioPull, LinkPatch};
     use aruna_core::structs::secondary_id::SecondaryIdKind;
     use aruna_operations::jobs::invenio::link_queue::drain_links;
     use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};

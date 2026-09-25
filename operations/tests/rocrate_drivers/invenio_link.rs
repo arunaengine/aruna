@@ -4,10 +4,10 @@
 
 use super::remote::{RemoteServer, remote};
 use super::*;
-use aruna_core::invenio::{
+use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE};
+use aruna_core::repository::{
     InvenioLink, LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, link_key,
 };
-use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_operations::jobs::invenio::link_queue::drain_links;
 use aruna_operations::jobs::invenio::links::{ChangeLinkOperation, LinkChange, list_links};
@@ -126,7 +126,7 @@ pub(super) async fn attach(
         updated_at: now,
         generation: 0,
         warning: None,
-        direction: aruna_core::invenio::LinkDirection::Push,
+        direction: aruna_core::repository::LinkDirection::Push,
     };
     let change = LinkChange::Create {
         link: Box::new(link),

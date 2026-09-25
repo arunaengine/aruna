@@ -93,7 +93,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
     for id in ["1", "2"] {
         let key = format!(
             "imported/{}",
-            aruna_core::invenio::file_path(id, "data.txt")?
+            aruna_core::repository::invenio::file_path(id, "data.txt")?
         );
         assert_eq!(object_versions(&fixture, &key).await?.len(), 1);
         let provenance = format!("imported/versions/{id}/invenio-record.json");
@@ -129,7 +129,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::invenio::{InvenioMode, InvenioOptions};
+    use aruna_core::repository::{InvenioMode, InvenioOptions};
     let seen = Arc::new(Mutex::new(Vec::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let storage = format!("http://{}/storage/", listener.local_addr()?);
@@ -184,7 +184,7 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
                     bucket: BUCKET.into(),
                     key: format!(
                         "imported/{}",
-                        aruna_core::invenio::file_path("2", "data.txt")?
+                        aruna_core::repository::invenio::file_path("2", "data.txt")?
                     ),
                     version_id: None,
                     range: None,
@@ -220,7 +220,7 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn invenio_import_modes() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::invenio::{InvenioMode, InvenioOptions};
+    use aruna_core::repository::{InvenioMode, InvenioOptions};
     use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
     for mode in [InvenioMode::Metadata, InvenioMode::Reference] {
         let fixture = build_fixture(false).await?;
@@ -268,7 +268,7 @@ async fn invenio_import_modes() -> Result<(), Box<dyn std::error::Error>> {
         );
         let key = format!(
             "imported/{}",
-            aruna_core::invenio::file_path("2", "content")?
+            aruna_core::repository::invenio::file_path("2", "content")?
         );
         if mode == InvenioMode::Reference {
             assert_eq!(object_versions(&fixture, &key).await?.len(), 1);
@@ -323,7 +323,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
         path_restrictions: None,
         session: None,
     };
-    let query = aruna_core::invenio::InvenioQuery {
+    let query = aruna_core::repository::InvenioQuery {
         group_id: fixture.group_id,
         connector_id,
         q: "doi:\"10.1234/2\"".into(),
@@ -339,7 +339,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert_eq!(page["hits"]["hits"][0]["id"], "2");
-    let invalid = aruna_core::invenio::InvenioQuery { size: 100, ..query };
+    let invalid = aruna_core::repository::InvenioQuery { size: 100, ..query };
     assert!(
         aruna_operations::jobs::invenio::search_records(&fixture.context, &auth, &invalid, 1024)
             .await
@@ -461,8 +461,8 @@ async fn invenio_cancels_reference() -> Result<(), Box<dyn std::error::Error>> {
             group_id: fixture.group_id,
             connector_id: connector(&fixture, &server).await,
             record_id: "2".into(),
-            options: aruna_core::invenio::InvenioOptions {
-                mode: aruna_core::invenio::InvenioMode::Reference,
+            options: aruna_core::repository::InvenioOptions {
+                mode: aruna_core::repository::InvenioMode::Reference,
                 all_versions: false,
             },
             pull: None,
@@ -481,7 +481,7 @@ async fn invenio_cancels_reference() -> Result<(), Box<dyn std::error::Error>> {
     release.notify_one();
     let key = format!(
         "imported/{}",
-        aruna_core::invenio::file_path("2", "data.txt")?
+        aruna_core::repository::invenio::file_path("2", "data.txt")?
     );
     assert!(object_versions(&fixture, &key).await?.is_empty());
     fixture.stop().await;
@@ -494,7 +494,7 @@ async fn start_update(
     fixture: &Fixture,
     server: &Server,
 ) -> Result<(JobContext, ImportRoCrateSpec, Ulid), Box<dyn std::error::Error>> {
-    use aruna_core::invenio::{InvenioOptions, InvenioPull, PullCheck};
+    use aruna_core::repository::{InvenioOptions, InvenioPull, PullCheck};
     use aruna_operations::jobs::invenio::link_queue::current_event;
     use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
     use aruna_operations::jobs::invenio::pull::start_pull;
@@ -557,7 +557,7 @@ async fn start_update(
 
 #[tokio::test]
 async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::invenio::crate_versions;
+    use aruna_core::repository::invenio::crate_versions;
     use aruna_operations::jobs::invenio::links::list_links;
     use aruna_operations::metadata::raw_revision::load_raw_revision;
     let fixture = build_fixture(false).await?;
@@ -586,7 +586,7 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
     for id in ["1", "2"] {
         let key = format!(
             "imported/{}",
-            aruna_core::invenio::file_path(id, "data.txt")?
+            aruna_core::repository::invenio::file_path(id, "data.txt")?
         );
         assert_eq!(object_versions(&fixture, &key).await?.len(), 1, "{key}");
     }
@@ -630,7 +630,7 @@ async fn add_note(fixture: &Fixture, name: &str) -> Result<Ulid, Box<dyn std::er
 
 #[tokio::test]
 async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::invenio::crate_versions;
+    use aruna_core::repository::invenio::crate_versions;
     use aruna_operations::metadata::raw_revision::load_raw_revision;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
@@ -673,7 +673,7 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(revision.winning_event_id, racing);
     let key = format!(
         "imported/{}",
-        aruna_core::invenio::file_path("2", "data.txt")?
+        aruna_core::repository::invenio::file_path("2", "data.txt")?
     );
     assert!(object_versions(&fixture, &key).await?.is_empty());
     fixture.stop().await;
@@ -682,7 +682,8 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::invenio::{LinkPatch, LinkStatus, crate_versions};
+    use aruna_core::repository::invenio::crate_versions;
+    use aruna_core::repository::{LinkPatch, LinkStatus};
     use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
     use aruna_operations::metadata::raw_revision::load_raw_revision;
     let fixture = build_fixture(false).await?;

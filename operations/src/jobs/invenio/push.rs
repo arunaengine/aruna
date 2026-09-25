@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_blob::invenio::{InvenioClient, InvenioError};
-use aruna_core::invenio::{
+use aruna_core::repository::invenio::validate_id;
+use aruna_core::repository::{
     InvenioDestination, InvenioLink, InvenioRecord, LinkFailure, LinkReview, LinkStatus,
-    LinkTarget, PushOutcome, RemoteState, validate_id,
+    LinkTarget, PushOutcome, RemoteState,
 };
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobError, JobErrorKind};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};

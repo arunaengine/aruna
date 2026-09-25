@@ -5,7 +5,8 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aruna_core::invenio::{InvenioLink, LinkRemote, LinkStatus, validate_id};
+use aruna_core::repository::invenio::validate_id;
+use aruna_core::repository::{InvenioLink, LinkRemote, LinkStatus};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
@@ -580,7 +581,7 @@ pub async fn create_link(
         updated_at: now,
         generation: 0,
         warning: None,
-        direction: aruna_core::invenio::LinkDirection::Push,
+        direction: aruna_core::repository::LinkDirection::Push,
     };
     let change = LinkChange::Create {
         link: Box::new(link.clone()),

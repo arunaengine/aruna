@@ -324,10 +324,10 @@ pub async fn submit_rocrate_export(
                 .iter()
                 .chain(destination.new_version.iter())
             {
-                aruna_core::invenio::validate_id(id)
+                aruna_core::repository::invenio::validate_id(id)
                     .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
             }
-            Ok(aruna_core::invenio::InvenioDestination {
+            Ok(aruna_core::repository::InvenioDestination {
                 group_id: ulid::Ulid::from_string(&destination.group_id)
                     .map_err(|_| ServerError::BadRequest)?,
                 connector_id: ulid::Ulid::from_string(&destination.connector_id)

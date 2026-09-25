@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::invenio::{InvenioLink, LinkRemote, LinkStatus, link_key};
 use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
+use aruna_core::repository::{InvenioLink, LinkRemote, LinkStatus, link_key};
 use aruna_core::storage_entries::shard_manifest_key;
 use aruna_core::structs::execution::job::RoCrateLimits;
 
@@ -31,7 +31,7 @@ fn link(document_id: Ulid, owner: NodeId, realm_id: RealmId, generation: u64) ->
         updated_at: std::time::SystemTime::UNIX_EPOCH,
         generation,
         warning: None,
-        direction: aruna_core::invenio::LinkDirection::Push,
+        direction: aruna_core::repository::LinkDirection::Push,
     }
 }
 

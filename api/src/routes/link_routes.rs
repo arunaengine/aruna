@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::invenio::{InvenioLink, LinkPatch, LinkStatus};
+use aruna_core::repository::{InvenioLink, LinkPatch, LinkStatus};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::jobs::invenio::link_queue::{current_event, refresh_review, start_push};
 use aruna_operations::jobs::invenio::links::LinkChange;

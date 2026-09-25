@@ -8,15 +8,15 @@ use aruna_core::document::{DocumentChange, DocumentOutboxEvent};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::invenio::{
-    InvenioCredential, InvenioLink, InvenioRecord, LinkBusy, LinkFailure, LinkPatch,
-    LinkQueueEntry, LinkReview, LinkStatus, PullCheck, PushOutcome, REVIEW_POLL_MS, RemoteState,
-    connector_link_key, link_key, link_prefix,
-};
 use aruna_core::keyspaces::{
     INVENIO_LINK_KEYSPACE, LINK_CONNECTOR_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::repository::{
+    InvenioCredential, InvenioLink, InvenioRecord, LinkBusy, LinkFailure, LinkPatch,
+    LinkQueueEntry, LinkReview, LinkStatus, PullCheck, PushOutcome, REVIEW_POLL_MS, RemoteState,
+    connector_link_key, link_key, link_prefix,
+};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::secondary_id::{IdentifierOrigin, RegisterIdentifiersSpec};

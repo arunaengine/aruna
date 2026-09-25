@@ -8,9 +8,9 @@ use std::path::{Component, Path};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::SourceResolutionError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::invenio::REFERENCE_GROUP;
 use aruna_core::keyspaces::OFFERED_DIRECTORY_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::repository::invenio::REFERENCE_GROUP;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,

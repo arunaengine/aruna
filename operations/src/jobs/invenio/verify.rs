@@ -4,7 +4,8 @@
 
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::InvenioClient;
-use aruna_core::invenio::{InvenioRecord, normalize_metadata};
+use aruna_core::repository::InvenioRecord;
+use aruna_core::repository::invenio::normalize_metadata;
 use http::Method;
 use serde_json::{Value, json};
 

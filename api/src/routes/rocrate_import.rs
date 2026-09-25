@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::StructuredId;
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
-use aruna_core::invenio::InvenioPull;
+use aruna_core::repository::InvenioPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
@@ -434,7 +434,7 @@ fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrat
             keep_updated,
             auto_update,
         } => {
-            aruna_core::invenio::validate_id(&record_id)
+            aruna_core::repository::invenio::validate_id(&record_id)
                 .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
             if auto_update.is_some() && !keep_updated {
                 return Err(ServerError::BadRequestReason(

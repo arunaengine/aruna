@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::invenio::{InvenioQuery, validate_id};
+use aruna_core::repository::InvenioQuery;
+use aruna_core::repository::invenio::validate_id;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::secondary_id::normalize_doi;
 use http::Method;

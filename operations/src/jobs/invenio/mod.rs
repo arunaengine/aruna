@@ -6,7 +6,7 @@ use std::future::Future;
 
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::handle::Handle;
-use aruna_core::invenio::{InvenioCredential, InvenioDestination, LinkFailure};
+use aruna_core::repository::{InvenioCredential, InvenioDestination, LinkFailure};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
@@ -59,8 +59,8 @@ impl From<InvenioError> for TransferError {
     }
 }
 
-impl From<aruna_core::invenio::InvenioError> for TransferError {
-    fn from(error: aruna_core::invenio::InvenioError) -> Self {
+impl From<aruna_core::repository::InvenioError> for TransferError {
+    fn from(error: aruna_core::repository::InvenioError) -> Self {
         Self::Permanent(error.to_string())
     }
 }

@@ -9,7 +9,7 @@ use super::link::{
 };
 use super::remote::remote;
 use super::*;
-use aruna_core::invenio::{InvenioLink, LinkFailure, LinkPatch, LinkReview, LinkStatus};
+use aruna_core::repository::{InvenioLink, LinkFailure, LinkPatch, LinkReview, LinkStatus};
 use aruna_operations::jobs::invenio::link_queue::{current_event, start_push};
 use aruna_operations::jobs::invenio::links::{LinkChange, LinkError, change_link};
 use aruna_operations::jobs::invenio::remote_state;
@@ -175,7 +175,7 @@ async fn cancelled_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     write_value(
         storage,
         aruna_core::keyspaces::INVENIO_LINK_KEYSPACE,
-        aruna_core::invenio::link_key(link.document_id, link.link_id),
+        aruna_core::repository::link_key(link.document_id, link.link_id),
         started.to_bytes()?,
     )
     .await?;
@@ -209,7 +209,7 @@ async fn revive_checks_lineage() -> Result<(), Box<dyn std::error::Error>> {
     pull.link_id = ulid::Ulid::from_parts(9, 9);
     pull.status = LinkStatus::Enabled;
     pull.direction =
-        aruna_core::invenio::LinkDirection::Pull(Box::new(aruna_core::invenio::LinkPull {
+        aruna_core::repository::LinkDirection::Pull(Box::new(aruna_core::repository::LinkPull {
             auto_update: false,
             options: Default::default(),
             target: aruna_core::structs::execution::job::ImportRoCrateTarget {
@@ -227,7 +227,7 @@ async fn revive_checks_lineage() -> Result<(), Box<dyn std::error::Error>> {
     write_value(
         &fixture.context.storage_handle,
         aruna_core::keyspaces::INVENIO_LINK_KEYSPACE,
-        aruna_core::invenio::link_key(pull.document_id, pull.link_id),
+        aruna_core::repository::link_key(pull.document_id, pull.link_id),
         pull.to_bytes()?,
     )
     .await?;
@@ -565,7 +565,7 @@ async fn stale_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     write_value(
         &fixture.context.storage_handle,
         aruna_core::keyspaces::INVENIO_LINK_KEYSPACE,
-        aruna_core::invenio::link_key(link.document_id, link.link_id),
+        aruna_core::repository::link_key(link.document_id, link.link_id),
         started.to_bytes()?,
     )
     .await?;

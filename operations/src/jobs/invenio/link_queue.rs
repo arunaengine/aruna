@@ -9,11 +9,11 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::invenio::{
+use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE};
+use aruna_core::repository::{
     InvenioLink, LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
     link_prefix,
 };
-use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE};
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;

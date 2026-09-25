@@ -5,10 +5,10 @@
 use super::*;
 use aruna_core::UserId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
-use aruna_core::invenio::{InvenioRecord, LinkFailure, LinkRemote};
 use aruna_core::keyspaces::{
     SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, WRITE_FENCE_KEYSPACE,
 };
+use aruna_core::repository::{InvenioRecord, LinkFailure, LinkRemote};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
@@ -56,7 +56,7 @@ fn link() -> InvenioLink {
         updated_at: SystemTime::UNIX_EPOCH,
         generation: 0,
         warning: None,
-        direction: aruna_core::invenio::LinkDirection::Push,
+        direction: aruna_core::repository::LinkDirection::Push,
     }
 }
 
@@ -581,7 +581,7 @@ fn finish_schedules_follow_ups() {
     let entry = queued_entry(&effects).expect("auto_publish waits for a quiet draft");
     assert_eq!(
         entry.due_at_ms,
-        NOW_MS + aruna_core::invenio::AUTO_PUBLISH_QUIET_MS
+        NOW_MS + aruna_core::repository::AUTO_PUBLISH_QUIET_MS
     );
 
     // A change queued during the push keeps its earlier check.
@@ -634,7 +634,7 @@ fn draft_needs_running_push() {
 fn pulling() -> InvenioLink {
     let mut link = link();
     link.direction =
-        aruna_core::invenio::LinkDirection::Pull(Box::new(aruna_core::invenio::LinkPull {
+        aruna_core::repository::LinkDirection::Pull(Box::new(aruna_core::repository::LinkPull {
             auto_update: false,
             options: Default::default(),
             target: aruna_core::structs::execution::job::ImportRoCrateTarget {
