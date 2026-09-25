@@ -283,7 +283,7 @@ pub async fn get_repository(
   token replaces it.
 - A changed endpoint needs a new token or an explicit removal, so a stored token never follows
   the connector to another host.
-- The id, group, creator and creation time are kept."#,
+- The id, group, kind, creator and creation time are kept; a different kind answers 400."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
         ("connector_id" = String, Path, description = "Connector to replace, as a 26-character ULID")
@@ -438,7 +438,9 @@ fn update_error(error: UpdateConnectorError) -> ServerError {
         }
         UpdateConnectorError::NotFound => ServerError::NotFound,
         UpdateConnectorError::InUse => ServerError::Conflict(error.to_string()),
-        UpdateConnectorError::SecretEndpoint => ServerError::BadRequestReason(error.to_string()),
+        UpdateConnectorError::SecretEndpoint | UpdateConnectorError::KindChanged => {
+            ServerError::BadRequestReason(error.to_string())
+        }
         UpdateConnectorError::GroupWrite(_)
         | UpdateConnectorError::Storage(_)
         | UpdateConnectorError::Unexpected => ServerError::InternalError(error.to_string()),

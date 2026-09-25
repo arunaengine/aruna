@@ -71,8 +71,10 @@ pub enum UpdateConnectorError {
     NotFound,
     #[error("a changed endpoint needs a new secret or an explicit secret removal")]
     SecretEndpoint,
-    #[error("repository connector is used by Invenio links; remove them first")]
+    #[error("repository connector is used by repository links; remove them first")]
     InUse,
+    #[error("a repository connector keeps its kind; register a new connector instead")]
+    KindChanged,
     #[error("unexpected event while changing a repository connector")]
     Unexpected,
 }
@@ -153,6 +155,9 @@ impl UpdateRepositoryOperation {
         let Some(existing) = self.existing.take() else {
             return self.fail(UpdateConnectorError::Unexpected);
         };
+        if existing.kind != self.input.kind {
+            return self.fail(UpdateConnectorError::KindChanged);
+        }
         if stored && self.input.secret_config.is_none() && existing.endpoint != self.input.endpoint
         {
             return self.fail(UpdateConnectorError::SecretEndpoint);
@@ -360,6 +365,18 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(moved.unwrap_err(), UpdateConnectorError::SecretEndpoint);
+
+        let rekinded = drive(
+            UpdateRepositoryOperation::new(UpdateConnectorInput {
+                kind: RepositoryConnectorKind::OaiPmh,
+                public_config: HashMap::new(),
+                secret_config: Some(HashMap::new()),
+                ..update(&connector, &connector.endpoint)
+            }),
+            &context,
+        )
+        .await;
+        assert_eq!(rekinded.unwrap_err(), UpdateConnectorError::KindChanged);
 
         let removed = drive(
             UpdateRepositoryOperation::new(UpdateConnectorInput {

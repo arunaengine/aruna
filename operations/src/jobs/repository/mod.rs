@@ -4,6 +4,7 @@
 
 use std::future::Future;
 
+use aruna_core::handle::Handle;
 use aruna_core::repository::{
     ImportMode, ImportOptions, LinkFailure, LinkTarget, PullCheck, RemoteState,
     RepositoryCredential, RepositoryDestination, RepositoryLink, RepositoryPull, RepositoryQuery,
@@ -13,14 +14,18 @@ use aruna_core::structs::execution::job::{
     ArtifactRef, ExportRoCrateSpec, ImportRoCrateSource, ImportRoCrateSpec,
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::blob::BucketInfo;
 use serde_json::Value;
 use ulid::Ulid;
 
+use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::{DriverContext, drive};
+use crate::harvest::create_connector::INVENIO_TOKEN as CONNECTOR_TOKEN;
 use crate::harvest::read_connector::{ConnectorView, GetRepositoryOperation, ReadConnectorError};
+use crate::harvest::repository::{parse_secret_read, read_secret_effect};
 
 use super::executor::JobContext;
 use super::export::ExportCheckpoint;
@@ -286,6 +291,70 @@ pub async fn connector_kind(
         .await?
         .connector
         .kind)
+}
+
+/// Opens the group's connector of `kind` for a transfer after checking the caller's access in the
+/// connector group: the connector and its token. A sealed personal credential gives the token,
+/// else the connector's own token when it keeps one.
+pub(crate) async fn open_connector(
+    context: &DriverContext,
+    auth: &AuthContext,
+    kind: RepositoryConnectorKind,
+    group_id: Ulid,
+    connector_id: Ulid,
+    permission: Permission,
+    credential: Option<&RepositoryCredential>,
+) -> Result<(ConnectorView, Option<String>), TransferError> {
+    authorize(
+        context,
+        auth.realm_id,
+        auth,
+        &format!("/{}/g/{group_id}/meta/**", auth.realm_id),
+        &permission,
+        PolicyRequestExtras::operation("metadata.repository"),
+    )
+    .await
+    .map_err(|error| match error {
+        AuthorizeError::Storage(_)
+        | AuthorizeError::CheckFailed(_)
+        | AuthorizeError::Policy(PolicyEnforcementError::Unavailable(_)) => {
+            TransferError::Retryable(error.to_string())
+        }
+        _ => TransferError::Permanent(error.to_string()),
+    })?;
+    let view = repository(context, group_id, connector_id).await?;
+    if view.connector.kind != kind {
+        return Err(TransferError::Permanent(format!(
+            "the repository connector is not of kind {kind}"
+        )));
+    }
+    let endpoint = &view.connector.endpoint;
+    let token = match credential {
+        Some(credential) => {
+            let key = context
+                .net_handle
+                .as_ref()
+                .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?
+                .credential_encryption_key();
+            Some(credential.open(&key, auth.user_id, group_id, connector_id, endpoint)?)
+        }
+        None if view.has_secret_config => connector_token(context, connector_id).await?,
+        None => None,
+    };
+    Ok((view, token))
+}
+
+async fn connector_token(
+    context: &DriverContext,
+    connector_id: Ulid,
+) -> Result<Option<String>, TransferError> {
+    let event = context
+        .storage_handle
+        .send_effect(read_secret_effect(connector_id, None))
+        .await;
+    let secret = parse_secret_read(event)
+        .map_err(|_| TransferError::Retryable("repository connector storage unavailable".into()))?;
+    Ok(secret.and_then(|secret| secret.secret_config.get(CONNECTOR_TOKEN).cloned()))
 }
 
 /// Reads the group's repository connector.
