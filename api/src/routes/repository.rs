@@ -71,7 +71,7 @@ Page starts at 1; size is 1 to 25 and query text is at most 4096 bytes. Reposito
 
 **Errors**
 
-Invalid queries return 400; denied access returns 403; repository availability failures return 503."#,
+Invalid queries return 400, with code not_supported for a repository kind without search. Denied access returns 403, an unknown connector 404 and repository availability failures 503."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the repository connector"),
         ("connector_id" = String, Path, description = "Repository connector of the group"),
@@ -85,6 +85,7 @@ Invalid queries return 400; denied access returns 403; repository availability f
         (status = 400, description = "Invalid query or repository response", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Connector access denied", body = ErrorResponse),
+        (status = 404, description = "Connector not found", body = ErrorResponse),
         (status = 503, description = "Repository unavailable", body = ErrorResponse)
     ), security(("bearer_auth" = []))
 )]
@@ -111,19 +112,16 @@ pub async fn search_records(
         aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
-    let context = state.get_ctx();
-    async {
-        use aruna_operations::jobs::repository::{connector_kind, search};
-        let kind = connector_kind(&context, query.group_id, query.connector_id).await?;
-        search(
-            kind,
-            &context,
-            &auth,
-            &query,
-            state.rocrate_limits().metadata_bytes,
-        )
-        .await
-    }
+    let kind =
+        super::repository_links::connector_kind(&state, query.group_id, query.connector_id).await?;
+    super::repository_links::ensure_capable(kind, "search", |can| can.search)?;
+    aruna_operations::jobs::repository::search(
+        kind,
+        &state.get_ctx(),
+        &auth,
+        &query,
+        state.rocrate_limits().metadata_bytes,
+    )
     .await
     .map(Json)
     .map_err(|error| match error {
@@ -241,7 +239,7 @@ Crate limits apply. Hidden edits and inaccessible or deleted versions cannot be 
 
 **Errors**
 
-None or several of record_id, doi and url, a DOI no published record has, a URL on another origin, or auto_update without keep_updated return 400. The returned job exposes progress, cancellation and failure details. Copy imports fail on missing data or checksum mismatches."#,
+None or several of record_id, doi and url, a doi or url on a repository kind without search (code not_supported), a DOI no published record has, a URL on another origin, or auto_update without keep_updated return 400. The returned job exposes progress, cancellation and failure details. Copy imports fail on missing data or checksum mismatches."#,
     request_body(content = RepositoryImportRequest, example = json!({
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
         "doi": "10.5281/zenodo.1234567", "target": {"bucket": "research", "prefix": "zenodo/1234567"},
@@ -297,8 +295,14 @@ pub async fn import_record(
             )
             .await?;
             let context = state.get_ctx();
+            let kind = connector_kind(&context, group_id, connector_id)
+                .await
+                .map_err(|error| match error {
+                    TransferError::Permanent(message) => ServerError::BadRequestReason(message),
+                    _ => ServerError::ServiceUnavailableReason("repository unavailable".into()),
+                })?;
+            super::repository_links::ensure_capable(kind, "record lookup", |can| can.search)?;
             async {
-                let kind = connector_kind(&context, group_id, connector_id).await?;
                 resolve(
                     kind,
                     &context,
@@ -363,7 +367,9 @@ Every referenced file must be readable; web data entities become references inst
 
 **Errors**
 
-A crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; repository.metadata does not satisfy them. Incomplete files, conflicting revisions or rejected metadata fail the job. An ambiguous creation outcome requires inspecting the repository and supplying draft_id. Cancellation retains remote drafts."#,
+A repository kind that cannot publish returns 400 with code not_supported. A crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; repository.metadata does not satisfy them.
+
+Incomplete files, conflicting revisions or rejected metadata fail the job. An ambiguous creation outcome requires inspecting the repository and supplying draft_id. Cancellation retains remote drafts."#,
     params(("document_id" = String, Path, description = "Aruna metadata document identifier")),
     request_body(content = SubmitRepositoryExport, example = json!({"repository": {
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
@@ -377,10 +383,10 @@ A crate that does not meet the repository's requirement Profile or mapping rules
             "report_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/report",
             "artifact_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX/artifacts/rocrate"
         })),
-        (status = 400, description = "Missing personal repository token, invalid metadata or draft identifier, or unmet repository requirements (code requirements_unmet with findings)", body = ErrorResponse),
+        (status = 400, description = "Missing personal repository token, invalid metadata or draft identifier, a repository kind that cannot publish (code not_supported), or unmet repository requirements (code requirements_unmet with findings)", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Crate or connector access denied", body = ErrorResponse),
-        (status = 404, description = "Crate not found", body = ErrorResponse),
+        (status = 404, description = "Crate or connector not found", body = ErrorResponse),
         (status = 409, description = "Job conflict or quota refusal", body = ErrorResponse),
         (status = 503, description = "Transfer placement unavailable", body = ErrorResponse)
     ), security(("bearer_auth" = []))

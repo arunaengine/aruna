@@ -67,6 +67,9 @@ pub enum ServerError {
     /// The dataset crate does not meet the repository's requirements; the body lists findings.
     #[error("the dataset does not meet the repository's requirements")]
     RequirementsUnmet(Vec<ProfileValidationFinding>),
+    /// The connector's repository kind cannot do the requested action.
+    #[error("{0}")]
+    NotSupported(String),
     #[error("Metadata Profile validation failed")]
     MetadataProfileValidation(Vec<ProfileValidationFinding>),
     #[error("Bad gateway")]
@@ -395,7 +398,8 @@ impl ServerError {
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_)
             | ServerError::MetadataValidation(_)
-            | ServerError::RequirementsUnmet(_) => StatusCode::BAD_REQUEST,
+            | ServerError::RequirementsUnmet(_)
+            | ServerError::NotSupported(_) => StatusCode::BAD_REQUEST,
             ServerError::MetadataProfileValidation(findings) => {
                 if profile_validation_unavailable(findings) {
                     StatusCode::SERVICE_UNAVAILABLE
@@ -432,6 +436,7 @@ impl ServerError {
             | ServerError::BadRequestMessage(_) => "Bad request".to_string(),
             ServerError::MetadataValidation(_) => "Validation failed".to_string(),
             ServerError::RequirementsUnmet(_) => "requirements_unmet".to_string(),
+            ServerError::NotSupported(_) => "not_supported".to_string(),
             ServerError::MetadataProfileValidation(findings) => findings.first().map_or_else(
                 || "profile_validation_failed".to_string(),
                 |finding| finding.code.clone(),

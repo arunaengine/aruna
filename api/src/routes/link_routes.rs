@@ -18,8 +18,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::repository_links::{
     LinkJobResponse, PatchLinkRequest, RepositoryLinkResponse, RotateTokenRequest, change,
-    job_response, link_error, link_example, managed, metadata_json, parse_ulid, readable,
-    seal_error, view,
+    ensure_capable, job_response, link_error, link_example, managed, metadata_json, parse_ulid,
+    readable, seal_error, view,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -295,6 +295,7 @@ A link without an open draft, a running push, a creator at the active job limit 
             "status_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX"
         })),
         (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 400, description = "The repository kind cannot publish drafts (code not_supported)", body = ErrorResponse),
         (status = 403, description = "Not the link creator", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse),
         (status = 409, description = "No open draft, a push is running, job limit reached, or the link is managed on its owner node", body = ErrorResponse),
@@ -309,6 +310,7 @@ pub async fn publish_link(
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_creator(&auth, &link)?;
     ensure_push(&link)?;
+    ensure_capable(link.kind, "publishing drafts", |can| can.drafts)?;
     let link = refresh_review(state.get_ctx().as_ref(), &link)
         .await
         .map_err(link_error)?;
@@ -412,6 +414,7 @@ A running push returns 409. A rejected token returns 409 with reason token_rejec
     ),
     responses(
         (status = 200, description = "The link with its new base", body = RepositoryLinkResponse, example = json!(link_example())),
+        (status = 400, description = "The repository kind has no drafts to accept (code not_supported)", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse),
@@ -427,6 +430,7 @@ pub async fn accept_remote(
 ) -> ServerResult<Json<RepositoryLinkResponse>> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_push(&link)?;
+    ensure_capable(link.kind, "accepting remote changes", |can| can.drafts)?;
     if link.active_job.is_some() {
         return Err(ServerError::Conflict(
             "a push of this link is running; accept after it finished".into(),
@@ -470,6 +474,7 @@ A paused or push link, a dataset that already holds the latest version, a refuse
             "job_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
             "status_url": "https://node.example/api/v1/compute/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAX"
         })),
+        (status = 400, description = "The repository kind has no pull links (code not_supported)", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse),
@@ -488,6 +493,7 @@ pub async fn pull_link(
             "this link pushes to the repository; use the push route".into(),
         ));
     }
+    ensure_capable(link.kind, "pull links", |can| can.pull)?;
     if link.status == LinkStatus::Paused {
         return Err(ServerError::Conflict(
             "resume the link before pulling".into(),

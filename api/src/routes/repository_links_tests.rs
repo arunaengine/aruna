@@ -426,6 +426,64 @@ async fn requirements_refuse_links() {
 }
 
 #[tokio::test]
+async fn unsupported_kinds_refused() {
+    let linked = setup().await;
+    let oai = drive(
+        CreateConnectorOperation::new(CreateConnectorInput {
+            group_id: linked.test.group_id,
+            created_by: linked.test.auth.user_id,
+            name: "harvest".into(),
+            kind: RepositoryConnectorKind::OaiPmh,
+            endpoint: "https://oai.example.org/oai".into(),
+            public_config: HashMap::new(),
+            secret_config: HashMap::new(),
+        }),
+        linked.test.state.get_ctx().as_ref(),
+    )
+    .await
+    .unwrap()
+    .connector
+    .connector_id;
+    let link = |connector_id: Ulid| {
+        let request = CreateLinkRequest {
+            connector_id: connector_id.to_string(),
+            ..request(&linked)
+        };
+        create_link(
+            State(linked.test.state.clone()),
+            Extension(Some(linked.test.auth.clone())),
+            Path(linked.document_id.clone()),
+            Json(request),
+        )
+    };
+    let Err(refused) = Box::pin(link(oai)).await else {
+        panic!("an OAI-PMH connector took a link");
+    };
+    assert_eq!(refused.status_code(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        refused.response_body().code.as_deref(),
+        Some("not_supported")
+    );
+    assert!(matches!(
+        Box::pin(link(Ulid::generate())).await,
+        Err(ServerError::NotFound)
+    ));
+    let search = crate::routes::repository::search_records(
+        State(linked.test.state.clone()),
+        Extension(Some(linked.test.auth.clone())),
+        Path((linked.test.group_id.to_string(), oai.to_string())),
+        axum::extract::Query(crate::routes::repository::RepositorySearch {
+            q: String::new(),
+            page: 1,
+            size: 25,
+            all_versions: false,
+        }),
+    )
+    .await;
+    assert!(matches!(search, Err(ServerError::NotSupported(_))));
+}
+
+#[tokio::test]
 async fn publisher_needed_off_zenodo() {
     // Zenodo sets the publisher itself; another InvenioRDM needs it in the crate.
     let root = serde_json::json!({"@id": "./", "@type": "Dataset", "name": "No publisher",

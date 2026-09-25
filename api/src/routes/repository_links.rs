@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aruna_core::repository::invenio::validate_id;
-use aruna_core::repository::{LinkFailure, LinkRemote, LinkStatus, RepositoryLink};
+use aruna_core::repository::{
+    Capabilities, LinkFailure, LinkRemote, LinkStatus, RepositoryLink, capabilities,
+};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
@@ -293,6 +295,39 @@ pub(super) fn link_error(error: LinkError) -> ServerError {
     }
 }
 
+/// Answers 400 with code not_supported unless the repository kind can do `action`.
+pub(crate) fn ensure_capable(
+    kind: RepositoryConnectorKind,
+    action: &str,
+    can: impl Fn(Capabilities) -> bool,
+) -> ServerResult<()> {
+    if capabilities(kind).is_some_and(can) {
+        return Ok(());
+    }
+    Err(ServerError::NotSupported(format!(
+        "this repository kind does not support {action}"
+    )))
+}
+
+/// The kind of the group's repository connector; an unknown connector answers 404.
+pub(crate) async fn connector_kind(
+    state: &ServerState,
+    group_id: Ulid,
+    connector_id: Ulid,
+) -> ServerResult<RepositoryConnectorKind> {
+    let context = state.get_ctx();
+    Box::pin(drive(
+        GetRepositoryOperation::new(group_id, connector_id),
+        &context,
+    ))
+    .await
+    .map(|view| view.connector.kind)
+    .map_err(|error| match error {
+        ReadConnectorError::NotFound => ServerError::NotFound,
+        _ => ServerError::ServiceUnavailableReason("repository connector unavailable".into()),
+    })
+}
+
 /// Answers 400 with the findings when the dataset crate does not meet the repository's
 /// requirements. Metadata overrides never satisfy them.
 pub(crate) async fn ensure_requirements(
@@ -302,6 +337,8 @@ pub(crate) async fn ensure_requirements(
     group_id: Ulid,
     connector_id: Ulid,
 ) -> ServerResult<()> {
+    let kind = connector_kind(state, group_id, connector_id).await?;
+    ensure_capable(kind, "publishing", |can| can.drafts)?;
     let checked = Box::pin(check_requirements(
         &state.get_ctx(),
         auth,
@@ -471,9 +508,9 @@ The node that creates a link owns it and must hold the dataset. Only that node c
 
 **Errors**
 
-Invalid input returns 400. A dataset crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; metadata overrides do not satisfy them. Denied access returns 403.
+Invalid input returns 400, with code not_supported for a repository kind that cannot publish. A dataset crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; metadata overrides do not satisfy them. Denied access returns 403.
 
-An unknown dataset, or a connector that does not exist in the group or is no Invenio connector, returns 404. A node that does not hold the dataset returns 409, as does an enabled pull link of the dataset that follows the same record lineage (parent_id) or an existing link with the same id."#,
+An unknown dataset, or a connector that does not exist in the group, returns 404. A node that does not hold the dataset returns 409, as does an enabled pull link of the dataset that follows the same record lineage (parent_id) or an existing link with the same id."#,
     params(("document_id" = String, Path, description = "Metadata document identifier")),
     request_body(content = CreateLinkRequest, example = json!({
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
@@ -481,10 +518,10 @@ An unknown dataset, or a connector that does not exist in the group or is no Inv
     })),
     responses(
         (status = 201, description = "Link created and first push queued", body = RepositoryLinkResponse, example = json!(link_example())),
-        (status = 400, description = "Invalid token, metadata or identifier, or unmet repository requirements", body = ErrorResponse, example = json!({"error": "the dataset does not meet the repository's requirements", "code": "requirements_unmet", "findings": [{"code": "constraint_violation", "severity": "violation", "focus_node": "./", "path": "(<http://schema.org/author> | <http://schema.org/creator>)", "rule": "http://www.w3.org/ns/shacl#minCount", "message": "The dataset needs creators; each person needs a name or family name and each organization a name.", "profile_revision": "builtin", "completeness": "complete"}]})),
+        (status = 400, description = "Invalid token, metadata or identifier, a repository kind that cannot publish (code not_supported), or unmet repository requirements", body = ErrorResponse, example = json!({"error": "the dataset does not meet the repository's requirements", "code": "requirements_unmet", "findings": [{"code": "constraint_violation", "severity": "violation", "focus_node": "./", "path": "(<http://schema.org/author> | <http://schema.org/creator>)", "rule": "http://www.w3.org/ns/shacl#minCount", "message": "The dataset needs creators; each person needs a name or family name and each organization a name.", "profile_revision": "builtin", "completeness": "complete"}]})),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Dataset or connector access denied", body = ErrorResponse),
-        (status = 404, description = "Dataset or Invenio connector not found", body = ErrorResponse),
+        (status = 404, description = "Dataset or repository connector not found", body = ErrorResponse),
         (status = 409, description = "This node does not hold the dataset, or an enabled pull link follows the same record lineage", body = ErrorResponse),
         (status = 503, description = "Node credential key unavailable", body = ErrorResponse)
     ), security(("bearer_auth" = []))
@@ -508,19 +545,8 @@ pub async fn create_link(
         Permission::WRITE,
     ))
     .await?;
-    let context = state.get_ctx();
-    let connector = Box::pin(drive(
-        GetRepositoryOperation::new(group_id, connector_id),
-        &context,
-    ))
-    .await
-    .map_err(|error| match error {
-        ReadConnectorError::NotFound => ServerError::NotFound,
-        _ => ServerError::ServiceUnavailableReason("repository connector unavailable".into()),
-    })?;
-    if connector.connector.kind != RepositoryConnectorKind::Invenio {
-        return Err(ServerError::NotFound);
-    }
+    let kind = connector_kind(&state, group_id, connector_id).await?;
+    ensure_capable(kind, "links", |can| can.drafts)?;
     if let Some(parent) = &request.parent_id {
         validate_id(parent).map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     }
@@ -591,7 +617,7 @@ pub async fn create_link(
         generation: 0,
         warning: None,
         direction: aruna_core::repository::LinkDirection::Push,
-        kind: connector.connector.kind,
+        kind,
     };
     let change = LinkChange::Create {
         link: Box::new(link.clone()),
