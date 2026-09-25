@@ -4,13 +4,13 @@
 
 use super::map_error;
 use crate::auth::require_realm_auth;
-use crate::error::{ServerError, ServerResult};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_blob::git::GitStore;
 use aruna_core::git::{CommitInfo, FileChange, FileChangeKind};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::git::changes::EntityChangeKind;
-use aruna_operations::git::versions::{self, Comparison, Named, Version};
+use aruna_operations::git::versions::{self, Comparison, Named, Version, VersionQuery};
 use aruna_operations::git::{GitError, PropertyConflict};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 #[schema(example = json!({"name":"Ada Lovelace","email":"ada@example.org","user_id":null}))]
 pub struct Author {
     pub name: String,
@@ -31,7 +31,7 @@ pub struct Author {
     pub user_id: Option<String>,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 #[schema(example = json!({"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Aruna","email":"git@aruna.local","user_id":"01M000000000000000000000003"},"message":"Rename the investigation","signed":true,"metadata_event_id":null,"branches":["draft/new-assay"],"tags":[]}))]
 pub struct VersionView {
     /// The Git commit ID.
@@ -82,18 +82,21 @@ pub struct PropertyChangeView {
 }
 
 #[derive(Serialize, ToSchema)]
-#[schema(example = json!({"id":"./","change":"changed","properties":[{"name":"name","before":["Old title"],"after":["New title"]}]}))]
+#[schema(example = json!({"id":"./","label":"ARC example","change":"changed","properties":[{"name":"name","before":["Old title"],"after":["New title"]}]}))]
 pub struct EntityChangeView {
     pub id: String,
+    /// The entity's name after the change, or before it when removed.
+    pub label: Option<String>,
     /// `added`, `removed` or `changed`.
     pub change: String,
     pub properties: Vec<PropertyChangeView>,
 }
 
 #[derive(Serialize, ToSchema)]
-#[schema(example = json!({"from":"c71a9e5512345678901234567890123456789abc","to":"9f3c2a7112345678901234567890123456789abc","entities":[{"id":"./","change":"changed","properties":[{"name":"name","before":["Old title"],"after":["New title"]}]}],"files":[{"path":"isa.investigation.xlsx","change":"modified"}]}))]
+#[schema(example = json!({"from":"c71a9e5512345678901234567890123456789abc","to":"9f3c2a7112345678901234567890123456789abc","entities":[{"id":"./","label":"ARC example","change":"changed","properties":[{"name":"name","before":["Old title"],"after":["New title"]}]}],"files":[{"path":"isa.investigation.xlsx","change":"modified"}]}))]
 pub struct ComparisonView {
-    pub from: String,
+    /// `null` when compared against an empty ARC.
+    pub from: Option<String>,
     pub to: String,
     /// `null` when either side has no readable ISA metadata.
     pub entities: Option<Vec<EntityChangeView>>,
@@ -108,16 +111,18 @@ pub struct NamedView {
 }
 
 #[derive(Serialize, ToSchema)]
-#[schema(example = json!({"name":"main","version":"9f3c2a7112345678901234567890123456789abc","protected":true}))]
+#[schema(example = json!({"name":"main","version":"9f3c2a7112345678901234567890123456789abc","protected":true,"head":{"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Aruna","email":"git@aruna.local","user_id":"01M000000000000000000000003"},"message":"Merge draft into main","signed":true,"metadata_event_id":null,"branches":["main"],"tags":[]}}))]
 pub struct BranchView {
     pub name: String,
     pub version: String,
     /// `main` holds the live metadata and `aruna` the graph snapshots.
     pub protected: bool,
+    /// The version the branch points to.
+    pub head: VersionView,
 }
 
 #[derive(Serialize, ToSchema)]
-#[schema(example = json!({"branches":[{"name":"main","version":"9f3c2a7112345678901234567890123456789abc","protected":true},{"name":"draft/new-assay","version":"c71a9e5512345678901234567890123456789abc","protected":false}]}))]
+#[schema(example = json!({"branches":[{"name":"main","version":"9f3c2a7112345678901234567890123456789abc","protected":true,"head":{"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Aruna","email":"git@aruna.local","user_id":"01M000000000000000000000003"},"message":"Merge draft into main","signed":true,"metadata_event_id":null,"branches":["main"],"tags":[]}}]}))]
 pub struct BranchList {
     pub branches: Vec<BranchView>,
 }
@@ -129,15 +134,18 @@ pub struct TagList {
 }
 
 #[derive(Serialize, ToSchema)]
-#[schema(example = json!({"id":"01M000000000000000000000004","branch":"main","version":"9f3c2a7112345678901234567890123456789abc"}))]
+#[schema(example = json!({"id":"01M000000000000000000000004","branch":"main","tag":null,"version":{"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Ada Lovelace","email":"ada@example.org","user_id":null},"message":"Fix affiliation","signed":true,"metadata_event_id":null,"branches":[],"tags":[]}}))]
 pub struct ConflictView {
     pub id: String,
-    pub branch: String,
-    pub version: String,
+    /// The branch the update was meant for; `null` for a tag.
+    pub branch: Option<String>,
+    /// The tag the update was meant for; tag conflicts can only be discarded.
+    pub tag: Option<String>,
+    pub version: VersionView,
 }
 
 #[derive(Serialize, ToSchema)]
-#[schema(example = json!({"conflicts":[{"id":"01M000000000000000000000004","branch":"main","version":"9f3c2a7112345678901234567890123456789abc"}]}))]
+#[schema(example = json!({"conflicts":[{"id":"01M000000000000000000000004","branch":"main","tag":null,"version":{"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Ada Lovelace","email":"ada@example.org","user_id":null},"message":"Fix affiliation","signed":true,"metadata_event_id":null,"branches":[],"tags":[]}}]}))]
 pub struct ConflictList {
     pub conflicts: Vec<ConflictView>,
 }
@@ -171,6 +179,8 @@ pub struct MergeConflictView {
 pub struct ListQuery {
     /// Branch to list, default `main`.
     pub branch: Option<String>,
+    /// Branch, tag or version whose versions are left out, e.g. `main` for a draft's own.
+    pub since: Option<String>,
     /// Page size, 1 to 200, default 50.
     pub limit: Option<usize>,
     /// `next_cursor` of the previous page.
@@ -179,8 +189,8 @@ pub struct ListQuery {
 
 #[derive(Deserialize, IntoParams)]
 pub struct CompareQuery {
-    /// Branch, tag or version.
-    pub from: String,
+    /// Branch, tag or version; without it everything in `to` counts as added.
+    pub from: Option<String>,
     /// Branch, tag or version.
     pub to: String,
 }
@@ -197,21 +207,35 @@ pub(super) fn expected(headers: &HeaderMap) -> Option<String> {
         .map(|value| value.trim().trim_matches('"').to_string())
 }
 
+/// Maps an error to its status and a stable `code` clients can branch on.
 pub(super) fn failure(error: GitError) -> Response {
-    match error {
-        GitError::Stale => ServerError::PreconditionFailed(error.to_string()).into_response(),
-        GitError::Exists => ServerError::Conflict(error.to_string()).into_response(),
-        GitError::Refused(reason) => ServerError::BadRequestMessage(reason).into_response(),
-        GitError::MergeConflict(conflict) => (
-            StatusCode::CONFLICT,
-            Json(MergeConflictView {
+    let message = error.to_string();
+    let (status, code) = match error {
+        GitError::MergeConflict(conflict) => {
+            let body = MergeConflictView {
                 files: conflict.files,
                 properties: conflict.properties.into_iter().map(conflict_view).collect(),
-            }),
-        )
-            .into_response(),
-        other => map_error(other).into_response(),
-    }
+            };
+            return (StatusCode::CONFLICT, Json(body)).into_response();
+        }
+        GitError::Authorization(error) => {
+            return map_error(GitError::Authorization(error)).into_response();
+        }
+        GitError::NotHolder => (StatusCode::NOT_FOUND, "not_holder"),
+        GitError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+        GitError::BranchMissing => (StatusCode::NOT_FOUND, "branch_missing"),
+        GitError::Stale => (StatusCode::PRECONDITION_FAILED, "stale"),
+        GitError::Exists => (StatusCode::CONFLICT, "exists"),
+        GitError::Locked(_) => (StatusCode::CONFLICT, "locked"),
+        GitError::Conflict => (StatusCode::CONFLICT, "conflict"),
+        GitError::Refused(_) => (StatusCode::BAD_REQUEST, "refused"),
+        GitError::Invalid => (StatusCode::BAD_REQUEST, "invalid"),
+        GitError::NotHook => (StatusCode::FORBIDDEN, "forbidden"),
+        GitError::Unavailable | GitError::Full => {
+            (StatusCode::SERVICE_UNAVAILABLE, "git_unavailable")
+        }
+    };
+    (status, Json(ErrorResponse::new(message).with_code(code))).into_response()
 }
 
 fn conflict_view(conflict: PropertyConflict) -> PropertyConflictView {
@@ -258,6 +282,7 @@ pub(super) fn version_view(version: Version) -> VersionView {
         authored_at_s,
         message,
         signed,
+        ..
     } = commit;
     // Aruna trailers are exposed as fields, not repeated in the message.
     let message = message
@@ -302,6 +327,7 @@ fn comparison_view(comparison: Comparison) -> ComparisonView {
                 .into_iter()
                 .map(|entity| EntityChangeView {
                     id: entity.id,
+                    label: entity.label,
                     change: match entity.change {
                         EntityChangeKind::Added => "added",
                         EntityChangeKind::Removed => "removed",
@@ -342,16 +368,13 @@ pub async fn list(
     let auth = require_realm_auth(&state, auth)?;
     let branch = query.branch.unwrap_or_else(|| "main".into());
     let limit = query.limit.unwrap_or(50);
-    let result = versions::list(
-        &state.get_ctx(),
-        store(&state)?,
-        &auth,
-        id,
-        &branch,
-        query.cursor.as_deref(),
+    let query = VersionQuery {
+        branch: &branch,
+        since: query.since.as_deref(),
+        cursor: query.cursor.as_deref(),
         limit,
-    )
-    .await;
+    };
+    let result = versions::list(&state.get_ctx(), store(&state)?, &auth, id, query).await;
     Ok(match result {
         Ok((list, next_cursor)) => Json(VersionList {
             versions: list.into_iter().map(version_view).collect(),
@@ -442,7 +465,7 @@ pub async fn compare(
         store(&state)?,
         &auth,
         id,
-        &query.from,
+        query.from.as_deref(),
         &query.to,
     )
     .await;
@@ -470,10 +493,11 @@ pub async fn conflicts(
         Ok(conflicts) => Json(ConflictList {
             conflicts: conflicts
                 .into_iter()
-                .map(|conflict| ConflictView {
+                .map(|(conflict, version)| ConflictView {
                     id: conflict.id.to_string(),
                     branch: conflict.branch,
-                    version: conflict.version,
+                    tag: conflict.tag,
+                    version: version_view(version),
                 })
                 .collect(),
         })

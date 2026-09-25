@@ -23,6 +23,8 @@ use ulid::Ulid;
 /// Branches that only the server moves or that hold the live metadata.
 const PROTECTED: [&str; 2] = ["main", "aruna"];
 const MAX_VERSIONS: usize = 200;
+/// Only commits this node made and signed carry trustworthy Aruna trailers.
+const SERVICE_EMAIL: &str = "git@aruna.local";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
@@ -37,18 +39,30 @@ pub struct Version {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Comparison {
-    pub from: String,
+    /// `None` compares against an empty ARC.
+    pub from: Option<String>,
     pub to: String,
     /// `None` when either side has no readable ISA metadata.
     pub entities: Option<Vec<EntityChange>>,
     pub files: Vec<FileChange>,
 }
 
+/// A kept branch or tag update; exactly one of `branch` and `tag` is set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conflict {
     pub id: Ulid,
-    pub branch: String,
+    pub branch: Option<String>,
+    pub tag: Option<String>,
     pub version: String,
+}
+
+/// Which versions to list: those of `branch` not reachable from `since`, one page at a time.
+#[derive(Clone, Debug, Default)]
+pub struct VersionQuery<'a> {
+    pub branch: &'a str,
+    pub since: Option<&'a str>,
+    pub cursor: Option<&'a str>,
+    pub limit: usize,
 }
 
 /// The commit message of a write and the branch head the caller expects, if any.
@@ -101,13 +115,14 @@ pub(super) async fn log(
     store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-    revision: &str,
+    (revision, exclude): (&str, Option<&str>),
     skip: usize,
     limit: usize,
 ) -> Result<Vec<CommitInfo>, GitError> {
     let effect = GitEffect::Log {
         document_id: id,
         revision: revision.to_string(),
+        exclude: exclude.map(str::to_owned),
         skip,
         limit,
     };
@@ -219,10 +234,12 @@ pub(super) fn version(
         .filter(|tag| tag.version == commit.commit)
         .map(|tag| tag.name.clone())
         .collect();
+    // A client can write any trailer; only this node's signed commits are believed.
+    let trusted = commit.signed && commit.committer_email == SERVICE_EMAIL;
+    let trailer = |key| trusted.then(|| trailer(&commit.message, key)).flatten();
     Version {
-        user_id: trailer(&commit.message, "Aruna-User:"),
-        metadata_event_id: trailer(&commit.message, "Aruna-Revision:")
-            .and_then(|value| value.parse().ok()),
+        user_id: trailer("Aruna-User:"),
+        metadata_event_id: trailer("Aruna-Revision:").and_then(|value| value.parse().ok()),
         commit,
         branches,
         tags,
@@ -236,25 +253,35 @@ pub async fn list(
     store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-    branch: &str,
-    cursor: Option<&str>,
-    limit: usize,
+    query: VersionQuery<'_>,
 ) -> Result<(Vec<Version>, Option<String>), GitError> {
     let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
-    let (head, skip) = match cursor {
+    let (head, skip) = match query.cursor {
         Some(cursor) => {
             let (head, skip) = cursor.split_once('.').ok_or(GitError::Invalid)?;
             let skip = skip.parse::<usize>().map_err(|_| GitError::Invalid)?;
-            (resolve(store, auth, id, head).await?, skip)
+            let head = resolve(store, auth, id, head)
+                .await
+                .map_err(|_| GitError::Invalid)?;
+            (head, skip)
         }
         None => {
-            let name = branch_ref(branch)?;
-            let head = projection.state.refs.get(&name).ok_or(GitError::NotFound)?;
+            let name = branch_ref(query.branch)?;
+            let head = projection
+                .state
+                .refs
+                .get(&name)
+                .ok_or(GitError::BranchMissing)?;
             (head.clone(), 0)
         }
     };
-    let limit = limit.clamp(1, MAX_VERSIONS);
-    let mut commits = log(store, auth, id, &head, skip, limit + 1).await?;
+    let since = match query.since {
+        Some(since) => Some(resolve(store, auth, id, since).await?),
+        None => None,
+    };
+    let limit = query.limit.clamp(1, MAX_VERSIONS);
+    let range = (head.as_str(), since.as_deref());
+    let mut commits = log(store, auth, id, range, skip, limit + 1).await?;
     let next = (commits.len() > limit).then(|| format!("{head}.{}", skip + limit));
     commits.truncate(limit);
     let tags = peeled_tags(store, auth, id, &projection).await?;
@@ -275,7 +302,7 @@ pub async fn show(
 ) -> Result<(Version, Vec<FileChange>), GitError> {
     let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
     let commit = resolve(store, auth, id, revision).await?;
-    let info = log(store, auth, id, &commit, 0, 1)
+    let info = log(store, auth, id, (&commit, None), 0, 1)
         .await?
         .pop()
         .ok_or(GitError::NotFound)?;
@@ -296,17 +323,21 @@ pub async fn compare(
     store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-    from: &str,
+    from: Option<&str>,
     to: &str,
 ) -> Result<Comparison, GitError> {
     let (_, _, _guard) = open(context, store, auth, id, Permission::READ).await?;
-    let from = resolve(store, auth, id, from).await?;
+    let from = match from {
+        Some(from) => Some(resolve(store, auth, id, from).await?),
+        None => None,
+    };
     let to = resolve(store, auth, id, to).await?;
-    let files = diff(store, auth, id, Some(&from), &to).await?;
-    let entities = match (
-        rocrate(store, auth, id, &from).await,
-        rocrate(store, auth, id, &to).await,
-    ) {
+    let files = diff(store, auth, id, from.as_deref(), &to).await?;
+    let before = match &from {
+        Some(from) => rocrate(store, auth, id, from).await,
+        None => Some(serde_json::json!({ "@graph": [] })),
+    };
+    let entities = match (before, rocrate(store, auth, id, &to).await) {
         (Some(before), Some(after)) => Some(entity_changes(&before, &after)),
         _ => None,
     };
@@ -318,29 +349,37 @@ pub async fn compare(
     })
 }
 
-/// Branches (`refs/heads/`) or tags (`refs/tags/`) with the commits they name.
-pub async fn names(
+/// Every branch with its head version.
+pub async fn branches(
     context: &DriverContext,
     store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-    tags: bool,
+) -> Result<Vec<Version>, GitError> {
+    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let tags = peeled_tags(store, auth, id, &projection).await?;
+    let mut heads = Vec::new();
+    for (name, target) in &projection.state.refs {
+        if name.starts_with("refs/heads/") {
+            let info = log(store, auth, id, (target, None), 0, 1)
+                .await?
+                .pop()
+                .ok_or(GitError::Unavailable)?;
+            heads.push(version(info, &projection.state.refs, &tags));
+        }
+    }
+    Ok(heads)
+}
+
+/// Every tag with the commit it names.
+pub async fn tags(
+    context: &DriverContext,
+    store: &GitStore,
+    auth: &AuthContext,
+    id: Ulid,
 ) -> Result<Vec<Named>, GitError> {
     let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
-    if tags {
-        return peeled_tags(store, auth, id, &projection).await;
-    }
-    Ok(projection
-        .state
-        .refs
-        .iter()
-        .filter_map(|(name, target)| {
-            name.strip_prefix("refs/heads/").map(|name| Named {
-                name: name.to_string(),
-                version: target.clone(),
-            })
-        })
-        .collect())
+    peeled_tags(store, auth, id, &projection).await
 }
 
 pub fn protected(branch: &str) -> bool {
@@ -367,7 +406,14 @@ pub async fn change_ref(
     }
     let (document, projection, _guard) = open(context, store, auth, id, Permission::WRITE).await?;
     let current = projection.state.refs.get(&name);
-    expect(current, expected)?;
+    // A tag may be named by the commit it points to as well as by its own object.
+    let peeled = match (current, name.starts_with("refs/tags/"), expected) {
+        (Some(_), true, Some(_)) => Some(resolve(store, auth, id, &name).await?),
+        _ => None,
+    };
+    if peeled.is_none() || peeled.as_deref() != expected {
+        expect(current, expected)?;
+    }
     let new = match target {
         Some(_) if current.is_some() => return Err(GitError::Exists),
         Some(target) => resolve(store, auth, id, target).await?,
@@ -397,29 +443,43 @@ pub async fn change_ref(
 }
 
 pub(super) fn parse_conflict(name: &str, target: &str) -> Option<Conflict> {
-    let rest = name.strip_prefix("refs/conflicts/heads/")?;
-    let (branch, id) = rest.rsplit_once('/')?;
+    let rest = name.strip_prefix("refs/conflicts/")?;
+    let (kind, rest) = rest.split_once('/')?;
+    let (short, id) = rest.rsplit_once('/')?;
+    let (branch, tag) = match kind {
+        "heads" => (Some(short.to_string()), None),
+        "tags" => (None, Some(short.to_string())),
+        _ => return None,
+    };
     Some(Conflict {
         id: id.parse().ok()?,
-        branch: branch.to_string(),
+        branch,
+        tag,
         version: target.to_string(),
     })
 }
 
-/// Branch updates that lost a race between holders and were kept instead of dropped.
+/// Branch and tag updates that lost a race between holders, with the version each kept.
 pub async fn conflicts(
     context: &DriverContext,
     store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-) -> Result<Vec<Conflict>, GitError> {
+) -> Result<Vec<(Conflict, Version)>, GitError> {
     let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
-    Ok(projection
-        .state
-        .refs
-        .iter()
-        .filter_map(|(name, target)| parse_conflict(name, target))
-        .collect())
+    let tags = peeled_tags(store, auth, id, &projection).await?;
+    let mut kept = Vec::new();
+    for (name, target) in &projection.state.refs {
+        if let Some(conflict) = parse_conflict(name, target) {
+            let commit = resolve(store, auth, id, target).await?;
+            let info = log(store, auth, id, (&commit, None), 0, 1)
+                .await?
+                .pop()
+                .ok_or(GitError::Unavailable)?;
+            kept.push((conflict, version(info, &projection.state.refs, &tags)));
+        }
+    }
+    Ok(kept)
 }
 
 /// The full ref name of a kept conflict, for discarding it.
@@ -452,10 +512,14 @@ mod tests {
             parsed,
             Some(Conflict {
                 id,
-                branch: "draft/x".into(),
+                branch: Some("draft/x".into()),
+                tag: None,
                 version: "abc".into(),
             })
         );
+        let tag = parse_conflict(&format!("refs/conflicts/tags/v1/{id}"), "abc").expect("tag");
+        assert_eq!((tag.branch, tag.tag), (None, Some("v1".into())));
         assert_eq!(parse_conflict("refs/conflicts/tags/v1/x", "abc"), None);
+        assert_eq!(parse_conflict("refs/conflicts/notes/x/y", "abc"), None);
     }
 }

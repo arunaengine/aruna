@@ -430,6 +430,16 @@ pub async fn export(
     let document = document(context, auth, id, Permission::READ).await?;
     let _guard = lock(id).await;
     refresh(context, store, &document).await?;
+    let known = GitEffect::Resolve {
+        document_id: id,
+        revision: revision.clone(),
+    };
+    if !matches!(
+        execute(store, known, auth.user_id).await?,
+        GitEvent::Resolved(Some(_))
+    ) {
+        return Err(GitError::NotFound);
+    }
     let effect = GitEffect::Export {
         document_id: id,
         revision,

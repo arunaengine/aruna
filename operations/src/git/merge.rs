@@ -100,7 +100,7 @@ pub async fn edit(
         };
         record(context, auth, &document, vec![update], bytes, lfs).await?;
     }
-    let info = log(store, auth, id, &new, 0, 1)
+    let info = log(store, auth, id, (&new, None), 0, 1)
         .await?
         .pop()
         .ok_or(GitError::Unavailable)?;
@@ -292,8 +292,8 @@ pub async fn resolve_conflict(
     context: &DriverContext,
     store: &GitStore,
     auth: &AuthContext,
-    id: Ulid,
-    conflict: Ulid,
+    (id, conflict): (Ulid, Ulid),
+    expected: Option<&str>,
 ) -> Result<Merged, GitError> {
     let (document, projection, _guard) = open(context, store, auth, id, Permission::WRITE).await?;
     let (name, kept) = projection
@@ -306,22 +306,24 @@ pub async fn resolve_conflict(
                 .map(|parsed| (name.clone(), parsed))
         })
         .ok_or(GitError::NotFound)?;
+    let Some(branch) = kept.branch else {
+        return Err(GitError::Refused(
+            "a kept tag can only be discarded; tags never move".into(),
+        ));
+    };
     let discard = RefUpdate {
         name,
         old: kept.version.clone(),
         new: ZERO_OID.into(),
     };
     let options = WriteOptions {
-        message: Some(format!(
-            "Merge kept conflict {conflict} into {}",
-            kept.branch
-        )),
-        expected: None,
+        message: Some(format!("Merge kept conflict {conflict} into {branch}")),
+        expected,
     };
     merge_into(
         (context, store, auth, &document, &projection),
         &kept.version,
-        &kept.branch,
+        &branch,
         options,
         vec![discard],
     )

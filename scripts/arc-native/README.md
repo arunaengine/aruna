@@ -83,22 +83,24 @@ snapshots, and other branches are drafts. Branch and tag names in paths are URL-
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /versions?branch=&limit=&cursor=` | Versions of a branch, newest first |
+| `GET /versions?branch=&since=&limit=&cursor=` | Versions of a branch, newest first; `since=main` leaves out main's versions |
 | `GET /versions/{version}` | One version and the files it changed |
 | `GET /versions/{version}/rocrate` | The ISA-derived RO-Crate of a version |
-| `GET /compare?from=&to=` | Changed entities, properties and files between two versions |
-| `GET`, `POST /branches`; `DELETE /branches/{name}` | List, create and delete branches |
+| `GET /compare?from=&to=` | Changed entities, properties and files between two versions; without `from`, everything counts as added |
+| `GET`, `POST /branches`; `DELETE /branches/{name}` | List branches with their head version, create and delete them |
 | `PUT /branches/{name}/rocrate` | Save new metadata on a draft branch as a new version |
 | `POST /branches/{name}/merge` | Merge into another branch; merging into `main` updates the live metadata |
 | `GET`, `POST /tags`; `DELETE /tags/{name}` | List, create and delete tags |
-| `GET /conflicts`; `POST /conflicts/{id}/merge`; `DELETE /conflicts/{id}` | Review, merge or discard kept conflicts |
+| `GET /conflicts`; `POST /conflicts/{id}/merge`; `DELETE /conflicts/{id}` | Review, merge or discard kept conflicts; a kept tag can only be discarded |
 
-Writes accept `If-Match` with the branch head the client last saw and answer 412 when the
-branch moved. A merge answers 409 when both sides changed the same metadata property to
+Writes accept `If-Match` with the branch head (or tag version) the client last saw and answer
+412 when it moved. Errors carry a `code`: `not_holder`, `not_found`, `branch_missing`, `stale`,
+`exists`, `locked`, `refused` or `git_unavailable`. A merge answers 409 when both sides changed the same metadata property to
 different values, or the same non-metadata file. Nothing changes then. Edit the draft to the
 wanted values and merge again. Workbook and RO-Crate file conflicts are resolved by merging
 the metadata and generating those files again. Server-made versions name the Aruna user in
-an `Aruna-User` commit trailer, shown as `author.user_id`.
+an `Aruna-User` commit trailer, shown as `author.user_id`. Only commits this node made and
+signed are trusted for it.
 
 ## Metadata representation
 

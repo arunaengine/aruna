@@ -23,6 +23,8 @@ pub struct PropertyChange {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntityChange {
     pub id: String,
+    /// The entity's `name` after the change, or before it when the entity was removed.
+    pub label: Option<String>,
     pub change: EntityChangeKind,
     pub properties: Vec<PropertyChange>,
 }
@@ -89,8 +91,14 @@ pub fn entity_changes(before: &Value, after: &Value) -> Vec<EntityChange> {
                     })
                 })
                 .collect();
+            let named = if new.is_empty() { old } else { new };
+            let label = named
+                .get("name")
+                .and_then(|values| values.iter().find_map(Value::as_str))
+                .map(str::to_owned);
             (!properties.is_empty()).then(|| EntityChange {
                 id: id.clone(),
+                label,
                 change,
                 properties,
             })
@@ -162,6 +170,14 @@ mod tests {
             ]
         );
         assert_eq!(changes[0].properties[0].name, "affiliation");
+        assert_eq!(changes[0].label, None);
+        let named = crate_with(json!([{"@id": "x", "name": "Old"}]));
+        assert_eq!(
+            entity_changes(&named, &crate_with(json!([])))[0]
+                .label
+                .as_deref(),
+            Some("Old")
+        );
         assert_eq!(changes[0].properties[0].before, vec![json!("Old")]);
         assert_eq!(changes[0].properties[0].after, vec![json!("New")]);
     }

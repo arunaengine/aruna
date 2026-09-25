@@ -59,6 +59,8 @@ pub enum GitError {
     MergeConflict(Box<MergeConflict>),
     #[error("only a push's own receive hook may record it")]
     NotHook,
+    #[error("the branch does not exist")]
+    BranchMissing,
 }
 
 /// Why a merge could not be completed; nothing was changed.

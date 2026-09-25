@@ -101,6 +101,7 @@ fn map_error(error: GitError) -> ServerError {
         GitError::Exists | GitError::MergeConflict(_) => ServerError::Conflict(error.to_string()),
         GitError::Refused(reason) => ServerError::BadRequestMessage(reason),
         GitError::NotHook => ServerError::Forbidden,
+        GitError::BranchMissing => ServerError::NotFound,
     }
 }
 

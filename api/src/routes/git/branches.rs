@@ -63,7 +63,7 @@ fn merge_view(merged: Merged) -> MergeView {
 
 #[utoipa::path(get, path = "/metadata/{document_id}/branches", tag = "metadata/versions",
     security(("bearer_auth" = [])), summary = "List dataset branches",
-    description = "Lists every branch and the version it points to.\n\n**Authentication**: realm bearer token with READ on the metadata document.",
+    description = "Lists every branch with the version it points to.\n\n**Authentication**: realm bearer token with READ on the metadata document.",
     params(("document_id" = String, Path, description = "Metadata document ID")),
     responses((status = 200, description = "Branches", body = BranchList),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
@@ -74,15 +74,21 @@ pub async fn branches(
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
     let auth = require_realm_auth(&state, auth)?;
-    let result = versions::names(&state.get_ctx(), store(&state)?, &auth, id, false).await;
+    let result = versions::branches(&state.get_ctx(), store(&state)?, &auth, id).await;
     Ok(match result {
-        Ok(names) => Json(BranchList {
-            branches: names
+        Ok(heads) => Json(BranchList {
+            branches: heads
                 .into_iter()
-                .map(|named| BranchView {
-                    protected: versions::protected(&named.name),
-                    name: named.name,
-                    version: named.version,
+                .flat_map(|head| {
+                    let version = head.commit.commit.clone();
+                    let names = head.branches.clone();
+                    let head = version_view(head);
+                    names.into_iter().map(move |name| BranchView {
+                        protected: versions::protected(&name),
+                        name,
+                        version: version.clone(),
+                        head: head.clone(),
+                    })
                 })
                 .collect(),
         })
@@ -273,7 +279,7 @@ pub async fn tags(
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
     let auth = require_realm_auth(&state, auth)?;
-    let result = versions::names(&state.get_ctx(), store(&state)?, &auth, id, true).await;
+    let result = versions::tags(&state.get_ctx(), store(&state)?, &auth, id).await;
     Ok(match result {
         Ok(names) => Json(TagList {
             tags: names.into_iter().map(named_view).collect(),
@@ -317,14 +323,17 @@ pub async fn create_tag(
     security(("bearer_auth" = [])), summary = "Delete a tag",
     description = "Deletes a tag; the version it named stays.\n\n**Authentication**: realm bearer token with WRITE on the metadata document.",
     params(("document_id" = String, Path, description = "Metadata document ID"),
-           ("name" = String, Path, description = "URL-encoded tag name")),
+           ("name" = String, Path, description = "URL-encoded tag name"),
+           ("If-Match" = Option<String>, Header, description = "Expected version of the tag")),
     responses((status = 204, description = "Tag deleted"),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
-              (status = 404, description = "Tag missing")))]
+              (status = 404, description = "Tag missing"),
+              (status = 412, description = "The tag names another version")))]
 pub async fn delete_tag(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((id, name)): Path<(Ulid, String)>,
+    headers: HeaderMap,
 ) -> ServerResult<Response> {
     let auth = require_realm_auth(&state, auth)?;
     let result = versions::change_ref(
@@ -334,7 +343,7 @@ pub async fn delete_tag(
         id,
         format!("refs/tags/{name}"),
         None,
-        None,
+        expected(&headers).as_deref(),
     )
     .await;
     Ok(deleted(result))
@@ -342,21 +351,33 @@ pub async fn delete_tag(
 
 #[utoipa::path(post, path = "/metadata/{document_id}/conflicts/{id}/merge", tag = "metadata/versions",
     security(("bearer_auth" = [])), summary = "Merge a kept conflict",
-    description = "Merges a kept conflict into the branch it lost to and removes it.\n\n**Authentication**: realm bearer token with WRITE on the metadata document.\n\n**Behavior**: works like a branch merge, including 409 for conflicting properties or files.",
+    description = "Merges a kept conflict into the branch it lost to and removes it.\n\n**Authentication**: realm bearer token with WRITE on the metadata document.\n\n**Behavior**: works like a branch merge, including 409 for conflicting properties or files. A kept tag can only be discarded (400). `If-Match` names the expected head of the branch.",
     params(("document_id" = String, Path, description = "Metadata document ID"),
-           ("id" = String, Path, description = "Conflict ID")),
+           ("id" = String, Path, description = "Conflict ID"),
+           ("If-Match" = Option<String>, Header, description = "Expected head version of the branch")),
     responses((status = 200, description = "Merged", body = MergeView),
+              (status = 400, description = "A kept tag, or merged metadata that cannot become an ARC"),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
               (status = 404, description = "Conflict missing"),
-              (status = 409, description = "Conflicting properties or files", body = MergeConflictView)))]
+              (status = 409, description = "Conflicting properties or files", body = MergeConflictView),
+              (status = 412, description = "The branch moved")))]
 pub async fn merge_conflict(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((id, conflict)): Path<(Ulid, Ulid)>,
+    headers: HeaderMap,
 ) -> ServerResult<Response> {
     let auth = require_realm_auth(&state, auth)?;
-    let result =
-        merge::resolve_conflict(&state.get_ctx(), store(&state)?, &auth, id, conflict).await;
+    let expected = expected(&headers);
+    let git = store(&state)?;
+    let result = merge::resolve_conflict(
+        &state.get_ctx(),
+        git,
+        &auth,
+        (id, conflict),
+        expected.as_deref(),
+    )
+    .await;
     Ok(match result {
         Ok(merged) => Json(merge_view(merged)).into_response(),
         Err(error) => failure(error),

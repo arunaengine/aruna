@@ -150,21 +150,22 @@ pub async fn merge_base(directory: &Path, first: &str, second: &str) -> Option<S
 /// Reads raw commit headers, so signatures are reported present, not verified.
 pub async fn log(
     directory: &Path,
-    revision: &str,
+    (revision, exclude): (&str, Option<&str>),
     skip: usize,
     limit: usize,
 ) -> std::io::Result<Vec<CommitInfo>> {
-    if !revision_valid(revision) {
+    if !revision_valid(revision) || exclude.is_some_and(|exclude| !revision_valid(exclude)) {
         return Err(std::io::Error::other("invalid Git revision"));
     }
-    let arguments = [
+    let mut arguments = vec![
         "rev-list".to_string(),
         "--header".into(),
         format!("--skip={skip}"),
         format!("--max-count={limit}"),
         revision.into(),
-        "--".into(),
     ];
+    arguments.extend(exclude.map(|exclude| format!("^{exclude}")));
+    arguments.push("--".into());
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
     let output = command(directory, &arguments).await?;
     text(&output)?
@@ -184,6 +185,7 @@ fn parse_commit(entry: &str) -> std::io::Result<CommitInfo> {
         parents: Vec::new(),
         author_name: String::new(),
         author_email: String::new(),
+        committer_email: String::new(),
         authored_at_s: 0,
         message: String::new(),
         signed: false,
@@ -199,6 +201,12 @@ fn parse_commit(entry: &str) -> std::io::Result<CommitInfo> {
             info.author_email = email.trim_start_matches('<').to_string();
             let seconds = time.split_whitespace().next().ok_or_else(invalid)?;
             info.authored_at_s = seconds.parse().map_err(|_| invalid())?;
+        } else if let Some(committer) = line.strip_prefix("committer ") {
+            let (identity, _) = committer.rsplit_once("> ").ok_or_else(invalid)?;
+            let email = identity
+                .split_once(" <")
+                .map_or(identity, |(_, email)| email);
+            info.committer_email = email.trim_start_matches('<').to_string();
         } else if line.starts_with("gpgsig ") || line.starts_with("gpgsig-sha256 ") {
             info.signed = true;
         }
@@ -305,17 +313,26 @@ mod tests {
         git(path, &["commit", "-q", "-m", body]).await;
         let second = git(path, &["rev-parse", "HEAD"]).await;
 
-        let commits = log(path, "main", 0, 10).await.expect("log reads");
+        let commits = log(path, ("main", None), 0, 10).await.expect("log reads");
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].commit, second);
         assert_eq!(commits[0].parents, vec![first.clone()]);
         assert_eq!(commits[0].author_name, "Ada Lovelace");
         assert_eq!(commits[0].author_email, "ada@example.org");
+        assert_eq!(commits[0].committer_email, "ada@example.org");
         assert_eq!(commits[0].authored_at_s, 1_700_000_000);
         assert_eq!(commits[0].message, body);
         assert!(!commits[0].signed);
         assert!(commits[1].parents.is_empty());
-        assert_eq!(log(path, "main", 1, 10).await.expect("skips").len(), 1);
+        assert_eq!(
+            log(path, ("main", None), 1, 10).await.expect("skips").len(),
+            1
+        );
+        let since = log(path, ("main", Some(&first)), 0, 10)
+            .await
+            .expect("excludes");
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].commit, second);
 
         let changes = diff(path, Some(&first), &second).await.expect("diff reads");
         let summary: Vec<_> = changes

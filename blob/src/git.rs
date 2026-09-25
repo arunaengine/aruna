@@ -71,10 +71,11 @@ impl GitStore {
             )),
             GitEffect::Log {
                 revision,
+                exclude,
                 skip,
                 limit,
                 ..
-            } => crate::repo::log(&repository, &revision, skip, limit)
+            } => crate::repo::log(&repository, (&revision, exclude.as_deref()), skip, limit)
                 .await
                 .map(GitEvent::Log),
             GitEffect::Diff { from, to, .. } => {

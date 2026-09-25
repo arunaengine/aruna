@@ -336,6 +336,25 @@ def exercise(root):
     assert status == 200 and edited["version"] != head and edited["parents"] == [head], edited
     assert edited["message"] == "Rename through REST" and edited["author"]["user_id"], edited
     assert root_entity(graph(metadata_url))["name"] == "Edited by another user"
+    status, own = api(metadata_url + "/versions?branch=rest%2Fdraft&since=main")
+    assert status == 200 and [item["version"] for item in own["versions"]] == [edited["version"]], own
+    status, missing = api(metadata_url + "/versions?branch=nothing-here")
+    assert status == 404 and missing["code"] == "branch_missing", missing
+    status, whole = api(metadata_url + "/compare?to=rest%2Fdraft")
+    assert status == 200 and whole["from"] is None and whole["files"], whole
+    status, heads = api(metadata_url + "/branches")
+    assert any(item["name"] == "rest/draft" and item["head"]["version"] == edited["version"]
+               for item in heads["branches"]), heads
+    claim = json.dumps({"refs": [{"name": "refs/heads/main", "old": head, "new": "a" * 40}],
+                        "lfs": [], "paths": []}).encode()
+    forged = urllib.request.Request(metadata_url + "/git/push", method="POST",
+                                    data=len(claim).to_bytes(4, "big") + claim,
+                                    headers={"Authorization": "Bearer " + os.environ["ARUNA_TOKEN"]})
+    try:
+        urllib.request.urlopen(forged, timeout=60)
+        raise AssertionError("a push record was accepted outside a receive hook")
+    except urllib.error.HTTPError as error:
+        assert error.code == 403, error.code
     status, comparison = api(metadata_url + "/compare?from=main&to=rest%2Fdraft")
     assert status == 200 and any(file["path"] == "aruna-metadata.json" for file in comparison["files"])
     assert "Edited through REST" in json.dumps(comparison["entities"]), comparison

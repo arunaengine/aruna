@@ -122,6 +122,7 @@ pub struct CommitInfo {
     pub parents: Vec<String>,
     pub author_name: String,
     pub author_email: String,
+    pub committer_email: String,
     pub authored_at_s: i64,
     pub message: String,
     pub signed: bool,
@@ -203,10 +204,12 @@ pub enum GitEffect {
         first: String,
         second: String,
     },
-    /// Up to `limit` commits reachable from `revision`, newest first, after skipping `skip`.
+    /// Up to `limit` commits reachable from `revision` but not from `exclude`, newest first,
+    /// after skipping `skip`.
     Log {
         document_id: Ulid,
         revision: String,
+        exclude: Option<String>,
         skip: usize,
         limit: usize,
     },
