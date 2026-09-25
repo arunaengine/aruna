@@ -147,15 +147,19 @@ pub(crate) async fn settle(
         Ok(checkpoint) => checkpoint.unwrap_or_default(),
         Err(error) => return retry(error),
     };
-    let push = match &outcome {
-        JobRunOutcome::Succeeded(_) => match checkpoint.pushed_outcome() {
-            Some(pushed) => pushed,
-            None => return outcome,
-        },
-        JobRunOutcome::Failed(error) if error.kind == JobErrorKind::Permanent => {
+    let settled = match &outcome {
+        JobRunOutcome::Failed(error) => error.kind == JobErrorKind::Permanent,
+        JobRunOutcome::Succeeded(_) | JobRunOutcome::Cancelled => true,
+        _ => false,
+    };
+    // A push that reached the repository counts as pushed, even when a later step failed.
+    let push = match (&outcome, checkpoint.pushed_outcome()) {
+        _ if !settled => return outcome,
+        (_, Some(pushed)) => pushed,
+        (JobRunOutcome::Failed(error), None) => {
             PushOutcome::Failed(checkpoint.push_failure(&error.message))
         }
-        JobRunOutcome::Cancelled => PushOutcome::Cancelled,
+        (JobRunOutcome::Cancelled, None) => PushOutcome::Cancelled,
         _ => return outcome,
     };
     let requeue = match &push {

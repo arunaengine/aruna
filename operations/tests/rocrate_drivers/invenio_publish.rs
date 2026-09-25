@@ -155,6 +155,41 @@ async fn busy_reservation_retries() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn cancelled_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    drain(&fixture).await?;
+    let started = current(&fixture, &link).await.0;
+    let job_id = started.active_job.ok_or("no push")?;
+    let storage = &fixture.context.storage_handle;
+    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+        .await?
+        .ok_or("push job missing")?;
+    let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
+        return Err("push job is not an export".into());
+    };
+    let ctx = claim_context(&fixture, job_id, record.payload).await?;
+    succeeded(Box::pin(run_export_job(&ctx, &spec)).await);
+    // The push reached the repository, but the link lost the record and the job is cancelled.
+    write_value(
+        storage,
+        aruna_core::keyspaces::INVENIO_LINK_KEYSPACE,
+        aruna_core::invenio::link_key(link.document_id, link.link_id),
+        started.to_bytes()?,
+    )
+    .await?;
+    ctx.cancel.cancel();
+    let outcome = Box::pin(run_export_job(&ctx, &spec)).await;
+    assert!(matches!(outcome, JobRunOutcome::Cancelled));
+    let (settled, _) = current(&fixture, &link).await;
+    assert!(settled.active_job.is_none() && settled.last_push.is_some());
+    assert_eq!(settled.remote.draft_id.as_deref(), Some("1"));
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_edits_accepted() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;
