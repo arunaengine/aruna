@@ -401,7 +401,7 @@ pub async fn missing_metadata(
 }
 
 /// The repository's record as the link and job see it; drafts point at the draft endpoint.
-pub(crate) fn record_from(
+pub(super) fn record_from(
     client: &InvenioClient<'_>,
     record: &Value,
 ) -> Result<RepositoryRecord, TransferError> {
@@ -436,7 +436,7 @@ pub(crate) fn record_from(
 }
 
 /// The file keys of a draft or published record.
-pub(crate) async fn file_keys(
+pub(super) async fn file_keys(
     client: &InvenioClient<'_>,
     id: &str,
     published: bool,

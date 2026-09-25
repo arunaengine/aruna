@@ -299,7 +299,7 @@ pub async fn refresh_review(
     if link.remote.review != LinkReview::Pending {
         return Ok(link.clone());
     }
-    let change = match super::push::review_state(context, link).await {
+    let change = match super::invenio::remote::review_state(context, link).await {
         Ok(Some(state)) => LinkChange::Accept(Box::new(state)),
         Ok(None) => return Ok(link.clone()),
         Err(TransferError::Refused(reason)) => LinkChange::Fail(reason),

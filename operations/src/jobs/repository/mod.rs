@@ -20,7 +20,7 @@ pub mod links;
 pub mod pull;
 pub(crate) mod push;
 pub use invenio::query::{RecordReference, resolve_record, search_records};
-pub use push::remote_state;
+pub use invenio::remote::remote_state;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {

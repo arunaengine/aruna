@@ -19,6 +19,7 @@ pub mod export;
 pub(crate) mod import;
 pub(crate) mod query;
 pub(crate) mod reference;
+pub(crate) mod remote;
 mod verify;
 
 impl From<InvenioError> for TransferError {
