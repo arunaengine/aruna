@@ -208,6 +208,17 @@ fn debounces_queued_changes() {
     );
     let late = LinkQueueEntry::debounce(document, Some(&next), 1_000 + LINK_DEBOUNCE_CAP_MS);
     assert_eq!(late.due_at_ms, 1_000 + LINK_DEBOUNCE_CAP_MS);
+    // An old auto_publish wait is no change, so a new change still gets its quiet time.
+    let publish = LinkQueueEntry {
+        document_id: document,
+        due_at_ms: 1_000 + AUTO_PUBLISH_QUIET_MS,
+        first_at_ms: 1_000,
+    };
+    let change = LinkQueueEntry::debounce(document, Some(&publish), 600_000);
+    assert_eq!(
+        (change.due_at_ms, change.first_at_ms),
+        (600_000 + LINK_DEBOUNCE_MS, 600_000)
+    );
 }
 
 #[test]

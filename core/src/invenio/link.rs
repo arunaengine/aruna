@@ -228,8 +228,13 @@ pub struct LinkQueueEntry {
 
 impl LinkQueueEntry {
     /// Queues a change at `now_ms`: each change moves the due time, up to the cap.
+    /// A publish or review wait is due past the cap; a change after it starts a new debounce.
     pub fn debounce(document_id: Ulid, previous: Option<&Self>, now_ms: u64) -> Self {
-        let first_at_ms = previous.map_or(now_ms, |entry| entry.first_at_ms.min(now_ms));
+        let first_at_ms = previous
+            .filter(|entry| {
+                entry.due_at_ms <= entry.first_at_ms.saturating_add(LINK_DEBOUNCE_CAP_MS)
+            })
+            .map_or(now_ms, |entry| entry.first_at_ms.min(now_ms));
         Self {
             document_id,
             due_at_ms: now_ms
