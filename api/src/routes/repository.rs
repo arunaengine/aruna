@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_operations::jobs::repository::Action;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -114,7 +115,7 @@ pub async fn search_records(
     .await?;
     let kind =
         super::repository_links::connector_kind(&state, query.group_id, query.connector_id).await?;
-    super::repository_links::ensure_capable(kind, "search", |can| can.search)?;
+    super::repository_links::ensure_capable(kind, Action::Search)?;
     aruna_operations::jobs::repository::search(
         kind,
         &state.get_ctx(),
@@ -266,9 +267,7 @@ pub async fn import_record(
     auth: Extension<Option<AuthContext>>,
     Json(request): Json<RepositoryImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    use aruna_operations::jobs::repository::{
-        RecordReference, TransferError, connector_kind, resolve,
-    };
+    use aruna_operations::jobs::repository::{RecordReference, TransferError, resolve};
     let reference = match (request.record_id, request.doi, request.url) {
         (Some(id), None, None) => RecordReference::Id(id),
         (None, Some(doi), None) => RecordReference::Doi(doi),
@@ -294,26 +293,19 @@ pub async fn import_record(
                 aruna_core::structs::identity::auth::Permission::READ,
             )
             .await?;
-            let context = state.get_ctx();
-            let kind = connector_kind(&context, group_id, connector_id)
-                .await
-                .map_err(|error| match error {
-                    TransferError::Permanent(message) => ServerError::BadRequestReason(message),
-                    _ => ServerError::ServiceUnavailableReason("repository unavailable".into()),
-                })?;
-            super::repository_links::ensure_capable(kind, "record lookup", |can| can.search)?;
-            async {
-                resolve(
-                    kind,
-                    &context,
-                    &caller,
-                    group_id,
-                    connector_id,
-                    &reference,
-                    state.rocrate_limits().metadata_bytes,
-                )
-                .await
-            }
+            let kind =
+                super::repository_links::connector_kind(&state, group_id, connector_id).await?;
+            super::repository_links::ensure_capable(kind, Action::Import)?;
+            super::repository_links::ensure_capable(kind, Action::Search)?;
+            resolve(
+                kind,
+                &state.get_ctx(),
+                &caller,
+                group_id,
+                connector_id,
+                &reference,
+                state.rocrate_limits().metadata_bytes,
+            )
             .await
             .map_err(|error| match error {
                 TransferError::Permanent(message) => ServerError::BadRequestReason(message),

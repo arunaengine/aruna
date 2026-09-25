@@ -9,7 +9,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::jobs::repository::link_queue::{current_event, refresh_review, start_push};
 use aruna_operations::jobs::repository::links::LinkChange;
 use aruna_operations::jobs::repository::pull::{check_now, start_pull};
-use aruna_operations::jobs::repository::{TransferError, remote_state, seal_link_token};
+use aruna_operations::jobs::repository::{Action, TransferError, remote_state, seal_link_token};
 use aruna_operations::jobs::service::cancel_owned_job;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -310,7 +310,7 @@ pub async fn publish_link(
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_creator(&auth, &link)?;
     ensure_push(&link)?;
-    ensure_capable(link.kind, "publishing drafts", |can| can.drafts)?;
+    ensure_capable(link.kind, Action::Drafts)?;
     let link = refresh_review(state.get_ctx().as_ref(), &link)
         .await
         .map_err(link_error)?;
@@ -430,7 +430,7 @@ pub async fn accept_remote(
 ) -> ServerResult<Json<RepositoryLinkResponse>> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_push(&link)?;
-    ensure_capable(link.kind, "accepting remote changes", |can| can.drafts)?;
+    ensure_capable(link.kind, Action::Drafts)?;
     if link.active_job.is_some() {
         return Err(ServerError::Conflict(
             "a push of this link is running; accept after it finished".into(),
@@ -493,7 +493,7 @@ pub async fn pull_link(
             "this link pushes to the repository; use the push route".into(),
         ));
     }
-    ensure_capable(link.kind, "pull links", |can| can.pull)?;
+    ensure_capable(link.kind, Action::Pull)?;
     if link.status == LinkStatus::Paused {
         return Err(ServerError::Conflict(
             "resume the link before pulling".into(),

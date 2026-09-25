@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::repository_links::{metadata_json, parse_ulid, readable, requirements};
+use super::repository_links::{connector, metadata_json, parse_ulid, readable, requirements};
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ProfileFindingResponse, ServerError, ServerResult};
 use crate::metadata::ensure_metadata_scope;
@@ -237,14 +237,8 @@ pub async fn check_repository(
     let connector_id = parse_ulid(&request.connector_id)?;
     metadata_json(&state, request.metadata)?;
     ensure_metadata_scope(&state, &auth, group_id, Permission::READ).await?;
-    let checked = Box::pin(requirements(
-        &state,
-        &auth,
-        document_id,
-        group_id,
-        connector_id,
-    ))
-    .await?;
+    let view = connector(&state, group_id, connector_id).await?;
+    let checked = Box::pin(requirements(&state, &auth, document_id, &view)).await?;
     Ok(Json(CheckResponse {
         kind: checked.kind.as_str().to_string(),
         profile: CheckProfileResponse {

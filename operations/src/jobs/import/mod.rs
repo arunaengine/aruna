@@ -404,9 +404,14 @@ async fn acquire_source(
             options,
             pull,
         } => {
+            use super::repository::{Action, ensure_supported};
             let kind = super::repository::connector_kind(&ctx.driver, *group_id, *connector_id)
                 .await
                 .map_err(transfer_failure)?;
+            ensure_supported(kind, Action::Import).map_err(transfer_failure)?;
+            if pull.is_some() {
+                ensure_supported(kind, Action::Pull).map_err(transfer_failure)?;
+            }
             let (artifact, found, progress) = super::repository::acquire(
                 kind,
                 ctx,

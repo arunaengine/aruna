@@ -12,8 +12,9 @@ use aruna_core::structs::identity::auth::AuthContext;
 use serde_json::Value;
 use ulid::Ulid;
 
-use super::{TransferError, not_supported, repository};
+use super::{Action, TransferError, ensure_supported, not_supported};
 use crate::driver::DriverContext;
+use crate::harvest::read_connector::ConnectorView;
 use crate::metadata::profile::validation::check_profile;
 
 /// What a repository of `kind` needs from a crate: the requirement Profile findings, then the
@@ -35,11 +36,9 @@ pub async fn check_requirements(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
     document_id: Ulid,
-    group_id: Ulid,
-    connector_id: Ulid,
+    view: &ConnectorView,
     metadata_bytes: u64,
 ) -> Result<RequirementCheck, TransferError> {
-    let view = repository(context, group_id, connector_id).await?;
     let (jsonld, _) = Box::pin(crate::jobs::export::crate_jsonld(
         context,
         auth,
@@ -64,6 +63,7 @@ pub(crate) async fn check_crate(
     endpoint: &str,
     jsonld: &str,
 ) -> Result<RequirementCheck, TransferError> {
+    ensure_supported(kind, Action::Publish)?;
     let descriptor = descriptor(kind).ok_or_else(|| not_supported("publishing"))?;
     let profile_iri = (descriptor.profile)(endpoint);
     let rules = descriptor.rules()?;

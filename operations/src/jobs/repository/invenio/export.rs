@@ -31,7 +31,7 @@ use crate::jobs::import::archive::{
 };
 use crate::jobs::repository::check::{check_content, unmet};
 use crate::jobs::repository::push::{guard, record_draft};
-use crate::jobs::repository::{TransferError, interruptible};
+use crate::jobs::repository::{Action, TransferError, interruptible, supports};
 use crate::jobs::service::read_artifact_range;
 
 pub(crate) async fn repository_export(
@@ -98,6 +98,7 @@ pub(crate) async fn repository_export(
         }
     }
     if checkpoint.repository_metadata.is_none()
+        && supports(RepositoryConnectorKind::Invenio, Action::ReserveIdentifier)
         && let Some(record) = checkpoint
             .repository
             .as_ref()
@@ -848,7 +849,9 @@ async fn review_community(
     destination: &RepositoryDestination,
     draft: &Value,
 ) -> Result<Option<String>, TransferError> {
-    if draft["versions"]["index"] != 1 {
+    if draft["versions"]["index"] != 1
+        || !supports(RepositoryConnectorKind::Invenio, Action::Review)
+    {
         return Ok(None);
     }
     let view = crate::jobs::repository::repository(

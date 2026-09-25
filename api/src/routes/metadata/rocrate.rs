@@ -14,10 +14,14 @@ use crate::metadata::{
     serialize_jsonld_object,
 };
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::routes::repository_links::{
+    connector, ensure_capable, ensure_requirements, validate_record_id,
+};
 use crate::server::state::ServerState;
 use aruna_core::structs::execution::job::ExportRoCrateSpec;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::jobs::repository::{Action, TransferError, seal_token};
 use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::metadata::api::ExportMetadataRequest;
 use aruna_operations::metadata::forward::{
@@ -319,14 +323,6 @@ pub async fn submit_rocrate_export(
                     "metadata overrides must be an object".into(),
                 ));
             }
-            for id in destination
-                .draft_id
-                .iter()
-                .chain(destination.published_id.iter())
-            {
-                aruna_core::repository::invenio::validate_id(id)
-                    .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-            }
             Ok(aruna_core::repository::RepositoryDestination {
                 group_id: ulid::Ulid::from_string(&destination.group_id)
                     .map_err(|_| ServerError::BadRequest)?,
@@ -350,26 +346,30 @@ pub async fn submit_rocrate_export(
             Permission::WRITE,
         )
         .await?;
-        Box::pin(crate::routes::repository_links::ensure_requirements(
-            &state,
-            &auth,
-            document_id,
-            destination.group_id,
-            destination.connector_id,
-        ))
-        .await?;
+        let view = connector(&state, destination.group_id, destination.connector_id).await?;
+        let kind = view.connector.kind;
+        ensure_capable(kind, Action::Publish)?;
+        if destination.published_id.is_some() {
+            ensure_capable(kind, Action::Versions)?;
+        }
+        for id in destination
+            .draft_id
+            .iter()
+            .chain(destination.published_id.iter())
+        {
+            validate_record_id(kind, id)?;
+        }
+        Box::pin(ensure_requirements(&state, &auth, document_id, &view)).await?;
         destination.credential = Some(
-            aruna_operations::jobs::repository::seal_credential(
+            seal_token(
                 &state.get_ctx(),
-                &auth,
-                destination,
+                auth.user_id,
+                &view,
+                None,
                 access_token.as_deref().unwrap_or_default(),
             )
-            .await
             .map_err(|error| match error {
-                aruna_operations::jobs::repository::TransferError::Permanent(message) => {
-                    ServerError::BadRequestReason(message)
-                }
+                TransferError::Permanent(message) => ServerError::BadRequestReason(message),
                 _ => ServerError::ServiceUnavailableReason(
                     "repository login could not be prepared".into(),
                 ),

@@ -481,10 +481,46 @@ async fn unsupported_kinds_refused() {
     )
     .await;
     assert!(matches!(search, Err(ServerError::NotSupported(_))));
+    let import = |connector_id: Ulid, doi: Option<&str>| {
+        crate::routes::repository::import_record(
+            State(linked.test.state.clone()),
+            Extension(Some(linked.test.auth.clone())),
+            Json(crate::routes::repository::RepositoryImportRequest {
+                group_id: linked.test.group_id.to_string(),
+                connector_id: connector_id.to_string(),
+                record_id: doi.is_none().then(|| "42".to_string()),
+                doi: doi.map(str::to_string),
+                url: None,
+                options: Default::default(),
+                keep_updated: false,
+                auto_update: None,
+                target: crate::routes::rocrate_import::ImportTargetRequest {
+                    bucket: "target".into(),
+                    prefix: "import".into(),
+                },
+                metadata: crate::routes::rocrate_import::ImportMetadataRequest {
+                    group_id: linked.test.group_id.to_string(),
+                    path: "imported".into(),
+                    public: false,
+                },
+                idempotency_key: None,
+            }),
+        )
+    };
+    assert!(matches!(
+        Box::pin(import(oai, None)).await,
+        Err(ServerError::NotSupported(_))
+    ));
+    for doi in [None, Some("10.5281/zenodo.1")] {
+        assert!(matches!(
+            Box::pin(import(Ulid::generate(), doi)).await,
+            Err(ServerError::NotFound)
+        ));
+    }
 }
 
 #[tokio::test]
-async fn publisher_needed_off_zenodo() {
+async fn publisher_off_zenodo() {
     // Zenodo sets the publisher itself; another InvenioRDM needs it in the crate.
     let root = serde_json::json!({"@id": "./", "@type": "Dataset", "name": "No publisher",
         "description": "Published without a publisher", "datePublished": "2026-01-01",

@@ -8,6 +8,7 @@ use aruna_core::handle::Handle;
 use aruna_core::repository::{
     ImportMode, ImportOptions, LinkFailure, LinkTarget, PullCheck, RemoteState,
     RepositoryCredential, RepositoryDestination, RepositoryLink, RepositoryPull, RepositoryQuery,
+    descriptor,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
@@ -240,6 +241,67 @@ fn not_supported(action: &str) -> TransferError {
     TransferError::Permanent(format!("this repository kind does not support {action}"))
 }
 
+/// An action a repository kind may not support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Action {
+    /// Links, one-time exports and requirement checks.
+    Publish,
+    /// Publishing an open draft and accepting remote drafts.
+    Drafts,
+    ReserveIdentifier,
+    Review,
+    Import,
+    /// Keeping an import updated through a pull link.
+    Pull,
+    /// Continuing a record's version lineage.
+    Versions,
+    Search,
+}
+
+impl Action {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Publish => "publishing",
+            Self::Drafts => "drafts",
+            Self::ReserveIdentifier => "reserving identifiers",
+            Self::Review => "reviews",
+            Self::Import => "imports",
+            Self::Pull => "pull links",
+            Self::Versions => "versions",
+            Self::Search => "search",
+        }
+    }
+}
+
+/// Whether `kind` supports `action`; API routes and jobs gate on this one rule.
+pub fn supports(kind: RepositoryConnectorKind, action: Action) -> bool {
+    let Some(descriptor) = descriptor(kind) else {
+        return false;
+    };
+    let can = descriptor.capabilities;
+    match action {
+        Action::Publish => !descriptor.profiles.is_empty() && descriptor.rules().is_ok(),
+        Action::Drafts => can.drafts,
+        Action::ReserveIdentifier => can.reserve_identifier,
+        Action::Review => can.review,
+        Action::Import => can.import,
+        Action::Pull => can.pull,
+        Action::Versions => can.versions,
+        Action::Search => can.search,
+    }
+}
+
+/// Fails permanently unless `kind` supports `action`.
+pub fn ensure_supported(
+    kind: RepositoryConnectorKind,
+    action: Action,
+) -> Result<(), TransferError> {
+    if supports(kind, action) {
+        return Ok(());
+    }
+    Err(not_supported(action.name()))
+}
+
 impl From<std::io::Error> for TransferError {
     fn from(error: std::io::Error) -> Self {
         Self::Retryable(error.to_string())
@@ -259,19 +321,7 @@ pub async fn seal_credential(
     token: &str,
 ) -> Result<RepositoryCredential, TransferError> {
     let view = repository(context, destination.group_id, destination.connector_id).await?;
-    let key = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?
-        .credential_encryption_key();
-    Ok(RepositoryCredential::seal(
-        &key,
-        auth.user_id,
-        destination.group_id,
-        destination.connector_id,
-        view.connector.endpoint,
-        token,
-    )?)
+    seal_token(context, auth.user_id, &view, None, token)
 }
 
 /// Seals a link's token for its creator, bound to the connector's current endpoint.
@@ -284,6 +334,17 @@ pub async fn seal_link_token(
     token: &str,
 ) -> Result<RepositoryCredential, TransferError> {
     let view = repository(context, group_id, connector_id).await?;
+    seal_token(context, user, &view, Some(link_id), token)
+}
+
+/// Seals a user's token for the connector's endpoint, and for `link_id` when a link keeps it.
+pub fn seal_token(
+    context: &DriverContext,
+    user: aruna_core::UserId,
+    view: &ConnectorView,
+    link_id: Option<Ulid>,
+    token: &str,
+) -> Result<RepositoryCredential, TransferError> {
     let key = context
         .net_handle
         .as_ref()
@@ -292,10 +353,10 @@ pub async fn seal_link_token(
     Ok(RepositoryCredential::seal_link(
         &key,
         user,
-        group_id,
-        connector_id,
-        Some(link_id),
-        view.connector.endpoint,
+        view.connector.group_id,
+        view.connector.connector_id,
+        link_id,
+        view.connector.endpoint.clone(),
         token,
     )?)
 }

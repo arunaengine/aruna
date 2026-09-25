@@ -192,9 +192,27 @@ async fn keep_updated_needs_write() {
     // The connector's group is another owner's; the caller only reads it.
     let shared = Ulid::generate();
     grant_reader(&state, user, shared).await;
+    let connector_id = aruna_operations::driver::drive(
+        aruna_operations::harvest::create_connector::CreateConnectorOperation::new(
+            aruna_operations::harvest::create_connector::CreateConnectorInput {
+                group_id: shared,
+                created_by: user,
+                name: "zenodo".into(),
+                kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
+                endpoint: "https://zenodo.example/api/".into(),
+                public_config: Default::default(),
+                secret_config: Default::default(),
+            },
+        ),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .unwrap()
+    .connector
+    .connector_id;
     let request = |keep_updated| RepositoryImportRequest {
         group_id: shared.to_string(),
-        connector_id: Ulid::generate().to_string(),
+        connector_id: connector_id.to_string(),
         record_id: Some("42".into()),
         doi: None,
         url: None,

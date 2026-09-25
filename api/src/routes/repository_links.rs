@@ -5,21 +5,22 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aruna_core::repository::invenio::validate_id;
 use aruna_core::repository::{
-    Capabilities, LinkFailure, LinkRemote, LinkStatus, RepositoryLink, capabilities,
+    LinkFailure, LinkRemote, LinkStatus, RepositoryLink, capabilities, descriptor,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
-use aruna_operations::harvest::read_connector::{GetRepositoryOperation, ReadConnectorError};
+use aruna_operations::harvest::read_connector::{
+    ConnectorView, GetRepositoryOperation, ReadConnectorError,
+};
 use aruna_operations::jobs::repository::check::{RequirementCheck, check_requirements};
 use aruna_operations::jobs::repository::link_queue::owner_holds;
 use aruna_operations::jobs::repository::links::{
     LinkChange, LinkError, change_link, list_links, read_link,
 };
-use aruna_operations::jobs::repository::{TransferError, seal_link_token};
+use aruna_operations::jobs::repository::{Action, TransferError, seal_token, supports};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -307,17 +308,39 @@ pub(super) fn link_error(error: LinkError) -> ServerError {
 }
 
 /// Answers 400 with code not_supported unless the repository kind can do `action`.
-pub(crate) fn ensure_capable(
-    kind: RepositoryConnectorKind,
-    action: &str,
-    can: impl Fn(Capabilities) -> bool,
-) -> ServerResult<()> {
-    if capabilities(kind).is_some_and(can) {
+pub(crate) fn ensure_capable(kind: RepositoryConnectorKind, action: Action) -> ServerResult<()> {
+    if supports(kind, action) {
         return Ok(());
     }
     Err(ServerError::NotSupported(format!(
-        "this repository kind does not support {action}"
+        "this repository kind does not support {}",
+        action.name()
     )))
+}
+
+/// Answers 400 unless the repository kind accepts `id` as a record id.
+pub(crate) fn validate_record_id(kind: RepositoryConnectorKind, id: &str) -> ServerResult<()> {
+    let descriptor = descriptor(kind)
+        .ok_or_else(|| ServerError::NotSupported("this repository kind has no records".into()))?;
+    (descriptor.validate_id)(id).map_err(|error| ServerError::BadRequestReason(error.to_string()))
+}
+
+/// The group's repository connector; an unknown connector answers 404.
+pub(crate) async fn connector(
+    state: &ServerState,
+    group_id: Ulid,
+    connector_id: Ulid,
+) -> ServerResult<ConnectorView> {
+    let context = state.get_ctx();
+    Box::pin(drive(
+        GetRepositoryOperation::new(group_id, connector_id),
+        &context,
+    ))
+    .await
+    .map_err(|error| match error {
+        ReadConnectorError::NotFound => ServerError::NotFound,
+        _ => ServerError::ServiceUnavailableReason("repository connector unavailable".into()),
+    })
 }
 
 /// The kind of the group's repository connector; an unknown connector answers 404.
@@ -326,17 +349,10 @@ pub(crate) async fn connector_kind(
     group_id: Ulid,
     connector_id: Ulid,
 ) -> ServerResult<RepositoryConnectorKind> {
-    let context = state.get_ctx();
-    Box::pin(drive(
-        GetRepositoryOperation::new(group_id, connector_id),
-        &context,
-    ))
-    .await
-    .map(|view| view.connector.kind)
-    .map_err(|error| match error {
-        ReadConnectorError::NotFound => ServerError::NotFound,
-        _ => ServerError::ServiceUnavailableReason("repository connector unavailable".into()),
-    })
+    Ok(connector(state, group_id, connector_id)
+        .await?
+        .connector
+        .kind)
 }
 
 /// Checks the dataset crate against the connector's repository; stores nothing.
@@ -344,17 +360,14 @@ pub(crate) async fn requirements(
     state: &ServerState,
     auth: &AuthContext,
     document_id: Ulid,
-    group_id: Ulid,
-    connector_id: Ulid,
+    view: &ConnectorView,
 ) -> ServerResult<RequirementCheck> {
-    let kind = connector_kind(state, group_id, connector_id).await?;
-    ensure_capable(kind, "publishing", |can| can.drafts)?;
+    ensure_capable(view.connector.kind, Action::Publish)?;
     Box::pin(check_requirements(
         &state.get_ctx(),
         auth,
         document_id,
-        group_id,
-        connector_id,
+        view,
         state.rocrate_limits().metadata_bytes,
     ))
     .await
@@ -370,17 +383,9 @@ pub(crate) async fn ensure_requirements(
     state: &ServerState,
     auth: &AuthContext,
     document_id: Ulid,
-    group_id: Ulid,
-    connector_id: Ulid,
+    view: &ConnectorView,
 ) -> ServerResult<()> {
-    let checked = Box::pin(requirements(
-        state,
-        auth,
-        document_id,
-        group_id,
-        connector_id,
-    ))
-    .await?;
+    let checked = Box::pin(requirements(state, auth, document_id, view)).await?;
     if checked.ready {
         return Ok(());
     }
@@ -574,20 +579,15 @@ pub async fn create_link(
         Permission::WRITE,
     ))
     .await?;
-    let kind = connector_kind(&state, group_id, connector_id).await?;
-    ensure_capable(kind, "links", |can| can.drafts)?;
+    let view = connector(&state, group_id, connector_id).await?;
+    let kind = view.connector.kind;
+    ensure_capable(kind, Action::Publish)?;
     if let Some(parent) = &request.parent_id {
-        validate_id(parent).map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+        ensure_capable(kind, Action::Versions)?;
+        validate_record_id(kind, parent)?;
     }
     let metadata_json = metadata_json(&state, request.metadata)?;
-    Box::pin(ensure_requirements(
-        &state,
-        &auth,
-        document_id,
-        group_id,
-        connector_id,
-    ))
-    .await?;
+    Box::pin(ensure_requirements(&state, &auth, document_id, &view)).await?;
     let context = state.get_ctx();
     let holds = aruna_operations::forward::routing::origin_holds_document(
         &context,
@@ -603,15 +603,13 @@ pub async fn create_link(
         ));
     }
     let link_id = Ulid::generate();
-    let secret = seal_link_token(
+    let secret = seal_token(
         &context,
         auth.user_id,
-        group_id,
-        connector_id,
-        link_id,
+        &view,
+        Some(link_id),
         &request.access_token,
     )
-    .await
     .map_err(seal_error)?;
     let owner_node_url = state
         .interface_state()

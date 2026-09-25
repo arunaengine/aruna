@@ -516,7 +516,7 @@ async fn repository_export(
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
     use super::repository::check::{check_crate, unmet};
-    use super::repository::{TransferError, deposit, repository};
+    use super::repository::{Action, TransferError, deposit, ensure_supported, repository};
     use aruna_core::repository::LinkFailure;
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
@@ -530,6 +530,10 @@ async fn repository_export(
             let view =
                 repository(&ctx.driver, destination.group_id, destination.connector_id).await?;
             let kind = view.connector.kind;
+            ensure_supported(kind, Action::Publish)?;
+            if destination.published_id.is_some() {
+                ensure_supported(kind, Action::Versions)?;
+            }
             // The snapshot must still meet the requirements before this job writes remotely.
             if checkpoint.repository.is_none() {
                 let jsonld = checkpoint.raw_jsonld.as_deref().ok_or_else(|| {

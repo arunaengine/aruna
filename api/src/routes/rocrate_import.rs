@@ -330,6 +330,7 @@ pub async fn submit_import(
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let mut source = parse_import_source(request.source)?;
+    Box::pin(repository_source(&state, &auth, &source)).await?;
     if let ImportRoCrateSource::Repository {
         group_id,
         pull: Some(RepositoryPull::Keep { owner_node_url, .. }),
@@ -424,6 +425,34 @@ pub async fn submit_import(
     ))
 }
 
+/// A repository source needs READ on the connector group, a connector whose kind imports, and a
+/// record id that kind accepts; keep_updated also needs pull links.
+async fn repository_source(
+    state: &ServerState,
+    auth: &AuthContext,
+    source: &ImportRoCrateSource,
+) -> ServerResult<()> {
+    use super::repository_links::{connector_kind, ensure_capable, validate_record_id};
+    use aruna_operations::jobs::repository::Action;
+    let ImportRoCrateSource::Repository {
+        group_id,
+        connector_id,
+        record_id,
+        pull,
+        ..
+    } = source
+    else {
+        return Ok(());
+    };
+    crate::metadata::ensure_metadata_scope(state, auth, *group_id, Permission::READ).await?;
+    let kind = connector_kind(state, *group_id, *connector_id).await?;
+    ensure_capable(kind, Action::Import)?;
+    if pull.is_some() {
+        ensure_capable(kind, Action::Pull)?;
+    }
+    validate_record_id(kind, record_id)
+}
+
 fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrateSource> {
     match source {
         ImportSourceRequest::Repository {
@@ -434,8 +463,6 @@ fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrat
             keep_updated,
             auto_update,
         } => {
-            aruna_core::repository::invenio::validate_id(&record_id)
-                .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
             if auto_update.is_some() && !keep_updated {
                 return Err(ServerError::BadRequestReason(
                     "auto_update needs keep_updated".into(),
