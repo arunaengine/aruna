@@ -395,3 +395,192 @@ impl From<LegacyJob> for JobRecord {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{LegacyExportResult, LegacyExportSpec, LegacyJob, LegacyPayload, LegacyResult};
+    use crate::migrate::migrate_output;
+    use crate::migrate::tests::{read, write};
+    use aruna_core::UserId;
+    use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_STATE_KEYSPACE};
+    use aruna_core::structs::execution::job::{
+        ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec, ImportMetadataTarget,
+        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord,
+        JobResultPayload, JobState, RoCrateLimits, job_record_key,
+    };
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_operations::jobs::export::ExportCheckpoint;
+    use aruna_operations::jobs::import::ImportCheckpoint;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    const REALM: RealmId = RealmId([1u8; 32]);
+
+    fn auth() -> AuthContext {
+        AuthContext {
+            user_id: UserId::nil(REALM),
+            realm_id: REALM,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    /// A finished export in the current shape, the one the legacy row must become.
+    fn export_job(job_id: JobId) -> JobRecord {
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::ExportRoCrate(ExportRoCrateSpec {
+                destination: None,
+                auth_context: auth(),
+                document_id: Ulid::from_bytes([2u8; 16]),
+                limits: RoCrateLimits::default(),
+            }),
+            UserId::nil(REALM),
+            iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            5,
+            5,
+            Some(b"export-key".to_vec()),
+        );
+        record.state = JobState::Succeeded;
+        record.result = Some(JobResultPayload::ExportRoCrate(ExportRoCrateResult {
+            repository: None,
+            artifact: None,
+            included: 3,
+            omitted: ExportOmissionCounts::default(),
+            report_digest: [9u8; 32],
+        }));
+        record
+    }
+
+    /// The same export as origin/main stored it.
+    fn legacy_job(record: JobRecord) -> LegacyJob {
+        let JobPayload::ExportRoCrate(spec) = record.payload else {
+            panic!("an export job");
+        };
+        let Some(JobResultPayload::ExportRoCrate(result)) = record.result else {
+            panic!("an export result");
+        };
+        LegacyJob {
+            job_id: record.job_id,
+            payload: LegacyPayload::ExportRoCrate(LegacyExportSpec {
+                auth_context: spec.auth_context,
+                document_id: spec.document_id,
+                limits: spec.limits,
+            }),
+            state: record.state,
+            created_by: record.created_by,
+            owner_node_id: record.owner_node_id,
+            created_at_ms: record.created_at_ms,
+            started_at_ms: record.started_at_ms,
+            updated_at_ms: record.updated_at_ms,
+            due_at_ms: record.due_at_ms,
+            finished_at_ms: record.finished_at_ms,
+            attempts: record.attempts,
+            next_attempt_epoch: record.next_attempt_epoch,
+            has_run: record.has_run,
+            last_error: record.last_error,
+            progress: record.progress,
+            cancel_requested: record.cancel_requested,
+            claim: record.claim,
+            dedup_key: record.dedup_key,
+            result: Some(LegacyResult::ExportRoCrate(LegacyExportResult {
+                artifact: result.artifact,
+                included: result.included,
+                omitted: result.omitted,
+                report_digest: result.report_digest,
+            })),
+            execution_class: record.execution_class,
+            plan_digest: record.plan_digest,
+            attempt_intent: record.attempt_intent,
+            workspace_bucket: record.workspace_bucket,
+            workspace_mode: record.workspace_mode,
+            captured_inputs: record.captured_inputs,
+            report_digest: record.report_digest,
+            retention_ms: record.retention_ms,
+            locally_exhausted: record.locally_exhausted,
+        }
+    }
+
+    fn import_job(job_id: JobId) -> JobRecord {
+        JobRecord::new(
+            job_id,
+            JobPayload::ImportRoCrate(ImportRoCrateSpec {
+                auth_context: auth(),
+                source: ImportRoCrateSource::Upload {
+                    upload_id: Ulid::from_bytes([3u8; 16]),
+                },
+                target: ImportRoCrateTarget {
+                    bucket: "target".to_string(),
+                    prefix: "crate".to_string(),
+                },
+                metadata: ImportMetadataTarget {
+                    group_id: Ulid::from_bytes([4u8; 16]),
+                    path: "crate".to_string(),
+                    public: false,
+                },
+                limits: RoCrateLimits::default(),
+                document_id: Ulid::from_bytes([5u8; 16]),
+            }),
+            UserId::nil(REALM),
+            iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            5,
+            5,
+            None,
+        )
+    }
+
+    #[test]
+    fn rewrites_legacy_exports() {
+        // Export records and results gain empty repository fields, both checkpoint
+        // shapes gain their defaults and other rows stay as they are.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let export_id = JobId::from_bytes([1u8; 16]);
+        let import_id = JobId::from_bytes([2u8; 16]);
+        let current = export_job(export_id);
+        let legacy = postcard::to_allocvec(&legacy_job(current.clone())).unwrap();
+        let import = import_job(import_id).to_bytes().unwrap();
+        write(
+            &path,
+            JOB_KEYSPACE,
+            vec![
+                (&job_record_key(export_id), legacy),
+                (&job_record_key(import_id), import.clone()),
+            ],
+        );
+        let export_state = postcard::to_allocvec(&ExportCheckpoint::default()).unwrap();
+        let import_state = postcard::to_allocvec(&ImportCheckpoint::default()).unwrap();
+        // Origin/main lacked the leading ten and the trailing two default bytes.
+        let legacy_export = export_state[10..].to_vec();
+        let legacy_import = import_state[..import_state.len() - 2].to_vec();
+        write(
+            &path,
+            JOB_STATE_KEYSPACE,
+            vec![
+                (&export_id.to_bytes(), legacy_export),
+                (&import_id.to_bytes(), legacy_import),
+                (b"plan", vec![1, 2, 3]),
+            ],
+        );
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!((output.jobs_scanned, output.jobs_rewritten), (2, 1));
+        assert_eq!(
+            (output.checkpoints_scanned, output.checkpoints_rewritten),
+            (2, 2)
+        );
+        let jobs = read(&path, JOB_KEYSPACE);
+        let migrated = JobRecord::from_bytes(&jobs[job_record_key(export_id).as_ref()]).unwrap();
+        assert_eq!(migrated, current);
+        assert_eq!(jobs[job_record_key(import_id).as_ref()], import);
+        let states = read(&path, JOB_STATE_KEYSPACE);
+        assert_eq!(states[export_id.to_bytes().as_slice()], export_state);
+        assert_eq!(states[import_id.to_bytes().as_slice()], import_state);
+        assert_eq!(states[b"plan".as_slice()], vec![1, 2, 3]);
+
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!((again.jobs_rewritten, again.checkpoints_rewritten), (0, 0));
+    }
+}
