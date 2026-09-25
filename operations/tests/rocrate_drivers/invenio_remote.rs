@@ -246,6 +246,8 @@ async fn remote_request(State(state): State<Arc<Mutex<Remote>>>, request: Reques
             let key = body[0]["key"].as_str().unwrap().to_string();
             let rec = state.records.get_mut(*id).unwrap();
             assert!(rec.files.insert(key.clone(), (None, false)).is_none());
+            // Like Invenio, file changes move the draft revision.
+            rec.revision += 1;
             json!({"entries": [{"key": key, "status": "pending"}]})
         }
         (Method::PUT, ["api", "records", id, "draft", "files", key, "content"]) => {

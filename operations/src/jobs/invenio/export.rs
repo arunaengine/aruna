@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::invenio::{
-    ExportIdentity, InvenioDestination, InvenioRecord, LinkFailure, MAX_RECORD_FILES,
+    ExportIdentity, InvenioDestination, InvenioRecord, LinkFailure, LinkTarget, MAX_RECORD_FILES,
     export_fields, record_id, validate_id,
 };
 use aruna_core::stream::BackendStream;
@@ -131,26 +131,74 @@ pub(crate) async fn repository_export(
         .artifact
         .as_ref()
         .ok_or_else(|| TransferError::Permanent("export artifact missing".into()))?;
-    let (record, files) = interruptible(
+    let metadata = checkpoint
+        .repository_metadata
+        .ok_or_else(|| TransferError::Permanent("repository metadata checkpoint missing".into()))?;
+    let deposited = interruptible(
         ctx,
-        deposit(
-            ctx,
-            spec,
-            destination,
-            record,
-            artifact,
-            checkpoint.repository_metadata.ok_or_else(|| {
-                TransferError::Permanent("repository metadata checkpoint missing".into())
-            })?,
-        ),
+        deposit(ctx, spec, destination, record, artifact, metadata),
     )
-    .await?;
+    .await;
+    let (record, files) = match deposited {
+        Ok(deposited) => deposited,
+        Err(error) => {
+            if let Some(target) = &destination.link {
+                observe_revision(ctx, spec, destination, target, record, metadata).await;
+            }
+            return Err(error);
+        }
+    };
     checkpoint.repository = Some(record);
     checkpoint.repository_files = files;
     checkpoint.repository_complete = true;
     persist_checkpoint(ctx, checkpoint)
         .await
         .map_err(TransferError::Retryable)
+}
+
+/// Stores the draft revision after this job's file writes on the link, so the next push
+/// does not mistake them for a remote edit. Changed metadata is left for that check.
+async fn observe_revision(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &InvenioDestination,
+    target: &LinkTarget,
+    record: &InvenioRecord,
+    metadata: [u8; 32],
+) {
+    let observed = async {
+        let client = connect(
+            &ctx.driver,
+            &spec.auth_context,
+            destination.group_id,
+            destination.connector_id,
+            Permission::WRITE,
+            spec.limits.metadata_bytes,
+            destination.credential.as_ref(),
+        )
+        .await?;
+        let url = client.url(&["records", &record.id, "draft"])?;
+        let current = client.json(Method::GET, url, None).await?;
+        let unchanged = metadata_digest(&current) == metadata;
+        let current = record_from(&client, &current)?;
+        Ok::<_, TransferError>(Some(current).filter(|current| {
+            unchanged
+                && !current.published
+                && current.parent_id == record.parent_id
+                && current.revision_id != record.revision_id
+        }))
+    };
+    let current = match observed.await {
+        Ok(Some(current)) => current,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "Reading the draft revision after a failed push failed");
+            return;
+        }
+    };
+    if let Err(error) = record_draft(ctx, spec, target, &current).await {
+        tracing::warn!(%error, "Recording the draft revision after a failed push failed");
+    }
 }
 
 /// Queues the record's DOIs and ids as `Published` identifiers of the exported dataset.
