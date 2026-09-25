@@ -45,11 +45,35 @@ referenced LFS availability. The CWL reference validator is restricted to ARC-lo
 it does not execute workflows or fetch external resources. External-resource accessibility,
 scientific correctness and publication/reproducibility readiness are not certified.
 LFS mappings preserve exact VersionIds when S3 key heads change. Administrative version
-purge can still remove those bytes. Git repository maintenance, cross-node failover and
-publication validation remain separate work. Node-local Git files live under `storage_path/git`.
-The owner is fixed by the original creation event: its authoring node when it was a holder,
-otherwise the first recorded holder. Later placement changes do not select another writer.
-Use that node's endpoint; automatic Git failover is not implemented.
+purge can still remove those bytes. Git repository maintenance and publication validation
+remain separate work.
+
+## Holders and history
+
+Git state is not tied to one node. Every push, server snapshot and LFS lock is a Git record
+on the metadata document's topic, next to its metadata events. Packs are stored as Aruna
+objects. Each document holder keeps a disposable cache under `storage_path/git` and rebuilds
+it from the records, so any holder serves clones, fetches, pushes and LFS downloads.
+
+A ref update applies when its old value matches or it fast-forwards. When two holders accept
+competing updates to one ref, one wins on every holder. The other is kept as
+`refs/conflicts/<ref>/<record id>`, for example `refs/conflicts/heads/main/<record id>`.
+Fetch and merge it to resolve the race; nothing pushed is dropped.
+
+A `File` entity whose `contentUrl` names an exact Aruna object version appears in the ARC as
+an LFS pointer to that object. Downloading it requires READ on the object. An object the
+snapshot's author cannot read stays out of the ARC; its entity still describes it.
+
+LFS locks use the standard Git LFS lock API under `/git/{repository}/info/lfs/locks`. A lock
+is a replicated claim: the earliest claim on a path wins on every holder. A push that changes
+a path locked by another user is rejected until the lock is released.
+
+Neither history has a hard cap. Metadata events are counted in windows of 1024 events or
+16 MiB per document. Before a window fills, a holder writes a checkpoint event with the
+current graph state, and the next window starts there. Each node writes a document through
+one CRDT actor, so vector clocks grow with the number of writing nodes, not with edits.
+Git records use the same idea: near 1024 records, a holder writes a Git checkpoint with the
+current refs, packs and locks.
 
 ## Metadata representation
 
@@ -161,4 +185,4 @@ trusting a success dialog. No external DataHUB account is used or modified.
 Repository READ covers its complete Git history, including ordinary Git files. Choose
 the metadata document's reader scope accordingly; public grants also apply to signed-in
 readers. LFS content additionally requires object READ. Native hosting currently requires
-Unix. LFS locking and GitLab-compatible login/discovery APIs are not implemented.
+Unix. GitLab-compatible login and discovery APIs are not implemented.
