@@ -98,9 +98,10 @@ pub async fn accept(
             size: 0,
         }
         .valid();
-        let location = match objects::copy(context, &document, oid).await? {
-            Some(copy) => Some(copy),
-            None => state.lfs.get(oid).cloned(),
+        // A known object keeps its original location, so access is decided for the original.
+        let location = match state.lfs.get(oid) {
+            Some(original) => Some(original.clone()),
+            None => objects::copy(context, &document, oid).await?,
         };
         lfs.push(location.filter(|_| valid).ok_or(GitError::Invalid)?);
     }
