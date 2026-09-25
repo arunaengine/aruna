@@ -4,6 +4,8 @@
 
 use super::project::{Projection, author, lock, project};
 use super::{GitError, document, objects, publish, records};
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
@@ -22,6 +24,7 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{event_log_key, materialization_status_key};
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{NodeId, UserId};
@@ -110,6 +113,24 @@ async fn resolve(
         let bucket = drive(GetBucketOperation::new(exact.bucket.clone()), context)
             .await
             .map_err(|_| GitError::NotFound)?;
+        // Size and digests of a local object are shown only to users who may read it.
+        let path = object_permission_path(
+            exact.realm_id,
+            bucket.group_id,
+            node,
+            &exact.bucket,
+            &exact.key,
+        );
+        authorize(
+            context,
+            exact.realm_id,
+            &author(user),
+            &path,
+            &Permission::READ,
+            PolicyRequestExtras::rest(),
+        )
+        .await
+        .map_err(|_| GitError::NotFound)?;
         let input = GetObjectInput {
             bucket: exact.bucket.clone(),
             key: exact.key.clone(),
