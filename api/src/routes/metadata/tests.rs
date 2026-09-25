@@ -4433,7 +4433,7 @@ async fn pid_lookup_hides_private() {
         document_id,
         identifiers,
         aruna_core::time::unix_timestamp_millis(),
-        None,
+        test.auth.clone(),
     )
     .await
     .unwrap();

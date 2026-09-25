@@ -20,6 +20,7 @@ use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::PersistentIdFailure;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
@@ -243,15 +244,27 @@ pub async fn withdraw_pid_routed(
 }
 
 /// Adds external identifiers through the document's authority, which owns the mapping lineage.
+/// The caller needs WRITE on the document on every path, as a forwarded request re-checks.
 pub async fn add_identifiers_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     document_id: Ulid,
     identifiers: Vec<SecondaryIdentifier>,
     occurred_at_ms: u64,
-    auth_token: Option<AuthToken>,
+    auth: AuthContext,
 ) -> Result<(PersistentIdMapping, bool), MetadataApiError> {
-    let add = || {
+    let add = async || {
+        let record = existing_record(context, document_id)
+            .await
+            .map_err(MetadataApiError::Internal)?
+            .ok_or(MetadataApiError::NotFound)?;
+        authorize_write(context, auth.clone(), record.permission_path)
+            .await
+            .map_err(|error| match error {
+                ForwardAuthError::Unauthorized => MetadataApiError::Unauthorized,
+                ForwardAuthError::Forbidden => MetadataApiError::Forbidden,
+                ForwardAuthError::Unavailable(_) => MetadataApiError::ServiceUnavailable,
+            })?;
         crate::metadata::persistent_id::add_secondary_ids(
             context.as_ref(),
             realm_id,
@@ -259,14 +272,17 @@ pub async fn add_identifiers_routed(
             identifiers.clone(),
             occurred_at_ms,
         )
+        .await
+        .map_err(pid_error)
     };
     if context.net_handle.is_none() {
-        return add().await.map_err(pid_error);
+        return add().await;
     }
     let (config, authority) = pid_authority(context, realm_id, document_id).await?;
     if is_local_node(context, authority) {
-        return add().await.map_err(pid_error);
+        return add().await;
     }
+    let auth_token = Some(AuthToken::internal(auth.clone()));
     let outcome = forward_pid(
         context,
         &config,

@@ -321,6 +321,7 @@ pub(super) fn succeeded(outcome: JobRunOutcome) {
     match outcome {
         JobRunOutcome::Succeeded(_) => {}
         JobRunOutcome::Failed(error) => panic!("push failed: {}", error.message),
+        JobRunOutcome::Deferred(error) => panic!("job deferred: {}", error.message),
         _ => panic!("unexpected push outcome"),
     }
 }

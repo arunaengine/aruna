@@ -76,7 +76,7 @@ pub async fn run_register_identifiers(
         spec.document_id,
         spec.identifiers.clone(),
         unix_timestamp_millis(),
-        Some(AuthToken::internal(spec.auth_context.clone())),
+        spec.auth_context.clone(),
     )
     .await;
     match result {

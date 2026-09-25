@@ -31,6 +31,8 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
         JobRunOutcome::Failed(error) => panic!("{}", error.message),
         _ => panic!("unexpected import outcome"),
     }
+    // Registration checks WRITE on the document, so it waits for its registry row.
+    replay_event_log(fixture.context.as_ref()).await?;
     Box::pin(super::link::run_registration(
         &fixture,
         ctx.job_id,
@@ -57,6 +59,36 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
             ("invenio_record", "2", endpoint.clone()),
             ("invenio_parent", "parent", endpoint),
         ]
+    );
+    // Adding identifiers needs WRITE on the document, also on the authority itself.
+    let stranger = AuthContext {
+        user_id: aruna_core::UserId::local(ulid::Ulid::from_parts(7, 7), fixture.actor.realm_id),
+        realm_id: fixture.actor.realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let doi = aruna_core::structs::secondary_id::SecondaryIdentifier::new(
+        aruna_core::structs::secondary_id::SecondaryIdKind::Doi,
+        "10.1234/foreign",
+        None,
+        aruna_core::structs::secondary_id::IdentifierOrigin::Published,
+    )?;
+    let denied = aruna_operations::metadata::persistent_id::forward::add_identifiers_routed(
+        &fixture.context,
+        fixture.actor.realm_id,
+        doc_id(1),
+        vec![doi],
+        unix_timestamp_millis(),
+        stranger,
+    )
+    .await;
+    assert!(
+        matches!(
+            denied,
+            Err(aruna_operations::metadata::api::MetadataApiError::Forbidden
+                | aruna_operations::metadata::api::MetadataApiError::Unauthorized)
+        ),
+        "{denied:?}"
     );
     for id in ["1", "2"] {
         let key = format!(
