@@ -227,7 +227,9 @@ registry view. A path-restricted delegated token is refused even when it would p
 - `status_url`, `report_url` and `artifact_url` are absolute and point at the owning node, the only
   node that can serve them.
 - Submissions are idempotent per caller when `idempotency_key` is set: replaying the same key
-  returns the same job with `created` false, while reusing it for a different document conflicts."#,
+  returns the same job with `created` false, while reusing it for a different document conflicts.
+- Repository exports use `POST /metadata/{document_id}/invenio/exports`; a `destination` field
+  here is refused as an unknown field."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = SubmitExportRequest,
