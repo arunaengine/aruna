@@ -284,8 +284,13 @@ pub async fn submit_rocrate_export(
     .await?;
     // Publishing the dataset as a repository record needs WRITE on it.
     if request.destination.is_some() {
-        crate::auth::ensure_permission(&state, &auth, record.permission_path, Permission::WRITE)
-            .await?;
+        Box::pin(crate::auth::ensure_permission(
+            &state,
+            &auth,
+            record.permission_path,
+            Permission::WRITE,
+        ))
+        .await?;
     }
     let mut access_token = None;
     let mut destination = request

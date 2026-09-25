@@ -337,7 +337,13 @@ pub async fn submit_import(
     } = &mut source
     {
         // A pull link is managed like any link of the connector group.
-        crate::metadata::ensure_metadata_scope(&state, &auth, *group_id, Permission::WRITE).await?;
+        Box::pin(crate::metadata::ensure_metadata_scope(
+            &state,
+            &auth,
+            *group_id,
+            Permission::WRITE,
+        ))
+        .await?;
         *owner_node_url = state
             .interface_state()
             .await

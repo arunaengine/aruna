@@ -484,8 +484,14 @@ pub async fn create_link(
     let connector_id = parse_ulid(&request.connector_id)?;
     ensure_metadata_scope(&state, &auth, group_id, Permission::WRITE).await?;
     // Publishing the dataset as a repository record needs WRITE on it.
-    let record = load_document_record(&state, document_id).await?;
-    ensure_permission(&state, &auth, record.permission_path, Permission::WRITE).await?;
+    let record = Box::pin(load_document_record(&state, document_id)).await?;
+    Box::pin(ensure_permission(
+        &state,
+        &auth,
+        record.permission_path,
+        Permission::WRITE,
+    ))
+    .await?;
     if let Some(parent) = &request.parent_id {
         validate_id(parent).map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     }
