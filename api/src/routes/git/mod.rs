@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod branches;
 mod lfs;
 mod locks;
 mod snapshot;
@@ -39,7 +40,15 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(versions::show))
         .routes(routes!(versions::rocrate))
         .routes(routes!(versions::compare))
+        .routes(routes!(branches::branches, branches::create_branch))
+        .routes(routes!(branches::delete_branch))
+        .routes(routes!(branches::edit))
+        .routes(routes!(branches::merge))
+        .routes(routes!(branches::tags, branches::create_tag))
+        .routes(routes!(branches::delete_tag))
         .routes(routes!(versions::conflicts))
+        .routes(routes!(branches::merge_conflict))
+        .routes(routes!(branches::discard_conflict))
 }
 
 pub async fn credentials(mut request: Request, next: Next) -> Response {
