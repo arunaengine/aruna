@@ -467,7 +467,12 @@ pub fn crate_versions(document: &Value) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|entity| {
-            let id = entity["@id"].as_str()?.strip_prefix("versions/")?;
+            let id = entity["@id"].as_str()?;
+            // A stored crate names its parts relative to the root, such as `./versions/1/`.
+            let id = id
+                .strip_prefix("./")
+                .unwrap_or(id)
+                .strip_prefix("versions/")?;
             let id = id.strip_suffix('/')?;
             validate_id(id).ok().map(|_| id.to_string())
         })

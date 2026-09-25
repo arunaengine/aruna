@@ -451,6 +451,9 @@ fn pull_adds_versions() {
         if entity["@id"] == file_path("1", "data.csv").unwrap() {
             entity["@id"] = json!("https://w3id.org/aruna/object/1");
         }
+        if entity["@id"] == "versions/1/" {
+            entity["@id"] = json!("./versions/1/");
+        }
     }
     let (latest, files) = version("2");
     let merged = pull_crate(
@@ -467,6 +470,10 @@ fn pull_adds_versions() {
     assert_eq!(
         root["hasPart"],
         json!([{"@id": "versions/1/"}, {"@id": "versions/2/"}])
+    );
+    assert_eq!(
+        crate_versions(&json!({"@graph": [{"@id": "./versions/3/"}, {"@id": "versions/../"}]})),
+        ["3"]
     );
     assert!(
         graph

@@ -580,7 +580,7 @@ pub async fn change_link(
         _ => None,
     };
     if let Some(enabled) = enabled {
-        ensure_lineage(&context.storage_handle, enabled).await?;
+        Box::pin(ensure_lineage(&context.storage_handle, enabled)).await?;
     }
     let operation =
         ChangeLinkOperation::new(link.document_id, link.link_id, change, SystemTime::now())

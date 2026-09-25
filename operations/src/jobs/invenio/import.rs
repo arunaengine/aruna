@@ -83,12 +83,12 @@ pub(crate) async fn acquire(
         .ok_or_else(|| invalid("requested record absent from history"))?;
     let (document, records, base) = match pull {
         Some(InvenioPull::Update { .. }) => {
-            let (jsonld, base) = crate::jobs::export::crate_jsonld(
+            let (jsonld, base) = Box::pin(crate::jobs::export::crate_jsonld(
                 &ctx.driver,
                 &spec.auth_context,
                 spec.document_id,
                 spec.limits.metadata_bytes,
-            )
+            ))
             .await?;
             let current: Value =
                 serde_json::from_str(&jsonld).map_err(|_| invalid("invalid dataset crate"))?;
@@ -496,7 +496,7 @@ pub(crate) async fn settle_import(
                 link: Box::new(link.clone()),
                 secret: None,
             };
-            match change_link(&ctx.driver, &link, change).await {
+            match Box::pin(change_link(&ctx.driver, &link, change)).await {
                 Ok(_) | Err(LinkError::Exists) => Ok(()),
                 Err(error) => Err(error),
             }
@@ -524,7 +524,7 @@ pub(crate) async fn settle_import(
                     requeue: false,
                 },
             };
-            match change_link(&ctx.driver, &link, change).await {
+            match Box::pin(change_link(&ctx.driver, &link, change)).await {
                 Ok(_) | Err(LinkError::NotFound) => Ok(()),
                 Err(error) => Err(error),
             }

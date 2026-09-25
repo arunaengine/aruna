@@ -227,7 +227,7 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
         }
 
         let result = match checkpoint.phase {
-            ImportPhase::Acquire => acquire_source(ctx, spec, &mut checkpoint)
+            ImportPhase::Acquire => Box::pin(acquire_source(ctx, spec, &mut checkpoint))
                 .await
                 .map(|input| {
                     checkpoint.refs.hidden_locations = vec![input.location.clone()];
@@ -263,7 +263,7 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                 )),
             },
             ImportPhase::Create if updates_link(spec) => match plan.as_ref() {
-                Some(plan) => update_document(ctx, spec, &mut checkpoint, plan).await,
+                Some(plan) => Box::pin(update_document(ctx, spec, &mut checkpoint, plan)).await,
                 None => Err(ImportFailure::Permanent(
                     "import plan is missing".to_string(),
                 )),
@@ -1173,12 +1173,12 @@ async fn update_document(
         .as_ref()
         .and_then(|pull| pull.base())
         .ok_or_else(|| ImportFailure::Permanent("pull base revision is missing".to_string()))?;
-    let (current, event_id) = crate::jobs::export::crate_jsonld(
+    let (current, event_id) = Box::pin(crate::jobs::export::crate_jsonld(
         &ctx.driver,
         &spec.auth_context,
         spec.document_id,
         spec.limits.metadata_bytes,
-    )
+    ))
     .await
     .map_err(transfer_failure)?;
     let revision = if event_id == base {
@@ -1191,7 +1191,7 @@ async fn update_document(
             crate::metadata::get_document::load_document_record(&ctx.driver, spec.document_id)
                 .await
                 .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
-        route_metadata_update(
+        Box::pin(route_metadata_update(
             &ctx.driver,
             actor,
             record.as_ref(),
@@ -1199,7 +1199,7 @@ async fn update_document(
             None,
             UpdateDocumentMutation::ReplaceRoCrate { jsonld },
             Some(AuthToken::internal(spec.auth_context.clone())),
-        )
+        ))
         .await
         .map_err(classify_metadata)?
         .last_event_id
@@ -1273,12 +1273,12 @@ async fn cleanup_source(
         register_identifiers(ctx, spec, checkpoint.identifiers.clone()).await?;
         checkpoint.identifiers.clear();
     }
-    super::invenio::import::settle_import(
+    Box::pin(super::invenio::import::settle_import(
         ctx,
         spec,
         checkpoint.pull.as_ref(),
         checkpoint.failure.as_deref(),
-    )
+    ))
     .await
     .map_err(|error| {
         ImportFailure::Retryable(format!("recording the pull link failed: {error}"))
