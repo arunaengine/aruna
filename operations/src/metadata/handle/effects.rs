@@ -992,6 +992,7 @@ fn sync_effect(
         MetadataEffect::PlanBatch {
             graph_iri,
             actor,
+            counter,
             source,
         } => {
             let call_span = debug_span!(
@@ -1004,7 +1005,7 @@ fn sync_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| plan_batch(node, auth, &graph_iri, actor, &source))
+                .in_scope(|| plan_batch(node, auth, &graph_iri, (actor, counter), &source))
                 .map(|batch| {
                     call_span.record("batch_ops", batch.ops.len() as u64);
                     MetadataEvent::BatchPlanned {

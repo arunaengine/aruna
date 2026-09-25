@@ -5,17 +5,19 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, METADATA_ACTOR_KEYSPACE, RAW_BUDGET_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    EVENT_LIMIT, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord, ProfileValidationStatus,
-    RAW_BYTES_LIMIT, RawOriginBudget, deterministic_materialization_actor, raw_quotas,
+    EVENT_LIMIT, MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError,
+    MetadataEvent, MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
+    ProfileValidationStatus, RAW_BYTES_LIMIT, RawOriginBudget, raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     create_acceptance_key, document_lifecycle_entry, event_log_key, event_log_prefix,
-    profile_validation_entry, raw_budget_entry, raw_budget_key, sync_revision_entry,
+    metadata_actor_entry, metadata_actor_key, profile_validation_entry, raw_budget_entry,
+    raw_budget_key, sync_revision_entry,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -90,6 +92,8 @@ pub struct UpdateDocumentOperation {
     record: Option<MetadataRegistryRecord>,
     update_event: Option<MetadataEventRecord>,
     planned_batch: Option<MetadataBatch>,
+    /// This node's actor after this update's dot, written with the event.
+    actor: Option<MetadataActor>,
     raw_budget: Option<RawOriginBudget>,
     next_raw_budget: Option<RawOriginBudget>,
     accepted_create: Option<MetadataEventRecord>,
@@ -109,6 +113,7 @@ enum UpdateDocumentState {
     Init,
     ReadCurrent,
     ReadRealmConfig,
+    ReadActor,
     PlanBatch,
     StartTransaction,
     ReadFence,
@@ -182,6 +187,7 @@ impl UpdateDocumentOperation {
             record: None,
             update_event: None,
             planned_batch,
+            actor: None,
             raw_budget: None,
             next_raw_budget: None,
             accepted_create: None,
@@ -292,9 +298,15 @@ impl UpdateDocumentOperation {
                 validate_entity_jsonld(jsonld)?;
             }
         }
+        let Some(actor) = self.actor.as_ref() else {
+            return Err(MetadataError::Backend(
+                "metadata actor is missing before planning".to_string(),
+            ));
+        };
         Ok(Some(Effect::Metadata(MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
-            actor: deterministic_materialization_actor(self.event_id),
+            actor: actor.actor,
+            counter: actor.counter,
             source: self.batch_source(),
         })))
     }
@@ -375,6 +387,9 @@ impl UpdateDocumentOperation {
             return Err(UpdateDocumentError::RawLimit);
         };
         writes.push(raw_budget_entry(raw_budget)?);
+        if let Some(actor) = &self.actor {
+            writes.push(metadata_actor_entry(actor)?);
+        }
         let Some(mut profile_status) = self.route_profile_status.clone() else {
             return Err(MetadataError::Backend(
                 "profile validation status is missing before update commit".to_string(),
@@ -594,6 +609,56 @@ impl UpdateDocumentOperation {
                         Err(error) => return self.fail(error.into()),
                     }
                 }
+                if matches!(
+                    self.config.mutation,
+                    UpdateDocumentMutation::ApplyBatch { .. }
+                ) {
+                    return self.begin_transaction_effect();
+                }
+                self.state = UpdateDocumentState::ReadActor;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: METADATA_ACTOR_KEYSPACE.to_string(),
+                    key: metadata_actor_key(self.config.document_id),
+                    txn_id: None,
+                })]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.unexpected_event("realm config read result", format!("{other:?}")),
+        }
+    }
+
+    /// Takes this node's next dot for the document. The event id is raised above the
+    /// node's previous one, so materialization applies the actor's dots in order.
+    fn read_actor(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                let current = match value
+                    .as_deref()
+                    .map(postcard::from_bytes::<MetadataActor>)
+                    .transpose()
+                {
+                    Ok(current) => current,
+                    Err(error) => {
+                        return self.fail(aruna_core::errors::ConversionError::from(error).into());
+                    }
+                };
+                if let Some(current) = &current
+                    && self.event_id <= current.last_event_id
+                {
+                    match current.last_event_id.increment() {
+                        Ok(next) => self.event_id = next,
+                        Err(_) => return self.fail(UpdateDocumentError::RawLimit),
+                    }
+                }
+                self.actor = MetadataActor::next(
+                    current.as_ref(),
+                    self.config.document_id,
+                    self.config.actor.node_id,
+                    self.event_id,
+                );
+                if self.actor.is_none() {
+                    return self.fail(UpdateDocumentError::RawLimit);
+                }
                 let Some(record) = self.record.clone() else {
                     return self.fail(UpdateDocumentError::DocumentNotFound);
                 };
@@ -607,7 +672,7 @@ impl UpdateDocumentOperation {
                 }
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("realm config read result", format!("{other:?}")),
+            other => self.unexpected_event("metadata actor read result", format!("{other:?}")),
         }
     }
 
@@ -871,10 +936,16 @@ impl UpdateDocumentOperation {
     }
 }
 
+static UPDATE_LOCKS: std::sync::LazyLock<[tokio::sync::Mutex<()>; 64]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|_| tokio::sync::Mutex::new(())));
+
 pub async fn update_metadata_document(
     mut operation: UpdateDocumentOperation,
     context: &DriverContext,
 ) -> Result<MetadataRegistryRecord, UpdateDocumentError> {
+    // One update per document at a time on this node keeps its actor's dots in order.
+    let lock = usize::from(operation.config.document_id.to_bytes()[15]) % 64;
+    let _guard = UPDATE_LOCKS[lock].lock().await;
     operation.route_profile_status = Some(match &operation.config.mutation {
         UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
             validate_submission(
@@ -979,6 +1050,7 @@ impl Operation for UpdateDocumentOperation {
         match self.state {
             UpdateDocumentState::ReadCurrent => self.read_current(event),
             UpdateDocumentState::ReadRealmConfig => self.read_realm_config(event),
+            UpdateDocumentState::ReadActor => self.read_actor(event),
             UpdateDocumentState::PlanBatch => self.plan_batch(event),
             UpdateDocumentState::StartTransaction => self.start_transaction(event),
             UpdateDocumentState::ReadFence => self.read_fence(event),
@@ -1121,6 +1193,19 @@ mod pure_tests {
             key: ByteView::from(*record.realm_id.as_bytes()),
             value: None,
         })
+    }
+
+    /// Answers the realm config and then the node's first actor read for the document.
+    fn configured(operation: &mut UpdateDocumentOperation, config: Event) -> Effects {
+        let effects = operation.step(config);
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the metadata actor read, got {effects:?}");
+        };
+        assert_eq!(key_space, METADATA_ACTOR_KEYSPACE);
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(Vec::new()),
+            value: None,
+        }))
     }
 
     fn create_event(record: &MetadataRegistryRecord) -> MetadataEventRecord {
@@ -1371,7 +1456,7 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        operation.step(realm_config_read(&record));
+        configured(&mut operation, realm_config_read(&record));
         operation.step(batch_planned(&record));
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
@@ -1413,7 +1498,7 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        assert_plan_batch(operation.step(realm_config_read(&record)).as_slice());
+        assert_plan_batch(configured(&mut operation, realm_config_read(&record)).as_slice());
         assert_start_transaction(operation.step(batch_planned(&record)).as_slice());
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert!(matches!(
@@ -1511,7 +1596,7 @@ mod pure_tests {
     ) -> Effects {
         operation.start();
         operation.step(registry_read(record));
-        assert_plan_batch(operation.step(config).as_slice());
+        assert_plan_batch(configured(operation, config).as_slice());
         assert_start_transaction(operation.step(batch_planned(record)).as_slice());
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let reads = operation.step(registry_read(record));
@@ -1605,7 +1690,7 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        operation.step(realm_config_read(&record));
+        configured(&mut operation, realm_config_read(&record));
         operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
@@ -1645,7 +1730,7 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        operation.step(realm_config_read(&record));
+        configured(&mut operation, realm_config_read(&record));
         operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
@@ -1735,7 +1820,7 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        operation.step(realm_config_read(&record));
+        configured(&mut operation, realm_config_read(&record));
         operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
@@ -1797,7 +1882,7 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&current));
-        operation.step(realm_config_read(&current));
+        configured(&mut operation, realm_config_read(&current));
         operation.step(batch_planned(&current));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&current));
@@ -1825,7 +1910,7 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        operation.step(realm_config_read(&record));
+        configured(&mut operation, realm_config_read(&record));
         operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(registry_read(&record));
@@ -1858,7 +1943,7 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        assert_plan_batch(operation.step(realm_config_read(&record)).as_slice());
+        assert_plan_batch(configured(&mut operation, realm_config_read(&record)).as_slice());
         assert_start_transaction(operation.step(batch_planned(&record)).as_slice());
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -1892,7 +1977,7 @@ mod pure_tests {
         assert_no_mutation(operation.start().as_slice());
         let effects = operation.step(registry_read(&record));
         assert_no_mutation(effects.as_slice());
-        let effects = operation.step(realm_config_read(&record));
+        let effects = configured(&mut operation, realm_config_read(&record));
         let [Effect::Metadata(MetadataEffect::PlanBatch { graph_iri, .. })] = effects.as_slice()
         else {
             panic!("expected batch planning before transaction, got {effects:?}");
@@ -1933,7 +2018,7 @@ mod pure_tests {
         operation.start();
         let effects = operation.step(registry_read(&record));
         assert_no_mutation(effects.as_slice());
-        let effects = operation.step(realm_config_read(&record));
+        let effects = configured(&mut operation, realm_config_read(&record));
         assert_no_mutation(effects.as_slice());
         assert_plan_batch(effects.as_slice());
         assert_start_transaction(operation.step(batch_planned(&record)).as_slice());
@@ -1966,7 +2051,7 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        assert_plan_batch(operation.step(realm_config_read(&record)).as_slice());
+        assert_plan_batch(configured(&mut operation, realm_config_read(&record)).as_slice());
         assert_start_transaction(operation.step(batch_planned(&record)).as_slice());
 
         let _effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
@@ -1996,7 +2081,11 @@ mod pure_tests {
 
         operation.start();
         operation.step(registry_read(&record));
-        let effects = operation.read_realm_config(realm_config_read(&record));
+        operation.read_realm_config(realm_config_read(&record));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(Vec::new()),
+            value: None,
+        }));
         assert_no_mutation(effects.as_slice());
         assert_eq!(
             operation.finalize(),
@@ -2004,6 +2093,47 @@ mod pure_tests {
                 MetadataError::InvalidInput("entity payload must define string `@id`".to_string())
             ))
         );
+    }
+
+    #[test]
+    fn reuses_node_actor() {
+        let actor = actor();
+        let record = record(&actor);
+        let mut operation = UpdateDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateDocumentMutation::ReplaceRoCrate {
+                jsonld: replace_jsonld(record.document_id, "Actor Reuse"),
+            },
+        ));
+        let previous = MetadataActor {
+            document_id: record.document_id,
+            actor: [5u8; 32],
+            counter: 41,
+            last_event_id: Ulid::from_parts(u64::MAX >> 16, 7),
+        };
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(Vec::new()),
+            value: Some(postcard::to_allocvec(&previous).unwrap().into()),
+        }));
+        let [
+            Effect::Metadata(MetadataEffect::PlanBatch {
+                actor: planned,
+                counter,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected batch planning with the node actor, got {effects:?}");
+        };
+        assert_eq!((*planned, *counter), (previous.actor, 42));
+        assert!(operation.event_id > previous.last_event_id);
+        let next = operation.actor.clone().expect("actor advanced");
+        assert_eq!(next.last_event_id, operation.event_id);
+        assert_eq!(next.counter, 42);
     }
 
     #[test]
@@ -2022,7 +2152,7 @@ mod pure_tests {
         assert_no_mutation(operation.start().as_slice());
         let effects = operation.step(registry_read(&record));
         assert_no_mutation(effects.as_slice());
-        let effects = operation.step(realm_config_read(&record));
+        let effects = configured(&mut operation, realm_config_read(&record));
         assert_no_mutation(effects.as_slice());
         let effects = operation.step(batch_planned(&record));
         assert_no_mutation(effects.as_slice());

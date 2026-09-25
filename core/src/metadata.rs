@@ -307,6 +307,49 @@ pub struct RawOriginBudget {
     pub encoded_bytes: u64,
 }
 
+/// This node's CRDT actor for one document. Reusing it keeps vector clocks bounded by the
+/// number of writing nodes; the counter and last event id only ever grow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataActor {
+    pub document_id: Ulid,
+    pub actor: [u8; 32],
+    pub counter: u64,
+    pub last_event_id: Ulid,
+}
+
+impl MetadataActor {
+    /// The next dot after `current`; a node without one, or whose storage was reset,
+    /// starts a fresh actor so it never repeats a dot it may have used before.
+    pub fn next(
+        current: Option<&Self>,
+        document_id: Ulid,
+        node_id: NodeId,
+        event_id: Ulid,
+    ) -> Option<Self> {
+        match current {
+            Some(current) => Some(Self {
+                document_id,
+                actor: current.actor,
+                counter: current.counter.checked_add(1)?,
+                last_event_id: event_id,
+            }),
+            None => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"aruna-metadata-actor-v2\0");
+                hasher.update(node_id.as_bytes());
+                hasher.update(&document_id.to_bytes());
+                hasher.update(&event_id.to_bytes());
+                Some(Self {
+                    document_id,
+                    actor: *hasher.finalize().as_bytes(),
+                    counter: 1,
+                    last_event_id: event_id,
+                })
+            }
+        }
+    }
+}
+
 pub fn raw_quotas(
     document_id: Ulid,
     origins: &[NodeId],
@@ -1054,9 +1097,12 @@ pub enum MetadataEffect {
     // OR-Set metadata graphs
     /// Change set `source` would commit against the local graph, published as a
     /// batch under `actor`. Plans only: the graph is not mutated.
+    /// Plans `source` as dot `(actor, counter)`; a counter above one depends on the actor's
+    /// previous dot, so every replica applies one actor's batches in order.
     PlanBatch {
         graph_iri: String,
         actor: [u8; 32],
+        counter: u64,
         source: MetadataBatchSource,
     },
     MergeBatch {
@@ -1736,5 +1782,26 @@ mod tests {
             decoded.findings[0].profile_revision,
             Some(revision.to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::*;
+
+    #[test]
+    fn actors_stay_distinct() {
+        let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let document = Ulid::from(1);
+        let first = MetadataActor::next(None, document, node, Ulid::from(10)).expect("first");
+        assert_eq!(first.counter, 1);
+        let second =
+            MetadataActor::next(Some(&first), document, node, Ulid::from(11)).expect("next");
+        assert_eq!((second.actor, second.counter), (first.actor, 2));
+        // A node that lost its record must not reuse the old actor's dots.
+        let reset = MetadataActor::next(None, document, node, Ulid::from(12)).expect("reset");
+        assert_ne!(reset.actor, first.actor);
+        let other = MetadataActor::next(None, Ulid::from(2), node, Ulid::from(10)).expect("other");
+        assert_ne!(other.actor, first.actor);
     }
 }

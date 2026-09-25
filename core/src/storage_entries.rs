@@ -354,6 +354,20 @@ pub fn graph_prune_key(record: &GraphPruneRecord) -> Key {
     ByteView::from(bytes)
 }
 
+pub fn metadata_actor_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn metadata_actor_entry(
+    actor: &crate::metadata::MetadataActor,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        crate::keyspaces::METADATA_ACTOR_KEYSPACE.to_string(),
+        metadata_actor_key(actor.document_id),
+        postcard::to_allocvec(actor)?.into(),
+    ))
+}
+
 pub fn create_event_entry(
     event: &MetadataEventRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {

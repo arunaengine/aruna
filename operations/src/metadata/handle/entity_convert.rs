@@ -643,9 +643,10 @@ pub(super) fn plan_batch(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     graph_iri: &str,
-    actor: [u8; 32],
+    dot: ([u8; 32], u64),
     source: &MetadataBatchSource,
 ) -> Result<MetadataBatch, CraqleError> {
+    let (actor, counter) = dot;
     let graph = GraphId::new(graph_iri);
     // Planning against a graph this node has not materialized yet would omit
     // the removals the change set needs, so the caller must retry instead.
@@ -665,11 +666,15 @@ pub(super) fn plan_batch(
             node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)?
         }
     };
-    let base_clock = node.vector_clock(&graph)?;
+    let mut base_clock = node.vector_clock(&graph)?;
+    // The clock keeps one counter per actor, so a later dot must never land first.
+    if counter > 1 {
+        base_clock.advance(ActorId::from_bytes(actor), counter - 1);
+    }
     let batch = Batch::from_changes(
         graph,
         ActorId::from_bytes(actor),
-        1,
+        counter,
         base_clock,
         changes,
         chrono::Utc::now(),

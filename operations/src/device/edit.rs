@@ -131,6 +131,7 @@ async fn plan_local(
         .send_metadata_effect(MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
             actor,
+            counter: 1,
             source: authored.clone(),
         })
         .await
