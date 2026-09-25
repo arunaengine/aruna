@@ -76,9 +76,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: ReclaimCommands,
     },
-    /// Rewrite legacy job results and realm configs, then clear the projection cache.
-    /// Writes the database and must run while the node is stopped. Current rows stay
-    /// unchanged, so repeating the migration is safe.
+    /// Rewrite legacy job, PID mapping and realm rows, rebuild the identifier index and seal
+    /// plain secrets. Writes the database and must run while the node is stopped. Current
+    /// rows stay unchanged, so repeating the migration is safe.
     Migrate {
         database_path: String,
     },
