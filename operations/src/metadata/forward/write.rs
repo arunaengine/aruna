@@ -265,6 +265,7 @@ pub async fn create_metadata_authorized(
     Ok(record)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn route_metadata_update(
     context: &Arc<DriverContext>,
     actor: Actor,
