@@ -6,7 +6,7 @@ use super::fields::{
     Person, crate_root, entity, identifier, keywords, licenses, person, publication_start,
     schema_value, values,
 };
-use super::rules::{Convert, rules};
+use super::rules::{Convert, field_value, rules};
 use super::{ExportIdentity, RepositoryError};
 use crate::metadata::{INVENIO_PROFILE_IRI, ZENODO_PROFILE_IRI};
 use crate::structs::execution::harvest::RepositoryConnectorKind;
@@ -347,13 +347,8 @@ pub fn export_metadata(
             .and_then(|rules| rules.target("record"))
             .ok_or(RepositoryError("missing Invenio record rules"))?;
         for field in &record.fields {
-            let value = field
-                .property
-                .iter()
-                .map(|property| schema_value(root, property))
-                .find(|value| !value.is_null())
-                .unwrap_or(&Value::Null);
-            if let Some(mapped) = convert(field.convert, graph, root, value, identity) {
+            let value = field_value(root, field);
+            if let Some(mapped) = convert(field.convert, graph, root, &value, identity) {
                 metadata[&field.field] = mapped;
             }
         }

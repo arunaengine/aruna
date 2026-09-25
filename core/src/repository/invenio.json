@@ -19,6 +19,7 @@
     {
       "name": "file",
       "select": { "types": ["File", "MediaObject"], "with_bytes": true },
+      "crate_files": true,
       "content": { "max_files": 100 }
     }
   ]

@@ -146,9 +146,14 @@ fn preview_reports_violations() {
             .iter()
             .any(|m| m.entity_id == "r1.fastq" && m.group.as_deref() == Some("#s1"))
     );
-    assert_eq!(findings.len(), 1, "{findings:#?}");
-    assert_eq!(findings[0].code, "mapping_violation");
-    assert_eq!(findings[0].focus_node.as_deref(), Some("r2.fastq"));
+    // r2.fastq has no sample: no group and no relation.
+    assert_eq!(findings.len(), 2, "{findings:#?}");
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.code == "mapping_violation"
+                && finding.focus_node.as_deref() == Some("r2.fastq"))
+    );
     let (_, findings) = preview(&grouped, &json!({"@graph": []}));
     assert_eq!(findings[0].rule, "sample/min");
 }
