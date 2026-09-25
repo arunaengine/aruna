@@ -215,7 +215,7 @@ async fn check_link(
             Some(record) if !record.state.is_terminal() => {
                 Ok(Some(now.saturating_add(ACTIVE_RETRY_MS)))
             }
-            record => settle_stale(context, &link, job_id, record.as_ref()).await,
+            record => settle_stale(context, &link, job_id, record.as_ref(), queued).await,
         };
     }
     // A decided review stores the repository's answer, which queues another check.
@@ -248,6 +248,7 @@ async fn settle_stale(
     link: &InvenioLink,
     job_id: JobId,
     record: Option<&JobRecord>,
+    queued: &Value,
 ) -> Result<Option<u64>, LinkError> {
     // A push that finished remotely but failed to record it still counts as pushed.
     let checkpoint = crate::jobs::export::stored_checkpoint(&context.storage_handle, job_id)
@@ -280,8 +281,7 @@ async fn settle_stale(
     change_link(context, link, change).await?;
     // A cancelled push skips its change; the next change queues a new check.
     if cancelled {
-        delete_entry(&context.storage_handle, id_key(link.link_id)).await?;
-        return Ok(None);
+        return drop_unchanged(&context.storage_handle, link.link_id, queued).await;
     }
     Ok(Some(unix_timestamp_millis()))
 }
