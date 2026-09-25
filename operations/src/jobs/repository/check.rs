@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use aruna_core::metadata::{MetadataError, ProfileValidationFinding, ProfileValidationSeverity};
-use aruna_core::repository::rules::{Mapped, preview, rules};
+use aruna_core::repository::rules::{Mapped, finding, preview, rules};
+use aruna_core::repository::{LinkFailure, MAX_LINK_FINDINGS};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::AuthContext;
 use serde_json::Value;
@@ -88,4 +89,57 @@ pub(crate) async fn check_crate(
         findings,
         mapping,
     })
+}
+
+/// The content rules of a kind checked against the files an export would upload, as paths
+/// with sizes. File formats and MD5 checksums are not checked yet.
+pub(crate) fn check_content(
+    kind: RepositoryConnectorKind,
+    files: &[(&str, u64)],
+) -> Result<Vec<ProfileValidationFinding>, TransferError> {
+    let Some(rules) = rules(kind)? else {
+        return Ok(Vec::new());
+    };
+    let violation = |focus: &str, rule: String, message: String| {
+        finding("content_violation", Some(focus.into()), None, rule, message)
+    };
+    let mut findings = Vec::new();
+    for target in &rules.targets {
+        let content = &target.content;
+        if let Some(max) = content.max_files.filter(|max| files.len() > *max) {
+            let message = format!("The export has {} files, more than {max}.", files.len());
+            findings.push(violation(
+                "./",
+                format!("{}/max_files", target.name),
+                message,
+            ));
+        }
+        if let Some(max) = content.max_file_bytes {
+            for (path, size) in files.iter().filter(|(_, size)| *size > max) {
+                let message = format!("{path} has {size} bytes, more than {max}.");
+                findings.push(violation(
+                    path,
+                    format!("{}/max_file_bytes", target.name),
+                    message,
+                ));
+            }
+        }
+        let total = files.iter().map(|(_, size)| size).sum::<u64>();
+        if let Some(max) = content.max_total_bytes.filter(|max| total > *max) {
+            let message = format!("The export has {total} bytes, more than {max}.");
+            findings.push(violation(
+                "./",
+                format!("{}/max_total_bytes", target.name),
+                message,
+            ));
+        }
+    }
+    Ok(findings)
+}
+
+/// A refusal a link records: violations first, at most `MAX_LINK_FINDINGS` findings.
+pub(crate) fn unmet(mut findings: Vec<ProfileValidationFinding>) -> TransferError {
+    findings.sort_by_key(|finding| finding.severity != ProfileValidationSeverity::Violation);
+    findings.truncate(MAX_LINK_FINDINGS);
+    TransferError::Refused(LinkFailure::RequirementsUnmet(findings))
 }

@@ -11,6 +11,7 @@ use ulid::Ulid;
 use super::{ImportOptions, RepositoryDestination, RepositoryRecord};
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::metadata::ProfileValidationFinding;
 use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::execution::job::{ImportRoCrateTarget, JobId, RoCrateLimits};
 use crate::structs::placement::record::PlacementRef;
@@ -24,8 +25,8 @@ pub const LINK_DEBOUNCE_CAP_MS: u64 = 300_000;
 pub const AUTO_PUBLISH_QUIET_MS: u64 = 900_000;
 /// How often a link asks the repository about a pending community review.
 pub const REVIEW_POLL_MS: u64 = 3_600_000;
-/// Zenodo accepts at most this many files per record.
-pub const MAX_RECORD_FILES: usize = 100;
+/// A failed link keeps at most this many requirement findings.
+pub const MAX_LINK_FINDINGS: usize = 20;
 /// How often a pull link asks the repository for a new version.
 pub const PULL_CHECK_MS: u64 = 86_400_000;
 /// First wait after a pull check found the repository busy or unreachable; it doubles per failure.
@@ -39,8 +40,8 @@ pub enum LinkFailure {
     Other(String),
     /// The owner node no longer holds the dataset, so it cannot push it.
     OwnerNotHolder,
-    /// The crate has more files than one repository record accepts.
-    TooManyFiles,
+    /// The crate does not meet the repository's requirements; the next dataset change retries.
+    RequirementsUnmet(Vec<ProfileValidationFinding>),
 }
 
 impl LinkFailure {
@@ -51,7 +52,7 @@ impl LinkFailure {
             Self::SourceUnavailable => "source_unavailable",
             Self::Other(reason) => reason,
             Self::OwnerNotHolder => "owner_not_holder",
-            Self::TooManyFiles => "too_many_files",
+            Self::RequirementsUnmet(_) => "requirements_unmet",
         }
     }
 }
@@ -460,6 +461,17 @@ impl RepositoryLink {
         }
         self.warning = None;
         self.updated_at = now;
+    }
+
+    /// A push link that failed on unmet requirements pushes again after the next dataset change.
+    pub fn retries_on_change(&self) -> bool {
+        self.pull().is_none()
+            && matches!(
+                self.status,
+                LinkStatus::Failed {
+                    reason: LinkFailure::RequirementsUnmet(_)
+                }
+            )
     }
 
     /// Whether auto_publish still has an open draft to publish once the dataset is quiet.

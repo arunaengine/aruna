@@ -515,7 +515,9 @@ async fn repository_export(
     destination: &aruna_core::repository::RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    use super::repository::{TransferError, connector_kind, deposit};
+    use super::repository::check::{check_crate, unmet};
+    use super::repository::{TransferError, deposit, repository};
+    use aruna_core::repository::LinkFailure;
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
             "repository export requires a complete crate with no omitted files".into(),
@@ -524,10 +526,24 @@ async fn repository_export(
     let exported = if checkpoint.repository_complete {
         Ok(())
     } else {
-        match connector_kind(&ctx.driver, destination.group_id, destination.connector_id).await {
-            Ok(kind) => deposit(kind, ctx, spec, destination, checkpoint).await,
-            Err(error) => Err(error),
-        }
+        Box::pin(async {
+            let view =
+                repository(&ctx.driver, destination.group_id, destination.connector_id).await?;
+            let kind = view.connector.kind;
+            // The snapshot must still meet the requirements before this job writes remotely.
+            if checkpoint.repository.is_none() {
+                let jsonld = checkpoint.raw_jsonld.as_deref().ok_or_else(|| {
+                    TransferError::Permanent("source crate metadata missing".into())
+                })?;
+                let endpoint = &view.connector.endpoint;
+                let checked = check_crate(&ctx.driver, kind, endpoint, jsonld).await?;
+                if !checked.ready {
+                    return Err(unmet(checked.findings));
+                }
+            }
+            deposit(kind, ctx, spec, destination, checkpoint).await
+        })
+        .await
     };
     // Queued on every run of this phase, so a failed queue is retried; the dedup key joins.
     let result = match exported {
@@ -544,7 +560,17 @@ async fn repository_export(
         Err(TransferError::Cancelled) => Err(ExportFailure::Cancelled),
         Err(TransferError::Interrupted) => Err(ExportFailure::Interrupted),
         Err(error @ TransferError::Refused(_)) => {
-            let message = error.to_string();
+            let message = match &error {
+                TransferError::Refused(LinkFailure::RequirementsUnmet(findings)) => format!(
+                    "the crate does not meet the repository's requirements: {}",
+                    findings
+                        .iter()
+                        .map(|finding| finding.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                error => error.to_string(),
+            };
             if let TransferError::Refused(failure) = error {
                 checkpoint.link_failure = Some(failure);
             }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aruna_core::repository::invenio::validate_id;
-use aruna_core::repository::{LinkRemote, LinkStatus, RepositoryLink};
+use aruna_core::repository::{LinkFailure, LinkRemote, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
@@ -27,7 +27,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::auth::{ensure_permission, ensure_permission_with, require_unrestricted_auth};
-use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::error::{ErrorResponse, ProfileFindingResponse, ServerError, ServerResult};
 use crate::metadata::{ensure_metadata_scope, load_document_record, parse_document_id};
 use crate::routes::execution::jobs::job_urls;
 use crate::server::state::ServerState;
@@ -143,7 +143,7 @@ pub struct InvenioLinkResponse {
     /// enabled, paused or failed.
     pub status: String,
     /// Failure reason such as remote_changed, token_rejected, source_unavailable,
-    /// too_many_files or owner_not_holder. An enabled pull link shows update_available, or
+    /// requirements_unmet or owner_not_holder. An enabled pull link shows update_available, or
     /// local_changed when a local edit holds the update back. An enabled push link shows
     /// review_declined after a declined community review. These are information, not failures.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,6 +151,9 @@ pub struct InvenioLinkResponse {
     /// A check that failed after the repository had already published the last push.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// For reason requirements_unmet: what the crate lacks. The next dataset change retries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub findings: Option<Vec<ProfileFindingResponse>>,
     pub auto_publish: bool,
     pub public_files: bool,
     /// A push is queued or running, or a pull is running.
@@ -201,6 +204,12 @@ fn timestamp(value: SystemTime) -> String {
 pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> InvenioLinkResponse {
     let info = link.info_reason().map(str::to_string);
     let pull = link.pull().cloned();
+    let findings = match &link.status {
+        LinkStatus::Failed {
+            reason: LinkFailure::RequirementsUnmet(findings),
+        } => Some(findings.iter().cloned().map(Into::into).collect()),
+        _ => None,
+    };
     let (status, reason) = match &link.status {
         LinkStatus::Enabled if !holds => ("failed", Some("owner_not_holder".to_string())),
         LinkStatus::Enabled => ("enabled", info),
@@ -232,6 +241,7 @@ pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> Inven
         status: status.to_string(),
         reason,
         warning: link.warning,
+        findings,
         auto_publish: link.auto_publish,
         public_files: link.public_files,
         // A pull link always has its next check queued, so only a running pull is pending.

@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::link::{
-    LINK_TOKEN, attach, change, current, drain, due_now, import_dataset, linked, run_push,
-    succeeded,
+    LINK_TOKEN, attach, change, current, drain, due_now, import_dataset, linked, replace_crate,
+    run_push, succeeded,
 };
 use super::remote::remote;
 use super::*;
@@ -14,6 +14,7 @@ use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError, change_link};
 use aruna_operations::jobs::repository::remote_state;
+use aruna_operations::metadata::raw_revision::load_raw_revision;
 
 async fn push_now(
     fixture: &Fixture,
@@ -527,8 +528,86 @@ async fn file_limit_refused() -> Result<(), Box<dyn std::error::Error>> {
         JobRunOutcome::Failed(_)
     ));
     let (failed, _) = current(&fixture, &link).await;
-    assert_eq!(failure(&failed), Some(&LinkFailure::TooManyFiles));
+    let Some(LinkFailure::RequirementsUnmet(findings)) = failure(&failed) else {
+        panic!("expected unmet requirements, got {:?}", failed.status);
+    };
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].code, "content_violation");
+    assert_eq!(findings[0].rule, "file/max_files");
+    // Refused before any remote write: no draft was created.
     assert!(server.state.lock().unwrap().records.is_empty());
+    assert!(failed.remote.draft_id.is_none());
+    fixture.stop().await;
+    Ok(())
+}
+
+/// Sets or removes the creator of the dataset's crate root.
+async fn set_creator(
+    fixture: &Fixture,
+    creator: Option<Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
+        .await?
+        .ok_or("revision missing")?;
+    let mut document: Value = serde_json::from_str(&revision.jsonld)?;
+    let graph = document["@graph"].as_array_mut().ok_or("graph missing")?;
+    for entity in graph
+        .iter_mut()
+        .filter(|entity| entity["@type"] == "Dataset")
+    {
+        match &creator {
+            Some(creator) => entity["creator"] = creator.clone(),
+            None => {
+                entity
+                    .as_object_mut()
+                    .ok_or("root is no object")?
+                    .remove("creator");
+            }
+        }
+    }
+    replace_crate(fixture, &document).await
+}
+
+#[tokio::test]
+async fn unmet_link_recovers() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    Box::pin(import_dataset(&fixture, archive_with(1).await?)).await?;
+    Box::pin(set_creator(&fixture, None)).await?;
+    let link = Box::pin(attach(
+        &fixture,
+        &server.endpoint,
+        LINK_TOKEN,
+        false,
+        None,
+        None,
+    ))
+    .await?;
+    drain(&fixture).await?;
+    assert!(matches!(
+        run_push(&fixture, &link).await?,
+        JobRunOutcome::Failed(_)
+    ));
+    let (failed, _) = current(&fixture, &link).await;
+    let Some(LinkFailure::RequirementsUnmet(findings)) = failure(&failed) else {
+        panic!("expected unmet requirements, got {:?}", failed.status);
+    };
+    assert!(findings.iter().any(|finding| {
+        finding.path.as_deref()
+            == Some("(<http://schema.org/author> | <http://schema.org/creator>)")
+    }));
+    assert!(server.state.lock().unwrap().records.is_empty());
+
+    // The next dataset change retries the failed link.
+    let creator = json!({"@type": "Person", "familyName": "Researcher"});
+    Box::pin(set_creator(&fixture, Some(creator))).await?;
+    assert!(current(&fixture, &link).await.1, "the edit queued a retry");
+    due_now(&fixture, &link).await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let (recovered, _) = current(&fixture, &link).await;
+    assert_eq!(recovered.status, LinkStatus::Enabled);
+    assert_eq!(server.state.lock().unwrap().records.len(), 1);
     fixture.stop().await;
     Ok(())
 }

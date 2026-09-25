@@ -264,7 +264,7 @@ pub(super) async fn change(
 }
 
 /// Stores `document` as the dataset's new crate and materializes it.
-async fn replace_crate(
+pub(super) async fn replace_crate(
     fixture: &Fixture,
     document: &Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -725,7 +725,7 @@ async fn lost_holder_fails() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn scaffold_link_pushes() -> Result<(), Box<dyn std::error::Error>> {
+async fn scaffold_link_checked() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;
     drive(
@@ -759,7 +759,7 @@ async fn scaffold_link_pushes() -> Result<(), Box<dyn std::error::Error>> {
         None,
     ))
     .await?;
-    // Scaffold fields name no creator or publisher, so the link supplies them as overrides.
+    // Scaffold fields name no creator or publisher, and link overrides do not supply them.
     let creators = json!({"publisher": "Aruna test", "creators": [{"person_or_org": {
         "type": "personal", "given_name": "Ada", "family_name": "Lovelace"}}]});
     let patch = LinkPatch {
@@ -774,14 +774,24 @@ async fn scaffold_link_pushes() -> Result<(), Box<dyn std::error::Error>> {
     );
     drive(change, &fixture.context).await?;
     drain(&fixture).await?;
-    succeeded(run_push(&fixture, &link).await?);
-    let (pushed, _) = current(&fixture, &link).await;
-    assert_eq!(pushed.remote.draft_id.as_deref(), Some("1"));
-    assert_eq!(keys(&server, "1"), ["ro-crate-metadata.json"]);
-    // The pushed revision counts as current, so an unchanged scaffold starts no second push.
-    due_now(&fixture, &link).await?;
-    drain(&fixture).await?;
-    assert_eq!(current(&fixture, &link).await, (pushed, false));
+    assert!(matches!(
+        run_push(&fixture, &link).await?,
+        JobRunOutcome::Failed(_)
+    ));
+    // The findings come from the scaffold's rendered crate, which the push read.
+    let (failed, _) = current(&fixture, &link).await;
+    let LinkStatus::Failed {
+        reason: LinkFailure::RequirementsUnmet(findings),
+    } = &failed.status
+    else {
+        panic!("expected unmet requirements, got {:?}", failed.status);
+    };
+    let paths = findings
+        .iter()
+        .filter_map(|finding| finding.path.as_deref())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&"http://schema.org/publisher"), "{paths:?}");
+    assert!(server.state.lock().unwrap().records.is_empty());
     fixture.stop().await;
     Ok(())
 }

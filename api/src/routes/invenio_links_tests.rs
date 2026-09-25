@@ -449,6 +449,43 @@ async fn publisher_needed_off_zenodo() {
 }
 
 #[tokio::test]
+async fn unmet_link_findings() {
+    let linked = setup().await;
+    let link = create(&linked, Some(linked.test.auth.clone()))
+        .await
+        .unwrap();
+    let mut stored = aruna_operations::jobs::repository::links::read_link(
+        &linked.test.state.get_ctx().storage_handle,
+        parse_document_id(&linked.document_id).unwrap(),
+        Ulid::from_string(&link.link_id).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let finding = aruna_core::repository::rules::finding(
+        "content_violation",
+        Some("./".into()),
+        None,
+        "file/max_files".into(),
+        "The export has 101 files, more than 100.".into(),
+    );
+    stored.status = LinkStatus::Failed {
+        reason: LinkFailure::RequirementsUnmet(vec![finding]),
+    };
+    let shown = serde_json::to_value(response(stored, false, true)).unwrap();
+    assert_eq!(shown["reason"], "requirements_unmet");
+    assert_eq!(shown["kind"], "invenio");
+    assert_eq!(shown["findings"][0]["rule"], "file/max_files");
+    assert_eq!(shown["findings"][0]["severity"], "violation");
+    assert!(
+        serde_json::to_value(&link)
+            .unwrap()
+            .get("findings")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn admin_rights_limited() {
     let linked = setup().await;
     let state = || State(linked.test.state.clone());

@@ -48,7 +48,8 @@ const QUEUE_PAGE: usize = 256;
 const ACTIVE_RETRY_MS: u64 = 30_000;
 const ERROR_RETRY_MS: u64 = 60_000;
 
-/// Push-check rows for the enabled push links of changed documents; each change moves the due time.
+/// Push-check rows for the push links of changed documents that push or retry after unmet
+/// requirements; each change moves the due time.
 /// A deleted document queues all its links, so the check removes them.
 pub(crate) async fn queue_rows(
     storage: &StorageHandle,
@@ -74,7 +75,8 @@ pub(crate) async fn queue_rows(
         let gone = !values.is_empty() && document_gone(storage, document_id).await?;
         for (_, value) in values {
             let link = RepositoryLink::from_bytes(&value)?;
-            if gone || (link.status == LinkStatus::Enabled && link.pull().is_none()) {
+            let pushes = link.status == LinkStatus::Enabled || link.retries_on_change();
+            if gone || (pushes && link.pull().is_none()) {
                 candidates.push((link.link_id, document_id));
             }
         }
@@ -202,7 +204,7 @@ async fn check_link(
         change_link(context, &link, LinkChange::Delete).await?;
         return Ok(None);
     }
-    if link.status != LinkStatus::Enabled {
+    if link.status != LinkStatus::Enabled && !link.retries_on_change() {
         return drop_entry().await;
     }
     if let Err(LinkError::NotHolder) = ensure_holder(context, &link).await {

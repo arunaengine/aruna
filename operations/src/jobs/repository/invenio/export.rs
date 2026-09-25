@@ -8,10 +8,10 @@ use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::repository::invenio::{export_fields, record_id, record_identifiers, validate_id};
 use aruna_core::repository::{
-    ExportIdentity, LinkFailure, LinkTarget, MAX_RECORD_FILES, RepositoryDestination,
-    RepositoryRecord,
+    ExportIdentity, LinkFailure, LinkTarget, RepositoryDestination, RepositoryRecord,
 };
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::secondary_id::IdentifierOrigin;
@@ -29,6 +29,7 @@ use crate::jobs::export::{ExportCheckpoint, persist_checkpoint};
 use crate::jobs::import::archive::{
     ArchiveCompression, ArchiveEntry, ArchiveInspection, inspect_reader,
 };
+use crate::jobs::repository::check::{check_content, unmet};
 use crate::jobs::repository::push::{guard, record_draft};
 use crate::jobs::repository::{TransferError, interruptible};
 use crate::jobs::service::read_artifact_range;
@@ -65,8 +66,15 @@ pub(crate) async fn repository_export(
             .as_ref()
             .ok_or_else(|| TransferError::Permanent("export artifact missing".into()))?;
         let inspection = inspect_artifact(ctx, spec, artifact).await?;
-        if inspection.entries.iter().filter(|e| !e.directory).count() > MAX_RECORD_FILES {
-            return Err(TransferError::Refused(LinkFailure::TooManyFiles));
+        let files = inspection
+            .entries
+            .iter()
+            .filter(|entry| !entry.directory)
+            .map(|entry| (entry.path.as_str(), entry.uncompressed_size))
+            .collect::<Vec<_>>();
+        let findings = check_content(RepositoryConnectorKind::Invenio, &files)?;
+        if !findings.is_empty() {
+            return Err(unmet(findings));
         }
         let jsonld = checkpoint
             .raw_jsonld
