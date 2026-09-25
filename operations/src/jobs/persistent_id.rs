@@ -61,6 +61,9 @@ pub async fn run_mint_pid(ctx: &JobContext, spec: &MintPersistentSpec) -> JobRun
     }
 }
 
+/// How long identifier registration waits for a missing mapping without using attempts.
+const IDENTIFIER_WAIT_MS: u64 = 600_000;
+
 /// Adds repository identifiers through the document's authority. An unreachable authority
 /// defers the job without using an attempt, so registration waits for it instead of failing.
 pub async fn run_register_identifiers(
@@ -78,11 +81,19 @@ pub async fn run_register_identifiers(
     .await;
     match result {
         Ok((_, changed)) => JobRunOutcome::Succeeded(JobResultPayload::Identifiers { changed }),
-        Err(
-            error @ (MetadataApiError::NotFound
-            | MetadataApiError::Forbidden
-            | MetadataApiError::Unauthorized),
-        ) => {
+        // The authority may not have the mapping yet; after the wait, attempts bound the retries.
+        Err(MetadataApiError::NotFound)
+            if unix_timestamp_millis().saturating_sub(ctx.job_id.timestamp_ms())
+                < IDENTIFIER_WAIT_MS =>
+        {
+            JobRunOutcome::Deferred(JobError::retryable(
+                "registering identifiers is waiting for the persistent id mapping",
+            ))
+        }
+        Err(error @ MetadataApiError::NotFound) => JobRunOutcome::Failed(JobError::retryable(
+            format!("registering identifiers: {error}"),
+        )),
+        Err(error @ (MetadataApiError::Forbidden | MetadataApiError::Unauthorized)) => {
             tracing::warn!(document_id = %spec.document_id, %error, "identifiers not registered");
             JobRunOutcome::Failed(JobError::permanent(format!(
                 "registering identifiers: {error}"
