@@ -72,7 +72,7 @@ async fn cancel_push(state: &ServerState, link: &RepositoryLink) {
 }
 
 #[utoipa::path(
-    get, path = "/metadata/{document_id}/invenio/links/{link_id}", tag = "metadata/invenio",
+    get, path = "/metadata/{document_id}/repository/links/{link_id}", tag = "metadata/repository",
     summary = "Read one repository link",
     description = r#"Returns one Invenio link of the dataset.
 
@@ -104,7 +104,7 @@ pub async fn get_link(
 }
 
 #[utoipa::path(
-    patch, path = "/metadata/{document_id}/invenio/links/{link_id}", tag = "metadata/invenio",
+    patch, path = "/metadata/{document_id}/repository/links/{link_id}", tag = "metadata/repository",
     summary = "Pause, resume or configure a link",
     description = r#"Changes the pause state, publish policy, file access or metadata overrides of a link.
 
@@ -175,7 +175,7 @@ pub async fn patch_link(
 }
 
 #[utoipa::path(
-    delete, path = "/metadata/{document_id}/invenio/links/{link_id}", tag = "metadata/invenio",
+    delete, path = "/metadata/{document_id}/repository/links/{link_id}", tag = "metadata/repository",
     summary = "Remove a repository link",
     description = r#"Removes the link together with its sealed token.
 
@@ -210,7 +210,7 @@ pub async fn delete_link(
 }
 
 #[utoipa::path(
-    post, path = "/metadata/{document_id}/invenio/links/{link_id}/push", tag = "metadata/invenio",
+    post, path = "/metadata/{document_id}/repository/links/{link_id}/push", tag = "metadata/repository",
     summary = "Push the dataset to its repository now",
     description = r#"Starts a push of the current dataset revision as an export_rocrate job.
 
@@ -270,7 +270,7 @@ pub async fn push_link(
 }
 
 #[utoipa::path(
-    post, path = "/metadata/{document_id}/invenio/links/{link_id}/publish", tag = "metadata/invenio",
+    post, path = "/metadata/{document_id}/repository/links/{link_id}/publish", tag = "metadata/repository",
     summary = "Publish the open repository draft",
     description = r#"Pushes the current dataset revision to the open draft and publishes it as an export_rocrate job.
 
@@ -333,7 +333,7 @@ pub async fn publish_link(
 }
 
 #[utoipa::path(
-    put, path = "/metadata/{document_id}/invenio/links/{link_id}/token", tag = "metadata/invenio",
+    put, path = "/metadata/{document_id}/repository/links/{link_id}/token", tag = "metadata/repository",
     summary = "Replace the personal token of a link",
     description = r#"Replaces the sealed personal access token of a link.
 
@@ -391,7 +391,7 @@ pub async fn rotate_token(
 }
 
 #[utoipa::path(
-    post, path = "/metadata/{document_id}/invenio/links/{link_id}/accept-remote", tag = "metadata/invenio",
+    post, path = "/metadata/{document_id}/repository/links/{link_id}/accept-remote", tag = "metadata/repository",
     summary = "Accept the repository's current state",
     description = r#"Makes the repository's current draft and latest published version the link's new base.
 
@@ -444,7 +444,7 @@ pub async fn accept_remote(
 }
 
 #[utoipa::path(
-    post, path = "/metadata/{document_id}/invenio/links/{link_id}/pull", tag = "metadata/invenio",
+    post, path = "/metadata/{document_id}/repository/links/{link_id}/pull", tag = "metadata/repository",
     summary = "Import the repository's new version now",
     description = r#"Checks the record lineage of a pull link and imports its latest version into the dataset as an import_rocrate job.
 

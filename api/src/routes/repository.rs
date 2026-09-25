@@ -30,10 +30,6 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct RepositorySearch {
-    /// Group that owns the repository connector.
-    pub group_id: String,
-    /// Invenio repository connector of the group.
-    pub connector_id: String,
     /// Native repository query; an empty query lists records.
     #[serde(default)]
     pub q: String,
@@ -56,8 +52,9 @@ fn page_size() -> u8 {
 }
 
 #[utoipa::path(
-    get, path = "/metadata/invenio/records", tag = "metadata/invenio",
-    summary = "Search published Invenio or Zenodo records",
+    get, path = "/metadata/groups/{group_id}/repositories/{connector_id}/records",
+    tag = "metadata/repository",
+    summary = "Search published repository records",
     description = r#"Searches one page of published records in the configured repository.
 
 **Authentication**
@@ -75,7 +72,11 @@ Page starts at 1; size is 1 to 25 and query text is at most 4096 bytes. Reposito
 **Errors**
 
 Invalid queries return 400; denied access returns 403; repository availability failures return 503."#,
-    params(RepositorySearch),
+    params(
+        ("group_id" = String, Path, description = "Group that owns the repository connector"),
+        ("connector_id" = String, Path, description = "Repository connector of the group"),
+        RepositorySearch
+    ),
     responses(
         (status = 200, description = "Native repository search page", body = serde_json::Value, example = json!({
             "hits": {"total": 1, "hits": [{"id": "1234567", "metadata": {"title": "Example dataset", "publication_date": "2026-09-22", "resource_type": {"id": "dataset"}, "creators": [{"person_or_org": {"type": "personal", "family_name": "Researcher"}}]}}]},
@@ -90,12 +91,13 @@ Invalid queries return 400; denied access returns 403; repository availability f
 pub async fn search_records(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Path((group_id, connector_id)): Path<(String, String)>,
     Query(query): Query<RepositorySearch>,
 ) -> ServerResult<Json<serde_json::Value>> {
     let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let query = aruna_core::repository::RepositoryQuery {
-        group_id: ulid::Ulid::from_string(&query.group_id).map_err(|_| ServerError::BadRequest)?,
-        connector_id: ulid::Ulid::from_string(&query.connector_id)
+        group_id: ulid::Ulid::from_string(&group_id).map_err(|_| ServerError::BadRequest)?,
+        connector_id: ulid::Ulid::from_string(&connector_id)
             .map_err(|_| ServerError::BadRequest)?,
         q: query.q,
         page: query.page,
@@ -215,7 +217,7 @@ pub struct SubmitRepositoryExport {
 }
 
 #[utoipa::path(
-    post, path = "/metadata/invenio/imports", tag = "metadata/invenio",
+    post, path = "/metadata/repository/imports", tag = "metadata/repository",
     summary = "Import Invenio metadata and data",
     description = r#"Imports repository metadata and optional data through a durable crate job.
 
@@ -322,7 +324,7 @@ pub async fn import_record(
         state,
         auth,
         Json(SubmitImportRequest {
-            source: ImportSourceRequest::Invenio {
+            source: ImportSourceRequest::Repository {
                 group_id: request.group_id,
                 connector_id: request.connector_id,
                 record_id,
@@ -339,7 +341,7 @@ pub async fn import_record(
 }
 
 #[utoipa::path(
-    post, path = "/metadata/{document_id}/invenio/exports", tag = "metadata/invenio",
+    post, path = "/metadata/{document_id}/repository/exports", tag = "metadata/repository",
     summary = "Export native Invenio metadata and files",
     description = r#"Exports mapped crate metadata and individual files to a native repository record.
 
@@ -349,7 +351,7 @@ Requires WRITE on the crate, WRITE on the metadata path of the repository connec
 
 **Behavior**
 
-Creates a draft or uses draft_id for recovery. Set new_version to a published record ID to continue its version lineage. Native source metadata and custom fields survive import/export; repository.metadata overrides mapped fields. RO-Crate JSON remains a provenance file.
+Creates a draft or uses draft_id for recovery. Set published_id to a published record ID to continue its version lineage. Native source metadata and custom fields survive import/export; repository.metadata overrides mapped fields. RO-Crate JSON remains a provenance file.
 
 Publication and public_files both default to false; public_files also applies to existing drafts. New drafts reserve their DOI. With a connector community, publishing a first version submits it for review instead.
 

@@ -75,7 +75,7 @@ pub struct UploadRoCrateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImportSourceRequest {
-    Invenio {
+    Repository {
         group_id: String,
         connector_id: String,
         record_id: String,
@@ -426,7 +426,7 @@ pub async fn submit_import(
 
 fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrateSource> {
     match source {
-        ImportSourceRequest::Invenio {
+        ImportSourceRequest::Repository {
             group_id,
             connector_id,
             record_id,

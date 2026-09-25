@@ -449,7 +449,7 @@ pub(super) async fn job_response(
 }
 
 #[utoipa::path(
-    post, path = "/metadata/{document_id}/invenio/links", tag = "metadata/invenio",
+    post, path = "/metadata/{document_id}/repository/links", tag = "metadata/repository",
     summary = "Link a dataset to an Invenio repository",
     description = r#"Creates a lasting link that pushes each later dataset change to one open repository draft.
 
@@ -605,7 +605,7 @@ pub async fn create_link(
 }
 
 #[utoipa::path(
-    get, path = "/metadata/{document_id}/invenio/links", tag = "metadata/invenio",
+    get, path = "/metadata/{document_id}/repository/links", tag = "metadata/repository",
     summary = "List the repository links of a dataset",
     description = r#"Lists the Invenio links this node keeps for the dataset.
 

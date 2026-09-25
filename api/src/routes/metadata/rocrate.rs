@@ -228,7 +228,7 @@ registry view. A path-restricted delegated token is refused even when it would p
   node that can serve them.
 - Submissions are idempotent per caller when `idempotency_key` is set: replaying the same key
   returns the same job with `created` false, while reusing it for a different document conflicts.
-- Repository exports use `POST /metadata/{document_id}/invenio/exports`; a `destination` field
+- Repository exports use `POST /metadata/{document_id}/repository/exports`; a `destination` field
   here is refused as an unknown field."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
@@ -322,7 +322,7 @@ pub async fn submit_rocrate_export(
             for id in destination
                 .draft_id
                 .iter()
-                .chain(destination.new_version.iter())
+                .chain(destination.published_id.iter())
             {
                 aruna_core::repository::invenio::validate_id(id)
                     .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
@@ -333,7 +333,7 @@ pub async fn submit_rocrate_export(
                 connector_id: ulid::Ulid::from_string(&destination.connector_id)
                     .map_err(|_| ServerError::BadRequest)?,
                 draft_id: destination.draft_id,
-                published_id: destination.new_version,
+                published_id: destination.published_id,
                 metadata_json: destination.metadata.to_string(),
                 publish: destination.publish,
                 public_files: destination.public_files,

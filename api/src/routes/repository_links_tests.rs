@@ -775,7 +775,7 @@ async fn readers_cannot_push() {
             group_id: linked.test.group_id.to_string(),
             connector_id: linked.connector_id.to_string(),
             draft_id: None,
-            new_version: None,
+            published_id: None,
             metadata: serde_json::json!({}),
             publish: false,
             public_files: false,

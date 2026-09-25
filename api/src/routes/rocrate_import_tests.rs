@@ -69,8 +69,6 @@ async fn invenio_requires_auth() {
             Err(ServerError::Unauthorized | ServerError::Forbidden)
         ));
         let query = crate::routes::repository::RepositorySearch {
-            group_id: group_id.clone(),
-            connector_id: Ulid::generate().to_string(),
             q: "dataset".into(),
             page: 1,
             size: 25,
@@ -79,6 +77,7 @@ async fn invenio_requires_auth() {
         let result = crate::routes::repository::search_records(
             State(state.clone()),
             Extension(auth.clone()),
+            axum::extract::Path((group_id.clone(), Ulid::generate().to_string())),
             axum::extract::Query(query),
         )
         .await;
@@ -91,7 +90,7 @@ async fn invenio_requires_auth() {
                 group_id,
                 connector_id: Ulid::generate().to_string(),
                 draft_id: None,
-                new_version: None,
+                published_id: None,
                 metadata: serde_json::json!({}),
                 publish: true,
                 public_files: false,
@@ -174,7 +173,7 @@ async fn invenio_names_one_record() {
         .await;
         assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
     }
-    let lone = parse_import_source(ImportSourceRequest::Invenio {
+    let lone = parse_import_source(ImportSourceRequest::Repository {
         group_id: group.to_string(),
         connector_id: Ulid::generate().to_string(),
         record_id: "42".into(),
@@ -232,10 +231,11 @@ async fn keep_updated_needs_write() {
 #[test]
 fn invenio_openapi_contract() {
     let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
-    assert!(openapi["paths"]["/metadata/invenio/records"]["get"]["responses"]["200"].is_object());
+    let search = "/metadata/groups/{group_id}/repositories/{connector_id}/records";
+    assert!(openapi["paths"][search]["get"]["responses"]["200"].is_object());
     for path in [
-        "/metadata/invenio/imports",
-        "/metadata/{document_id}/invenio/exports",
+        "/metadata/repository/imports",
+        "/metadata/{document_id}/repository/exports",
     ] {
         let operation = &openapi["paths"][path]["post"];
         assert!(operation["responses"]["202"].is_object());

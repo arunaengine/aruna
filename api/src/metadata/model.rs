@@ -384,7 +384,7 @@ pub struct RepositoryExportRequest {
     #[serde(default)]
     pub draft_id: Option<String>,
     #[serde(default)]
-    pub new_version: Option<String>,
+    pub published_id: Option<String>,
     #[serde(default)]
     pub metadata: serde_json::Value,
     #[serde(default)]
