@@ -128,7 +128,7 @@ pub struct LastPushResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct InvenioLinkResponse {
+pub struct RepositoryLinkResponse {
     pub link_id: String,
     pub document_id: String,
     pub group_id: String,
@@ -201,7 +201,7 @@ fn timestamp(value: SystemTime) -> String {
 }
 
 /// `holds` is false once the owner node lost the dataset; such a link cannot push any more.
-pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> InvenioLinkResponse {
+pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> RepositoryLinkResponse {
     let info = link.info_reason().map(str::to_string);
     let pull = link.pull().cloned();
     let findings = match &link.status {
@@ -228,7 +228,7 @@ pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> Inven
         review,
         ..
     } = link.remote;
-    InvenioLinkResponse {
+    RepositoryLinkResponse {
         link_id: link.link_id.to_string(),
         document_id: link.document_id.to_string(),
         group_id: link.group_id.to_string(),
@@ -406,7 +406,7 @@ pub(super) async fn change(
 async fn responses(
     state: &ServerState,
     document_id: Ulid,
-) -> ServerResult<Vec<InvenioLinkResponse>> {
+) -> ServerResult<Vec<RepositoryLinkResponse>> {
     let context = state.get_ctx();
     let mut views = Vec::new();
     for (link, queued) in list_links(&context.storage_handle, document_id)
@@ -424,7 +424,7 @@ pub(super) async fn view(
     state: &ServerState,
     document_id: Ulid,
     link_id: Ulid,
-) -> ServerResult<Json<InvenioLinkResponse>> {
+) -> ServerResult<Json<RepositoryLinkResponse>> {
     let link_id = link_id.to_string();
     responses(state, document_id)
         .await?
@@ -480,7 +480,7 @@ An unknown dataset, or a connector that does not exist in the group or is no Inv
         "access_token": "<personal-access-token>", "parent_id": "abcde-12345", "auto_publish": false
     })),
     responses(
-        (status = 201, description = "Link created and first push queued", body = InvenioLinkResponse, example = json!(link_example())),
+        (status = 201, description = "Link created and first push queued", body = RepositoryLinkResponse, example = json!(link_example())),
         (status = 400, description = "Invalid token, metadata or identifier, or unmet repository requirements", body = ErrorResponse, example = json!({"error": "the dataset does not meet the repository's requirements", "code": "requirements_unmet", "findings": [{"code": "constraint_violation", "severity": "violation", "focus_node": "./", "path": "(<http://schema.org/author> | <http://schema.org/creator>)", "rule": "http://www.w3.org/ns/shacl#minCount", "message": "The dataset needs creators; each person needs a name or family name and each organization a name.", "profile_revision": "builtin", "completeness": "complete"}]})),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Dataset or connector access denied", body = ErrorResponse),
@@ -494,7 +494,7 @@ pub async fn create_link(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(document_id): Path<String>,
     Json(request): Json<CreateLinkRequest>,
-) -> ServerResult<(StatusCode, Json<InvenioLinkResponse>)> {
+) -> ServerResult<(StatusCode, Json<RepositoryLinkResponse>)> {
     let (auth, document_id) = readable(&state, auth, &document_id).await?;
     let group_id = parse_ulid(&request.group_id)?;
     let connector_id = parse_ulid(&request.connector_id)?;
@@ -628,7 +628,7 @@ An enabled push link shows reason review_declined when the community declined th
 Every holder of the dataset lists its links. owner_node_url names the node that pushes and manages each link. pending covers queued pushes only on that node. A link whose node no longer holds the dataset shows status failed with reason owner_not_holder."#,
     params(("document_id" = String, Path, description = "Metadata document identifier")),
     responses(
-        (status = 200, description = "Links of the dataset", body = Vec<InvenioLinkResponse>, example = json!([link_example()])),
+        (status = 200, description = "Links of the dataset", body = Vec<RepositoryLinkResponse>, example = json!([link_example()])),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Dataset access denied", body = ErrorResponse),
         (status = 404, description = "Dataset not found", body = ErrorResponse)
@@ -638,11 +638,11 @@ pub async fn list_repository_links(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(document_id): Path<String>,
-) -> ServerResult<Json<Vec<InvenioLinkResponse>>> {
+) -> ServerResult<Json<Vec<RepositoryLinkResponse>>> {
     let (_, document_id) = readable(&state, auth, &document_id).await?;
     Ok(Json(responses(&state, document_id).await?))
 }
 
 #[cfg(test)]
-#[path = "invenio_links_tests.rs"]
+#[path = "repository_links_tests.rs"]
 mod tests;

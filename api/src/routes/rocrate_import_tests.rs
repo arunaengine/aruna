@@ -35,14 +35,14 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn invenio_requires_auth() {
-    use crate::metadata::InvenioExportRequest;
-    use crate::routes::invenio::{
-        InvenioImportRequest, SubmitInvenioExport, export_record, import_record,
+    use crate::metadata::RepositoryExportRequest;
+    use crate::routes::repository::{
+        RepositoryImportRequest, SubmitRepositoryExport, export_record, import_record,
     };
     let (_root, state, user) = plain_state(test_limits()).await;
     for auth in [None, restricted(user)] {
         let group_id = Ulid::generate().to_string();
-        let import = InvenioImportRequest {
+        let import = RepositoryImportRequest {
             group_id: group_id.clone(),
             connector_id: Ulid::generate().to_string(),
             record_id: Some("42".into()),
@@ -68,7 +68,7 @@ async fn invenio_requires_auth() {
             result,
             Err(ServerError::Unauthorized | ServerError::Forbidden)
         ));
-        let query = crate::routes::invenio::InvenioSearch {
+        let query = crate::routes::repository::RepositorySearch {
             group_id: group_id.clone(),
             connector_id: Ulid::generate().to_string(),
             q: "dataset".into(),
@@ -76,7 +76,7 @@ async fn invenio_requires_auth() {
             size: 25,
             all_versions: false,
         };
-        let result = crate::routes::invenio::search_records(
+        let result = crate::routes::repository::search_records(
             State(state.clone()),
             Extension(auth.clone()),
             axum::extract::Query(query),
@@ -86,8 +86,8 @@ async fn invenio_requires_auth() {
             result,
             Err(ServerError::Unauthorized | ServerError::Forbidden)
         ));
-        let export = SubmitInvenioExport {
-            repository: InvenioExportRequest {
+        let export = SubmitRepositoryExport {
+            repository: RepositoryExportRequest {
                 group_id,
                 connector_id: Ulid::generate().to_string(),
                 draft_id: None,
@@ -115,9 +115,9 @@ async fn invenio_requires_auth() {
 
 #[tokio::test]
 async fn invenio_denies_connector() {
-    use crate::routes::invenio::{InvenioImportRequest, import_record};
+    use crate::routes::repository::{RepositoryImportRequest, import_record};
     let (_root, state, user, group) = submit_state().await;
-    let request = InvenioImportRequest {
+    let request = RepositoryImportRequest {
         group_id: Ulid::generate().to_string(),
         connector_id: Ulid::generate().to_string(),
         record_id: Some("42".into()),
@@ -143,9 +143,9 @@ async fn invenio_denies_connector() {
 
 #[tokio::test]
 async fn invenio_names_one_record() {
-    use crate::routes::invenio::{InvenioImportRequest, import_record};
+    use crate::routes::repository::{RepositoryImportRequest, import_record};
     let (_root, state, user, group) = submit_state().await;
-    let request = |record_id: Option<&str>, doi: Option<&str>| InvenioImportRequest {
+    let request = |record_id: Option<&str>, doi: Option<&str>| RepositoryImportRequest {
         group_id: group.to_string(),
         connector_id: Ulid::generate().to_string(),
         record_id: record_id.map(str::to_string),
@@ -187,13 +187,13 @@ async fn invenio_names_one_record() {
 
 #[tokio::test]
 async fn keep_updated_needs_write() {
-    use crate::routes::invenio::{InvenioImportRequest, import_record};
+    use crate::routes::repository::{RepositoryImportRequest, import_record};
     let (_root, state, user, group) = submit_state().await;
     seed_bucket(&state, "target", group, user).await;
     // The connector's group is another owner's; the caller only reads it.
     let shared = Ulid::generate();
     grant_reader(&state, user, shared).await;
-    let request = |keep_updated| InvenioImportRequest {
+    let request = |keep_updated| RepositoryImportRequest {
         group_id: shared.to_string(),
         connector_id: Ulid::generate().to_string(),
         record_id: Some("42".into()),
@@ -246,13 +246,13 @@ fn invenio_openapi_contract() {
     }
     let request =
         serde_json::json!({"group_id": "group", "connector_id": "connector", "metadata": {}});
-    let default: crate::metadata::InvenioExportRequest =
+    let default: crate::metadata::RepositoryExportRequest =
         serde_json::from_value(request.clone()).unwrap();
     assert!(!default.publish);
     assert!(!default.public_files);
     let mut configured = request;
     configured["publish"] = serde_json::json!(true);
-    let configured: crate::metadata::InvenioExportRequest =
+    let configured: crate::metadata::RepositoryExportRequest =
         serde_json::from_value(configured).unwrap();
     assert!(configured.publish);
 }
@@ -260,7 +260,7 @@ fn invenio_openapi_contract() {
 #[test]
 fn invenio_mode_contract() {
     for mode in ["copy", "reference", "metadata"] {
-        let request: crate::routes::invenio::InvenioImportRequest =
+        let request: crate::routes::repository::RepositoryImportRequest =
             serde_json::from_value(serde_json::json!({
                 "group_id": "group", "connector_id": "connector", "record_id": "42", "mode": mode,
                 "all_versions": false, "target": {"bucket": "target", "prefix": "import"},
@@ -270,18 +270,18 @@ fn invenio_mode_contract() {
         assert!(!request.options.all_versions);
         assert_eq!(serde_json::to_value(&request).unwrap()["mode"], mode);
     }
-    let options: crate::routes::invenio::InvenioOptionsRequest =
+    let options: crate::routes::repository::ImportOptionsRequest =
         serde_json::from_value(serde_json::json!({})).unwrap();
     assert!(options.all_versions);
     assert!(matches!(
         options.mode,
-        crate::routes::invenio::InvenioDataMode::Copy
+        crate::routes::repository::ImportDataMode::Copy
     ));
 }
 
 #[test]
 fn invenio_login_private() {
-    let request: crate::metadata::InvenioExportRequest =
+    let request: crate::metadata::RepositoryExportRequest =
         serde_json::from_value(serde_json::json!({
             "group_id": "group", "connector_id": "connector", "access_token": "author-private-token"
         }))
@@ -299,7 +299,7 @@ fn invenio_login_private() {
     assert!(!format!("{request:?}").contains("author-private-token"));
     let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
     assert_eq!(
-        openapi["components"]["schemas"]["InvenioExportRequest"]["properties"]["access_token"]["writeOnly"],
+        openapi["components"]["schemas"]["RepositoryExportRequest"]["properties"]["access_token"]["writeOnly"],
         true
     );
 }

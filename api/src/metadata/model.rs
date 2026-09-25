@@ -371,14 +371,14 @@ pub struct RoCrateExportParams {
 pub struct SubmitExportRequest {
     /// Set only by the Invenio export route; this route refuses it as an unknown field.
     #[serde(skip)]
-    pub destination: Option<InvenioExportRequest>,
+    pub destination: Option<RepositoryExportRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct InvenioExportRequest {
+pub struct RepositoryExportRequest {
     pub group_id: String,
     pub connector_id: String,
     #[serde(default)]
@@ -400,9 +400,9 @@ fn omit_token(_: &Option<String>) -> bool {
     true
 }
 
-impl std::fmt::Debug for InvenioExportRequest {
+impl std::fmt::Debug for RepositoryExportRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InvenioExportRequest")
+        f.debug_struct("RepositoryExportRequest")
             .field("group_id", &self.group_id)
             .field("connector_id", &self.connector_id)
             .finish_non_exhaustive()

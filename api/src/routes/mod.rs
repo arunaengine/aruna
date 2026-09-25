@@ -18,8 +18,6 @@ pub mod device;
 pub mod drs;
 pub mod execution;
 pub mod info;
-pub mod invenio;
-pub mod invenio_links;
 pub mod link_routes;
 pub mod management_relay;
 pub mod metadata;
@@ -29,6 +27,8 @@ pub mod onboarding;
 pub mod pid;
 pub mod placement;
 pub mod policies;
+pub mod repository;
+pub mod repository_links;
 pub mod rocrate_import;
 pub mod search;
 pub mod staging;
@@ -73,8 +73,8 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(pid::router())
         .merge(placement::router())
         .merge(rocrate_import::router())
-        .merge(invenio::router())
-        .merge(invenio_links::router())
+        .merge(repository::router())
+        .merge(repository_links::router())
         .merge(link_routes::router())
         .merge(notifications::router())
         .merge(policies::router())

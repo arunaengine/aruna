@@ -95,7 +95,10 @@ fn request(linked: &Linked) -> CreateLinkRequest {
     }
 }
 
-async fn create(linked: &Linked, auth: Option<AuthContext>) -> ServerResult<InvenioLinkResponse> {
+async fn create(
+    linked: &Linked,
+    auth: Option<AuthContext>,
+) -> ServerResult<RepositoryLinkResponse> {
     Box::pin(create_link(
         State(linked.test.state.clone()),
         Extension(auth),
@@ -116,7 +119,7 @@ fn stranger(linked: &Linked) -> AuthContext {
     }
 }
 
-fn paths(linked: &Linked, link: &InvenioLinkResponse) -> Path<(String, String)> {
+fn paths(linked: &Linked, link: &RepositoryLinkResponse) -> Path<(String, String)> {
     Path((linked.document_id.clone(), link.link_id.clone()))
 }
 
@@ -753,8 +756,8 @@ async fn viewer(linked: &Linked) -> AuthContext {
 
 #[tokio::test]
 async fn readers_cannot_push() {
-    use crate::metadata::InvenioExportRequest;
-    use crate::routes::invenio::{SubmitInvenioExport, export_record};
+    use crate::metadata::RepositoryExportRequest;
+    use crate::routes::repository::{SubmitRepositoryExport, export_record};
     let linked = setup().await;
     let reader = viewer(&linked).await;
     // The reader sees the dataset's links, so only the missing WRITE refuses the pushes below.
@@ -767,8 +770,8 @@ async fn readers_cannot_push() {
     assert!(listed.is_ok());
     let created = create(&linked, Some(reader.clone())).await;
     assert!(matches!(created, Err(ServerError::Forbidden)));
-    let export = SubmitInvenioExport {
-        repository: InvenioExportRequest {
+    let export = SubmitRepositoryExport {
+        repository: RepositoryExportRequest {
             group_id: linked.test.group_id.to_string(),
             connector_id: linked.connector_id.to_string(),
             draft_id: None,

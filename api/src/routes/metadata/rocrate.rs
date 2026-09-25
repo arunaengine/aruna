@@ -350,7 +350,7 @@ pub async fn submit_rocrate_export(
             Permission::WRITE,
         )
         .await?;
-        Box::pin(crate::routes::invenio_links::ensure_requirements(
+        Box::pin(crate::routes::repository_links::ensure_requirements(
             &state,
             &auth,
             document_id,

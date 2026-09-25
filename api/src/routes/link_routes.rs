@@ -16,8 +16,8 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::invenio_links::{
-    InvenioLinkResponse, LinkJobResponse, PatchLinkRequest, RotateTokenRequest, change,
+use super::repository_links::{
+    LinkJobResponse, PatchLinkRequest, RepositoryLinkResponse, RotateTokenRequest, change,
     job_response, link_error, link_example, managed, metadata_json, parse_ulid, readable,
     seal_error, view,
 };
@@ -88,7 +88,7 @@ The shape matches the list entries. Tokens are never returned."#,
         ("link_id" = String, Path, description = "Link identifier")
     ),
     responses(
-        (status = 200, description = "The link", body = InvenioLinkResponse, example = json!(link_example())),
+        (status = 200, description = "The link", body = RepositoryLinkResponse, example = json!(link_example())),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Dataset access denied", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse)
@@ -98,7 +98,7 @@ pub async fn get_link(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((document_id, link_id)): Path<(String, String)>,
-) -> ServerResult<Json<InvenioLinkResponse>> {
+) -> ServerResult<Json<RepositoryLinkResponse>> {
     let (_, document_id) = readable(&state, auth, &document_id).await?;
     view(&state, document_id, parse_ulid(&link_id)?).await
 }
@@ -127,7 +127,7 @@ A metadata value that is not an object returns 400. auto_update on a push link, 
     ),
     request_body(content = PatchLinkRequest, example = json!({"paused": true})),
     responses(
-        (status = 200, description = "The changed link", body = InvenioLinkResponse, example = json!(link_example())),
+        (status = 200, description = "The changed link", body = RepositoryLinkResponse, example = json!(link_example())),
         (status = 400, description = "Invalid metadata overrides, or settings of the other link direction", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the creator or a group admin, or settings changed by someone else than the creator", body = ErrorResponse),
@@ -140,7 +140,7 @@ pub async fn patch_link(
     Extension(auth): Extension<Option<AuthContext>>,
     Path((document_id, link_id)): Path<(String, String)>,
     Json(request): Json<PatchLinkRequest>,
-) -> ServerResult<Json<InvenioLinkResponse>> {
+) -> ServerResult<Json<RepositoryLinkResponse>> {
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
     let push_settings = request.auto_publish.is_some()
         || request.public_files.is_some()
@@ -411,7 +411,7 @@ A running push returns 409. A rejected token returns 409 with reason token_rejec
         ("link_id" = String, Path, description = "Link identifier")
     ),
     responses(
-        (status = 200, description = "The link with its new base", body = InvenioLinkResponse, example = json!(link_example())),
+        (status = 200, description = "The link with its new base", body = RepositoryLinkResponse, example = json!(link_example())),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 403, description = "Not the creator or a group admin", body = ErrorResponse),
         (status = 404, description = "Dataset or link not found", body = ErrorResponse),
@@ -424,7 +424,7 @@ pub async fn accept_remote(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path((document_id, link_id)): Path<(String, String)>,
-) -> ServerResult<Json<InvenioLinkResponse>> {
+) -> ServerResult<Json<RepositoryLinkResponse>> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_push(&link)?;
     if link.active_job.is_some() {

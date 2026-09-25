@@ -13,7 +13,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{InvenioExportRequest, SubmitExportRequest, SubmitExportResponse};
+use crate::metadata::{RepositoryExportRequest, SubmitExportRequest, SubmitExportResponse};
 use crate::server::state::ServerState;
 
 use super::rocrate_import::{
@@ -29,7 +29,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
-pub struct InvenioSearch {
+pub struct RepositorySearch {
     /// Group that owns the repository connector.
     pub group_id: String,
     /// Invenio repository connector of the group.
@@ -75,7 +75,7 @@ Page starts at 1; size is 1 to 25 and query text is at most 4096 bytes. Reposito
 **Errors**
 
 Invalid queries return 400; denied access returns 403; repository availability failures return 503."#,
-    params(InvenioSearch),
+    params(RepositorySearch),
     responses(
         (status = 200, description = "Native repository search page", body = serde_json::Value, example = json!({
             "hits": {"total": 1, "hits": [{"id": "1234567", "metadata": {"title": "Example dataset", "publication_date": "2026-09-22", "resource_type": {"id": "dataset"}, "creators": [{"person_or_org": {"type": "personal", "family_name": "Researcher"}}]}}]},
@@ -90,7 +90,7 @@ Invalid queries return 400; denied access returns 403; repository availability f
 pub async fn search_records(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Query(query): Query<InvenioSearch>,
+    Query(query): Query<RepositorySearch>,
 ) -> ServerResult<Json<serde_json::Value>> {
     let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let query = aruna_core::repository::RepositoryQuery {
@@ -138,7 +138,7 @@ pub async fn search_records(
 /// Names the record by exactly one of record_id, doi or url.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct InvenioImportRequest {
+pub struct RepositoryImportRequest {
     pub group_id: String,
     pub connector_id: String,
     #[serde(default)]
@@ -150,7 +150,7 @@ pub struct InvenioImportRequest {
     #[serde(default)]
     pub url: Option<String>,
     #[serde(flatten)]
-    pub options: InvenioOptionsRequest,
+    pub options: ImportOptionsRequest,
     /// Creates a pull link that keeps the new dataset updated from the record lineage.
     #[serde(default)]
     pub keep_updated: bool,
@@ -165,7 +165,7 @@ pub struct InvenioImportRequest {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum InvenioDataMode {
+pub enum ImportDataMode {
     #[default]
     Copy,
     Reference,
@@ -173,9 +173,9 @@ pub enum InvenioDataMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct InvenioOptionsRequest {
+pub struct ImportOptionsRequest {
     #[serde(default)]
-    pub mode: InvenioDataMode,
+    pub mode: ImportDataMode,
     #[serde(default = "include_versions")]
     pub all_versions: bool,
 }
@@ -184,32 +184,32 @@ fn include_versions() -> bool {
     true
 }
 
-impl Default for InvenioOptionsRequest {
+impl Default for ImportOptionsRequest {
     fn default() -> Self {
         Self {
-            mode: InvenioDataMode::Copy,
+            mode: ImportDataMode::Copy,
             all_versions: true,
         }
     }
 }
 
-impl From<InvenioOptionsRequest> for aruna_core::repository::ImportOptions {
-    fn from(value: InvenioOptionsRequest) -> Self {
+impl From<ImportOptionsRequest> for aruna_core::repository::ImportOptions {
+    fn from(value: ImportOptionsRequest) -> Self {
         use aruna_core::repository::ImportMode;
         Self {
             all_versions: value.all_versions,
             mode: match value.mode {
-                InvenioDataMode::Copy => ImportMode::Copy,
-                InvenioDataMode::Reference => ImportMode::Reference,
-                InvenioDataMode::Metadata => ImportMode::Metadata,
+                ImportDataMode::Copy => ImportMode::Copy,
+                ImportDataMode::Reference => ImportMode::Reference,
+                ImportDataMode::Metadata => ImportMode::Metadata,
             },
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SubmitInvenioExport {
-    pub repository: InvenioExportRequest,
+pub struct SubmitRepositoryExport {
+    pub repository: RepositoryExportRequest,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -240,7 +240,7 @@ Crate limits apply. Hidden edits and inaccessible or deleted versions cannot be 
 **Errors**
 
 None or several of record_id, doi and url, a DOI no published record has, a URL on another origin, or auto_update without keep_updated return 400. The returned job exposes progress, cancellation and failure details. Copy imports fail on missing data or checksum mismatches."#,
-    request_body(content = InvenioImportRequest, example = json!({
+    request_body(content = RepositoryImportRequest, example = json!({
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
         "doi": "10.5281/zenodo.1234567", "target": {"bucket": "research", "prefix": "zenodo/1234567"},
         "metadata": {"group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "path": "datasets/zenodo", "public": false},
@@ -264,7 +264,7 @@ None or several of record_id, doi and url, a DOI no published record has, a URL 
 pub async fn import_record(
     state: State<Arc<ServerState>>,
     auth: Extension<Option<AuthContext>>,
-    Json(request): Json<InvenioImportRequest>,
+    Json(request): Json<RepositoryImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     use aruna_operations::jobs::repository::{
         RecordReference, TransferError, connector_kind, resolve,
@@ -363,7 +363,7 @@ Every referenced file must be readable; web data entities become references inst
 
 A crate that does not meet the repository's requirement Profile or mapping rules returns 400 with code requirements_unmet and the findings; repository.metadata does not satisfy them. Incomplete files, conflicting revisions or rejected metadata fail the job. An ambiguous creation outcome requires inspecting the repository and supplying draft_id. Cancellation retains remote drafts."#,
     params(("document_id" = String, Path, description = "Aruna metadata document identifier")),
-    request_body(content = SubmitInvenioExport, example = json!({"repository": {
+    request_body(content = SubmitRepositoryExport, example = json!({"repository": {
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
         "access_token": "<personal-access-token>", "publish": false
     }})),
@@ -387,7 +387,7 @@ pub async fn export_record(
     state: State<Arc<ServerState>>,
     auth: Extension<Option<AuthContext>>,
     path: Path<String>,
-    Json(request): Json<SubmitInvenioExport>,
+    Json(request): Json<SubmitRepositoryExport>,
 ) -> ServerResult<(StatusCode, Json<SubmitExportResponse>)> {
     super::metadata::rocrate::submit_rocrate_export(
         state,

@@ -80,7 +80,7 @@ pub enum ImportSourceRequest {
         connector_id: String,
         record_id: String,
         #[serde(flatten)]
-        options: super::invenio::InvenioOptionsRequest,
+        options: super::repository::ImportOptionsRequest,
         /// Creates a pull link that keeps the new dataset updated from the record lineage.
         #[serde(default)]
         keep_updated: bool,
