@@ -360,19 +360,20 @@ async fn process_prune_job(
         });
     };
 
-    match metadata_handle.prune_if_deleted(graph_iri.clone()).await {
-        Ok(pruned) => {
-            if pruned && let Err(error) = queue_deleted(context, &graph_iri).await {
-                warn!(%graph_iri, %error, "Failed to queue Invenio links of a deleted dataset");
-            }
-            Ok(ProcessedJobGroup {
-                completed_keys: job_keys,
-                processed: 1,
-            })
-        }
+    // A retry after a failed link queueing finds the graph already pruned, so it queues again.
+    let pruned = match metadata_handle.prune_if_deleted(graph_iri.clone()).await {
+        Ok(_) => queue_deleted(context, &graph_iri)
+            .await
+            .map_err(|error| format!("queueing the Invenio links failed: {error}")),
+        Err(error) => Err(error.to_string()),
+    };
+    match pruned {
+        Ok(()) => Ok(ProcessedJobGroup {
+            completed_keys: job_keys,
+            processed: 1,
+        }),
         Err(error) => {
-            reschedule_prune_job(&context.storage_handle, &job_keys, &job, error.to_string())
-                .await?;
+            reschedule_prune_job(&context.storage_handle, &job_keys, &job, error).await?;
             Ok(ProcessedJobGroup {
                 completed_keys: Vec::new(),
                 processed: 1,
