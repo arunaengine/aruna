@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
-use aruna_core::repository::invenio::{export_fields, record_id, record_identifiers, validate_id};
+use aruna_core::repository::invenio::{
+    export_fields, missing_fields, record_id, record_identifiers, validate_id,
+};
 use aruna_core::repository::{
     ExportIdentity, LinkFailure, LinkTarget, RepositoryDestination, RepositoryRecord,
 };
@@ -28,7 +30,7 @@ use crate::harvest::create_connector::INVENIO_COMMUNITY;
 use crate::jobs::executor::JobContext;
 use crate::jobs::export::{ExportCheckpoint, persist_checkpoint};
 use crate::jobs::import::archive::{ArchiveCompression, ArchiveEntry};
-use crate::jobs::repository::check::{inspect_artifact, uploads};
+use crate::jobs::repository::check::{inspect_artifact, unmet, uploads};
 use crate::jobs::repository::push::{guard, record_draft};
 use crate::jobs::repository::{Action, TransferError, interruptible, supports};
 use crate::jobs::service::read_artifact_range;
@@ -233,7 +235,7 @@ pub(crate) async fn create_draft(
         .map_err(|_| invalid("invalid repository metadata"))?;
     let document: Value =
         serde_json::from_str(jsonld).map_err(|_| invalid("invalid source crate"))?;
-    let mut fields = export_fields(&document, &overrides, identity)?;
+    let mut fields = mapped_fields(&client, &document, &overrides, identity)?;
     if fields.to_string().len() as u64 > spec.limits.metadata_bytes {
         return Err(invalid("mapped repository metadata exceeds limit"));
     }
@@ -296,6 +298,22 @@ pub(crate) async fn create_draft(
         return Err(invalid("draft identity mismatch"));
     }
     record_from(&client, &record)
+}
+
+/// The record fields mapped from the crate and overrides; a record that would lack a required
+/// field is refused with findings before any remote write.
+fn mapped_fields(
+    client: &InvenioClient<'_>,
+    document: &Value,
+    overrides: &Value,
+    identity: &ExportIdentity,
+) -> Result<Value, TransferError> {
+    let fields = export_fields(document, overrides, identity)?;
+    let missing = missing_fields(&fields["metadata"], client.endpoint());
+    if !missing.is_empty() {
+        return Err(unmet(missing));
+    }
+    Ok(fields)
 }
 
 /// Reserves the draft's DOI in its own step, after the draft is stored, so a failed
@@ -423,7 +441,7 @@ pub(crate) async fn prepare_draft(
         serde_json::from_str(jsonld).map_err(|_| invalid("invalid crate metadata"))?;
     let overrides: Value = serde_json::from_str(&destination.metadata_json)
         .map_err(|_| invalid("invalid metadata overrides"))?;
-    let mut fields = export_fields(&document, &overrides, identity)?;
+    let mut fields = mapped_fields(&client, &document, &overrides, identity)?;
     fields["files"] = json!({"enabled": true});
     let url = client.url(&["records", &record.id, "draft"])?;
     let current = client.json(Method::GET, url.clone(), None).await?;

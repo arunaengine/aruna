@@ -264,6 +264,38 @@ fn derives_export_metadata() {
 }
 
 #[test]
+fn missing_fields_refused() {
+    let document = json!({"@graph": [
+        {"@id": "ro-crate-metadata.json", "about": {"@id": "./"}},
+        {"@id": "./", "name": "Title", "datePublished": "2026",
+            "author": {"@id": "#ada"}, "creator": [{"@id": "#ada"}, {"@id": "#bob"}]},
+        {"@id": "#ada", "@type": "Person", "name": "Ada"},
+        {"@id": "#bob", "@type": "Person", "familyName": "Bob"}
+    ]});
+    let identity = ExportIdentity::default();
+    let mapped = export_metadata(&document, &json!({}), &identity).unwrap();
+    // Creators are the union of author and creator, each person once.
+    assert_eq!(mapped["creators"].as_array().unwrap().len(), 2);
+    assert!(missing_fields(&mapped, "https://zenodo.org/api/").is_empty());
+    let paths = |metadata: &Value, endpoint| {
+        missing_fields(metadata, endpoint)
+            .into_iter()
+            .map(|finding| finding.path.unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        paths(&mapped, "https://rdm.example.org/api/"),
+        ["publisher"]
+    );
+    // Overrides cannot clear what the record needs.
+    let cleared = export_metadata(&document, &json!({"creators": [], "title": ""}), &identity);
+    assert_eq!(
+        paths(&cleared.unwrap(), "https://zenodo.org/api/"),
+        ["title", "creators"]
+    );
+}
+
+#[test]
 fn relates_registered_identifiers() {
     let doi = |value, origin| SecondaryIdentifier::new(SecondaryIdKind::Doi, value, None, origin);
     let identity = ExportIdentity {

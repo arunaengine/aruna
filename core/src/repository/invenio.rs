@@ -6,9 +6,9 @@ use super::fields::{
     Person, crate_root, entity, identifier, keywords, licenses, person, publication_start,
     schema_value, values,
 };
-use super::rules::{Convert, field_value, rules};
+use super::rules::{Convert, field_value, finding, rules};
 use super::{ExportIdentity, RepositoryError};
-use crate::metadata::{INVENIO_PROFILE_IRI, ZENODO_PROFILE_IRI};
+use crate::metadata::{INVENIO_PROFILE_IRI, ProfileValidationFinding, ZENODO_PROFILE_IRI};
 use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier};
 use serde_json::{Value, json};
@@ -534,6 +534,39 @@ fn related_identifiers(value: &Value, identity: &ExportIdentity) -> Vec<Value> {
             "relation_type": {"id": "references"}}));
     }
     identifiers
+}
+
+/// Required record fields the mapped metadata lacks, as findings; a repository at `endpoint`
+/// other than Zenodo also needs a publisher. Overrides can clear what the crate provides.
+pub fn missing_fields(metadata: &Value, endpoint: &str) -> Vec<ProfileValidationFinding> {
+    let text = |value: &Value| value.as_str().is_some_and(|text| !text.trim().is_empty());
+    let mut required = vec![
+        ("title", text(&metadata["title"])),
+        ("publication_date", text(&metadata["publication_date"])),
+        (
+            "creators",
+            metadata["creators"]
+                .as_array()
+                .is_some_and(|creators| !creators.is_empty()),
+        ),
+        ("resource_type", text(&metadata["resource_type"]["id"])),
+    ];
+    if requirement_profile(endpoint) == INVENIO_PROFILE_IRI {
+        required.push(("publisher", text(&metadata["publisher"])));
+    }
+    required
+        .into_iter()
+        .filter(|(_, present)| !present)
+        .map(|(field, _)| {
+            finding(
+                "mapping_violation",
+                Some("./".into()),
+                Some(field.into()),
+                format!("record/{field}"),
+                format!("The mapped record has no {field}; the crate or overrides must give it."),
+            )
+        })
+        .collect()
 }
 
 /// Returns native descriptive fields without copying source ownership, access settings or managed PIDs.

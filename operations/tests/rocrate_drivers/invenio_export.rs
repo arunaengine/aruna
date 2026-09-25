@@ -48,6 +48,31 @@ async fn export_spec(
 }
 
 #[tokio::test]
+async fn cleared_creators_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let mut spec = export_spec(&fixture, &server, false).await?;
+    spec.destination.as_mut().unwrap().metadata_json = r#"{"creators": []}"#.into();
+    let ctx = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+    let JobRunOutcome::Failed(error) = run_export_job(&ctx, &spec).await else {
+        panic!("an export without creators was not refused");
+    };
+    assert!(error.message.contains("no creators"), "{}", error.message);
+    // Refused before the draft was created.
+    assert!(
+        !server
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(method, _)| *method == Method::POST)
+    );
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn invenio_export_modes() -> Result<(), Box<dyn std::error::Error>> {
     for (publish, public_files) in [(false, false), (true, false), (true, true)] {
         let fixture = build_fixture(false).await?;
