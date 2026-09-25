@@ -46,6 +46,8 @@ pub struct MigrateOutput {
     pub realm_configs_rewritten: usize,
     pub secrets_scanned: usize,
     pub secrets_sealed: usize,
+    /// Secret rows left unchanged because they could not be read, as `keyspace/key: reason`.
+    pub secrets_skipped: Vec<String>,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -78,9 +80,10 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let configs = realm_configs(&db, &config_rows)?;
     let secret_key = node_key(&db)?;
     let mut secrets = Vec::new();
+    let mut secrets_skipped = Vec::new();
     for name in SEALED_KEYSPACES {
         let rows = db.keyspace(name, KeyspaceCreateOptions::default)?;
-        let sealed = seal_rows(&db, &rows, name, secret_key.as_ref())?;
+        let sealed = seal_rows(&db, &rows, name, secret_key.as_ref(), &mut secrets_skipped)?;
         secrets.push((rows, sealed));
     }
 
@@ -121,6 +124,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         realm_configs_rewritten: configs.rows.len(),
         secrets_scanned: secrets.iter().map(|(_, sealed)| sealed.scanned).sum(),
         secrets_sealed: secrets.iter().map(|(_, sealed)| sealed.rows.len()).sum(),
+        secrets_skipped,
     })
 }
 
@@ -137,11 +141,13 @@ fn node_key(db: &OptimisticTxDatabase) -> Result<Option<CredentialEncryptionKey>
 }
 
 /// Seals plain secret rows; rows that already open with the node key stay unchanged.
+/// Rows that are neither are added to `skipped` and left as they are.
 fn seal_rows(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
     name: &str,
     secret_key: Option<&CredentialEncryptionKey>,
+    skipped: &mut Vec<String>,
 ) -> Result<Rewrites, ExplorerError> {
     let plain = |value: &[u8]| match name {
         SOURCE_SECRET_KEYSPACE => SourceConnectorSecret::from_bytes(value).is_ok(),
@@ -154,18 +160,17 @@ fn seal_rows(
     for entry in db.read_tx().iter(keyspace) {
         let (key, value) = entry.into_inner()?;
         scanned += 1;
-        let secret_key = secret_key
-            .ok_or_else(|| decode_error(name, &key, "no node state to derive the key from"))?;
+        let Some(secret_key) = secret_key else {
+            skipped.push(row_note(name, &key, "no node state to derive the key from"));
+            continue;
+        };
         let aad = row_aad(name, &key);
         if open_bytes(secret_key, &value, &aad).is_ok() {
             continue;
         }
         if !plain(&value) {
-            return Err(decode_error(
-                name,
-                &key,
-                "neither sealed nor a plain secret",
-            ));
+            skipped.push(row_note(name, &key, "neither sealed nor a plain secret"));
+            continue;
         }
         let sealed = seal_bytes(secret_key, &value, &aad)
             .map_err(|error| decode_error(name, &key, error))?;
@@ -270,7 +275,11 @@ where
 }
 
 fn decode_error(name: &str, key: &[u8], error: impl std::fmt::Display) -> ExplorerError {
-    ExplorerError::Decode(format!("{name}/{}: {error}", hex::encode(key)))
+    ExplorerError::Decode(row_note(name, key, error))
+}
+
+fn row_note(name: &str, key: &[u8], reason: impl std::fmt::Display) -> String {
+    format!("{name}/{}: {reason}", hex::encode(key))
 }
 
 /// Previous shape of `PhysicalExecutionResult`, before the bounded stdout and
@@ -689,17 +698,28 @@ mod tests {
         .unwrap()
         .to_bytes()
         .unwrap();
-        write(&path, SOURCE_SECRET_KEYSPACE, vec![(b"row", plain.clone())]);
+        write(
+            &path,
+            SOURCE_SECRET_KEYSPACE,
+            vec![(b"row", plain.clone()), (b"junk", vec![0xff; 3])],
+        );
 
         let output = migrate_output(path.to_str().unwrap()).unwrap();
 
-        assert_eq!((output.secrets_scanned, output.secrets_sealed), (1, 1));
+        // An unreadable row is reported and kept, and the readable one is still sealed.
+        assert_eq!((output.secrets_scanned, output.secrets_sealed), (2, 1));
+        assert_eq!(output.secrets_skipped.len(), 1);
+        assert!(output.secrets_skipped[0].starts_with(SOURCE_SECRET_KEYSPACE));
+        assert_eq!(
+            read(&path, SOURCE_SECRET_KEYSPACE)[b"junk".as_slice()],
+            vec![0xff; 3]
+        );
         let sealed = &read(&path, SOURCE_SECRET_KEYSPACE)[b"row".as_slice()];
         assert!(!sealed.windows(11).any(|window| window == b"canary-61d0"));
         let key = CredentialEncryptionKey::derive(&[11u8; 32]);
         let aad = aruna_storage::row_aad(SOURCE_SECRET_KEYSPACE, b"row");
         assert_eq!(open_bytes(&key, sealed, &aad).unwrap(), plain);
         let again = migrate_output(path.to_str().unwrap()).unwrap();
-        assert_eq!(again.secrets_sealed, 0);
+        assert_eq!((again.secrets_sealed, again.secrets_skipped.len()), (0, 1));
     }
 }
