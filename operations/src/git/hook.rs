@@ -250,11 +250,20 @@ async fn changed(directory: &Path, updates: &[RefUpdate]) -> std::io::Result<Vec
     let mut paths = BTreeSet::new();
     for update in updates.iter().filter(|update| update.new != ZERO_OID) {
         let listing = if update.old == ZERO_OID {
-            command(
-                directory,
-                &["ls-tree", "-r", "-z", "--name-only", &update.new],
-            )
-            .await?
+            // A new branch or tag changes only files in commits no existing ref contains.
+            let arguments = [
+                "log",
+                "-z",
+                "--name-only",
+                "--format=",
+                &update.new,
+                "--not",
+                "--all",
+            ];
+            match command(directory, &arguments).await {
+                Ok(listing) => listing,
+                Err(_) => continue,
+            }
         } else {
             let range = [update.old.as_str(), update.new.as_str()];
             let arguments = [
