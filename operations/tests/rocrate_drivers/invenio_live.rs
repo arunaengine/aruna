@@ -521,13 +521,40 @@ async fn transfer(
     spec: &ExportRoCrateSpec,
 ) -> Result<InvenioRecord, Box<dyn std::error::Error>> {
     let ctx = claim_context(fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
-    match Box::pin(run_export_job(&ctx, spec)).await {
+    let outcome = Box::pin(run_export_job(&ctx, spec)).await;
+    complete(fixture, &ctx, &outcome).await?;
+    match outcome {
         JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) => result
             .repository
             .ok_or_else(|| "missing repository result".into()),
         JobRunOutcome::Failed(error) => Err(error.message.into()),
         _ => Err("unexpected export outcome".into()),
     }
+}
+
+/// Ends a succeeded job like the runtime, so it no longer counts against the job limit.
+async fn complete(
+    fixture: &Fixture,
+    ctx: &JobContext,
+    outcome: &JobRunOutcome,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let JobRunOutcome::Succeeded(result) = outcome else {
+        return Ok(());
+    };
+    let storage = &fixture.context.storage_handle;
+    let record = aruna_operations::jobs::store::read_job_record(storage, ctx.job_id, None)
+        .await?
+        .ok_or("job missing")?;
+    aruna_operations::jobs::store::complete_job(
+        storage,
+        ctx.job_id,
+        ctx.claim_token,
+        result.clone(),
+        record.progress,
+        unix_timestamp_millis(),
+    )
+    .await?;
+    Ok(())
 }
 
 fn require_import(outcome: JobRunOutcome) -> Result<u64, Box<dyn std::error::Error>> {
@@ -676,6 +703,171 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(&read, bytes, "{mode:?} bytes differ for {key}");
         }
     }
+    fixture.stop().await;
+    Ok(())
+}
+
+/// Publishes v1, imports it with keep_updated, publishes v2 and lets the daily check pull it.
+#[tokio::test]
+#[ignore = "requires a disposable loopback Invenio instance and personal token file"]
+async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::invenio::{InvenioPull, LinkPatch, crate_versions};
+    use aruna_core::structs::secondary_id::SecondaryIdKind;
+    use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
+    use aruna_operations::jobs::invenio::pull::drain_pulls;
+    let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
+    let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
+    let token = token.trim();
+    let fixture = build_fixture(false).await?;
+    let connector = live_connector(&fixture, &endpoint, Some(token)).await?;
+    Box::pin(super::link::import_dataset(
+        &fixture,
+        native_archive().await?,
+    ))
+    .await?;
+    let title = format!("Aruna pull {}", Ulid::generate());
+    let metadata = |version: &str| {
+        json!({"title": format!("{title} {version}"), "publisher": "Aruna acceptance"}).to_string()
+    };
+    let auth = AuthContext {
+        user_id: fixture.actor.user_id,
+        realm_id: fixture.actor.realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let mut destination = InvenioDestination {
+        group_id: fixture.group_id,
+        connector_id: connector,
+        draft_id: None,
+        new_version: None,
+        metadata_json: metadata("v1"),
+        publish: true,
+        public_files: true,
+        credential: None,
+        link: None,
+    };
+    destination.credential =
+        Some(seal_credential(&fixture.context, &auth, &destination, token).await?);
+    let mut spec = ExportRoCrateSpec {
+        auth_context: auth.clone(),
+        document_id: doc_id(1),
+        limits: RoCrateLimits::default(),
+        destination: Some(destination),
+    };
+    let first = transfer(&fixture, &spec).await?;
+    assert!(first.published);
+
+    let import = spec_with_source(
+        &fixture,
+        ImportRoCrateSource::Invenio {
+            group_id: fixture.group_id,
+            connector_id: connector,
+            record_id: first.id.clone(),
+            options: InvenioOptions::default(),
+            pull: Some(InvenioPull::Keep {
+                auto_update: true,
+                owner_node_url: "https://node.example/api/v1".into(),
+            }),
+        },
+        doc_id(2),
+    );
+    let ctx = claim_context(
+        &fixture,
+        job_id(),
+        JobPayload::ImportRoCrate(import.clone()),
+    )
+    .await?;
+    let outcome = Box::pin(run_rocrate_import(&ctx, &import)).await;
+    complete(&fixture, &ctx, &outcome).await?;
+    require_import(outcome)?;
+    replay_event_log(fixture.context.as_ref()).await?;
+    process_materialization_batch(fixture.context.as_ref()).await?;
+    let storage = &fixture.context.storage_handle;
+    let (link, _) = list_links(storage, doc_id(2))
+        .await?
+        .pop()
+        .ok_or("the import kept no pull link")?;
+    assert_eq!(link.remote.record_id.as_deref(), Some(first.id.as_str()));
+
+    let target = spec.destination.as_mut().unwrap();
+    target.new_version = Some(first.id.clone());
+    target.metadata_json = metadata("v2");
+    let second = transfer(&fixture, &spec).await?;
+    assert!(second.published && second.parent_id == first.parent_id);
+
+    // Pausing and resuming makes the check due now; the search index may lag a little.
+    let job = tokio::time::timeout(std::time::Duration::from_secs(180), async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let (current, _) = list_links(storage, doc_id(2)).await?.remove(0);
+            if let Some(job) = current.active_job {
+                return Ok::<_, Box<dyn std::error::Error>>(job);
+            }
+            for paused in [true, false] {
+                let patch = LinkPatch {
+                    paused: Some(paused),
+                    ..LinkPatch::default()
+                };
+                let (current, _) = list_links(storage, doc_id(2)).await?.remove(0);
+                Box::pin(change_link(
+                    &fixture.context,
+                    &current,
+                    LinkChange::Patch(patch),
+                ))
+                .await?;
+            }
+            Box::pin(drain_pulls(&fixture.context)).await?;
+        }
+    })
+    .await??;
+    let record = aruna_operations::jobs::store::read_job_record(storage, job, None)
+        .await?
+        .ok_or("pull job missing")?;
+    let JobPayload::ImportRoCrate(update) = record.payload.clone() else {
+        return Err("pull job is not an import".into());
+    };
+    let ctx = claim_context(&fixture, job, record.payload).await?;
+    require_import(Box::pin(run_rocrate_import(&ctx, &update)).await)?;
+    replay_event_log(fixture.context.as_ref()).await?;
+    process_materialization_batch(fixture.context.as_ref()).await?;
+
+    let (pulled, _) = list_links(storage, doc_id(2)).await?.remove(0);
+    assert_eq!(pulled.active_job, None);
+    assert_eq!(pulled.remote.record_id.as_deref(), Some(second.id.as_str()));
+    assert_eq!(pulled.remote.doi, second.doi);
+    assert_eq!(pulled.pull_reason(), None);
+    let revision = aruna_operations::metadata::raw_revision::load_raw_revision(
+        &fixture.context,
+        doc_id(2),
+        None,
+    )
+    .await?
+    .ok_or("revision missing")?;
+    let document: Value = serde_json::from_str(&revision.jsonld)?;
+    let mut versions = crate_versions(&document);
+    versions.sort();
+    let mut expected = vec![first.id.clone(), second.id.clone()];
+    expected.sort();
+    assert_eq!(versions, expected);
+    assert!(revision.jsonld.contains(&format!("{title} v2")));
+    Box::pin(super::link::run_registration(
+        &fixture,
+        job,
+        update.auth_context.user_id,
+    ))
+    .await?;
+    let mapping =
+        aruna_operations::metadata::persistent_id::read_mapping(&fixture.context, doc_id(2))
+            .await?
+            .ok_or("pulled dataset has no mapping")?;
+    let doi = second.doi.as_deref().ok_or("v2 has no DOI")?;
+    assert!(
+        mapping
+            .secondary_identifiers
+            .iter()
+            .any(|id| id.kind == SecondaryIdKind::Doi && id.value.eq_ignore_ascii_case(doi))
+    );
     fixture.stop().await;
     Ok(())
 }
