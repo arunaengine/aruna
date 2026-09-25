@@ -86,6 +86,46 @@ pub struct GitStatus {
 
 pub type Refs = std::collections::BTreeMap<String, String>;
 
+/// One commit as read from the repository, without verifying its signature.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitInfo {
+    pub commit: String,
+    pub parents: Vec<String>,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at_s: i64,
+    pub message: String,
+    pub signed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub change: FileChangeKind,
+}
+
+/// The result of merging a source commit into a target commit. No ref moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The target already contains the source.
+    UpToDate,
+    /// The target is an ancestor of the source, which becomes the new target.
+    FastForward,
+    Merged(String),
+    /// Files both sides changed that no metadata merge can resolve.
+    Conflicts(Vec<String>),
+    /// The merged metadata cannot be represented as a valid ARC.
+    Failed(String),
+}
+
 pub enum GitEffect {
     Initialize(Ulid),
     /// SHA-256 digests of the packs the local cache already holds.
@@ -287,7 +327,10 @@ impl GitRecord {
                 } => {
                     (!refs.is_empty() || revision.is_some())
                         && refs.iter().all(|update| {
-                            valid_ref(&update.name, revision.is_some())
+                            // Users may discard a kept conflict, never write one.
+                            let discard = update.new == ZERO_OID
+                                && update.name.starts_with("refs/conflicts/");
+                            valid_ref(&update.name, revision.is_some() || discard)
                                 && hex(&update.old, 40)
                                 && hex(&update.new, 40)
                                 && update.old != update.new
@@ -405,6 +448,14 @@ mod tests {
         assert!(push("refs/heads/main", None).validate());
         assert!(!push("refs/heads/aruna", None).validate());
         assert!(push("refs/heads/aruna", Some(Ulid::from(9))).validate());
+        let conflict = "refs/conflicts/heads/main/x";
+        assert!(!push(conflict, None).validate());
+        let mut discard = push(conflict, None);
+        if let GitChange::Objects { refs, .. } = &mut discard.change {
+            refs[0].old = "a".repeat(40);
+            refs[0].new = ZERO_OID.into();
+        }
+        assert!(discard.validate());
         let mut invalid = push("refs/heads/main", None);
         if let GitChange::Objects { refs, .. } = &mut invalid.change {
             refs[0].new = "A".repeat(40);
