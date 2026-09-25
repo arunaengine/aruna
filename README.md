@@ -278,9 +278,34 @@ Object-backed RO-Crate imports copy the archive into a hidden seekable spool. Un
 deleted at the end of the import, the importing node can temporarily use roughly twice the archive's
 stored bytes; operators should reserve capacity accordingly.
 
-### Invenio and Zenodo transfers
+### Repository publishing: Invenio and Zenodo
 
-The native REST API transfers crates through durable jobs. Create an Invenio repository
+The native REST API publishes crates to repositories and imports records through durable jobs.
+The routes are generic; Invenio (including Zenodo) is the first repository kind.
+`GET /api/v1/metadata/repository/kinds` lists every kind that can publish, with its
+`capabilities` (`drafts`, `reserve_identifier`, `versions`, `review`, `pull`, `search`,
+`release_date` and `identifier_kind`), its requirement `profiles` and its mapping rule `targets`.
+An action the kind cannot do answers 400 with code `not_supported`. Harvest-only kinds such as
+`oai_pmh` are not listed.
+
+A repository's requirements have three layers, all reported as Profile validation findings
+(`code`, `severity`, `focus_node`, `path`, `rule`, `message`). Built-in SHACL requirement
+Profiles check the crate metadata: `https://w3id.org/aruna/profiles/repository/zenodo` needs the
+DataCite fields (title, publication date, creators with a name or family name, and a license as
+a warning), and `https://w3id.org/aruna/profiles/repository/invenio` also needs a `publisher`,
+as text or as an entity with a `name`. Zenodo endpoints use the first, other InvenioRDM instances
+the second. Mapping rules, embedded as JSON data per kind, say which crate entities become which
+repository objects and fields and report `mapping_violation`. Content rules check the files in
+the export job before any repository write and report `content_violation`; an Invenio record
+holds at most 100 files. Only the crate satisfies requirements; `metadata` overrides never do.
+
+`POST /api/v1/metadata/{document_id}/repository/check` with `group_id`, `connector_id` and an
+optional `metadata` object checks the dataset without storing or sending anything. It answers
+`kind`, `profile` (`iri`, `revision`), `ready` (no finding is a violation), `findings` and
+`mapping`, which says what each crate entity becomes. It requires READ on the dataset and on the
+connector group's metadata path.
+
+Create an Invenio repository
 connector with `POST /api/v1/metadata/groups/{group_id}/repositories`, `kind` set to `invenio`
 and `endpoint` set to the repository API root, for example `https://zenodo.org/api/` or
 `https://sandbox.zenodo.org/api/`. Store a repository personal access token in
@@ -288,13 +313,14 @@ and `endpoint` set to the repository API root, for example `https://zenodo.org/a
 own Invenio/Zenodo access token in `repository.access_token`; the connector token is never used
 for publishing. The node's egress policy applies to all requests.
 
-Search published records with `GET /api/v1/metadata/invenio/records`, passing `group_id`,
-`connector_id`, `q`, `page` and `size` as query parameters. Results use the native repository
+Search published records with
+`GET /api/v1/metadata/groups/{group_id}/repositories/{connector_id}/records`, passing `q`,
+`page` and `size` as query parameters. Results use the native repository
 JSON representation. Pages start at 1, size is at most 25, and `all_versions=true` includes
 older published versions. Search requires READ on the connector group's metadata path and does
 not import data.
 
-Import a record with `POST /api/v1/metadata/invenio/imports`:
+Import a record with `POST /api/v1/metadata/repository/imports`:
 
 ```json
 {
@@ -332,7 +358,7 @@ such as `metadata/funding/0/award/number`. Partial publication dates use their e
 crate validation; `https://w3id.org/aruna/invenio/publicationDate` retains the exact original
 date or interval, which is restored on export when the mapped date has not been edited.
 
-Export with `POST /api/v1/metadata/{document_id}/invenio/exports`:
+Export with `POST /api/v1/metadata/{document_id}/repository/exports`:
 
 ```json
 {
@@ -357,13 +383,10 @@ their vocabulary. Override controlled vocabulary fields for the target repositor
 Source identifiers become provenance relations;
 the transfer does not claim an existing source DOI as a newly issued repository DOI.
 Exports with omitted files fail. Web data entities, `File` entities with an `https://` identifier
-and no Aruna bytes, stay in the crate and become `references` relations. A record holds at most
-100 files; larger crates fail with `too_many_files` before a draft is created. The request
-fails with 400 and a `missing` list when the mapped metadata lacks title, publication date,
-resource type or creators. Repositories other than Zenodo also need `publisher` to register the
-DOI. It comes from the crate root `publisher`, as text or as an entity with a `name`, or from
-`repository.metadata`; Zenodo sets it itself. Creator identifiers are sent only for ORCID, GND,
-ISNI and ROR.
+and no Aruna bytes, stay in the crate and become `references` relations. The request fails with
+400, code `requirements_unmet` and the `findings` when the crate does not meet the repository's
+requirements. A crate with more files than the record holds fails the job before a draft is
+created. Creator identifiers are sent only for ORCID, GND, ISNI and ROR.
 Every new draft reserves its DOI, which `result.repository.doi` shows.
 `publish: false` (the default) leaves an unpublished draft with restricted file access;
 `publish: true` publishes after verifying every uploaded file. Repository validation and
@@ -373,10 +396,10 @@ whose metadata is replaced by the mapped crate metadata. When the connector name
 `community`, publishing a record's first version submits it to that community for review
 instead, and `result.repository.in_review` is true.
 
-Set `repository.new_version` to an existing published record ID to create its next version
+Set `repository.published_id` to an existing published record ID to create its next version
 under the same parent identifier. This requires permission on that record. A new-version draft
 inherits repository access settings and may already exist; unexpected files cause a failure.
-Supply `draft_id` alongside `new_version` when recovering that draft. Metadata updates use the
+Supply `draft_id` alongside `published_id` when recovering that draft. Metadata updates use the
 captured draft revision and fail on conflicts. Metadata and the complete file set are checked
 before and after publication; the upstream publication action has no atomic revision guard.
 Exporting an imported history remains one crate snapshot unless versions are submitted
@@ -401,12 +424,12 @@ because it publishes the dataset under a repository record, and connector-group 
 identifier registration checks WRITE on the dataset as the submitting user.
 
 A link keeps a dataset in sync with one Invenio record lineage. Create it with
-`POST /api/v1/metadata/{document_id}/invenio/links` and a body with `group_id`, `connector_id`
+`POST /api/v1/metadata/{document_id}/repository/links` and a body with `group_id`, `connector_id`
 and the user's `access_token`. It requires WRITE on the dataset and on the connector group's
 metadata path. Set `parent_id` to continue an existing record, for example the
 imported source. The node that creates the link must hold the dataset; it seals the token for
-that link and becomes the link's owner. Creation fails with 400 and a `missing` list when the
-mapped metadata lacks required fields. The first push is queued right away. Later changes push
+that link and becomes the link's owner. Creation fails with 400, code `requirements_unmet` and
+the `findings` when the crate does not meet the repository's requirements. The first push is queued right away. Later changes push
 10 seconds after the last change, at most 5 minutes after the first waiting one, as one
 `export_rocrate` job, and `POST .../links/{link_id}/push` queues one at once. Pushes update one
 open draft, which keeps its reserved DOI (`remote.doi` with `remote.doi_reserved`) and is kept
@@ -417,12 +440,15 @@ and `remote.review` shows `pending`, then `accepted` or `declined`. A declined r
 reason `review_declined` on the enabled link: pushes still update the draft, `auto_publish`
 waits, and an explicit publish submits the draft again. After a publish, the next
 push creates a new version. A check that fails after the repository published becomes
-`warning`; the published record and DOI are always kept.
+`warning`; the published record and DOI are always kept. `remote.state` sums up the repository
+side: `none`, `draft`, `review` or `published`.
 
 A push fails the link instead of leaving out files or overwriting remote edits. Reasons are
 `remote_changed` when the draft was edited in the repository, a file appeared there or the
 lineage has a newer version, `token_rejected`, `source_unavailable` when a file has no
-readable copy or a referenced origin changed, `too_many_files` and `owner_not_holder`.
+readable copy or a referenced origin changed, `requirements_unmet` with the `findings` on the
+link, and `owner_not_holder`. A link that failed on unmet requirements retries after the next
+dataset change.
 `POST .../links/{link_id}/accept-remote` makes the repository's current state the new base and
 enables the link again. `PATCH` pauses or resumes a link and changes its options,
 `PUT .../token` replaces the token, and `DELETE` removes the link and its token. Pausing or
