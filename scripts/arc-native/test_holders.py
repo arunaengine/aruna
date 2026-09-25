@@ -8,10 +8,11 @@ import os
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from arc import scaffold
-from test_native import command, commit, http
+from test_native import api, command, commit, http
 
 
 def wait(description, check):
@@ -89,13 +90,27 @@ def exercise(root):
     (b / "race.txt").write_text("second holder\n")
     command(b, env, "add", "race.txt")
     commit(b, env, "test: race through the second holder")
-    accepted = [command(clone, env, "push", "origin", "race", success=None) is not None for clone in (a, b)]
+    # Both pushes start together, so each holder can accept one before the other replicates.
+    with ThreadPoolExecutor(2) as pool:
+        pushes = [pool.submit(command, clone, env, "push", "origin", "race", success=None) for clone in (a, b)]
+        accepted = [push.result() is not None for push in pushes]
     assert any(accepted)
+    races = lambda state: [name for name in state if name.startswith("refs/conflicts/heads/race/")]
+    # Every accepted push but one must end up kept, once both records reached both holders.
     final = wait("holders did not converge after competing pushes",
-                 lambda: (s := converged()) and "refs/heads/race" in s and s)
-    kept = [name for name in final if name.startswith("refs/conflicts/heads/race/")]
-    assert len(kept) == accepted.count(True) - 1
+                 lambda: (s := converged()) and "refs/heads/race" in s
+                 and len(races(s)) == accepted.count(True) - 1 and s)
+    kept = races(final)
     print("PASS: competing branch pushes converge to one branch and keep the other as a conflict ref", flush=True)
+
+    if kept:
+        base = f"{os.environ['ARUNA_API_A']}/api/v1/metadata/{os.environ['ARUNA_DOCUMENT_ID']}"
+        status, listed = api(base + "/conflicts")
+        assert status == 200 and [item["branch"] for item in listed["conflicts"]] == ["race"], listed
+        assert api(f"{base}/conflicts/{listed['conflicts'][0]['id']}", "DELETE")[0] == 204
+        wait("holders kept a discarded conflict", lambda: (s := converged())
+             and not any(name.startswith("refs/conflicts/") for name in s) and s)
+        print("PASS: a kept conflict is listed through REST and discarded on both holders", flush=True)
 
 
 if __name__ == "__main__":
