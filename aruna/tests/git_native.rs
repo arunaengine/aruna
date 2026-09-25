@@ -19,27 +19,28 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 
-#[tokio::test]
-#[ignore = "requires ARUNA_ARC_PYTHON, Git LFS and optionally ARUNA_ARCITECT"]
-async fn native_clients() -> TestResult<()> {
-    let python = std::env::var("ARUNA_ARC_PYTHON")?;
-    let seed = spawn_complete_seed().await?;
-    let directory = tempfile::tempdir()?;
+type ServerTask = tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>;
+
+/// Serves one node's REST API with native Git hosting from `root`.
+async fn git_server(
+    context: Arc<aruna_operations::driver::DriverContext>,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
+    node_id: iroh::PublicKey,
+    capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
+    root: std::path::PathBuf,
+) -> TestResult<(String, tokio_util::sync::CancellationToken, ServerTask)> {
     let state = Arc::new(
         ServerState::new(
-            seed.context.clone(),
-            seed.realm_id,
-            seed.net.node_id(),
-            seed.capabilities.clone(),
+            context,
+            realm_id,
+            node_id,
+            capabilities,
             false,
             None,
             aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
         .await
-        .with_git(
-            directory.path().join("git"),
-            env!("CARGO_BIN_EXE_aruna").into(),
-        ),
+        .with_git(root, env!("CARGO_BIN_EXE_aruna").into()),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -52,14 +53,29 @@ async fn native_clients() -> TestResult<()> {
         },
     );
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let stopped = shutdown.clone();
-    let server_task = tokio::spawn(server.run_with_listener(listener, stopped));
+    let task = tokio::spawn(server.run_with_listener(listener, shutdown.clone()));
+    Ok((format!("http://{address}"), shutdown, task))
+}
+
+#[tokio::test]
+#[ignore = "requires ARUNA_ARC_PYTHON, Git LFS and optionally ARUNA_ARCITECT"]
+async fn native_clients() -> TestResult<()> {
+    let python = std::env::var("ARUNA_ARC_PYTHON")?;
+    let seed = spawn_complete_seed().await?;
+    let directory = tempfile::tempdir()?;
+    let (base, shutdown, server_task) = git_server(
+        seed.context.clone(),
+        seed.realm_id,
+        seed.net.node_id(),
+        seed.capabilities.clone(),
+        directory.path().join("git"),
+    )
+    .await?;
     let result = async {
         let token = create_bearer_token(seed.context.as_ref(), seed.user_id, seed.realm_id, seed.capabilities.clone()).await?;
         let group = create_group_http(&seed.base_url, &token, "native-arc").await?;
         let credentials = create_s3_credentials(&seed.base_url, &token, &group.group_id).await?;
         let endpoint = seed.s3.as_ref().ok_or_else(|| std::io::Error::other("S3 unavailable"))?;
-        let base = format!("http://{address}");
         let client = reqwest::Client::new();
         let document: serde_json::Value = client.post(format!("{base}/api/v1/metadata")).bearer_auth(&token)
             .json(&serde_json::json!({"group_id":group.group_id,"path":"native-arc","name":"Native ARC",
@@ -111,5 +127,72 @@ async fn native_clients() -> TestResult<()> {
     shutdown.cancel();
     server_task.await??;
     seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires ARUNA_ARC_PYTHON and Git LFS"]
+async fn holder_failover() -> TestResult<()> {
+    let python = std::env::var("ARUNA_ARC_PYTHON")?;
+    let seed = spawn_complete_seed().await?;
+    let secret =
+        shared::create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server)
+            .await?;
+    let joiner = shared::spawn_complete_joiner(&seed, secret).await?;
+    shared::wait_realm_nodes(&[seed.context.as_ref(), joiner.context.as_ref()], &seed.realm_id, 2).await?;
+    let directory = tempfile::tempdir()?;
+    let (base_a, stop_a, task_a) = git_server(
+        seed.context.clone(),
+        seed.realm_id,
+        seed.net.node_id(),
+        seed.capabilities.clone(),
+        directory.path().join("a"),
+    )
+    .await?;
+    let (base_b, stop_b, task_b) = git_server(
+        joiner.context.clone(),
+        joiner.config.realm_id,
+        joiner.config.node_id,
+        joiner.config.node_capabilities.clone(),
+        directory.path().join("b"),
+    )
+    .await?;
+    let result = async {
+        let token = create_bearer_token(seed.context.as_ref(), seed.user_id, seed.realm_id, seed.capabilities.clone()).await?;
+        let group = create_group_http(&seed.base_url, &token, "holder-arc").await?;
+        shared::wait_group_http(&joiner.base_url, &token, &group.group_id).await?;
+        let client = reqwest::Client::new();
+        let document: serde_json::Value = client.post(format!("{base_a}/api/v1/metadata")).bearer_auth(&token)
+            .json(&serde_json::json!({"group_id":group.group_id,"path":"holder-arc","name":"Holder ARC",
+                "description":"Two holders serve one ARC","date_published":"2026-09-25",
+                "license":"https://creativecommons.org/licenses/by/4.0/","public":false}))
+            .send().await?.error_for_status()?.json().await?;
+        let id = document["document_id"].as_str().ok_or_else(|| std::io::Error::other("document ID missing"))?;
+        for base in [&base_a, &base_b] {
+            shared::wait_until("ARC repository on each holder", shared::WAIT_CAP, Duration::from_millis(250), || async {
+                let Ok(response) = client.get(format!("{base}/api/v1/metadata/{id}/git")).bearer_auth(&token).send().await else {
+                    return false;
+                };
+                response.status().is_success()
+                    && response.json::<serde_json::Value>().await.is_ok_and(|status| status["commit"].is_string())
+            }).await?;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("workspace root");
+        let mut child = Command::new(python).arg(root.join("scripts/arc-native/test_holders.py"))
+            .env("ARUNA_GIT_URL_A", format!("{base_a}/api/v1/git/{id}.git"))
+            .env("ARUNA_GIT_URL_B", format!("{base_b}/api/v1/git/{id}.git"))
+            .env("ARUNA_API_A", &base_a).env("ARUNA_API_B", &base_b)
+            .env("ARUNA_TOKEN", &token).env("ARUNA_DOCUMENT_ID", id)
+            .kill_on_drop(true).spawn()?;
+        if !tokio::time::timeout(Duration::from_secs(1200), child.wait()).await??.success() {
+            return Err(std::io::Error::other("two-holder Git test failed").into());
+        }
+        Ok(())
+    }.await;
+    stop_a.cancel();
+    stop_b.cancel();
+    task_a.await??;
+    task_b.await??;
+    shared::shutdown_pair(joiner, seed).await;
     result
 }

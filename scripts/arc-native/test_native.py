@@ -23,6 +23,8 @@ from botocore.config import Config
 def command(directory, env, *args, success=True):
     result = subprocess.run(["git", "-c", "credential.helper=", "-C", str(directory), *args],
                             env=env, capture_output=True, timeout=180)
+    if success is None:
+        return result.stdout if result.returncode == 0 else None
     if (result.returncode == 0) != success:
         raise AssertionError(f"Git {args[0]} returned {result.returncode}: {result.stderr.decode()}")
     return result.stdout
