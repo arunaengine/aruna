@@ -807,15 +807,13 @@ async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
     // Every origin writes more than its share of one window, so only checkpoints keep
     // the document writable.
     let edits = aruna_core::metadata::EVENT_LIMIT as usize + 76;
-    for edit in 0..edits {
-        let node = origins[edit % origins.len()];
+    let write = async |node: &TestNode, name: String| -> Result<(), Box<dyn std::error::Error>> {
         let jsonld = format!(
             r#"{{"@context":"https://w3id.org/ro/crate/1.2/context","@graph":[
 {{"@id":"ro-crate-metadata.json","@type":"CreativeWork","conformsTo":{{"@id":"https://w3id.org/ro/crate/1.2"}},"about":{{"@id":"https://w3id.org/aruna/{document_id}"}}}},
-{{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"Edit {edit}","description":"Long history","datePublished":"2026-02-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}}}}]}}"#
+{{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"{name}","description":"Long history","datePublished":"2026-02-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}}}}]}}"#
         );
         // A burst can outrun materialization; the window opens again once it catches up.
-        let mut accepted = false;
         for _ in 0..1200 {
             let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
                 actor: actor(node),
@@ -827,10 +825,7 @@ async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
                 },
             });
             match update_metadata_document(operation, node.context.as_ref()).await {
-                Ok(_) => {
-                    accepted = true;
-                    break;
-                }
+                Ok(_) => return Ok(()),
                 // Backpressure and write conflicts are both answered by retrying.
                 Err(
                     UpdateDocumentError::RawLimit
@@ -841,16 +836,63 @@ async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => return Err(error.into()),
             }
         }
-        assert!(accepted, "edit {edit} stayed refused");
+        Err(format!("{name} stayed refused").into())
+    };
+    for edit in 0..edits {
+        write(origins[edit % origins.len()], format!("Edit {edit}")).await?;
     }
-    let last = format!("Edit {}", edits - 1);
+    // The last edits are concurrent, so one more edit follows once every node merged them all.
+    let mut dots = Vec::new();
+    for node in &origins {
+        let event = node
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: aruna_core::keyspaces::METADATA_ACTOR_KEYSPACE.to_string(),
+                key: aruna_core::storage_entries::metadata_actor_key(document_id),
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) = event
+        else {
+            return Err("metadata actor unreadable".into());
+        };
+        let own: aruna_core::metadata::MetadataActor = postcard::from_bytes(&bytes)?;
+        dots.push((craqle::ActorId(own.actor), own.counter));
+    }
+    wait_for_convergence("edits did not reach every node", || async {
+        let mut pending = 0;
+        for node in &nodes {
+            let event = node
+                .context
+                .metadata_handle
+                .as_ref()
+                .ok_or("metadata handle missing")?
+                .send_effect(Effect::Metadata(MetadataEffect::GraphSnapshot {
+                    graph_iri: created.record.graph_iri.clone(),
+                }))
+                .await;
+            let Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) = event else {
+                return Err("graph state unreadable".into());
+            };
+            pending += dots
+                .iter()
+                .filter(|(actor, counter)| snapshot.clock.0.get(actor) < Some(counter))
+                .count();
+        }
+        Ok::<_, Box<dyn std::error::Error>>(pending)
+    })
+    .await?;
+    write(origins[0], "Final edit".to_string()).await?;
     wait_metadata_state(
         &nodes,
         group_id,
         document_id,
         &created.record.graph_iri,
         3,
-        &last,
+        "Final edit",
     )
     .await?;
     let checkpoints = nodes[0]
