@@ -199,8 +199,18 @@ node's secret key, which the node keeps in its state under `STORAGE_PATH`. Only 
 can decrypt these secrets, and a restart derives the same key again. Back up `STORAGE_PATH` as a
 whole to keep them usable. A node restored without its state, or with another identity, cannot
 decrypt them: register the connector and backend secrets again with their `PUT` routes and
-replace each link token with `PUT .../token`. Nodes that stored secrets before this encryption
-need one `aruna-doctor migrate` run with the node stopped, which encrypts those rows.
+replace each link token with `PUT .../token`. Secrets stored before this encryption are
+encrypted by the migrate run described under Upgrading.
+
+### Upgrading
+
+After upgrading a node, stop it and run `aruna-doctor migrate <STORAGE_PATH>` once before the new
+version starts. The run rewrites rows that older versions stored in an earlier layout: job records
+and their checkpoints, PID mappings and their queued publishes, and the realm configuration. It
+rebuilds the identifier index from the PID mappings and encrypts plain stored secrets. The output
+counts scanned and rewritten rows per kind and lists secret rows it could not read; those stay
+unchanged. A second run changes nothing. Without the migration the new version cannot read the old
+rows.
 
 ## Interactive Session Networking
 
@@ -350,7 +360,10 @@ Exports with omitted files fail. Web data entities, `File` entities with an `htt
 and no Aruna bytes, stay in the crate and become `references` relations. A record holds at most
 100 files; larger crates fail with `too_many_files` before a draft is created. The request
 fails with 400 and a `missing` list when the mapped metadata lacks title, publication date,
-resource type or creators. Creator identifiers are sent only for ORCID, GND, ISNI and ROR.
+resource type or creators. Repositories other than Zenodo also need `publisher` to register the
+DOI. It comes from the crate root `publisher`, as text or as an entity with a `name`, or from
+`repository.metadata`; Zenodo sets it itself. Creator identifiers are sent only for ORCID, GND,
+ISNI and ROR.
 Every new draft reserves its DOI, which `result.repository.doi` shows.
 `publish: false` (the default) leaves an unpublished draft with restricted file access;
 `publish: true` publishes after verifying every uploaded file. Repository validation and
@@ -377,7 +390,8 @@ token changes the idempotency identity. No shared publishing account is selected
 
 The response provides job status and report URLs; the existing job API also supports cancellation.
 Successful exports include `result.repository` with the record ID, parent ID, revision, assigned
-DOI when available, API URL and publication state. Both transfers support `idempotency_key`.
+DOI and concept DOI when available, API URL, page URL and publication state. Both transfers
+support `idempotency_key`.
 An ambiguous draft-creation response stops
 automatic creation; inspect the repository and supply `repository.draft_id` in a new request
 to reuse the unpublished draft. Failed or cancelled transfers leave remote drafts available
@@ -391,8 +405,9 @@ imported source. The node that creates the link must hold the dataset; it seals 
 that link and becomes the link's owner. Creation fails with 400 and a `missing` list when the
 mapped metadata lacks required fields. The first push is queued right away. Later changes push
 10 seconds after the last change, at most 5 minutes after the first waiting one, as one
-`export_rocrate` job. Pushes update one open draft, which keeps its reserved DOI
-(`remote.doi` with `remote.doi_reserved`) and is kept even when a push fails. Publish it with
+`export_rocrate` job, and `POST .../links/{link_id}/push` queues one at once. Pushes update one
+open draft, which keeps its reserved DOI (`remote.doi` with `remote.doi_reserved`) and is kept
+even when a push fails. Publish it with
 `POST .../links/{link_id}/publish`, or set `auto_publish` to publish once the draft has been
 quiet for 15 minutes. With a connector community, the first version goes to community review
 and `remote.review` shows `pending`, then `accepted` or `declined`. After a publish, the next
@@ -424,9 +439,11 @@ the link shows `local_changed`; an explicit pull then overwrites the root metada
 local parts and files. One dataset cannot have an enabled push link and an enabled pull link
 for the same record lineage.
 
-Imports and pushes record the repository DOI and record IDs as secondary identifiers of the
-dataset. `GET /api/v1/metadata/{document_id}/pids` lists them, and
-`GET /api/v1/pid/lookup?kind=doi&value=<doi>` finds the dataset for one identifier.
+Imports and pushes record the version DOI, concept DOI, record ID and parent ID as secondary
+identifiers of the dataset, with origin `imported` or `published`. Exports add them to the crate
+they send without editing the dataset. `GET /api/v1/metadata/{document_id}/pids` lists them, and
+`GET /api/v1/pid/lookup?kind=doi&value=<doi>` lists every readable dataset that holds one
+identifier, published ones first. Any node of the realm answers it; 404 means no readable match.
 
 The opt-in `invenio::live::native_repository` test exercises a real local Invenio instance.
 Set `ARUNA_INVENIO_ENDPOINT` to its loopback API URL, `ARUNA_INVENIO_TOKEN_FILE` to an
