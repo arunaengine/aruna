@@ -37,8 +37,16 @@ impl GitStore {
         let _slot = self.slots.try_acquire().map_err(std::io::Error::other)?;
         let id = match &effect {
             GitEffect::Initialize(id) | GitEffect::Refs(id) | GitEffect::Imported(id) => *id,
-            GitEffect::Generate { snapshot, .. } => snapshot.document_id,
+            GitEffect::Generate { snapshot, .. } | GitEffect::Edit { snapshot, .. } => {
+                snapshot.document_id
+            }
             GitEffect::Import { document_id, .. }
+            | GitEffect::Resolve { document_id, .. }
+            | GitEffect::MergeBase { document_id, .. }
+            | GitEffect::Log { document_id, .. }
+            | GitEffect::Diff { document_id, .. }
+            | GitEffect::Merge { document_id, .. }
+            | GitEffect::MergeMetadata { document_id, .. }
             | GitEffect::Ancestry { document_id, .. }
             | GitEffect::SetRefs { document_id, .. }
             | GitEffect::Pack { document_id, .. }
@@ -54,6 +62,52 @@ impl GitStore {
                     Err(error) => GitEvent::GenerateFailed(error),
                 },
             ),
+            GitEffect::Resolve { revision, .. } => Ok(GitEvent::Resolved(
+                crate::repo::resolve(&repository, &revision).await,
+            )),
+            GitEffect::MergeBase { first, second, .. } => Ok(GitEvent::Resolved(
+                crate::repo::merge_base(&repository, &first, &second).await,
+            )),
+            GitEffect::Log {
+                revision,
+                skip,
+                limit,
+                ..
+            } => crate::repo::log(&repository, &revision, skip, limit)
+                .await
+                .map(GitEvent::Log),
+            GitEffect::Diff { from, to, .. } => {
+                crate::repo::diff(&repository, from.as_deref(), &to)
+                    .await
+                    .map(GitEvent::Diff)
+            }
+            GitEffect::Edit {
+                head,
+                snapshot,
+                message,
+            } => crate::arc::edit(&repository, &head, snapshot, message)
+                .await
+                .map(GitEvent::Edited),
+            GitEffect::Merge {
+                target,
+                source,
+                message,
+                ..
+            } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(std::io::Error::other)?;
+                let occurred_at_ms =
+                    u64::try_from(now.as_millis()).map_err(std::io::Error::other)?;
+                crate::arc::merge(&repository, id, &target, &source, message, occurred_at_ms)
+                    .await
+                    .map(GitEvent::Merged)
+            }
+            GitEffect::MergeMetadata {
+                old, new, graph, ..
+            } => crate::arc::merge_metadata(&repository, old.as_deref(), &new, &graph)
+                .await
+                .map(GitEvent::MetadataMerged),
             GitEffect::Imported(_) => crate::repo::imported(&repository)
                 .await
                 .map(GitEvent::Imported),

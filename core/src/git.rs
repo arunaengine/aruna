@@ -163,6 +163,50 @@ pub enum GitEffect {
         document_id: Ulid,
         revision: String,
     },
+    /// The commit a branch, tag or commit id names, if any.
+    Resolve {
+        document_id: Ulid,
+        revision: String,
+    },
+    /// The best common ancestor of two commits, if any.
+    MergeBase {
+        document_id: Ulid,
+        first: String,
+        second: String,
+    },
+    /// Up to `limit` commits reachable from `revision`, newest first, after skipping `skip`.
+    Log {
+        document_id: Ulid,
+        revision: String,
+        skip: usize,
+        limit: usize,
+    },
+    /// Files changed from `from` (or an empty tree) to `to`.
+    Diff {
+        document_id: Ulid,
+        from: Option<String>,
+        to: String,
+    },
+    /// Commits the snapshot's metadata on top of `head` without moving any ref.
+    Edit {
+        head: String,
+        snapshot: GitSnapshot,
+        message: String,
+    },
+    /// Merges `source` into `target` without moving any ref.
+    Merge {
+        document_id: Ulid,
+        target: String,
+        source: String,
+        message: String,
+    },
+    /// Applies the metadata changed from `old` (or nothing) to `new` onto `graph` JSON-LD.
+    MergeMetadata {
+        document_id: Ulid,
+        old: Option<String>,
+        new: String,
+        graph: String,
+    },
     Http(Box<GitRequest>),
 }
 
@@ -180,6 +224,14 @@ pub enum GitEvent {
     /// The graph cannot be represented as a valid ARC yet; nothing was built.
     GenerateFailed(String),
     Exported(Bytes),
+    Resolved(Option<String>),
+    Log(Vec<CommitInfo>),
+    Diff(Vec<FileChange>),
+    /// The new commit, the unchanged head, or why the metadata cannot become an ARC.
+    Edited(Result<String, String>),
+    Merged(MergeOutcome),
+    /// The merged JSON-LD, `None` when nothing changed, or why the merge failed.
+    MetadataMerged(Result<Option<String>, String>),
     Response {
         status: u16,
         headers: Vec<(String, String)>,

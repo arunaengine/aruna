@@ -26,7 +26,6 @@ pub async fn validate() -> std::io::Result<()> {
     let directory = Path::new(".");
     let mut revisions = BTreeSet::new();
     let mut main = None;
-    let mut derived = Value::Null;
     let mut updates = Vec::new();
     for update in input.lines() {
         let parts: Vec<_> = update.split_whitespace().collect();
@@ -141,9 +140,6 @@ pub async fn validate() -> std::io::Result<()> {
             if converted.get("rocrate").is_none() {
                 return Err(invalid());
             }
-            if main.as_ref().is_some_and(|(_, commit)| *commit == revision) {
-                derived = converted["rocrate"].clone();
-            }
             if !paths.contains("isa.investigation.xlsx") {
                 return Err(invalid());
             }
@@ -197,7 +193,7 @@ pub async fn validate() -> std::io::Result<()> {
     let paths = changed(directory, &updates).await?;
     unlocked(&url, &paths, &token).await?;
     if arc && let Some((old, new)) = main {
-        merge(directory, &old, &new, derived, &token).await?;
+        merge(directory, &old, &new, &token).await?;
     }
     publish(directory, updates, objects, paths, &token).await
 }
@@ -308,23 +304,8 @@ async fn publish(
 }
 
 /// Merges ISA and `aruna-metadata.json` edits on main into the document before refs move.
-async fn merge(
-    directory: &Path,
-    old: &str,
-    new: &str,
-    derived: Value,
-    token: &str,
-) -> std::io::Result<()> {
+async fn merge(directory: &Path, old: &str, new: &str, token: &str) -> std::io::Result<()> {
     let url = std::env::var("ARUNA_GIT_METADATA_URL").map_err(|_| invalid())?;
-    let (mut base, mut json_base) = (Value::Null, None);
-    if !old.bytes().all(|byte| byte == b'0') {
-        base = aruna_blob::arc::export(directory, old)
-            .await
-            .ok()
-            .and_then(|value| value.get("rocrate").cloned())
-            .unwrap_or(Value::Null);
-        json_base = metadata_file(directory, old).await;
-    }
     // Scaffolded documents have no raw revision until their first replacement.
     let current =
         match aruna_blob::git::metadata_request(&format!("{url}/rocrate?view=raw"), token, None)
@@ -336,17 +317,14 @@ async fn merge(
             )?["rocrate"]
                 .take(),
         };
-    let merged = aruna_blob::arc::convert(json!({"mode": "merge",
-        "graph": serde_json::to_string(&current)?, "base": base, "new": derived,
-        "json_base": json_base, "json_new": metadata_file(directory, new).await}))
-    .await?;
-    if let Some(error) = merged["error"].as_str() {
-        return Err(std::io::Error::other(error.to_string()));
-    }
-    let Some(jsonld) = merged["jsonld"].as_str() else {
-        return Ok(());
+    let old = (!old.bytes().all(|byte| byte == b'0')).then_some(old);
+    let graph = serde_json::to_string(&current)?;
+    let jsonld = match aruna_blob::arc::merge_metadata(directory, old, new, &graph).await? {
+        Ok(Some(jsonld)) => jsonld,
+        Ok(None) => return Ok(()),
+        Err(error) => return Err(std::io::Error::other(error)),
     };
-    let rocrate: Value = serde_json::from_str(jsonld)?;
+    let rocrate: Value = serde_json::from_str(&jsonld)?;
     let body = serde_json::to_vec(&json!({ "rocrate": rocrate }))?;
     aruna_blob::git::metadata_request(
         &format!("{url}/rocrate"),
@@ -355,14 +333,4 @@ async fn merge(
     )
     .await?;
     Ok(())
-}
-
-async fn metadata_file(directory: &Path, revision: &str) -> Option<String> {
-    let bytes = command(
-        directory,
-        &["show", &format!("{revision}:aruna-metadata.json")],
-    )
-    .await
-    .ok()?;
-    String::from_utf8(bytes.to_vec()).ok()
 }
