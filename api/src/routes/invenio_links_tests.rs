@@ -314,7 +314,7 @@ async fn holder_copy_refuses() {
     let document_id = parse_document_id(&linked.document_id).unwrap();
     // A replicated copy of a link another node owns; that node is not a holder of the dataset.
     let now = std::time::SystemTime::now();
-    let copy = InvenioLink {
+    let copy = RepositoryLink {
         link_id: Ulid::generate(),
         document_id,
         group_id: linked.test.group_id,
@@ -456,10 +456,10 @@ async fn admin_rights_limited() {
 }
 
 /// Stores a pull link on the dataset the way a keep_updated import creates it.
-async fn pull_link_for(linked: &Linked) -> InvenioLink {
+async fn pull_link_for(linked: &Linked) -> RepositoryLink {
     use aruna_core::repository::{InvenioRecord, LinkDirection, LinkPull};
     let now = std::time::SystemTime::now();
-    let mut link = InvenioLink {
+    let mut link = RepositoryLink {
         link_id: Ulid::generate(),
         document_id: parse_document_id(&linked.document_id).unwrap(),
         group_id: linked.test.group_id,

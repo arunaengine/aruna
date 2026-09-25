@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::repository::InvenioLink;
+use aruna_core::repository::RepositoryLink;
 
 use super::metadata::MetadataOutcome;
 use super::*;
@@ -62,7 +62,7 @@ pub(in crate::document_sync) fn validate_link(
     bytes: Option<&[u8]>,
     change: &DocumentChange,
 ) -> std::result::Result<(), String> {
-    let DocumentTarget::InvenioLink {
+    let DocumentTarget::RepositoryLink {
         document_id,
         link_id,
     } = target
@@ -71,7 +71,7 @@ pub(in crate::document_sync) fn validate_link(
     };
     match bytes {
         Some(bytes) => {
-            let link = InvenioLink::from_bytes(bytes).map_err(|error| error.to_string())?;
+            let link = RepositoryLink::from_bytes(bytes).map_err(|error| error.to_string())?;
             if link.document_id != *document_id || link.link_id != *link_id {
                 return Err("payload does not match its target".to_string());
             }
@@ -101,7 +101,7 @@ pub(in crate::document_sync) async fn store_link(
     bytes: Option<Vec<u8>>,
     change: DocumentChange,
 ) -> Result<MetadataPlacementOutcome<bool>> {
-    let DocumentTarget::InvenioLink { document_id, .. } = target else {
+    let DocumentTarget::RepositoryLink { document_id, .. } = target else {
         return Ok(MetadataPlacementOutcome::Rejected);
     };
     for _ in 0..2 {

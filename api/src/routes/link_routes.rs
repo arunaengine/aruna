@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::repository::{InvenioLink, LinkPatch, LinkStatus};
+use aruna_core::repository::{LinkPatch, LinkStatus, RepositoryLink};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::jobs::invenio::link_queue::{current_event, refresh_review, start_push};
 use aruna_operations::jobs::invenio::links::LinkChange;
@@ -36,7 +36,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 /// Publishing and the push settings act for the creator's repository account, so only the
 /// creator may change them.
-fn ensure_creator(auth: &AuthContext, link: &InvenioLink) -> ServerResult<()> {
+fn ensure_creator(auth: &AuthContext, link: &RepositoryLink) -> ServerResult<()> {
     if link.created_by != auth.user_id {
         return Err(ServerError::Forbidden);
     }
@@ -44,7 +44,7 @@ fn ensure_creator(auth: &AuthContext, link: &InvenioLink) -> ServerResult<()> {
 }
 
 /// Push actions do not apply to a link that pulls.
-fn ensure_push(link: &InvenioLink) -> ServerResult<()> {
+fn ensure_push(link: &RepositoryLink) -> ServerResult<()> {
     if link.pull().is_some() {
         return Err(ServerError::Conflict(
             "this link pulls from the repository; use the pull route".into(),
@@ -54,7 +54,7 @@ fn ensure_push(link: &InvenioLink) -> ServerResult<()> {
 }
 
 /// Stops the link's running push; the job also stops by itself at its next remote write.
-async fn cancel_push(state: &ServerState, link: &InvenioLink) {
+async fn cancel_push(state: &ServerState, link: &RepositoryLink) {
     let Some(job_id) = link.active_job else {
         return;
     };

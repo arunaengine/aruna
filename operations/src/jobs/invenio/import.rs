@@ -13,8 +13,8 @@ use aruna_core::repository::invenio::{
     crate_versions, file_path, import_crate, pull_crate, record_id, record_identifiers, validate_id,
 };
 use aruna_core::repository::{
-    InvenioLink, InvenioMode, InvenioOptions, InvenioPull, InvenioRecord, LinkDirection,
-    LinkFailure, LinkPull, LinkRemote, LinkStatus, PULL_CHECK_MS, PushOutcome,
+    ImportMode, ImportOptions, InvenioRecord, LinkDirection, LinkFailure, LinkPull, LinkRemote,
+    LinkStatus, PULL_CHECK_MS, PushOutcome, RepositoryLink, RepositoryPull,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
@@ -59,11 +59,11 @@ pub(crate) async fn acquire(
     group_id: Ulid,
     connector_id: Ulid,
     selected: &str,
-    options: &InvenioOptions,
-    pull: Option<&InvenioPull>,
+    options: &ImportOptions,
+    pull: Option<&RepositoryPull>,
 ) -> Result<(ArtifactRef, Vec<SecondaryIdentifier>, Option<PullProgress>), TransferError> {
     validate_id(selected)?;
-    if let Some(InvenioPull::Update { link_id }) = pull {
+    if let Some(RepositoryPull::Update { link_id }) = pull {
         running(ctx, spec, *link_id).await?;
     }
     let client = connect(
@@ -84,7 +84,7 @@ pub(crate) async fn acquire(
         .map(|(record, _)| record.clone())
         .ok_or_else(|| invalid("requested record absent from history"))?;
     let (document, records, base) = match pull {
-        Some(InvenioPull::Update { .. }) => {
+        Some(RepositoryPull::Update { .. }) => {
             let (jsonld, base) = Box::pin(crate::jobs::export::crate_jsonld(
                 &ctx.driver,
                 &spec.auth_context,
@@ -199,7 +199,7 @@ pub(super) async fn history(
     client: &InvenioClient<'_>,
     selected: &str,
     limits: &RoCrateLimits,
-    options: &InvenioOptions,
+    options: &ImportOptions,
 ) -> Result<(String, Vec<(Value, Value)>), TransferError> {
     let seed = client
         .json(Method::GET, client.url(&["records", selected])?, None)
@@ -270,7 +270,7 @@ pub(super) async fn history(
             {
                 return Err(invalid("version identity or publication state changed"));
             }
-            let files = if options.mode == InvenioMode::Metadata {
+            let files = if options.mode == ImportMode::Metadata {
                 json!({"entries": [], "listing_requested": false})
             } else {
                 client
@@ -316,7 +316,7 @@ async fn write_archive(
     metadata: &str,
     records: &[(Value, Value)],
     limits: &RoCrateLimits,
-    mode: InvenioMode,
+    mode: ImportMode,
 ) -> Result<(), TransferError> {
     let mut archive = async_zip::base::write::ZipFileWriter::with_tokio(writer);
     archive
@@ -345,7 +345,7 @@ async fn write_archive(
             if path.len() as u64 > limits.key_bytes || !paths.insert(path.clone()) {
                 return Err(invalid("duplicate or oversized file path"));
             }
-            if mode == InvenioMode::Reference {
+            if mode == ImportMode::Reference {
                 let descriptor = json!({"record_id": id, "file": file}).to_string();
                 size = checked_size(size, descriptor.len() as u64, limits.expanded_import_bytes)?;
                 archive
@@ -438,7 +438,7 @@ pub(crate) async fn settle_import(
     progress: Option<&PullProgress>,
     failure: Option<&str>,
 ) -> Result<(), LinkError> {
-    let ImportRoCrateSource::Invenio {
+    let ImportRoCrateSource::Repository {
         group_id,
         connector_id,
         options,
@@ -451,14 +451,14 @@ pub(crate) async fn settle_import(
     let done = progress.and_then(|progress| Some((progress, progress.revision?)));
     let now = std::time::SystemTime::now();
     match pull {
-        InvenioPull::Keep {
+        RepositoryPull::Keep {
             auto_update,
             owner_node_url,
         } => {
             let Some((progress, revision)) = done else {
                 return Ok(());
             };
-            let mut link = InvenioLink {
+            let mut link = RepositoryLink {
                 link_id: ctx.job_id.as_ulid(),
                 document_id: spec.document_id,
                 group_id: *group_id,
@@ -503,7 +503,7 @@ pub(crate) async fn settle_import(
                 Err(error) => Err(error),
             }
         }
-        InvenioPull::Update { link_id } => {
+        RepositoryPull::Update { link_id } => {
             let storage = &ctx.driver.storage_handle;
             let Some(link) = read_link(storage, spec.document_id, *link_id)
                 .await?

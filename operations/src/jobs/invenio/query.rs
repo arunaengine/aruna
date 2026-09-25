@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::repository::InvenioQuery;
+use aruna_core::repository::RepositoryQuery;
 use aruna_core::repository::invenio::validate_id;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::secondary_id::normalize_doi;
@@ -17,7 +17,7 @@ use crate::driver::DriverContext;
 pub async fn search_records(
     context: &DriverContext,
     auth: &AuthContext,
-    query: &InvenioQuery,
+    query: &RepositoryQuery,
     limit: u64,
 ) -> Result<Value, TransferError> {
     if query.page == 0 || !(1..=25).contains(&query.size) || query.q.len() > 4096 {

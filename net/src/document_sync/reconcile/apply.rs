@@ -135,7 +135,7 @@ impl DocumentSyncService {
                 )),
             };
         }
-        if let DocumentTarget::InvenioLink { .. } = target {
+        if let DocumentTarget::RepositoryLink { .. } = target {
             return self.apply_link(target, Some(bytes), change).await;
         }
         if let DocumentTarget::MetadataGraphLifecycle { graph_iri } = target {
@@ -287,7 +287,7 @@ impl DocumentSyncService {
         if let DocumentTarget::PersistentIdMapping { .. } = target {
             return Ok(());
         }
-        if let DocumentTarget::InvenioLink { .. } = target {
+        if let DocumentTarget::RepositoryLink { .. } = target {
             return self.apply_link(target, None, change).await;
         }
         if let DocumentTarget::MetadataRegistry {

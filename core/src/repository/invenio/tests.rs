@@ -18,7 +18,7 @@ fn binds_repository_login() {
     let group = Ulid::from_bytes([4; 16]);
     let connector = Ulid::from_bytes([5; 16]);
     let endpoint = "https://zenodo.org/api/";
-    let credential = InvenioCredential::seal(
+    let credential = RepositoryCredential::seal(
         &key,
         user,
         group,
@@ -85,8 +85,15 @@ fn binds_repository_login() {
                 publish: true,
                 public_files: false,
                 credential: Some(
-                    InvenioCredential::seal(&key, user, group, connector, endpoint.into(), token)
-                        .unwrap(),
+                    RepositoryCredential::seal(
+                        &key,
+                        user,
+                        group,
+                        connector,
+                        endpoint.into(),
+                        token,
+                    )
+                    .unwrap(),
                 ),
                 link: None,
             }),

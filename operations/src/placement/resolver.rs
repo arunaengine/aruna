@@ -172,7 +172,7 @@ pub fn document_class(target: &DocumentTarget) -> DocumentClass {
         | DocumentTarget::MetadataDocumentLifecycle { .. }
         | DocumentTarget::MetadataGraphLifecycle { .. }
         | DocumentTarget::PersistentIdMapping { .. }
-        | DocumentTarget::InvenioLink { .. } => DocumentClass::Metadata,
+        | DocumentTarget::RepositoryLink { .. } => DocumentClass::Metadata,
         DocumentTarget::PlacementPolicy { .. } => DocumentClass::PlacementPolicy,
         DocumentTarget::RealmAuthorization { .. }
         | DocumentTarget::RealmConfig { .. }
@@ -196,7 +196,7 @@ pub fn subject_bytes(target: &DocumentTarget) -> Vec<u8> {
         | DocumentTarget::MetadataCreateEvent { document_id, .. }
         | DocumentTarget::MetadataDocumentLifecycle { document_id }
         | DocumentTarget::PersistentIdMapping { document_id }
-        | DocumentTarget::InvenioLink { document_id, .. } => document_id.to_bytes().to_vec(),
+        | DocumentTarget::RepositoryLink { document_id, .. } => document_id.to_bytes().to_vec(),
         DocumentTarget::MetadataGraphLifecycle { graph_iri } => graph_iri.as_bytes().to_vec(),
         // The policy id alone; the document's holders are unrelated to the
         // subjects its selectors allow.

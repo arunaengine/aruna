@@ -6,7 +6,7 @@ use super::remote::{RemoteServer, remote};
 use super::*;
 use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE};
 use aruna_core::repository::{
-    InvenioLink, LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, link_key,
+    LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, RepositoryLink, link_key,
 };
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_operations::jobs::invenio::link_queue::drain_links;
@@ -33,7 +33,7 @@ pub(super) async fn linked(
     token: &str,
     auto_publish: bool,
     parent_id: Option<&str>,
-) -> Result<InvenioLink, Box<dyn std::error::Error>> {
+) -> Result<RepositoryLink, Box<dyn std::error::Error>> {
     Box::pin(import_dataset(fixture, native_archive().await?)).await?;
     Box::pin(attach(
         fixture,
@@ -72,7 +72,7 @@ pub(super) async fn attach(
     auto_publish: bool,
     parent_id: Option<&str>,
     community: Option<&str>,
-) -> Result<InvenioLink, Box<dyn std::error::Error>> {
+) -> Result<RepositoryLink, Box<dyn std::error::Error>> {
     let connector_id = drive(
         CreateConnectorOperation::new(CreateConnectorInput {
             group_id: fixture.group_id,
@@ -101,7 +101,7 @@ pub(super) async fn attach(
     )
     .await?;
     let now = SystemTime::now();
-    let link = InvenioLink {
+    let link = RepositoryLink {
         link_id,
         document_id: doc_id(1),
         group_id: fixture.group_id,
@@ -140,7 +140,7 @@ pub(super) async fn attach(
     .ok_or("created link missing")?)
 }
 
-pub(super) async fn current(fixture: &Fixture, link: &InvenioLink) -> (InvenioLink, bool) {
+pub(super) async fn current(fixture: &Fixture, link: &RepositoryLink) -> (RepositoryLink, bool) {
     list_links(&fixture.context.storage_handle, link.document_id)
         .await
         .unwrap()
@@ -152,7 +152,7 @@ pub(super) async fn current(fixture: &Fixture, link: &InvenioLink) -> (InvenioLi
 /// Makes the queued check due now instead of waiting out the debounce.
 pub(super) async fn due_now(
     fixture: &Fixture,
-    link: &InvenioLink,
+    link: &RepositoryLink,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entry = LinkQueueEntry {
         document_id: link.document_id,
@@ -171,7 +171,7 @@ pub(super) async fn due_now(
 /// Moves the last push back past the auto_publish quiet time and makes the check due.
 pub(super) async fn quiet_draft(
     fixture: &Fixture,
-    link: &InvenioLink,
+    link: &RepositoryLink,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stored = current(fixture, link).await.0;
     let push = stored.last_push.as_mut().ok_or("nothing pushed yet")?;
@@ -189,7 +189,7 @@ pub(super) async fn quiet_draft(
 /// Runs the push job the link recorded, as the job runtime would.
 pub(super) async fn run_push(
     fixture: &Fixture,
-    link: &InvenioLink,
+    link: &RepositoryLink,
 ) -> Result<JobRunOutcome, Box<dyn std::error::Error>> {
     let job_id = current(fixture, link)
         .await
@@ -928,7 +928,7 @@ async fn missing_file_fails() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Whether `key_space` still holds a row keyed by the link id.
-async fn has_row(fixture: &Fixture, key_space: &str, link: &InvenioLink) -> bool {
+async fn has_row(fixture: &Fixture, key_space: &str, link: &RepositoryLink) -> bool {
     let event = fixture
         .context
         .storage_handle

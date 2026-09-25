@@ -11,7 +11,7 @@ use crate::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use super::InvenioError;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InvenioCredential {
+pub struct RepositoryCredential {
     pub endpoint: String,
     fingerprint: [u8; 32],
     pub(crate) sealed: EncryptedS3Secret,
@@ -19,7 +19,7 @@ pub struct InvenioCredential {
     pub link_id: Option<Ulid>,
 }
 
-impl InvenioCredential {
+impl RepositoryCredential {
     pub fn seal(
         key: &CredentialEncryptionKey,
         user: UserId,

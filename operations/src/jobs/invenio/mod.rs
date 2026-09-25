@@ -6,7 +6,7 @@ use std::future::Future;
 
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::handle::Handle;
-use aruna_core::repository::{InvenioCredential, InvenioDestination, LinkFailure};
+use aruna_core::repository::{InvenioDestination, LinkFailure, RepositoryCredential};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
@@ -84,7 +84,7 @@ pub(crate) async fn connect<'a>(
     connector_id: Ulid,
     permission: Permission,
     limit: u64,
-    credential: Option<&InvenioCredential>,
+    credential: Option<&RepositoryCredential>,
 ) -> Result<InvenioClient<'a>, TransferError> {
     authorize(
         context,
@@ -130,14 +130,14 @@ pub async fn seal_credential(
     auth: &AuthContext,
     destination: &InvenioDestination,
     token: &str,
-) -> Result<InvenioCredential, TransferError> {
+) -> Result<RepositoryCredential, TransferError> {
     let view = repository(context, destination.group_id, destination.connector_id).await?;
     let key = context
         .net_handle
         .as_ref()
         .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?
         .credential_encryption_key();
-    Ok(InvenioCredential::seal(
+    Ok(RepositoryCredential::seal(
         &key,
         auth.user_id,
         destination.group_id,
@@ -155,14 +155,14 @@ pub async fn seal_link_token(
     connector_id: Ulid,
     link_id: Ulid,
     token: &str,
-) -> Result<InvenioCredential, TransferError> {
+) -> Result<RepositoryCredential, TransferError> {
     let view = repository(context, group_id, connector_id).await?;
     let key = context
         .net_handle
         .as_ref()
         .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?
         .credential_encryption_key();
-    Ok(InvenioCredential::seal_link(
+    Ok(RepositoryCredential::seal_link(
         &key,
         user,
         group_id,

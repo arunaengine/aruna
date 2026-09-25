@@ -89,7 +89,7 @@ pub enum DocumentTarget {
         policy_id: Ulid,
     },
     /// One Invenio link of a document. Only the link's owner node writes it; holders keep a copy.
-    InvenioLink {
+    RepositoryLink {
         document_id: Ulid,
         link_id: Ulid,
     },
@@ -385,7 +385,7 @@ impl DocumentTarget {
             | Self::MetadataCreateEvent { document_id, .. }
             | Self::MetadataDocumentLifecycle { document_id }
             | Self::PersistentIdMapping { document_id }
-            | Self::InvenioLink { document_id, .. } => TopicId::metadata(*document_id),
+            | Self::RepositoryLink { document_id, .. } => TopicId::metadata(*document_id),
             Self::MetadataGraphLifecycle { graph_iri } => {
                 TopicId::metadata(graph_lifecycle_topic(graph_iri))
             }
@@ -413,7 +413,7 @@ impl DocumentTarget {
             Self::WatchSubscription { .. } => WATCH_SUBSCRIPTIONS_KEYSPACE,
             Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
             Self::PlacementPolicy { .. } => PLACEMENT_POLICY_KEYSPACE,
-            Self::InvenioLink { .. } => INVENIO_LINK_KEYSPACE,
+            Self::RepositoryLink { .. } => INVENIO_LINK_KEYSPACE,
         }
     }
 
@@ -458,7 +458,7 @@ impl DocumentTarget {
             }
             Self::NodeInfo { node_id, .. } => ByteView::from(node_info_key(*node_id)),
             Self::PlacementPolicy { policy_id } => ByteView::from(placement_policy_key(*policy_id)),
-            Self::InvenioLink {
+            Self::RepositoryLink {
                 document_id,
                 link_id,
             } => ByteView::from(link_key(*document_id, *link_id)),
@@ -480,7 +480,7 @@ impl DocumentTarget {
                 | Self::MetadataGraphLifecycle { .. }
                 | Self::PersistentIdMapping { .. }
                 | Self::PlacementPolicy { .. }
-                | Self::InvenioLink { .. }
+                | Self::RepositoryLink { .. }
         )
     }
 

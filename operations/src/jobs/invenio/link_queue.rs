@@ -11,8 +11,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE};
 use aruna_core::repository::{
-    InvenioLink, LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
-    link_prefix,
+    LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
+    RepositoryLink, link_prefix,
 };
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
@@ -73,7 +73,7 @@ pub(crate) async fn queue_rows(
         };
         let gone = !values.is_empty() && document_gone(storage, document_id).await?;
         for (_, value) in values {
-            let link = InvenioLink::from_bytes(&value)?;
+            let link = RepositoryLink::from_bytes(&value)?;
             if gone || (link.status == LinkStatus::Enabled && link.pull().is_none()) {
                 candidates.push((link.link_id, document_id));
             }
@@ -249,7 +249,7 @@ async fn check_link(
 /// A push job ended without recording its outcome, for example cancelled while queued.
 async fn settle_stale(
     context: &Arc<DriverContext>,
-    link: &InvenioLink,
+    link: &RepositoryLink,
     job_id: JobId,
     record: Option<&JobRecord>,
     queued: &Value,
@@ -294,8 +294,8 @@ async fn settle_stale(
 /// stored afterwards. A refused request fails the link.
 pub async fn refresh_review(
     context: &DriverContext,
-    link: &InvenioLink,
-) -> Result<InvenioLink, LinkError> {
+    link: &RepositoryLink,
+) -> Result<RepositoryLink, LinkError> {
     if link.remote.review != LinkReview::Pending {
         return Ok(link.clone());
     }
@@ -313,7 +313,7 @@ pub async fn refresh_review(
 /// Submits the push job as the link's creator and records it as the running push.
 pub async fn start_push(
     context: &Arc<DriverContext>,
-    link: &InvenioLink,
+    link: &RepositoryLink,
     event_id: Ulid,
     publish: bool,
 ) -> Result<JobId, LinkError> {
@@ -350,7 +350,7 @@ pub async fn start_push(
 }
 
 /// Whether the link's owner still holds the dataset; an unknown placement counts as held.
-pub async fn owner_holds(context: &DriverContext, link: &InvenioLink) -> bool {
+pub async fn owner_holds(context: &DriverContext, link: &RepositoryLink) -> bool {
     let realm_id = link.created_by.realm_id;
     let Some(config) = load_realm_config(context, realm_id).await else {
         return true;
@@ -364,7 +364,7 @@ pub async fn owner_holds(context: &DriverContext, link: &InvenioLink) -> bool {
 /// a node outside the holder set cannot publish to them, and holders derive the same state.
 pub(super) async fn ensure_holder(
     context: &DriverContext,
-    link: &InvenioLink,
+    link: &RepositoryLink,
 ) -> Result<(), LinkError> {
     if owner_holds(context, link).await {
         return Ok(());

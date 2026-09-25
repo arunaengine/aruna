@@ -9,14 +9,14 @@ use super::link::{
 };
 use super::remote::remote;
 use super::*;
-use aruna_core::repository::{InvenioLink, LinkFailure, LinkPatch, LinkReview, LinkStatus};
+use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
 use aruna_operations::jobs::invenio::link_queue::{current_event, start_push};
 use aruna_operations::jobs::invenio::links::{LinkChange, LinkError, change_link};
 use aruna_operations::jobs::invenio::remote_state;
 
 async fn push_now(
     fixture: &Fixture,
-    link: &InvenioLink,
+    link: &RepositoryLink,
     publish: bool,
 ) -> Result<JobRunOutcome, Box<dyn std::error::Error>> {
     let link = current(fixture, link).await.0;
@@ -25,7 +25,7 @@ async fn push_now(
     run_push(fixture, &link).await
 }
 
-fn failure(link: &InvenioLink) -> Option<&LinkFailure> {
+fn failure(link: &RepositoryLink) -> Option<&LinkFailure> {
     match &link.status {
         LinkStatus::Failed { reason } => Some(reason),
         _ => None,

@@ -25,7 +25,7 @@ use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, JOB_STATE_KEYSPACE};
 use aruna_core::metadata::MetadataValidationViolation;
-use aruna_core::repository::InvenioPull;
+use aruna_core::repository::RepositoryPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::execution::job::{
@@ -397,7 +397,7 @@ async fn acquire_source(
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<ImportInput, ImportFailure> {
     match &spec.source {
-        ImportRoCrateSource::Invenio {
+        ImportRoCrateSource::Repository {
             group_id,
             connector_id,
             record_id,
@@ -1151,8 +1151,8 @@ async fn create_document(
 fn updates_link(spec: &ImportRoCrateSpec) -> bool {
     matches!(
         &spec.source,
-        ImportRoCrateSource::Invenio {
-            pull: Some(InvenioPull::Update { .. }),
+        ImportRoCrateSource::Repository {
+            pull: Some(RepositoryPull::Update { .. }),
             ..
         }
     )
@@ -1167,8 +1167,8 @@ async fn update_document(
     plan: &ImportPlan,
 ) -> Result<(), ImportFailure> {
     // Pausing or deleting the link while the files were imported cancels the update.
-    if let ImportRoCrateSource::Invenio {
-        pull: Some(InvenioPull::Update { link_id }),
+    if let ImportRoCrateSource::Repository {
+        pull: Some(RepositoryPull::Update { link_id }),
         ..
     } = &spec.source
     {

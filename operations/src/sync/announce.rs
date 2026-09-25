@@ -14,7 +14,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
 use aruna_core::operation::Operation;
-use aruna_core::repository::InvenioLink;
+use aruna_core::repository::RepositoryLink;
 use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::RealmId;
@@ -360,12 +360,12 @@ impl AnnounceTopicOperation {
                 }
                 Ok(placement_policy_change(&document, self.placement))
             }
-            DocumentTarget::InvenioLink {
+            DocumentTarget::RepositoryLink {
                 document_id,
                 link_id,
             } => {
-                let link =
-                    InvenioLink::from_bytes(bytes).map_err(AnnounceTopicError::ConversionError)?;
+                let link = RepositoryLink::from_bytes(bytes)
+                    .map_err(AnnounceTopicError::ConversionError)?;
                 if link.document_id != *document_id || link.link_id != *link_id {
                     return Err(AnnounceTopicError::DocumentSync(format!(
                         "invenio link target {document_id}/{link_id} does not match its payload"

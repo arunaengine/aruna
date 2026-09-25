@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{InvenioDestination, InvenioOptions, InvenioRecord};
+use super::{ImportOptions, InvenioDestination, InvenioRecord};
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
 use crate::structs::execution::job::{ImportRoCrateTarget, JobId, RoCrateLimits};
@@ -111,7 +111,7 @@ pub struct LinkPush {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InvenioLink {
+pub struct RepositoryLink {
     pub link_id: Ulid,
     pub document_id: Ulid,
     pub group_id: Ulid,
@@ -155,7 +155,7 @@ pub enum LinkDirection {
 pub struct LinkPull {
     pub auto_update: bool,
     /// The mode and version choice of the import; updates import the same way.
-    pub options: InvenioOptions,
+    pub options: ImportOptions,
     /// Where the import wrote its files; updates add new versions there.
     pub target: ImportRoCrateTarget,
     /// The lineage's latest published version at the last check, with its revision.
@@ -262,9 +262,9 @@ pub struct RemoteState {
 #[error("another push of this link is still running")]
 pub struct LinkBusy;
 
-impl InvenioLink {
+impl RepositoryLink {
     pub fn target(&self) -> DocumentTarget {
-        DocumentTarget::InvenioLink {
+        DocumentTarget::RepositoryLink {
             document_id: self.document_id,
             link_id: self.link_id,
         }
@@ -528,7 +528,7 @@ impl InvenioLink {
     }
 }
 
-impl InvenioLink {
+impl RepositoryLink {
     pub fn pull(&self) -> Option<&LinkPull> {
         match &self.direction {
             LinkDirection::Pull(pull) => Some(pull),

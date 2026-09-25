@@ -11,7 +11,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
     let connector_id = connector(&fixture, &server).await;
     let spec = spec_with_source(
         &fixture,
-        ImportRoCrateSource::Invenio {
+        ImportRoCrateSource::Repository {
             group_id: fixture.group_id,
             connector_id,
             record_id: "2".into(),
@@ -129,7 +129,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::repository::{InvenioMode, InvenioOptions};
+    use aruna_core::repository::{ImportMode, ImportOptions};
     let seen = Arc::new(Mutex::new(Vec::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let storage = format!("http://{}/storage/", listener.local_addr()?);
@@ -144,9 +144,9 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
     });
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     for (foreign, mode) in [
-        (false, InvenioMode::Copy),
-        (true, InvenioMode::Copy),
-        (true, InvenioMode::Reference),
+        (false, ImportMode::Copy),
+        (true, ImportMode::Copy),
+        (true, ImportMode::Reference),
     ] {
         let fixture = build_fixture(false).await?;
         let server = serve(Repository::default()).await;
@@ -158,11 +158,11 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
         server.state.lock().unwrap().redirect = Some(target);
         let spec = spec_with_source(
             &fixture,
-            ImportRoCrateSource::Invenio {
+            ImportRoCrateSource::Repository {
                 group_id: fixture.group_id,
                 connector_id: connector(&fixture, &server).await,
                 record_id: "2".into(),
-                options: InvenioOptions {
+                options: ImportOptions {
                     mode,
                     all_versions: false,
                 },
@@ -177,7 +177,7 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
             JobRunOutcome::Failed(error) => panic!("{}", error.message),
             _ => panic!("redirected import did not complete"),
         }
-        if mode == InvenioMode::Reference {
+        if mode == ImportMode::Reference {
             use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
             let mut object = drive(
                 GetObjectOperation::new(GetObjectInput {
@@ -220,9 +220,9 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn invenio_import_modes() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::repository::{InvenioMode, InvenioOptions};
+    use aruna_core::repository::{ImportMode, ImportOptions};
     use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
-    for mode in [InvenioMode::Metadata, InvenioMode::Reference] {
+    for mode in [ImportMode::Metadata, ImportMode::Reference] {
         let fixture = build_fixture(false).await?;
         let server = serve(Repository {
             file_name: Some("content".into()),
@@ -232,11 +232,11 @@ async fn invenio_import_modes() -> Result<(), Box<dyn std::error::Error>> {
         let connector_id = connector(&fixture, &server).await;
         let spec = spec_with_source(
             &fixture,
-            ImportRoCrateSource::Invenio {
+            ImportRoCrateSource::Repository {
                 group_id: fixture.group_id,
                 connector_id,
                 record_id: "parent".into(),
-                options: InvenioOptions {
+                options: ImportOptions {
                     mode,
                     all_versions: false,
                 },
@@ -250,7 +250,7 @@ async fn invenio_import_modes() -> Result<(), Box<dyn std::error::Error>> {
             JobRunOutcome::Succeeded(JobResultPayload::ImportRoCrate(result)) => {
                 assert_eq!(
                     result.imported,
-                    if mode == InvenioMode::Reference { 2 } else { 1 }
+                    if mode == ImportMode::Reference { 2 } else { 1 }
                 );
             }
             JobRunOutcome::Failed(error) => panic!("{}", error.message),
@@ -270,7 +270,7 @@ async fn invenio_import_modes() -> Result<(), Box<dyn std::error::Error>> {
             "imported/{}",
             aruna_core::repository::invenio::file_path("2", "content")?
         );
-        if mode == InvenioMode::Reference {
+        if mode == ImportMode::Reference {
             assert_eq!(object_versions(&fixture, &key).await?.len(), 1);
             let mut object = drive(
                 GetObjectOperation::new(GetObjectInput {
@@ -323,7 +323,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
         path_restrictions: None,
         session: None,
     };
-    let query = aruna_core::repository::InvenioQuery {
+    let query = aruna_core::repository::RepositoryQuery {
         group_id: fixture.group_id,
         connector_id,
         q: "doi:\"10.1234/2\"".into(),
@@ -339,7 +339,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert_eq!(page["hits"]["hits"][0]["id"], "2");
-    let invalid = aruna_core::repository::InvenioQuery { size: 100, ..query };
+    let invalid = aruna_core::repository::RepositoryQuery { size: 100, ..query };
     assert!(
         aruna_operations::jobs::invenio::search_records(&fixture.context, &auth, &invalid, 1024)
             .await
@@ -421,7 +421,7 @@ async fn invenio_rejects_corruption() -> Result<(), Box<dyn std::error::Error>> 
         let connector_id = connector(&fixture, &server).await;
         let spec = spec_with_source(
             &fixture,
-            ImportRoCrateSource::Invenio {
+            ImportRoCrateSource::Repository {
                 group_id: fixture.group_id,
                 connector_id,
                 record_id: "2".into(),
@@ -457,12 +457,12 @@ async fn invenio_cancels_reference() -> Result<(), Box<dyn std::error::Error>> {
     .await;
     let spec = spec_with_source(
         &fixture,
-        ImportRoCrateSource::Invenio {
+        ImportRoCrateSource::Repository {
             group_id: fixture.group_id,
             connector_id: connector(&fixture, &server).await,
             record_id: "2".into(),
-            options: aruna_core::repository::InvenioOptions {
-                mode: aruna_core::repository::InvenioMode::Reference,
+            options: aruna_core::repository::ImportOptions {
+                mode: aruna_core::repository::ImportMode::Reference,
                 all_versions: false,
             },
             pull: None,
@@ -494,22 +494,22 @@ async fn start_update(
     fixture: &Fixture,
     server: &Server,
 ) -> Result<(JobContext, ImportRoCrateSpec, Ulid), Box<dyn std::error::Error>> {
-    use aruna_core::repository::{InvenioOptions, InvenioPull, PullCheck};
+    use aruna_core::repository::{ImportOptions, PullCheck, RepositoryPull};
     use aruna_operations::jobs::invenio::link_queue::current_event;
     use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
     use aruna_operations::jobs::invenio::pull::start_pull;
     let connector_id = connector(fixture, server).await;
     let spec = spec_with_source(
         fixture,
-        ImportRoCrateSource::Invenio {
+        ImportRoCrateSource::Repository {
             group_id: fixture.group_id,
             connector_id,
             record_id: "1".into(),
-            options: InvenioOptions {
+            options: ImportOptions {
                 all_versions: false,
-                ..InvenioOptions::default()
+                ..ImportOptions::default()
             },
-            pull: Some(InvenioPull::Keep {
+            pull: Some(RepositoryPull::Keep {
                 auto_update: false,
                 owner_node_url: "https://node.example/api/v1".into(),
             }),

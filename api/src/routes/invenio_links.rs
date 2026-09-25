@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aruna_core::repository::invenio::validate_id;
-use aruna_core::repository::{InvenioLink, LinkRemote, LinkStatus};
+use aruna_core::repository::{LinkRemote, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
@@ -196,7 +196,7 @@ fn timestamp(value: SystemTime) -> String {
 }
 
 /// `holds` is false once the owner node lost the dataset; such a link cannot push any more.
-pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioLinkResponse {
+pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> InvenioLinkResponse {
     let info = link.info_reason().map(str::to_string);
     let pull = link.pull().cloned();
     let (status, reason) = match &link.status {
@@ -363,7 +363,7 @@ pub(super) async fn managed(
     auth: Option<AuthContext>,
     document_id: &str,
     link_id: &str,
-) -> ServerResult<(AuthContext, InvenioLink)> {
+) -> ServerResult<(AuthContext, RepositoryLink)> {
     let (auth, document_id) = readable(state, auth, document_id).await?;
     let link_id = parse_ulid(link_id)?;
     let link = read_link(&state.get_ctx().storage_handle, document_id, link_id)
@@ -384,9 +384,9 @@ pub(super) async fn managed(
 
 pub(super) async fn change(
     state: &ServerState,
-    link: &InvenioLink,
+    link: &RepositoryLink,
     change: LinkChange,
-) -> ServerResult<Option<InvenioLink>> {
+) -> ServerResult<Option<RepositoryLink>> {
     change_link(state.get_ctx().as_ref(), link, change)
         .await
         .map_err(link_error)
@@ -556,7 +556,7 @@ pub async fn create_link(
         .map(|rest| rest.api_base_url)
         .ok_or_else(|| ServerError::InternalError("REST interface URL is unavailable".into()))?;
     let now = SystemTime::now();
-    let link = InvenioLink {
+    let link = RepositoryLink {
         link_id,
         document_id,
         group_id,

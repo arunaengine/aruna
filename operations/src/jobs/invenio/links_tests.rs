@@ -33,8 +33,8 @@ fn job(nonce: u64) -> JobId {
     .unwrap()
 }
 
-fn link() -> InvenioLink {
-    InvenioLink {
+fn link() -> RepositoryLink {
+    RepositoryLink {
         link_id: Ulid::from_bytes([1; 16]),
         document_id: Ulid::from_bytes([2; 16]),
         group_id: Ulid::from_bytes([4; 16]),
@@ -60,9 +60,9 @@ fn link() -> InvenioLink {
     }
 }
 
-fn secret(link_id: Ulid) -> InvenioCredential {
+fn secret(link_id: Ulid) -> RepositoryCredential {
     let link = link();
-    InvenioCredential::seal_link(
+    RepositoryCredential::seal_link(
         &CredentialEncryptionKey::derive(&[1; 32]),
         link.created_by,
         link.group_id,
@@ -80,14 +80,14 @@ fn operation(change: LinkChange) -> ChangeLinkOperation {
 }
 
 /// Runs the operation up to the effects that follow reading the stored link.
-fn read(op: &mut ChangeLinkOperation, stored: Option<&InvenioLink>) -> Effects {
+fn read(op: &mut ChangeLinkOperation, stored: Option<&RepositoryLink>) -> Effects {
     read_queued(op, stored, None)
 }
 
 /// Like `read`, with a push check already queued for the link.
 fn read_queued(
     op: &mut ChangeLinkOperation,
-    stored: Option<&InvenioLink>,
+    stored: Option<&RepositoryLink>,
     queued: Option<&LinkQueueEntry>,
 ) -> Effects {
     assert!(matches!(
@@ -217,7 +217,7 @@ fn create_writes_rows() {
         "the stored row carries a sync generation"
     );
     assert_eq!(
-        InvenioLink {
+        RepositoryLink {
             generation: 0,
             ..created
         },
@@ -443,7 +443,7 @@ fn route(generation: u64) -> MappingRoute {
 /// Answers the fence read of a routed change with the stored fence value.
 fn fenced(
     op: &mut ChangeLinkOperation,
-    stored: Option<&InvenioLink>,
+    stored: Option<&RepositoryLink>,
     fence: Option<u64>,
 ) -> Effects {
     let effects = read(op, stored);
@@ -502,7 +502,7 @@ fn routed_changes_replicate() {
     let DocumentOutboxEvent::Upsert { bytes, change } = outbox_event(&rows) else {
         panic!("create publishes an upsert");
     };
-    assert_eq!(InvenioLink::from_bytes(&bytes).unwrap(), created);
+    assert_eq!(RepositoryLink::from_bytes(&bytes).unwrap(), created);
     assert_eq!(change, created.sync_change(route.placement));
 
     // A delete keeps a tombstone that orders after the last stored change.
@@ -631,7 +631,7 @@ fn draft_needs_running_push() {
     assert_eq!(link.remote.revision_id, Some(4));
 }
 
-fn pulling() -> InvenioLink {
+fn pulling() -> RepositoryLink {
     let mut link = link();
     link.direction =
         aruna_core::repository::LinkDirection::Pull(Box::new(aruna_core::repository::LinkPull {
@@ -691,7 +691,7 @@ fn pull_links_never_push() {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    let stored = InvenioLink::from_bytes(&rows[0].2).unwrap();
+    let stored = RepositoryLink::from_bytes(&rows[0].2).unwrap();
     assert_eq!(stored.pull().unwrap().next_check_ms, 5_000.min(now_ms));
     assert!(schedules(&commit(&mut op, effects)));
 }
@@ -711,7 +711,7 @@ fn pull_check_replaces_row() {
         keyspaces(&rows),
         [INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
     );
-    let stored = InvenioLink::from_bytes(&rows[0].2).unwrap();
+    let stored = RepositoryLink::from_bytes(&rows[0].2).unwrap();
     let entry: LinkQueueEntry = postcard::from_bytes(&rows[1].2).unwrap();
     assert_eq!(entry.due_at_ms, stored.pull().unwrap().next_check_ms);
     assert!(entry.due_at_ms > 1_000);

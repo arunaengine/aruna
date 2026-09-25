@@ -295,13 +295,13 @@ pub enum ImportRoCrateSource {
         connector_id: Ulid,
         path: String,
     },
-    Invenio {
+    Repository {
         group_id: GroupId,
         connector_id: Ulid,
         record_id: String,
-        options: crate::repository::InvenioOptions,
+        options: crate::repository::ImportOptions,
         /// Set when the import keeps a pull link or updates one.
-        pull: Option<crate::repository::InvenioPull>,
+        pull: Option<crate::repository::RepositoryPull>,
     },
 }
 

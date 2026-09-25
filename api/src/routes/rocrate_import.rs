@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::StructuredId;
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
-use aruna_core::repository::InvenioPull;
+use aruna_core::repository::RepositoryPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
@@ -330,9 +330,9 @@ pub async fn submit_import(
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let mut source = parse_import_source(request.source)?;
-    if let ImportRoCrateSource::Invenio {
+    if let ImportRoCrateSource::Repository {
         group_id,
-        pull: Some(InvenioPull::Keep { owner_node_url, .. }),
+        pull: Some(RepositoryPull::Keep { owner_node_url, .. }),
         ..
     } = &mut source
     {
@@ -442,11 +442,11 @@ fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrat
                 ));
             }
             // The owner node URL is filled in once the request is accepted.
-            let pull = keep_updated.then(|| InvenioPull::Keep {
+            let pull = keep_updated.then(|| RepositoryPull::Keep {
                 auto_update: auto_update.unwrap_or(false),
                 owner_node_url: String::new(),
             });
-            Ok(ImportRoCrateSource::Invenio {
+            Ok(ImportRoCrateSource::Repository {
                 options: options.into(),
                 group_id: parse_ulid(&group_id)?,
                 connector_id: parse_ulid(&connector_id)?,
@@ -530,7 +530,7 @@ async fn fast_source_check(
     idempotency_key: Option<&str>,
 ) -> ServerResult<()> {
     match source {
-        ImportRoCrateSource::Invenio { group_id, .. } => {
+        ImportRoCrateSource::Repository { group_id, .. } => {
             crate::metadata::ensure_metadata_scope(state, auth, *group_id, Permission::READ).await
         }
         ImportRoCrateSource::Upload { upload_id } => {

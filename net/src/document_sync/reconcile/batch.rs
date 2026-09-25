@@ -148,7 +148,7 @@ pub(super) async fn apply_batch_event(
         record_metadata(outcome, state);
         return Ok(());
     }
-    if matches!(event.target(), DocumentTarget::InvenioLink { .. }) {
+    if matches!(event.target(), DocumentTarget::RepositoryLink { .. }) {
         let outcome = apply_link_event(service, topic_id, actor_id, identity, event).await?;
         record_metadata(outcome, state);
         return Ok(());

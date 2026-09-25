@@ -4,12 +4,12 @@
 
 use super::*;
 use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
-use aruna_core::repository::{InvenioLink, LinkRemote, LinkStatus, link_key};
+use aruna_core::repository::{LinkRemote, LinkStatus, RepositoryLink, link_key};
 use aruna_core::storage_entries::shard_manifest_key;
 use aruna_core::structs::execution::job::RoCrateLimits;
 
-fn link(document_id: Ulid, owner: NodeId, realm_id: RealmId, generation: u64) -> InvenioLink {
-    InvenioLink {
+fn link(document_id: Ulid, owner: NodeId, realm_id: RealmId, generation: u64) -> RepositoryLink {
+    RepositoryLink {
         link_id: Ulid::from_parts(4_000, 9),
         document_id,
         group_id: Ulid::from_parts(4_001, 1),
@@ -107,7 +107,7 @@ async fn link_replication_order() {
     service
         .ensure_sync_topics(&[topic_id], Vec::new())
         .expect("link shard topic genesis");
-    let upsert = |link: &InvenioLink, event_id: u64| DocumentSyncPublish::Upsert {
+    let upsert = |link: &RepositoryLink, event_id: u64| DocumentSyncPublish::Upsert {
         event_id: Ulid::from_parts(event_id, 1),
         target: link.target(),
         bytes: link.to_bytes().expect("link serializes"),

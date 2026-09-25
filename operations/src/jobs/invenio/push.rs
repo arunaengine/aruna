@@ -5,8 +5,8 @@
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::repository::invenio::validate_id;
 use aruna_core::repository::{
-    InvenioDestination, InvenioLink, InvenioRecord, LinkFailure, LinkReview, LinkStatus,
-    LinkTarget, PushOutcome, RemoteState,
+    InvenioDestination, InvenioRecord, LinkFailure, LinkReview, LinkStatus, LinkTarget,
+    PushOutcome, RemoteState, RepositoryLink,
 };
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobError, JobErrorKind};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -227,7 +227,7 @@ pub(super) async fn record_draft(
 }
 
 /// The identity pushes of a link run as: its creator.
-pub(crate) fn creator_auth(link: &InvenioLink) -> AuthContext {
+pub(crate) fn creator_auth(link: &RepositoryLink) -> AuthContext {
     AuthContext {
         user_id: link.created_by,
         realm_id: link.created_by.realm_id,
@@ -238,7 +238,7 @@ pub(crate) fn creator_auth(link: &InvenioLink) -> AuthContext {
 
 async fn link_client<'a>(
     context: &'a DriverContext,
-    link: &InvenioLink,
+    link: &RepositoryLink,
 ) -> Result<InvenioClient<'a>, TransferError> {
     let credential = read_secret(&context.storage_handle, link.link_id)
         .await
@@ -281,7 +281,7 @@ fn review_of(record: &Value) -> Option<LinkReview> {
 /// The repository's answer to a pending review; `None` while the community still decides.
 pub(crate) async fn review_state(
     context: &DriverContext,
-    link: &InvenioLink,
+    link: &RepositoryLink,
 ) -> Result<Option<RemoteState>, TransferError> {
     let Some(draft_id) = link.remote.draft_id.as_deref() else {
         return Ok(None);
@@ -315,7 +315,7 @@ pub(crate) async fn review_state(
 /// The repository's current draft and latest published version, for accepting remote edits.
 pub async fn remote_state(
     context: &DriverContext,
-    link: &InvenioLink,
+    link: &RepositoryLink,
 ) -> Result<RemoteState, TransferError> {
     let client = link_client(context, link).await?;
     let draft = match link.remote.draft_id.as_deref() {

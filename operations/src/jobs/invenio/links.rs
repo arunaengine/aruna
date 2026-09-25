@@ -13,8 +13,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::repository::{
-    InvenioCredential, InvenioLink, InvenioRecord, LinkBusy, LinkFailure, LinkPatch,
-    LinkQueueEntry, LinkReview, LinkStatus, PullCheck, PushOutcome, REVIEW_POLL_MS, RemoteState,
+    InvenioRecord, LinkBusy, LinkFailure, LinkPatch, LinkQueueEntry, LinkReview, LinkStatus,
+    PullCheck, PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryCredential, RepositoryLink,
     connector_link_key, link_key, link_prefix,
 };
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
@@ -40,11 +40,11 @@ const PULL_ACTIVE_MS: u64 = 60_000;
 pub enum LinkChange {
     /// Pull links read with the connector's token and have no secret of their own.
     Create {
-        link: Box<InvenioLink>,
-        secret: Option<InvenioCredential>,
+        link: Box<RepositoryLink>,
+        secret: Option<RepositoryCredential>,
     },
     Patch(LinkPatch),
-    Rotate(InvenioCredential),
+    Rotate(RepositoryCredential),
     Begin(JobId),
     /// `requeue` asks for another comparison because the dataset moved on during the push.
     Finish {
@@ -130,10 +130,10 @@ pub struct ChangeLinkOperation {
     deletes: Vec<(String, Key)>,
     schedule: bool,
     route: Option<MappingRoute>,
-    stored: Option<InvenioLink>,
+    stored: Option<RepositoryLink>,
     queued: Option<LinkQueueEntry>,
     pending: usize,
-    output: Option<Result<Option<InvenioLink>, LinkError>>,
+    output: Option<Result<Option<RepositoryLink>, LinkError>>,
 }
 
 impl ChangeLinkOperation {
@@ -166,7 +166,7 @@ impl ChangeLinkOperation {
         self.abort()
     }
 
-    fn plan(&mut self, stored: Option<InvenioLink>) -> Result<Effects, LinkError> {
+    fn plan(&mut self, stored: Option<RepositoryLink>) -> Result<Effects, LinkError> {
         let link_row = (
             INVENIO_LINK_KEYSPACE.to_string(),
             ByteView::from(link_key(self.document_id, self.link_id)),
@@ -371,7 +371,7 @@ impl ChangeLinkOperation {
 }
 
 impl Operation for ChangeLinkOperation {
-    type Output = Option<InvenioLink>;
+    type Output = Option<RepositoryLink>;
     type Error = LinkError;
 
     fn start(&mut self) -> Effects {
@@ -421,7 +421,7 @@ impl Operation for ChangeLinkOperation {
                 let queued = values.pop().and_then(|(_, value)| value);
                 let link = values.pop().and_then(|(_, value)| value);
                 let stored = match link
-                    .map(|bytes| InvenioLink::from_bytes(&bytes))
+                    .map(|bytes| RepositoryLink::from_bytes(&bytes))
                     .transpose()
                 {
                     Ok(stored) => stored,
@@ -536,7 +536,7 @@ fn millis(time: SystemTime) -> u64 {
 /// Without `bytes` the change removes the row.
 fn sync_rows(
     route: &MappingRoute,
-    link: &InvenioLink,
+    link: &RepositoryLink,
     change: DocumentChange,
     bytes: Option<Vec<u8>>,
 ) -> Result<Vec<(String, Key, Value)>, ConversionError> {
@@ -565,9 +565,9 @@ fn sync_rows(
 /// Applies a change on the link's owner node and replicates it to the document's holders.
 pub async fn change_link(
     context: &DriverContext,
-    link: &InvenioLink,
+    link: &RepositoryLink,
     change: LinkChange,
-) -> Result<Option<InvenioLink>, LinkError> {
+) -> Result<Option<RepositoryLink>, LinkError> {
     let route = match context.net_handle.as_ref() {
         Some(net) if net.node_id() != link.owner_node => {
             return Err(LinkError::NotOwner(link.owner_node_url.clone()));
@@ -607,7 +607,7 @@ pub async fn change_link(
 /// review, as `Published` identifiers of the dataset.
 async fn register_accepted(
     context: &DriverContext,
-    link: &InvenioLink,
+    link: &RepositoryLink,
     record: &InvenioRecord,
 ) -> Result<(), LinkError> {
     let identifiers = record.identifiers(&link.endpoint, IdentifierOrigin::Published);
@@ -633,7 +633,7 @@ async fn register_accepted(
 /// One lineage cannot have an enabled push link and an enabled pull link on one dataset.
 pub(super) async fn ensure_lineage(
     storage: &StorageHandle,
-    link: &InvenioLink,
+    link: &RepositoryLink,
 ) -> Result<(), LinkError> {
     let pulls = link.pull().is_some();
     let conflict = list_links(storage, link.document_id)
@@ -657,7 +657,7 @@ pub(crate) fn id_key(id: Ulid) -> Key {
 
 fn secret_row(
     link_id: Ulid,
-    secret: &InvenioCredential,
+    secret: &RepositoryCredential,
 ) -> Result<(String, Key, Value), ConversionError> {
     Ok((
         LINK_SECRET_KEYSPACE.to_string(),
@@ -677,7 +677,7 @@ async fn send(storage: &StorageHandle, effect: StorageEffect) -> Result<Event, L
 pub async fn list_links(
     storage: &StorageHandle,
     document_id: Ulid,
-) -> Result<Vec<(InvenioLink, bool)>, LinkError> {
+) -> Result<Vec<(RepositoryLink, bool)>, LinkError> {
     let mut links = Vec::new();
     let mut start = None;
     loop {
@@ -700,7 +700,7 @@ pub async fn list_links(
             return Err(LinkError::Unexpected(format!("{event:?}")));
         };
         for (_, value) in values {
-            links.push(InvenioLink::from_bytes(&value)?);
+            links.push(RepositoryLink::from_bytes(&value)?);
         }
         match next_start_after {
             Some(next) => start = Some(next),
@@ -736,7 +736,7 @@ pub async fn read_link(
     storage: &StorageHandle,
     document_id: Ulid,
     link_id: Ulid,
-) -> Result<Option<InvenioLink>, LinkError> {
+) -> Result<Option<RepositoryLink>, LinkError> {
     let event = send(
         storage,
         StorageEffect::Read {
@@ -748,7 +748,7 @@ pub async fn read_link(
     .await?;
     match event {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .map(|bytes| InvenioLink::from_bytes(&bytes))
+            .map(|bytes| RepositoryLink::from_bytes(&bytes))
             .transpose()?),
         other => Err(LinkError::Unexpected(format!("{other:?}"))),
     }
@@ -757,7 +757,7 @@ pub async fn read_link(
 pub(crate) async fn read_secret(
     storage: &StorageHandle,
     link_id: Ulid,
-) -> Result<Option<InvenioCredential>, LinkError> {
+) -> Result<Option<RepositoryCredential>, LinkError> {
     let event = send(
         storage,
         StorageEffect::Read {

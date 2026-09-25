@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aruna_blob::invenio::InvenioError;
 use aruna_core::repository::{
-    InvenioLink, InvenioPull, LinkFailure, LinkStatus, PullCheck, PushOutcome,
+    LinkFailure, LinkStatus, PullCheck, PushOutcome, RepositoryLink, RepositoryPull,
 };
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobState,
@@ -31,7 +31,7 @@ const ACTIVE_RETRY_MS: u64 = 60_000;
 /// no link change moved its queued check.
 pub(super) async fn check_due(
     context: &Arc<DriverContext>,
-    link: &InvenioLink,
+    link: &RepositoryLink,
     now: u64,
 ) -> Result<Option<u64>, LinkError> {
     if let Some(job_id) = link.active_job {
@@ -53,7 +53,7 @@ pub(super) async fn check_due(
 /// A pull job that ended without recording its outcome, for example cancelled while queued.
 async fn settle_stale(
     context: &DriverContext,
-    link: &InvenioLink,
+    link: &RepositoryLink,
     job_id: JobId,
     now: u64,
 ) -> Result<Option<u64>, LinkError> {
@@ -86,8 +86,8 @@ async fn settle_stale(
 /// A refusal, such as a withdrawn record, fails the link. Returns the stored link.
 pub async fn check_now(
     context: &DriverContext,
-    link: &InvenioLink,
-) -> Result<Option<InvenioLink>, LinkError> {
+    link: &RepositoryLink,
+) -> Result<Option<RepositoryLink>, LinkError> {
     let change = match latest_version(context, link).await {
         Ok(check) => LinkChange::Checked(check),
         Err(TransferError::Refused(reason)) => LinkChange::Fail(reason),
@@ -101,7 +101,7 @@ pub async fn check_now(
 /// version listing.
 async fn latest_version(
     context: &DriverContext,
-    link: &InvenioLink,
+    link: &RepositoryLink,
 ) -> Result<PullCheck, TransferError> {
     let held = link
         .remote
@@ -151,7 +151,10 @@ async fn latest_version(
 }
 
 /// Submits an import of the lineage's latest version into the linked dataset, as the creator.
-pub async fn start_pull(context: &DriverContext, link: &InvenioLink) -> Result<JobId, LinkError> {
+pub async fn start_pull(
+    context: &DriverContext,
+    link: &RepositoryLink,
+) -> Result<JobId, LinkError> {
     let pull = link
         .pull()
         .ok_or_else(|| LinkError::Unexpected("the link does not pull".into()))?;
@@ -171,12 +174,12 @@ pub async fn start_pull(context: &DriverContext, link: &InvenioLink) -> Result<J
         .ok_or(LinkError::NotHolder)?;
     let spec = ImportRoCrateSpec {
         auth_context: creator_auth(link),
-        source: ImportRoCrateSource::Invenio {
+        source: ImportRoCrateSource::Repository {
             group_id: link.group_id,
             connector_id: link.connector_id,
             record_id: record_id.clone(),
             options: pull.options.clone(),
-            pull: Some(InvenioPull::Update {
+            pull: Some(RepositoryPull::Update {
                 link_id: link.link_id,
             }),
         },

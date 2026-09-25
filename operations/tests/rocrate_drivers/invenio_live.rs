@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::repository::{InvenioMode, InvenioOptions, InvenioQuery, InvenioRecord};
+use aruna_core::repository::{ImportMode, ImportOptions, InvenioRecord, RepositoryQuery};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
 use aruna_operations::jobs::invenio::{seal_credential, search_records};
@@ -119,7 +119,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
         client.get(file_url).send().await?.status(),
         StatusCode::FORBIDDEN
     );
-    let query = InvenioQuery {
+    let query = RepositoryQuery {
         group_id: fixture.group_id,
         connector_id: connector,
         q: format!("\"{title}\""),
@@ -149,24 +149,24 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
     .await??;
     let anonymous = live_connector(&fixture, &endpoint, None).await?;
     for (index, mode) in [
-        InvenioMode::Copy,
-        InvenioMode::Reference,
-        InvenioMode::Metadata,
+        ImportMode::Copy,
+        ImportMode::Reference,
+        ImportMode::Metadata,
     ]
     .into_iter()
     .enumerate()
     {
         let mut import = spec_with_source(
             &fixture,
-            ImportRoCrateSource::Invenio {
+            ImportRoCrateSource::Repository {
                 group_id: fixture.group_id,
-                connector_id: if mode == InvenioMode::Metadata {
+                connector_id: if mode == ImportMode::Metadata {
                     anonymous
                 } else {
                     connector
                 },
                 record_id: second.id.clone(),
-                options: InvenioOptions {
+                options: ImportOptions {
                     mode,
                     all_versions: true,
                 },
@@ -182,8 +182,8 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
         let count = require_import(run_rocrate_import(&ctx, &import).await)?;
-        assert_eq!(count, if mode == InvenioMode::Metadata { 2 } else { 8 });
-        if mode != InvenioMode::Metadata {
+        assert_eq!(count, if mode == ImportMode::Metadata { 2 } else { 8 });
+        if mode != ImportMode::Metadata {
             let key = format!(
                 "live-{index}/{}",
                 aruna_core::repository::invenio::file_path(&second.id, "nested/data.txt")?
@@ -613,7 +613,7 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
     let connector = live_connector(&fixture, &endpoint, None).await?;
     let auth = import_spec(&fixture, Ulid::generate(), doc_id(1)).auth_context;
     let title = current["metadata"]["title"].as_str().ok_or("no title")?;
-    let query = InvenioQuery {
+    let query = RepositoryQuery {
         group_id: fixture.group_id,
         connector_id: connector,
         q: format!("\"{title}\""),
@@ -631,9 +631,9 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     for (index, mode) in [
-        InvenioMode::Copy,
-        InvenioMode::Reference,
-        InvenioMode::Metadata,
+        ImportMode::Copy,
+        ImportMode::Reference,
+        ImportMode::Metadata,
     ]
     .into_iter()
     .enumerate()
@@ -641,11 +641,11 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
         let document = doc_id(index as u64 + 1);
         let mut import = spec_with_source(
             &fixture,
-            ImportRoCrateSource::Invenio {
+            ImportRoCrateSource::Repository {
                 group_id: fixture.group_id,
                 connector_id: connector,
                 record_id: record.clone(),
-                options: InvenioOptions {
+                options: ImportOptions {
                     mode,
                     all_versions: true,
                 },
@@ -691,7 +691,7 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
                 &fixture.context,
             )
             .await;
-            if mode == InvenioMode::Metadata {
+            if mode == ImportMode::Metadata {
                 assert!(object.is_err(), "metadata import stored {key}");
                 continue;
             }
@@ -712,7 +712,7 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::invenio::crate_versions;
-    use aruna_core::repository::{InvenioPull, LinkPatch};
+    use aruna_core::repository::{LinkPatch, RepositoryPull};
     use aruna_core::structs::secondary_id::SecondaryIdKind;
     use aruna_operations::jobs::invenio::link_queue::drain_links;
     use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
@@ -760,12 +760,12 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
 
     let import = spec_with_source(
         &fixture,
-        ImportRoCrateSource::Invenio {
+        ImportRoCrateSource::Repository {
             group_id: fixture.group_id,
             connector_id: connector,
             record_id: first.id.clone(),
-            options: InvenioOptions::default(),
-            pull: Some(InvenioPull::Keep {
+            options: ImportOptions::default(),
+            pull: Some(RepositoryPull::Keep {
                 auto_update: true,
                 owner_node_url: "https://node.example/api/v1".into(),
             }),

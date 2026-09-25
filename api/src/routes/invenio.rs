@@ -93,7 +93,7 @@ pub async fn search_records(
     Query(query): Query<InvenioSearch>,
 ) -> ServerResult<Json<serde_json::Value>> {
     let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
-    let query = aruna_core::repository::InvenioQuery {
+    let query = aruna_core::repository::RepositoryQuery {
         group_id: ulid::Ulid::from_string(&query.group_id).map_err(|_| ServerError::BadRequest)?,
         connector_id: ulid::Ulid::from_string(&query.connector_id)
             .map_err(|_| ServerError::BadRequest)?,
@@ -186,15 +186,15 @@ impl Default for InvenioOptionsRequest {
     }
 }
 
-impl From<InvenioOptionsRequest> for aruna_core::repository::InvenioOptions {
+impl From<InvenioOptionsRequest> for aruna_core::repository::ImportOptions {
     fn from(value: InvenioOptionsRequest) -> Self {
-        use aruna_core::repository::InvenioMode;
+        use aruna_core::repository::ImportMode;
         Self {
             all_versions: value.all_versions,
             mode: match value.mode {
-                InvenioDataMode::Copy => InvenioMode::Copy,
-                InvenioDataMode::Reference => InvenioMode::Reference,
-                InvenioDataMode::Metadata => InvenioMode::Metadata,
+                InvenioDataMode::Copy => ImportMode::Copy,
+                InvenioDataMode::Reference => ImportMode::Reference,
+                InvenioDataMode::Metadata => ImportMode::Metadata,
             },
         }
     }

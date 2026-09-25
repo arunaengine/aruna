@@ -10,13 +10,13 @@ use thiserror::Error;
 use ulid::Ulid;
 
 mod credential;
-pub use credential::InvenioCredential;
+pub use credential::RepositoryCredential;
 pub mod invenio;
 mod link;
 pub use link::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InvenioQuery {
+pub struct RepositoryQuery {
     pub group_id: Ulid,
     pub connector_id: Ulid,
     pub q: String,
@@ -27,7 +27,7 @@ pub struct InvenioQuery {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InvenioMode {
+pub enum ImportMode {
     #[default]
     Copy,
     Reference,
@@ -35,15 +35,15 @@ pub enum InvenioMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InvenioOptions {
-    pub mode: InvenioMode,
+pub struct ImportOptions {
+    pub mode: ImportMode,
     pub all_versions: bool,
 }
 
-impl Default for InvenioOptions {
+impl Default for ImportOptions {
     fn default() -> Self {
         Self {
-            mode: InvenioMode::Copy,
+            mode: ImportMode::Copy,
             all_versions: true,
         }
     }
@@ -51,7 +51,7 @@ impl Default for InvenioOptions {
 
 /// How an Invenio import relates to a pull link.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum InvenioPull {
+pub enum RepositoryPull {
     /// After the import, a new pull link keeps the dataset updated from the lineage.
     Keep {
         auto_update: bool,
@@ -70,7 +70,7 @@ pub struct InvenioDestination {
     pub metadata_json: String,
     pub publish: bool,
     pub public_files: bool,
-    pub credential: Option<InvenioCredential>,
+    pub credential: Option<RepositoryCredential>,
     /// Set when a lasting link pushes; its token then comes from the link's sealed secret.
     pub link: Option<LinkTarget>,
 }
