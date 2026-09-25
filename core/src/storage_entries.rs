@@ -427,17 +427,23 @@ pub fn create_projection_entries(
     event: &MetadataEventRecord,
 ) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
     let mut entries = vec![create_event_entry(event)?, pending_projection_entry(event)];
-    if matches!(
+    entries.extend(checkpoint_entry(event));
+    Ok(entries)
+}
+
+/// The window marker of a checkpoint event, written wherever the event is logged.
+pub fn checkpoint_entry(event: &MetadataEventRecord) -> Option<(KeySpace, Key, Value)> {
+    matches!(
         event.payload,
         crate::metadata::MetadataEventPayload::Checkpoint { .. }
-    ) {
-        entries.push((
+    )
+    .then(|| {
+        (
             crate::keyspaces::METADATA_CHECKPOINT_KEYSPACE.to_string(),
             event_log_key(event.record.document_id, event.event_id),
             ByteView::from(Vec::new()),
-        ));
-    }
-    Ok(entries)
+        )
+    })
 }
 
 pub fn graph_lifecycle_entry(

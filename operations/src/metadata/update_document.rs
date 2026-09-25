@@ -27,6 +27,7 @@ use aruna_core::structs::storage::metadata_registry::{
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use byteview::ByteView;
+use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -77,6 +78,8 @@ pub enum UpdateDocumentMutation {
         batch: Box<MetadataBatch>,
         authored: MetadataBatchSource,
     },
+    /// Opens a new history window with this holder's current graph state.
+    Checkpoint,
 }
 
 /// Validates a metadata update and persists the event plus projection work.
@@ -94,6 +97,8 @@ pub struct UpdateDocumentOperation {
     planned_batch: Option<MetadataBatch>,
     /// This node's actor after this update's dot, written with the event.
     actor: Option<MetadataActor>,
+    /// A checkpoint's graph state; `Some(None)` when too large to carry.
+    snapshot: Option<Option<Box<GraphReplicaSnapshot>>>,
     raw_budget: Option<RawOriginBudget>,
     next_raw_budget: Option<RawOriginBudget>,
     accepted_create: Option<MetadataEventRecord>,
@@ -118,6 +123,7 @@ enum UpdateDocumentState {
     ReadCurrent,
     ReadRealmConfig,
     ReadActor,
+    TakeSnapshot,
     PlanBatch,
     StartTransaction,
     ReadFence,
@@ -173,7 +179,8 @@ impl UpdateDocumentOperation {
             UpdateDocumentMutation::ReplaceRoCrate { .. } => None,
             UpdateDocumentMutation::UpsertDataEntity { .. }
             | UpdateDocumentMutation::UpsertContextualEntity { .. }
-            | UpdateDocumentMutation::ApplyBatch { .. } => {
+            | UpdateDocumentMutation::ApplyBatch { .. }
+            | UpdateDocumentMutation::Checkpoint => {
                 Some(stale_status(config.document_id, "dataset_revision_changed"))
             }
         };
@@ -193,6 +200,7 @@ impl UpdateDocumentOperation {
             update_event: None,
             planned_batch,
             actor: None,
+            snapshot: None,
             raw_budget: None,
             next_raw_budget: None,
             accepted_create: None,
@@ -225,38 +233,46 @@ impl UpdateDocumentOperation {
         record
     }
 
-    fn batch_source(&self) -> MetadataBatchSource {
+    fn batch_source(&self) -> Option<MetadataBatchSource> {
         match &self.config.mutation {
             UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
-                MetadataBatchSource::ReplaceRoCrate {
+                Some(MetadataBatchSource::ReplaceRoCrate {
                     jsonld: jsonld.clone(),
-                }
+                })
             }
             UpdateDocumentMutation::UpsertDataEntity { jsonld } => {
-                MetadataBatchSource::UpsertDataEntity {
+                Some(MetadataBatchSource::UpsertDataEntity {
                     jsonld: jsonld.clone(),
-                }
+                })
             }
             UpdateDocumentMutation::UpsertContextualEntity { jsonld } => {
-                MetadataBatchSource::UpsertContextualEntity {
+                Some(MetadataBatchSource::UpsertContextualEntity {
                     jsonld: jsonld.clone(),
-                }
+                })
             }
-            UpdateDocumentMutation::ApplyBatch { authored, .. } => authored.clone(),
+            UpdateDocumentMutation::ApplyBatch { authored, .. } => Some(authored.clone()),
+            UpdateDocumentMutation::Checkpoint => None,
         }
     }
 
     fn update_event_payload(&self) -> Result<MetadataEventPayload, UpdateDocumentError> {
-        let Some(batch) = self.planned_batch.clone() else {
+        if let UpdateDocumentMutation::Checkpoint = self.config.mutation {
+            let Some(snapshot) = self.snapshot.clone() else {
+                return Err(MetadataError::Backend(
+                    "checkpoint graph state is missing before commit".to_string(),
+                )
+                .into());
+            };
+            return Ok(MetadataEventPayload::Checkpoint { snapshot });
+        }
+        let (Some(batch), Some(authored)) = (self.planned_batch.clone(), self.batch_source())
+        else {
             return Err(MetadataError::Backend(
                 "metadata batch is missing before update commit".to_string(),
             )
             .into());
         };
-        Ok(MetadataEventPayload::ApplyBatch {
-            batch,
-            authored: self.batch_source(),
-        })
+        Ok(MetadataEventPayload::ApplyBatch { batch, authored })
     }
 
     fn update_event_record(
@@ -298,7 +314,9 @@ impl UpdateDocumentOperation {
     ) -> Result<Option<Effect>, MetadataError> {
         match &self.config.mutation {
             // A device already planned its batch, so there is nothing to plan.
-            UpdateDocumentMutation::ApplyBatch { .. } => return Ok(None),
+            UpdateDocumentMutation::ApplyBatch { .. } | UpdateDocumentMutation::Checkpoint => {
+                return Ok(None);
+            }
             UpdateDocumentMutation::ReplaceRoCrate { .. } => {}
             UpdateDocumentMutation::UpsertDataEntity { jsonld }
             | UpdateDocumentMutation::UpsertContextualEntity { jsonld } => {
@@ -314,7 +332,9 @@ impl UpdateDocumentOperation {
             graph_iri: record.graph_iri.clone(),
             actor: actor.actor,
             counter: actor.counter,
-            source: self.batch_source(),
+            source: self
+                .batch_source()
+                .ok_or_else(|| MetadataError::Backend("a checkpoint plans no batch".to_string()))?,
         })))
     }
 
@@ -668,6 +688,15 @@ impl UpdateDocumentOperation {
                 ) {
                     return self.begin_transaction_effect();
                 }
+                if let UpdateDocumentMutation::Checkpoint = self.config.mutation {
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(UpdateDocumentError::DocumentNotFound);
+                    };
+                    self.state = UpdateDocumentState::TakeSnapshot;
+                    return smallvec![Effect::Metadata(MetadataEffect::GraphSnapshot {
+                        graph_iri: record.graph_iri.clone(),
+                    })];
+                }
                 self.state = UpdateDocumentState::ReadActor;
                 smallvec![Effect::Storage(StorageEffect::Read {
                     key_space: METADATA_ACTOR_KEYSPACE.to_string(),
@@ -695,10 +724,19 @@ impl UpdateDocumentOperation {
                         return self.fail(aruna_core::errors::ConversionError::from(error).into());
                     }
                 };
-                if let Some(current) = &current
-                    && self.event_id <= current.last_event_id
+                // Materialization runs a document's events in id order, so a new event
+                // must sort after every event its plan may depend on.
+                let floor = self
+                    .record
+                    .as_ref()
+                    .map(|record| record.last_event_id)
+                    .into_iter()
+                    .chain(current.as_ref().map(|current| current.last_event_id))
+                    .max();
+                if let Some(floor) = floor
+                    && self.event_id <= floor
                 {
-                    match current.last_event_id.increment() {
+                    match floor.increment() {
                         Ok(next) => self.event_id = next,
                         Err(_) => return self.fail(UpdateDocumentError::RawLimit),
                     }
@@ -726,6 +764,20 @@ impl UpdateDocumentOperation {
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
             other => self.unexpected_event("metadata actor read result", format!("{other:?}")),
+        }
+    }
+
+    /// Keeps graph state small enough that the checkpoint fits a fresh window.
+    fn take_snapshot(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) => {
+                let fits = postcard::experimental::serialized_size(&snapshot)
+                    .is_ok_and(|size| size as u64 <= RAW_BYTES_LIMIT / 4);
+                self.snapshot = Some(fits.then_some(snapshot));
+                self.begin_transaction_effect()
+            }
+            Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
+            other => self.unexpected_event("checkpoint graph state", format!("{other:?}")),
         }
     }
 
@@ -944,6 +996,32 @@ impl UpdateDocumentOperation {
                 }
                 self.quota = Some(quota);
                 self.raw_budget = Some(reconstructed);
+                if let UpdateDocumentMutation::Checkpoint = self.config.mutation {
+                    // The checkpoint is the first event of the window it opens.
+                    self.next_raw_budget = match self.update_event.clone().map(|checkpoint| {
+                        let bytes = postcard::experimental::serialized_size(&checkpoint)
+                            .map_err(|_| UpdateDocumentError::RawLimit)?
+                            as u64;
+                        let quota = self.window_quota(&checkpoint)?;
+                        Ok::<_, UpdateDocumentError>(RawOriginBudget {
+                            events: 1,
+                            encoded_bytes: bytes,
+                            ..quota
+                        })
+                    }) {
+                        Some(Ok(budget)) => Some(budget),
+                        Some(Err(error)) => return self.fail(error),
+                        None => return self.fail(UpdateDocumentError::MissingTransaction),
+                    };
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(UpdateDocumentError::MissingTransaction);
+                    };
+                    self.state = UpdateDocumentState::WriteUpdateBatch;
+                    return match self.write_batch_effect(txn_id) {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => self.fail(error),
+                    };
+                }
                 self.next_raw_budget = match self.check_raw_budget(history_events, history_bytes) {
                     Ok(budget) => Some(budget),
                     Err(error) => return self.fail(error),
@@ -1063,7 +1141,8 @@ pub async fn update_metadata_document(
         }
         UpdateDocumentMutation::UpsertDataEntity { .. }
         | UpdateDocumentMutation::UpsertContextualEntity { .. }
-        | UpdateDocumentMutation::ApplyBatch { .. } => {
+        | UpdateDocumentMutation::ApplyBatch { .. }
+        | UpdateDocumentMutation::Checkpoint => {
             stale_status(operation.config.document_id, "dataset_revision_changed")
         }
     });
@@ -1156,6 +1235,7 @@ impl Operation for UpdateDocumentOperation {
             UpdateDocumentState::ReadCurrent => self.read_current(event),
             UpdateDocumentState::ReadRealmConfig => self.read_realm_config(event),
             UpdateDocumentState::ReadActor => self.read_actor(event),
+            UpdateDocumentState::TakeSnapshot => self.take_snapshot(event),
             UpdateDocumentState::PlanBatch => self.plan_batch(event),
             UpdateDocumentState::StartTransaction => self.start_transaction(event),
             UpdateDocumentState::ReadFence => self.read_fence(event),
