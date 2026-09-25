@@ -1094,6 +1094,12 @@ pub enum MetadataEffect {
     ContainsGraph {
         graph_iri: String,
     },
+    /// Whether the graph already applied dot `(actor, counter)`.
+    ContainsDot {
+        graph_iri: String,
+        actor: [u8; 32],
+        counter: u64,
+    },
     // Device replicas
     GraphSnapshot {
         graph_iri: String,
@@ -1179,6 +1185,10 @@ pub enum MetadataEvent {
         graph_iri: String,
         exists: bool,
     },
+    ContainsDotResult {
+        graph_iri: String,
+        contains: bool,
+    },
     // Device replicas
     GraphSnapshotResult {
         graph_iri: String,
@@ -1231,6 +1241,9 @@ pub enum MetadataError {
     Storage(#[from] StorageError),
     #[error("metadata backend error: {0}")]
     Backend(String),
+    /// A batch depends on events this replica has not merged yet; it applies once they arrive.
+    #[error("metadata causal dependencies missing: {0}")]
+    MissingDependencies(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

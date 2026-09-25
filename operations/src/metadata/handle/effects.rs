@@ -158,6 +158,13 @@ impl MetadataHandle {
                             exists: false,
                         }));
                     }
+                    // A deleted graph applies nothing more, so nothing is left to apply.
+                    MetadataEffect::ContainsDot { graph_iri, .. } => {
+                        return Some(Event::Metadata(MetadataEvent::ContainsDotResult {
+                            graph_iri: graph_iri.clone(),
+                            contains: true,
+                        }));
+                    }
                     _ if effect_rejects_deleted(effect) => {
                         return Some(Event::Metadata(MetadataEvent::Error {
                             graph_iri: Some(graph_iri.to_string()),
@@ -300,6 +307,7 @@ pub(super) fn metadata_effect_kind(effect: &MetadataEffect) -> &'static str {
         MetadataEffect::DeleteGraph { .. } => "delete_graph",
         MetadataEffect::ListGraphs => "list_graphs",
         MetadataEffect::ContainsGraph { .. } => "contains_graph",
+        MetadataEffect::ContainsDot { .. } => "contains_dot",
         MetadataEffect::PlanBatch { .. } => "plan_batch",
         MetadataEffect::MergeBatch { .. } => "merge_batch",
         MetadataEffect::GraphSnapshot { .. } => "graph_snapshot",
@@ -325,6 +333,7 @@ pub(super) fn metadata_event_kind(event: &MetadataEvent) -> &'static str {
         MetadataEvent::GraphDeleted { .. } => "graph_deleted",
         MetadataEvent::GraphListResult { .. } => "graph_list_result",
         MetadataEvent::ContainsGraphResult { .. } => "contains_graph_result",
+        MetadataEvent::ContainsDotResult { .. } => "contains_dot_result",
         MetadataEvent::BatchPlanned { .. } => "batch_planned",
         MetadataEvent::BatchMerged { .. } => "batch_merged",
         MetadataEvent::GraphSnapshotResult { .. } => "graph_snapshot_result",
@@ -359,7 +368,8 @@ pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
         | MetadataError::ProfileValidation(_)
         | MetadataError::Persist(_)
         | MetadataError::Storage(_)
-        | MetadataError::Backend(_) => MetadataReadError::Unavailable,
+        | MetadataError::Backend(_)
+        | MetadataError::MissingDependencies(_) => MetadataReadError::Unavailable,
     }
 }
 
@@ -379,6 +389,7 @@ pub(super) fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         | MetadataEffect::ExportRoCrateSummary { graph_iri }
         | MetadataEffect::DeleteGraph { graph_iri }
         | MetadataEffect::ContainsGraph { graph_iri }
+        | MetadataEffect::ContainsDot { graph_iri, .. }
         | MetadataEffect::GraphSnapshot { graph_iri }
         | MetadataEffect::InstallSnapshot { graph_iri, .. }
         | MetadataEffect::PlanBatch { graph_iri, .. }
@@ -919,6 +930,25 @@ fn graph_effect(
             );
             result
         }
+        MetadataEffect::ContainsDot {
+            graph_iri,
+            actor,
+            counter,
+        } => {
+            let graph = GraphId::new(&graph_iri);
+            let dot = craqle::Dot {
+                actor: craqle::ActorId::from_bytes(actor),
+                counter,
+            };
+            let contains = match node.contains_graph(&graph) {
+                Ok(true) => node.vector_clock(&graph).map(|clock| clock.contains(&dot)),
+                other => other,
+            };
+            contains.map(|contains| MetadataEvent::ContainsDotResult {
+                graph_iri: graph_iri.clone(),
+                contains,
+            })
+        }
         _ => unreachable!("effect family routed incorrectly"),
     }
 }
@@ -1090,7 +1120,8 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         | MetadataEffect::SyncBestEffort { .. } => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
-        | MetadataEffect::ContainsGraph { .. }) => graph_effect(&node, &auth, effect),
+        | MetadataEffect::ContainsGraph { .. }
+        | MetadataEffect::ContainsDot { .. }) => graph_effect(&node, &auth, effect),
         effect @ (MetadataEffect::GraphSnapshot { .. }
         | MetadataEffect::InstallSnapshot { .. }
         | MetadataEffect::PlanBatch { .. }
