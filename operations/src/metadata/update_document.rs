@@ -2381,6 +2381,7 @@ mod pure_tests {
             actor: [5u8; 32],
             counter: 41,
             last_event_id: Ulid::from_parts(u64::MAX >> 16, 7),
+            rejected: Vec::new(),
         };
         operation.start();
         operation.step(registry_read(&record));

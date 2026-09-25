@@ -15,7 +15,7 @@ use aruna_core::keyspaces::METADATA_ACTOR_KEYSPACE;
 use aruna_core::metadata::{
     MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
 };
-use aruna_core::storage_entries::metadata_actor_key;
+use aruna_core::storage_entries::{metadata_actor_entry, metadata_actor_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::{TaskEvent, TaskKey};
 use craqle::ActorId;
@@ -73,7 +73,9 @@ pub async fn apply_local_edit(
     }
     let actor = MetadataActor::next(current.as_ref(), record.document_id, node_id, draft_id)
         .ok_or(DeviceEditError::Unavailable)?;
-    let batch = plan_local(context, &record, &authored, (actor.actor, actor.counter)).await?;
+    let mut batch = plan_local(context, &record, &authored, (actor.actor, actor.counter)).await?;
+    // Holders never get refused dots, so a new edit must not wait for them.
+    actor.strip(&mut batch.base_clock);
     let entry = PublishEntry::edit(draft_id, owner, &record, batch.clone(), authored);
     drive(
         EnqueueDraftOperation::new(EnqueueDraftInput { entry }).with_actor(actor),
@@ -119,6 +121,48 @@ fn authored_source(mutation: UpdateDocumentMutation) -> Option<MetadataBatchSour
         }
         _ => None,
     }
+}
+
+/// Marks an edit the realm permanently refused, so later edits start a fresh actor and
+/// never depend on it. Returns whether the actor record was updated.
+pub(super) async fn reject_edit(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+    dot: ([u8; 32], u64),
+) -> bool {
+    let _guard = crate::metadata::update_document::document_lock(document_id).await;
+    let Ok(Some(mut current)) = read_actor(context, document_id).await else {
+        return false;
+    };
+    current.reject(dot.0, dot.1);
+    let Ok((key_space, key, value)) = metadata_actor_entry(&current) else {
+        return false;
+    };
+    matches!(
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            })
+            .await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    )
+}
+
+/// Whether an edit depends on one the realm permanently refused.
+pub(super) async fn refused_edit(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+    dot: ([u8; 32], u64),
+) -> bool {
+    read_actor(context, document_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|current| current.refused(dot.0, dot.1))
 }
 
 /// This device's CRDT actor for the document, if it edited the document before.

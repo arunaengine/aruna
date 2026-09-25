@@ -323,25 +323,36 @@ pub struct MetadataActor {
     pub actor: [u8; 32],
     pub counter: u64,
     pub last_event_id: Ulid,
+    /// Actors and the first counter the realm permanently refused; those dots never apply.
+    pub rejected: Vec<([u8; 32], u64)>,
 }
 
 impl MetadataActor {
-    /// The next dot after `current`; a node without one, or whose storage was reset,
-    /// starts a fresh actor so it never repeats a dot it may have used before.
+    /// The next dot after `current`. A node without one, whose storage was reset, or whose
+    /// actor had an edit refused starts a fresh actor, so it never repeats a dot.
     pub fn next(
         current: Option<&Self>,
         document_id: Ulid,
         node_id: NodeId,
         event_id: Ulid,
     ) -> Option<Self> {
+        let rejected = current.map_or_else(Vec::new, |current| current.rejected.clone());
         match current {
-            Some(current) => Some(Self {
-                document_id,
-                actor: current.actor,
-                counter: current.counter.checked_add(1)?,
-                last_event_id: event_id,
-            }),
-            None => {
+            Some(current)
+                if !current
+                    .rejected
+                    .iter()
+                    .any(|(actor, _)| *actor == current.actor) =>
+            {
+                Some(Self {
+                    document_id,
+                    actor: current.actor,
+                    counter: current.counter.checked_add(1)?,
+                    last_event_id: event_id,
+                    rejected,
+                })
+            }
+            _ => {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(b"aruna-metadata-actor-v2\0");
                 hasher.update(node_id.as_bytes());
@@ -352,7 +363,41 @@ impl MetadataActor {
                     actor: *hasher.finalize().as_bytes(),
                     counter: 1,
                     last_event_id: event_id,
+                    rejected,
                 })
+            }
+        }
+    }
+
+    /// Records that the realm refused `(actor, counter)`; that dot and every later one of
+    /// the same actor can never apply anywhere.
+    pub fn reject(&mut self, actor: [u8; 32], counter: u64) {
+        match self.rejected.iter_mut().find(|(known, _)| *known == actor) {
+            Some((_, first)) => *first = (*first).min(counter),
+            None => self.rejected.push((actor, counter)),
+        }
+    }
+
+    /// Whether `(actor, counter)` depends on or is a refused dot.
+    pub fn refused(&self, actor: [u8; 32], counter: u64) -> bool {
+        self.rejected
+            .iter()
+            .any(|(known, first)| *known == actor && counter >= *first)
+    }
+
+    /// Removes refused dots from `clock`, so a new edit does not wait for them.
+    pub fn strip(&self, clock: &mut VectorClock) {
+        for (actor, first) in &self.rejected {
+            let key = craqle::ActorId::from_bytes(*actor);
+            if clock.0.get(&key).is_some_and(|seen| seen >= first) {
+                match first.checked_sub(1).filter(|kept| *kept > 0) {
+                    Some(kept) => {
+                        clock.0.insert(key, kept);
+                    }
+                    None => {
+                        clock.0.remove(&key);
+                    }
+                }
             }
         }
     }
@@ -1824,5 +1869,31 @@ mod actor_tests {
         assert_ne!(reset.actor, first.actor);
         let other = MetadataActor::next(None, Ulid::from(2), node, Ulid::from(10)).expect("other");
         assert_ne!(other.actor, first.actor);
+    }
+
+    #[test]
+    fn refused_actor_retires() {
+        let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let document = Ulid::from(1);
+        let first = MetadataActor::next(None, document, node, Ulid::from(5)).expect("first");
+        let mut second =
+            MetadataActor::next(Some(&first), document, node, Ulid::from(6)).expect("second");
+        second.reject(first.actor, 2);
+        assert!(second.refused(first.actor, 2) && second.refused(first.actor, 3));
+        assert!(!second.refused(first.actor, 1));
+        let fresh =
+            MetadataActor::next(Some(&second), document, node, Ulid::from(7)).expect("fresh");
+        assert_ne!(fresh.actor, first.actor);
+        assert_eq!(fresh.counter, 1);
+        assert_eq!(fresh.rejected, vec![(first.actor, 2)]);
+        let mut clock = VectorClock::default();
+        clock.advance(craqle::ActorId::from_bytes(first.actor), 3);
+        clock.advance(craqle::ActorId::from_bytes([9; 32]), 4);
+        fresh.strip(&mut clock);
+        assert_eq!(
+            clock.0.get(&craqle::ActorId::from_bytes(first.actor)),
+            Some(&1)
+        );
+        assert_eq!(clock.0.get(&craqle::ActorId::from_bytes([9; 32])), Some(&4));
     }
 }
