@@ -6,11 +6,6 @@ use serde_json::json;
 
 use super::*;
 
-const KINDS: [RepositoryConnectorKind; 2] = [
-    RepositoryConnectorKind::Invenio,
-    RepositoryConnectorKind::OaiPmh,
-];
-
 fn bytes_id(seed: u8) -> String {
     W3idIdentifier::ContentHash([seed; 32]).to_w3id()
 }
@@ -28,10 +23,14 @@ fn document(entities: Vec<Value>) -> Value {
 
 #[test]
 fn shipped_rules_consistent() {
-    for kind in KINDS {
-        let Some(rules) = rules(kind).expect("embedded rules parse") else {
-            continue;
-        };
+    assert!(rules(RepositoryConnectorKind::OaiPmh).unwrap().is_none());
+    for descriptor in crate::repository::kinds() {
+        let kind = descriptor.kind;
+        let rules = descriptor.rules().expect("embedded rules parse");
+        for endpoint in ["https://zenodo.org/api/", "https://repo.example/api/"] {
+            let iri = (descriptor.profile)(endpoint);
+            assert!(descriptor.profiles.iter().any(|profile| profile.iri == iri));
+        }
         let mut names = rules
             .targets
             .iter()

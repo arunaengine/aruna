@@ -4,12 +4,9 @@
 
 use std::sync::Arc;
 
-use aruna_core::repository::capabilities;
-use aruna_core::repository::rules::{Mapped, rules};
-use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
+use aruna_core::repository::rules::Mapped;
+use aruna_core::repository::{KindDescriptor, kinds};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_operations::jobs::repository::requirement_profiles;
-use aruna_operations::metadata::builtin_shapes;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -36,6 +33,8 @@ pub struct CapabilitiesResponse {
     pub review: bool,
     pub pull: bool,
     pub search: bool,
+    /// Records can be imported as datasets.
+    pub import: bool,
     pub release_date: bool,
     /// The identifier a published record receives, such as doi.
     pub identifier_kind: String,
@@ -108,30 +107,28 @@ pub struct CheckResponse {
     pub mapping: Vec<MappingResponse>,
 }
 
-fn kind_view(kind: RepositoryConnectorKind) -> ServerResult<Option<RepositoryKindResponse>> {
-    let Some(can) = capabilities(kind) else {
-        return Ok(None);
-    };
-    let targets = match rules(kind) {
-        Ok(Some(rules)) => serde_json::to_value(&rules.targets)
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
-        Ok(None) => serde_json::json!([]),
-        Err(error) => return Err(ServerError::InternalError(error.to_string())),
-    };
-    let profiles = requirement_profiles(kind)
+fn kind_view(descriptor: &KindDescriptor) -> ServerResult<RepositoryKindResponse> {
+    let rules = descriptor
+        .rules()
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let targets = serde_json::to_value(&rules.targets)
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let profiles = descriptor
+        .profiles
         .iter()
-        .map(|(iri, name)| KindProfileResponse {
-            iri: (*iri).to_string(),
-            name: (*name).to_string(),
-            shapes: builtin_shapes(iri)
-                .unwrap_or_default()
+        .map(|profile| KindProfileResponse {
+            iri: profile.iri.to_string(),
+            name: profile.name.to_string(),
+            shapes: profile
+                .shapes
                 .iter()
-                .map(|shapes| (*shapes).to_string())
+                .map(|shapes| shapes.to_string())
                 .collect(),
         })
         .collect();
-    Ok(Some(RepositoryKindResponse {
-        kind: kind.as_str().to_string(),
+    let can = descriptor.capabilities;
+    Ok(RepositoryKindResponse {
+        kind: descriptor.kind.as_str().to_string(),
         capabilities: CapabilitiesResponse {
             drafts: can.drafts,
             reserve_identifier: can.reserve_identifier,
@@ -139,12 +136,13 @@ fn kind_view(kind: RepositoryConnectorKind) -> ServerResult<Option<RepositoryKin
             review: can.review,
             pull: can.pull,
             search: can.search,
+            import: can.import,
             release_date: can.release_date,
-            identifier_kind: can.identifier_kind.to_string(),
+            identifier_kind: can.identifier_kind.as_str().to_string(),
         },
         profiles,
         targets,
-    }))
+    })
 }
 
 #[utoipa::path(
@@ -165,7 +163,7 @@ Kinds that only harvest, such as oai_pmh, are not listed."#,
         (status = 200, description = "Repository kinds", body = Vec<RepositoryKindResponse>, example = json!([{
             "kind": "invenio",
             "capabilities": {"drafts": true, "reserve_identifier": true, "versions": true,
-                "review": true, "pull": true, "search": true, "release_date": false,
+                "review": true, "pull": true, "search": true, "import": true, "release_date": false,
                 "identifier_kind": "doi"},
             "profiles": [{"iri": "https://w3id.org/aruna/profiles/repository/zenodo",
                 "name": "Zenodo record", "shapes": ["@prefix sh: <http://www.w3.org/ns/shacl#> ."]}],
@@ -179,14 +177,11 @@ pub async fn list_kinds(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<Json<Vec<RepositoryKindResponse>>> {
     require_unrestricted_auth(&state, auth)?;
-    let mut kinds = Vec::new();
-    for kind in [
-        RepositoryConnectorKind::Invenio,
-        RepositoryConnectorKind::OaiPmh,
-    ] {
-        kinds.extend(kind_view(kind)?);
-    }
-    Ok(Json(kinds))
+    kinds()
+        .iter()
+        .map(kind_view)
+        .collect::<ServerResult<_>>()
+        .map(Json)
 }
 
 #[utoipa::path(

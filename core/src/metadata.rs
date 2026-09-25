@@ -31,10 +31,7 @@ pub const INVENIO_PROFILE_IRI: &str = "https://w3id.org/aruna/profiles/repositor
 
 /// Whether the node validates this IRI from its own embedded shapes.
 pub fn is_builtin_profile(iri: &str) -> bool {
-    matches!(
-        iri,
-        CRATE_PROFILE_IRI | ZENODO_PROFILE_IRI | INVENIO_PROFILE_IRI
-    )
+    iri == CRATE_PROFILE_IRI || crate::repository::builtin_profile(iri).is_some()
 }
 
 /// Supported RO-Crate specification IRIs and the remaining RO-Crate community profiles (workflow run

@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::LazyLock;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,9 +14,6 @@ use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
-
-static INVENIO: LazyLock<Result<Rules, String>> =
-    LazyLock::new(|| serde_json::from_str(include_str!("invenio.json")).map_err(|e| e.to_string()));
 
 /// The rules of one repository kind, in the order their targets select entities.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -136,13 +131,12 @@ fn one() -> usize {
 
 /// The embedded rules of a kind; `None` for kinds without rules.
 pub fn rules(kind: RepositoryConnectorKind) -> Result<Option<&'static Rules>, RepositoryError> {
-    match kind {
-        RepositoryConnectorKind::Invenio => INVENIO
-            .as_ref()
-            .map(Some)
-            .map_err(|_| RepositoryError("invalid embedded mapping rules")),
-        RepositoryConnectorKind::OaiPmh => Ok(None),
-    }
+    super::descriptor(kind).map(|kind| kind.rules()).transpose()
+}
+
+/// Parses a kind's rules JSON.
+pub(super) fn load(json: &str) -> Result<Rules, String> {
+    serde_json::from_str(json).map_err(|error| error.to_string())
 }
 
 impl Rules {

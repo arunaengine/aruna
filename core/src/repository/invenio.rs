@@ -8,6 +8,7 @@ use super::fields::{
 };
 use super::rules::{Convert, rules};
 use super::{ExportIdentity, RepositoryError};
+use crate::metadata::{INVENIO_PROFILE_IRI, ZENODO_PROFILE_IRI};
 use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier};
 use serde_json::{Value, json};
@@ -23,6 +24,21 @@ pub const REFERENCE_GROUP: &str = "group_id";
 const NATIVE_METADATA: &str = "https://w3id.org/aruna/invenio/metadata";
 const CUSTOM_FIELDS: &str = "https://w3id.org/aruna/invenio/customFields";
 const PUBLICATION_DATE: &str = "https://w3id.org/aruna/invenio/publicationDate";
+
+/// Zenodo sets the publisher itself; other InvenioRDM instances need one to mint a DOI.
+pub(super) fn requirement_profile(endpoint: &str) -> &'static str {
+    let host = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match host.as_str() {
+        "zenodo.org" | "sandbox.zenodo.org" => ZENODO_PROFILE_IRI,
+        _ => INVENIO_PROFILE_IRI,
+    }
+}
 
 pub fn validate_id(id: &str) -> Result<(), RepositoryError> {
     if id.is_empty()

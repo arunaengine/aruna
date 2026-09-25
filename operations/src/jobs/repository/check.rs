@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use aruna_core::metadata::{MetadataError, ProfileValidationFinding, ProfileValidationSeverity};
 use aruna_core::repository::rules::{Mapped, finding, preview, rules};
-use aruna_core::repository::{LinkFailure, MAX_LINK_FINDINGS};
+use aruna_core::repository::{LinkFailure, MAX_LINK_FINDINGS, descriptor};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::AuthContext;
 use serde_json::Value;
 use ulid::Ulid;
 
-use super::{TransferError, not_supported, repository, requirement_profile};
+use super::{TransferError, not_supported, repository};
 use crate::driver::DriverContext;
 use crate::metadata::profile::validation::check_profile;
 
@@ -64,10 +64,9 @@ pub(crate) async fn check_crate(
     endpoint: &str,
     jsonld: &str,
 ) -> Result<RequirementCheck, TransferError> {
-    let (Some(profile_iri), Some(rules)) = (requirement_profile(kind, endpoint), rules(kind)?)
-    else {
-        return Err(not_supported("publishing"));
-    };
+    let descriptor = descriptor(kind).ok_or_else(|| not_supported("publishing"))?;
+    let profile_iri = (descriptor.profile)(endpoint);
+    let rules = descriptor.rules()?;
     let document: Value = serde_json::from_str(jsonld)
         .map_err(|_| TransferError::Permanent("invalid source crate".into()))?;
     let status = Box::pin(check_profile(context, profile_iri, jsonld))

@@ -14,6 +14,8 @@ mod credential;
 pub use credential::RepositoryCredential;
 pub mod fields;
 pub mod invenio;
+mod kind;
+pub use kind::{KindDescriptor, RequirementProfile, builtin_profile, descriptor, kinds};
 mod link;
 pub mod rules;
 pub use link::*;
@@ -99,7 +101,7 @@ pub struct RepositoryRecord {
 }
 
 /// What a repository kind supports; the kind refuses every other action.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capabilities {
     pub drafts: bool,
     pub reserve_identifier: bool,
@@ -107,31 +109,21 @@ pub struct Capabilities {
     pub review: bool,
     pub pull: bool,
     pub search: bool,
+    /// Records can be imported as datasets.
+    pub import: bool,
     /// A record can wait for a release date before it becomes public.
     pub release_date: bool,
-    /// The identifier a published record receives, such as `doi`.
-    pub identifier_kind: &'static str,
+    /// The identifier a published record receives, such as a DOI.
+    pub identifier_kind: SecondaryIdKind,
 }
 
 /// The capabilities of a kind that publishes records; `None` for kinds that only harvest.
-pub const fn capabilities(kind: RepositoryConnectorKind) -> Option<Capabilities> {
-    match kind {
-        RepositoryConnectorKind::Invenio => Some(Capabilities {
-            drafts: true,
-            reserve_identifier: true,
-            versions: true,
-            review: true,
-            pull: true,
-            search: true,
-            release_date: false,
-            identifier_kind: "doi",
-        }),
-        RepositoryConnectorKind::OaiPmh => None,
-    }
+pub fn capabilities(kind: RepositoryConnectorKind) -> Option<Capabilities> {
+    descriptor(kind).map(|descriptor| descriptor.capabilities)
 }
 
 #[derive(Debug, Error)]
-#[error("invalid Invenio record: {0}")]
+#[error("invalid repository data: {0}")]
 pub struct RepositoryError(pub &'static str);
 
 /// The dataset's own identifiers, read when an export starts. Exports add them to what they

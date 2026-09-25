@@ -3,24 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::metadata::{CRATE_PROFILE_IRI, INVENIO_PROFILE_IRI, ZENODO_PROFILE_IRI};
+use aruna_core::metadata::CRATE_PROFILE_IRI;
+use aruna_core::repository::builtin_profile;
 
 /// Revision reported for every built-in Profile: the shapes change only when
 /// the node binary does, so there is nothing per-realm to pin.
 pub(crate) const BUILTIN_REVISION: &str = "builtin";
 
 const RUN_CRATE_SHAPES: &str = include_str!("process_run.ttl");
-const DATACITE_SHAPES: &str = include_str!("datacite.ttl");
-const PUBLISHER_SHAPES: &str = include_str!("publisher.ttl");
 
 /// The embedded SHACL Turtle sources for `iri`, when the node ships shapes for it.
 pub fn builtin_shapes(iri: &str) -> Option<&'static [&'static str]> {
-    match iri {
-        CRATE_PROFILE_IRI => Some(&[RUN_CRATE_SHAPES]),
-        ZENODO_PROFILE_IRI => Some(&[DATACITE_SHAPES]),
-        INVENIO_PROFILE_IRI => Some(&[DATACITE_SHAPES, PUBLISHER_SHAPES]),
-        _ => None,
+    if iri == CRATE_PROFILE_IRI {
+        return Some(&[RUN_CRATE_SHAPES]);
     }
+    builtin_profile(iri).map(|profile| profile.shapes)
 }
 
 #[cfg(test)]
@@ -30,7 +27,11 @@ mod pure_tests {
 
     #[test]
     fn shapes_parse() {
-        for iri in [CRATE_PROFILE_IRI, ZENODO_PROFILE_IRI, INVENIO_PROFILE_IRI] {
+        let repository = aruna_core::repository::kinds()
+            .iter()
+            .flat_map(|kind| kind.profiles)
+            .map(|profile| profile.iri);
+        for iri in std::iter::once(CRATE_PROFILE_IRI).chain(repository) {
             for shapes in builtin_shapes(iri).expect("embedded shapes") {
                 let triples = TurtleParser::new()
                     .for_slice(shapes.as_bytes())
