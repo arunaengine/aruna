@@ -199,3 +199,7 @@ pub fn publication_start(value: &str) -> Result<String, RepositoryError> {
     }
     start.ok_or(RepositoryError("missing publication date"))
 }
+
+#[cfg(test)]
+#[path = "fields_tests.rs"]
+mod tests;
