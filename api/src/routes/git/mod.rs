@@ -6,6 +6,7 @@ mod lfs;
 mod locks;
 mod snapshot;
 mod transport;
+mod versions;
 
 use crate::auth::{map_authorize_error, require_realm_auth};
 use crate::error::{ServerError, ServerResult};
@@ -34,6 +35,11 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(transport::rpc))
         .routes(routes!(lfs::batch))
         .routes(routes!(lfs::upload, lfs::download))
+        .routes(routes!(versions::list))
+        .routes(routes!(versions::show))
+        .routes(routes!(versions::rocrate))
+        .routes(routes!(versions::compare))
+        .routes(routes!(versions::conflicts))
 }
 
 pub async fn credentials(mut request: Request, next: Next) -> Response {

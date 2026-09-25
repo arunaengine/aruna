@@ -29,6 +29,7 @@ use utoipa_axum::routes;
         (name = "metadata/repository", description = "Repository search, import, publication and requirement checks"),
         (name = "metadata/repositories", description = "Invenio and OAI-PMH repository connectors"),
         (name = "metadata/git", description = "Native ARC repositories and Git LFS transfers"),
+        (name = "metadata/versions", description = "Dataset versions, branches, tags and merges as plain JSON"),
         (name = "metadata/validation", description = "Metadata profile validation")
     ),
     components(schemas(crate::metadata::MetadataRoCrateView))

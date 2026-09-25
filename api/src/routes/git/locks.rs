@@ -48,7 +48,8 @@ pub struct CreateLock {
     responses((status = 201, description = "Lock created", body = Value, content_type = "application/vnd.git-lfs+json",
                example = json!({"lock":{"id":"01M000000000000000000000002","path":"assays/assay/dataset/measurements.bin","locked_at":"2026-09-25T10:00:00+00:00","owner":{"name":"01M000000000000000000000003"}}})),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
-              (status = 409, description = "Path is locked by another user", body = Value, content_type = "application/vnd.git-lfs+json")))]
+              (status = 409, description = "Path is locked by another user", body = Value, content_type = "application/vnd.git-lfs+json",
+               example = json!({"lock":{"id":"01M000000000000000000000002","path":"assays/assay/dataset/measurements.bin","locked_at":"2026-09-25T10:00:00+00:00","owner":{"name":"01M000000000000000000000003"}},"message":"already locked"}))))]
 pub async fn create(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -163,7 +164,8 @@ pub struct Unlock {
     description = "Releases a file lock as defined by the Git LFS locking API.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password, with WRITE on the document.\n\n**Behavior**: the owner releases a lock; another writer needs `force`.",
     params(("repository" = String, Path, description = "Document ID followed by .git"), ("id" = String, Path, description = "Lock ID")),
     request_body(content = Value, content_type = "application/vnd.git-lfs+json", example = json!({"force":false})),
-    responses((status = 200, description = "Lock released", body = Value, content_type = "application/vnd.git-lfs+json"),
+    responses((status = 200, description = "Lock released", body = Value, content_type = "application/vnd.git-lfs+json",
+               example = json!({"lock":{"id":"01M000000000000000000000002","path":"assays/assay/dataset/measurements.bin","locked_at":"2026-09-25T10:00:00+00:00","owner":{"name":"01M000000000000000000000003"}}})),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
               (status = 404, description = "No such lock"), (status = 409, description = "Owned by another user; use force")))]
 pub async fn unlock(
