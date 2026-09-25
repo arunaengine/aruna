@@ -413,7 +413,7 @@ async fn admin_rights_limited() {
     let document_id = parse_document_id(&linked.document_id).unwrap();
     let link_id = Ulid::from_string(&link.link_id).unwrap();
     let context = linked.test.state.get_ctx();
-    let mut stored = aruna_operations::jobs::invenio::links::read_link(
+    let mut stored = aruna_operations::jobs::repository::links::read_link(
         &context.storage_handle,
         document_id,
         link_id,

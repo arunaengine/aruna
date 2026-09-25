@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use aruna_core::repository::{LinkPatch, LinkStatus, RepositoryLink};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::jobs::invenio::link_queue::{current_event, refresh_review, start_push};
-use aruna_operations::jobs::invenio::links::LinkChange;
-use aruna_operations::jobs::invenio::pull::{check_now, start_pull};
-use aruna_operations::jobs::invenio::{TransferError, remote_state, seal_link_token};
+use aruna_operations::jobs::repository::link_queue::{current_event, refresh_review, start_push};
+use aruna_operations::jobs::repository::links::LinkChange;
+use aruna_operations::jobs::repository::pull::{check_now, start_pull};
+use aruna_operations::jobs::repository::{TransferError, remote_state, seal_link_token};
 use aruna_operations::jobs::service::cancel_owned_job;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

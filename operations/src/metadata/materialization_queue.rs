@@ -271,8 +271,11 @@ pub async fn process_materialization_batch(
     if timings.processed > 0
         && let Some(task_handle) = &context.task_handle
     {
-        crate::jobs::invenio::link_queue::restore_link_timer(&context.storage_handle, task_handle)
-            .await;
+        crate::jobs::repository::link_queue::restore_link_timer(
+            &context.storage_handle,
+            task_handle,
+        )
+        .await;
     }
     if job_count > 0 {
         info!(
@@ -796,7 +799,9 @@ async fn plan_finish_chunk(
     }
 
     // Linked repositories learn of the change in the same commit as the new status.
-    match crate::jobs::invenio::link_queue::queue_rows(storage, superseding.keys().copied()).await {
+    match crate::jobs::repository::link_queue::queue_rows(storage, superseding.keys().copied())
+        .await
+    {
         Ok(rows) => plan.writes.extend(rows),
         Err(error) => warn!(%error, "Failed to queue Invenio link pushes after materialization"),
     }

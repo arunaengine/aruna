@@ -324,7 +324,7 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
         .as_ref()
         .and_then(|target| target.link.as_ref())
     {
-        Some(link) => super::invenio::push::settle(ctx, spec, link, outcome).await,
+        Some(link) => super::repository::push::settle(ctx, spec, link, outcome).await,
         None => outcome,
     }
 }
@@ -515,7 +515,7 @@ async fn repository_export(
     destination: &aruna_core::repository::RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    use super::invenio::{TransferError, export};
+    use super::repository::{TransferError, export};
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
             "repository export requires a complete crate with no omitted files".into(),
@@ -585,8 +585,8 @@ pub(crate) async fn crate_jsonld(
     auth: &AuthContext,
     document_id: Ulid,
     metadata_bytes: u64,
-) -> Result<(String, Ulid), super::invenio::TransferError> {
-    use super::invenio::TransferError;
+) -> Result<(String, Ulid), super::repository::TransferError> {
+    use super::repository::TransferError;
     match read_crate(context, auth, document_id, metadata_bytes).await {
         Ok((jsonld, event_id, _)) => Ok((jsonld, event_id)),
         Err(ExportFailure::Permanent(message)) => Err(TransferError::Permanent(message)),

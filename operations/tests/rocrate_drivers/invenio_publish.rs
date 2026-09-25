@@ -10,9 +10,9 @@ use super::link::{
 use super::remote::remote;
 use super::*;
 use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
-use aruna_operations::jobs::invenio::link_queue::{current_event, start_push};
-use aruna_operations::jobs::invenio::links::{LinkChange, LinkError, change_link};
-use aruna_operations::jobs::invenio::remote_state;
+use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
+use aruna_operations::jobs::repository::links::{LinkChange, LinkError, change_link};
+use aruna_operations::jobs::repository::remote_state;
 
 async fn push_now(
     fixture: &Fixture,

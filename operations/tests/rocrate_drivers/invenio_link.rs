@@ -9,9 +9,9 @@ use aruna_core::repository::{
     LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, RepositoryLink, link_key,
 };
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
-use aruna_operations::jobs::invenio::link_queue::drain_links;
-use aruna_operations::jobs::invenio::links::{ChangeLinkOperation, LinkChange, list_links};
-use aruna_operations::jobs::invenio::seal_link_token;
+use aruna_operations::jobs::repository::link_queue::drain_links;
+use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange, list_links};
+use aruna_operations::jobs::repository::seal_link_token;
 use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::jobs::store::{complete_job, fail_job};
 use aruna_operations::jobs::submit::SubmitJobError;
@@ -396,7 +396,7 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .ok_or("revision missing")?
         .winning_event_id;
-    Box::pin(aruna_operations::jobs::invenio::link_queue::start_push(
+    Box::pin(aruna_operations::jobs::repository::link_queue::start_push(
         &fixture.context,
         &second,
         event,
@@ -703,7 +703,7 @@ async fn lost_holder_fails() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert!(
-        !aruna_operations::jobs::invenio::link_queue::owner_holds(&fixture.context, &link).await
+        !aruna_operations::jobs::repository::link_queue::owner_holds(&fixture.context, &link).await
     );
 
     drain(&fixture).await?;

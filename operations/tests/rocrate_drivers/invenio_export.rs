@@ -31,7 +31,7 @@ async fn export_spec(
         link: None,
     };
     destination.credential = Some(
-        aruna_operations::jobs::invenio::seal_credential(
+        aruna_operations::jobs::repository::seal_credential(
             &fixture.context,
             &import.auth_context,
             &destination,

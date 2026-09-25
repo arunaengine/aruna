@@ -331,7 +331,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
         size: 25,
         all_versions: false,
     };
-    let page = aruna_operations::jobs::invenio::search_records(
+    let page = aruna_operations::jobs::repository::search_records(
         &fixture.context,
         &auth,
         &query,
@@ -341,7 +341,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(page["hits"]["hits"][0]["id"], "2");
     let invalid = aruna_core::repository::RepositoryQuery { size: 100, ..query };
     assert!(
-        aruna_operations::jobs::invenio::search_records(&fixture.context, &auth, &invalid, 1024)
+        aruna_operations::jobs::repository::search_records(&fixture.context, &auth, &invalid, 1024)
             .await
             .is_err()
     );
@@ -351,7 +351,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn doi_keeps_case() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_operations::jobs::invenio::{RecordReference, resolve_record};
+    use aruna_operations::jobs::repository::{RecordReference, resolve_record};
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let connector_id = connector(&fixture, &server).await;
@@ -495,9 +495,9 @@ async fn start_update(
     server: &Server,
 ) -> Result<(JobContext, ImportRoCrateSpec, Ulid), Box<dyn std::error::Error>> {
     use aruna_core::repository::{ImportOptions, PullCheck, RepositoryPull};
-    use aruna_operations::jobs::invenio::link_queue::current_event;
-    use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
-    use aruna_operations::jobs::invenio::pull::start_pull;
+    use aruna_operations::jobs::repository::link_queue::current_event;
+    use aruna_operations::jobs::repository::links::{LinkChange, change_link, list_links};
+    use aruna_operations::jobs::repository::pull::start_pull;
     let connector_id = connector(fixture, server).await;
     let spec = spec_with_source(
         fixture,
@@ -558,7 +558,7 @@ async fn start_update(
 #[tokio::test]
 async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::invenio::crate_versions;
-    use aruna_operations::jobs::invenio::links::list_links;
+    use aruna_operations::jobs::repository::links::list_links;
     use aruna_operations::metadata::raw_revision::load_raw_revision;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
@@ -684,7 +684,7 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
 async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::invenio::crate_versions;
     use aruna_core::repository::{LinkPatch, LinkStatus};
-    use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
+    use aruna_operations::jobs::repository::links::{LinkChange, change_link, list_links};
     use aruna_operations::metadata::raw_revision::load_raw_revision;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;

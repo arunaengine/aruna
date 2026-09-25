@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::jobs::invenio::link_queue::queue_deleted;
+use crate::jobs::repository::link_queue::queue_deleted;
 
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 

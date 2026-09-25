@@ -12,12 +12,12 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::harvest::read_connector::{GetRepositoryOperation, ReadConnectorError};
-use aruna_operations::jobs::invenio::export::missing_metadata;
-use aruna_operations::jobs::invenio::link_queue::owner_holds;
-use aruna_operations::jobs::invenio::links::{
+use aruna_operations::jobs::repository::export::missing_metadata;
+use aruna_operations::jobs::repository::link_queue::owner_holds;
+use aruna_operations::jobs::repository::links::{
     LinkChange, LinkError, change_link, list_links, read_link,
 };
-use aruna_operations::jobs::invenio::{TransferError, seal_link_token};
+use aruna_operations::jobs::repository::{TransferError, seal_link_token};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

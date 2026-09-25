@@ -6,7 +6,7 @@ use super::*;
 use aruna_core::repository::{ImportMode, ImportOptions, RepositoryQuery, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
-use aruna_operations::jobs::invenio::{seal_credential, search_records};
+use aruna_operations::jobs::repository::{seal_credential, search_records};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 
 #[tokio::test]
@@ -217,7 +217,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
     use aruna_core::repository::{LinkFailure, LinkPatch, LinkStatus};
-    use aruna_operations::jobs::invenio::links::{LinkChange, change_link};
+    use aruna_operations::jobs::repository::links::{LinkChange, change_link};
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
@@ -311,7 +311,7 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
             reason: LinkFailure::RemoteChanged
         }
     );
-    let state = Box::pin(aruna_operations::jobs::invenio::remote_state(
+    let state = Box::pin(aruna_operations::jobs::repository::remote_state(
         fixture.context.as_ref(),
         &failed,
     ))
@@ -352,7 +352,7 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     .await?
     .ok_or("revision missing")?
     .winning_event_id;
-    Box::pin(aruna_operations::jobs::invenio::link_queue::start_push(
+    Box::pin(aruna_operations::jobs::repository::link_queue::start_push(
         &fixture.context,
         &continued,
         event,
@@ -402,7 +402,7 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     use super::link::{attach, current, drain, due_now, import_dataset, run_push, succeeded};
     use aruna_core::repository::{LinkPatch, LinkReview};
-    use aruna_operations::jobs::invenio::links::{LinkChange, change_link};
+    use aruna_operations::jobs::repository::links::{LinkChange, change_link};
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
@@ -454,7 +454,7 @@ async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     .await?
     .ok_or("revision missing")?
     .winning_event_id;
-    Box::pin(aruna_operations::jobs::invenio::link_queue::start_push(
+    Box::pin(aruna_operations::jobs::repository::link_queue::start_push(
         &fixture.context,
         &pushed,
         event,
@@ -714,8 +714,8 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::invenio::crate_versions;
     use aruna_core::repository::{LinkPatch, RepositoryPull};
     use aruna_core::structs::secondary_id::SecondaryIdKind;
-    use aruna_operations::jobs::invenio::link_queue::drain_links;
-    use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
+    use aruna_operations::jobs::repository::link_queue::drain_links;
+    use aruna_operations::jobs::repository::links::{LinkChange, change_link, list_links};
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
@@ -854,7 +854,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     assert!(revision.jsonld.contains(&format!("{title} v2")));
     // Imports name records by version DOI, concept DOI or page URL as well.
     let resolve = async |reference| {
-        Box::pin(aruna_operations::jobs::invenio::resolve_record(
+        Box::pin(aruna_operations::jobs::repository::resolve_record(
             &fixture.context,
             &auth,
             fixture.group_id,
@@ -864,7 +864,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .await
     };
-    use aruna_operations::jobs::invenio::RecordReference::{Doi, Url};
+    use aruna_operations::jobs::repository::RecordReference::{Doi, Url};
     let version_doi = first.doi.clone().ok_or("v1 has no DOI")?;
     assert_eq!(resolve(Doi(version_doi.to_uppercase())).await?, first.id);
     let concept = second.concept_doi.clone().ok_or("no concept DOI")?;

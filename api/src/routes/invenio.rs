@@ -109,7 +109,7 @@ pub async fn search_records(
         aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
-    aruna_operations::jobs::invenio::search_records(
+    aruna_operations::jobs::repository::search_records(
         &state.get_ctx(),
         &auth,
         &query,
@@ -118,10 +118,10 @@ pub async fn search_records(
     .await
     .map(Json)
     .map_err(|error| match error {
-        aruna_operations::jobs::invenio::TransferError::Permanent(message) => {
+        aruna_operations::jobs::repository::TransferError::Permanent(message) => {
             ServerError::BadRequestReason(message)
         }
-        error @ aruna_operations::jobs::invenio::TransferError::Refused(_) => {
+        error @ aruna_operations::jobs::repository::TransferError::Refused(_) => {
             ServerError::BadRequestReason(error.to_string())
         }
         _ => ServerError::ServiceUnavailableReason("repository search unavailable".into()),
@@ -259,7 +259,7 @@ pub async fn import_record(
     auth: Extension<Option<AuthContext>>,
     Json(request): Json<InvenioImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    use aruna_operations::jobs::invenio::{RecordReference, TransferError, resolve_record};
+    use aruna_operations::jobs::repository::{RecordReference, TransferError, resolve_record};
     let reference = match (request.record_id, request.doi, request.url) {
         (Some(id), None, None) => RecordReference::Id(id),
         (None, Some(doi), None) => RecordReference::Doi(doi),

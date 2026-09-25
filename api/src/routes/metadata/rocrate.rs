@@ -360,7 +360,7 @@ pub async fn submit_rocrate_export(
         ))
         .await?;
         destination.credential = Some(
-            aruna_operations::jobs::invenio::seal_credential(
+            aruna_operations::jobs::repository::seal_credential(
                 &state.get_ctx(),
                 &auth,
                 destination,
@@ -368,7 +368,7 @@ pub async fn submit_rocrate_export(
             )
             .await
             .map_err(|error| match error {
-                aruna_operations::jobs::invenio::TransferError::Permanent(message) => {
+                aruna_operations::jobs::repository::TransferError::Permanent(message) => {
                     ServerError::BadRequestReason(message)
                 }
                 _ => ServerError::ServiceUnavailableReason(
