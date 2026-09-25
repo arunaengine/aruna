@@ -1,4 +1,4 @@
-//! Re-encodes legacy job and realm rows and seals plain secret rows with the node key.
+//! Re-encodes legacy job, realm and PID mapping rows and seals plain secret rows with the node key.
 //! Rows already current stay unchanged, the projection cache is cleared and repeats are safe.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -11,8 +11,10 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, sea
 use aruna_core::keyspaces::{
     BACKEND_SECRET_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
     FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE, SOURCE_SECRET_KEYSPACE,
+    ID_MAPPING_KEYSPACE, NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE, SECONDARY_ID_KEYSPACE,
+    SOURCE_SECRET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
+use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
@@ -29,6 +31,8 @@ use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, R
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use ulid::Ulid;
+
+mod mappings;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {
@@ -48,6 +52,14 @@ pub struct MigrateOutput {
     pub secrets_sealed: usize,
     /// Secret rows left unchanged because they could not be read, as `keyspace/key: reason`.
     pub secrets_skipped: Vec<String>,
+    pub mappings_scanned: usize,
+    pub mappings_rewritten: usize,
+    /// Queued document publishes; those carrying a legacy mapping are rewritten.
+    pub outbox_scanned: usize,
+    pub outbox_rewritten: usize,
+    /// Identifier index rows written or removed so the index matches the mappings.
+    pub identifier_index_written: usize,
+    pub identifier_index_removed: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -69,6 +81,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let conflict_rows = db.keyspace(FAMILY_CONFLICT_KEYSPACE, KeyspaceCreateOptions::default)?;
     let cache_rows = db.keyspace(FAMILY_PROJECTION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let config_rows = db.keyspace(REALM_CONFIG_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let mapping_rows = db.keyspace(ID_MAPPING_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let outbox_rows = db.keyspace(SYNC_OUTBOX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let index_rows = db.keyspace(SECONDARY_ID_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -78,6 +93,19 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         rewrites::<ConflictRecord, LegacyConflict>(&db, &conflict_rows, FAMILY_CONFLICT_KEYSPACE)?;
     let projections = keys(&db, &cache_rows)?;
     let configs = realm_configs(&db, &config_rows)?;
+    let mappings = rewrites::<PersistentIdMapping, mappings::LegacyMapping>(
+        &db,
+        &mapping_rows,
+        ID_MAPPING_KEYSPACE,
+    )?;
+    let outbox = mappings::outbox_rows(&db, &outbox_rows, SYNC_OUTBOX_KEYSPACE)?;
+    let index = mappings::index_rebuild(
+        &db,
+        &mapping_rows,
+        &mappings.rows,
+        &index_rows,
+        ID_MAPPING_KEYSPACE,
+    )?;
     let secret_key = node_key(&db)?;
     let mut secrets = Vec::new();
     let mut secrets_skipped = Vec::new();
@@ -93,6 +121,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&pending_rows, &pending.rows),
         (&conflict_rows, &conflicts.rows),
         (&config_rows, &configs.rows),
+        (&mapping_rows, &mappings.rows),
+        (&outbox_rows, &outbox.rows),
+        (&index_rows, &index.writes),
     ]
     .into_iter()
     .chain(
@@ -106,6 +137,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     }
     for key in &projections {
         txn.remove(cache_rows.clone(), key.clone());
+    }
+    for key in &index.removes {
+        txn.remove(index_rows.clone(), key.clone());
     }
     txn.commit()?.map_err(|_| {
         ExplorerError::Decode("migration conflicted with a running node".to_string())
@@ -125,6 +159,12 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         secrets_scanned: secrets.iter().map(|(_, sealed)| sealed.scanned).sum(),
         secrets_sealed: secrets.iter().map(|(_, sealed)| sealed.rows.len()).sum(),
         secrets_skipped,
+        mappings_scanned: mappings.scanned,
+        mappings_rewritten: mappings.rows.len(),
+        outbox_scanned: outbox.scanned,
+        outbox_rewritten: outbox.rows.len(),
+        identifier_index_written: index.writes.len(),
+        identifier_index_removed: index.removes.len(),
     })
 }
 
@@ -485,7 +525,7 @@ mod tests {
             .expect("record signs")
     }
 
-    fn write(path: &Path, keyspace: &str, entries: Vec<(&[u8], Vec<u8>)>) {
+    pub(super) fn write(path: &Path, keyspace: &str, entries: Vec<(&[u8], Vec<u8>)>) {
         let db = OptimisticTxDatabase::builder(path).open().unwrap();
         let keyspace = db
             .keyspace(keyspace, KeyspaceCreateOptions::default)
@@ -497,7 +537,7 @@ mod tests {
         txn.commit().unwrap().unwrap();
     }
 
-    fn read(path: &Path, keyspace: &str) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    pub(super) fn read(path: &Path, keyspace: &str) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let db = OptimisticTxDatabase::builder(path).open().unwrap();
         let keyspace = db
             .keyspace(keyspace, KeyspaceCreateOptions::default)
