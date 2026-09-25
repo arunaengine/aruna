@@ -411,3 +411,105 @@ async fn invenio_cancels_reference() -> Result<(), Box<dyn std::error::Error>> {
     fixture.stop().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::invenio::{InvenioOptions, InvenioPull, PullCheck, crate_versions};
+    use aruna_operations::jobs::invenio::link_queue::current_event;
+    use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
+    use aruna_operations::jobs::invenio::pull::start_pull;
+    use aruna_operations::metadata::raw_revision::load_raw_revision;
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let connector_id = connector(&fixture, &server).await;
+    let spec = spec_with_source(
+        &fixture,
+        ImportRoCrateSource::Invenio {
+            group_id: fixture.group_id,
+            connector_id,
+            record_id: "1".into(),
+            options: InvenioOptions {
+                all_versions: false,
+                ..InvenioOptions::default()
+            },
+            pull: Some(InvenioPull::Keep {
+                auto_update: false,
+                owner_node_url: "https://node.example/api/v1".into(),
+            }),
+        },
+        doc_id(1),
+    );
+    let ctx = claim_context(&fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
+    super::link::succeeded(Box::pin(run_rocrate_import(&ctx, &spec)).await);
+    replay_event_log(fixture.context.as_ref()).await?;
+    process_materialization_batch(fixture.context.as_ref()).await?;
+    let storage = &fixture.context.storage_handle;
+    let links = list_links(storage, doc_id(1)).await?;
+    let [(link, false)] = links.as_slice() else {
+        panic!("the import keeps one pull link without a queued push: {links:?}");
+    };
+    let first = current_event(&fixture.context, doc_id(1)).await?;
+    assert_eq!(link.remote.record_id.as_deref(), Some("1"));
+    assert_eq!(link.remote.doi.as_deref(), Some("10.1234/1"));
+    assert_eq!(link.pull().and_then(|pull| pull.revision), Some(first));
+
+    // The repository published version 2; the user pulls it.
+    let found = PullCheck::Found {
+        latest_id: "2".into(),
+        revision: 1,
+        local: Some(first),
+    };
+    let link = Box::pin(change_link(
+        &fixture.context,
+        link,
+        LinkChange::Checked(found),
+    ))
+    .await?
+    .ok_or("link missing")?;
+    assert_eq!(link.pull_reason(), Some("update_available"));
+    let pull = Box::pin(start_pull(&fixture.context, &link)).await?;
+    let record = aruna_operations::jobs::store::read_job_record(storage, pull, None)
+        .await?
+        .ok_or("pull job missing")?;
+    let JobPayload::ImportRoCrate(update) = record.payload.clone() else {
+        return Err("pull job is not an import".into());
+    };
+    let ctx = claim_context(&fixture, pull, record.payload).await?;
+    super::link::succeeded(Box::pin(run_rocrate_import(&ctx, &update)).await);
+    replay_event_log(fixture.context.as_ref()).await?;
+    process_materialization_batch(fixture.context.as_ref()).await?;
+
+    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
+        .await?
+        .ok_or("revision missing")?;
+    let document: Value = serde_json::from_str(&revision.jsonld)?;
+    assert_eq!(crate_versions(&document), ["1", "2"]);
+    let graph = document["@graph"].as_array().ok_or("graph missing")?;
+    let root_id = graph
+        .iter()
+        .find(|entity| entity["@id"] == "ro-crate-metadata.json")
+        .map(|descriptor| descriptor["about"]["@id"].clone())
+        .ok_or("descriptor missing")?;
+    let root = graph
+        .iter()
+        .find(|entity| entity["@id"] == root_id)
+        .ok_or("root missing")?;
+    assert_eq!(root["name"], "Record 2");
+    for id in ["1", "2"] {
+        let key = format!(
+            "imported/{}",
+            aruna_core::invenio::file_path(id, "data.txt")?
+        );
+        assert_eq!(object_versions(&fixture, &key).await?.len(), 1, "{key}");
+    }
+    let (pulled, _) = list_links(storage, doc_id(1)).await?.remove(0);
+    assert_eq!(pulled.active_job, None);
+    assert_eq!(pulled.remote.record_id.as_deref(), Some("2"));
+    assert_eq!(pulled.remote.doi.as_deref(), Some("10.1234/2"));
+    assert_eq!(pulled.pull_reason(), None);
+    assert_eq!(
+        pulled.pull().and_then(|pull| pull.revision),
+        Some(revision.winning_event_id)
+    );
+    Ok(())
+}
