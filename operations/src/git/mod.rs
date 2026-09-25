@@ -13,6 +13,7 @@ pub mod push;
 mod records;
 pub mod snapshot;
 pub mod state;
+pub mod versions;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
