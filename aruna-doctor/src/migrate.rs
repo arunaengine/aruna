@@ -14,7 +14,6 @@ use aruna_core::keyspaces::{
     ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEYSPACE,
     REALM_CONFIG_KEYSPACE, SECONDARY_ID_KEYSPACE, SOURCE_SECRET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
-use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
@@ -25,6 +24,7 @@ use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
 use aruna_core::structs::storage::group_backend::GroupStorageSecret;
+use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
@@ -102,11 +102,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         rewrites::<ConflictRecord, LegacyConflict>(&db, &conflict_rows, FAMILY_CONFLICT_KEYSPACE)?;
     let projections = keys(&db, &cache_rows)?;
     let configs = realm_configs(&db, &config_rows)?;
-    let mappings = rewrites::<PersistentIdMapping, mappings::LegacyMapping>(
-        &db,
-        &mapping_rows,
-        ID_MAPPING_KEYSPACE,
-    )?;
+    let mappings =
+        rewrites::<PersistentIdMapping, LegacyMapping>(&db, &mapping_rows, ID_MAPPING_KEYSPACE)?;
     let outbox = mappings::outbox_rows(&db, &outbox_rows, SYNC_OUTBOX_KEYSPACE)?;
     let index = mappings::index_rebuild(
         &db,

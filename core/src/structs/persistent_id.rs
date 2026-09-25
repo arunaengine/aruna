@@ -294,8 +294,63 @@ impl PersistentIdMapping {
         Ok(postcard::to_allocvec(self)?)
     }
 
+    /// Also reads the shape before the secondary identifiers, so old rows and signed oplog
+    /// entries still replay; they read with an empty identifier set.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        match postcard::from_bytes(bytes) {
+            Ok(mapping) => Ok(mapping),
+            Err(error) => match postcard::take_from_bytes::<LegacyMapping>(bytes) {
+                Ok((legacy, [])) => Ok(legacy.into()),
+                _ => Err(error.into()),
+            },
+        }
+    }
+}
+
+/// Previous shape of `PersistentIdMapping`, before the secondary identifiers.
+#[derive(Serialize, Deserialize)]
+pub struct LegacyMapping {
+    pub pid: String,
+    pub target: Ulid,
+    pub kind: PersistentIdKind,
+    pub provider: PersistentIdProvider,
+    pub status: PersistentIdStatus,
+    pub requested_at_ms: Option<u64>,
+    pub requested_by: Option<UserId>,
+    pub job_id: Option<JobId>,
+    pub public: Option<bool>,
+    pub permission_path: Option<String>,
+    pub minted_at_ms: Option<u64>,
+    pub minted_by: Option<UserId>,
+    pub failure: Option<PersistentIdFailure>,
+    pub withdrawn_at_ms: Option<u64>,
+    pub withdrawn_by: Option<UserId>,
+    pub withdrawal_reason: Option<String>,
+    pub revision: PersistentIdRevision,
+}
+
+impl From<LegacyMapping> for PersistentIdMapping {
+    fn from(legacy: LegacyMapping) -> Self {
+        Self {
+            pid: legacy.pid,
+            target: legacy.target,
+            kind: legacy.kind,
+            provider: legacy.provider,
+            status: legacy.status,
+            requested_at_ms: legacy.requested_at_ms,
+            requested_by: legacy.requested_by,
+            job_id: legacy.job_id,
+            public: legacy.public,
+            permission_path: legacy.permission_path,
+            minted_at_ms: legacy.minted_at_ms,
+            minted_by: legacy.minted_by,
+            failure: legacy.failure,
+            withdrawn_at_ms: legacy.withdrawn_at_ms,
+            withdrawn_by: legacy.withdrawn_by,
+            withdrawal_reason: legacy.withdrawal_reason,
+            revision: legacy.revision,
+            secondary_identifiers: BTreeSet::new(),
+        }
     }
 }
 
@@ -587,6 +642,16 @@ mod tests {
         assert_eq!(change.current.actor, node(7));
         assert_eq!(change.kind, DocumentChangeKind::Upsert);
         assert_eq!(change.placement, placement);
+    }
+
+    #[test]
+    fn reads_legacy_mapping() {
+        let mapping = active_mapping(Ulid::from_bytes([9; 16]), revision(1, 7));
+        let bytes = mapping.to_bytes().unwrap();
+        // Postcard is positional: the old shape is the current one without the empty set.
+        let legacy = &bytes[..bytes.len() - 1];
+        assert_eq!(PersistentIdMapping::from_bytes(legacy).unwrap(), mapping);
+        assert!(PersistentIdMapping::from_bytes(&legacy[..legacy.len() - 1]).is_err());
     }
 
     #[test]

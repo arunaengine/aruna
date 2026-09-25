@@ -5,17 +5,10 @@
 
 use super::{Rewrites, decode_error, rewritten};
 use crate::explorer::ExplorerError;
-use aruna_core::UserId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::{
-    PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
-    PersistentIdRevision, PersistentIdStatus, secondary_index_entries,
-};
+use aruna_core::structs::{LegacyMapping, PersistentIdMapping, secondary_index_entries};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use ulid::Ulid;
+use std::collections::BTreeMap;
 
 /// Identifier index rows to write and to remove so the index matches the mappings.
 pub(super) struct IndexRebuild {
@@ -93,61 +86,14 @@ pub(super) fn index_rebuild(
     })
 }
 
-/// Previous shape of `PersistentIdMapping`, before the secondary identifiers.
-#[derive(Serialize, Deserialize)]
-pub(super) struct LegacyMapping {
-    pub(super) pid: String,
-    pub(super) target: Ulid,
-    pub(super) kind: PersistentIdKind,
-    pub(super) provider: PersistentIdProvider,
-    pub(super) status: PersistentIdStatus,
-    pub(super) requested_at_ms: Option<u64>,
-    pub(super) requested_by: Option<UserId>,
-    pub(super) job_id: Option<JobId>,
-    pub(super) public: Option<bool>,
-    pub(super) permission_path: Option<String>,
-    pub(super) minted_at_ms: Option<u64>,
-    pub(super) minted_by: Option<UserId>,
-    pub(super) failure: Option<PersistentIdFailure>,
-    pub(super) withdrawn_at_ms: Option<u64>,
-    pub(super) withdrawn_by: Option<UserId>,
-    pub(super) withdrawal_reason: Option<String>,
-    pub(super) revision: PersistentIdRevision,
-}
-
-impl From<LegacyMapping> for PersistentIdMapping {
-    fn from(legacy: LegacyMapping) -> Self {
-        Self {
-            pid: legacy.pid,
-            target: legacy.target,
-            kind: legacy.kind,
-            provider: legacy.provider,
-            status: legacy.status,
-            requested_at_ms: legacy.requested_at_ms,
-            requested_by: legacy.requested_by,
-            job_id: legacy.job_id,
-            public: legacy.public,
-            permission_path: legacy.permission_path,
-            minted_at_ms: legacy.minted_at_ms,
-            minted_by: legacy.minted_by,
-            failure: legacy.failure,
-            withdrawn_at_ms: legacy.withdrawn_at_ms,
-            withdrawn_by: legacy.withdrawn_by,
-            withdrawal_reason: legacy.withdrawal_reason,
-            revision: legacy.revision,
-            secondary_identifiers: BTreeSet::new(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::LegacyMapping;
     use crate::migrate::migrate_output;
     use crate::migrate::tests::{read, write};
     use aruna_core::UserId;
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SECONDARY_ID_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
+    use aruna_core::structs::LegacyMapping;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
