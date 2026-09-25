@@ -746,7 +746,7 @@ async fn readable_job(
 }
 
 /// A repository link push runs as the link creator. A group admin of the link's group, who may
-/// manage the link, reads the push as their own, like a joined PID job.
+/// manage the link and read the dataset, reads the push as their own, like a joined PID job.
 async fn linked_push_job(
     context: &DriverContext,
     auth: &AuthContext,
@@ -764,26 +764,31 @@ async fn linked_push_job(
     if record.created_by.realm_id != auth.realm_id {
         return Ok(None);
     }
-    let path = group_admin_path(auth.realm_id, destination.group_id);
-    let extras = PolicyRequestExtras::rest();
-    match authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &path,
-        &Permission::WRITE,
-        extras,
-    )
-    .await
-    {
-        Ok(()) => {
-            record.created_by = auth.user_id;
-            Ok(Some(record))
+    // The report lists the dataset's files, so the admin also needs READ on the dataset.
+    let Some(document) = load_document_record(context, spec.document_id)
+        .await
+        .map_err(|error| format!("{error:?}"))?
+    else {
+        return Ok(None);
+    };
+    let checks = [
+        (
+            group_admin_path(auth.realm_id, destination.group_id),
+            Permission::WRITE,
+        ),
+        (document.permission_path, Permission::READ),
+    ];
+    for (path, permission) in checks {
+        let extras = PolicyRequestExtras::rest();
+        match authorize(context, auth.realm_id, auth, &path, &permission, extras).await {
+            Ok(()) => {}
+            Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => return Ok(None),
+            Err(AuthorizeError::CheckFailed(error)) => return Err(error),
+            Err(AuthorizeError::Storage(error)) => return Err(error.to_string()),
         }
-        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => Ok(None),
-        Err(AuthorizeError::CheckFailed(error)) => Err(error),
-        Err(AuthorizeError::Storage(error)) => Err(error.to_string()),
     }
+    record.created_by = auth.user_id;
+    Ok(Some(record))
 }
 
 /// A `MintPersistentId` job the caller did not submit is readable while the
