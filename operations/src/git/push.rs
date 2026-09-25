@@ -98,7 +98,7 @@ pub async fn accept(
         Some(objects::store_pack(context, auth, &document, pack).await?)
     };
     let change = GitChange::Objects {
-        pack,
+        pack: pack.map(Box::new),
         refs: request.refs,
         lfs,
         revision: None,

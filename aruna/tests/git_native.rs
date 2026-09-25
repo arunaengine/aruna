@@ -115,7 +115,7 @@ async fn native_clients() -> TestResult<()> {
             .env("ARUNA_READ_TOKEN", read_token).env("ARUNA_OTHER_TOKEN", &other_token)
             .env("ARUNA_ARN_PREFIX", format!("arn:aruna:{}:{}:s3", seed.realm_id, seed.net.node_id()))
             .env("ARUNA_GIT_ROOT", directory.path().join("git"))
-            .env("ARUNA_GROUP_ID", &group.group_id).env("ARUNA_BUCKET", &bucket)
+            .env("ARUNA_GROUP_ID", &group.group_id).env("ARUNA_BUCKET", bucket)
             .env("ARUNA_S3_URL", &endpoint.endpoint_url).env("AWS_ACCESS_KEY_ID", &credentials.access_key_id)
             .env("AWS_SECRET_ACCESS_KEY", &credentials.access_secret).env("AWS_DEFAULT_REGION", shared::AWS_REGION)
             .kill_on_drop(true).spawn()?;
@@ -151,7 +151,12 @@ async fn holder_failover() -> TestResult<()> {
         shared::create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server)
             .await?;
     let joiner = shared::spawn_complete_joiner(&seed, secret).await?;
-    shared::wait_realm_nodes(&[seed.context.as_ref(), joiner.context.as_ref()], &seed.realm_id, 2).await?;
+    shared::wait_realm_nodes(
+        &[seed.context.as_ref(), joiner.context.as_ref()],
+        &seed.realm_id,
+        2,
+    )
+    .await?;
     let directory = tempfile::tempdir()?;
     let (base_a, stop_a, task_a) = git_server(
         seed.context.clone(),

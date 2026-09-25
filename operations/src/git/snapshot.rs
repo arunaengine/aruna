@@ -281,7 +281,7 @@ async fn generate(
     updates.extend(main.map(|main| update("refs/heads/main", main)));
     updates.retain(|update| update.old != update.new);
     let change = GitChange::Objects {
-        pack,
+        pack: pack.map(Box::new),
         refs: updates,
         lfs,
         revision: Some(event_id),

@@ -73,7 +73,7 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                     }
                     state.revision = Some(*revision);
                 }
-                state.packs.extend(pack.iter().cloned());
+                state.packs.extend(pack.as_deref().cloned());
                 for object in lfs {
                     state.lfs.insert(object.sha256.clone(), object.clone());
                 }

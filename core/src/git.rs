@@ -167,7 +167,7 @@ pub enum GitChange {
     /// A pack of new objects and the ref updates it makes. A server snapshot names the
     /// metadata event it represents in `revision`; older or equal revisions are ignored.
     Objects {
-        pack: Option<StoredObject>,
+        pack: Option<Box<StoredObject>>,
         refs: Vec<RefUpdate>,
         lfs: Vec<StoredObject>,
         revision: Option<Ulid>,
@@ -292,7 +292,7 @@ impl GitRecord {
                                 && hex(&update.new, 40)
                                 && update.old != update.new
                         })
-                        && pack.as_ref().is_none_or(StoredObject::valid)
+                        && pack.as_deref().is_none_or(StoredObject::valid)
                         && lfs.iter().all(StoredObject::valid)
                 }
                 GitChange::Lock { path, .. } => valid_path(path),
@@ -458,6 +458,6 @@ mod tests {
             (keyspace.as_str(), key.clone()),
             (GIT_RECORD_KEYSPACE, target.storage_key())
         );
-        assert!(key.starts_with(&git_record_prefix(record.document_id)));
+        assert!(key.starts_with(git_record_prefix(record.document_id)));
     }
 }

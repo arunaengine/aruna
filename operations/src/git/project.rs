@@ -73,7 +73,7 @@ pub async fn project(
             .find(|record| match &record.change {
                 GitChange::Objects {
                     pack: Some(own), ..
-                } => own == pack,
+                } => **own == *pack,
                 GitChange::Checkpoint(checkpoint) => checkpoint.pack == *pack,
                 _ => false,
             })
