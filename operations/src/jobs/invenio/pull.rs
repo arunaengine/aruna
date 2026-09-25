@@ -24,7 +24,7 @@ use http::Method;
 use tracing::warn;
 
 use super::link_queue::{current_event, document_gone, ensure_holder};
-use super::links::{LinkChange, LinkError, change_link, schedule_pulls};
+use super::links::{LinkChange, LinkError, change_link, ensure_lineage, schedule_pulls};
 use super::push::creator_auth;
 use super::{TransferError, connect};
 use crate::driver::DriverContext;
@@ -267,6 +267,10 @@ pub async fn start_pull(context: &DriverContext, link: &InvenioLink) -> Result<J
         .or_else(|| link.remote.record_id.clone())
         .ok_or(LinkError::NoRevision)?;
     ensure_holder(context, link).await?;
+    // A failed link runs again only if no enabled link follows its lineage the other way.
+    if matches!(link.status, LinkStatus::Failed { .. }) {
+        Box::pin(ensure_lineage(&context.storage_handle, link)).await?;
+    }
     let document = load_document_record(context, link.document_id)
         .await
         .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?

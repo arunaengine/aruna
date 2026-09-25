@@ -574,9 +574,16 @@ pub async fn change_link(
             .map_err(|error| LinkError::Unexpected(error.to_string()))?,
         None => None,
     };
+    // These changes can end a failure and enable the link again.
+    let revives = matches!(link.status, LinkStatus::Failed { .. })
+        && matches!(
+            change,
+            LinkChange::Rotate(_) | LinkChange::Begin(_) | LinkChange::Accept(_)
+        );
     let enabled = match &change {
         LinkChange::Create { link, .. } => Some(link.as_ref()),
         LinkChange::Patch(patch) if patch.paused == Some(false) => Some(link),
+        _ if revives => Some(link),
         _ => None,
     };
     if let Some(enabled) = enabled {
@@ -589,7 +596,10 @@ pub async fn change_link(
 }
 
 /// One lineage cannot have an enabled push link and an enabled pull link on one dataset.
-async fn ensure_lineage(storage: &StorageHandle, link: &InvenioLink) -> Result<(), LinkError> {
+pub(super) async fn ensure_lineage(
+    storage: &StorageHandle,
+    link: &InvenioLink,
+) -> Result<(), LinkError> {
     let pulls = link.pull().is_some();
     let conflict = list_links(storage, link.document_id)
         .await?

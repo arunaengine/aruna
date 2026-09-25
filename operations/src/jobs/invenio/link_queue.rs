@@ -28,7 +28,8 @@ use ulid::Ulid;
 
 use super::TransferError;
 use super::links::{
-    ChangeLinkOperation, LinkChange, LinkError, change_link, id_key, read_link, schedule_drain,
+    ChangeLinkOperation, LinkChange, LinkError, change_link, ensure_lineage, id_key, read_link,
+    schedule_drain,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
@@ -325,6 +326,10 @@ pub async fn start_push(
         limits: link.limits.clone(),
     };
     ensure_holder(context, link).await?;
+    // A failed link runs again only if no enabled link follows its lineage the other way.
+    if matches!(link.status, LinkStatus::Failed { .. }) {
+        Box::pin(ensure_lineage(&context.storage_handle, link)).await?;
+    }
     let owner = context
         .net_handle
         .as_ref()

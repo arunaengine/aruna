@@ -11,7 +11,7 @@ use super::remote::remote;
 use super::*;
 use aruna_core::invenio::{InvenioLink, LinkFailure, LinkPatch, LinkReview, LinkStatus};
 use aruna_operations::jobs::invenio::link_queue::{current_event, start_push};
-use aruna_operations::jobs::invenio::links::{LinkChange, change_link};
+use aruna_operations::jobs::invenio::links::{LinkChange, LinkError, change_link};
 use aruna_operations::jobs::invenio::remote_state;
 
 async fn push_now(
@@ -185,6 +185,63 @@ async fn cancelled_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     let (settled, _) = current(&fixture, &link).await;
     assert!(settled.active_job.is_none() && settled.last_push.is_some());
     assert_eq!(settled.remote.draft_id.as_deref(), Some("1"));
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn revive_checks_lineage() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    drain(&fixture).await?;
+    succeeded(run_push(&fixture, &link).await?);
+    let pushed = current(&fixture, &link).await.0;
+    let failed = change_link(
+        &fixture.context,
+        &pushed,
+        LinkChange::Fail(LinkFailure::RemoteChanged),
+    )
+    .await?
+    .ok_or("link missing")?;
+    // An enabled pull link now follows the same lineage.
+    let mut pull = failed.clone();
+    pull.link_id = ulid::Ulid::from_parts(9, 9);
+    pull.status = LinkStatus::Enabled;
+    pull.direction =
+        aruna_core::invenio::LinkDirection::Pull(Box::new(aruna_core::invenio::LinkPull {
+            auto_update: false,
+            options: Default::default(),
+            target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+                bucket: "research".into(),
+                prefix: "zenodo".into(),
+            },
+            latest_remote_id: None,
+            latest_revision: None,
+            last_checked_at: None,
+            next_check_ms: u64::MAX,
+            failures: 0,
+            revision: None,
+            local_changed: false,
+        }));
+    write_value(
+        &fixture.context.storage_handle,
+        aruna_core::keyspaces::INVENIO_LINK_KEYSPACE,
+        aruna_core::invenio::link_key(pull.document_id, pull.link_id),
+        pull.to_bytes()?,
+    )
+    .await?;
+    let event = current_event(&fixture.context, failed.document_id).await?;
+    let started = Box::pin(start_push(&fixture.context, &failed, event, false)).await;
+    assert_eq!(started, Err(LinkError::Lineage));
+    let state = remote_state(fixture.context.as_ref(), &failed).await?;
+    let accepted = change_link(
+        &fixture.context,
+        &failed,
+        LinkChange::Accept(Box::new(state)),
+    );
+    assert_eq!(accepted.await, Err(LinkError::Lineage));
+    assert_eq!(current(&fixture, &link).await.0.status, failed.status);
     fixture.stop().await;
     Ok(())
 }
