@@ -565,7 +565,8 @@ async fn pull_link_routes() {
         paused: Some(true),
         ..PatchLinkRequest::default()
     };
-    settings(pause).await.unwrap();
+    let Json(paused) = settings(pause).await.unwrap();
+    assert_eq!(paused.status, "paused");
     assert!(matches!(
         pull_link(state(), owner(), path()).await,
         Err(ServerError::Conflict(_))
