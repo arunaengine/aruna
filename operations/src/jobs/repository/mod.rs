@@ -120,11 +120,30 @@ pub(crate) async fn check_lineage(
     }
 }
 
-/// Whether an import entry is a reference descriptor instead of file bytes.
-pub(crate) fn is_reference(spec: &ImportRoCrateSpec, path: &str) -> bool {
-    matches!(&spec.source, ImportRoCrateSource::Repository { options, .. } if options.mode == ImportMode::Reference)
-        && path.starts_with("versions/")
-        && path.contains("/files/")
+/// The connector kind of a repository import in reference mode; `None` for any other import.
+pub(crate) async fn reference_kind(
+    context: &DriverContext,
+    spec: &ImportRoCrateSpec,
+) -> Result<Option<RepositoryConnectorKind>, TransferError> {
+    match &spec.source {
+        ImportRoCrateSource::Repository {
+            group_id,
+            connector_id,
+            options,
+            ..
+        } if options.mode == ImportMode::Reference => Ok(Some(
+            connector_kind(context, *group_id, *connector_id).await?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// Whether an entry of a reference import artifact is a reference descriptor, not file bytes.
+pub(crate) fn is_reference(kind: RepositoryConnectorKind, path: &str) -> bool {
+    match kind {
+        RepositoryConnectorKind::Invenio => invenio::import::is_reference(path),
+        RepositoryConnectorKind::OaiPmh => false,
+    }
 }
 
 /// Writes a reference object whose bytes stay in the repository.

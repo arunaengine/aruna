@@ -887,7 +887,11 @@ async fn write_next(
         ctx.shutdown.clone(),
     )
     .await?;
-    if super::repository::is_reference(spec, &entry.path) {
+    let reference = super::repository::reference_kind(&ctx.driver, spec)
+        .await
+        .map_err(transfer_failure)?
+        .filter(|kind| super::repository::is_reference(*kind, &entry.path));
+    if let Some(kind) = reference {
         let mut bytes = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|error| ImportFailure::Retryable(error.to_string()))?;
@@ -900,19 +904,6 @@ async fn write_next(
         }
         let descriptor = serde_json::from_slice(&bytes)
             .map_err(|_| ImportFailure::Permanent("invalid reference descriptor".into()))?;
-        let ImportRoCrateSource::Repository {
-            group_id,
-            connector_id,
-            ..
-        } = &spec.source
-        else {
-            return Err(ImportFailure::Permanent(
-                "reference requires repository source".into(),
-            ));
-        };
-        let kind = super::repository::connector_kind(&ctx.driver, *group_id, *connector_id)
-            .await
-            .map_err(transfer_failure)?;
         let metadata = super::repository::write_reference(
             kind,
             ctx,
@@ -1052,6 +1043,9 @@ async fn rewrite_crate(
 ) -> Result<(), ImportFailure> {
     let validated = validate_document(&plan.metadata_json).map_err(validation_failure)?;
     let reports = load_reports(ctx).await?;
+    let reference = super::repository::reference_kind(&ctx.driver, spec)
+        .await
+        .map_err(transfer_failure)?;
     let mut targets = HashMap::new();
     for entry in &plan.entries {
         let Some(file_id) = &entry.described_id else {
@@ -1061,24 +1055,25 @@ async fn rewrite_crate(
             .get(&entry.path)
             .ok_or_else(|| ImportFailure::Permanent("import report row is missing".to_string()))?;
         let w3id = entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id();
-        let hash_w3id = if super::repository::is_reference(spec, &entry.path) {
-            w3id.clone()
-        } else {
-            let hash: [u8; 32] = report
-                .detail
-                .blake3
-                .as_deref()
-                .ok_or_else(|| ImportFailure::Permanent("imported hash is missing".to_string()))
-                .and_then(|hash| {
-                    hex::decode(hash)
-                        .ok()
-                        .and_then(|hash| hash.try_into().ok())
-                        .ok_or_else(|| {
-                            ImportFailure::Permanent("imported hash is invalid".to_string())
-                        })
-                })?;
-            format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash))
-        };
+        let hash_w3id =
+            if reference.is_some_and(|kind| super::repository::is_reference(kind, &entry.path)) {
+                w3id.clone()
+            } else {
+                let hash: [u8; 32] = report
+                    .detail
+                    .blake3
+                    .as_deref()
+                    .ok_or_else(|| ImportFailure::Permanent("imported hash is missing".to_string()))
+                    .and_then(|hash| {
+                        hex::decode(hash)
+                            .ok()
+                            .and_then(|hash| hash.try_into().ok())
+                            .ok_or_else(|| {
+                                ImportFailure::Permanent("imported hash is invalid".to_string())
+                            })
+                    })?;
+                format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash))
+            };
         targets.insert(
             file_id.clone(),
             RewriteTarget {

@@ -30,6 +30,11 @@ use crate::jobs::executor::JobContext;
 use crate::jobs::repository::pull::{PullProgress, running};
 use crate::jobs::repository::{TransferError, interruptible};
 
+/// Record files sit under `versions/{id}/files/`; in reference mode they are descriptors.
+pub(crate) fn is_reference(path: &str) -> bool {
+    path.starts_with("versions/") && path.contains("/files/")
+}
+
 pub(crate) async fn acquire(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
