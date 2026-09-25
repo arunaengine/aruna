@@ -2,9 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use super::RepositoryError;
+use super::{ExportIdentity, RepositoryError};
+use crate::structs::secondary_id::{SecondaryIdKind, normalize_doi};
 
 /// An identifier with its scheme, such as `doi`, `url` or `orcid`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,6 +199,44 @@ pub fn publication_start(value: &str) -> Result<String, RepositoryError> {
         }
     }
     start.ok_or(RepositoryError("missing publication date"))
+}
+
+/// Adds the registered DOIs to the crate root `identifier`, skipping DOIs it already names.
+pub fn add_root_identifiers(document: &mut Value, identity: &ExportIdentity) {
+    let Some(id) = crate_root(document).and_then(|root| root["@id"].as_str().map(str::to_string))
+    else {
+        return;
+    };
+    let Some(root) = document["@graph"]
+        .as_array_mut()
+        .and_then(|graph| graph.iter_mut().find(|entity| entity["@id"] == id.as_str()))
+    else {
+        return;
+    };
+    let key = [
+        "identifier",
+        "schema:identifier",
+        "http://schema.org/identifier",
+    ]
+    .into_iter()
+    .find(|key| root.get(*key).is_some())
+    .unwrap_or("identifier");
+    let mut current = values(&root[key]).to_vec();
+    let known = current
+        .iter()
+        .filter_map(identifier)
+        .filter(|id| id.scheme == "doi")
+        .filter_map(|id| normalize_doi(&id.value).ok())
+        .collect::<Vec<_>>();
+    for doi in &identity.identifiers {
+        if doi.kind == SecondaryIdKind::Doi && !known.contains(&doi.value) {
+            current.push(json!({
+                "@type": "PropertyValue", "propertyID": "doi",
+                "value": format!("https://doi.org/{}", doi.value)
+            }));
+        }
+    }
+    root[key] = Value::Array(current);
 }
 
 #[cfg(test)]

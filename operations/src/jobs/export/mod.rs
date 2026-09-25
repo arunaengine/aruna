@@ -733,7 +733,7 @@ async fn snapshot_export(
         jsonld
     } else {
         let mut document = document;
-        aruna_core::repository::invenio::add_root_identifiers(&mut document, &identity);
+        aruna_core::repository::fields::add_root_identifiers(&mut document, &identity);
         document.to_string()
     };
 
