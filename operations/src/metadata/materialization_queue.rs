@@ -751,8 +751,10 @@ async fn plan_finish_chunk(
                     continue;
                 }
                 let attempts = job.attempts.saturating_add(1);
+                // A dependency that stays missing is checked rarely, not every two seconds.
                 let delay = if waiting {
-                    retry_after_ms(attempts, RETRY_BASE_MS, 2_000)
+                    let cap = if attempts > 30 { 300_000 } else { 2_000 };
+                    retry_after_ms(attempts, RETRY_BASE_MS, cap)
                 } else {
                     retry_delay_ms(attempts)
                 };
