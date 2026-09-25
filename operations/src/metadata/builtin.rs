@@ -14,7 +14,7 @@ const DATACITE_SHAPES: &str = include_str!("datacite.ttl");
 const PUBLISHER_SHAPES: &str = include_str!("publisher.ttl");
 
 /// The embedded SHACL Turtle sources for `iri`, when the node ships shapes for it.
-pub(crate) fn builtin_shapes(iri: &str) -> Option<&'static [&'static str]> {
+pub fn builtin_shapes(iri: &str) -> Option<&'static [&'static str]> {
     match iri {
         CRATE_PROFILE_IRI => Some(&[RUN_CRATE_SHAPES]),
         ZENODO_PROFILE_IRI => Some(&[DATACITE_SHAPES]),

@@ -18,13 +18,13 @@ use std::collections::HashMap;
 
 const TOKEN: &str = "personal-link-token";
 
-struct Linked {
-    test: TestState,
-    document_id: String,
-    connector_id: Ulid,
+pub(crate) struct Linked {
+    pub(crate) test: TestState,
+    pub(crate) document_id: String,
+    pub(crate) connector_id: Ulid,
 }
 
-async fn setup() -> Linked {
+pub(crate) async fn setup() -> Linked {
     let root = serde_json::json!({"@id": "./", "@type": "Dataset", "name": "Linked",
         "description": "Pushed to a repository", "datePublished": "2026-01-01",
         "publisher": "Aruna test", "creator": {"@type": "Person", "familyName": "Doe"},
@@ -33,7 +33,7 @@ async fn setup() -> Linked {
 }
 
 /// A dataset with this crate root and an Invenio connector at `endpoint`.
-async fn setup_crate(root: serde_json::Value, endpoint: &str) -> Linked {
+pub(crate) async fn setup_crate(root: serde_json::Value, endpoint: &str) -> Linked {
     let test = setup_network_state().await;
     test.state
         .register_rest_interface("127.0.0.1:3000".parse().unwrap())

@@ -88,6 +88,7 @@ impl MetadataPhaseSource {
     }
 }
 
+pub use builtin::builtin_shapes;
 pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
 pub use handle::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
 pub(crate) use handle::{WritePeerError, transport_message_kind};

@@ -35,6 +35,12 @@ impl From<InvenioError> for TransferError {
     }
 }
 
+/// The requirement Profiles of Invenio repositories, with their names.
+pub(crate) const PROFILES: &[(&str, &str)] = &[
+    (ZENODO_PROFILE_IRI, "Zenodo record"),
+    (INVENIO_PROFILE_IRI, "InvenioRDM record"),
+];
+
 /// Zenodo sets the publisher itself; other InvenioRDM instances need one to mint a DOI.
 pub(crate) fn requirement_profile(endpoint: &str) -> &'static str {
     let host = endpoint

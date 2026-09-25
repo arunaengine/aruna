@@ -21,14 +21,14 @@ static INVENIO: LazyLock<Result<Rules, String>> =
     LazyLock::new(|| serde_json::from_str(include_str!("invenio.json")).map_err(|e| e.to_string()));
 
 /// The rules of one repository kind, in the order their targets select entities.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rules {
     pub targets: Vec<Target>,
 }
 
 /// One kind of repository object, such as a record, a file or a sample.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub name: String,
@@ -47,7 +47,7 @@ pub struct Target {
 }
 
 /// Which entities a target takes; every given condition must hold.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Select {
     #[serde(default)]
@@ -64,7 +64,7 @@ pub struct Select {
 }
 
 /// Groups a target's entities by the entity of target `each` they name through `property`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
     pub each: String,
@@ -75,7 +75,7 @@ pub struct Group {
 }
 
 /// Each entity must name at least `min` entities of `target` through `property`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Relation {
     pub property: String,
@@ -85,7 +85,7 @@ pub struct Relation {
 }
 
 /// Checks of the file bytes, run by the export before any remote write.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Content {
     pub max_files: Option<usize>,
@@ -99,7 +99,7 @@ pub struct Content {
 }
 
 /// A repository field filled from the first of `property` the entity has.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Field {
     pub property: Vec<String>,
@@ -107,7 +107,7 @@ pub struct Field {
     pub convert: Convert,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Convert {
     Text,

@@ -28,6 +28,7 @@ pub mod pid;
 pub mod placement;
 pub mod policies;
 pub mod repository;
+pub mod repository_check;
 pub mod repository_links;
 pub mod rocrate_import;
 pub mod search;
@@ -75,6 +76,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(rocrate_import::router())
         .merge(repository::router())
         .merge(repository_links::router())
+        .merge(repository_check::router())
         .merge(link_routes::router())
         .merge(notifications::router())
         .merge(policies::router())
@@ -228,6 +230,7 @@ pub(crate) mod tests {
             "GET",
             "/metadata/groups/{group_id}/repositories/{connector_id}/records",
         ),
+        ("GET", "/metadata/repository/kinds"),
         ("GET", "/metadata/{document_id}/repository/links"),
         ("GET", "/metadata/{document_id}/repository/links/{link_id}"),
         (
@@ -370,6 +373,7 @@ pub(crate) mod tests {
         ("POST", "/metadata/groups/{group_id}/repositories"),
         ("POST", "/metadata/repository/imports"),
         ("POST", "/metadata/{document_id}/repository/exports"),
+        ("POST", "/metadata/{document_id}/repository/check"),
         ("POST", "/metadata/{document_id}/repository/links"),
         (
             "POST",

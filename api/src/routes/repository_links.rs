@@ -14,7 +14,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::harvest::read_connector::{GetRepositoryOperation, ReadConnectorError};
-use aruna_operations::jobs::repository::check::check_requirements;
+use aruna_operations::jobs::repository::check::{RequirementCheck, check_requirements};
 use aruna_operations::jobs::repository::link_queue::owner_holds;
 use aruna_operations::jobs::repository::links::{
     LinkChange, LinkError, change_link, list_links, read_link,
@@ -333,18 +333,17 @@ pub(crate) async fn connector_kind(
     })
 }
 
-/// Answers 400 with the findings when the dataset crate does not meet the repository's
-/// requirements. Metadata overrides never satisfy them.
-pub(crate) async fn ensure_requirements(
+/// Checks the dataset crate against the connector's repository; stores nothing.
+pub(crate) async fn requirements(
     state: &ServerState,
     auth: &AuthContext,
     document_id: Ulid,
     group_id: Ulid,
     connector_id: Ulid,
-) -> ServerResult<()> {
+) -> ServerResult<RequirementCheck> {
     let kind = connector_kind(state, group_id, connector_id).await?;
     ensure_capable(kind, "publishing", |can| can.drafts)?;
-    let checked = Box::pin(check_requirements(
+    Box::pin(check_requirements(
         &state.get_ctx(),
         auth,
         document_id,
@@ -356,7 +355,26 @@ pub(crate) async fn ensure_requirements(
     .map_err(|error| match error {
         TransferError::Permanent(message) => ServerError::BadRequestReason(message),
         _ => ServerError::ServiceUnavailableReason("the requirements could not be checked".into()),
-    })?;
+    })
+}
+
+/// Answers 400 with the findings when the dataset crate does not meet the repository's
+/// requirements. Metadata overrides never satisfy them.
+pub(crate) async fn ensure_requirements(
+    state: &ServerState,
+    auth: &AuthContext,
+    document_id: Ulid,
+    group_id: Ulid,
+    connector_id: Ulid,
+) -> ServerResult<()> {
+    let checked = Box::pin(requirements(
+        state,
+        auth,
+        document_id,
+        group_id,
+        connector_id,
+    ))
+    .await?;
     if checked.ready {
         return Ok(());
     }
@@ -676,4 +694,4 @@ pub async fn list_repository_links(
 
 #[cfg(test)]
 #[path = "repository_links_tests.rs"]
-mod tests;
+pub(crate) mod tests;

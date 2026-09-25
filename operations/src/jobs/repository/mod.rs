@@ -220,6 +220,16 @@ pub fn requirement_profile(kind: RepositoryConnectorKind, endpoint: &str) -> Opt
     }
 }
 
+/// Every requirement Profile of `kind` as IRI and name.
+pub fn requirement_profiles(
+    kind: RepositoryConnectorKind,
+) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        RepositoryConnectorKind::Invenio => invenio::PROFILES,
+        RepositoryConnectorKind::OaiPmh => &[],
+    }
+}
+
 fn not_supported(action: &str) -> TransferError {
     TransferError::Permanent(format!("this repository kind does not support {action}"))
 }
