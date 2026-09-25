@@ -11,6 +11,7 @@ use ulid::Ulid;
 
 mod credential;
 pub use credential::RepositoryCredential;
+pub mod fields;
 pub mod invenio;
 mod link;
 pub use link::*;

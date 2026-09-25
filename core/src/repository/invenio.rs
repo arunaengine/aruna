@@ -2,6 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::fields::{
+    crate_root, entity, identifier, keywords, licenses, person, publication_start, schema_value,
+    values,
+};
 use super::{ExportIdentity, RepositoryError};
 use crate::structs::secondary_id::{
     IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier, normalize_doi,
@@ -44,8 +48,8 @@ pub fn add_root_identifiers(document: &mut Value, identity: &ExportIdentity) {
     let known = current
         .iter()
         .filter_map(identifier)
-        .filter(|id| id["scheme"] == "doi")
-        .filter_map(|id| normalize_doi(id["identifier"].as_str()?).ok())
+        .filter(|id| id.scheme == "doi")
+        .filter_map(|id| normalize_doi(&id.value).ok())
         .collect::<Vec<_>>();
     for doi in &identity.identifiers {
         if doi.kind == SecondaryIdKind::Doi && !known.contains(&doi.value) {
@@ -449,11 +453,7 @@ fn map_metadata(
         }
         // A publisher entity or reference maps to its name.
         if let Some(publisher) = values(schema_value(root, "publisher")).first() {
-            let publisher = publisher["@id"]
-                .as_str()
-                .and_then(|id| graph.iter().find(|entity| entity["@id"] == id))
-                .unwrap_or(publisher);
-            if let Some(name) = schema_value(publisher, "name").as_str() {
+            if let Some(name) = schema_value(entity(graph, publisher), "name").as_str() {
                 metadata["publisher"] = json!(name);
             }
         }
@@ -474,49 +474,28 @@ fn map_metadata(
         let creators = values(creators)
             .iter()
             .filter_map(|creator| {
-                let creator = creator["@id"]
-                    .as_str()
-                    .and_then(|id| graph.iter().find(|entity| entity["@id"] == id))
-                    .unwrap_or(creator);
-                let family = schema_value(creator, "familyName").as_str();
-                let name = schema_value(creator, "name").as_str();
-                let organizational = values(&creator["@type"]).iter().any(|kind| {
-                    kind.as_str().is_some_and(|kind| {
-                        matches!(
-                            kind,
-                            "Organization"
-                                | "schema:Organization"
-                                | "http://schema.org/Organization"
-                                | "https://schema.org/Organization"
-                        )
-                    })
-                });
-                let mut person = if organizational {
-                    json!({"type": "organizational", "name": name?})
+                let creator = person(graph, creator);
+                let mut person = if creator.organization {
+                    json!({"type": "organizational", "name": creator.name?})
                 } else {
-                    let family = family.or(name)?;
+                    let family = creator.family_name.or(creator.name)?;
                     let mut person = json!({"type": "personal", "family_name": family});
-                    if let Some(given) = schema_value(creator, "givenName").as_str() {
+                    if let Some(given) = creator.given_name {
                         person["given_name"] = json!(given);
                     }
                     person
                 };
                 person["identifiers"] = Value::Array(
-                    values(schema_value(creator, "identifier"))
-                        .iter()
-                        .filter_map(creator_identifier)
+                    creator
+                        .identifiers
+                        .into_iter()
+                        .map(|id| json!({"scheme": id.scheme, "identifier": id.value}))
                         .collect(),
                 );
-                let affiliations = values(schema_value(creator, "affiliation"))
-                    .iter()
-                    .filter_map(|value| {
-                        let value = value["@id"]
-                            .as_str()
-                            .and_then(|id| graph.iter().find(|entity| entity["@id"] == id))
-                            .unwrap_or(value);
-                        let name = schema_value(value, "name").as_str()?;
-                        Some(json!({"name": name}))
-                    })
+                let affiliations = creator
+                    .affiliations
+                    .into_iter()
+                    .map(|name| json!({"name": name}))
                     .collect::<Vec<_>>();
                 Some(json!({"person_or_org": person, "affiliations": affiliations}))
             })
@@ -527,11 +506,9 @@ fn map_metadata(
         let mut identifiers = values(schema_value(root, "identifier"))
             .iter()
             .filter_map(identifier)
-            .filter(|id| {
-                id["scheme"] != "doi"
-                    || !identity.published_doi(id["identifier"].as_str().unwrap_or_default())
-            })
-            .map(|mut id| {
+            .filter(|id| id.scheme != "doi" || !identity.published_doi(&id.value))
+            .map(|id| {
+                let mut id = json!({"scheme": id.scheme, "identifier": id.value});
                 let own = identity
                     .own
                     .iter()
@@ -561,24 +538,22 @@ fn map_metadata(
         if !identifiers.is_empty() {
             metadata["related_identifiers"] = Value::Array(identifiers);
         }
-        let subjects = values(schema_value(root, "keywords"))
-            .iter()
-            .filter_map(Value::as_str)
+        let subjects = keywords(root)
+            .into_iter()
             .map(|subject| json!({"subject": subject}))
             .collect::<Vec<_>>();
         if !subjects.is_empty() {
             metadata["subjects"] = Value::Array(subjects);
         }
         metadata["rights"] = Value::Array(
-            values(schema_value(root, "license"))
-                .iter()
-                .filter_map(|license| {
-                    let text = license.as_str().or_else(|| license["@id"].as_str())?;
+            licenses(root)
+                .into_iter()
+                .map(|text| {
                     let mut right = json!({"title": {"en": text}});
                     if text.starts_with("https://") || text.starts_with("http://") {
                         right["link"] = json!(text);
                     }
-                    Some(right)
+                    right
                 })
                 .collect(),
         );
@@ -664,20 +639,6 @@ pub fn export_fields(
     Ok(result)
 }
 
-fn crate_root(document: &Value) -> Option<&Value> {
-    let graph = document["@graph"].as_array()?;
-    let id = graph
-        .iter()
-        .find(|entity| {
-            entity["@id"].as_str().is_some_and(|id| {
-                id == "ro-crate-metadata.json" || id.ends_with("/ro-crate-metadata.json")
-            })
-        })
-        .and_then(|entity| schema_value(entity, "about")["@id"].as_str())
-        .unwrap_or("./");
-    graph.iter().find(|entity| entity["@id"] == id)
-}
-
 fn native_properties(value: &Value, path: &str, result: &mut Vec<Value>) {
     match value {
         Value::Object(values) => {
@@ -694,98 +655,6 @@ fn native_properties(value: &Value, path: &str, result: &mut Vec<Value>) {
         Value::Null => {}
         value => result.push(json!({"@type": "PropertyValue", "propertyID": path, "value": value})),
     }
-}
-
-fn schema_value<'a>(entity: &'a Value, name: &str) -> &'a Value {
-    for key in [
-        name.to_string(),
-        format!("schema:{name}"),
-        format!("http://schema.org/{name}"),
-        format!("https://schema.org/{name}"),
-    ] {
-        if let Some(value) = entity.get(key) {
-            return value;
-        }
-    }
-    &Value::Null
-}
-
-/// Uses the earliest day represented by an EDTF date; the source precision is retained separately.
-fn publication_start(value: &str) -> Result<String, RepositoryError> {
-    let mut start = None;
-    let parts = value.split('/').collect::<Vec<_>>();
-    if parts.len() > 2 {
-        return Err(RepositoryError("invalid publication interval"));
-    }
-    for part in parts {
-        let full = match part.len() {
-            4 => format!("{part}-01-01"),
-            7 => format!("{part}-01"),
-            10 => part.to_string(),
-            _ => return Err(RepositoryError("invalid publication date")),
-        };
-        let date = chrono::NaiveDate::parse_from_str(&full, "%Y-%m-%d")
-            .map_err(|_| RepositoryError("invalid publication date"))?;
-        if start.is_none() {
-            start = Some(date.to_string());
-        }
-    }
-    start.ok_or(RepositoryError("missing publication date"))
-}
-
-fn values(value: &Value) -> &[Value] {
-    match value {
-        Value::Null => &[],
-        Value::Array(values) => values,
-        value => std::slice::from_ref(value),
-    }
-}
-
-/// Keeps the person and organization schemes Invenio accepts; their URL forms are recognized.
-fn creator_identifier(value: &Value) -> Option<Value> {
-    let id = identifier(value)?;
-    let text = id["identifier"].as_str()?;
-    let text = text
-        .strip_prefix("https://")
-        .or_else(|| text.strip_prefix("http://"));
-    let url_form = text.and_then(|text| {
-        [
-            ("orcid", "orcid.org/"),
-            ("gnd", "d-nb.info/gnd/"),
-            ("isni", "isni.org/isni/"),
-            ("ror", "ror.org/"),
-        ]
-        .into_iter()
-        .find_map(|(scheme, prefix)| Some((scheme, text.strip_prefix(prefix)?)))
-    });
-    let (scheme, value) = match url_form {
-        Some((scheme, value)) => (scheme, value.trim_end_matches('/')),
-        None => (id["scheme"].as_str()?, id["identifier"].as_str()?),
-    };
-    let scheme = scheme.to_ascii_lowercase();
-    matches!(scheme.as_str(), "orcid" | "gnd" | "isni" | "ror")
-        .then(|| json!({"scheme": scheme, "identifier": value}))
-}
-
-fn identifier(value: &Value) -> Option<Value> {
-    let scheme = schema_value(value, "propertyID").as_str();
-    let text = schema_value(value, "value")
-        .as_str()
-        .or_else(|| value.as_str())
-        .or_else(|| value["@id"].as_str())?;
-    let (scheme, text) = if let Some(doi) = text
-        .strip_prefix("https://doi.org/")
-        .or_else(|| text.strip_prefix("http://doi.org/"))
-    {
-        ("doi", doi)
-    } else if let Some(scheme) = scheme {
-        (scheme, text)
-    } else if text.starts_with("https://") || text.starts_with("http://") {
-        ("url", text)
-    } else {
-        return None;
-    };
-    Some(json!({"scheme": scheme, "identifier": text}))
 }
 
 #[cfg(test)]
