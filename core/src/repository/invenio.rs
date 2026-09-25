@@ -452,10 +452,10 @@ fn map_metadata(
             }
         }
         // A publisher entity or reference maps to its name.
-        if let Some(publisher) = values(schema_value(root, "publisher")).first() {
-            if let Some(name) = schema_value(entity(graph, publisher), "name").as_str() {
-                metadata["publisher"] = json!(name);
-            }
+        if let Some(publisher) = values(schema_value(root, "publisher")).first()
+            && let Some(name) = schema_value(entity(graph, publisher), "name").as_str()
+        {
+            metadata["publisher"] = json!(name);
         }
         if let Some(date) = schema_value(root, "datePublished").as_str() {
             let date = date.split('T').next().unwrap_or(date);
