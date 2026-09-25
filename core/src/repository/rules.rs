@@ -18,7 +18,7 @@ use crate::structs::storage::replication::{
 };
 
 static INVENIO: LazyLock<Result<Rules, String>> =
-    LazyLock::new(|| toml::from_str(include_str!("invenio.toml")).map_err(|e| e.to_string()));
+    LazyLock::new(|| serde_json::from_str(include_str!("invenio.json")).map_err(|e| e.to_string()));
 
 /// The rules of one repository kind, in the order their targets select entities.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

@@ -78,12 +78,11 @@ fn shipped_rules_consistent() {
 
 #[test]
 fn unknown_rules_refused() {
-    let unknown = "[[targets]]\nname = \"record\"\nselect = { root = true }\n\
-        fields = [{ property = [\"name\"], field = \"title\", convert = \"shout\" }]";
-    assert!(toml::from_str::<Rules>(unknown).is_err());
-    assert!(
-        toml::from_str::<Rules>("[[targets]]\nname = \"x\"\nselect = { roots = true }").is_err()
-    );
+    let unknown = json!({"targets": [{"name": "record", "select": {"root": true},
+        "fields": [{"property": ["name"], "field": "title", "convert": "shout"}]}]});
+    assert!(serde_json::from_value::<Rules>(unknown).is_err());
+    let misspelled = json!({"targets": [{"name": "x", "select": {"roots": true}}]});
+    assert!(serde_json::from_value::<Rules>(misspelled).is_err());
 }
 
 #[test]
@@ -130,12 +129,12 @@ fn preview_reports_violations() {
     assert_eq!(findings[0].code, "content_violation");
     assert_eq!(findings[0].rule, "file/max_files");
 
-    let grouped: Rules = toml::from_str(
-        "[[targets]]\nname = \"sample\"\nselect = { types = [\"Sample\"] }\nmin = 1\n\
-         [[targets]]\nname = \"run\"\nselect = { types = [\"File\"] }\n\
-         group = { each = \"sample\", property = \"about\" }\n\
-         relations = [{ property = \"about\", target = \"sample\" }]",
-    )
+    let grouped: Rules = serde_json::from_value(json!({"targets": [
+        {"name": "sample", "select": {"types": ["Sample"]}, "min": 1},
+        {"name": "run", "select": {"types": ["File"]},
+            "group": {"each": "sample", "property": "about"},
+            "relations": [{"property": "about", "target": "sample"}]}
+    ]}))
     .unwrap();
     let document = document(vec![
         json!({"@id": "#s1", "@type": "Sample"}),

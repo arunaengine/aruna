@@ -1,0 +1,25 @@
+{
+  "targets": [
+    {
+      "name": "record",
+      "select": { "root": true },
+      "min": 1,
+      "fields": [
+        { "property": ["name"], "field": "title", "convert": "text" },
+        { "property": ["description"], "field": "description", "convert": "text" },
+        { "property": ["version"], "field": "version", "convert": "text" },
+        { "property": ["publisher"], "field": "publisher", "convert": "publisher" },
+        { "property": ["datePublished"], "field": "publication_date", "convert": "date" },
+        { "property": ["creator", "author"], "field": "creators", "convert": "persons" },
+        { "property": ["identifier"], "field": "related_identifiers", "convert": "identifiers" },
+        { "property": ["keywords"], "field": "subjects", "convert": "keywords" },
+        { "property": ["license"], "field": "rights", "convert": "licenses" }
+      ]
+    },
+    {
+      "name": "file",
+      "select": { "types": ["File", "MediaObject"], "with_bytes": true },
+      "content": { "max_files": 100 }
+    }
+  ]
+}
