@@ -190,12 +190,32 @@ pub async fn validate() -> std::io::Result<()> {
             return Err(invalid());
         }
     }
+    current(directory, &updates).await?;
     let paths = changed(directory, &updates).await?;
     unlocked(&url, &paths, &token).await?;
     if arc && let Some((old, new)) = main {
         merge(directory, &old, &new, &token).await?;
     }
     publish(directory, updates, objects, paths, &token).await
+}
+
+/// Refuses updates whose old value no longer matches, before anything is published. A
+/// replicated record can move a ref between the client's ref listing and its push.
+async fn current(directory: &Path, updates: &[RefUpdate]) -> std::io::Result<()> {
+    for update in updates {
+        let arguments = ["rev-parse", "--verify", "--quiet", update.name.as_str()];
+        let found = match command(directory, &arguments).await {
+            Ok(oid) => String::from_utf8(oid.to_vec()).map_err(|_| invalid())?,
+            Err(_) => ZERO_OID.to_string(),
+        };
+        if found.trim() != update.old {
+            return Err(std::io::Error::other(format!(
+                "{} moved on the server; fetch and push again",
+                update.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses early when another user locks a changed file, before metadata is merged.
