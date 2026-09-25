@@ -194,10 +194,39 @@ pub async fn validate() -> std::io::Result<()> {
             return Err(invalid());
         }
     }
+    let paths = changed(directory, &updates).await?;
+    unlocked(&url, &paths, &token).await?;
     if arc && let Some((old, new)) = main {
         merge(directory, &old, &new, derived, &token).await?;
     }
-    publish(directory, updates, objects, &token).await
+    publish(directory, updates, objects, paths, &token).await
+}
+
+/// Refuses early when another user locks a changed file, before metadata is merged.
+async fn unlocked(lfs_url: &str, paths: &[String], token: &str) -> std::io::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let url = lfs_url.replace("/objects/batch", "/locks/verify");
+    let body = serde_json::to_vec(&json!({})).map_err(std::io::Error::other)?;
+    let reply = aruna_blob::git::metadata_request(
+        &url,
+        token,
+        Some(("application/vnd.git-lfs+json", body)),
+    )
+    .await?;
+    let reply: Value = serde_json::from_slice(&reply)?;
+    let paths: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
+    for lock in reply["theirs"].as_array().into_iter().flatten() {
+        if let Some(path) = lock["path"].as_str()
+            && paths.contains(path)
+        {
+            return Err(std::io::Error::other(format!(
+                "{path} is locked by another user"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Files that the updates change, for LFS lock checks.
@@ -245,10 +274,10 @@ async fn publish(
     directory: &Path,
     updates: Vec<RefUpdate>,
     objects: Vec<LfsObject>,
+    paths: Vec<String>,
     token: &str,
 ) -> std::io::Result<()> {
     let url = std::env::var("ARUNA_GIT_METADATA_URL").map_err(|_| invalid())?;
-    let paths = changed(directory, &updates).await?;
     let include: Vec<String> = updates
         .iter()
         .filter(|update| update.new != ZERO_OID)
