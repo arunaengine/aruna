@@ -1375,6 +1375,67 @@ async fn lifecycle_acceptance_fence() {
 }
 
 #[tokio::test]
+async fn older_update_logged() {
+    let (_dir, storage) = test_storage();
+    let group_id = Ulid::from_parts(20, 1);
+    let document_id = Ulid::from_parts(21, 1);
+    let created = Ulid::from_parts(22, 1);
+    let create = metadata_create_event(group_id, document_id, 100, created, 7);
+    let update = |event_id: Ulid, updated_at_ms: u64, actor_seed: u8| {
+        let mut event =
+            metadata_create_event(group_id, document_id, updated_at_ms, event_id, actor_seed);
+        event.record.establishing_event_id = created;
+        event.payload = MetadataEventPayload::ReplaceRoCrate {
+            jsonld: "{}".to_string(),
+        };
+        MetadataLifecycleRecord::Upsert {
+            event: Box::new(event),
+        }
+    };
+    let (older, newer) = (Ulid::from_parts(23, 1), Ulid::from_parts(24, 1));
+    for lifecycle in [
+        MetadataLifecycleRecord::Upsert {
+            event: Box::new(create),
+        },
+        update(newer, 300, 8),
+        update(older, 200, 9),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (step, lifecycle) = lifecycle;
+        let change = metadata_lifecycle_change(&lifecycle, node(8));
+        assert!(
+            store_document_lifecycle(&storage, &lifecycle, change)
+                .await
+                .expect("lifecycle applies"),
+            "step {step} was not applied"
+        );
+    }
+    for event_id in [older, newer] {
+        assert!(
+            read_storage_value(
+                &storage,
+                EVENT_LOG_KEYSPACE,
+                event_log_key(document_id, event_id)
+            )
+            .await
+            .is_some(),
+            "concurrent event {event_id} must reach the event log"
+        );
+    }
+    let revision = read_lifecycle_revision(&storage, document_id).await;
+    assert_eq!(revision.current.event_id, newer);
+    let repeat = update(older, 200, 9);
+    let change = metadata_lifecycle_change(&repeat, node(8));
+    assert!(
+        !store_document_lifecycle(&storage, &repeat, change)
+            .await
+            .expect("duplicate older event is idempotent")
+    );
+}
+
+#[tokio::test]
 async fn newer_sidecar_blocks() {
     let (_dir, storage) = test_storage();
     let group_id = Ulid::from_parts(10, 1);
