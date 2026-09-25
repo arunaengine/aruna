@@ -19,6 +19,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::secondary_id::{IdentifierOrigin, RegisterIdentifiersSpec};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_storage::StorageHandle;
@@ -589,10 +590,42 @@ pub async fn change_link(
     if let Some(enabled) = enabled {
         Box::pin(ensure_lineage(&context.storage_handle, enabled)).await?;
     }
+    if let LinkChange::Accept(state) = &change
+        && let Some(record) = state.latest.as_ref().filter(|record| record.published)
+    {
+        register_accepted(context, link, record).await?;
+    }
     let operation =
         ChangeLinkOperation::new(link.document_id, link.link_id, change, SystemTime::now())
             .routed(route);
     drive(operation, context).await
+}
+
+/// Queues a published record that the link adopts outside a push, such as after a community
+/// review, as `Published` identifiers of the dataset.
+async fn register_accepted(
+    context: &DriverContext,
+    link: &InvenioLink,
+    record: &InvenioRecord,
+) -> Result<(), LinkError> {
+    let identifiers = record.identifiers(&link.endpoint, IdentifierOrigin::Published);
+    if identifiers.is_empty() {
+        return Ok(());
+    }
+    let owner = context
+        .net_handle
+        .as_ref()
+        .map_or(link.owner_node, |net| net.node_id());
+    let spec = RegisterIdentifiersSpec {
+        document_id: link.document_id,
+        identifiers,
+        auth_context: super::push::creator_auth(link),
+    };
+    let key = format!("identifiers/{}/{}", link.link_id, record.id);
+    crate::jobs::service::submit_identifiers(context, spec, owner, key)
+        .await
+        .map(|_| ())
+        .map_err(|error| LinkError::Submit(error.to_string()))
 }
 
 /// One lineage cannot have an enabled push link and an enabled pull link on one dataset.

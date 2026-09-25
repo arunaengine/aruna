@@ -421,10 +421,10 @@ pub(crate) async fn submit_identifiers(
     context: &DriverContext,
     spec: aruna_core::structs::secondary_id::RegisterIdentifiersSpec,
     owner_node_id: NodeId,
-    for_job: JobId,
+    key: String,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let created_by = spec.auth_context.user_id;
-    let dedup_key = Some(format!("identifiers/{for_job}").into_bytes());
+    let dedup_key = Some(key.into_bytes());
     let job_id = mint_local_job(
         context,
         created_by.realm_id,

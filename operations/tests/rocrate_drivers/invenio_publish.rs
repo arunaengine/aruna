@@ -360,6 +360,16 @@ async fn community_reviews_first() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(accepted.remote.review, LinkReview::Accepted);
     assert!(accepted.remote.published);
     assert_eq!(accepted.remote.record_id.as_deref(), Some("1"));
+    // The review published outside a push, so accepting it registers the record's identifiers.
+    let key = format!("identifiers/{}/1", link.link_id);
+    let queued = aruna_operations::jobs::store::find_dedup_plan(
+        &fixture.context.storage_handle,
+        link.created_by,
+        key.as_bytes(),
+        None,
+    )
+    .await?;
+    assert!(queued.is_some(), "no identifier registration queued");
 
     // Later versions publish directly.
     Box::pin(change(&fixture, "Second version", false)).await?;

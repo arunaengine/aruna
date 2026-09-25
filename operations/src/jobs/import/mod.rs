@@ -1241,7 +1241,7 @@ async fn register_identifiers(
             auth_context: spec.auth_context.clone(),
         },
         ctx.owner_node_id,
-        ctx.job_id,
+        format!("identifiers/{}", ctx.job_id),
     )
     .await
     .map(|_| ())
