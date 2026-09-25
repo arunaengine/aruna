@@ -5,18 +5,23 @@
 use std::sync::Arc;
 
 use aruna_core::repository::{
-    LinkFailure, LinkStatus, PullCheck, PushOutcome, RepositoryLink, RepositoryPull,
+    LinkDirection, LinkFailure, LinkPull, LinkRemote, LinkStatus, PULL_CHECK_MS, PullCheck,
+    PushOutcome, RepositoryLink, RepositoryPull, RepositoryRecord,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobState,
 };
+use aruna_core::time::unix_timestamp_millis;
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 use super::link_queue::ensure_holder;
-use super::links::{LinkChange, LinkError, change_link, ensure_lineage};
+use super::links::{LinkChange, LinkError, change_link, ensure_lineage, read_link};
 use super::push::creator_auth;
 use super::{TransferError, latest_version};
 use crate::driver::DriverContext;
+use crate::jobs::executor::JobContext;
 use crate::jobs::service::submit_rocrate_import;
 use crate::jobs::store::read_job_record;
 use crate::jobs::submit::SubmitJobError;
@@ -153,4 +158,142 @@ pub async fn start_pull(
         })?;
     change_link(context, link, LinkChange::Begin(submitted.job_id)).await?;
     Ok(submitted.job_id)
+}
+
+/// What an import that keeps or updates a pull link carries to its cleanup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PullProgress {
+    /// The version the dataset holds after the import.
+    pub(crate) record: RepositoryRecord,
+    pub(crate) endpoint: String,
+    /// The dataset revision an update merged into.
+    pub(crate) base: Option<Ulid>,
+    /// The dataset revision the import wrote.
+    pub(crate) revision: Option<Ulid>,
+}
+
+/// Stops an update once its link is gone, paused or runs another job.
+pub(crate) async fn running(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    link_id: Ulid,
+) -> Result<(), TransferError> {
+    let link = read_link(&ctx.driver.storage_handle, spec.document_id, link_id)
+        .await
+        .map_err(|error| TransferError::Retryable(error.to_string()))?
+        .filter(|link| link.status != LinkStatus::Paused && link.pull().is_some())
+        .ok_or(TransferError::Cancelled)?;
+    match link.active_job {
+        Some(job_id) if job_id == ctx.job_id => Ok(()),
+        None => Err(TransferError::Retryable(
+            "the link has not started this pull".into(),
+        )),
+        Some(_) => Err(TransferError::Permanent(
+            "a newer pull of this link replaced this job".into(),
+        )),
+    }
+}
+
+/// Records the end of an import on its pull link: a new link after an import that keeps one,
+/// the held version after an update, or the failed or cancelled update.
+pub(crate) async fn settle_import(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    progress: Option<&PullProgress>,
+    failure: Option<&str>,
+) -> Result<(), LinkError> {
+    let ImportRoCrateSource::Repository {
+        group_id,
+        connector_id,
+        options,
+        pull: Some(pull),
+        ..
+    } = &spec.source
+    else {
+        return Ok(());
+    };
+    let done = progress.and_then(|progress| Some((progress, progress.revision?)));
+    let now = std::time::SystemTime::now();
+    match pull {
+        RepositoryPull::Keep {
+            auto_update,
+            owner_node_url,
+        } => {
+            let Some((progress, revision)) = done else {
+                return Ok(());
+            };
+            let mut link = RepositoryLink {
+                link_id: ctx.job_id.as_ulid(),
+                document_id: spec.document_id,
+                group_id: *group_id,
+                connector_id: *connector_id,
+                endpoint: progress.endpoint.clone(),
+                owner_node: ctx.owner_node_id,
+                owner_node_url: owner_node_url.clone(),
+                created_by: spec.auth_context.user_id,
+                status: LinkStatus::Enabled,
+                auto_publish: false,
+                public_files: false,
+                metadata_json: "{}".into(),
+                remote: LinkRemote::default(),
+                last_push: None,
+                active_job: None,
+                sequence: 0,
+                limits: spec.limits.clone(),
+                created_at: now,
+                updated_at: now,
+                generation: 0,
+                warning: None,
+                direction: LinkDirection::Pull(Box::new(LinkPull {
+                    auto_update: *auto_update,
+                    options: options.clone(),
+                    target: spec.target.clone(),
+                    latest_remote_id: None,
+                    latest_revision: None,
+                    last_checked_at: None,
+                    next_check_ms: unix_timestamp_millis().saturating_add(PULL_CHECK_MS),
+                    failures: 0,
+                    revision: None,
+                    local_changed: false,
+                })),
+            };
+            link.hold(&progress.record, revision, now);
+            let change = LinkChange::Create {
+                link: Box::new(link.clone()),
+                secret: None,
+            };
+            match Box::pin(change_link(&ctx.driver, &link, change)).await {
+                Ok(_) | Err(LinkError::Exists) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        RepositoryPull::Update { link_id } => {
+            let storage = &ctx.driver.storage_handle;
+            let Some(link) = read_link(storage, spec.document_id, *link_id)
+                .await?
+                .filter(|link| link.active_job == Some(ctx.job_id))
+            else {
+                return Ok(());
+            };
+            let change = match (done, failure) {
+                (Some((progress, revision)), _) => LinkChange::Pulled {
+                    job_id: ctx.job_id,
+                    record: Box::new(progress.record.clone()),
+                    revision,
+                },
+                (None, failure) => LinkChange::Finish {
+                    job_id: ctx.job_id,
+                    outcome: Box::new(match failure {
+                        Some(message) => PushOutcome::Failed(LinkFailure::Other(message.into())),
+                        None => PushOutcome::Cancelled,
+                    }),
+                    requeue: false,
+                },
+            };
+            match Box::pin(change_link(&ctx.driver, &link, change)).await {
+                Ok(_) | Err(LinkError::NotFound) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
 }

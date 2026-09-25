@@ -145,7 +145,7 @@ pub struct ImportCheckpoint {
     /// Repository identifiers registered on the created document during cleanup.
     identifiers: Vec<SecondaryIdentifier>,
     /// Set when the import keeps or updates a pull link.
-    pull: Option<super::repository::invenio::import::PullProgress>,
+    pull: Option<super::repository::pull::PullProgress>,
 }
 
 impl Default for ImportCheckpoint {
@@ -1174,7 +1174,7 @@ async fn update_document(
         ..
     } = &spec.source
     {
-        super::repository::invenio::import::running(ctx, spec, *link_id)
+        super::repository::pull::running(ctx, spec, *link_id)
             .await
             .map_err(transfer_failure)?;
     }
@@ -1186,7 +1186,7 @@ async fn update_document(
     let base = checkpoint
         .pull
         .as_ref()
-        .and_then(|pull| pull.base())
+        .and_then(|pull| pull.base)
         .ok_or_else(|| ImportFailure::Permanent("pull base revision is missing".to_string()))?;
     let (current, event_id) = Box::pin(crate::jobs::export::crate_jsonld(
         &ctx.driver,
@@ -1298,7 +1298,7 @@ async fn cleanup_source(
         register_identifiers(ctx, spec, checkpoint.identifiers.clone()).await?;
         checkpoint.identifiers.clear();
     }
-    Box::pin(super::repository::invenio::import::settle_import(
+    Box::pin(super::repository::pull::settle_import(
         ctx,
         spec,
         checkpoint.pull.as_ref(),

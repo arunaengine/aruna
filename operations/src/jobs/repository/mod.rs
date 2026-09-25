@@ -80,7 +80,7 @@ pub(crate) async fn acquire(
     (
         ArtifactRef,
         Vec<SecondaryIdentifier>,
-        Option<invenio::import::PullProgress>,
+        Option<pull::PullProgress>,
     ),
     TransferError,
 > {
