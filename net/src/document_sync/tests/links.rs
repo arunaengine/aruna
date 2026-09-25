@@ -1,9 +1,9 @@
-//! Tests that replicated Invenio links keep owner order, refuse forgeries and stay deleted.
+//! Tests that replicated repository links keep owner order, refuse forgeries and stay deleted.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
+use aruna_core::keyspaces::{REPOSITORY_LINK_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
 use aruna_core::repository::{LinkRemote, LinkStatus, RepositoryLink, link_key};
 use aruna_core::storage_entries::shard_manifest_key;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -117,7 +117,7 @@ async fn link_replication_order() {
     let stored = || async {
         read_storage_value(
             &storage,
-            INVENIO_LINK_KEYSPACE,
+            REPOSITORY_LINK_KEYSPACE,
             ByteView::from(link_key(document_id, first.link_id)),
         )
         .await

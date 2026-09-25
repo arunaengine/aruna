@@ -109,7 +109,7 @@ fn read_queued(
         panic!("expected the link and queue read, got {effects:?}");
     };
     let read = reads.iter().map(|row| row.0.as_str()).collect::<Vec<_>>();
-    assert_eq!(read, [INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]);
+    assert_eq!(read, [REPOSITORY_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]);
     op.step(Event::Storage(StorageEvent::BatchReadResult {
         values: vec![
             (
@@ -195,7 +195,7 @@ fn create_writes_rows() {
         [
             LINK_SECRET_KEYSPACE,
             LINK_CONNECTOR_KEYSPACE,
-            INVENIO_LINK_KEYSPACE,
+            REPOSITORY_LINK_KEYSPACE,
             LINK_QUEUE_KEYSPACE
         ]
     );
@@ -267,7 +267,7 @@ fn delete_removes_secret() {
     assert_eq!(
         spaces,
         [
-            INVENIO_LINK_KEYSPACE,
+            REPOSITORY_LINK_KEYSPACE,
             LINK_QUEUE_KEYSPACE,
             LINK_SECRET_KEYSPACE,
             LINK_CONNECTOR_KEYSPACE
@@ -320,7 +320,7 @@ fn begin_takes_queue() {
     let mut stored = link();
     let mut op = operation(LinkChange::Begin(job(1)));
     let effects = read(&mut op, Some(&stored));
-    assert_eq!(keyspaces(&written(&effects)), [INVENIO_LINK_KEYSPACE]);
+    assert_eq!(keyspaces(&written(&effects)), [REPOSITORY_LINK_KEYSPACE]);
     let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: vec![],
     }));
@@ -401,7 +401,7 @@ fn rotate_resumes_rejected() {
         keyspaces(&written(&effects)),
         [
             LINK_SECRET_KEYSPACE,
-            INVENIO_LINK_KEYSPACE,
+            REPOSITORY_LINK_KEYSPACE,
             LINK_QUEUE_KEYSPACE
         ]
     );
@@ -421,7 +421,7 @@ fn patch_pauses_quietly() {
         ..LinkPatch::default()
     }));
     let effects = read(&mut op, Some(&stored));
-    assert_eq!(keyspaces(&written(&effects)), [INVENIO_LINK_KEYSPACE]);
+    assert_eq!(keyspaces(&written(&effects)), [REPOSITORY_LINK_KEYSPACE]);
     let effects = commit(&mut op, effects);
     assert!(effects.is_empty());
     assert_eq!(op.finalize().unwrap().unwrap().status, LinkStatus::Paused);
@@ -514,7 +514,7 @@ fn routed_changes_replicate() {
     };
     assert_eq!(change, created.delete_change(route.placement));
     assert!(keyspaces(&rows).contains(&SHARD_MANIFEST_KEYSPACE));
-    assert!(!keyspaces(&rows).contains(&INVENIO_LINK_KEYSPACE));
+    assert!(!keyspaces(&rows).contains(&REPOSITORY_LINK_KEYSPACE));
 }
 
 #[test]
@@ -624,7 +624,7 @@ fn draft_needs_running_push() {
     stored.active_job = Some(job(1));
     let mut op = operation(change());
     let effects = read(&mut op, Some(&stored));
-    assert_eq!(keyspaces(&written(&effects)), [INVENIO_LINK_KEYSPACE]);
+    assert_eq!(keyspaces(&written(&effects)), [REPOSITORY_LINK_KEYSPACE]);
     commit(&mut op, effects);
     let link = op.finalize().unwrap().unwrap();
     assert_eq!(link.remote.draft_id.as_deref(), Some("draft-1"));
@@ -666,7 +666,7 @@ fn pull_links_never_push() {
         keyspaces(&rows),
         [
             LINK_CONNECTOR_KEYSPACE,
-            INVENIO_LINK_KEYSPACE,
+            REPOSITORY_LINK_KEYSPACE,
             LINK_QUEUE_KEYSPACE
         ]
     );
@@ -685,7 +685,7 @@ fn pull_links_never_push() {
     let rows = written(&effects);
     assert_eq!(
         keyspaces(&rows),
-        [INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
+        [REPOSITORY_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
     );
     let now_ms = now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -709,7 +709,7 @@ fn pull_check_replaces_row() {
     let rows = written(&effects);
     assert_eq!(
         keyspaces(&rows),
-        [INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
+        [REPOSITORY_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
     );
     let stored = RepositoryLink::from_bytes(&rows[0].2).unwrap();
     let entry: LinkQueueEntry = postcard::from_bytes(&rows[1].2).unwrap();
@@ -721,7 +721,7 @@ fn pull_check_replaces_row() {
     paused.status = LinkStatus::Paused;
     let mut op = operation(LinkChange::Checked(PullCheck::Unavailable));
     let effects = read_queued(&mut op, Some(&paused), Some(&queued));
-    assert_eq!(keyspaces(&written(&effects)), [INVENIO_LINK_KEYSPACE]);
+    assert_eq!(keyspaces(&written(&effects)), [REPOSITORY_LINK_KEYSPACE]);
     let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: vec![],
     }));

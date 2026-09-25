@@ -174,7 +174,7 @@ async fn cancelled_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     // The push reached the repository, but the link lost the record and the job is cancelled.
     write_value(
         storage,
-        aruna_core::keyspaces::INVENIO_LINK_KEYSPACE,
+        aruna_core::keyspaces::REPOSITORY_LINK_KEYSPACE,
         aruna_core::repository::link_key(link.document_id, link.link_id),
         started.to_bytes()?,
     )
@@ -226,7 +226,7 @@ async fn revive_checks_lineage() -> Result<(), Box<dyn std::error::Error>> {
         }));
     write_value(
         &fixture.context.storage_handle,
-        aruna_core::keyspaces::INVENIO_LINK_KEYSPACE,
+        aruna_core::keyspaces::REPOSITORY_LINK_KEYSPACE,
         aruna_core::repository::link_key(pull.document_id, pull.link_id),
         pull.to_bytes()?,
     )
@@ -564,7 +564,7 @@ async fn stale_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     // The push finished remotely, but recording it on the link failed.
     write_value(
         &fixture.context.storage_handle,
-        aruna_core::keyspaces::INVENIO_LINK_KEYSPACE,
+        aruna_core::keyspaces::REPOSITORY_LINK_KEYSPACE,
         aruna_core::repository::link_key(link.document_id, link.link_id),
         started.to_bytes()?,
     )

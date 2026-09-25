@@ -4,7 +4,7 @@
 
 use super::remote::{RemoteServer, remote};
 use super::*;
-use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE};
+use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::repository::{
     LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, RepositoryLink, link_key,
 };
@@ -178,7 +178,7 @@ pub(super) async fn quiet_draft(
     push.pushed_at = SystemTime::UNIX_EPOCH;
     write_value(
         &fixture.context.storage_handle,
-        INVENIO_LINK_KEYSPACE,
+        REPOSITORY_LINK_KEYSPACE,
         link_key(link.document_id, link.link_id),
         stored.to_bytes()?,
     )
@@ -598,7 +598,7 @@ async fn queued_push_recovers() -> Result<(), Box<dyn std::error::Error>> {
         .context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: INVENIO_LINK_KEYSPACE.into(),
+            key_space: REPOSITORY_LINK_KEYSPACE.into(),
             key: link_key(link.document_id, link.link_id).into(),
             txn_id: None,
         })
@@ -797,7 +797,7 @@ async fn admins_read_pushes() -> Result<(), Box<dyn std::error::Error>> {
     link.created_by = UserId::local(Ulid::generate(), realm_id);
     write_value(
         &fixture.context.storage_handle,
-        INVENIO_LINK_KEYSPACE,
+        REPOSITORY_LINK_KEYSPACE,
         link_key(link.document_id, link.link_id),
         link.to_bytes()?,
     )

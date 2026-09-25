@@ -9,7 +9,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE};
+use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::repository::{
     LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
     RepositoryLink, link_prefix,
@@ -59,7 +59,7 @@ pub(crate) async fn queue_rows(
     for document_id in documents {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
-                key_space: INVENIO_LINK_KEYSPACE.to_string(),
+                key_space: REPOSITORY_LINK_KEYSPACE.to_string(),
                 prefix: Some(ByteView::from(link_prefix(document_id))),
                 start: None,
                 limit: QUEUE_PAGE,

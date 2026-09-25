@@ -92,7 +92,7 @@ pub(crate) async fn connect<'a>(
         auth,
         &format!("/{}/g/{group_id}/meta/**", auth.realm_id),
         &permission,
-        PolicyRequestExtras::operation("metadata.invenio"),
+        PolicyRequestExtras::operation("metadata.repository"),
     )
     .await
     .map_err(|error| match error {

@@ -1,4 +1,4 @@
-//! Applies replicated Invenio links: only the link's owner publishes, deletes leave tombstones.
+//! Applies replicated repository links: only the link's owner publishes, deletes leave tombstones.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -23,14 +23,14 @@ pub(super) async fn apply_link_event(
         } => (target.clone(), Some(bytes.clone()), *change),
         DocumentEvent::Delete { target, change, .. } => (target.clone(), None, *change),
         DocumentEvent::AdminOperation { .. } => {
-            let reason = "invenio link events are upserts or deletes";
+            let reason = "repository link events are upserts or deletes";
             return Ok(MetadataOutcome::Rejected(SyncRejection::new(
                 identity, event, reason,
             )));
         }
     };
     let reject = |reason: String| {
-        warn!(%topic_id, ?target, %reason, "Rejecting a replicated Invenio link");
+        warn!(%topic_id, ?target, %reason, "Rejecting a replicated repository link");
         Ok(MetadataOutcome::Rejected(SyncRejection::new(
             identity,
             event.clone(),
@@ -38,10 +38,10 @@ pub(super) async fn apply_link_event(
         )))
     };
     if actor_id != ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor)) {
-        return reject("invenio link revision actor is not its publisher".to_string());
+        return reject("repository link revision actor is not its publisher".to_string());
     }
     if let Err(reason) = validate_link(&target, bytes.as_deref(), &change) {
-        return reject(format!("invalid invenio link: {reason}"));
+        return reject(format!("invalid repository link: {reason}"));
     }
     match store_link(&service.storage, service.realm_id, &target, bytes, change).await? {
         MetadataPlacementOutcome::Accepted(true) => Ok(MetadataOutcome::Applied {
@@ -51,7 +51,7 @@ pub(super) async fn apply_link_event(
         MetadataPlacementOutcome::Accepted(false) => Ok(MetadataOutcome::Skipped),
         MetadataPlacementOutcome::Deferred(dependency) => Ok(MetadataOutcome::Deferred(dependency)),
         MetadataPlacementOutcome::Rejected => {
-            reject("invenio link has a mismatched placement".to_string())
+            reject("repository link has a mismatched placement".to_string())
         }
     }
 }
@@ -67,7 +67,7 @@ pub(in crate::document_sync) fn validate_link(
         link_id,
     } = target
     else {
-        return Err("target is not an invenio link".to_string());
+        return Err("target is not a repository link".to_string());
     };
     match bytes {
         Some(bytes) => {
@@ -137,7 +137,9 @@ pub(in crate::document_sync) async fn store_link(
             }
         }
     }
-    Err(NetError::Dht("invenio link conflicted twice".to_string()))
+    Err(NetError::Dht(
+        "repository link conflicted twice".to_string(),
+    ))
 }
 
 /// Commits the change, or returns the outcome that leaves the transaction to be aborted.
@@ -211,10 +213,10 @@ impl DocumentSyncService {
         match store_link(&self.storage, self.realm_id, &target, bytes, change).await? {
             MetadataPlacementOutcome::Accepted(_) => Ok(()),
             MetadataPlacementOutcome::Deferred(_) => Err(NetError::Dht(
-                "invenio link placement configuration is unavailable".to_string(),
+                "repository link placement configuration is unavailable".to_string(),
             )),
             MetadataPlacementOutcome::Rejected => Err(NetError::Bootstrap(
-                "invenio link has a mismatched placement".to_string(),
+                "repository link has a mismatched placement".to_string(),
             )),
         }
     }

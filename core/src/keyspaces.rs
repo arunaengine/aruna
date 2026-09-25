@@ -191,14 +191,14 @@ pub const HARVEST_PROVENANCE_KEYSPACE: &str = "harvest_provenance";
 pub const ID_MAPPING_KEYSPACE: &str = "persistent_id_mapping";
 /// Reverse index of secondary identifiers, `kind 0 value 0 endpoint` to document id (#451).
 pub const SECONDARY_ID_KEYSPACE: &str = "persistent_id_secondary";
-/// Invenio links on their owner node, keyed by `document id || link id`.
-pub const INVENIO_LINK_KEYSPACE: &str = "invenio_links";
+/// Repository links on their owner node, keyed by `document id || link id`.
+pub const REPOSITORY_LINK_KEYSPACE: &str = "repository_links";
 /// A link's sealed personal token, keyed by link id; removed with the link.
-pub const LINK_SECRET_KEYSPACE: &str = "invenio_link_secrets";
+pub const LINK_SECRET_KEYSPACE: &str = "repository_link_secrets";
 /// Links per repository connector, `connector id || link id`, so a used connector stays.
-pub const LINK_CONNECTOR_KEYSPACE: &str = "invenio_link_connectors";
+pub const LINK_CONNECTOR_KEYSPACE: &str = "repository_link_connectors";
 /// Durable push checks per link id, drained by `TaskKey::DrainLinkQueue`.
-pub const LINK_QUEUE_KEYSPACE: &str = "invenio_link_queue";
+pub const LINK_QUEUE_KEYSPACE: &str = "repository_link_queue";
 
 // Durable job framework keyspaces (#318).
 pub const JOB_KEYSPACE: &str = "jobs";
@@ -377,7 +377,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     HARVEST_PROVENANCE_KEYSPACE,
     ID_MAPPING_KEYSPACE,
     SECONDARY_ID_KEYSPACE,
-    INVENIO_LINK_KEYSPACE,
+    REPOSITORY_LINK_KEYSPACE,
     LINK_SECRET_KEYSPACE,
     LINK_CONNECTOR_KEYSPACE,
     LINK_QUEUE_KEYSPACE,

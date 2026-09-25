@@ -10,7 +10,7 @@ use crate::routes::metadata::repositories::delete_repository;
 use crate::routes::metadata::tests::{TestState, drain_metadata_background, setup_network_state};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{INVENIO_LINK_KEYSPACE, LINK_SECRET_KEYSPACE};
+use aruna_core::keyspaces::{LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::driver::drive;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
@@ -163,7 +163,7 @@ async fn link_routes_authorize() {
     let document_id = parse_document_id(&linked.document_id).unwrap();
     for (key_space, key) in [
         (
-            INVENIO_LINK_KEYSPACE,
+            REPOSITORY_LINK_KEYSPACE,
             aruna_core::repository::link_key(document_id, link_id),
         ),
         (LINK_SECRET_KEYSPACE, link_id.to_bytes().to_vec()),
@@ -344,7 +344,7 @@ async fn holder_copy_refuses() {
         .get_ctx()
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: INVENIO_LINK_KEYSPACE.into(),
+            key_space: REPOSITORY_LINK_KEYSPACE.into(),
             key: copy.target().storage_key(),
             value: copy.to_bytes().unwrap().into(),
             txn_id: None,
@@ -425,7 +425,7 @@ async fn admin_rights_limited() {
     context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: INVENIO_LINK_KEYSPACE.into(),
+            key_space: REPOSITORY_LINK_KEYSPACE.into(),
             key: aruna_core::repository::link_key(document_id, link_id).into(),
             value: stored.to_bytes().unwrap().into(),
             txn_id: None,

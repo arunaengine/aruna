@@ -12,9 +12,9 @@ use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
-    GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, INVENIO_LINK_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    USER_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
+    GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE,
+    NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REPOSITORY_LINK_KEYSPACE, USER_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use crate::repository::link_key;
@@ -88,7 +88,7 @@ pub enum DocumentTarget {
     PlacementPolicy {
         policy_id: Ulid,
     },
-    /// One Invenio link of a document. Only the link's owner node writes it; holders keep a copy.
+    /// One repository link of a document. Only its owner node writes it; holders keep a copy.
     RepositoryLink {
         document_id: Ulid,
         link_id: Ulid,
@@ -413,7 +413,7 @@ impl DocumentTarget {
             Self::WatchSubscription { .. } => WATCH_SUBSCRIPTIONS_KEYSPACE,
             Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
             Self::PlacementPolicy { .. } => PLACEMENT_POLICY_KEYSPACE,
-            Self::RepositoryLink { .. } => INVENIO_LINK_KEYSPACE,
+            Self::RepositoryLink { .. } => REPOSITORY_LINK_KEYSPACE,
         }
     }
 

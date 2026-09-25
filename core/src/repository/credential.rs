@@ -87,8 +87,8 @@ fn token_aad(
     endpoint: &str,
 ) -> Vec<u8> {
     let mut aad = match link_id {
-        Some(_) => b"aruna invenio link credential\0".to_vec(),
-        None => b"aruna invenio credential\0".to_vec(),
+        Some(_) => b"aruna repository link credential\0".to_vec(),
+        None => b"aruna repository credential\0".to_vec(),
     };
     aad.extend_from_slice(&user.to_bytes());
     aad.extend_from_slice(&group.to_bytes());

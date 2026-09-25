@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    INVENIO_LINK_KEYSPACE, LINK_CONNECTOR_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE,
+    LINK_CONNECTOR_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::repository::{
@@ -168,7 +168,7 @@ impl ChangeLinkOperation {
 
     fn plan(&mut self, stored: Option<RepositoryLink>) -> Result<Effects, LinkError> {
         let link_row = (
-            INVENIO_LINK_KEYSPACE.to_string(),
+            REPOSITORY_LINK_KEYSPACE.to_string(),
             ByteView::from(link_key(self.document_id, self.link_id)),
         );
         let queue_row = (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id));
@@ -407,7 +407,7 @@ impl Operation for ChangeLinkOperation {
                 smallvec![Effect::Storage(StorageEffect::BatchRead {
                     reads: vec![
                         (
-                            INVENIO_LINK_KEYSPACE.to_string(),
+                            REPOSITORY_LINK_KEYSPACE.to_string(),
                             ByteView::from(link_key(self.document_id, self.link_id)),
                         ),
                         (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id)),
@@ -684,7 +684,7 @@ pub async fn list_links(
         let event = send(
             storage,
             StorageEffect::Iter {
-                key_space: INVENIO_LINK_KEYSPACE.to_string(),
+                key_space: REPOSITORY_LINK_KEYSPACE.to_string(),
                 prefix: Some(ByteView::from(link_prefix(document_id))),
                 start: start.take().map(IterStart::After),
                 limit: LINK_PAGE,
@@ -740,7 +740,7 @@ pub async fn read_link(
     let event = send(
         storage,
         StorageEffect::Read {
-            key_space: INVENIO_LINK_KEYSPACE.to_string(),
+            key_space: REPOSITORY_LINK_KEYSPACE.to_string(),
             key: ByteView::from(link_key(document_id, link_id)),
             txn_id: None,
         },
