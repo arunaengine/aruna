@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod changes;
 pub mod hook;
 pub mod lfs;
 pub mod locks;
@@ -44,6 +45,31 @@ pub enum GitError {
     Full,
     #[error("{0} is locked by another user")]
     Locked(String),
+    #[error("the branch moved since the version the request named")]
+    Stale,
+    #[error("the name already exists")]
+    Exists,
+    #[error("{0}")]
+    Refused(String),
+    #[error("the merge has conflicts")]
+    MergeConflict(Box<MergeConflict>),
+}
+
+/// Why a merge could not be completed; nothing was changed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeConflict {
+    /// Files both sides changed that no metadata merge resolves.
+    pub files: Vec<String>,
+    pub properties: Vec<PropertyConflict>,
+}
+
+/// A metadata property both sides changed from their common version to different values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropertyConflict {
+    pub entity: String,
+    pub property: String,
+    pub source: Vec<serde_json::Value>,
+    pub target: Vec<serde_json::Value>,
 }
 
 pub async fn document(

@@ -82,6 +82,9 @@ fn map_error(error: GitError) -> ServerError {
         GitError::Locked(path) => {
             ServerError::Conflict(format!("{path} is locked by another user"))
         }
+        GitError::Stale => ServerError::PreconditionFailed(error.to_string()),
+        GitError::Exists | GitError::MergeConflict(_) => ServerError::Conflict(error.to_string()),
+        GitError::Refused(reason) => ServerError::BadRequestMessage(reason),
     }
 }
 

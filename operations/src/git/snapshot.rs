@@ -43,7 +43,11 @@ fn first(context: &DriverContext, holders: &[NodeId]) -> bool {
     context.net_handle.as_ref().map(|net| net.node_id()) == holders.first().copied()
 }
 
-async fn execute(store: &GitStore, effect: GitEffect, actor: UserId) -> Result<GitEvent, GitError> {
+pub(super) async fn execute(
+    store: &GitStore,
+    effect: GitEffect,
+    actor: UserId,
+) -> Result<GitEvent, GitError> {
     store
         .execute(effect, actor)
         .await
@@ -52,7 +56,7 @@ async fn execute(store: &GitStore, effect: GitEffect, actor: UserId) -> Result<G
 
 /// The materialized graph this node would snapshot, if it is ready. During materialization
 /// the graph is current before its status says so, which `materializing` states.
-async fn current(
+pub(super) async fn current(
     context: &DriverContext,
     document: &MetadataRegistryRecord,
     revision: Option<&MetadataRawRevision>,
@@ -154,7 +158,7 @@ async fn resolve(
 
 /// File entities that name an exact Aruna object version. An object the author cannot
 /// read stays out of the ARC; its entity still describes it in the metadata.
-async fn linked(
+pub(super) async fn linked(
     context: &DriverContext,
     document: &MetadataRegistryRecord,
     jsonld: &str,

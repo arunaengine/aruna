@@ -2,11 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::state::{Ancestry, reduce};
+use super::state::{Ancestry, GitState, reduce};
 use super::{GitError, objects, publish, records};
 use crate::driver::DriverContext;
-use aruna_core::git::{GitChange, GitRecord, LfsObject, RefUpdate, valid_path, valid_ref};
+use aruna_core::git::{
+    GitChange, GitRecord, LfsObject, RefUpdate, StoredObject, valid_path, valid_ref,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -70,15 +73,7 @@ pub async fn accept(
         return Err(GitError::Invalid);
     }
     let (state, _) = reduce(&records::scan(context, id).await?, &Ancestry::new());
-    for path in &request.paths {
-        if state
-            .locks
-            .get(path)
-            .is_some_and(|lock| lock.user_id != auth.user_id)
-        {
-            return Err(GitError::Locked(path.clone()));
-        }
-    }
+    unlocked(&state, auth, &request.paths)?;
     let mut lfs = Vec::with_capacity(request.lfs.len());
     for oid in &request.lfs {
         let valid = LfsObject {
@@ -92,18 +87,47 @@ pub async fn accept(
         };
         lfs.push(location.filter(|_| valid).ok_or(GitError::Invalid)?);
     }
+    record(context, auth, &document, request.refs, pack, lfs).await
+}
+
+/// Refuses changes to files another user locked.
+pub(super) fn unlocked(
+    state: &GitState,
+    auth: &AuthContext,
+    paths: &[String],
+) -> Result<(), GitError> {
+    match paths.iter().find(|path| {
+        state
+            .locks
+            .get(*path)
+            .is_some_and(|lock| lock.user_id != auth.user_id)
+    }) {
+        Some(path) => Err(GitError::Locked(path.clone())),
+        None => Ok(()),
+    }
+}
+
+/// Stores a non-empty pack and publishes the ref updates as one replicated record.
+pub(super) async fn record(
+    context: &DriverContext,
+    auth: &AuthContext,
+    document: &MetadataRegistryRecord,
+    refs: Vec<RefUpdate>,
+    pack: Bytes,
+    lfs: Vec<StoredObject>,
+) -> Result<GitRecord, GitError> {
     let pack = if objects_in(&pack) == 0 {
         None
     } else {
-        Some(objects::store_pack(context, auth, &document, pack).await?)
+        Some(objects::store_pack(context, auth, document, pack).await?)
     };
     let change = GitChange::Objects {
         pack: pack.map(Box::new),
-        refs: request.refs,
+        refs,
         lfs,
         revision: None,
     };
-    publish::publish(context, &document, auth.user_id, change).await
+    publish::publish(context, document, auth.user_id, change).await
 }
 
 #[cfg(test)]
