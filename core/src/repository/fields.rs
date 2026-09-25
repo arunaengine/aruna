@@ -4,8 +4,8 @@
 
 use serde_json::{Value, json};
 
-use super::{ExportIdentity, RepositoryError};
-use crate::structs::secondary_id::{SecondaryIdKind, normalize_doi};
+use super::{ExportIdentity, RepositoryError, kinds};
+use crate::structs::secondary_id::{SecondaryIdKind, normalize_value};
 
 /// An identifier with its scheme, such as `doi`, `url` or `orcid`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,7 +201,8 @@ pub fn publication_start(value: &str) -> Result<String, RepositoryError> {
     start.ok_or(RepositoryError("missing publication date"))
 }
 
-/// Adds the registered DOIs to the crate root `identifier`, skipping DOIs it already names.
+/// Adds the registered identifiers that publishing kinds give records, such as DOIs, to the
+/// crate root `identifier`, skipping identifiers it already names.
 pub fn add_root_identifiers(document: &mut Value, identity: &ExportIdentity) {
     let Some(id) = crate_root(document).and_then(|root| root["@id"].as_str().map(str::to_string))
     else {
@@ -225,16 +226,27 @@ pub fn add_root_identifiers(document: &mut Value, identity: &ExportIdentity) {
     let known = current
         .iter()
         .filter_map(identifier)
-        .filter(|id| id.scheme == "doi")
-        .filter_map(|id| normalize_doi(&id.value).ok())
+        .filter_map(|id| {
+            let kind = SecondaryIdKind::parse(&id.scheme)?;
+            Some((kind, normalize_value(kind, &id.value).ok()?))
+        })
         .collect::<Vec<_>>();
-    for doi in &identity.identifiers {
-        if doi.kind == SecondaryIdKind::Doi && !known.contains(&doi.value) {
-            current.push(json!({
-                "@type": "PropertyValue", "propertyID": "doi",
-                "value": format!("https://doi.org/{}", doi.value)
-            }));
+    let record_kinds = kinds()
+        .iter()
+        .map(|kind| kind.capabilities.identifier_kind)
+        .collect::<Vec<_>>();
+    for added in &identity.identifiers {
+        if !record_kinds.contains(&added.kind) || known.contains(&(added.kind, added.value.clone()))
+        {
+            continue;
         }
+        let value = match added.kind {
+            SecondaryIdKind::Doi => format!("https://doi.org/{}", added.value),
+            _ => added.value.clone(),
+        };
+        current.push(json!({
+            "@type": "PropertyValue", "propertyID": added.kind.as_str(), "value": value
+        }));
     }
     root[key] = Value::Array(current);
 }

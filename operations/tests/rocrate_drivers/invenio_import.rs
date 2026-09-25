@@ -535,7 +535,7 @@ async fn start_update(
     };
     let first = current_event(&fixture.context, doc_id(1)).await?;
     assert_eq!(link.remote.record_id.as_deref(), Some("1"));
-    assert_eq!(link.remote.doi.as_deref(), Some("10.1234/1"));
+    assert_eq!(link.remote.identifier.as_deref(), Some("10.1234/1"));
     assert_eq!(link.pull().and_then(|pull| pull.revision), Some(first));
 
     // The repository published version 2; the user pulls it.
@@ -603,7 +603,7 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
         .remove(0);
     assert_eq!(pulled.active_job, None);
     assert_eq!(pulled.remote.record_id.as_deref(), Some("2"));
-    assert_eq!(pulled.remote.doi.as_deref(), Some("10.1234/2"));
+    assert_eq!(pulled.remote.identifier.as_deref(), Some("10.1234/2"));
     assert_eq!(pulled.pull_reason(), None);
     assert_eq!(
         pulled.pull().and_then(|pull| pull.revision),

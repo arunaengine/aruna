@@ -98,7 +98,10 @@ pub(crate) async fn repository_export(
         }
     }
     if checkpoint.repository_metadata.is_none()
-        && let Some(record) = checkpoint.repository.as_ref().filter(|r| r.doi.is_none())
+        && let Some(record) = checkpoint
+            .repository
+            .as_ref()
+            .filter(|r| r.identifier.is_none())
     {
         let reserved = interruptible(ctx, reserve_doi(ctx, spec, destination, record)).await?;
         if reserved != *record {
@@ -372,11 +375,11 @@ pub(super) fn record_from(
         revision_id: record["revision_id"]
             .as_u64()
             .ok_or_else(|| invalid("missing record revision"))?,
-        doi: record["pids"]["doi"]["identifier"]
+        identifier: record["pids"]["doi"]["identifier"]
             .as_str()
             .map(str::to_string),
         html_url: page_url(client, record),
-        concept_doi: record["parent"]["pids"]["doi"]["identifier"]
+        concept_identifier: record["parent"]["pids"]["doi"]["identifier"]
             .as_str()
             .map(str::to_string),
         in_review: false,

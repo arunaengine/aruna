@@ -91,8 +91,8 @@ async fn failed_push_continues() -> Result<(), Box<dyn std::error::Error>> {
     assert!(failure(&failed).is_some());
     // The draft was stored before the uploads, with its reserved DOI.
     assert_eq!(failed.remote.draft_id.as_deref(), Some("1"));
-    assert_eq!(failed.remote.doi.as_deref(), Some("10.1234/1"));
-    assert!(failed.remote.doi_reserved);
+    assert_eq!(failed.remote.identifier.as_deref(), Some("10.1234/1"));
+    assert!(failed.remote.identifier_reserved);
 
     server.state.lock().unwrap().reject_uploads = false;
     succeeded(push_now(&fixture, &link, false).await?);
@@ -144,13 +144,13 @@ async fn busy_reservation_retries() -> Result<(), Box<dyn std::error::Error>> {
     let (waiting, _) = current(&fixture, &link).await;
     // The draft is on the link before its DOI, so the retry continues it.
     assert_eq!(waiting.remote.draft_id.as_deref(), Some("1"));
-    assert!(!waiting.remote.doi_reserved);
+    assert!(!waiting.remote.identifier_reserved);
     assert!(waiting.status == LinkStatus::Enabled && waiting.active_job.is_some());
 
     succeeded(Box::pin(run_export_job(&ctx, &spec)).await);
     let (pushed, _) = current(&fixture, &link).await;
-    assert_eq!(pushed.remote.doi.as_deref(), Some("10.1234/1"));
-    assert!(pushed.remote.doi_reserved);
+    assert_eq!(pushed.remote.identifier.as_deref(), Some("10.1234/1"));
+    assert!(pushed.remote.identifier_reserved);
     assert_eq!(server.state.lock().unwrap().records.len(), 1);
     fixture.stop().await;
     Ok(())

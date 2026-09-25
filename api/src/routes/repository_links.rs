@@ -111,11 +111,12 @@ pub struct LinkRemoteResponse {
     pub draft_id: Option<String>,
     /// The last version this link published.
     pub record_id: Option<String>,
-    /// The open draft's reserved DOI while doi_reserved is true, else the published DOI.
-    pub doi: Option<String>,
-    pub doi_reserved: bool,
-    /// The DOI that names every version of the record.
-    pub concept_doi: Option<String>,
+    /// The open draft's reserved identifier while identifier_reserved is true, else the
+    /// published one; its kind is the link's identifier_kind.
+    pub identifier: Option<String>,
+    pub identifier_reserved: bool,
+    /// The identifier that names every version of the record.
+    pub concept_identifier: Option<String>,
     pub record_url: Option<String>,
     pub published: bool,
     /// Community review of the first version: none, pending, accepted or declined.
@@ -143,6 +144,8 @@ pub struct RepositoryLinkResponse {
     pub created_by: String,
     /// The connector's repository kind, such as invenio.
     pub kind: String,
+    /// The kind of identifier a published record receives, such as doi.
+    pub identifier_kind: String,
     /// push sends dataset changes to the repository; pull imports new repository versions.
     pub direction: String,
     /// enabled, paused or failed.
@@ -188,11 +191,11 @@ pub(super) fn link_example() -> serde_json::Value {
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
         "endpoint": "https://zenodo.org/api/", "owner_node_url": "https://node.example/api/v1",
         "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
-        "kind": "invenio", "direction": "push",
+        "kind": "invenio", "identifier_kind": "doi", "direction": "push",
         "status": "enabled", "auto_publish": false, "public_files": false, "pending": false,
         "remote": {"state": "draft", "parent_id": "abcde-12345", "draft_id": "fghij-67890", "record_id": null,
-            "doi": "10.5281/zenodo.123457", "doi_reserved": true,
-            "concept_doi": "10.5281/zenodo.123456",
+            "identifier": "10.5281/zenodo.123457", "identifier_reserved": true,
+            "concept_identifier": "10.5281/zenodo.123456",
             "record_url": "https://zenodo.org/uploads/fghij-67890", "published": false,
             "review": "none"},
         "last_push": {"event_id": "01ARZ3NDEKTSV4RRFFQ69G5FB0", "job_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
@@ -226,11 +229,11 @@ pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> Repos
         parent_id,
         draft_id,
         record_id,
-        doi,
+        identifier,
         record_url,
         published,
-        concept_doi,
-        doi_reserved,
+        concept_identifier,
+        identifier_reserved,
         review,
         ..
     } = link.remote;
@@ -243,6 +246,9 @@ pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> Repos
         owner_node_url: link.owner_node_url,
         created_by: link.created_by.to_string(),
         kind: link.kind.as_str().to_string(),
+        identifier_kind: capabilities(link.kind)
+            .map_or("", |can| can.identifier_kind.as_str())
+            .to_string(),
         direction: if pull.is_some() { "pull" } else { "push" }.to_string(),
         status: status.to_string(),
         reason,
@@ -262,9 +268,9 @@ pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> Repos
             parent_id,
             draft_id,
             record_id,
-            doi,
-            doi_reserved,
-            concept_doi,
+            identifier,
+            identifier_reserved,
+            concept_identifier,
             record_url,
             published,
             review: review.name().to_string(),

@@ -202,7 +202,7 @@ async fn invenio_continues_versions() -> Result<(), Box<dyn std::error::Error>> 
             let record = result.repository.unwrap();
             assert_eq!(record.id, "3");
             assert_eq!(record.parent_id, "parent");
-            assert_eq!(record.doi.as_deref(), Some("10.1234/3"));
+            assert_eq!(record.identifier.as_deref(), Some("10.1234/3"));
             assert!(record.published);
         }
         JobRunOutcome::Failed(error) => panic!("{}", error.message),

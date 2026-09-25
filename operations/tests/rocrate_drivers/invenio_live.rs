@@ -244,8 +244,8 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .ok_or("first push left no draft")?;
     assert!(!first.remote.published);
-    let reserved = first.remote.doi.clone().ok_or("no DOI reserved")?;
-    assert!(first.remote.doi_reserved);
+    let reserved = first.remote.identifier.clone().ok_or("no DOI reserved")?;
+    assert!(first.remote.identifier_reserved);
 
     Box::pin(change(&fixture, "Live second revision", true)).await?;
     due_now(&fixture, &link).await?;
@@ -363,10 +363,13 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     succeeded(run_push(&fixture, &link).await?);
     let published = current(&fixture, &link).await.0;
-    assert!(published.remote.published && !published.remote.doi_reserved);
+    assert!(published.remote.published && !published.remote.identifier_reserved);
     assert_eq!(published.remote.record_id.as_deref(), Some(draft.as_str()));
-    assert_eq!(published.remote.doi.as_deref(), Some(reserved.as_str()));
-    assert!(published.remote.concept_doi.is_some());
+    assert_eq!(
+        published.remote.identifier.as_deref(),
+        Some(reserved.as_str())
+    );
+    assert!(published.remote.concept_identifier.is_some());
     assert_eq!(published.warning, None);
 
     Box::pin(change(&fixture, "Live third revision", false)).await?;
@@ -390,10 +393,10 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     // Every version reserves its own DOI.
     let doi = version
         .remote
-        .doi
+        .identifier
         .as_deref()
         .ok_or("new version has no DOI")?;
-    assert!(version.remote.doi_reserved && doi != reserved);
+    assert!(version.remote.identifier_reserved && doi != reserved);
     assert_eq!(record["pids"]["doi"]["identifier"].as_str(), Some(doi));
     fixture.stop().await;
     Ok(())
@@ -489,7 +492,7 @@ async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(accepted.remote.review, LinkReview::Accepted);
     assert!(accepted.remote.published);
     assert_eq!(accepted.remote.record_id.as_deref(), Some(draft.as_str()));
-    assert!(accepted.remote.doi.is_some() && !accepted.remote.doi_reserved);
+    assert!(accepted.remote.identifier.is_some() && !accepted.remote.identifier_reserved);
     fixture.stop().await;
     Ok(())
 }
@@ -845,7 +848,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     let (pulled, _) = list_links(storage, doc_id(2)).await?.remove(0);
     assert_eq!(pulled.active_job, None);
     assert_eq!(pulled.remote.record_id.as_deref(), Some(second.id.as_str()));
-    assert_eq!(pulled.remote.doi, second.doi);
+    assert_eq!(pulled.remote.identifier, second.identifier);
     assert_eq!(pulled.pull_reason(), None);
     let revision = aruna_operations::metadata::raw_revision::load_raw_revision(
         &fixture.context,
@@ -875,9 +878,9 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         .await
     };
     use aruna_operations::jobs::repository::RecordReference::{Doi, Url};
-    let version_doi = first.doi.clone().ok_or("v1 has no DOI")?;
+    let version_doi = first.identifier.clone().ok_or("v1 has no DOI")?;
     assert_eq!(resolve(Doi(version_doi.to_uppercase())).await?, first.id);
-    let concept = second.concept_doi.clone().ok_or("no concept DOI")?;
+    let concept = second.concept_identifier.clone().ok_or("no concept DOI")?;
     assert_eq!(
         resolve(Doi(format!("https://doi.org/{concept}"))).await?,
         second.id
@@ -894,7 +897,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         aruna_operations::metadata::persistent_id::read_mapping(&fixture.context, doc_id(2))
             .await?
             .ok_or("pulled dataset has no mapping")?;
-    let doi = second.doi.as_deref().ok_or("v2 has no DOI")?;
+    let doi = second.identifier.as_deref().ok_or("v2 has no DOI")?;
     assert!(
         mapping
             .secondary_identifiers

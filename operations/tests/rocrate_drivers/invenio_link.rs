@@ -421,7 +421,7 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
     let (published, _) = current(&fixture, &link).await;
     assert!(published.remote.published && published.remote.draft_id.is_none());
     assert_eq!(published.remote.record_id.as_deref(), Some("1"));
-    assert_eq!(published.remote.doi.as_deref(), Some("10.1234/1"));
+    assert_eq!(published.remote.identifier.as_deref(), Some("10.1234/1"));
     let auth = Box::pin(run_registration(&fixture, push_job, pusher)).await?;
     let found = Box::pin(aruna_operations::metadata::secondary_ids::lookup_local(
         &fixture.context,
@@ -533,8 +533,8 @@ async fn token_rejection_recovers() -> Result<(), Box<dyn std::error::Error>> {
         "auto publish waits for a quiet draft"
     );
     assert!(queued && pushed.active_job.is_none());
-    assert_eq!(pushed.remote.doi.as_deref(), Some("10.1234/1"));
-    assert!(pushed.remote.doi_reserved);
+    assert_eq!(pushed.remote.identifier.as_deref(), Some("10.1234/1"));
+    assert!(pushed.remote.identifier_reserved);
     drain(&fixture).await?;
     assert!(current(&fixture, &link).await.0.active_job.is_none());
 
@@ -547,9 +547,12 @@ async fn token_rejection_recovers() -> Result<(), Box<dyn std::error::Error>> {
         "auto publish published the quiet draft"
     );
     assert_eq!(published.remote.record_id.as_deref(), Some("1"));
-    assert_eq!(published.remote.doi.as_deref(), Some("10.1234/1"));
-    assert!(!published.remote.doi_reserved);
-    assert_eq!(published.remote.concept_doi.as_deref(), Some("10.1234/p1"));
+    assert_eq!(published.remote.identifier.as_deref(), Some("10.1234/1"));
+    assert!(!published.remote.identifier_reserved);
+    assert_eq!(
+        published.remote.concept_identifier.as_deref(),
+        Some("10.1234/p1")
+    );
     fixture.stop().await;
     Ok(())
 }

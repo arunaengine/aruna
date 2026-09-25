@@ -86,17 +86,17 @@ impl LinkReview {
 }
 
 /// The repository side: `record_id` is the last version this link published.
-/// `doi` is the open draft's reserved DOI while `doi_reserved` is set.
+/// `identifier` is the open draft's reserved identifier while `identifier_reserved` is set.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LinkRemote {
     pub parent_id: Option<String>,
     pub draft_id: Option<String>,
     pub record_id: Option<String>,
-    pub doi: Option<String>,
+    pub identifier: Option<String>,
     pub record_url: Option<String>,
     pub published: bool,
-    pub concept_doi: Option<String>,
-    pub doi_reserved: bool,
+    pub concept_identifier: Option<String>,
+    pub identifier_reserved: bool,
     /// Draft revision after this link's last write; another revision means a remote edit.
     pub revision_id: Option<u64>,
     pub review: LinkReview,
@@ -441,12 +441,12 @@ impl RepositoryLink {
             remote.revision_id = Some(record.revision_id);
         }
         remote.published = record.published;
-        remote.doi_reserved = !record.published && record.doi.is_some();
-        if record.doi.is_some() || !record.published {
-            remote.doi = record.doi.clone();
+        remote.identifier_reserved = !record.published && record.identifier.is_some();
+        if record.identifier.is_some() || !record.published {
+            remote.identifier = record.identifier.clone();
         }
-        if record.concept_doi.is_some() {
-            remote.concept_doi = record.concept_doi.clone();
+        if record.concept_identifier.is_some() {
+            remote.concept_identifier = record.concept_identifier.clone();
         }
         remote.record_url = Some(record.html_url.clone().unwrap_or(record.url.clone()));
     }

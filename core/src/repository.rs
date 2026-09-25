@@ -4,7 +4,7 @@
 
 use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::secondary_id::{
-    IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier, normalize_doi,
+    IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier, normalize_value,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -87,11 +87,12 @@ pub struct RepositoryRecord {
     pub published: bool,
     pub parent_id: String,
     pub revision_id: u64,
-    pub doi: Option<String>,
+    /// The record's identifier of the kind's identifier kind, such as its DOI.
+    pub identifier: Option<String>,
     /// The repository's page for people, when it names one on its own origin.
     pub html_url: Option<String>,
-    /// DOI of the record's parent, which names every version.
-    pub concept_doi: Option<String>,
+    /// Identifier of the record's parent, which names every version.
+    pub concept_identifier: Option<String>,
     /// Submitted to the connector's community for review instead of published.
     pub in_review: bool,
     /// A check that failed after the repository had already published the record.
@@ -140,12 +141,13 @@ pub struct ExportIdentity {
 }
 
 impl ExportIdentity {
-    pub(crate) fn published_doi(&self, doi: &str) -> bool {
-        normalize_doi(doi).is_ok_and(|doi| {
+    /// Whether this dataset published the identifier to a repository.
+    pub(crate) fn published(&self, kind: SecondaryIdKind, value: &str) -> bool {
+        normalize_value(kind, value).is_ok_and(|value| {
             self.identifiers.iter().any(|known| {
-                known.kind == SecondaryIdKind::Doi
+                known.kind == kind
                     && known.origin == IdentifierOrigin::Published
-                    && known.value == doi
+                    && known.value == value
             })
         })
     }

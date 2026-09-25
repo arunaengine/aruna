@@ -55,9 +55,9 @@ fn record(id: &str, published: bool, doi: Option<&str>) -> RepositoryRecord {
         published,
         parent_id: "parent-1".into(),
         revision_id: 3,
-        doi: doi.map(str::to_string),
+        identifier: doi.map(str::to_string),
         html_url: None,
-        concept_doi: None,
+        concept_identifier: None,
         in_review: false,
         warning: None,
         identifiers: Vec::new(),
@@ -105,8 +105,8 @@ fn plans_lineage_pushes() {
         &pushed("draft-2", false, Some("10.1/y")),
         SystemTime::now(),
     );
-    assert_eq!(link.remote.doi.as_deref(), Some("10.1/y"));
-    assert!(link.remote.doi_reserved && !link.remote.published);
+    assert_eq!(link.remote.identifier.as_deref(), Some("10.1/y"));
+    assert!(link.remote.identifier_reserved && !link.remote.published);
     assert_eq!(link.remote.parent_id.as_deref(), Some("parent-1"));
     assert_eq!(link.remote.files, ["data.txt"]);
     let target = link.destination(false).link.unwrap();
@@ -130,7 +130,7 @@ fn stores_draft_early() {
     );
     assert_eq!(link.remote.draft_id.as_deref(), Some("draft-1"));
     assert_eq!(link.remote.revision_id, Some(3));
-    assert!(link.remote.doi_reserved);
+    assert!(link.remote.identifier_reserved);
     assert_eq!(link.destination(false).draft_id.as_deref(), Some("draft-1"));
 }
 
@@ -174,7 +174,7 @@ fn review_blocks_publishing() {
     };
     link.accept(&state, SystemTime::now());
     assert_eq!(link.remote.review, LinkReview::Accepted);
-    assert!(link.remote.published && !link.remote.doi_reserved);
+    assert!(link.remote.published && !link.remote.identifier_reserved);
     assert_eq!(link.remote.record_id.as_deref(), Some("draft-1"));
 }
 
@@ -489,7 +489,7 @@ fn pull_records_version() {
     assert!(link.pulled(job(1), &v2, revision, now));
     assert_eq!(link.active_job, None);
     assert_eq!(link.remote.record_id.as_deref(), Some("v2"));
-    assert_eq!(link.remote.doi.as_deref(), Some("10.5281/zenodo.2"));
+    assert_eq!(link.remote.identifier.as_deref(), Some("10.5281/zenodo.2"));
     assert_eq!(link.pull().unwrap().revision, Some(revision));
     assert!(!link.update_available() && !link.pull().unwrap().local_changed);
     let patch = LinkPatch {

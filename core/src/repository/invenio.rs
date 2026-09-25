@@ -506,7 +506,10 @@ fn related_identifiers(value: &Value, identity: &ExportIdentity) -> Vec<Value> {
     let mut identifiers = values(value)
         .iter()
         .filter_map(identifier)
-        .filter(|id| id.scheme != "doi" || !identity.published_doi(&id.value))
+        .filter(|id| {
+            SecondaryIdKind::parse(&id.scheme)
+                .is_none_or(|kind| !identity.published(kind, &id.value))
+        })
         .map(|id| {
             let mut id = json!({"scheme": id.scheme, "identifier": id.value});
             let own = identity
