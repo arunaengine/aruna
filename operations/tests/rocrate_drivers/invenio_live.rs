@@ -851,6 +851,28 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     expected.sort();
     assert_eq!(versions, expected);
     assert!(revision.jsonld.contains(&format!("{title} v2")));
+    // Imports name records by version DOI, concept DOI or page URL as well.
+    let resolve = async |reference| {
+        Box::pin(aruna_operations::jobs::invenio::resolve_record(
+            &fixture.context,
+            &auth,
+            fixture.group_id,
+            connector,
+            &reference,
+            1024 * 1024,
+        ))
+        .await
+    };
+    use aruna_operations::jobs::invenio::RecordReference::{Doi, Url};
+    let version_doi = first.doi.clone().ok_or("v1 has no DOI")?;
+    assert_eq!(resolve(Doi(version_doi.to_uppercase())).await?, first.id);
+    let concept = second.concept_doi.clone().ok_or("no concept DOI")?;
+    assert_eq!(
+        resolve(Doi(format!("https://doi.org/{concept}"))).await?,
+        second.id
+    );
+    let page = format!("{}records/{}", endpoint.trim_end_matches("api/"), first.id);
+    assert_eq!(resolve(Url(page)).await?, first.id);
     Box::pin(super::link::run_registration(
         &fixture,
         job,
