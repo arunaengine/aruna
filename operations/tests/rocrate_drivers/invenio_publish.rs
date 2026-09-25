@@ -116,6 +116,45 @@ async fn failed_push_continues() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn busy_reservation_retries() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    server.state.lock().unwrap().busy_reserve = true;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    drain(&fixture).await?;
+    let job_id = current(&fixture, &link)
+        .await
+        .0
+        .active_job
+        .ok_or("no push")?;
+    let storage = &fixture.context.storage_handle;
+    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+        .await?
+        .ok_or("push job missing")?;
+    let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
+        return Err("push job is not an export".into());
+    };
+    let ctx = claim_context(&fixture, job_id, record.payload).await?;
+    assert!(matches!(
+        Box::pin(run_export_job(&ctx, &spec)).await,
+        JobRunOutcome::Failed(error) if error.kind == aruna_core::structs::execution::job::JobErrorKind::Retryable
+    ));
+    let (waiting, _) = current(&fixture, &link).await;
+    // The draft is on the link before its DOI, so the retry continues it.
+    assert_eq!(waiting.remote.draft_id.as_deref(), Some("1"));
+    assert!(!waiting.remote.doi_reserved);
+    assert!(waiting.status == LinkStatus::Enabled && waiting.active_job.is_some());
+
+    succeeded(Box::pin(run_export_job(&ctx, &spec)).await);
+    let (pushed, _) = current(&fixture, &link).await;
+    assert_eq!(pushed.remote.doi.as_deref(), Some("10.1234/1"));
+    assert!(pushed.remote.doi_reserved);
+    assert_eq!(server.state.lock().unwrap().records.len(), 1);
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_edits_accepted() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;

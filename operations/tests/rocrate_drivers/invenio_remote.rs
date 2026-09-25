@@ -26,6 +26,8 @@ pub(super) struct Remote {
     pub(super) community: Option<String>,
     /// Refuses file content like a repository that rejects the upload.
     pub(super) reject_uploads: bool,
+    /// Answers the next DOI reservation with 429, like a busy repository.
+    pub(super) busy_reserve: bool,
     next: u64,
     pub(super) records: BTreeMap<String, Rec>,
     pub(super) calls: Vec<(Method, String)>,
@@ -176,6 +178,9 @@ async fn remote_request(State(state): State<Arc<Mutex<Remote>>>, request: Reques
             state.json(id)
         }
         (Method::POST, ["api", "records", id, "draft", "pids", "doi"]) if draft(&state, id) => {
+            if std::mem::take(&mut state.busy_reserve) {
+                return StatusCode::TOO_MANY_REQUESTS.into_response();
+            }
             let rec = state.records.get_mut(*id).unwrap();
             if rec.reserved {
                 return StatusCode::BAD_REQUEST.into_response();

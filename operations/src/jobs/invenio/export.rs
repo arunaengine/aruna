@@ -75,14 +75,28 @@ pub(crate) async fn repository_export(
                 .await
                 .map_err(TransferError::Retryable)
         };
-        let draft = create_draft(ctx, spec, destination, &jsonld, &identity, fence);
-        let record = interruptible(ctx, draft).await?;
+        // Not interruptible: a created draft must reach the checkpoint and the link.
+        let record = create_draft(ctx, spec, destination, &jsonld, &identity, fence).await?;
         checkpoint.repository = Some(record.clone());
         persist_checkpoint(ctx, checkpoint)
             .await
             .map_err(TransferError::Retryable)?;
         if let Some(target) = &destination.link {
             record_draft(ctx, spec, target, &record).await?;
+        }
+    }
+    if checkpoint.repository_metadata.is_none()
+        && let Some(record) = checkpoint.repository.as_ref().filter(|r| r.doi.is_none())
+    {
+        let reserved = interruptible(ctx, reserve_doi(ctx, spec, destination, record)).await?;
+        if reserved != *record {
+            checkpoint.repository = Some(reserved.clone());
+            persist_checkpoint(ctx, checkpoint)
+                .await
+                .map_err(TransferError::Retryable)?;
+            if let Some(target) = &destination.link {
+                record_draft(ctx, spec, target, &reserved).await?;
+            }
         }
     }
     if checkpoint.repository_metadata.is_none() {
@@ -218,7 +232,7 @@ pub(crate) async fn create_draft(
     } else {
         None
     };
-    let mut record = if let Some(id) = &destination.draft_id {
+    let record = if let Some(id) = &destination.draft_id {
         validate_id(id)?;
         client
             .json(Method::GET, client.url(&["records", id, "draft"])?, None)
@@ -259,24 +273,50 @@ pub(crate) async fn create_draft(
     {
         return Err(invalid("draft identity mismatch"));
     }
-    if !record["pids"]["doi"]["identifier"].is_string() {
-        guard(ctx, spec, destination).await?;
-        let url = client.url(&["records", &id, "draft", "pids", "doi"])?;
-        match client.json(Method::POST, url, None).await {
-            Ok(reserved)
-                if record_id(&reserved)? == id && reserved["parent"]["id"] == parent_id =>
-            {
-                record = reserved;
-            }
-            Ok(_) => return Err(invalid("draft identity changed while reserving its DOI")),
-            Err(error @ (InvenioError::Transport | InvenioError::Status(401 | 403 | 429))) => {
-                return Err(error.into());
-            }
-            // A repository without a DOI provider still publishes; the next push tries again.
-            Err(error) => tracing::warn!(%error, "Reserving the draft DOI failed"),
+    record_from(&client, &record)
+}
+
+/// Reserves the draft's DOI in its own step, after the draft is stored, so a failed
+/// reservation retries without losing the draft.
+async fn reserve_doi(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &InvenioDestination,
+    record: &InvenioRecord,
+) -> Result<InvenioRecord, TransferError> {
+    let credential = destination
+        .credential
+        .as_ref()
+        .ok_or_else(|| invalid("a personal repository login is required"))?;
+    let client = connect(
+        &ctx.driver,
+        &spec.auth_context,
+        destination.group_id,
+        destination.connector_id,
+        Permission::WRITE,
+        spec.limits.metadata_bytes,
+        Some(credential),
+    )
+    .await?;
+    guard(ctx, spec, destination).await?;
+    let url = client.url(&["records", &record.id, "draft", "pids", "doi"])?;
+    match client.json(Method::POST, url, None).await {
+        Ok(reserved)
+            if record_id(&reserved)? == record.id
+                && reserved["parent"]["id"] == record.parent_id.as_str() =>
+        {
+            record_from(&client, &reserved)
+        }
+        Ok(_) => Err(invalid("draft identity changed while reserving its DOI")),
+        Err(error @ (InvenioError::Transport | InvenioError::Status(401 | 403 | 429))) => {
+            Err(error.into())
+        }
+        // A repository without a DOI provider still publishes; the next push tries again.
+        Err(error) => {
+            tracing::warn!(%error, "Reserving the draft DOI failed");
+            Ok(record.clone())
         }
     }
-    record_from(&client, &record)
 }
 
 /// The mandatory fields the dataset's mapped crate lacks with these overrides for the
