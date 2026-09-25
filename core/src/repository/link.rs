@@ -104,6 +104,22 @@ pub struct LinkRemote {
     pub files: Vec<String>,
 }
 
+impl LinkRemote {
+    /// `review` while a review is pending, `draft` while a draft is open, `published` once a
+    /// version is out, else `none`.
+    pub fn state(&self) -> &'static str {
+        if self.review == LinkReview::Pending {
+            "review"
+        } else if self.draft_id.is_some() {
+            "draft"
+        } else if self.published || self.record_id.is_some() {
+            "published"
+        } else {
+            "none"
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LinkPush {
     pub event_id: Ulid,

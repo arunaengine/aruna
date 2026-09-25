@@ -678,6 +678,7 @@ async fn pull_link_routes() {
     assert_eq!(view.direction, "pull");
     assert_eq!(view.auto_update, Some(false));
     assert_eq!(view.remote.record_id.as_deref(), Some("v1"));
+    assert_eq!(view.remote.state, "published");
     assert_eq!(view.remote.latest_remote_id.as_deref(), Some("v1"));
     assert_eq!((view.reason, view.pending), (None, false));
     // Push actions and push settings do not apply to a pull link.
@@ -723,6 +724,7 @@ async fn pull_link_routes() {
         .await
         .unwrap();
     assert_eq!(push.direction, "push");
+    assert_eq!(push.remote.state, "none");
     let resume = PatchLinkRequest {
         paused: Some(false),
         ..PatchLinkRequest::default()

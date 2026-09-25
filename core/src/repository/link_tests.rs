@@ -135,6 +135,22 @@ fn stores_draft_early() {
 }
 
 #[test]
+fn derives_remote_state() {
+    let mut link = link();
+    assert_eq!(link.remote.state(), "none");
+    link.adopt(&record("draft-1", false, Some("10.1/r")));
+    assert_eq!(link.remote.state(), "draft");
+    link.remote.review = LinkReview::Pending;
+    assert_eq!(link.remote.state(), "review");
+    link.remote.review = LinkReview::Accepted;
+    link.adopt(&record("draft-1", true, Some("10.1/r")));
+    assert_eq!(link.remote.state(), "published");
+    // The next version's draft is open again while the last version stays published.
+    link.adopt(&record("draft-2", false, Some("10.1/s")));
+    assert_eq!(link.remote.state(), "draft");
+}
+
+#[test]
 fn review_blocks_publishing() {
     let mut link = link();
     link.auto_publish = true;

@@ -104,6 +104,9 @@ pub struct PatchLinkRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LinkRemoteResponse {
+    /// Derived: review while a review is pending, draft while a draft is open, published once a
+    /// version is out, else none.
+    pub state: String,
     pub parent_id: Option<String>,
     pub draft_id: Option<String>,
     /// The last version this link published.
@@ -187,7 +190,7 @@ pub(super) fn link_example() -> serde_json::Value {
         "created_by": "01JUSER01ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
         "kind": "invenio", "direction": "push",
         "status": "enabled", "auto_publish": false, "public_files": false, "pending": false,
-        "remote": {"parent_id": "abcde-12345", "draft_id": "fghij-67890", "record_id": null,
+        "remote": {"state": "draft", "parent_id": "abcde-12345", "draft_id": "fghij-67890", "record_id": null,
             "doi": "10.5281/zenodo.123457", "doi_reserved": true,
             "concept_doi": "10.5281/zenodo.123456",
             "record_url": "https://zenodo.org/uploads/fghij-67890", "published": false,
@@ -218,6 +221,7 @@ pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> Repos
         LinkStatus::Paused => ("paused", None),
         LinkStatus::Failed { reason } => ("failed", Some(reason.reason().to_string())),
     };
+    let state = link.remote.state().to_string();
     let LinkRemote {
         parent_id,
         draft_id,
@@ -254,6 +258,7 @@ pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> Repos
             .and_then(|pull| pull.last_checked_at)
             .map(timestamp),
         remote: LinkRemoteResponse {
+            state,
             parent_id,
             draft_id,
             record_id,
