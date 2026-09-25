@@ -105,8 +105,9 @@ enum ExportPhase {
     Publish,
 }
 
+/// Progress an export job keeps under its id; public so the doctor can migrate stored rows.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ExportCheckpoint {
+pub struct ExportCheckpoint {
     pub(crate) repository_started: bool,
     pub(crate) repository_complete: bool,
     pub(crate) repository_metadata: Option<[u8; 32]>,

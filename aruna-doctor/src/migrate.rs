@@ -11,14 +11,14 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, sea
 use aruna_core::keyspaces::{
     BACKEND_SECRET_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
     FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    ID_MAPPING_KEYSPACE, NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE, SECONDARY_ID_KEYSPACE,
-    SOURCE_SECRET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, SECONDARY_ID_KEYSPACE, SOURCE_SECRET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
-    JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
+    JobRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use ulid::Ulid;
 
+mod jobs;
 mod mappings;
 
 #[derive(Debug, Serialize)]
@@ -60,6 +61,12 @@ pub struct MigrateOutput {
     /// Identifier index rows written or removed so the index matches the mappings.
     pub identifier_index_written: usize,
     pub identifier_index_removed: usize,
+    /// Local job records; export jobs gain empty repository fields.
+    pub jobs_scanned: usize,
+    pub jobs_rewritten: usize,
+    /// Checkpoints of RO-Crate import and export jobs.
+    pub checkpoints_scanned: usize,
+    pub checkpoints_rewritten: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -84,6 +91,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let mapping_rows = db.keyspace(ID_MAPPING_KEYSPACE, KeyspaceCreateOptions::default)?;
     let outbox_rows = db.keyspace(SYNC_OUTBOX_KEYSPACE, KeyspaceCreateOptions::default)?;
     let index_rows = db.keyspace(SECONDARY_ID_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let job_rows = db.keyspace(JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let state_rows = db.keyspace(JOB_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -106,6 +115,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         &index_rows,
         ID_MAPPING_KEYSPACE,
     )?;
+    let jobs = rewrites::<JobRecord, jobs::LegacyJob>(&db, &job_rows, JOB_KEYSPACE)?;
+    let kinds = jobs::checkpoint_kinds(&db, &job_rows, &jobs.rows, JOB_KEYSPACE)?;
+    let checkpoints = jobs::checkpoint_rows(&db, &state_rows, &kinds, JOB_STATE_KEYSPACE)?;
     let secret_key = node_key(&db)?;
     let mut secrets = Vec::new();
     let mut secrets_skipped = Vec::new();
@@ -124,6 +136,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&mapping_rows, &mappings.rows),
         (&outbox_rows, &outbox.rows),
         (&index_rows, &index.writes),
+        (&job_rows, &jobs.rows),
+        (&state_rows, &checkpoints.rows),
     ]
     .into_iter()
     .chain(
@@ -165,6 +179,10 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         outbox_rewritten: outbox.rows.len(),
         identifier_index_written: index.writes.len(),
         identifier_index_removed: index.removes.len(),
+        jobs_scanned: jobs.scanned,
+        jobs_rewritten: jobs.rows.len(),
+        checkpoints_scanned: checkpoints.scanned,
+        checkpoints_rewritten: checkpoints.rows.len(),
     })
 }
 

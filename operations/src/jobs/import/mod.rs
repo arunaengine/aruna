@@ -123,8 +123,9 @@ struct ImportPlan {
     entries: Vec<ImportEntryPlan>,
 }
 
+/// Progress an import job keeps under its id; public so the doctor can migrate stored rows.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ImportCheckpoint {
+pub struct ImportCheckpoint {
     refs: RoCrateCheckpointRefs,
     phase: ImportPhase,
     input: Option<ImportInput>,
