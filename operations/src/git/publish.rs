@@ -113,21 +113,18 @@ pub async fn publish(
     if let Some(entry) = shard_manifest_entry(&target, &change).map_err(|_| GitError::Invalid)? {
         writes.push(entry);
     }
-    let peers: Vec<_> = peers.into_iter().filter(|peer| *peer != node_id).collect();
-    if !peers.is_empty() {
-        let outbox = new_outbox_record(
-            node_id,
-            target,
-            peers,
-            DocumentOutboxEvent::Upsert { bytes, change },
-            record.placement,
-            false,
-        )
-        .fenced_at(
-            crate::placement::fence::write_generation(&config, &record.placement).unwrap_or(0),
-        );
-        writes.push(outbox_write_entry(&outbox).map_err(|_| GitError::Invalid)?);
-    }
+    // Every record goes onto the document topic, even with no co-holder yet, so holders
+    // that join later receive it through topic sync.
+    let outbox = new_outbox_record(
+        node_id,
+        target,
+        peers,
+        DocumentOutboxEvent::Upsert { bytes, change },
+        record.placement,
+        false,
+    )
+    .fenced_at(crate::placement::fence::write_generation(&config, &record.placement).unwrap_or(0));
+    writes.push(outbox_write_entry(&outbox).map_err(|_| GitError::Invalid)?);
     records::commit(context, writes).await?;
     if let Some(tasks) = context.task_handle.as_ref() {
         // The record is durable; a missed wake-up only delays replication to the next drain.
