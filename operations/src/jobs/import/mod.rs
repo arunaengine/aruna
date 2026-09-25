@@ -235,30 +235,30 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                     checkpoint.input = Some(input);
                     checkpoint.phase = ImportPhase::Inspect;
                 }),
-            ImportPhase::Inspect => {
-                inspect_source(ctx, spec, &checkpoint)
-                    .await
-                    .map(|(inspection, metadata_json)| {
-                        checkpoint.inspection = Some(inspection);
-                        checkpoint.metadata_json = Some(metadata_json);
-                        checkpoint.phase = ImportPhase::Validate;
-                    })
-            }
-            ImportPhase::Validate => match validate_source(ctx, spec, &mut checkpoint).await {
-                Ok(validated) => {
-                    plan = Some(validated);
-                    Ok(())
+            ImportPhase::Inspect => Box::pin(inspect_source(ctx, spec, &checkpoint)).await.map(
+                |(inspection, metadata_json)| {
+                    checkpoint.inspection = Some(inspection);
+                    checkpoint.metadata_json = Some(metadata_json);
+                    checkpoint.phase = ImportPhase::Validate;
+                },
+            ),
+            ImportPhase::Validate => {
+                match Box::pin(validate_source(ctx, spec, &mut checkpoint)).await {
+                    Ok(validated) => {
+                        plan = Some(validated);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
             ImportPhase::Write => match plan.as_ref() {
-                Some(plan) => write_next(ctx, spec, &mut checkpoint, plan).await,
+                Some(plan) => Box::pin(write_next(ctx, spec, &mut checkpoint, plan)).await,
                 None => Err(ImportFailure::Permanent(
                     "import plan is missing".to_string(),
                 )),
             },
             ImportPhase::Rewrite => match plan.as_ref() {
-                Some(plan) => rewrite_crate(ctx, spec, &mut checkpoint, plan).await,
+                Some(plan) => Box::pin(rewrite_crate(ctx, spec, &mut checkpoint, plan)).await,
                 None => Err(ImportFailure::Permanent(
                     "import plan is missing".to_string(),
                 )),
@@ -269,8 +269,10 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                     "import plan is missing".to_string(),
                 )),
             },
-            ImportPhase::Create => create_document(ctx, spec, &mut checkpoint).await,
-            ImportPhase::Cleanup => cleanup_source(ctx, spec, plan.as_ref(), &mut checkpoint).await,
+            ImportPhase::Create => Box::pin(create_document(ctx, spec, &mut checkpoint)).await,
+            ImportPhase::Cleanup => {
+                Box::pin(cleanup_source(ctx, spec, plan.as_ref(), &mut checkpoint)).await
+            }
             ImportPhase::Done => return import_outcome(&checkpoint, spec),
         };
 
