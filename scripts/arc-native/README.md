@@ -75,6 +75,31 @@ one CRDT actor, so vector clocks grow with the number of writing nodes, not with
 Git records use the same idea: near 1024 records, a holder writes a Git checkpoint with the
 current refs, packs and locks.
 
+## Versions API
+
+The same history is available as plain JSON under `/api/v1/metadata/{document_id}`, without
+Git. A version is one commit. `main` holds the live metadata, `aruna` holds the graph
+snapshots, and other branches are drafts. Branch and tag names in paths are URL-encoded.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /versions?branch=&limit=&cursor=` | Versions of a branch, newest first |
+| `GET /versions/{version}` | One version and the files it changed |
+| `GET /versions/{version}/rocrate` | The ISA-derived RO-Crate of a version |
+| `GET /compare?from=&to=` | Changed entities, properties and files between two versions |
+| `GET`, `POST /branches`; `DELETE /branches/{name}` | List, create and delete branches |
+| `PUT /branches/{name}/rocrate` | Save new metadata on a draft branch as a new version |
+| `POST /branches/{name}/merge` | Merge into another branch; merging into `main` updates the live metadata |
+| `GET`, `POST /tags`; `DELETE /tags/{name}` | List, create and delete tags |
+| `GET /conflicts`; `POST /conflicts/{id}/merge`; `DELETE /conflicts/{id}` | Review, merge or discard kept conflicts |
+
+Writes accept `If-Match` with the branch head the client last saw and answer 412 when the
+branch moved. A merge answers 409 when both sides changed the same metadata property to
+different values, or the same non-metadata file. Nothing changes then. Edit the draft to the
+wanted values and merge again. Workbook and RO-Crate file conflicts are resolved by merging
+the metadata and generating those files again. Server-made versions name the Aruna user in
+an `Aruna-User` commit trailer, shown as `author.user_id`.
+
 ## Metadata representation
 
 The implementation follows DataPLANT's [ISA RO-Crate mapping](https://github.com/nfdi4plants/isa-ro-crate-profile/blob/release/profile/isa_ro_crate_mapping.md)
