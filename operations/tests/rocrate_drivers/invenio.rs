@@ -51,8 +51,8 @@ struct Repository {
     partial_metadata: bool,
     file_name: Option<String>,
     redirect: Option<String>,
-    head_started: Option<Arc<tokio::sync::Notify>>,
-    head_release: Option<Arc<tokio::sync::Notify>>,
+    content_started: Option<Arc<tokio::sync::Notify>>,
+    content_release: Option<Arc<tokio::sync::Notify>>,
 }
 
 struct Server {
@@ -150,10 +150,13 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             state.lock().unwrap().revision.max(1).to_string()
         );
     }
-    if request.method() == Method::HEAD {
+    if request.uri().path().ends_with("/content") {
         let wait = {
             let state = state.lock().unwrap();
-            state.head_started.clone().zip(state.head_release.clone())
+            state
+                .content_started
+                .clone()
+                .zip(state.content_release.clone())
         };
         if let Some((started, release)) = wait {
             started.notify_one();

@@ -406,8 +406,8 @@ async fn invenio_cancels_reference() -> Result<(), Box<dyn std::error::Error>> {
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let server = serve(Repository {
-        head_started: Some(started.clone()),
-        head_release: Some(release.clone()),
+        content_started: Some(started.clone()),
+        content_release: Some(release.clone()),
         ..Default::default()
     })
     .await;
@@ -444,18 +444,19 @@ async fn invenio_cancels_reference() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[tokio::test]
-async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::invenio::{InvenioOptions, InvenioPull, PullCheck, crate_versions};
+/// Imports record 1 with a pull link and queues the pull of version 2.
+/// Returns the claimed pull job and the dataset revision it is based on.
+async fn start_update(
+    fixture: &Fixture,
+    server: &Server,
+) -> Result<(JobContext, ImportRoCrateSpec, Ulid), Box<dyn std::error::Error>> {
+    use aruna_core::invenio::{InvenioOptions, InvenioPull, PullCheck};
     use aruna_operations::jobs::invenio::link_queue::current_event;
     use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
     use aruna_operations::jobs::invenio::pull::start_pull;
-    use aruna_operations::metadata::raw_revision::load_raw_revision;
-    let fixture = build_fixture(false).await?;
-    let server = serve(Repository::default()).await;
-    let connector_id = connector(&fixture, &server).await;
+    let connector_id = connector(fixture, server).await;
     let spec = spec_with_source(
-        &fixture,
+        fixture,
         ImportRoCrateSource::Invenio {
             group_id: fixture.group_id,
             connector_id,
@@ -471,7 +472,7 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
         },
         doc_id(1),
     );
-    let ctx = claim_context(&fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
+    let ctx = claim_context(fixture, job_id(), JobPayload::ImportRoCrate(spec.clone())).await?;
     super::link::succeeded(Box::pin(run_rocrate_import(&ctx, &spec)).await);
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
@@ -506,7 +507,18 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
     let JobPayload::ImportRoCrate(update) = record.payload.clone() else {
         return Err("pull job is not an import".into());
     };
-    let ctx = claim_context(&fixture, pull, record.payload).await?;
+    let ctx = claim_context(fixture, pull, record.payload).await?;
+    Ok((ctx, update, first))
+}
+
+#[tokio::test]
+async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::invenio::crate_versions;
+    use aruna_operations::jobs::invenio::links::list_links;
+    use aruna_operations::metadata::raw_revision::load_raw_revision;
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let (ctx, update, _) = start_update(&fixture, &server).await?;
     super::link::succeeded(Box::pin(run_rocrate_import(&ctx, &update)).await);
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
@@ -534,7 +546,9 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
         );
         assert_eq!(object_versions(&fixture, &key).await?.len(), 1, "{key}");
     }
-    let (pulled, _) = list_links(storage, doc_id(1)).await?.remove(0);
+    let (pulled, _) = list_links(&fixture.context.storage_handle, doc_id(1))
+        .await?
+        .remove(0);
     assert_eq!(pulled.active_job, None);
     assert_eq!(pulled.remote.record_id.as_deref(), Some("2"));
     assert_eq!(pulled.remote.doi.as_deref(), Some("10.1234/2"));
@@ -543,5 +557,128 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
         pulled.pull().and_then(|pull| pull.revision),
         Some(revision.winning_event_id)
     );
+    Ok(())
+}
+
+/// Adds a contextual entity through the normal update, without materializing it.
+async fn add_note(fixture: &Fixture, name: &str) -> Result<Ulid, Box<dyn std::error::Error>> {
+    use aruna_operations::metadata::update_document::{
+        UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
+    };
+    let note =
+        json!({"@id": format!("https://example.org/{name}"), "@type": "Thing", "name": name});
+    let record = drive(
+        UpdateDocumentOperation::new(UpdateDocumentConfig {
+            actor: fixture.actor.clone(),
+            group_id: fixture.group_id,
+            document_id: doc_id(1),
+            public: false,
+            mutation: UpdateDocumentMutation::UpsertContextualEntity {
+                jsonld: note.to_string(),
+            },
+            expected_revision: None,
+        }),
+        &fixture.context,
+    )
+    .await?;
+    Ok(record.last_event_id)
+}
+
+#[tokio::test]
+async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::invenio::crate_versions;
+    use aruna_operations::metadata::raw_revision::load_raw_revision;
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let (ctx, update, _) = start_update(&fixture, &server).await?;
+    // A materialized batch makes the rendered graph the revision the pull reads.
+    add_note(&fixture, "earlier-edit").await?;
+    replay_event_log(fixture.context.as_ref()).await?;
+    process_materialization_batch(fixture.context.as_ref()).await?;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = server.state.lock().unwrap();
+        state.content_started = Some(started.clone());
+        state.content_release = Some(release.clone());
+    }
+    let task = tokio::spawn(async move { Box::pin(run_rocrate_import(&ctx, &update)).await });
+    // This edit lands after the pull read its base and is not rendered yet, so the pull's own
+    // re-read still sees the base and only the update's revision guard can catch it.
+    tokio::time::timeout(std::time::Duration::from_secs(120), started.notified()).await?;
+    let racing = add_note(&fixture, "racing-edit").await?;
+    release.notify_one();
+    let JobRunOutcome::Failed(error) =
+        tokio::time::timeout(std::time::Duration::from_secs(120), task).await??
+    else {
+        return Err("a pull over a newer edit must fail".into());
+    };
+    assert!(
+        error.message.contains("changed while the pull updated it"),
+        "{}",
+        error.message
+    );
+    replay_event_log(fixture.context.as_ref()).await?;
+    process_materialization_batch(fixture.context.as_ref()).await?;
+
+    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
+        .await?
+        .ok_or("revision missing")?;
+    let document: Value = serde_json::from_str(&revision.jsonld)?;
+    assert_eq!(crate_versions(&document), ["1"]);
+    assert_eq!(revision.winning_event_id, racing);
+    let key = format!(
+        "imported/{}",
+        aruna_core::invenio::file_path("2", "data.txt")?
+    );
+    assert!(object_versions(&fixture, &key).await?.is_empty());
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::invenio::{LinkPatch, LinkStatus, crate_versions};
+    use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
+    use aruna_operations::metadata::raw_revision::load_raw_revision;
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let (ctx, update, first) = start_update(&fixture, &server).await?;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = server.state.lock().unwrap();
+        state.content_started = Some(started.clone());
+        state.content_release = Some(release.clone());
+    }
+    let task = tokio::spawn(async move { Box::pin(run_rocrate_import(&ctx, &update)).await });
+    // The pull is downloading version 2 when the link is paused.
+    tokio::time::timeout(std::time::Duration::from_secs(120), started.notified()).await?;
+    let (link, _) = list_links(&fixture.context.storage_handle, doc_id(1))
+        .await?
+        .remove(0);
+    let paused = LinkPatch {
+        paused: Some(true),
+        ..LinkPatch::default()
+    };
+    change_link(fixture.context.as_ref(), &link, LinkChange::Patch(paused)).await?;
+    release.notify_one();
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(120), task).await??,
+        JobRunOutcome::Cancelled
+    ));
+
+    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
+        .await?
+        .ok_or("revision missing")?;
+    assert_eq!(revision.winning_event_id, first);
+    let document: Value = serde_json::from_str(&revision.jsonld)?;
+    assert_eq!(crate_versions(&document), ["1"]);
+    let (stopped, _) = list_links(&fixture.context.storage_handle, doc_id(1))
+        .await?
+        .remove(0);
+    assert_eq!(stopped.status, LinkStatus::Paused);
+    assert_eq!(stopped.active_job, None);
+    fixture.stop().await;
     Ok(())
 }
