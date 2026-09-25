@@ -939,13 +939,18 @@ impl UpdateDocumentOperation {
 static UPDATE_LOCKS: std::sync::LazyLock<[tokio::sync::Mutex<()>; 64]> =
     std::sync::LazyLock::new(|| std::array::from_fn(|_| tokio::sync::Mutex::new(())));
 
+/// Serializes this node's writes to one document, so its actor's dots stay in order.
+pub(crate) async fn document_lock(document_id: Ulid) -> tokio::sync::MutexGuard<'static, ()> {
+    UPDATE_LOCKS[usize::from(document_id.to_bytes()[15]) % 64]
+        .lock()
+        .await
+}
+
 pub async fn update_metadata_document(
     mut operation: UpdateDocumentOperation,
     context: &DriverContext,
 ) -> Result<MetadataRegistryRecord, UpdateDocumentError> {
-    // One update per document at a time on this node keeps its actor's dots in order.
-    let lock = usize::from(operation.config.document_id.to_bytes()[15]) % 64;
-    let _guard = UPDATE_LOCKS[lock].lock().await;
+    let _guard = document_lock(operation.config.document_id).await;
     operation.route_profile_status = Some(match &operation.config.mutation {
         UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
             validate_submission(
