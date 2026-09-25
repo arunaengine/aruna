@@ -1,4 +1,4 @@
-//! Tests Invenio link routes for authorization, token secrecy and connector protection.
+//! Tests repository link routes for authorization, token secrecy and connector protection.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

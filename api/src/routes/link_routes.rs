@@ -1,4 +1,4 @@
-//! Changes one Invenio link: read, configure, remove, push, publish and replace its token.
+//! Changes one repository link: read, configure, remove, push, publish and replace its token.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -74,7 +74,7 @@ async fn cancel_push(state: &ServerState, link: &RepositoryLink) {
 #[utoipa::path(
     get, path = "/metadata/{document_id}/repository/links/{link_id}", tag = "metadata/repository",
     summary = "Read one repository link",
-    description = r#"Returns one Invenio link of the dataset.
+    description = r#"Returns one repository link of the dataset.
 
 **Authentication**
 

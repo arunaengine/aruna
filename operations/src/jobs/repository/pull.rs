@@ -147,7 +147,7 @@ pub async fn start_pull(
         .as_ref()
         .map_or(link.owner_node, |net| net.node_id());
     let key = format!(
-        "invenio-pull/{}/{record_id}/{}",
+        "repository-pull/{}/{record_id}/{}",
         link.link_id, link.sequence
     );
     let submitted = submit_rocrate_import(context, spec, owner, Some(key))

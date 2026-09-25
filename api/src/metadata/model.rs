@@ -369,7 +369,7 @@ pub struct RoCrateExportParams {
 #[serde(deny_unknown_fields)]
 #[schema(as = SubmitRoCrateExportRequest)]
 pub struct SubmitExportRequest {
-    /// Set only by the Invenio export route; this route refuses it as an unknown field.
+    /// Set only by the repository export route; this route refuses it as an unknown field.
     #[serde(skip)]
     pub destination: Option<RepositoryExportRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

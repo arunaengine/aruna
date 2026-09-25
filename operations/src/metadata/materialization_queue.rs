@@ -803,7 +803,7 @@ async fn plan_finish_chunk(
         .await
     {
         Ok(rows) => plan.writes.extend(rows),
-        Err(error) => warn!(%error, "Failed to queue Invenio link pushes after materialization"),
+        Err(error) => warn!(%error, "Failed to queue repository link pushes after materialization"),
     }
     plan.superseding = superseding;
     Ok(plan)

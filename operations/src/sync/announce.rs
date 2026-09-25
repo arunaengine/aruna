@@ -368,7 +368,7 @@ impl AnnounceTopicOperation {
                     .map_err(AnnounceTopicError::ConversionError)?;
                 if link.document_id != *document_id || link.link_id != *link_id {
                     return Err(AnnounceTopicError::DocumentSync(format!(
-                        "invenio link target {document_id}/{link_id} does not match its payload"
+                        "repository link target {document_id}/{link_id} does not match its payload"
                     )));
                 }
                 Ok(link.sync_change(self.placement))

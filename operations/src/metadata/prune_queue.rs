@@ -364,7 +364,7 @@ async fn process_prune_job(
     let pruned = match metadata_handle.prune_if_deleted(graph_iri.clone()).await {
         Ok(_) => queue_deleted(context, &graph_iri)
             .await
-            .map_err(|error| format!("queueing the Invenio links failed: {error}")),
+            .map_err(|error| format!("queueing the repository links failed: {error}")),
         Err(error) => Err(error.to_string()),
     };
     match pruned {

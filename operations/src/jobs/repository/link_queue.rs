@@ -167,7 +167,7 @@ pub async fn drain_links(context: &Arc<DriverContext>) -> Result<Option<Duration
             let retry_at = match check_link(context, link_id, &entry, &value, now).await {
                 Ok(retry_at) => retry_at,
                 Err(error) => {
-                    warn!(%link_id, %error, "Invenio link push check failed");
+                    warn!(%link_id, %error, "Repository link push check failed");
                     Some(now.saturating_add(ERROR_RETRY_MS))
                 }
             };
@@ -582,7 +582,7 @@ pub async fn restore_link_timer(storage: &StorageHandle, task_handle: &TaskHandl
     let mut start = None;
     loop {
         let Ok((values, next_start)) = scan_queue(storage, start).await else {
-            warn!("Failed to scan the Invenio link queue");
+            warn!("Failed to scan the repository link queue");
             return;
         };
         for (_, value) in values {
@@ -601,7 +601,7 @@ pub async fn restore_link_timer(storage: &StorageHandle, task_handle: &TaskHandl
         .send_effect(schedule_drain(due_after(now, due)))
         .await
     {
-        warn!(%message, "Failed to arm the Invenio link queue");
+        warn!(%message, "Failed to arm the repository link queue");
     }
 }
 

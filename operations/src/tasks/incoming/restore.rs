@@ -529,12 +529,12 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
-    /// Starts the Invenio link pushes whose debounce elapsed and re-arms for the next one.
+    /// Starts the repository link pushes whose debounce elapsed and re-arms for the next one.
     pub(super) async fn drain_link_queue(&self) {
         let after = match crate::jobs::repository::link_queue::drain_links(&self.context).await {
             Ok(after) => after,
             Err(error) => {
-                warn!(task_id = ?TaskKey::DrainLinkQueue, %error, "Failed to drain Invenio link queue");
+                warn!(task_id = ?TaskKey::DrainLinkQueue, %error, "Failed to drain repository link queue");
                 Some(LINK_RETRY_AFTER)
             }
         };

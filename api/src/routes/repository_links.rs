@@ -1,4 +1,4 @@
-//! Lasting Invenio links that push later dataset changes to one repository record lineage.
+//! Lasting repository links that push later dataset changes to one repository record lineage.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -521,7 +521,7 @@ pub(super) async fn job_response(
 
 #[utoipa::path(
     post, path = "/metadata/{document_id}/repository/links", tag = "metadata/repository",
-    summary = "Link a dataset to an Invenio repository",
+    summary = "Link a dataset to a repository",
     description = r#"Creates a lasting link that pushes each later dataset change to one open repository draft.
 
 **Authentication**
@@ -660,7 +660,7 @@ pub async fn create_link(
 #[utoipa::path(
     get, path = "/metadata/{document_id}/repository/links", tag = "metadata/repository",
     summary = "List the repository links of a dataset",
-    description = r#"Lists the Invenio links this node keeps for the dataset.
+    description = r#"Lists the repository links this node keeps for the dataset.
 
 **Authentication**
 

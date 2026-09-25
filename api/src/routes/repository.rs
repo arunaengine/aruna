@@ -217,7 +217,7 @@ pub struct SubmitRepositoryExport {
 
 #[utoipa::path(
     post, path = "/metadata/repository/imports", tag = "metadata/repository",
-    summary = "Import Invenio metadata and data",
+    summary = "Import a repository record",
     description = r#"Imports repository metadata and optional data through a durable crate job.
 
 **Authentication**
@@ -338,7 +338,7 @@ pub async fn import_record(
 
 #[utoipa::path(
     post, path = "/metadata/{document_id}/repository/exports", tag = "metadata/repository",
-    summary = "Export native Invenio metadata and files",
+    summary = "Export a dataset as a repository record",
     description = r#"Exports mapped crate metadata and individual files to a native repository record.
 
 **Authentication**

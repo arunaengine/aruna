@@ -553,7 +553,7 @@ impl RepositoryLink {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_millis());
         format!(
-            "invenio-link/{}/{event_id}/{}/{updated}/{action}",
+            "repository-link/{}/{event_id}/{}/{updated}/{action}",
             self.link_id, self.sequence
         )
     }

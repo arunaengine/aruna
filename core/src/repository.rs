@@ -54,7 +54,7 @@ impl Default for ImportOptions {
     }
 }
 
-/// How an Invenio import relates to a pull link.
+/// How a repository import relates to a pull link.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RepositoryPull {
     /// After the import, a new pull link keeps the dataset updated from the lineage.
@@ -131,7 +131,7 @@ pub struct RepositoryError(pub &'static str);
 /// send, so the document itself is never edited and a push never causes another push.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExportIdentity {
-    /// The dataset's active w3id PID; Invenio exports relate it as `isidenticalto`.
+    /// The dataset's active w3id PID; exports relate the record to it as the same dataset.
     pub own: Vec<String>,
     /// Registered repository identifiers of the dataset.
     pub identifiers: Vec<SecondaryIdentifier>,

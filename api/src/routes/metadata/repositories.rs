@@ -344,7 +344,7 @@ pub async fn replace_repository(
 
 **Behavior**
 - Repeating the call answers 404.
-- A connector that Invenio links on this node still use is kept and answers 409.
+- A connector that repository links on this node still use is kept and answers 409.
 - Existing reference imports keep their repository file URLs and read them without the removed
   token from then on."#,
     params(
@@ -357,7 +357,7 @@ pub async fn replace_repository(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "No such connector in this group", body = ErrorResponse),
-        (status = 409, description = "Invenio links still use the connector", body = ErrorResponse)
+        (status = 409, description = "Repository links still use the connector", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
