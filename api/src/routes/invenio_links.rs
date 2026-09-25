@@ -227,7 +227,8 @@ pub(super) fn response(link: InvenioLink, queued: bool, holds: bool) -> InvenioL
         warning: link.warning,
         auto_publish: link.auto_publish,
         public_files: link.public_files,
-        pending: queued || link.active_job.is_some(),
+        // A pull link always has its next check queued, so only a running pull is pending.
+        pending: (queued && pull.is_none()) || link.active_job.is_some(),
         auto_update: pull.as_ref().map(|pull| pull.auto_update),
         last_checked_at: pull
             .as_ref()

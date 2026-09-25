@@ -33,6 +33,8 @@ use crate::placement::fence;
 use crate::sync::document_outbox::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
 const LINK_PAGE: usize = 256;
+/// How long a pull check waits for a running pull before it looks again.
+const PULL_ACTIVE_MS: u64 = 60_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkChange {
@@ -127,8 +129,6 @@ pub struct ChangeLinkOperation {
     txn_id: Option<TxnId>,
     deletes: Vec<(String, Key)>,
     schedule: bool,
-    /// The change needs a pull check soon, so the pull timer fires now.
-    pull_check: bool,
     route: Option<MappingRoute>,
     stored: Option<InvenioLink>,
     queued: Option<LinkQueueEntry>,
@@ -147,7 +147,6 @@ impl ChangeLinkOperation {
             txn_id: None,
             deletes: Vec::new(),
             schedule: false,
-            pull_check: false,
             route: None,
             stored: None,
             queued: None,
@@ -194,8 +193,6 @@ impl ChangeLinkOperation {
                     ByteView::from(link.document_id.to_bytes().to_vec()),
                 ));
                 queue = link.pull().is_none().then_some(now_ms);
-                // A new pull link arms the check, which then waits for its first due time.
-                self.pull_check = link.pull().is_some();
                 Some(*link)
             }
             (LinkChange::Create { .. }, Some(_)) => return Err(LinkError::Exists),
@@ -295,12 +292,27 @@ impl ChangeLinkOperation {
             link.stamp(now_ms);
             link
         });
-        // Pull links never push; a change that would look for work checks the repository instead.
-        if let Some(pull) = result.as_mut().and_then(InvenioLink::pull_mut)
-            && queue.take().is_some()
-        {
-            pull.next_check_ms = pull.next_check_ms.min(now_ms);
-            self.pull_check = true;
+        // Pull links never push: their queue row holds the next repository check, and a change
+        // that would look for work checks now. A running pull is looked at again later.
+        let mut replace = false;
+        if let Some(link) = result.as_mut().filter(|link| link.pull().is_some()) {
+            let look_now = queue.take().is_some();
+            let running = link.active_job.is_some();
+            let enabled = link.status == LinkStatus::Enabled;
+            if let Some(pull) = link.pull_mut().filter(|_| enabled) {
+                if look_now {
+                    pull.next_check_ms = pull.next_check_ms.min(now_ms);
+                }
+                queue = Some(if running {
+                    now_ms.saturating_add(PULL_ACTIVE_MS)
+                } else {
+                    pull.next_check_ms
+                });
+                replace = true;
+                self.deletes.retain(|row| row != &queue_row);
+            } else if !self.deletes.contains(&queue_row) {
+                self.deletes.push(queue_row.clone());
+            }
         }
         if let Some(link) = &result {
             let bytes = link.to_bytes()?;
@@ -311,8 +323,8 @@ impl ChangeLinkOperation {
             writes.push((link_row.0, link_row.1, ByteView::from(bytes)));
         }
         if let Some(due_at_ms) = queue {
-            // A change queued meanwhile keeps its earlier due time.
-            let queued = self.queued.take();
+            // A change queued meanwhile keeps its earlier due time; a pull check is replaced.
+            let queued = self.queued.take().filter(|_| !replace);
             let entry = LinkQueueEntry {
                 document_id: self.document_id,
                 due_at_ms: queued
@@ -452,9 +464,6 @@ impl Operation for ChangeLinkOperation {
                 if self.schedule {
                     effects.push(schedule_drain(Duration::ZERO));
                 }
-                if self.pull_check {
-                    effects.push(schedule_pulls(Duration::ZERO));
-                }
                 if self
                     .route
                     .as_ref()
@@ -514,13 +523,6 @@ impl Operation for ChangeLinkOperation {
 pub fn schedule_drain(after: Duration) -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainLinkQueue,
-        after,
-    })
-}
-
-pub fn schedule_pulls(after: Duration) -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::CheckPullLinks,
         after,
     })
 }

@@ -61,7 +61,6 @@ async fn durable_rearm_loop(
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
         crate::jobs::invenio::link_queue::restore_link_timer(&context.storage_handle, &task_handle)
             .await;
-        crate::jobs::invenio::pull::restore_pull_timer(&context, &task_handle).await;
     }
 }
 
@@ -538,20 +537,6 @@ impl OperationsTaskHandler {
         };
         if let Some(after) = after {
             self.reschedule_timer(TaskKey::DrainLinkQueue, after).await;
-        }
-    }
-
-    /// Checks the pull links that are due and re-arms for the next one.
-    pub(super) async fn check_pull_links(&self) {
-        let after = match crate::jobs::invenio::pull::drain_pulls(&self.context).await {
-            Ok(after) => after,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::CheckPullLinks, %error, "Failed to check Invenio pull links");
-                Some(LINK_RETRY_AFTER)
-            }
-        };
-        if let Some(after) = after {
-            self.reschedule_timer(TaskKey::CheckPullLinks, after).await;
         }
     }
 }

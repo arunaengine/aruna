@@ -53,7 +53,6 @@ fn timer_is_restored(effect: &TaskEffect) -> bool {
             | TaskKey::DrainMirrorRepair
             | TaskKey::DrainDeviceIntake
             | TaskKey::DrainLinkQueue
-            | TaskKey::CheckPullLinks
     )
 }
 

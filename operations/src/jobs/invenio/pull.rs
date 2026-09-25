@@ -3,28 +3,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use aruna_blob::invenio::InvenioError;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::invenio::{
     InvenioLink, InvenioPull, LinkFailure, LinkStatus, PullCheck, PushOutcome,
 };
-use aruna_core::keyspaces::INVENIO_LINK_KEYSPACE;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobState,
 };
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::task::TaskEvent;
-use aruna_core::time::unix_timestamp_millis;
-use aruna_tasks::TaskHandle;
 use http::Method;
-use tracing::warn;
 
-use super::link_queue::{current_event, document_gone, ensure_holder};
-use super::links::{LinkChange, LinkError, change_link, ensure_lineage, schedule_pulls};
+use super::link_queue::{current_event, ensure_holder};
+use super::links::{LinkChange, LinkError, change_link, ensure_lineage};
 use super::push::creator_auth;
 use super::{TransferError, connect};
 use crate::driver::DriverContext;
@@ -32,114 +23,17 @@ use crate::jobs::service::submit_rocrate_import;
 use crate::jobs::store::read_job_record;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::get_document::load_document_record;
-use crate::tasks::queue_backoff::{due_after, min_due_at};
 
-const LINK_PAGE: usize = 256;
 /// How often a check waits for a running pull before it looks again.
 const ACTIVE_RETRY_MS: u64 = 60_000;
-const ERROR_RETRY_MS: u64 = 300_000;
 
-/// Checks every due pull link this node owns and returns the wait until the next check.
-pub async fn drain_pulls(context: &Arc<DriverContext>) -> Result<Option<Duration>, LinkError> {
-    let now = unix_timestamp_millis();
-    let mut next = None;
-    for link in local_pulls(context).await? {
-        let due = link.pull().map_or(u64::MAX, |pull| pull.next_check_ms);
-        if due > now {
-            next = min_due_at(next, due);
-            continue;
-        }
-        let retry_at = match check_link(context, &link, now).await {
-            Ok(retry_at) => retry_at,
-            Err(error) => {
-                warn!(link_id = %link.link_id, %error, "Invenio pull check failed");
-                Some(now.saturating_add(ERROR_RETRY_MS))
-            }
-        };
-        if let Some(retry_at) = retry_at {
-            next = min_due_at(next, retry_at);
-        }
-    }
-    Ok(next.map(|due| due_after(unix_timestamp_millis(), due)))
-}
-
-/// Arms the pull check for the earliest due link this node owns.
-pub async fn restore_pull_timer(context: &DriverContext, task_handle: &TaskHandle) {
-    let links = match local_pulls(context).await {
-        Ok(links) => links,
-        Err(error) => {
-            warn!(%error, "Failed to scan the Invenio pull links");
-            return;
-        }
-    };
-    let Some(due) = links
-        .iter()
-        .filter_map(|link| link.pull().map(|pull| pull.next_check_ms))
-        .min()
-    else {
-        return;
-    };
-    let after = due_after(unix_timestamp_millis(), due);
-    if let Event::Task(TaskEvent::Error { message, .. }) =
-        task_handle.send_effect(schedule_pulls(after)).await
-    {
-        warn!(%message, "Failed to arm the Invenio pull check");
-    }
-}
-
-/// The enabled pull links this node owns.
-async fn local_pulls(context: &DriverContext) -> Result<Vec<InvenioLink>, LinkError> {
-    let local = context.net_handle.as_ref().map(|net| net.node_id());
-    let mut links = Vec::new();
-    let mut start = None;
-    loop {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: INVENIO_LINK_KEYSPACE.to_string(),
-                prefix: None,
-                start: start.take().map(IterStart::After),
-                limit: LINK_PAGE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => return Err(LinkError::Unexpected(format!("{other:?}"))),
-        };
-        for (_, value) in values {
-            let link = InvenioLink::from_bytes(&value)?;
-            if link.pull().is_some()
-                && link.status == LinkStatus::Enabled
-                && local.is_none_or(|node| node == link.owner_node)
-            {
-                links.push(link);
-            }
-        }
-        match next_start {
-            Some(key) => start = Some(key),
-            None => return Ok(links),
-        }
-    }
-}
-
-/// Checks one due link and starts an automatic update; returns when to look again.
-async fn check_link(
+/// Checks one due pull link and starts an automatic update; returns when to look again if
+/// no link change moved its queued check.
+pub(super) async fn check_due(
     context: &Arc<DriverContext>,
     link: &InvenioLink,
     now: u64,
 ) -> Result<Option<u64>, LinkError> {
-    if document_gone(&context.storage_handle, link.document_id).await? {
-        change_link(context, link, LinkChange::Delete).await?;
-        return Ok(None);
-    }
-    if let Err(LinkError::NotHolder) = ensure_holder(context, link).await {
-        return Ok(None);
-    }
     if let Some(job_id) = link.active_job {
         return settle_stale(context, link, job_id, now).await;
     }
@@ -153,7 +47,7 @@ async fn check_link(
             Err(error) => return Err(error),
         }
     }
-    Ok(stored.pull().map(|pull| pull.next_check_ms))
+    Ok(None)
 }
 
 /// A pull job that ended without recording its outcome, for example cancelled while queued.
@@ -185,7 +79,7 @@ async fn settle_stale(
         requeue: false,
     };
     change_link(context, link, change).await?;
-    Ok(Some(now))
+    Ok(None)
 }
 
 /// Asks the repository for the lineage's latest version and stores the answer on the link.

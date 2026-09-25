@@ -202,11 +202,14 @@ async fn check_link(
         change_link(context, &link, LinkChange::Delete).await?;
         return Ok(None);
     }
-    if link.status != LinkStatus::Enabled || link.pull().is_some() {
+    if link.status != LinkStatus::Enabled {
         return drop_entry().await;
     }
     if let Err(LinkError::NotHolder) = ensure_holder(context, &link).await {
         return drop_entry().await;
+    }
+    if link.pull().is_some() {
+        return super::pull::check_due(context, &link, now).await;
     }
     if let Some(job_id) = link.active_job {
         let record = read_job_record(storage, job_id, None)

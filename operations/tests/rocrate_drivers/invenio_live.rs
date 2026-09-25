@@ -713,8 +713,8 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
 async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::invenio::{InvenioPull, LinkPatch, crate_versions};
     use aruna_core::structs::secondary_id::SecondaryIdKind;
+    use aruna_operations::jobs::invenio::link_queue::drain_links;
     use aruna_operations::jobs::invenio::links::{LinkChange, change_link, list_links};
-    use aruna_operations::jobs::invenio::pull::drain_pulls;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
@@ -817,7 +817,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
                 ))
                 .await?;
             }
-            Box::pin(drain_pulls(&fixture.context)).await?;
+            Box::pin(drain_links(&fixture.context)).await?;
         }
     })
     .await??;

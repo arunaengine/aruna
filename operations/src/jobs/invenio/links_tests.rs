@@ -652,17 +652,10 @@ fn pulling() -> InvenioLink {
     link
 }
 
-fn checks_pulls(effects: &Effects) -> bool {
-    matches!(
-        &effects[..],
-        [Effect::Task(TaskEffect::ResetTimer { key: TaskKey::CheckPullLinks, after })]
-            if after.is_zero()
-    )
-}
-
 #[test]
 fn pull_links_never_push() {
-    let link = pulling();
+    let mut link = pulling();
+    link.pull_mut().unwrap().next_check_ms = 5_000;
     let mut op = operation(LinkChange::Create {
         link: Box::new(link.clone()),
         secret: None,
@@ -671,9 +664,16 @@ fn pull_links_never_push() {
     let rows = written(&effects);
     assert_eq!(
         keyspaces(&rows),
-        [LINK_CONNECTOR_KEYSPACE, INVENIO_LINK_KEYSPACE]
+        [
+            LINK_CONNECTOR_KEYSPACE,
+            INVENIO_LINK_KEYSPACE,
+            LINK_QUEUE_KEYSPACE
+        ]
     );
-    assert!(checks_pulls(&commit(&mut op, effects)));
+    // The queue row holds the first repository check, not a push.
+    let entry: LinkQueueEntry = postcard::from_bytes(&rows[2].2).unwrap();
+    assert_eq!(entry.due_at_ms, 5_000);
+    assert!(schedules(&commit(&mut op, effects)));
     // Resuming a pull link checks the repository now instead of queueing a push.
     let mut paused = link.clone();
     paused.status = LinkStatus::Paused;
@@ -683,14 +683,51 @@ fn pull_links_never_push() {
     }));
     let effects = read(&mut op, Some(&paused));
     let rows = written(&effects);
-    assert_eq!(keyspaces(&rows), [INVENIO_LINK_KEYSPACE]);
-    let stored = InvenioLink::from_bytes(&rows[0].2).unwrap();
     assert_eq!(
-        stored.pull().unwrap().next_check_ms,
-        now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
+        keyspaces(&rows),
+        [INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
     );
-    assert!(checks_pulls(&commit(&mut op, effects)));
+    let now_ms = now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let stored = InvenioLink::from_bytes(&rows[0].2).unwrap();
+    assert_eq!(stored.pull().unwrap().next_check_ms, 5_000.min(now_ms));
+    assert!(schedules(&commit(&mut op, effects)));
+}
+
+#[test]
+fn pull_check_replaces_row() {
+    // A finished check moves the queued check to its next due time, even when it is later.
+    let mut op = operation(LinkChange::Checked(PullCheck::Unavailable));
+    let queued = LinkQueueEntry {
+        document_id: pulling().document_id,
+        due_at_ms: 1_000,
+        first_at_ms: 1_000,
+    };
+    let effects = read_queued(&mut op, Some(&pulling()), Some(&queued));
+    let rows = written(&effects);
+    assert_eq!(
+        keyspaces(&rows),
+        [INVENIO_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
+    );
+    let stored = InvenioLink::from_bytes(&rows[0].2).unwrap();
+    let entry: LinkQueueEntry = postcard::from_bytes(&rows[1].2).unwrap();
+    assert_eq!(entry.due_at_ms, stored.pull().unwrap().next_check_ms);
+    assert!(entry.due_at_ms > 1_000);
+
+    // A paused pull link has no queued check.
+    let mut paused = pulling();
+    paused.status = LinkStatus::Paused;
+    let mut op = operation(LinkChange::Checked(PullCheck::Unavailable));
+    let effects = read_queued(&mut op, Some(&paused), Some(&queued));
+    assert_eq!(keyspaces(&written(&effects)), [INVENIO_LINK_KEYSPACE]);
+    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: vec![],
+    }));
+    assert!(matches!(
+        &effects[..],
+        [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })]
+            if deletes.iter().map(|row| row.0.as_str()).eq([LINK_QUEUE_KEYSPACE])
+    ));
 }

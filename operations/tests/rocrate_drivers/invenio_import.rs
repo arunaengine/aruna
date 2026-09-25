@@ -445,8 +445,8 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
     process_materialization_batch(fixture.context.as_ref()).await?;
     let storage = &fixture.context.storage_handle;
     let links = list_links(storage, doc_id(1)).await?;
-    let [(link, false)] = links.as_slice() else {
-        panic!("the import keeps one pull link without a queued push: {links:?}");
+    let [(link, true)] = links.as_slice() else {
+        panic!("the import keeps one pull link with its next check queued: {links:?}");
     };
     let first = current_event(&fixture.context, doc_id(1)).await?;
     assert_eq!(link.remote.record_id.as_deref(), Some("1"));
