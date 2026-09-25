@@ -535,7 +535,7 @@ async fn file_limit_refused() -> Result<(), Box<dyn std::error::Error>> {
     };
     // The missing license stays a warning; the file count is the one violation.
     let findings = findings
-        .into_iter()
+        .iter()
         .filter(|finding| finding.severity == ProfileValidationSeverity::Violation)
         .collect::<Vec<_>>();
     assert_eq!(findings.len(), 1, "{findings:#?}");
