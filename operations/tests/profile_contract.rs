@@ -649,6 +649,7 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
             mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: crate_json(document_id, Some(&tag), false, true),
             },
+            expected_revision: None,
         }),
         test.context.as_ref(),
     )
@@ -673,6 +674,7 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
             mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: crate_json(document_id, Some(&tag), true, true),
             },
+            expected_revision: None,
         }),
         test.context.as_ref(),
     )
@@ -1013,6 +1015,7 @@ async fn make_private(
             mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: profile_json(profile_id, minimum_shape()),
             },
+            expected_revision: None,
         }),
         test.context.as_ref(),
     )
@@ -1051,6 +1054,7 @@ async fn revision_change_repins() -> Result<(), Box<dyn std::error::Error>> {
             mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: profile_json(profile_id, minimum_shape()),
             },
+            expected_revision: None,
         }),
         test.context.as_ref(),
     )

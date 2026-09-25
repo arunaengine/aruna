@@ -447,6 +447,7 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
         UpdateDocumentMutation::UpsertDataEntity {
             jsonld: "{}".to_string(),
         },
+        None,
         Some(realm.bearer_token()),
     )
     .await

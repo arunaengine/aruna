@@ -66,7 +66,7 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
 use crate::metadata::forward::{route_metadata_create, route_metadata_update};
-use crate::metadata::update_document::UpdateDocumentMutation;
+use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
@@ -1202,34 +1202,28 @@ async fn update_document(
             crate::metadata::get_document::load_document_record(&ctx.driver, spec.document_id)
                 .await
                 .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
-        let updated = Box::pin(route_metadata_update(
+        // The holder refuses the update inside its transaction when an edit landed after `base`.
+        match Box::pin(route_metadata_update(
             &ctx.driver,
             actor,
             record.as_ref(),
             spec.document_id,
             None,
             UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+            Some(base),
             Some(AuthToken::internal(spec.auth_context.clone())),
         ))
         .await
-        .map_err(classify_metadata)?
-        .last_event_id;
-        // The update takes no expected revision, so a change that raced it shows afterwards.
-        let (_, after) = Box::pin(crate::jobs::export::crate_jsonld(
-            &ctx.driver,
-            &spec.auth_context,
-            spec.document_id,
-            spec.limits.metadata_bytes,
-        ))
-        .await
-        .map_err(transfer_failure)?;
-        if after != updated && after != base {
-            return Err(ImportFailure::Permanent(
-                "the dataset changed while the pull updated it; check it and pull again"
-                    .to_string(),
-            ));
+        {
+            Ok(updated) => updated.last_event_id,
+            Err(MetadataWriteError::Update(UpdateDocumentError::RevisionConflict { .. })) => {
+                return Err(ImportFailure::Permanent(
+                    "the dataset changed while the pull updated it; check it and pull again"
+                        .to_string(),
+                ));
+            }
+            Err(error) => return Err(classify_metadata(error)),
         }
-        updated
     } else {
         let own = plan
             .entries

@@ -530,6 +530,7 @@ async fn update_document(
         UpdateDocumentMutation::ReplaceRoCrate {
             jsonld: dc_to_jsonld(record),
         },
+        None,
         Some(internal_token(source.created_by, realm_id)),
     )
     .await?;

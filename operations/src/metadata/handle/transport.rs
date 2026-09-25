@@ -467,6 +467,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::GroupDeletionResult { .. } => "group_deletion_result",
         MetadataTransportMessage::LookupIdentifier { .. } => "lookup_identifier",
         MetadataTransportMessage::IdentifierMatches { .. } => "identifier_matches",
+        MetadataTransportMessage::ForwardedRevisionConflict { .. } => "forwarded_revision_conflict",
         MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
         MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
         MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",

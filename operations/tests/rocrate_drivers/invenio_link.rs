@@ -276,6 +276,7 @@ async fn replace_crate(
             mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: document.to_string(),
             },
+            expected_revision: None,
         }),
         &fixture.context,
     )

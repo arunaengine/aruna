@@ -120,6 +120,8 @@ pub enum MetadataTransportMessage {
         /// record copy may be stale, so only an explicit request value travels.
         public: Option<bool>,
         mutation: UpdateDocumentMutation,
+        /// The holder refuses the update when the document moved past this event.
+        expected_revision: Option<Ulid>,
     },
     ForwardDeleteDocument {
         auth_token: Option<AuthToken>,
@@ -485,6 +487,11 @@ pub enum MetadataTransportMessage {
     },
     IdentifierMatches {
         result: Result<Vec<crate::metadata::secondary_ids::IdentifierMatch>, MetadataReadError>,
+    },
+    /// A forwarded update refused because the document moved past the expected revision.
+    ForwardedRevisionConflict {
+        expected: Ulid,
+        current: Ulid,
     },
 }
 
@@ -903,6 +910,7 @@ mod tests {
             mutation: UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: "{}".to_string(),
             },
+            expected_revision: None,
         });
         assert_auth_token(MetadataTransportMessage::ForwardDeleteDocument {
             auth_token: Some(AuthToken::bearer("delete-token").unwrap()),
