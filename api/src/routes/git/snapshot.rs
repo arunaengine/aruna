@@ -61,9 +61,20 @@ pub async fn repository_status(
         lfs_url: format!("{clone_url}/info/lfs"),
         clone_url,
         bucket: repository.bucket,
-        revision: status.as_ref().map(|value| value.event_id.to_string()),
-        commit: status.as_ref().and_then(|value| value.commit.clone()),
-        error: status.and_then(|value| value.error),
+        revision: projection
+            .state
+            .revision
+            .map(|revision| revision.to_string()),
+        commit: projection.state.refs.get("refs/heads/aruna").cloned(),
+        // A conversion error matters only while no newer snapshot replaced it.
+        error: status
+            .filter(|value| {
+                projection
+                    .state
+                    .revision
+                    .is_none_or(|applied| value.event_id > applied)
+            })
+            .and_then(|value| value.error),
         refs: projection.state.refs,
     }))
 }
