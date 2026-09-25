@@ -389,7 +389,10 @@ pub(crate) async fn ensure_requirements(
     if checked.ready {
         return Ok(());
     }
-    Err(ServerError::RequirementsUnmet(checked.findings))
+    Err(ServerError::RequirementsUnmet(
+        checked.findings,
+        checked.omitted,
+    ))
 }
 
 pub(super) fn seal_error(error: TransferError) -> ServerError {

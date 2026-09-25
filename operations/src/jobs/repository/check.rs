@@ -38,9 +38,15 @@ pub struct RequirementCheck {
     pub profile_revision: Option<String>,
     /// No finding is a violation.
     pub ready: bool,
+    /// At most `MAX_CHECK_FINDINGS`, violations first.
     pub findings: Vec<ProfileValidationFinding>,
+    /// How many findings the capped list leaves out.
+    pub omitted: usize,
     pub mapping: Vec<Mapped>,
 }
+
+/// The most findings a check returns.
+pub const MAX_CHECK_FINDINGS: usize = 100;
 
 /// Checks the dataset's current crate against the connector's repository.
 pub async fn check_requirements(
@@ -89,14 +95,19 @@ pub(crate) async fn check_crate(
     let (mapping, rule_findings) = preview(rules, &document);
     let mut findings = status.findings;
     findings.extend(rule_findings);
+    let ready = !findings
+        .iter()
+        .any(|finding| finding.severity == ProfileValidationSeverity::Violation);
+    findings.sort_by_key(|finding| finding.severity != ProfileValidationSeverity::Violation);
+    let omitted = findings.len().saturating_sub(MAX_CHECK_FINDINGS);
+    findings.truncate(MAX_CHECK_FINDINGS);
     Ok(RequirementCheck {
         kind,
         profile_iri,
         profile_revision: status.profile_revision,
-        ready: !findings
-            .iter()
-            .any(|finding| finding.severity == ProfileValidationSeverity::Violation),
+        ready,
         findings,
+        omitted,
         mapping,
     })
 }

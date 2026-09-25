@@ -103,7 +103,11 @@ pub struct CheckResponse {
     pub profile: CheckProfileResponse,
     /// No finding is a violation.
     pub ready: bool,
+    /// At most 100 findings, violations first.
     pub findings: Vec<ProfileFindingResponse>,
+    /// How many further findings the list leaves out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omitted_findings: Option<usize>,
     pub mapping: Vec<MappingResponse>,
 }
 
@@ -247,6 +251,7 @@ pub async fn check_repository(
         },
         ready: checked.ready,
         findings: checked.findings.into_iter().map(Into::into).collect(),
+        omitted_findings: Some(checked.omitted).filter(|omitted| *omitted > 0),
         mapping: checked.mapping.into_iter().map(Into::into).collect(),
     }))
 }

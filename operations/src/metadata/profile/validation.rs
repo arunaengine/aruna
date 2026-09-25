@@ -322,7 +322,7 @@ pub async fn preview_submission(
 }
 
 /// Evaluates a crate against the Profile `iri` whether or not the crate names it, and stores
-/// nothing. Built-in and public Profiles resolve.
+/// nothing. Built-in and public Profiles resolve; structural crate violations are findings too.
 pub async fn check_profile(
     context: &DriverContext,
     iri: &str,
@@ -330,7 +330,25 @@ pub async fn check_profile(
 ) -> Result<ProfileValidationStatus, MetadataError> {
     let preview =
         evaluate_tagged(context, Ulid::nil(), ProfileScope::PublicOnly, iri, jsonld).await?;
-    Ok(preview.status)
+    let mut status = preview.status;
+    if !preview.structural_violations.is_empty() {
+        status.state = ProfileValidationState::Invalid;
+    }
+    status
+        .findings
+        .extend(preview.structural_violations.into_iter().map(|violation| {
+            ProfileValidationFinding {
+                code: violation.code,
+                severity: ProfileValidationSeverity::Violation,
+                focus_node: Some(violation.entity_id.unwrap_or_else(|| "./".into())),
+                path: Some(violation.pointer).filter(|pointer| !pointer.is_empty()),
+                rule: "structural".into(),
+                message: violation.message,
+                profile_revision: status.profile_revision.clone(),
+                completeness: ProfileValidationCompleteness::Complete,
+            }
+        }));
+    Ok(status)
 }
 
 struct ProfileAssessment {

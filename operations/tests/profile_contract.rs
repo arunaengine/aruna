@@ -551,6 +551,30 @@ async fn repository_profiles_checked() -> Result<(), Box<dyn std::error::Error>>
     let status = check_profile(test.context.as_ref(), INVENIO_PROFILE_IRI, &crate_json).await?;
     assert_eq!(status.state, ProfileValidationState::Invalid);
 
+    // A crate the node would refuse to store fails the check with its structural violations.
+    let mut document: serde_json::Value =
+        serde_json::from_str(&repository_crate(document_id, person.clone(), None))?;
+    document["@graph"][1]
+        .as_object_mut()
+        .ok_or("root is no object")?
+        .remove("description");
+    let status = check_profile(
+        test.context.as_ref(),
+        ZENODO_PROFILE_IRI,
+        &document.to_string(),
+    )
+    .await?;
+    assert_eq!(status.state, ProfileValidationState::Invalid);
+    assert!(
+        status
+            .findings
+            .iter()
+            .any(|finding| finding.rule == "structural"
+                && finding.severity == ProfileValidationSeverity::Violation),
+        "{:#?}",
+        status.findings
+    );
+
     // Values the record mapping would drop are refused: lists, typed and language-tagged text.
     let tagged = json!([{"@id": "#ada", "@type": "Person",
         "name": {"@value": "Ada", "@language": "en"}}]);
@@ -606,7 +630,7 @@ fn repository_crate(
         .collect::<Vec<_>>();
     let mut root = json!({
         "@id": graph_iri, "@type": "Dataset", "name": "Repository fixture",
-        "description": "Requirement profile fixture", "datePublished": "2026-09"
+        "description": "Requirement profile fixture", "datePublished": "2026-09-01"
     });
     if !references.is_empty() {
         root["author"] = json!(references);
