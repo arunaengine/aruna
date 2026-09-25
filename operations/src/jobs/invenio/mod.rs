@@ -6,7 +6,7 @@ use std::future::Future;
 
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::handle::Handle;
-use aruna_core::repository::{InvenioDestination, LinkFailure, RepositoryCredential};
+use aruna_core::repository::{LinkFailure, RepositoryCredential, RepositoryDestination};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
@@ -59,8 +59,8 @@ impl From<InvenioError> for TransferError {
     }
 }
 
-impl From<aruna_core::repository::InvenioError> for TransferError {
-    fn from(error: aruna_core::repository::InvenioError) -> Self {
+impl From<aruna_core::repository::RepositoryError> for TransferError {
+    fn from(error: aruna_core::repository::RepositoryError) -> Self {
         Self::Permanent(error.to_string())
     }
 }
@@ -128,7 +128,7 @@ pub(crate) async fn connect<'a>(
 pub async fn seal_credential(
     context: &DriverContext,
     auth: &AuthContext,
-    destination: &InvenioDestination,
+    destination: &RepositoryDestination,
     token: &str,
 ) -> Result<RepositoryCredential, TransferError> {
     let view = repository(context, destination.group_id, destination.connector_id).await?;

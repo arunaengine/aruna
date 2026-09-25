@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{ExportIdentity, InvenioError};
+use super::{ExportIdentity, RepositoryError};
 use crate::structs::secondary_id::{
     IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier, normalize_doi,
 };
@@ -58,28 +58,28 @@ pub fn add_root_identifiers(document: &mut Value, identity: &ExportIdentity) {
     root[key] = Value::Array(current);
 }
 
-pub fn validate_id(id: &str) -> Result<(), InvenioError> {
+pub fn validate_id(id: &str) -> Result<(), RepositoryError> {
     if id.is_empty()
         || id.len() > 128
         || !id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     {
-        return Err(InvenioError("unsafe record identifier"));
+        return Err(RepositoryError("unsafe record identifier"));
     }
     Ok(())
 }
 
-pub fn record_id(record: &Value) -> Result<&str, InvenioError> {
-    let id = record["id"].as_str().ok_or(InvenioError("missing id"))?;
+pub fn record_id(record: &Value) -> Result<&str, RepositoryError> {
+    let id = record["id"].as_str().ok_or(RepositoryError("missing id"))?;
     validate_id(id)?;
     Ok(id)
 }
 
-pub fn file_path(id: &str, key: &str) -> Result<String, InvenioError> {
+pub fn file_path(id: &str, key: &str) -> Result<String, RepositoryError> {
     validate_id(id)?;
     if key.is_empty() {
-        return Err(InvenioError("empty file key"));
+        return Err(RepositoryError("empty file key"));
     }
     Ok(format!(
         "versions/{id}/files/{}",
@@ -87,9 +87,9 @@ pub fn file_path(id: &str, key: &str) -> Result<String, InvenioError> {
     ))
 }
 
-pub fn validate_metadata(metadata: &Value) -> Result<(), InvenioError> {
+pub fn validate_metadata(metadata: &Value) -> Result<(), RepositoryError> {
     if !missing_fields(metadata).is_empty() {
-        return Err(InvenioError(
+        return Err(RepositoryError(
             "title, publication_date, resource_type and creators are required",
         ));
     }
@@ -124,7 +124,7 @@ pub fn missing_metadata(
     document: &Value,
     overrides: &Value,
     endpoint: &str,
-) -> Result<Vec<&'static str>, InvenioError> {
+) -> Result<Vec<&'static str>, RepositoryError> {
     let metadata = map_metadata(document, overrides, &ExportIdentity::default())?;
     let mut missing = missing_fields(&metadata);
     if lacks_publisher(&metadata, endpoint) {
@@ -153,11 +153,11 @@ fn lacks_publisher(metadata: &Value, endpoint: &str) -> bool {
 }
 
 /// Maps searchable fields; the companion JSON files retain every unmapped field.
-pub fn record_entity(record: &Value, id: &str) -> Result<Value, InvenioError> {
+pub fn record_entity(record: &Value, id: &str) -> Result<Value, RepositoryError> {
     let metadata = &record["metadata"];
     let title = metadata["title"]
         .as_str()
-        .ok_or(InvenioError("missing title"))?;
+        .ok_or(RepositoryError("missing title"))?;
     let mut entity = json!({
         "@id": id, "@type": "Dataset", "name": title,
         "description": "Imported repository record"
@@ -254,11 +254,11 @@ pub fn import_crate(
     endpoint: &str,
     selected: &str,
     records: &[(Value, Value)],
-) -> Result<Value, InvenioError> {
+) -> Result<Value, RepositoryError> {
     let selected_record = records
         .iter()
         .find(|(record, _)| record["id"] == selected)
-        .ok_or(InvenioError("requested record absent from history"))?;
+        .ok_or(RepositoryError("requested record absent from history"))?;
     let mut root = record_entity(&selected_record.0, "./")?;
     let mut parts = Vec::new();
     let mut graph = vec![json!({
@@ -281,11 +281,11 @@ pub fn import_crate(
         }));
         let entries = files["entries"]
             .as_array()
-            .ok_or(InvenioError("missing file entries"))?;
+            .ok_or(RepositoryError("missing file entries"))?;
         for file in entries {
             let key = file["key"]
                 .as_str()
-                .ok_or(InvenioError("missing file key"))?;
+                .ok_or(RepositoryError("missing file key"))?;
             let path = file_path(id, key)?;
             children.push(json!({"@id": path}));
             graph.push(json!({
@@ -310,15 +310,15 @@ pub fn pull_crate(
     endpoint: &str,
     latest: &Value,
     added: &[(Value, Value)],
-) -> Result<Value, InvenioError> {
-    let root = crate_root(current).ok_or(InvenioError("missing crate root"))?;
+) -> Result<Value, RepositoryError> {
+    let root = crate_root(current).ok_or(RepositoryError("missing crate root"))?;
     let root_id = root["@id"]
         .as_str()
-        .ok_or(InvenioError("missing crate root"))?;
+        .ok_or(RepositoryError("missing crate root"))?;
     let mut parts = values(&root["hasPart"]).to_vec();
     let mut graph = current["@graph"]
         .as_array()
-        .ok_or(InvenioError("missing crate graph"))?
+        .ok_or(RepositoryError("missing crate graph"))?
         .clone();
     let known = graph
         .iter()
@@ -346,7 +346,7 @@ pub fn pull_crate(
     let slot = graph
         .iter_mut()
         .find(|candidate| candidate["@id"] == root_id)
-        .ok_or(InvenioError("missing crate root"))?;
+        .ok_or(RepositoryError("missing crate root"))?;
     *slot = entity;
     Ok(json!({"@context": current["@context"].clone(), "@graph": graph}))
 }
@@ -420,7 +420,7 @@ pub fn export_metadata(
     document: &Value,
     overrides: &Value,
     identity: &ExportIdentity,
-) -> Result<Value, InvenioError> {
+) -> Result<Value, RepositoryError> {
     let metadata = map_metadata(document, overrides, identity)?;
     validate_metadata(&metadata)?;
     Ok(metadata)
@@ -430,7 +430,7 @@ fn map_metadata(
     document: &Value,
     overrides: &Value,
     identity: &ExportIdentity,
-) -> Result<Value, InvenioError> {
+) -> Result<Value, RepositoryError> {
     let mut metadata = json!({"resource_type": {"id": "dataset"}, "rights": []});
     let graph = document["@graph"]
         .as_array()
@@ -587,7 +587,7 @@ fn map_metadata(
         && let Some(native) = root[NATIVE_METADATA].as_str()
     {
         let native: Value =
-            serde_json::from_str(native).map_err(|_| InvenioError("invalid native metadata"))?;
+            serde_json::from_str(native).map_err(|_| RepositoryError("invalid native metadata"))?;
         let baseline = record_entity(&json!({"metadata": native}), "./")?;
         for (key, field) in [("description", "description"), ("rights", "license")] {
             if native.get(key).is_none()
@@ -599,7 +599,7 @@ fn map_metadata(
         }
         for (key, value) in native
             .as_object()
-            .ok_or(InvenioError("native metadata must be an object"))?
+            .ok_or(RepositoryError("native metadata must be an object"))?
         {
             let field = match key.as_str() {
                 "title" => Some("name"),
@@ -636,7 +636,7 @@ fn map_metadata(
             metadata[key] = value.clone();
         }
     } else if !overrides.is_null() {
-        return Err(InvenioError("metadata overrides must be an object"));
+        return Err(RepositoryError("metadata overrides must be an object"));
     }
     Ok(metadata)
 }
@@ -647,17 +647,17 @@ pub fn export_fields(
     overrides: &Value,
     identity: &ExportIdentity,
     endpoint: &str,
-) -> Result<Value, InvenioError> {
+) -> Result<Value, RepositoryError> {
     let metadata = export_metadata(document, overrides, identity)?;
     if lacks_publisher(&metadata, endpoint) {
-        return Err(InvenioError("publisher is required by this repository"));
+        return Err(RepositoryError("publisher is required by this repository"));
     }
     let mut result = json!({"metadata": metadata, "custom_fields": {}});
     if let Some(fields) = crate_root(document).and_then(|root| root[CUSTOM_FIELDS].as_str()) {
         let fields: Value =
-            serde_json::from_str(fields).map_err(|_| InvenioError("invalid custom fields"))?;
+            serde_json::from_str(fields).map_err(|_| RepositoryError("invalid custom fields"))?;
         if !fields.is_object() {
-            return Err(InvenioError("custom fields must be an object"));
+            return Err(RepositoryError("custom fields must be an object"));
         }
         result["custom_fields"] = fields;
     }
@@ -711,26 +711,26 @@ fn schema_value<'a>(entity: &'a Value, name: &str) -> &'a Value {
 }
 
 /// Uses the earliest day represented by an EDTF date; the source precision is retained separately.
-fn publication_start(value: &str) -> Result<String, InvenioError> {
+fn publication_start(value: &str) -> Result<String, RepositoryError> {
     let mut start = None;
     let parts = value.split('/').collect::<Vec<_>>();
     if parts.len() > 2 {
-        return Err(InvenioError("invalid publication interval"));
+        return Err(RepositoryError("invalid publication interval"));
     }
     for part in parts {
         let full = match part.len() {
             4 => format!("{part}-01-01"),
             7 => format!("{part}-01"),
             10 => part.to_string(),
-            _ => return Err(InvenioError("invalid publication date")),
+            _ => return Err(RepositoryError("invalid publication date")),
         };
         let date = chrono::NaiveDate::parse_from_str(&full, "%Y-%m-%d")
-            .map_err(|_| InvenioError("invalid publication date"))?;
+            .map_err(|_| RepositoryError("invalid publication date"))?;
         if start.is_none() {
             start = Some(date.to_string());
         }
     }
-    start.ok_or(InvenioError("missing publication date"))
+    start.ok_or(RepositoryError("missing publication date"))
 }
 
 fn values(value: &Value) -> &[Value] {

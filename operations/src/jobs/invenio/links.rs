@@ -13,9 +13,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::repository::{
-    InvenioRecord, LinkBusy, LinkFailure, LinkPatch, LinkQueueEntry, LinkReview, LinkStatus,
-    PullCheck, PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryCredential, RepositoryLink,
-    connector_link_key, link_key, link_prefix,
+    LinkBusy, LinkFailure, LinkPatch, LinkQueueEntry, LinkReview, LinkStatus, PullCheck,
+    PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryCredential, RepositoryLink,
+    RepositoryRecord, connector_link_key, link_key, link_prefix,
 };
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
@@ -58,7 +58,7 @@ pub enum LinkChange {
     /// Stores the draft the running push created, before it uploads anything.
     Draft {
         job_id: JobId,
-        record: Box<InvenioRecord>,
+        record: Box<RepositoryRecord>,
     },
     /// Takes the repository's current state as the base, after a review or remote edits.
     Accept(Box<RemoteState>),
@@ -67,7 +67,7 @@ pub enum LinkChange {
     /// Records the version the running pull imported and the dataset revision it wrote.
     Pulled {
         job_id: JobId,
-        record: Box<InvenioRecord>,
+        record: Box<RepositoryRecord>,
         revision: Ulid,
     },
 }
@@ -608,7 +608,7 @@ pub async fn change_link(
 async fn register_accepted(
     context: &DriverContext,
     link: &RepositoryLink,
-    record: &InvenioRecord,
+    record: &RepositoryRecord,
 ) -> Result<(), LinkError> {
     let identifiers = record.identifiers(&link.endpoint, IdentifierOrigin::Published);
     if identifiers.is_empty() {

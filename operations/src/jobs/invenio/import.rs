@@ -13,8 +13,8 @@ use aruna_core::repository::invenio::{
     crate_versions, file_path, import_crate, pull_crate, record_id, record_identifiers, validate_id,
 };
 use aruna_core::repository::{
-    ImportMode, ImportOptions, InvenioRecord, LinkDirection, LinkFailure, LinkPull, LinkRemote,
-    LinkStatus, PULL_CHECK_MS, PushOutcome, RepositoryLink, RepositoryPull,
+    ImportMode, ImportOptions, LinkDirection, LinkFailure, LinkPull, LinkRemote, LinkStatus,
+    PULL_CHECK_MS, PushOutcome, RepositoryLink, RepositoryPull, RepositoryRecord,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
@@ -39,7 +39,7 @@ use crate::jobs::executor::JobContext;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PullProgress {
     /// The version the dataset holds after the import.
-    pub(super) record: InvenioRecord,
+    pub(super) record: RepositoryRecord,
     pub(super) endpoint: String,
     /// The dataset revision an update merged into.
     base: Option<Ulid>,

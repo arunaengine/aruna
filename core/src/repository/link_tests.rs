@@ -47,8 +47,8 @@ fn link() -> RepositoryLink {
     }
 }
 
-fn record(id: &str, published: bool, doi: Option<&str>) -> InvenioRecord {
-    InvenioRecord {
+fn record(id: &str, published: bool, doi: Option<&str>) -> RepositoryRecord {
+    RepositoryRecord {
         id: id.into(),
         url: format!("https://zenodo.org/api/records/{id}"),
         published,
@@ -75,14 +75,14 @@ fn pushed(id: &str, published: bool, doi: Option<&str>) -> PushOutcome {
 fn plans_lineage_pushes() {
     let mut link = link();
     let first = link.destination(false);
-    assert_eq!((first.draft_id, first.new_version), (None, None));
+    assert_eq!((first.draft_id, first.published_id), (None, None));
     assert_eq!(first.link.unwrap().parent_id, None);
 
     link.begin(job(1), SystemTime::now()).unwrap();
     assert!(link.finish(job(1), &pushed("draft-1", false, None), SystemTime::now()));
     let update = link.destination(false);
     assert_eq!(update.draft_id.as_deref(), Some("draft-1"));
-    assert_eq!(update.new_version, None);
+    assert_eq!(update.published_id, None);
 
     link.begin(job(2), SystemTime::now()).unwrap();
     link.finish(
@@ -94,7 +94,7 @@ fn plans_lineage_pushes() {
     assert!(link.remote.published && link.remote.draft_id.is_none());
     let next = link.destination(false);
     assert_eq!(next.draft_id, None);
-    assert_eq!(next.new_version.as_deref(), Some("draft-1"));
+    assert_eq!(next.published_id.as_deref(), Some("draft-1"));
     assert_eq!(next.link.unwrap().published_id.as_deref(), Some("draft-1"));
 
     link.begin(job(3), SystemTime::now()).unwrap();
@@ -461,7 +461,7 @@ fn pull_records_version() {
     let now = SystemTime::now();
     let mut link = pulling(false);
     link.checked(&found("v2", 5, 21), now);
-    let v2 = InvenioRecord {
+    let v2 = RepositoryRecord {
         revision_id: 5,
         ..record("v2", true, Some("10.5281/zenodo.2"))
     };

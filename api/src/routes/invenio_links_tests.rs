@@ -457,7 +457,7 @@ async fn admin_rights_limited() {
 
 /// Stores a pull link on the dataset the way a keep_updated import creates it.
 async fn pull_link_for(linked: &Linked) -> RepositoryLink {
-    use aruna_core::repository::{InvenioRecord, LinkDirection, LinkPull};
+    use aruna_core::repository::{LinkDirection, LinkPull, RepositoryRecord};
     let now = std::time::SystemTime::now();
     let mut link = RepositoryLink {
         link_id: Ulid::generate(),
@@ -497,7 +497,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
             local_changed: false,
         })),
     };
-    let record = InvenioRecord {
+    let record = RepositoryRecord {
         id: "v1".into(),
         url: "https://zenodo.example/api/records/v1".into(),
         published: true,

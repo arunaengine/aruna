@@ -19,11 +19,11 @@ async fn export_spec(
     ));
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
-    let mut destination = InvenioDestination {
+    let mut destination = RepositoryDestination {
         group_id: fixture.group_id,
         connector_id: connector(fixture, server).await,
         draft_id: None,
-        new_version: None,
+        published_id: None,
         metadata_json: "{}".into(),
         publish,
         public_files: false,
@@ -195,7 +195,7 @@ async fn invenio_continues_versions() -> Result<(), Box<dyn std::error::Error>> 
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let mut spec = export_spec(&fixture, &server, true).await?;
-    spec.destination.as_mut().unwrap().new_version = Some("2".into());
+    spec.destination.as_mut().unwrap().published_id = Some("2".into());
     let ctx = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
     match run_export_job(&ctx, &spec).await {
         JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(result)) => {
@@ -235,7 +235,7 @@ async fn invenio_retries_versions() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await;
     let mut spec = export_spec(&fixture, &server, true).await?;
-    spec.destination.as_mut().unwrap().new_version = Some("2".into());
+    spec.destination.as_mut().unwrap().published_id = Some("2".into());
     let ctx = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
     match run_export_job(&ctx, &spec).await {
         JobRunOutcome::Failed(error) => assert_eq!(
@@ -296,7 +296,7 @@ async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await;
         let mut spec = export_spec(&fixture, &server, true).await?;
-        spec.destination.as_mut().unwrap().new_version = Some("2".into());
+        spec.destination.as_mut().unwrap().published_id = Some("2".into());
         if change == 3 {
             spec.destination.as_mut().unwrap().metadata_json = json!({"creators": [{
                 "person_or_org": {"type": "personal", "family_name": "Researcher", "given_name": "A"},

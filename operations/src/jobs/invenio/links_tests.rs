@@ -8,7 +8,7 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::keyspaces::{
     SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE, WRITE_FENCE_KEYSPACE,
 };
-use aruna_core::repository::{InvenioRecord, LinkFailure, LinkRemote};
+use aruna_core::repository::{LinkFailure, LinkRemote, RepositoryRecord};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
@@ -340,7 +340,7 @@ fn begin_takes_queue() {
 
 #[test]
 fn finish_requeues_enabled() {
-    let record = InvenioRecord {
+    let record = RepositoryRecord {
         id: "draft-1".into(),
         url: "https://zenodo.org/api/records/draft-1/draft".into(),
         published: false,
@@ -547,7 +547,7 @@ fn aborting_rejects_events() {
 
 #[test]
 fn finish_schedules_follow_ups() {
-    let mut record = InvenioRecord {
+    let mut record = RepositoryRecord {
         id: "draft-1".into(),
         url: "https://zenodo.org/api/records/draft-1/draft".into(),
         published: false,
@@ -559,7 +559,7 @@ fn finish_schedules_follow_ups() {
         in_review: true,
         warning: None,
     };
-    let finish = |record: &InvenioRecord| LinkChange::Finish {
+    let finish = |record: &RepositoryRecord| LinkChange::Finish {
         job_id: job(1),
         outcome: Box::new(PushOutcome::Pushed {
             record: Box::new(record.clone()),
@@ -597,7 +597,7 @@ fn finish_schedules_follow_ups() {
 
 #[test]
 fn draft_needs_running_push() {
-    let record = InvenioRecord {
+    let record = RepositoryRecord {
         id: "draft-1".into(),
         url: "https://zenodo.org/api/records/draft-1/draft".into(),
         published: false,

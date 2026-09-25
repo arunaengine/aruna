@@ -5,8 +5,8 @@
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::repository::invenio::validate_id;
 use aruna_core::repository::{
-    InvenioDestination, InvenioRecord, LinkFailure, LinkReview, LinkStatus, LinkTarget,
-    PushOutcome, RemoteState, RepositoryLink,
+    LinkFailure, LinkReview, LinkStatus, LinkTarget, PushOutcome, RemoteState,
+    RepositoryDestination, RepositoryLink, RepositoryRecord,
 };
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobError, JobErrorKind};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -24,10 +24,10 @@ use crate::jobs::export::{ExportCheckpoint, persist_checkpoint, read_export_chec
 pub(super) async fn prepare(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
+    destination: &RepositoryDestination,
     target: &LinkTarget,
     checkpoint: &mut ExportCheckpoint,
-) -> Result<InvenioDestination, TransferError> {
+) -> Result<RepositoryDestination, TransferError> {
     let storage = &ctx.driver.storage_handle;
     let retry = |error: LinkError| TransferError::Retryable(error.to_string());
     let link = read_link(storage, spec.document_id, target.link_id)
@@ -60,8 +60,8 @@ pub(super) async fn prepare(
             .await
             .map_err(TransferError::Retryable)?;
     }
-    destination.new_version = destination
-        .new_version
+    destination.published_id = destination
+        .published_id
         .or_else(|| checkpoint.repository_base.clone());
     Ok(destination)
 }
@@ -70,7 +70,7 @@ pub(super) async fn prepare(
 async fn check_lineage(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
+    destination: &RepositoryDestination,
     target: &LinkTarget,
 ) -> Result<Option<String>, TransferError> {
     let client = connect(
@@ -187,7 +187,7 @@ pub(crate) async fn settle(
 pub(super) async fn guard(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
+    destination: &RepositoryDestination,
 ) -> Result<(), TransferError> {
     let Some(target) = &destination.link else {
         return Ok(());
@@ -208,7 +208,7 @@ pub(super) async fn record_draft(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     target: &LinkTarget,
-    record: &InvenioRecord,
+    record: &RepositoryRecord,
 ) -> Result<(), TransferError> {
     let storage = &ctx.driver.storage_handle;
     let link = read_link(storage, spec.document_id, target.link_id)

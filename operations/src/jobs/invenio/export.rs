@@ -8,7 +8,8 @@ use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::repository::invenio::{export_fields, record_id, validate_id};
 use aruna_core::repository::{
-    ExportIdentity, InvenioDestination, InvenioRecord, LinkFailure, LinkTarget, MAX_RECORD_FILES,
+    ExportIdentity, LinkFailure, LinkTarget, MAX_RECORD_FILES, RepositoryDestination,
+    RepositoryRecord,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
@@ -34,7 +35,7 @@ use crate::jobs::service::read_artifact_range;
 pub(crate) async fn repository_export(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
+    destination: &RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), TransferError> {
     let prepared;
@@ -161,9 +162,9 @@ pub(crate) async fn repository_export(
 async fn observe_revision(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
+    destination: &RepositoryDestination,
     target: &LinkTarget,
-    record: &InvenioRecord,
+    record: &RepositoryRecord,
     metadata: [u8; 32],
 ) {
     let observed = async {
@@ -206,8 +207,8 @@ async fn observe_revision(
 pub(crate) async fn register_published(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
-    record: &InvenioRecord,
+    destination: &RepositoryDestination,
+    record: &RepositoryRecord,
 ) -> Result<(), TransferError> {
     let view =
         super::repository(&ctx.driver, destination.group_id, destination.connector_id).await?;
@@ -233,11 +234,11 @@ pub(crate) async fn register_published(
 pub(crate) async fn create_draft(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
+    destination: &RepositoryDestination,
     jsonld: &str,
     identity: &ExportIdentity,
     fence: impl AsyncFnOnce() -> Result<(), TransferError>,
-) -> Result<InvenioRecord, TransferError> {
+) -> Result<RepositoryRecord, TransferError> {
     let credential = destination
         .credential
         .as_ref()
@@ -263,7 +264,7 @@ pub(crate) async fn create_draft(
     if fields.to_string().len() as u64 > spec.limits.metadata_bytes {
         return Err(invalid("mapped repository metadata exceeds limit"));
     }
-    let parent = if let Some(id) = &destination.new_version {
+    let parent = if let Some(id) = &destination.published_id {
         validate_id(id)?;
         let source = client
             .json(Method::GET, client.url(&["records", id])?, None)
@@ -285,7 +286,7 @@ pub(crate) async fn create_draft(
         client
             .json(Method::GET, client.url(&["records", id, "draft"])?, None)
             .await?
-    } else if let Some(id) = &destination.new_version {
+    } else if let Some(id) = &destination.published_id {
         guard(ctx, spec, destination).await?;
         client
             .json(
@@ -329,9 +330,9 @@ pub(crate) async fn create_draft(
 async fn reserve_doi(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
-    record: &InvenioRecord,
-) -> Result<InvenioRecord, TransferError> {
+    destination: &RepositoryDestination,
+    record: &RepositoryRecord,
+) -> Result<RepositoryRecord, TransferError> {
     let credential = destination
         .credential
         .as_ref()
@@ -396,7 +397,7 @@ pub async fn missing_metadata(
 pub(super) fn record_from(
     client: &InvenioClient<'_>,
     record: &Value,
-) -> Result<InvenioRecord, TransferError> {
+) -> Result<RepositoryRecord, TransferError> {
     let id = record_id(record)?.to_string();
     let published = record["is_published"] == true;
     let url = if published {
@@ -404,7 +405,7 @@ pub(super) fn record_from(
     } else {
         client.url(&["records", &id, "draft"])?
     };
-    Ok(InvenioRecord {
+    Ok(RepositoryRecord {
         url: url.to_string(),
         published,
         parent_id: record["parent"]["id"]
@@ -476,11 +477,11 @@ async fn inspect_artifact(
 pub(crate) async fn prepare_draft(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
-    record: &InvenioRecord,
+    destination: &RepositoryDestination,
+    record: &RepositoryRecord,
     jsonld: &str,
     identity: &ExportIdentity,
-) -> Result<(InvenioRecord, [u8; 32]), TransferError> {
+) -> Result<(RepositoryRecord, [u8; 32]), TransferError> {
     let credential = destination
         .credential
         .as_ref()
@@ -522,7 +523,7 @@ pub(crate) async fn prepare_draft(
         access["embargo"] = current["access"]["embargo"].clone();
     }
     fields["access"] = access;
-    let draft = if destination.draft_id.is_some() || destination.new_version.is_some() {
+    let draft = if destination.draft_id.is_some() || destination.published_id.is_some() {
         if current["revision_id"].as_u64() == Some(record.revision_id) {
             guard(ctx, spec, destination).await?;
             client.update(url, &fields, record.revision_id).await?
@@ -549,7 +550,7 @@ pub(crate) async fn prepare_draft(
     }
     verify_metadata(&fields, &draft)?;
     if destination.draft_id.is_none()
-        && destination.new_version.is_none()
+        && destination.published_id.is_none()
         && draft["revision_id"].as_u64() != Some(record.revision_id)
     {
         return Err(invalid("repository metadata changed during creation"));
@@ -564,11 +565,11 @@ pub(crate) async fn prepare_draft(
 pub(crate) async fn deposit(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
-    record: &InvenioRecord,
+    destination: &RepositoryDestination,
+    record: &RepositoryRecord,
     artifact: &ArtifactRef,
     metadata: [u8; 32],
-) -> Result<(InvenioRecord, Vec<String>), TransferError> {
+) -> Result<(RepositoryRecord, Vec<String>), TransferError> {
     let credential = destination
         .credential
         .as_ref()
@@ -714,7 +715,7 @@ pub(crate) async fn deposit(
 async fn upload_entry(
     ctx: &JobContext,
     client: &InvenioClient<'_>,
-    record: &InvenioRecord,
+    record: &RepositoryRecord,
     artifact: &ArtifactRef,
     entry: &ArchiveEntry,
     mut existing: Option<&Value>,
@@ -824,13 +825,13 @@ async fn upload_entry(
 async fn finish(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &InvenioDestination,
+    destination: &RepositoryDestination,
     client: &InvenioClient<'_>,
-    record: &InvenioRecord,
+    record: &RepositoryRecord,
     published: bool,
     metadata: [u8; 32],
     files: &std::collections::BTreeMap<String, (Hasher, u64)>,
-) -> Result<InvenioRecord, TransferError> {
+) -> Result<RepositoryRecord, TransferError> {
     let current_url = if published {
         client.url(&["records", &record.id])?
     } else {
@@ -883,7 +884,7 @@ async fn finish(
 /// The connector's community when this draft is a record's first version, which needs review.
 async fn review_community(
     ctx: &JobContext,
-    destination: &InvenioDestination,
+    destination: &RepositoryDestination,
     draft: &Value,
 ) -> Result<Option<String>, TransferError> {
     if draft["versions"]["index"] != 1 {
@@ -902,7 +903,7 @@ async fn review_community(
 /// Submits the draft to the community; a submission still open stays as it is.
 async fn submit_review(
     client: &InvenioClient<'_>,
-    record: &InvenioRecord,
+    record: &RepositoryRecord,
     draft: &Value,
     community: &str,
 ) -> Result<(), TransferError> {

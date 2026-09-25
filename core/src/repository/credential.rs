@@ -8,7 +8,7 @@ use ulid::Ulid;
 use crate::UserId;
 use crate::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 
-use super::InvenioError;
+use super::RepositoryError;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryCredential {
@@ -27,7 +27,7 @@ impl RepositoryCredential {
         connector: Ulid,
         endpoint: String,
         token: &str,
-    ) -> Result<Self, InvenioError> {
+    ) -> Result<Self, RepositoryError> {
         Self::seal_link(key, user, group, connector, None, endpoint, token)
     }
 
@@ -39,18 +39,18 @@ impl RepositoryCredential {
         link_id: Option<Ulid>,
         endpoint: String,
         token: &str,
-    ) -> Result<Self, InvenioError> {
+    ) -> Result<Self, RepositoryError> {
         if token.is_empty()
             || token.len() > 16 * 1024
             || !token.bytes().all(|byte| byte.is_ascii_graphic())
         {
-            return Err(InvenioError(
+            return Err(RepositoryError(
                 "a personal repository access token is required",
             ));
         }
         let aad = token_aad(user, group, connector, link_id, &endpoint);
         let sealed = EncryptedS3Secret::encrypt(key, token, &aad)
-            .map_err(|_| InvenioError("repository token encryption failed"))?;
+            .map_err(|_| RepositoryError("repository token encryption failed"))?;
         Ok(Self {
             endpoint,
             fingerprint: *blake3::hash(token.as_bytes()).as_bytes(),
@@ -66,16 +66,16 @@ impl RepositoryCredential {
         group: Ulid,
         connector: Ulid,
         endpoint: &str,
-    ) -> Result<String, InvenioError> {
+    ) -> Result<String, RepositoryError> {
         if endpoint != self.endpoint {
-            return Err(InvenioError("repository endpoint changed after login"));
+            return Err(RepositoryError("repository endpoint changed after login"));
         }
         self.sealed
             .open(
                 key,
                 &token_aad(user, group, connector, self.link_id, endpoint),
             )
-            .map_err(|_| InvenioError("repository login is not valid for this user and node"))
+            .map_err(|_| RepositoryError("repository login is not valid for this user and node"))
     }
 }
 

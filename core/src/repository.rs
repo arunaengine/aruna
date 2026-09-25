@@ -62,11 +62,11 @@ pub enum RepositoryPull {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InvenioDestination {
+pub struct RepositoryDestination {
     pub group_id: Ulid,
     pub connector_id: Ulid,
     pub draft_id: Option<String>,
-    pub new_version: Option<String>,
+    pub published_id: Option<String>,
     pub metadata_json: String,
     pub publish: bool,
     pub public_files: bool,
@@ -76,7 +76,7 @@ pub struct InvenioDestination {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InvenioRecord {
+pub struct RepositoryRecord {
     pub id: String,
     pub url: String,
     pub published: bool,
@@ -93,7 +93,7 @@ pub struct InvenioRecord {
     pub warning: Option<String>,
 }
 
-impl InvenioRecord {
+impl RepositoryRecord {
     /// The version DOI, concept DOI, record id and parent id as secondary identifiers.
     pub fn identifiers(
         &self,
@@ -115,7 +115,7 @@ impl InvenioRecord {
 
 #[derive(Debug, Error)]
 #[error("invalid Invenio record: {0}")]
-pub struct InvenioError(pub &'static str);
+pub struct RepositoryError(pub &'static str);
 
 /// The dataset's own identifiers, read when an export starts. Exports add them to what they
 /// send, so the document itself is never edited and a push never causes another push.

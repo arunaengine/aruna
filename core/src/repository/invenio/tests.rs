@@ -76,11 +76,11 @@ fn binds_repository_login() {
             },
             document_id: Ulid::nil(),
             limits: RoCrateLimits::default(),
-            destination: Some(InvenioDestination {
+            destination: Some(RepositoryDestination {
                 group_id: group,
                 connector_id: connector,
                 draft_id: None,
-                new_version: None,
+                published_id: None,
                 metadata_json: "{}".into(),
                 publish: true,
                 public_files: false,

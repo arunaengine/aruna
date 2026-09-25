@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{ImportOptions, InvenioDestination, InvenioRecord};
+use super::{ImportOptions, RepositoryDestination, RepositoryRecord};
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
 use crate::structs::execution::job::{ImportRoCrateTarget, JobId, RoCrateLimits};
@@ -207,7 +207,7 @@ pub struct LinkPatch {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PushOutcome {
     Pushed {
-        record: Box<InvenioRecord>,
+        record: Box<RepositoryRecord>,
         event_id: Ulid,
         dataset_digest: Option<[u8; 32]>,
         /// The file keys the record holds after the push.
@@ -250,9 +250,9 @@ impl LinkQueueEntry {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteState {
     /// The open draft with its revision, if one remains.
-    pub draft: Option<InvenioRecord>,
+    pub draft: Option<RepositoryRecord>,
     /// The latest published version of the lineage.
-    pub latest: Option<InvenioRecord>,
+    pub latest: Option<RepositoryRecord>,
     pub review: LinkReview,
     /// File keys of the open draft; accepting them lets later pushes replace them.
     pub files: Vec<String>,
@@ -409,7 +409,7 @@ impl RepositoryLink {
     }
 
     /// Takes the repository's view of the draft or published record as the link's remote.
-    pub fn adopt(&mut self, record: &InvenioRecord) {
+    pub fn adopt(&mut self, record: &RepositoryRecord) {
         let remote = &mut self.remote;
         remote.parent_id = Some(record.parent_id.clone());
         if record.published {
@@ -432,7 +432,7 @@ impl RepositoryLink {
     }
 
     /// Stores the draft of the running push as soon as it exists, so a retry continues it.
-    pub fn draft(&mut self, job_id: JobId, record: &InvenioRecord, now: SystemTime) -> bool {
+    pub fn draft(&mut self, job_id: JobId, record: &RepositoryRecord, now: SystemTime) -> bool {
         if self.active_job != Some(job_id) || record.published {
             return false;
         }
@@ -490,12 +490,12 @@ impl RepositoryLink {
     }
 
     /// Updates the open draft, else starts a new version of the lineage, else a new record.
-    pub fn destination(&self, publish: bool) -> InvenioDestination {
+    pub fn destination(&self, publish: bool) -> RepositoryDestination {
         let draft = self.remote.draft_id.clone();
-        InvenioDestination {
+        RepositoryDestination {
             group_id: self.group_id,
             connector_id: self.connector_id,
-            new_version: draft
+            published_id: draft
                 .is_none()
                 .then(|| self.remote.record_id.clone())
                 .flatten(),
@@ -619,7 +619,7 @@ impl RepositoryLink {
     pub fn pulled(
         &mut self,
         job_id: JobId,
-        record: &InvenioRecord,
+        record: &RepositoryRecord,
         revision: Ulid,
         now: SystemTime,
     ) -> bool {
@@ -632,7 +632,7 @@ impl RepositoryLink {
     }
 
     /// Makes `record` and dataset `revision` the pull link's base.
-    pub fn hold(&mut self, record: &InvenioRecord, revision: Ulid, now: SystemTime) {
+    pub fn hold(&mut self, record: &RepositoryRecord, revision: Ulid, now: SystemTime) {
         self.adopt(record);
         self.remote.revision_id = Some(record.revision_id);
         if let Some(pull) = self.pull_mut() {

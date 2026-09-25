@@ -111,7 +111,7 @@ pub struct ExportCheckpoint {
     pub(crate) repository_started: bool,
     pub(crate) repository_complete: bool,
     pub(crate) repository_metadata: Option<[u8; 32]>,
-    pub(crate) repository: Option<aruna_core::repository::InvenioRecord>,
+    pub(crate) repository: Option<aruna_core::repository::RepositoryRecord>,
     /// A link's resolved lineage base: the latest published version it continues.
     pub(crate) repository_base: Option<String>,
     pub(crate) link_failure: Option<aruna_core::repository::LinkFailure>,
@@ -512,7 +512,7 @@ async fn run_export(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome
 async fn repository_export(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    destination: &aruna_core::repository::InvenioDestination,
+    destination: &aruna_core::repository::RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
     use super::invenio::{TransferError, export};

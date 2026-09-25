@@ -4,7 +4,7 @@
 
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
-use aruna_core::repository::{ExportIdentity, InvenioRecord, LinkFailure};
+use aruna_core::repository::{ExportIdentity, LinkFailure, RepositoryRecord};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::{
@@ -70,7 +70,7 @@ pub(super) fn checkpoint_rows(
         false,
         false,
         None::<[u8; 32]>,
-        None::<InvenioRecord>,
+        None::<RepositoryRecord>,
         None::<String>,
         None::<LinkFailure>,
         Vec::<String>::new(),

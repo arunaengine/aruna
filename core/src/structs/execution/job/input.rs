@@ -367,7 +367,7 @@ pub struct ImportRoCrateSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRoCrateSpec {
-    pub destination: Option<crate::repository::InvenioDestination>,
+    pub destination: Option<crate::repository::RepositoryDestination>,
     pub auth_context: AuthContext,
     pub document_id: Ulid,
     pub limits: RoCrateLimits,
@@ -532,7 +532,7 @@ pub struct ExportOmissionCounts {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRoCrateResult {
-    pub repository: Option<crate::repository::InvenioRecord>,
+    pub repository: Option<crate::repository::RepositoryRecord>,
     pub artifact: Option<ArtifactRef>,
     pub included: u64,
     pub omitted: ExportOmissionCounts,

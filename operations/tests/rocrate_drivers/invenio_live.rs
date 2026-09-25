@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::repository::{ImportMode, ImportOptions, InvenioRecord, RepositoryQuery};
+use aruna_core::repository::{ImportMode, ImportOptions, RepositoryQuery, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
 use aruna_operations::jobs::invenio::{seal_credential, search_records};
@@ -35,11 +35,11 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
     let title = format!("Aruna acceptance {}", Ulid::generate());
-    let mut destination = InvenioDestination {
+    let mut destination = RepositoryDestination {
         group_id: fixture.group_id,
         connector_id: connector,
         draft_id: None,
-        new_version: None,
+        published_id: None,
         metadata_json: json!({"title": title, "publisher": "Aruna acceptance"}).to_string(),
         publish: false,
         public_files: false,
@@ -92,7 +92,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
     assert!(first.published);
     let target = spec.destination.as_mut().unwrap();
     target.draft_id = None;
-    target.new_version = Some(first.id.clone());
+    target.published_id = Some(first.id.clone());
     let second = transfer(&fixture, &spec).await?;
     assert!(second.published);
     assert_ne!(first.id, second.id);
@@ -519,7 +519,7 @@ async fn live_connector(
 async fn transfer(
     fixture: &Fixture,
     spec: &ExportRoCrateSpec,
-) -> Result<InvenioRecord, Box<dyn std::error::Error>> {
+) -> Result<RepositoryRecord, Box<dyn std::error::Error>> {
     let ctx = claim_context(fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
     let outcome = Box::pin(run_export_job(&ctx, spec)).await;
     complete(fixture, &ctx, &outcome).await?;
@@ -736,11 +736,11 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         path_restrictions: None,
         session: None,
     };
-    let mut destination = InvenioDestination {
+    let mut destination = RepositoryDestination {
         group_id: fixture.group_id,
         connector_id: connector,
         draft_id: None,
-        new_version: None,
+        published_id: None,
         metadata_json: metadata("v1"),
         publish: true,
         public_files: true,
@@ -791,7 +791,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(link.remote.record_id.as_deref(), Some(first.id.as_str()));
 
     let target = spec.destination.as_mut().unwrap();
-    target.new_version = Some(first.id.clone());
+    target.published_id = Some(first.id.clone());
     target.metadata_json = metadata("v2");
     let second = transfer(&fixture, &spec).await?;
     assert!(second.published && second.parent_id == first.parent_id);

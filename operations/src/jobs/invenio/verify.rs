@@ -4,7 +4,7 @@
 
 use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::InvenioClient;
-use aruna_core::repository::InvenioRecord;
+use aruna_core::repository::RepositoryRecord;
 use aruna_core::repository::invenio::normalize_metadata;
 use http::Method;
 use serde_json::{Value, json};
@@ -14,7 +14,7 @@ use super::export::invalid;
 
 pub(super) async fn verify_files(
     client: &InvenioClient<'_>,
-    record: &InvenioRecord,
+    record: &RepositoryRecord,
     published: bool,
     expected: &std::collections::BTreeMap<String, (Hasher, u64)>,
 ) -> Result<(), TransferError> {
