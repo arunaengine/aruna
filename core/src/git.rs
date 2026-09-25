@@ -67,6 +67,14 @@ pub struct GitSnapshot {
     pub event_id: Ulid,
     pub occurred_at_ms: u64,
     pub jsonld: String,
+    /// Aruna objects that File entities name, placed in the ARC as LFS pointers.
+    pub objects: Vec<LinkedObject>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LinkedObject {
+    pub entity: String,
+    pub object: StoredObject,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

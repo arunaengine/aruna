@@ -355,6 +355,28 @@ class MappingTests(unittest.TestCase):
             return result
         return {"@context": document["@context"][0], "@graph": walk(document["@graph"])}
 
+    def test_object_pointers(self):
+        graph = source()
+        data = "https://w3id.org/aruna/data/arn:aruna:realm:node:s3/bucket/raw/run%201.raw@01M"
+        other = "https://w3id.org/aruna/data/arn:aruna:realm:node:s3/bucket/notes.txt@01N"
+        graph["@graph"][1]["hasPart"] = [{"@id": "#assay"}, {"@id": other}]
+        graph["@graph"] += [
+            {"@id": "#assay", "@type": "Dataset", "additionalType": "Assay", "identifier": "run",
+             "name": "Run", "hasPart": {"@id": data}},
+            {"@id": data, "@type": "File", "name": "run 1.raw"},
+            {"@id": other, "@type": "File", "name": "notes.txt"}]
+        objects = {data: {"oid": "a" * 64, "size": 7, "key": "raw/run 1.raw"},
+                   other: {"oid": "b" * 64, "size": 3, "key": "notes.txt"}}
+        result = conversion.convert({"mode": "generate", "document_id": "document-id",
+                                     "jsonld": json.dumps(graph), "objects": objects})
+        self.assertEqual(result["pointers"], {"assays/run/dataset/run 1.raw": data, "dataset/notes.txt": other})
+        pointer = base64.b64decode(result["files"]["assays/run/dataset/run 1.raw"]).decode()
+        self.assertEqual(pointer, f"version https://git-lfs.github.com/spec/v1\noid sha256:{'a' * 64}\nsize 7\n")
+        attributes = base64.b64decode(result["files"][".gitattributes"]).decode().splitlines()
+        self.assertIn("/assays/run/dataset/run[[:space:]]1.raw filter=lfs diff=lfs merge=lfs -text", attributes)
+        self.assertIn("*.bin filter=lfs diff=lfs merge=lfs -text", attributes)
+        conversion.convert({"mode": "inspect", "files": result["files"]})
+
     def test_git_removals(self):
         graph = source()
         graph["@graph"][1]["creator"] = [{"@id": "#person-ada"}, {"@id": "#person-bob"}]

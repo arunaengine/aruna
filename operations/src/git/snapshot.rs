@@ -5,18 +5,25 @@
 use super::project::{Projection, author, lock, project};
 use super::{GitError, document, objects, publish, records};
 use crate::driver::DriverContext;
+use crate::driver::drive;
+use crate::replication::bao_read::{BaoReadOutput, managed_read};
+use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
+use crate::s3::bucket::get::GetBucketOperation;
+use crate::s3::object::get::{GetObjectInput, get_object_info};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CHECKPOINT_AFTER, GitChange, GitCheckpoint, GitEffect, GitEvent, GitSnapshot, GitStatus,
-    RefUpdate, STATUS, ZERO_OID,
+    LinkedObject, RefUpdate, STATUS, StoredObject, ZERO_OID,
 };
 use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEventRecord, MetadataRawRevision,
 };
 use aruna_core::storage_entries::{event_log_key, materialization_status_key};
+use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
 use ulid::Ulid;
@@ -84,6 +91,127 @@ async fn current(
     Ok(Some((document.last_event_id, jsonld)))
 }
 
+/// Size and digests of an exact object version, read here or from its node.
+async fn resolve(
+    context: &DriverContext,
+    exact: &VersionedObjectArn,
+    user: UserId,
+) -> Result<StoredObject, GitError> {
+    let node = context
+        .net_handle
+        .as_ref()
+        .map(|net| net.node_id())
+        .ok_or(GitError::Unavailable)?;
+    let (size, hashes, group_id) = if exact.node_id == node {
+        let bucket = drive(GetBucketOperation::new(exact.bucket.clone()), context)
+            .await
+            .map_err(|_| GitError::NotFound)?;
+        let input = GetObjectInput {
+            bucket: exact.bucket.clone(),
+            key: exact.key.clone(),
+            version_id: Some(exact.version),
+            range: None,
+            group_id: bucket.group_id,
+            user_identity: user,
+            node_id: node,
+        };
+        let info = get_object_info(context, input, None)
+            .await
+            .map_err(|_| GitError::NotFound)?;
+        (info.size, info.hashes, Some(bucket.group_id))
+    } else {
+        let request = BaoReadRequest {
+            auth_context: author(user),
+            realm_id: exact.realm_id,
+            target: BaoReadTarget::ExactVersion(exact.clone()),
+            expected_blake3: None,
+            metadata_only: true,
+            destination: None,
+            known_refs: Vec::new(),
+        };
+        match managed_read(context, exact.node_id, request).await {
+            Ok(BaoReadOutput::Metadata { size, hashes, .. }) => (size, hashes, None),
+            _ => return Err(GitError::NotFound),
+        }
+    };
+    Ok(StoredObject {
+        node_id: exact.node_id,
+        group_id,
+        bucket: exact.bucket.clone(),
+        key: exact.key.clone(),
+        version_id: exact.version,
+        size,
+        sha256: hashes
+            .get(HASH_SHA256)
+            .map(hex::encode)
+            .ok_or(GitError::Unavailable)?,
+        blake3: hashes
+            .get(HASH_BLAKE3)
+            .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
+            .ok_or(GitError::Unavailable)?,
+    })
+}
+
+/// File entities that name an exact Aruna object version. An object the author cannot
+/// read stays out of the ARC; its entity still describes it in the metadata.
+async fn linked(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    jsonld: &str,
+    user: UserId,
+) -> Vec<LinkedObject> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(jsonld) else {
+        return Vec::new();
+    };
+    let mut linked = Vec::new();
+    for entity in value["@graph"].as_array().into_iter().flatten() {
+        let listed = |value: &serde_json::Value| -> Vec<String> {
+            let values = value
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| vec![value.clone()]);
+            values
+                .iter()
+                .filter_map(|item| item.as_str().or_else(|| item["@id"].as_str()))
+                .map(str::to_owned)
+                .collect()
+        };
+        let Some(id) = entity["@id"].as_str() else {
+            continue;
+        };
+        // RO-Crate `File` is an alias of schema.org MediaObject, which exports may spell out.
+        let file = |kind: &String| {
+            let local = kind
+                .trim_start_matches("http://schema.org/")
+                .trim_start_matches("https://schema.org/");
+            matches!(local, "File" | "MediaObject")
+        };
+        if !listed(&entity["@type"]).iter().any(file) {
+            continue;
+        }
+        let urls = listed(&entity["contentUrl"]);
+        let Some(exact) = crate::jobs::export::entity_identity(id, &urls).exact else {
+            continue;
+        };
+        if exact.realm_id != document.realm_id {
+            continue;
+        }
+        match resolve(context, &exact, user).await {
+            Ok(object) => linked.push(LinkedObject {
+                entity: id.to_string(),
+                object,
+            }),
+            Err(error) => {
+                tracing::warn!(entity = id, %error, "Leaving unreadable object out of the ARC")
+            }
+        }
+        if linked.len() >= 10_000 {
+            break;
+        }
+    }
+    linked
+}
+
 async fn generate(
     context: &DriverContext,
     store: &GitStore,
@@ -102,6 +230,8 @@ async fn generate(
         .as_ref()
         .map_or(UserId::nil(document.realm_id), |event| event.user_id);
     let occurred_at_ms = event.map_or(document.updated_at_ms, |event| event.occurred_at_ms);
+    let objects = linked(context, document, &jsonld, user).await;
+    let lfs: Vec<StoredObject> = objects.iter().map(|linked| linked.object.clone()).collect();
     let refs = &projection.state.refs;
     let effect = GitEffect::Generate {
         snapshot: GitSnapshot {
@@ -109,6 +239,7 @@ async fn generate(
             event_id,
             occurred_at_ms,
             jsonld,
+            objects,
         },
         refs: refs.clone(),
     };
@@ -152,7 +283,7 @@ async fn generate(
     let change = GitChange::Objects {
         pack,
         refs: updates,
-        lfs: Vec::new(),
+        lfs,
         revision: Some(event_id),
     };
     publish::publish(context, document, user, change).await?;

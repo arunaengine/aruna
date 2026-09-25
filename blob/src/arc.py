@@ -241,12 +241,48 @@ def generate(request, root):
         canonical_workbook(workbook)
     (root / "ro-crate-metadata.json").write_text(json.dumps(document, indent=2) + "\n")
     (root / "aruna-metadata.json").write_text(source)
-    (root / ".gitattributes").write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n")
+    pointers = link(root, json.loads(source), request.get("objects", {}))
+    attributes = ["*.bin filter=lfs diff=lfs merge=lfs -text"]
+    attributes += ["/" + path.replace(" ", "[[:space:]]") + " filter=lfs diff=lfs merge=lfs -text"
+                   for path in sorted(pointers)]
+    (root / ".gitattributes").write_text("\n".join(attributes) + "\n")
     paths = sorted(path for path in root.rglob("*") if path.is_file())
     if len(paths) > 10000 or sum(path.stat().st_size for path in paths) > LIMIT // 2:
         raise ValueError("generated ARC exceeds the repository limit")
     return {"files": {str(path.relative_to(root)): base64.b64encode(path.read_bytes()).decode() for path in paths},
-            "required": data_paths(document)}
+            "required": data_paths(document), "pointers": pointers}
+
+
+def link(root, source, objects):
+    """Writes LFS pointers for Aruna objects next to the assay or study that lists them."""
+    graph = entities(source)
+    parents = {}
+    for entity in graph.values():
+        for part in listed(entity.get("hasPart")):
+            if isinstance(part, dict) and part.get("@id") in objects:
+                kinds = {term(kind) for kind in listed(entity.get("additionalType"))}
+                identifier = next((value for value in listed(entity.get("identifier"))
+                                   if isinstance(value, str)), None)
+                if identifier and kinds & {"Assay", "Study"}:
+                    parents.setdefault(part["@id"], (kinds, identifier))
+    pointers = {}
+    for identifier in sorted(objects):
+        target = objects[identifier]
+        kinds, owner = parents.get(identifier, (set(), None))
+        folder = (f"assays/{owner}/dataset" if "Assay" in kinds else
+                  f"studies/{owner}/resources" if "Study" in kinds else "dataset")
+        names = [value for value in listed(graph.get(identifier, {}).get("name")) if isinstance(value, str)]
+        name = PurePosixPath(names[0] if names else target["key"]).name or "data"
+        path = str(confined(f"{folder}/{name}"))
+        stem, suffix, count = PurePosixPath(path).stem, PurePosixPath(path).suffix, 1
+        while (root / path).exists() or path in pointers:
+            count += 1
+            path = str(PurePosixPath(folder) / f"{stem}-{count}{suffix}")
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(f"version https://git-lfs.github.com/spec/v1\noid sha256:{target['oid']}\n"
+                                 f"size {target['size']}\n")
+        pointers[path] = identifier
+    return pointers
 
 
 def listed(value):

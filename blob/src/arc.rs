@@ -165,7 +165,12 @@ fn entities(value: &Value) -> Vec<String> {
 
 /// Brings graph changes onto a client-edited main without replacing equivalent client files.
 /// Workbooks change only when their ISA meaning differs from the graph's generated ARC.
-async fn reconcile(directory: &Path, main: &str, files: &Files) -> std::io::Result<Option<String>> {
+async fn reconcile(
+    directory: &Path,
+    main: &str,
+    files: &Files,
+    pointers: &std::collections::BTreeSet<String>,
+) -> std::io::Result<Option<String>> {
     let (_, derived) = files
         .get("ro-crate-metadata.json")
         .ok_or_else(|| failed("ARC conversion omitted its RO-Crate"))?;
@@ -178,13 +183,12 @@ async fn reconcile(directory: &Path, main: &str, files: &Files) -> std::io::Resu
     let mut overlay = Files::new();
     for (path, entry) in files {
         let isa = workbook(path) || path == "LICENSE";
-        if (isa && same)
-            || !(isa
-                || matches!(
-                    path.as_str(),
-                    "ro-crate-metadata.json" | "aruna-metadata.json"
-                ))
-        {
+        let derived = pointers.contains(path)
+            || matches!(
+                path.as_str(),
+                "ro-crate-metadata.json" | "aruna-metadata.json"
+            );
+        if (isa && same) || !(isa || derived) {
             continue;
         }
         let existing = command(directory, &["show", &format!("{main}:{path}")])
@@ -192,6 +196,28 @@ async fn reconcile(directory: &Path, main: &str, files: &Files) -> std::io::Resu
             .ok();
         if existing.as_deref() != Some(entry.1.as_slice()) {
             overlay.insert(path.clone(), entry.clone());
+        }
+    }
+    if !pointers.is_empty()
+        && let Some((mode, generated)) = files.get(".gitattributes")
+    {
+        // Keep the client's LFS rules and add the pointer paths it lacks.
+        let existing = command(directory, &["show", &format!("{main}:.gitattributes")])
+            .await
+            .unwrap_or_default();
+        let mut merged = String::from_utf8_lossy(&existing).into_owned();
+        let known: std::collections::BTreeSet<String> = merged.lines().map(str::to_owned).collect();
+        for line in String::from_utf8_lossy(generated).lines() {
+            if !known.contains(line) {
+                if !merged.is_empty() && !merged.ends_with('\n') {
+                    merged.push('\n');
+                }
+                merged.push_str(line);
+                merged.push('\n');
+            }
+        }
+        if merged.as_bytes() != existing.as_ref() {
+            overlay.insert(".gitattributes".into(), (mode.clone(), merged.into_bytes()));
         }
     }
     let mut removed = Vec::new();
@@ -222,7 +248,24 @@ pub async fn generate(
 ) -> std::io::Result<Result<(String, Option<String>), String>> {
     let previous = refs.get("refs/heads/aruna").cloned();
     let main = refs.get("refs/heads/main").cloned();
-    let conversion = convert(json!({"mode":"generate", "document_id":source.document_id.to_string(), "jsonld":source.jsonld})).await?;
+    let objects: serde_json::Map<String, Value> = source
+        .objects
+        .iter()
+        .map(|linked| {
+            let object = &linked.object;
+            let target = json!({"oid": object.sha256, "size": object.size, "key": object.key});
+            (linked.entity.clone(), target)
+        })
+        .collect();
+    let conversion = convert(
+        json!({"mode":"generate", "document_id":source.document_id.to_string(),
+        "jsonld":source.jsonld, "objects": objects}),
+    )
+    .await?;
+    let pointers: std::collections::BTreeSet<String> = conversion["pointers"]
+        .as_object()
+        .map(|pointers| pointers.keys().cloned().collect())
+        .unwrap_or_default();
     if let Some(error) = conversion["error"].as_str() {
         return Ok(Err(error.into()));
     }
@@ -291,7 +334,7 @@ pub async fn generate(
     let main = match main.as_deref() {
         None => Some(commit.clone()),
         Some(main) if previous.as_deref() == Some(main) => Some(commit.clone()),
-        Some(main) => match reconcile(directory, main, &files).await? {
+        Some(main) => match reconcile(directory, main, &files, &pointers).await? {
             Some(tree) => {
                 let message = format!("Merge Aruna metadata into main{trailer}");
                 let parents = [main, commit.as_str()];
