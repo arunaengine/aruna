@@ -17,6 +17,8 @@ pub struct GitState {
     pub waiting: Vec<LfsLock>,
     /// Released locks and the record that released them.
     pub released: Vec<(LfsLock, Ulid)>,
+    /// Releases the next checkpoint adds.
+    pub new_released: Vec<(LfsLock, Ulid)>,
     pub revision: Option<Ulid>,
     /// The graph digest of the newest applied snapshot.
     pub digest: Option<[u8; 32]>,
@@ -88,11 +90,12 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
             .map(|lock| (lock.path.clone(), lock.clone()))
             .collect();
         state.waiting = newest.waiting.clone();
-        state.released = newest.released.clone();
+
         state.revision = newest.revision;
         state.digest = newest.digest;
         for (_, checkpoint) in chain.iter().rev() {
             state.made.extend(checkpoint.made.iter().cloned());
+            state.released.extend(checkpoint.released.iter().cloned());
             for pack in &checkpoint.packs {
                 if !state.packs.contains(pack) {
                     state.packs.push(pack.clone());
@@ -219,7 +222,8 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                     .map(|(path, _)| path.clone());
                 if let Some(path) = released {
                     if let Some(lock) = state.locks.remove(&path) {
-                        state.released.push((lock, record.event_id));
+                        state.released.push((lock.clone(), record.event_id));
+                        state.new_released.push((lock, record.event_id));
                     }
                     // Claims made while the lock was held were refused; the first later one holds.
                     let unlocked = record.event_id;
@@ -415,7 +419,11 @@ mod tests {
             };
             checkpoint.released = vec![(held, Ulid::from(20))];
         }
-        let state = done(&[folded, lock(15, 2, 4)], &Ancestry::new());
+        let state = done(&[folded.clone(), lock(15, 2, 4)], &Ancestry::new());
+        assert!(state.locks.is_empty());
+        // The release stays known when a later checkpoint builds on that one.
+        let later = checkpoint(40, Some(30), &[], &[35]);
+        let state = done(&[folded, later, lock(15, 2, 4)], &Ancestry::new());
         assert!(state.locks.is_empty());
     }
 
