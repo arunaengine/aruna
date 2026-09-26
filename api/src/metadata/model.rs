@@ -295,6 +295,9 @@ pub struct ReplaceRoCrateRequest {
     pub rocrate: Value,
     #[serde(default)]
     pub public: Option<bool>,
+    /// The newest event id the caller based its crate on; a newer edit answers 412.
+    #[serde(default)]
+    pub expected_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

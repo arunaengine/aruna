@@ -336,15 +336,22 @@ async fn publish(
 async fn merge(directory: &Path, old: &str, new: &str, token: &str) -> std::io::Result<()> {
     let url = std::env::var("ARUNA_GIT_METADATA_URL").map_err(|_| invalid())?;
     // Scaffolded documents have no raw revision until their first replacement.
-    let current =
+    let (current, revision) =
         match aruna_blob::git::metadata_request(&format!("{url}/rocrate?view=raw"), token, None)
             .await
         {
-            Ok(bytes) => serde_json::from_slice::<Value>(&bytes)?["raw"].take(),
-            Err(_) => serde_json::from_slice::<Value>(
-                &aruna_blob::git::metadata_request(&format!("{url}/rocrate"), token, None).await?,
-            )?["rocrate"]
-                .take(),
+            Ok(bytes) => {
+                let mut view = serde_json::from_slice::<Value>(&bytes)?;
+                (view["raw"].take(), view["winning_event_id"].take())
+            }
+            Err(_) => (
+                serde_json::from_slice::<Value>(
+                    &aruna_blob::git::metadata_request(&format!("{url}/rocrate"), token, None)
+                        .await?,
+                )?["rocrate"]
+                    .take(),
+                Value::Null,
+            ),
         };
     let old = (!old.bytes().all(|byte| byte == b'0')).then_some(old);
     let graph = serde_json::to_string(&current)?;
@@ -354,7 +361,8 @@ async fn merge(directory: &Path, old: &str, new: &str, token: &str) -> std::io::
         Err(error) => return Err(std::io::Error::other(error)),
     };
     let rocrate: Value = serde_json::from_str(&jsonld)?;
-    let body = serde_json::to_vec(&json!({ "rocrate": rocrate }))?;
+    // An edit that lands while the push runs must not be overwritten; the push is refused.
+    let body = serde_json::to_vec(&json!({ "rocrate": rocrate, "expected_revision": revision }))?;
     aruna_blob::git::metadata_request(
         &format!("{url}/rocrate"),
         token,
