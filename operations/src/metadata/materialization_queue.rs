@@ -1651,9 +1651,11 @@ async fn process_materialization_job(
     match apply_result {
         Ok(materialized) => {
             let raw_revision = materialized.raw_revision;
-            if let Err(error) =
-                crate::git::snapshot::capture(context, &event.record, raw_revision.as_ref()).await
-            {
+            // Boxed so callers' futures stay shallow enough to prove `Send`.
+            let capture: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> = Box::pin(
+                crate::git::snapshot::capture(context, &event.record, raw_revision.as_ref()),
+            );
+            if let Err(error) = capture.await {
                 return Ok(ProcessedMaterializationJob::deferred(
                     defer_materialization_job(
                         &job_key,
@@ -1664,9 +1666,10 @@ async fn process_materialization_job(
                     craqle_elapsed,
                 ));
             }
-            if let Err(error) =
-                crate::metadata::checkpoint::after_materialization(context, &event.record).await
-            {
+            let checkpoint: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> = Box::pin(
+                crate::metadata::checkpoint::after_materialization(context, &event.record),
+            );
+            if let Err(error) = checkpoint.await {
                 // The next materialization of this document checks the window again.
                 warn!(document_id = %event.record.document_id, %error, "Metadata checkpoint failed");
             }
