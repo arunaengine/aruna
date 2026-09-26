@@ -122,9 +122,12 @@ async fn apply_one(
         match Box::pin(update_metadata_document(operation, context)).await {
             Ok(_) => return Ok(()),
             Err(UpdateDocumentError::GraphChanged) => {}
-            Err(UpdateDocumentError::MetadataError(error)) => {
-                return Err(GitError::Refused(error.to_string()));
-            }
+            // Only a verdict on the merged crate itself is final; anything else is retried.
+            Err(UpdateDocumentError::MetadataError(
+                error @ (MetadataError::InvalidInput(_)
+                | MetadataError::Validation(_)
+                | MetadataError::ProfileValidation(_)),
+            )) => return Err(GitError::Refused(error.to_string())),
             Err(error) => {
                 warn!(document_id = %document.document_id, %error, "Pushed metadata waits");
                 return Err(GitError::Unavailable);
