@@ -55,13 +55,14 @@ jobs:
           tool: uv@0.11.28
 
       # Real Git, Git LFS and ARC clients; the node itself converts ARCs with arctrl.
+      # One test at a time: the multi-node test can stall document sync under parallel load.
       - name: Run native Git tests
         run: >-
           uv run --no-project --python 3.13
           --with-requirements scripts/arc-native/requirements.txt
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
           exec cargo nextest run -p aruna --test git_native --all-features --locked
-          --profile ci --run-ignored only --no-tests fail'
+          --profile ci --run-ignored only --no-tests fail --test-threads 1'
 
       # nextest never runs doctests; this keeps them in the gate.
       - name: Run doctests
