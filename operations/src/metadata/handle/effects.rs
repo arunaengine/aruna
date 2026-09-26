@@ -11,7 +11,7 @@ use aruna_core::handle::Handle;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults};
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use async_trait::async_trait;
-use craqle::{ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, GraphId};
+use craqle::{ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, GraphId, RoCrateError};
 use tracing::{Instrument, Span, debug_span, field, warn};
 
 use super::entity_convert::{
@@ -311,6 +311,7 @@ pub(super) fn metadata_effect_kind(effect: &MetadataEffect) -> &'static str {
         MetadataEffect::PlanBatch { .. } => "plan_batch",
         MetadataEffect::MergeBatch { .. } => "merge_batch",
         MetadataEffect::GraphSnapshot { .. } => "graph_snapshot",
+        MetadataEffect::ExportVersioned { .. } => "export_versioned",
         MetadataEffect::InstallSnapshot { .. } => "install_snapshot",
     }
 }
@@ -326,6 +327,7 @@ pub(super) fn metadata_event_kind(event: &MetadataEvent) -> &'static str {
         MetadataEvent::GraphSyncScheduled { .. } => "graph_sync_scheduled",
         MetadataEvent::GraphPolicyResult { .. } => "graph_policy_result",
         MetadataEvent::RoCrateExportResult { .. } => "rocrate_export_result",
+        MetadataEvent::VersionedExport { .. } => "versioned_export",
         MetadataEvent::RoCrateSummaryResult { .. } => "rocrate_summary_result",
         MetadataEvent::RoCratePageResult { .. } => "rocrate_page_result",
         MetadataEvent::SearchResult { .. } => "search_result",
@@ -391,6 +393,7 @@ pub(super) fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         | MetadataEffect::ContainsGraph { graph_iri }
         | MetadataEffect::ContainsDot { graph_iri, .. }
         | MetadataEffect::GraphSnapshot { graph_iri }
+        | MetadataEffect::ExportVersioned { graph_iri }
         | MetadataEffect::InstallSnapshot { graph_iri, .. }
         | MetadataEffect::PlanBatch { graph_iri, .. }
         | MetadataEffect::MergeBatch { graph_iri, .. } => Some(graph_iri.clone()),
@@ -781,6 +784,24 @@ fn export_effect(
             );
             result
         }
+        MetadataEffect::ExportVersioned { graph_iri } => {
+            // The version only counts when no dot landed during the export.
+            let graph = GraphId::new(&graph_iri);
+            for _ in 0..8 {
+                let before = node.vector_clock(&graph)?;
+                let jsonld = node.export_rocrate(auth, &graph)?;
+                if node.vector_clock(&graph)? == before {
+                    return Ok(MetadataEvent::VersionedExport {
+                        graph_iri: graph_iri.clone(),
+                        jsonld,
+                        version: aruna_core::metadata::graph_version(&before),
+                    });
+                }
+            }
+            Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
+                "metadata graph `{graph_iri}` kept changing while exporting"
+            ))))
+        }
         MetadataEffect::ExportRoCrateSummary { graph_iri } => {
             let call_span = debug_span!(
                 "metadata.backend.craqle.export_rocrate_summary",
@@ -1114,7 +1135,8 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         | MetadataEffect::GetGraphPolicy { .. }) => policy_effect(&node, &auth, effect),
         effect @ (MetadataEffect::ExportRoCrate { .. }
         | MetadataEffect::ExportRoCrateSummary { .. }
-        | MetadataEffect::ExportRoCratePage { .. }) => export_effect(&node, &auth, effect),
+        | MetadataEffect::ExportRoCratePage { .. }
+        | MetadataEffect::ExportVersioned { .. }) => export_effect(&node, &auth, effect),
         MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::QueryGraphs { .. }
         | MetadataEffect::SyncBestEffort { .. } => unreachable!("handled asynchronously"),

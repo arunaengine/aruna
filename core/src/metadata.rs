@@ -970,6 +970,12 @@ pub enum MetadataClockRelation {
     Concurrent,
 }
 
+/// A short version of a graph: it changes with every applied dot, also a late, older one.
+pub fn graph_version(clock: &VectorClock) -> String {
+    let bytes = postcard::to_allocvec(clock).unwrap_or_default();
+    hex::encode(blake3::hash(&bytes).as_bytes())
+}
+
 pub fn compare_metadata_clocks(local: &VectorClock, remote: &VectorClock) -> MetadataClockRelation {
     let mut local_ahead = false;
     let mut remote_ahead = false;
@@ -1149,6 +1155,10 @@ pub enum MetadataEffect {
     GraphSnapshot {
         graph_iri: String,
     },
+    /// Exports the graph together with the [`graph_version`] it was exported at.
+    ExportVersioned {
+        graph_iri: String,
+    },
     InstallSnapshot {
         graph_iri: String,
         snapshot: Box<GraphReplicaSnapshot>,
@@ -1233,6 +1243,11 @@ pub enum MetadataEvent {
         contains: bool,
     },
     // Device replicas
+    VersionedExport {
+        graph_iri: String,
+        jsonld: String,
+        version: String,
+    },
     GraphSnapshotResult {
         graph_iri: String,
         snapshot: Box<GraphReplicaSnapshot>,

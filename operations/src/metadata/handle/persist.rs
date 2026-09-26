@@ -88,6 +88,7 @@ pub(super) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::ContainsGraph { .. }
         | MetadataEffect::ContainsDot { .. }
         | MetadataEffect::GraphSnapshot { .. }
+        | MetadataEffect::ExportVersioned { .. }
         // A device runs no document sync, so an installed snapshot has no
         // journal entry to flush.
         | MetadataEffect::InstallSnapshot { .. }

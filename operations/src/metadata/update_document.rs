@@ -111,6 +111,8 @@ pub struct UpdateDocumentOperation {
     /// resolved at, read as a fence inside the write transaction.
     fenced: Vec<(PlacementRef, u64)>,
     route_profile_status: Option<ProfileValidationStatus>,
+    /// The graph version the caller based its change on; any other refuses the update.
+    expected_graph: Option<String>,
     /// Phase-time and identity sampling; production keeps the defaults.
     phase_source: crate::metadata::MetadataPhaseSource,
     state: UpdateDocumentState,
@@ -160,6 +162,8 @@ pub enum UpdateDocumentError {
     TopicAnnouncement(String),
     #[error("the document changed since revision {expected}; it is now at {current}")]
     RevisionConflict { expected: Ulid, current: Ulid },
+    #[error("the metadata graph changed since the version the update was based on")]
+    GraphChanged,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -209,10 +213,18 @@ impl UpdateDocumentOperation {
             realm_config: None,
             fenced: Vec::new(),
             route_profile_status,
+            expected_graph: None,
             phase_source,
             state: UpdateDocumentState::Init,
             output: None,
         }
+    }
+
+    /// Refuses the update unless it is planned against the graph at `version`, so a change
+    /// computed from an older graph never removes values that arrived since.
+    pub fn with_expected_graph(mut self, version: String) -> Self {
+        self.expected_graph = Some(version);
+        self
     }
 
     /// Replaces the phase-time and identity source and re-mints the event
@@ -784,6 +796,11 @@ impl UpdateDocumentOperation {
     fn plan_batch(&mut self, event: Event) -> Effects {
         match event {
             Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => {
+                if let Some(expected) = &self.expected_graph
+                    && aruna_core::metadata::graph_version(&batch.base_clock) != *expected
+                {
+                    return self.fail(UpdateDocumentError::GraphChanged);
+                }
                 self.planned_batch = Some(batch);
                 self.begin_transaction_effect()
             }
@@ -1947,6 +1964,36 @@ mod pure_tests {
                 ..
             })] if *write_txn == txn_id
         ));
+    }
+
+    #[test]
+    fn refuses_changed_graph() {
+        let planned = |version: String| {
+            let actor = actor();
+            let record = record(&actor);
+            let config = config(
+                actor,
+                &record,
+                UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: replace_jsonld(record.document_id, "merged"),
+                },
+            );
+            let mut operation = UpdateDocumentOperation::new(config).with_expected_graph(version);
+            operation.start();
+            operation.step(registry_read(&record));
+            configured(&mut operation, realm_config_read(&record));
+            let effects = operation.step(batch_planned(&record));
+            (operation, effects)
+        };
+        let current = aruna_core::metadata::graph_version(&craqle::VectorClock::default());
+        let (_, effects) = planned(current);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+        let (operation, effects) = planned("older".into());
+        assert!(effects.is_empty());
+        assert_eq!(operation.finalize(), Err(UpdateDocumentError::GraphChanged));
     }
 
     fn guarded_step(expected: Ulid) -> (UpdateDocumentOperation, Effects) {

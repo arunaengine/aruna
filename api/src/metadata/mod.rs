@@ -230,7 +230,7 @@ pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
         UpdateDocumentError::DocumentNotFound => ServerError::NotFound,
         UpdateDocumentError::RawLimit => ServerError::ServiceUnavailable,
         UpdateDocumentError::MetadataError(metadata_error) => map_metadata_error(metadata_error),
-        UpdateDocumentError::RevisionConflict { .. } => {
+        UpdateDocumentError::RevisionConflict { .. } | UpdateDocumentError::GraphChanged => {
             ServerError::PreconditionFailed(error.to_string())
         }
         other => ServerError::InternalError(other.to_string()),
