@@ -451,7 +451,15 @@ pub async fn change_ref(
         new: new.clone(),
     };
     let nothing = (Bytes::new(), Vec::new());
-    record(context, auth, &document, vec![update], nothing, Vec::new()).await?;
+    record(
+        context,
+        auth,
+        &document,
+        vec![update],
+        nothing,
+        (Vec::new(), None),
+    )
+    .await?;
     Ok(Named { name, version: new })
 }
 

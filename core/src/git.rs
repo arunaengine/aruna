@@ -15,6 +15,8 @@ use ulid::Ulid;
 /// This node's own stored copies of Git packs and LFS content, keyed by document and SHA-256.
 pub const LOCAL_OBJECTS: &str = "git_local_objects";
 pub const STATUS: &str = "git_status";
+/// Accepted pushes to main whose metadata this node still has to apply.
+pub const PENDING: &str = "git_pending_merges";
 pub const MAX_GIT_BYTES: usize = 64 * 1024 * 1024;
 /// Upper bound for one replicated Git record.
 pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
@@ -89,6 +91,14 @@ pub struct GitStatus {
 }
 
 pub type Refs = std::collections::BTreeMap<String, String>;
+
+/// The metadata a push to main brings, applied after the push is recorded until it succeeds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingMerge {
+    pub user_id: UserId,
+    pub old: String,
+    pub new: String,
+}
 
 /// One async lock per document, created on first use and dropped once nobody holds it.
 #[derive(Debug, Default)]

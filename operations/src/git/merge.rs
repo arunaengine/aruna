@@ -5,20 +5,18 @@
 use super::changes::property_conflicts;
 use super::project::Projection;
 use super::push::{record, unlocked};
-use super::snapshot::{current, execute, linked};
+use super::snapshot::{execute, linked};
 use super::versions::{
     Version, WriteOptions, branch_ref, diff, expect, log, now_ms, open, parse_conflict,
     peeled_tags, plain, protected, resolve, rocrate, version,
 };
 use super::{GitError, MergeConflict};
 use crate::driver::DriverContext;
-use crate::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
-    update_metadata_document,
-};
 use aruna_blob::git::GitStore;
-use aruna_core::git::{GitEffect, GitEvent, GitSnapshot, MergeOutcome, RefUpdate, ZERO_OID};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::git::{
+    GitEffect, GitEvent, GitSnapshot, MergeOutcome, PendingMerge, RefUpdate, ZERO_OID,
+};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
 use ulid::Ulid;
@@ -100,7 +98,15 @@ pub async fn edit(
             new: new.clone(),
         };
         let made = vec![new.clone()];
-        record(context, auth, &document, vec![update], (bytes, lfs), made).await?;
+        record(
+            context,
+            auth,
+            &document,
+            vec![update],
+            (bytes, lfs),
+            (made, None),
+        )
+        .await?;
     }
     let info = log(store, auth, id, (&new, None), 0, 1)
         .await?
@@ -223,6 +229,13 @@ async fn merge_into(
     } else {
         vec![new.clone()]
     };
+    // Merged metadata follows the recorded merge, so a failed record changes nothing.
+    let merge = (into == "main" && new != target).then(|| PendingMerge {
+        user_id: auth.user_id,
+        old: target.clone(),
+        new: new.clone(),
+    });
+    let follows = merge.is_some();
     if new != target {
         let paths: Vec<String> = diff(store, auth, id, Some(&target), &new)
             .await?
@@ -230,9 +243,6 @@ async fn merge_into(
             .map(|change| change.path)
             .collect();
         unlocked(&projection.state, auth, &paths)?;
-        if into == "main" {
-            update_metadata(context, store, auth, document, &target, &new).await?;
-        }
         bytes = pack(store, auth, id, projection, &new).await?;
         updates.insert(
             0,
@@ -244,63 +254,23 @@ async fn merge_into(
         );
     }
     if !updates.is_empty() {
-        record(context, auth, document, updates, (bytes, Vec::new()), made).await?;
+        record(
+            context,
+            auth,
+            document,
+            updates,
+            (bytes, Vec::new()),
+            (made, merge),
+        )
+        .await?;
+    }
+    if follows && let Err(error) = super::pending::apply(context, store, document).await {
+        tracing::warn!(document_id = %id, %error, "Merged metadata applies on the next refresh");
     }
     Ok(Merged {
         version: new,
         fast_forward,
     })
-}
-
-/// Applies the metadata main gains from `old` to `new` to the live document, as a push does.
-async fn update_metadata(
-    context: &DriverContext,
-    store: &GitStore,
-    auth: &AuthContext,
-    document: &MetadataRegistryRecord,
-    old: &str,
-    new: &str,
-) -> Result<(), GitError> {
-    let (revision, graph) = current(context, document, None, false)
-        .await?
-        .ok_or(GitError::Unavailable)?;
-    let effect = GitEffect::MergeMetadata {
-        document_id: document.document_id,
-        old: Some(old.to_string()),
-        new: new.to_string(),
-        graph,
-    };
-    let jsonld = match execute(store, effect, auth.user_id).await? {
-        GitEvent::MetadataMerged(Ok(Some(jsonld))) => jsonld,
-        GitEvent::MetadataMerged(Ok(None)) => return Ok(()),
-        GitEvent::MetadataMerged(Err(error)) => return Err(GitError::Refused(error)),
-        _ => return Err(GitError::Unavailable),
-    };
-    let node_id = context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id())
-        .ok_or(GitError::Unavailable)?;
-    let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
-        actor: Actor {
-            node_id,
-            user_id: auth.user_id,
-            realm_id: document.realm_id,
-        },
-        group_id: document.group_id,
-        document_id: document.document_id,
-        public: document.public,
-        mutation: UpdateDocumentMutation::ReplaceRoCrate { jsonld },
-        // An edit that lands while the merge runs must not be overwritten; retry instead.
-        expected_revision: Some(revision),
-    });
-    update_metadata_document(operation, context)
-        .await
-        .map(|_| ())
-        .map_err(|error| match error {
-            UpdateDocumentError::RevisionConflict { .. } => GitError::Stale,
-            other => GitError::Refused(other.to_string()),
-        })
 }
 
 /// Merges a kept conflict into its branch and removes it in the same record.

@@ -141,11 +141,13 @@ The two editing paths have explicit revision boundaries:
   and `aruna`. It updates `aruna-metadata.json` and the derived `ro-crate-metadata.json`. ISA
   workbooks are replaced only when their ISA meaning differs from the graph. Client files,
   data and LFS pointers stay. Pull before the next push, as with any shared Git branch.
-- A push to `main` merges into the metadata document before its refs move. Only values changed
-  between the old and new `main` are applied, from the ISA workbooks and `aruna-metadata.json`.
-  Graph fields that ISA cannot express, such as keywords or custom properties, stay. ISA ids
-  such as `#Person_Ada_Lovelace` are matched to existing graph entities. The update runs as the
-  pushing user through the normal RO-Crate replace operation. If it is refused, so is the push.
+- A push to `main` merges into the metadata document. Only values changed between the old and
+  new `main` are applied, from the ISA workbooks and `aruna-metadata.json`. Graph fields that ISA
+  cannot express, such as keywords or custom properties, stay. ISA ids such as
+  `#Person_Ada_Lovelace` are matched to existing graph entities. A push whose metadata cannot be
+  merged is refused. The merge is applied as the pushing user right after the push is recorded,
+  onto the current graph, so edits made in between are kept. A node that stops before applying
+  it applies it when it runs again. REST merges into `main` work the same way.
 - Push preserves incoming commit IDs and spreadsheet bytes. Obtain current ISA-derived
   metadata for any branch, tag or commit through
   `GET /api/v1/metadata/{id}/git/rocrate?revision=main`. The response names the exact resolved

@@ -382,6 +382,9 @@ async fn update(
     materializing: bool,
 ) -> Result<Projection, GitError> {
     let mut projection = project(context, store, document).await?;
+    if let Err(error) = super::pending::apply(context, store, document).await {
+        tracing::warn!(document_id = %document.document_id, %error, "Pushed metadata waits");
+    }
     let leading = first(context, &projection.holders);
     let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
     // The graph's content decides, so a late older edit that changes it is captured too.

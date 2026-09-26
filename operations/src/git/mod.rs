@@ -8,6 +8,7 @@ pub mod lfs;
 pub mod locks;
 pub mod merge;
 pub mod objects;
+pub mod pending;
 pub mod project;
 pub mod publish;
 pub mod push;
@@ -159,10 +160,15 @@ pub async fn transport(
         request.push_key = key.value.clone();
         key
     });
-    store
+    let served = store
         .execute(GitEffect::Http(Box::new(request)), auth.user_id)
         .await
-        .map_err(|_| GitError::Unavailable)
+        .map_err(|_| GitError::Unavailable)?;
+    // A recorded push to main brings metadata; it applies now, or on a later refresh.
+    if write && let Err(error) = pending::apply(context, store, &document).await {
+        tracing::warn!(document_id = %document.document_id, %error, "Pushed metadata waits");
+    }
+    Ok(served)
 }
 
 /// Keys of receive-pack requests running on this node, one per document under its lock.

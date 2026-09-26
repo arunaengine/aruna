@@ -52,6 +52,17 @@ pub async fn publish(
     user_id: UserId,
     change: GitChange,
 ) -> Result<GitRecord, GitError> {
+    publish_with(context, document, user_id, change, Vec::new()).await
+}
+
+/// Like [`publish`], writing `extra` local rows in the same transaction.
+pub async fn publish_with(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    user_id: UserId,
+    change: GitChange,
+    extra: Vec<(String, byteview::ByteView, byteview::ByteView)>,
+) -> Result<GitRecord, GitError> {
     let peers = holders(context, document).await?;
     let config = load_realm_config(context, document.realm_id)
         .await
@@ -108,6 +119,7 @@ pub async fn publish(
     )
     .fenced_at(crate::placement::fence::write_generation(&config, &record.placement).unwrap_or(0));
     writes.push(outbox_write_entry(&outbox).map_err(|_| GitError::Invalid)?);
+    writes.extend(extra);
     records::commit(context, writes).await?;
     if let Some(tasks) = context.task_handle.as_ref() {
         // The record is durable; a missed wake-up only delays replication to the next drain.

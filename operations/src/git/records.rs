@@ -219,3 +219,50 @@ pub(super) async fn commit(
     }
     Ok(())
 }
+
+/// Every row in `space` whose key starts with `prefix`, in key order.
+pub(super) async fn prefixed<T: DeserializeOwned>(
+    context: &DriverContext,
+    space: &str,
+    prefix: Vec<u8>,
+) -> Result<Vec<(Vec<u8>, T)>, GitError> {
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Iter {
+            key_space: space.into(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: 1024,
+            txn_id: None,
+        }))
+        .await
+    else {
+        return Err(GitError::Unavailable);
+    };
+    values
+        .into_iter()
+        .map(|(key, value)| {
+            let value = postcard::from_bytes(&value).map_err(|_| GitError::Unavailable)?;
+            Ok((key.to_vec(), value))
+        })
+        .collect()
+}
+
+pub(super) async fn remove(
+    context: &DriverContext,
+    space: &str,
+    key: Vec<u8>,
+) -> Result<(), GitError> {
+    match context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Delete {
+            key_space: space.into(),
+            key: key.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        _ => Err(GitError::Unavailable),
+    }
+}

@@ -6,7 +6,8 @@ use super::state::{Ancestry, GitState, reduce};
 use super::{GitError, objects, publish, records};
 use crate::driver::DriverContext;
 use aruna_core::git::{
-    GitChange, GitRecord, LfsObject, RefUpdate, StoredObject, ZERO_OID, valid_path, valid_ref,
+    GitChange, GitRecord, LfsObject, PendingMerge, RefUpdate, StoredObject, ZERO_OID, valid_path,
+    valid_ref,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -61,7 +62,7 @@ pub async fn accept(
     request: PushRequest,
     pack: Bytes,
 ) -> Result<GitRecord, GitError> {
-    let (document, _) = super::repository(context, auth, id, Permission::WRITE).await?;
+    let (document, repository) = super::repository(context, auth, id, Permission::WRITE).await?;
     if !super::push_key_valid(id, key) {
         return Err(GitError::NotHook);
     }
@@ -110,13 +111,25 @@ pub async fn accept(
         };
         lfs.push(location.filter(|_| valid).ok_or(GitError::Invalid)?);
     }
+    // Pushed metadata follows the recorded push; the hook already checked that it merges.
+    let merge = request
+        .refs
+        .iter()
+        .find(|update| update.name == "refs/heads/main" && update.new != ZERO_OID)
+        .filter(|_| repository.arc)
+        .map(|update| PendingMerge {
+            user_id: auth.user_id,
+            old: update.old.clone(),
+            new: update.new.clone(),
+        });
+    let written = (pack, lfs);
     record(
         context,
         auth,
         &document,
         request.refs,
-        (pack, lfs),
-        Vec::new(),
+        written,
+        (Vec::new(), merge),
     )
     .await
 }
@@ -139,14 +152,14 @@ pub(super) fn unlocked(
 }
 
 /// Stores a non-empty pack and publishes the ref updates as one replicated record. `made`
-/// lists commits this node created itself.
+/// lists commits this node created itself; a pending merge is written in the same step.
 pub(super) async fn record(
     context: &DriverContext,
     auth: &AuthContext,
     document: &MetadataRegistryRecord,
     refs: Vec<RefUpdate>,
     (pack, lfs): (Bytes, Vec<StoredObject>),
-    made: Vec<String>,
+    (made, merge): (Vec<String>, Option<PendingMerge>),
 ) -> Result<GitRecord, GitError> {
     let pack = if objects_in(&pack) == 0 {
         None
@@ -161,7 +174,11 @@ pub(super) async fn record(
         digest: None,
         made,
     };
-    publish::publish(context, document, auth.user_id, change).await
+    let extra = match &merge {
+        Some(merge) => vec![super::pending::entry(document.document_id, merge)?],
+        None => Vec::new(),
+    };
+    publish::publish_with(context, document, auth.user_id, change, extra).await
 }
 
 #[cfg(test)]

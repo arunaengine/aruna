@@ -193,23 +193,12 @@ pub async fn validate() -> std::io::Result<()> {
     current(directory, &updates).await?;
     let paths = changed(directory, &updates).await?;
     unlocked(&url, &paths, &token).await?;
-    let merged = match (arc, main) {
-        (true, Some((old, new))) => merge(directory, &old, &new, &token).await?,
-        _ => None,
-    };
-    let Err(error) = publish(directory, updates, objects, paths, &token).await else {
-        return Ok(());
-    };
-    // The push is refused, so the metadata it changed goes back to what it was.
-    if let Some((previous, revision)) = merged {
-        let url = std::env::var("ARUNA_GIT_METADATA_URL").map_err(|_| invalid())?;
-        if let Err(undo) = replace(&url, &token, previous, revision).await {
-            return Err(std::io::Error::other(format!(
-                "{error}; the metadata merged from this push could not be restored: {undo}"
-            )));
-        }
+    // The node applies pushed metadata after it recorded the push; checking here keeps a
+    // push whose metadata cannot merge from being accepted at all.
+    if arc && let Some((old, new)) = main {
+        mergeable(directory, &old, &new, &token).await?;
     }
-    Err(error)
+    publish(directory, updates, objects, paths, &token).await
 }
 
 /// Refuses every update Git would refuse after this hook, before anything is published: an
@@ -379,59 +368,22 @@ async fn publish(
     .map(|_| ())
 }
 
-/// Merges ISA and `aruna-metadata.json` edits on main into the document before refs move.
-/// Returns the crate it replaced and the revision the replacement made, for a rollback.
-async fn merge(
-    directory: &Path,
-    old: &str,
-    new: &str,
-    token: &str,
-) -> std::io::Result<Option<(Value, Value)>> {
+/// Checks that the ISA and `aruna-metadata.json` edits on main merge into the document.
+async fn mergeable(directory: &Path, old: &str, new: &str, token: &str) -> std::io::Result<()> {
     let url = std::env::var("ARUNA_GIT_METADATA_URL").map_err(|_| invalid())?;
     let fetch = async |path: &str| -> std::io::Result<Value> {
         let bytes = aruna_blob::git::metadata_request(&format!("{url}{path}"), token, None).await?;
         Ok(serde_json::from_slice::<Value>(&bytes)?)
     };
-    // Scaffolded documents have no raw revision until their first replacement; their
-    // revision is read before the crate, so an edit in between is caught by the check.
-    let (current, revision) = match fetch("/rocrate?view=raw").await {
-        Ok(mut view) => (view["raw"].take(), view["winning_event_id"].take()),
-        Err(_) => {
-            let revision = fetch("").await?["revision"].take();
-            (fetch("/rocrate").await?["rocrate"].take(), revision)
-        }
+    // Scaffolded documents have no raw revision until their first replacement.
+    let current = match fetch("/rocrate?view=raw").await {
+        Ok(mut view) => view["raw"].take(),
+        Err(_) => fetch("/rocrate").await?["rocrate"].take(),
     };
-    if !revision.is_string() {
-        return Err(std::io::Error::other(
-            "the metadata revision is unknown; push again",
-        ));
-    }
     let old = (!old.bytes().all(|byte| byte == b'0')).then_some(old);
     let graph = serde_json::to_string(&current)?;
-    let jsonld = match aruna_blob::arc::merge_metadata(directory, old, new, &graph).await? {
-        Ok(Some(jsonld)) => jsonld,
-        Ok(None) => return Ok(None),
-        Err(error) => return Err(std::io::Error::other(error)),
-    };
-    let rocrate: Value = serde_json::from_str(&jsonld)?;
-    // An edit that lands while the push runs must not be overwritten; the push is refused.
-    let replaced = replace(&url, token, rocrate, revision).await?;
-    Ok(Some((current, replaced)))
-}
-
-/// Replaces the document's crate at `revision` and returns the revision the replace made.
-async fn replace(
-    url: &str,
-    token: &str,
-    rocrate: Value,
-    revision: Value,
-) -> std::io::Result<Value> {
-    let body = serde_json::to_vec(&json!({ "rocrate": rocrate, "expected_revision": revision }))?;
-    let reply = aruna_blob::git::metadata_request(
-        &format!("{url}/rocrate"),
-        token,
-        Some(("application/json", body)),
-    )
-    .await?;
-    Ok(serde_json::from_slice::<Value>(&reply)?["revision"].take())
+    match aruna_blob::arc::merge_metadata(directory, old, new, &graph).await? {
+        Ok(_) => Ok(()),
+        Err(error) => Err(std::io::Error::other(error)),
+    }
 }
