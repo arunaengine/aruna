@@ -373,34 +373,34 @@ async fn update(
     revision: Option<&MetadataRawRevision>,
     materializing: bool,
 ) -> Result<Projection, GitError> {
-    let mut projection = project(context, store, document).await?;
-    if let Err(error) = super::pending::apply(context, store, document).await {
+    let mut projection = erased(project(context, store, document)).await?;
+    if let Err(error) = erased(super::pending::apply(context, store, document)).await {
         tracing::warn!(document_id = %document.document_id, %error, "Pushed metadata waits");
     }
     let leading = first(context, &projection.holders);
     let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
     // The graph's content decides, so a late older edit that changes it is captured too.
-    if let Some(source) = current(context, document, revision, materializing).await?
+    if let Some(source) = erased(current(context, document, revision, materializing)).await?
         && let Ok(canonical) = craqle::canonicalize_jsonld(&source.1)
         && projection.state.digest != Some(canonical.digest)
         && (leading || overdue)
     {
-        generate(
+        erased(generate(
             context,
             store,
             document,
             &projection,
             source,
             canonical.digest,
-        )
+        ))
         .await?;
-        projection = project(context, store, document).await?;
+        projection = erased(project(context, store, document)).await?;
     }
     let uncovered = publish::uncovered(&projection.records).len();
     if uncovered > CHECKPOINT_AFTER && (leading || uncovered > 2 * CHECKPOINT_AFTER) {
         // A missing checkpoint only delays folding; it must never fail the request.
-        match checkpoint(context, document, &projection).await {
-            Ok(()) => projection = project(context, store, document).await?,
+        match erased(checkpoint(context, document, &projection)).await {
+            Ok(()) => projection = erased(project(context, store, document)).await?,
             Err(error) => tracing::warn!(%error, "Git checkpoint not written"),
         }
     }
@@ -473,4 +473,11 @@ pub async fn export(
         return Err(GitError::Invalid);
     }
     Ok(bytes)
+}
+
+/// Keeps each step's `Send` proof separate; one proof over the whole capture is too costly.
+fn erased<'a, T>(
+    future: impl Future<Output = T> + Send + 'a,
+) -> std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>> {
+    Box::pin(future)
 }

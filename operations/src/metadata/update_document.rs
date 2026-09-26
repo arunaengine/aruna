@@ -1141,39 +1141,44 @@ pub(crate) async fn document_lock(document_id: Ulid) -> tokio::sync::MutexGuard<
         .await
 }
 
-pub async fn update_metadata_document(
+/// Type-erased, so futures that await an update do not repeat its whole `Send` proof.
+pub fn update_metadata_document(
     mut operation: UpdateDocumentOperation,
     context: &DriverContext,
-) -> Result<MetadataRegistryRecord, UpdateDocumentError> {
-    let _guard = document_lock(operation.config.document_id).await;
-    operation.route_profile_status = Some(match &operation.config.mutation {
-        UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
-            validate_submission(
-                context,
-                operation.config.document_id,
-                operation.config.group_id,
-                jsonld,
-            )
-            .await?
+) -> std::pin::Pin<
+    Box<dyn Future<Output = Result<MetadataRegistryRecord, UpdateDocumentError>> + Send + '_>,
+> {
+    Box::pin(async move {
+        let _guard = document_lock(operation.config.document_id).await;
+        operation.route_profile_status = Some(match &operation.config.mutation {
+            UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
+                validate_submission(
+                    context,
+                    operation.config.document_id,
+                    operation.config.group_id,
+                    jsonld,
+                )
+                .await?
+            }
+            UpdateDocumentMutation::UpsertDataEntity { .. }
+            | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ApplyBatch { .. }
+            | UpdateDocumentMutation::Checkpoint => {
+                stale_status(operation.config.document_id, "dataset_revision_changed")
+            }
+        });
+        let cache_generation = context
+            .metadata_handle
+            .as_ref()
+            .map(|metadata_handle| metadata_handle.visibility_generation());
+        let updated = drive(operation, context).await?;
+        if let (Some(metadata_handle), Some(cache_generation)) =
+            (context.metadata_handle.as_ref(), cache_generation)
+        {
+            metadata_handle.upsert_cached_at(updated.clone(), cache_generation);
         }
-        UpdateDocumentMutation::UpsertDataEntity { .. }
-        | UpdateDocumentMutation::UpsertContextualEntity { .. }
-        | UpdateDocumentMutation::ApplyBatch { .. }
-        | UpdateDocumentMutation::Checkpoint => {
-            stale_status(operation.config.document_id, "dataset_revision_changed")
-        }
-    });
-    let cache_generation = context
-        .metadata_handle
-        .as_ref()
-        .map(|metadata_handle| metadata_handle.visibility_generation());
-    let updated = drive(operation, context).await?;
-    if let (Some(metadata_handle), Some(cache_generation)) =
-        (context.metadata_handle.as_ref(), cache_generation)
-    {
-        metadata_handle.upsert_cached_at(updated.clone(), cache_generation);
-    }
-    Ok(updated)
+        Ok(updated)
+    })
 }
 
 fn validate_entity_jsonld(jsonld: &str) -> Result<(), MetadataError> {
