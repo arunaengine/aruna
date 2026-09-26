@@ -24,8 +24,8 @@
 <p align="center">
   <a href="https://v3.aruna-engine.org/app/docs/v1">Portal documentation</a> ·
   <a href="https://api.node-1.v3.aruna-engine.org/swagger-ui/">Swagger UI</a> ·
-  <a href="#why-aruna">Why Aruna</a> ·
   <a href="#features">Features</a> ·
+  <a href="#architecture-and-goals">Architecture</a> ·
   <a href="#getting-started">Getting started</a> ·
   <a href="#avoiding-common-pitfalls">Pitfalls</a> ·
   <a href="#feedback--contributions">Contributing</a>
@@ -35,72 +35,51 @@
 > **Aruna v3 is now in public testing.** You can [try it out](https://v3.aruna-engine.org) and share feedback through [GitHub issues](https://github.com/arunaengine/aruna/issues). Aruna v2 remains available on the [v2 branch](https://github.com/arunaengine/aruna/tree/v2).
 
 Aruna helps research organizations store, describe, share and reuse their data, while every
-organization keeps control of its own infrastructure. Each organization runs its own Aruna node.
-The nodes connect to each other directly, so researchers can find and work with data across
-institutions without a central service in the middle.
-
-## Why Aruna
-
-Research data rarely lives in one place. It is spread over universities, labs, archives and
-computing centers. Each of them has its own storage, its own rules and its own responsibility for
-the data. Researchers who work together still need to find data, understand what it is, share it
-and analyze it, often across all of these places.
-
-Central platforms solve this by collecting everything in one spot. That works for some data, but
-many institutions cannot or do not want to give up control over where their data is stored and who
-may see it. Copying data around by hand is slow and error-prone, and descriptions of the data get
-lost on the way.
-
-Aruna takes a different path:
-
-- **Every organization stays in charge.** Each organization runs its own node, decides where its
-  data lives and who may access it.
-- **Nodes work together as a network.** Nodes that trust each other form a *realm*, for example an
-  institute, a consortium or a project. Being in the same realm does not give anyone access to data;
-  access is always granted explicitly.
-- **Data and its description belong together.** Every dataset carries rich, standardized metadata,
-  so others can understand and reuse it years later.
-
-The goal is to make research data FAIR: findable, accessible, interoperable and reusable, without
-taking it away from the people and institutions responsible for it.
+organization keeps control of its own infrastructure. Research data is usually spread over
+universities, labs, archives and computing centers, each with its own storage and rules. Instead of
+collecting everything on one central platform, each organization runs its own Aruna node, and the
+nodes connect to each other directly. Researchers can then find and work with data across
+institutions, and every dataset keeps a rich description so others can understand and reuse it.
 
 ## Features
 
-### Store and access data
-
-- **Works with your existing tools**: every node offers an [S3](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html)-compatible interface, so common tools, scripts and workflow systems work without changes.
-- **Flexible storage**: keep data on local disks or connect other storage systems. Buckets can combine local files, copies and references to files on other nodes.
-- **Safe transfers**: files are checked when they are stored and while they are copied, so damaged data is noticed early.
-
-### Describe and find data
-
-- **Rich descriptions**: datasets are described with [RO-Crate](https://www.researchobject.org/ro-crate/), a widely used standard that covers files, people, instruments, software and workflows.
-- **Quality checks**: profiles define what a good description of a dataset needs, and Aruna shows what is still missing.
-- **Search across nodes**: find datasets on all nodes of a realm, limited to what you are allowed to see.
-- **Changes merge on their own**: edits made on different nodes, even while offline, come together automatically.
-
-### Work together
-
 - **Web portal**: browse files, edit datasets, manage access and follow compute runs in the browser.
+- **Works with your existing tools**: every node offers an [S3](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html)-compatible interface, so common tools, scripts and workflow systems work without changes.
+- **Rich dataset descriptions**: datasets are described with [RO-Crate](https://www.researchobject.org/ro-crate/), a widely used standard that covers files, people, instruments, software and workflows.
+- **Quality checks**: profiles define what a good dataset description needs, and Aruna shows what is still missing.
+- **Search across nodes**: find datasets on all connected nodes, limited to what you are allowed to see.
 - **Groups and permissions**: give people access to exactly the data they need, alone or through groups and roles.
+- **Changes merge on their own**: edits made on different nodes, even while offline, come together automatically.
 - **Native Git for datasets**: every dataset is also a Git repository in the [ARC](https://arc-rdm.org/) layout. Clone it, work on branches and push changes back; the dataset description stays in sync.
 - **Dataset history**: see every version of a dataset, compare versions and merge draft changes in the portal.
-
-### Analyze data
-
+- **Publish with a DOI**: send datasets to [Zenodo](https://zenodo.org/) or other [InvenioRDM](https://inveniordm.docs.cern.ch/) repositories and keep both in sync. Existing records can be imported, too.
 - **Compute jobs**: run analysis containers on your own infrastructure from the portal or through the standard [GA4GH TES](https://www.ga4gh.org/product/task-execution-service-tes/) interface.
 - **Interactive notebooks**: write and run Jupyter notebooks in the portal, with direct access to your data.
-- **AI assistants**: connect AI assistants through [MCP](https://modelcontextprotocol.io/) so they can search, read and work with your data on your behalf, with your permissions.
-
-### Share and publish
-
-- **Publish with a DOI**: send datasets to [Zenodo](https://zenodo.org/) or other [InvenioRDM](https://inveniordm.docs.cern.ch/) repositories and keep both in sync. Existing records can be imported, too.
+- **AI assistants**: connect AI assistants through [MCP](https://modelcontextprotocol.io/) so they can search, read and work with your data, with your permissions.
+- **Flexible storage**: keep data on local disks or connect other storage systems. Buckets can combine local files, copies and references to files on other nodes.
+- **Safe transfers**: files are checked when they are stored and while they are copied, so damaged data is noticed early.
 - **Open standards**: single sign-on with [OIDC](https://openid.net/connect/), data references with [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) and metadata harvesting with [OAI-PMH](https://www.openarchives.org/pmh/).
-
-### Run it your way
-
 - **Simple to deploy**: run a single node as one program, or a cluster of nodes.
-- **Works across networks**: nodes find and reach each other directly, also behind firewalls.
+
+## Architecture and Goals
+
+Many institutions cannot or do not want to give up control over where their data is stored and
+who may see it. Copying data around by hand is slow, and descriptions of the data get lost on the
+way. Aruna is built so that data can be shared without being handed over.
+
+- **Nodes**: each organization runs its own node. The node decides where the organization's data
+  lives and who may access it.
+- **Realms**: nodes that trust each other form a realm, for example an institute, a consortium or a
+  project. Being in the same realm does not give anyone access to data; access is always granted
+  explicitly through groups, roles and permissions.
+- **Direct connections**: nodes find and reach each other on their own, also behind firewalls. No
+  central server is needed, and a node keeps working when others are offline. Changes are shared
+  again once the nodes can reach each other.
+- **Data and description together**: files and their descriptions move together, so a dataset stays
+  understandable wherever it is used.
+
+The goal is to make research data FAIR: findable, accessible, interoperable and reusable, while each
+institution stays responsible for its own data.
 
 ## Getting Started
 
