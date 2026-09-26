@@ -194,7 +194,7 @@ pub enum GitEffect {
         include: Vec<String>,
         exclude: Vec<String>,
     },
-    /// Builds signed snapshot commits on the given refs without moving any ref.
+    /// Builds snapshot commits on the given refs without moving any ref.
     Generate {
         snapshot: GitSnapshot,
         refs: Refs,

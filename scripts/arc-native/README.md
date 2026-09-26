@@ -9,7 +9,7 @@ materialization. Git and LFS are served by Aruna's own REST listener. The node u
 HTTP backend, an Aruna receive helper and pinned ARCtrl for ISA conversion. LFS bytes use
 Aruna's ordinary authorization, routing, quota, checksum and versioned-object operations.
 
-Creation remains asynchronous. The signed initial commit appears when the accepted
+Creation remains asynchronous. The initial commit appears when the accepted
 metadata has been converted successfully. Existing documents without a repository are
 also initialized on authorized Git access. Discover its URLs and conversion status with:
 
@@ -103,8 +103,8 @@ Writes accept `If-Match` with the branch head (or tag version) the client last s
 different values, or the same non-metadata file. Nothing changes then. Edit the draft to the
 wanted values and merge again. Workbook and RO-Crate file conflicts are resolved by merging
 the metadata and generating those files again. Server-made versions name the Aruna user in
-an `Aruna-User` commit trailer, shown as `author.user_id`. Only commits this node made and
-signed are trusted for it.
+an `Aruna-User` commit trailer, shown as `author.user_id`. Only commits this node made are
+trusted for it.
 
 ## Metadata representation
 
@@ -135,9 +135,9 @@ The two editing paths have explicit revision boundaries:
 - `aruna-metadata.json` retains the exact selected Aruna JSON-LD, including its original
   1.2/1.3 context, identifiers and fields outside ISA. The ARCtrl-derived representation
   uses its supported RO-Crate 1.2 context. Additional source information is not discarded.
-- The protected `aruna` branch records signed snapshots. Each commit names its source event in
+- The protected `aruna` branch records snapshots. Each commit names its source event in
   an `Aruna-Revision` trailer. `main` fast-forwards while it still equals the previous snapshot.
-- After a client changed `main`, graph edits arrive as a signed merge commit with parents `main`
+- After a client changed `main`, graph edits arrive as a merge commit with parents `main`
   and `aruna`. It updates `aruna-metadata.json` and the derived `ro-crate-metadata.json`. ISA
   workbooks are replaced only when their ISA meaning differs from the graph. Client files,
   data and LFS pointers stay. Pull before the next push, as with any shared Git branch.
@@ -161,13 +161,10 @@ working ARC can still lack the contacts, assays, workflows or evidence required 
 
 ## Runtime requirements
 
-Native hosting requires Unix, Git, Python 3.13 with `blob/arc-requirements.txt`, and configured
-Git signing. The image includes Git, GPG, Python, ARCtrl and the CWL validator. Operators must
-provide a service signing key and Git configuration, for example using `GIT_CONFIG_GLOBAL`
-and `GNUPGHOME` pointing at their mounted configuration/key store. Generated commits have
-the service author `Aruna <git@aruna.local>` and matching author/committer timestamps.
-The signing key must be usable by the unattended service. Missing runtime/signing/storage
-infrastructure leaves work pending for retry; it never creates an unsigned fallback commit.
+Native hosting requires Unix, Git and Python 3.13 with `blob/arc-requirements.txt`. The image
+includes Git, Python, ARCtrl and the CWL validator. Generated commits are not signed yet; they
+have the service author `Aruna <git@aruna.local>` and matching author/committer timestamps.
+Missing runtime or storage infrastructure leaves work pending for retry.
 
 ## ARCitect client patch
 
@@ -190,7 +187,7 @@ Aruna's protocol or rewriting ARC contents.
 ## Reproduce the integration test
 
 The ignored `git_native` test starts a temporary Aruna node and native REST listener. It
-checks automatic signed repository creation without an activation request, graph snapshots,
+checks automatic repository creation without an activation request, graph snapshots,
 ISA-derived commit exports, real Git/LFS transfer, historical content after S3 overwrite,
 read-only token denial, invalid ARC branches, atomic rejection, branches and tags.
 With `ARUNA_ARCITECT` set, it also runs the actual patched Electron app with Playwright.

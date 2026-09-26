@@ -1,4 +1,4 @@
-//! Converts ISA metadata, records signed ARC snapshots and merges them into main.
+//! Converts ISA metadata, records ARC snapshots and merges them into main.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -131,7 +131,7 @@ async fn commit_tree(
     let date = format!("@{} +0000", occurred_at_ms / 1000);
     process
         .current_dir(directory)
-        .args(["commit-tree", "-S", tree])
+        .args(["commit-tree", "--no-gpg-sign", tree])
         .env("GIT_AUTHOR_NAME", "Aruna")
         .env("GIT_COMMITTER_NAME", "Aruna")
         .env("GIT_AUTHOR_EMAIL", "git@aruna.local")
@@ -319,7 +319,7 @@ async fn arc_files(
     Ok(Ok((files, pointers)))
 }
 
-/// Builds the signed `aruna` commit for `source` and, when main must follow, the main commit.
+/// Builds the `aruna` commit for `source` and, when main must follow, the main commit.
 /// No ref moves: refs change only through replicated records. Unrepresentable metadata is an
 /// `Err` value, never a fabricated commit.
 pub async fn generate(
@@ -440,7 +440,7 @@ fn metadata(path: &str) -> bool {
     workbook(path) || matches!(path, "ro-crate-metadata.json" | "aruna-metadata.json")
 }
 
-/// Merges `source` into `target` as a signed commit. Conflicting metadata files are
+/// Merges `source` into `target`. Conflicting metadata files are
 /// resolved by merging the metadata and regenerating them; other conflicts are returned.
 pub async fn merge(
     directory: &Path,

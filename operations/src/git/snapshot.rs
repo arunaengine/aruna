@@ -1,4 +1,4 @@
-//! Publishes signed ARC snapshots and checkpoints as Git records on document holders.
+//! Publishes ARC snapshots and checkpoints as Git records on document holders.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

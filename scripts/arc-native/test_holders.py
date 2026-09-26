@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from arc import scaffold
-from test_native import api, command, commit, http
+from test_native import api, command, commit, http, isolate
 
 
 def wait(description, check):
@@ -115,4 +115,5 @@ def exercise(root):
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="aruna-git-holders-") as directory:
+        isolate(Path(directory))
         exercise(Path(directory))

@@ -32,7 +32,7 @@ pub struct Author {
 }
 
 #[derive(Clone, Serialize, ToSchema)]
-#[schema(example = json!({"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Aruna","email":"git@aruna.local","user_id":"01M000000000000000000000003"},"message":"Rename the investigation","signed":true,"metadata_event_id":null,"branches":["draft/new-assay"],"tags":[]}))]
+#[schema(example = json!({"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Aruna","email":"git@aruna.local","user_id":"01M000000000000000000000003"},"message":"Rename the investigation","signed":false,"metadata_event_id":null,"branches":["draft/new-assay"],"tags":[]}))]
 pub struct VersionView {
     /// The Git commit ID.
     pub version: String,
@@ -111,7 +111,7 @@ pub struct NamedView {
 }
 
 #[derive(Serialize, ToSchema)]
-#[schema(example = json!({"name":"main","version":"9f3c2a7112345678901234567890123456789abc","protected":true,"head":{"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Aruna","email":"git@aruna.local","user_id":"01M000000000000000000000003"},"message":"Merge draft into main","signed":true,"metadata_event_id":null,"branches":["main"],"tags":[]}}))]
+#[schema(example = json!({"name":"main","version":"9f3c2a7112345678901234567890123456789abc","protected":true,"head":{"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Aruna","email":"git@aruna.local","user_id":"01M000000000000000000000003"},"message":"Merge draft into main","signed":false,"metadata_event_id":null,"branches":["main"],"tags":[]}}))]
 pub struct BranchView {
     pub name: String,
     pub version: String,
@@ -122,7 +122,7 @@ pub struct BranchView {
 }
 
 #[derive(Serialize, ToSchema)]
-#[schema(example = json!({"branches":[{"name":"main","version":"9f3c2a7112345678901234567890123456789abc","protected":true,"head":{"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Aruna","email":"git@aruna.local","user_id":"01M000000000000000000000003"},"message":"Merge draft into main","signed":true,"metadata_event_id":null,"branches":["main"],"tags":[]}}]}))]
+#[schema(example = json!({"branches":[{"name":"main","version":"9f3c2a7112345678901234567890123456789abc","protected":true,"head":{"version":"9f3c2a7112345678901234567890123456789abc","parents":["c71a9e5512345678901234567890123456789abc"],"created_at":"2026-09-25T11:02:00Z","author":{"name":"Aruna","email":"git@aruna.local","user_id":"01M000000000000000000000003"},"message":"Merge draft into main","signed":false,"metadata_event_id":null,"branches":["main"],"tags":[]}}]}))]
 pub struct BranchList {
     pub branches: Vec<BranchView>,
 }
