@@ -326,6 +326,8 @@ pub struct GitCheckpoint {
     pub refs: Vec<(String, String)>,
     pub lfs: Vec<StoredObject>,
     pub locks: Vec<LfsLock>,
+    /// Claims that lost to a held lock and may still win if that lock was released earlier.
+    pub waiting: Vec<LfsLock>,
     pub revision: Option<Ulid>,
     pub covered: Vec<Ulid>,
 }

@@ -345,6 +345,7 @@ async fn checkpoint(
         refs: state.refs.clone().into_iter().collect(),
         lfs: state.new_lfs.clone(),
         locks: state.locks.values().cloned().collect(),
+        waiting: state.waiting.clone(),
         revision: state.revision,
         covered: state.applied.clone(),
     }));
