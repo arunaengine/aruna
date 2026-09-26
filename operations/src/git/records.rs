@@ -226,26 +226,34 @@ pub(super) async fn prefixed<T: DeserializeOwned>(
     space: &str,
     prefix: Vec<u8>,
 ) -> Result<Vec<(Vec<u8>, T)>, GitError> {
-    let Event::Storage(StorageEvent::IterResult { values, .. }) = context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Iter {
-            key_space: space.into(),
-            prefix: Some(prefix.into()),
-            start: None,
-            limit: 1024,
-            txn_id: None,
-        }))
-        .await
-    else {
-        return Err(GitError::Unavailable);
-    };
-    values
-        .into_iter()
-        .map(|(key, value)| {
+    let mut rows = Vec::new();
+    let mut start = None;
+    loop {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: space.into(),
+                prefix: Some(prefix.clone().into()),
+                start: start.take().map(aruna_core::effects::IterStart::After),
+                limit: 1024,
+                txn_id: None,
+            }))
+            .await
+        else {
+            return Err(GitError::Unavailable);
+        };
+        for (key, value) in values {
             let value = postcard::from_bytes(&value).map_err(|_| GitError::Unavailable)?;
-            Ok((key.to_vec(), value))
-        })
-        .collect()
+            rows.push((key.to_vec(), value));
+        }
+        match next_start_after {
+            Some(key) => start = Some(key),
+            None => return Ok(rows),
+        }
+    }
 }
 
 pub(super) async fn remove(

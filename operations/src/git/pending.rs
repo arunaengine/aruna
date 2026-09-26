@@ -211,4 +211,33 @@ mod tests {
         sorted.sort();
         assert_eq!(keys, sorted);
     }
+
+    #[tokio::test]
+    async fn drain_reads_all() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().to_str().expect("path");
+        let context = DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(path).expect("storage"),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let merge = PendingMerge {
+            user_id: aruna_core::UserId::new(Ulid::from(1), RealmId([1; 32])),
+            old: ZERO_OID.into(),
+            new: "a".repeat(40),
+        };
+        // More rows than one storage page, as a backlog of blocked documents would leave.
+        let rows: Vec<_> = (0..1100u128)
+            .map(|id| entry(Ulid::from(id), &merge).expect("row"))
+            .collect();
+        let keys: Vec<_> = rows.iter().map(|row| row.1.to_vec()).collect();
+        records::commit(&context, rows).await.expect("commit");
+        let read = records::prefixed::<PendingMerge>(&context, PENDING, Vec::new())
+            .await
+            .expect("read");
+        assert_eq!(read.into_iter().map(|row| row.0).collect::<Vec<_>>(), keys);
+    }
 }
