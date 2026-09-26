@@ -64,7 +64,17 @@ pub(super) fn verify_metadata(expected: &Value, record: &Value) -> Result<(), Tr
             "repository metadata differs from the requested crate",
         ));
     }
+    if !matches_access(&expected["access"], record) {
+        return Err(invalid(
+            "repository access differs from the requested access",
+        ));
+    }
     Ok(())
+}
+
+/// Whether the record has the requested record, file and embargo access.
+pub(super) fn matches_access(expected: &Value, record: &Value) -> bool {
+    expected.is_null() || matches_fields(expected, &record["access"])
 }
 
 pub(super) fn complete_metadata(expected: &Value, actual: &Value) -> bool {

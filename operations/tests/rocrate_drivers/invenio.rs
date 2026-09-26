@@ -34,6 +34,7 @@ struct Repository {
     committed: HashSet<String>,
     metadata: Option<Value>,
     custom_fields: Value,
+    access: Value,
     revision: u64,
     lost_metadata: bool,
     author_login: bool,
@@ -254,6 +255,7 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             );
             state.metadata = Some(body["metadata"].clone());
             state.custom_fields = body["custom_fields"].clone();
+            state.access = body["access"].clone();
             assert_eq!(
                 body["access"]["files"],
                 if state.public_files {
@@ -280,6 +282,7 @@ async fn mock_request(State(state): State<Arc<Mutex<Repository>>>, request: Requ
             let body: Value = serde_json::from_slice(&body).unwrap();
             state.metadata = Some(body["metadata"].clone());
             state.custom_fields = body["custom_fields"].clone();
+            state.access = body["access"].clone();
             if state.partial_metadata {
                 state.metadata.as_mut().unwrap()["title"] = Value::Null;
             }
@@ -378,6 +381,9 @@ fn draft_record(state: &Repository, published: bool) -> Value {
         state.custom_fields.clone()
     };
     record["parent"]["access"] = json!({"owned_by": {"user": 42}});
+    if !state.access.is_null() {
+        record["access"] = state.access.clone();
+    }
     record
 }
 

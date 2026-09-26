@@ -313,7 +313,7 @@ async fn invenio_rejects_updates() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
-    for change in 0..4 {
+    for change in 0..5 {
         let fixture = build_fixture(false).await?;
         let server = serve(Repository {
             lost_metadata: true,
@@ -346,6 +346,11 @@ async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
             server.state.lock().unwrap().metadata.as_mut().unwrap()["creators"][0]["role"] =
                 json!({"id": "datamanager"});
         }
+        if change == 4 {
+            let mut state = server.state.lock().unwrap();
+            state.access["files"] = json!("public");
+            state.revision += 1;
+        }
         match run_export_job(&ctx, &spec).await {
             JobRunOutcome::Succeeded(_) if succeeds => {}
             JobRunOutcome::Failed(error) if !succeeds => {
@@ -367,6 +372,40 @@ async fn invenio_recovers_metadata() -> Result<(), Box<dyn std::error::Error>> {
         );
         fixture.stop().await;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_edit_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = serve(Repository::default()).await;
+    let spec = export_spec(&fixture, &server, true).await?;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = server.state.lock().unwrap();
+        state.content_started = Some(started.clone());
+        state.content_release = Some(release.clone());
+    }
+    let ctx = claim_context(&fixture, job_id(), JobPayload::ExportRoCrate(spec.clone())).await?;
+    let task = tokio::spawn(async move { Box::pin(run_export_job(&ctx, &spec)).await });
+    // A remote edit during the upload makes the files public after the draft was prepared.
+    tokio::time::timeout(std::time::Duration::from_secs(120), started.notified()).await?;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.access["files"] = json!("public");
+        state.content_started = None;
+        state.content_release = None;
+    }
+    release.notify_one();
+    let JobRunOutcome::Failed(error) =
+        tokio::time::timeout(std::time::Duration::from_secs(120), task).await??
+    else {
+        return Err("publishing over public file access must fail".into());
+    };
+    assert!(error.message.contains("more public"), "{}", error.message);
+    assert!(!server.state.lock().unwrap().published);
+    fixture.stop().await;
     Ok(())
 }
 

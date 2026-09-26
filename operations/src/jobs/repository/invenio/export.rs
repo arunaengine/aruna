@@ -24,7 +24,8 @@ use serde_json::{Value, json};
 
 use super::connect;
 use super::verify::{
-    complete_fields, complete_metadata, metadata_digest, verify_file, verify_files, verify_metadata,
+    complete_fields, complete_metadata, matches_access, metadata_digest, verify_file, verify_files,
+    verify_metadata,
 };
 use crate::harvest::create_connector::INVENIO_COMMUNITY;
 use crate::jobs::executor::JobContext;
@@ -473,6 +474,7 @@ pub(crate) async fn prepare_draft(
             .is_some_and(|revision| revision > record.revision_id)
             && complete_metadata(&fields["metadata"], &current["metadata"])
             && complete_fields(&fields["custom_fields"], &current["custom_fields"])
+            && matches_access(&fields["access"], &current)
         {
             current
         } else {
@@ -785,6 +787,11 @@ async fn finish(
     if current["parent"]["id"] != record.parent_id {
         return Err(invalid("repository parent changed"));
     }
+    if !destination.public_files && current["access"]["files"] != "restricted" {
+        return Err(invalid(
+            "repository file access is more public than requested",
+        ));
+    }
     verify_files(client, record, published, files).await?;
     if !destination.publish || published {
         return record_from(client, &current);
@@ -813,6 +820,8 @@ async fn finish(
         Some("published metadata changed".into())
     } else if result["parent"]["id"] != record.parent_id {
         Some("published parent changed".into())
+    } else if !destination.public_files && result["access"]["files"] != "restricted" {
+        Some("published file access is more public than requested".into())
     } else {
         verify_files(client, record, true, files)
             .await

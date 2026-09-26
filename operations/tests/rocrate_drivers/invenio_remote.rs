@@ -15,6 +15,7 @@ pub(super) struct Rec {
     pub(super) review: Option<String>,
     pub(super) metadata: Value,
     custom_fields: Value,
+    access: Value,
     pub(super) files: BTreeMap<String, (Option<Vec<u8>>, bool)>,
 }
 
@@ -49,7 +50,7 @@ impl Remote {
                 "pids": {"doi": {"identifier": format!("10.1234/{}", rec.parent)}}},
             "revision_id": rec.revision,
             "is_published": rec.published, "metadata": rec.metadata,
-            "custom_fields": rec.custom_fields, "files": {"enabled": true},
+            "custom_fields": rec.custom_fields, "access": rec.access, "files": {"enabled": true},
             "versions": {"index": rec.index, "is_latest": self.lineage(&rec.parent).first().is_some_and(|latest| latest == id)},
             "pids": pids,
             "links": {"self_html": format!("{}/records/{id}", self.origin)}})
@@ -93,9 +94,15 @@ impl Remote {
         let id = self.next.to_string();
         let parent = parent.unwrap_or_else(|| format!("p{id}"));
         let index = self.lineage(&parent).len() as u64 + 1;
-        let (metadata, custom_fields) = rec_from
-            .map(|rec| (rec.metadata.clone(), rec.custom_fields.clone()))
-            .unwrap_or((json!({}), json!({})));
+        let (metadata, custom_fields, access) = rec_from
+            .map(|rec| {
+                (
+                    rec.metadata.clone(),
+                    rec.custom_fields.clone(),
+                    rec.access.clone(),
+                )
+            })
+            .unwrap_or((json!({}), json!({}), Value::Null));
         self.records.insert(
             id.clone(),
             Rec {
@@ -107,6 +114,7 @@ impl Remote {
                 review: None,
                 metadata,
                 custom_fields,
+                access,
                 files: BTreeMap::new(),
             },
         );
@@ -161,6 +169,7 @@ async fn remote_request(State(state): State<Arc<Mutex<Remote>>>, request: Reques
             let rec = state.records.get_mut(&id).unwrap();
             rec.metadata = body["metadata"].clone();
             rec.custom_fields = body["custom_fields"].clone();
+            rec.access = body["access"].clone();
             state.json(&id)
         }
         (Method::GET, ["api", "records", id, "draft"]) if draft(&state, id) => state.json(id),
@@ -172,6 +181,7 @@ async fn remote_request(State(state): State<Arc<Mutex<Remote>>>, request: Reques
             }
             rec.metadata = body["metadata"].clone();
             rec.custom_fields = body["custom_fields"].clone();
+            rec.access = body["access"].clone();
             // Like Zenodo, a body without pids drops the reserved DOI.
             rec.reserved &= body["pids"]["doi"]["identifier"].is_string();
             rec.revision += 2;
