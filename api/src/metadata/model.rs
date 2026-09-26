@@ -28,6 +28,8 @@ pub struct MetadataDocumentSummary {
     pub replicas: usize,
     pub created_at: String,
     pub updated_at: String,
+    /// The newest accepted event, usable as `expected_revision` for a later replace.
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -699,6 +701,7 @@ impl From<&MetadataRegistryRecord> for MetadataDocumentSummary {
             replicas: record.holder_node_ids.len(),
             created_at: format_timestamp_ms(record.created_at_ms),
             updated_at: format_timestamp_ms(record.updated_at_ms),
+            revision: Some(record.last_event_id.to_string()),
         }
     }
 }
@@ -714,6 +717,7 @@ impl From<&MetadataPathWinner> for MetadataDocumentSummary {
             replicas: winner.replicas,
             created_at: format_timestamp_ms(winner.created_at_ms),
             updated_at: format_timestamp_ms(winner.updated_at_ms),
+            revision: None,
         }
     }
 }
