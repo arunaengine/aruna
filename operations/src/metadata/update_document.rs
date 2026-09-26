@@ -1963,12 +1963,13 @@ mod pure_tests {
         let mut operation = UpdateDocumentOperation::new(config);
         operation.start();
         operation.step(registry_read(&record));
-        operation.step(realm_config_read(&record));
+        configured(&mut operation, realm_config_read(&record));
         operation.step(batch_planned(&record));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: Ulid::from_parts(21, 21),
         }));
         operation.step(registry_read(&record));
+        operation.step(no_window());
         operation.step(raw_missing_budget(&record));
         let effects = operation.step(raw_events(&record));
         (operation, effects)
