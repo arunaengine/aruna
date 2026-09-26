@@ -280,6 +280,7 @@ async fn update_metadata(
         document_id: document.document_id,
         public: document.public,
         mutation: UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+        expected_revision: None,
     });
     update_metadata_document(operation, context)
         .await

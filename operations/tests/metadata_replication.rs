@@ -823,6 +823,7 @@ async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
                 mutation: UpdateDocumentMutation::ReplaceRoCrate {
                     jsonld: jsonld.clone(),
                 },
+                expected_revision: None,
             });
             match update_metadata_document(operation, node.context.as_ref()).await {
                 Ok(_) => return Ok(()),

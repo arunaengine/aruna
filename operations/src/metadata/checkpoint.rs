@@ -112,6 +112,7 @@ pub async fn after_materialization(
         document_id: record.document_id,
         public: record.public,
         mutation: UpdateDocumentMutation::Checkpoint,
+        expected_revision: None,
     });
     update_metadata_document(operation, context)
         .await
