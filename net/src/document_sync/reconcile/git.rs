@@ -4,6 +4,7 @@
 
 use aruna_core::document::{DocumentEvent, DocumentTarget};
 use aruna_core::git::GitRecord;
+use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::SyncQuarantineIdentity;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use tracing::warn;
@@ -24,6 +25,7 @@ pub(super) async fn apply_git_event(
     let DocumentEvent::Upsert {
         target: target @ DocumentTarget::GitRecord { .. },
         bytes,
+        change,
         ..
     } = &event
     else {
@@ -77,9 +79,15 @@ pub(super) async fn apply_git_event(
         Some(stored) if stored.as_ref() == bytes.as_slice() => Ok(MetadataOutcome::Skipped),
         Some(_) => reject("Git record id is already used by a different record"),
         None => {
-            service
-                .storage_write(keyspace, target.storage_key(), bytes.clone().into())
-                .await?;
+            // The revision and manifest rows let this holder prove the shard in a handover.
+            let bootstrap =
+                |error: aruna_core::errors::ConversionError| NetError::Bootstrap(error.to_string());
+            let mut writes = vec![
+                (keyspace, target.storage_key(), bytes.clone().into()),
+                sync_revision_entry(target, change).map_err(bootstrap)?,
+            ];
+            writes.extend(shard_manifest_entry(target, change).map_err(bootstrap)?);
+            service.storage_batch_write(writes).await?;
             Ok(MetadataOutcome::Applied {
                 target: target.clone(),
                 tombstone: None,
