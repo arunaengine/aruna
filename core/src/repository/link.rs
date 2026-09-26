@@ -244,6 +244,8 @@ pub struct LinkQueueEntry {
     pub due_at_ms: u64,
     /// When the oldest change still waiting was queued; it caps the debounce.
     pub first_at_ms: u64,
+    /// Only waits for the running push to end; no dataset change is queued.
+    pub settle_only: bool,
 }
 
 impl LinkQueueEntry {
@@ -259,6 +261,7 @@ impl LinkQueueEntry {
                 .saturating_add(LINK_DEBOUNCE_MS)
                 .min(first_at_ms.saturating_add(DEBOUNCE_CAP_MS)),
             first_at_ms,
+            settle_only: false,
         }
     }
 }

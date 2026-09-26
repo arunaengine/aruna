@@ -235,6 +235,7 @@ fn debounces_queued_changes() {
         document_id: document,
         due_at_ms: 1_000 + PUBLISH_QUIET_MS,
         first_at_ms: 1_000,
+        settle_only: false,
     };
     let change = LinkQueueEntry::debounce(document, Some(&publish), 600_000);
     assert_eq!(

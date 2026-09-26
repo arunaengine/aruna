@@ -45,7 +45,7 @@ use crate::tasks::queue_backoff::{due_after, min_due_at};
 
 const QUEUE_PAGE: usize = 256;
 /// How often a check waits for a running push before it looks again.
-const ACTIVE_RETRY_MS: u64 = 30_000;
+pub(super) const ACTIVE_RETRY_MS: u64 = 30_000;
 const ERROR_RETRY_MS: u64 = 60_000;
 
 /// Push-check rows for the push links of changed documents that push or retry after unmet
@@ -204,16 +204,11 @@ async fn check_link(
         change_link(context, &link, LinkChange::Delete).await?;
         return Ok(None);
     }
-    if link.status != LinkStatus::Enabled && !link.retries_on_change() {
-        return drop_entry().await;
-    }
     if let Err(LinkError::NotHolder) = ensure_holder(context, &link).await {
         return drop_entry().await;
     }
-    if link.pull().is_some() {
-        return super::pull::check_due(context, &link, now).await;
-    }
-    if let Some(job_id) = link.active_job {
+    // A paused link still settles its push, for example one cancelled while queued.
+    if let Some(job_id) = link.active_job.filter(|_| link.pull().is_none()) {
         let record = read_job_record(storage, job_id, None)
             .await
             .map_err(LinkError::Unexpected)?;
@@ -223,6 +218,12 @@ async fn check_link(
             }
             record => settle_stale(context, &link, job_id, record.as_ref(), queued).await,
         };
+    }
+    if link.status != LinkStatus::Enabled && !link.retries_on_change() {
+        return drop_entry().await;
+    }
+    if link.pull().is_some() {
+        return super::pull::check_due(context, &link, now).await;
     }
     // A decided review stores the repository's answer, which queues another check.
     if refresh_review(context, &link).await? != link {
@@ -635,6 +636,7 @@ mod tests {
             document_id,
             due_at_ms,
             first_at_ms,
+            settle_only: false,
         };
         let queued = queue_row(link_id, &entry(100, 90)).unwrap();
         write_row(&storage, queued.clone()).await.unwrap();

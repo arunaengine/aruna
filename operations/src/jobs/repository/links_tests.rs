@@ -317,20 +317,45 @@ fn rejects_unexpected_events() {
 }
 
 #[test]
-fn begin_takes_queue() {
+fn begin_keeps_check() {
     let mut stored = link();
+    let due = LinkQueueEntry {
+        document_id: stored.document_id,
+        due_at_ms: 0,
+        first_at_ms: 0,
+        settle_only: false,
+    };
     let mut op = operation(LinkChange::Begin(job(1)));
-    let effects = read(&mut op, Some(&stored));
+    let effects = read_queued(&mut op, Some(&stored), Some(&due));
+    let rows = written(&effects);
+    assert_eq!(
+        keyspaces(&rows),
+        [REPOSITORY_LINK_KEYSPACE, LINK_QUEUE_KEYSPACE]
+    );
+    // The due check is replaced by one that settles the push once its job ended.
+    let entry: LinkQueueEntry = postcard::from_bytes(&rows[1].2).unwrap();
+    assert_eq!(entry.due_at_ms, NOW_MS + ACTIVE_RETRY_MS);
+    assert!(entry.settle_only);
+    assert!(schedules(&commit(&mut op, effects)));
+
+    stored.active_job = Some(job(1));
+    // The push ends without anything to look at, so its kept check goes too.
+    let mut op = operation(LinkChange::Finish {
+        job_id: job(1),
+        outcome: Box::new(PushOutcome::Cancelled),
+        requeue: false,
+    });
+    let effects = read_queued(&mut op, Some(&stored), Some(&entry));
     assert_eq!(keyspaces(&written(&effects)), [REPOSITORY_LINK_KEYSPACE]);
     let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: vec![],
     }));
     let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = &effects[..] else {
-        panic!("expected the queue entry delete, got {effects:?}");
+        panic!("expected the kept check delete, got {effects:?}");
     };
+    assert_eq!(deletes.len(), 1);
     assert_eq!(deletes[0].0, LINK_QUEUE_KEYSPACE);
 
-    stored.active_job = Some(job(1));
     let mut busy = operation(LinkChange::Begin(job(2)));
     read(&mut busy, Some(&stored));
     busy.step(Event::Storage(StorageEvent::TransactionAborted {
@@ -592,6 +617,7 @@ fn finish_requeues_link() {
         document_id: stored.document_id,
         due_at_ms: NOW_MS + 5,
         first_at_ms: NOW_MS - 5,
+        settle_only: false,
     };
     let mut op = operation(finish(&record));
     let effects = read_queued(&mut op, Some(&stored), Some(&earlier));
@@ -708,6 +734,7 @@ fn check_replaces_row() {
         document_id: pulling().document_id,
         due_at_ms: 1_000,
         first_at_ms: 1_000,
+        settle_only: false,
     };
     let effects = read_queued(&mut op, Some(&pulling()), Some(&queued));
     let rows = written(&effects);

@@ -27,6 +27,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
 
+use super::link_queue::ACTIVE_RETRY_MS;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::persistent_id::{MappingRoute, mapping_route};
 use crate::placement::fence;
@@ -176,6 +177,7 @@ impl ChangeLinkOperation {
         let mut writes = Vec::new();
         // When the drain should look at the link next, if this change needs a look.
         let mut queue = None;
+        let mut settle_only = false;
         let result = match (
             std::mem::replace(&mut self.change, LinkChange::Delete),
             stored,
@@ -216,7 +218,14 @@ impl ChangeLinkOperation {
             }
             (LinkChange::Begin(job_id), Some(mut link)) => {
                 link.begin(job_id, self.now)?;
-                self.deletes.push(queue_row.clone());
+                // A push keeps its check queued, so a job that ends without running still settles.
+                if link.pull().is_none() {
+                    self.queued = None;
+                    settle_only = true;
+                    queue = Some(now_ms.saturating_add(ACTIVE_RETRY_MS));
+                } else {
+                    self.deletes.push(queue_row.clone());
+                }
                 Some(link)
             }
             (
@@ -235,6 +244,14 @@ impl ChangeLinkOperation {
                         .then_some(now_ms)
                         .or(review)
                         .or(link.publish_due_ms());
+                }
+                // The check kept at Begin ends with the push it waited for.
+                let waited = self
+                    .queued
+                    .as_ref()
+                    .is_some_and(|queued| queued.settle_only);
+                if applied && queue.is_none() && waited {
+                    self.deletes.push(queue_row.clone());
                 }
                 Some(link)
             }
@@ -331,6 +348,7 @@ impl ChangeLinkOperation {
                     .as_ref()
                     .map_or(due_at_ms, |q| q.due_at_ms.min(due_at_ms)),
                 first_at_ms: queued.map_or(now_ms, |queued| queued.first_at_ms),
+                settle_only,
             };
             let value = postcard::to_allocvec(&entry).map_err(ConversionError::from)?;
             writes.push((queue_row.0, queue_row.1, ByteView::from(value)));

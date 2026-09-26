@@ -159,6 +159,7 @@ pub(super) async fn due_now(
         document_id: link.document_id,
         due_at_ms: 0,
         first_at_ms: 0,
+        settle_only: false,
     };
     write_value(
         &fixture.context.storage_handle,
@@ -615,7 +616,8 @@ async fn queued_push_recovers() -> Result<(), Box<dyn std::error::Error>> {
     drain(&fixture).await?;
     let (started, queued) = current(&fixture, &link).await;
     assert_eq!(started.active_job, Some(orphan.job_id));
-    assert!(!queued);
+    // The running push keeps a check queued that settles it once the job ends.
+    assert!(queued);
     succeeded(run_push(&fixture, &link).await?);
     let (pushed, _) = current(&fixture, &link).await;
     assert_eq!(pushed.remote.draft_id.as_deref(), Some("2"));
@@ -681,8 +683,8 @@ async fn full_slots_wait() -> Result<(), Box<dyn std::error::Error>> {
     drain(&fixture).await?;
     let (started, queued) = current(&fixture, &link).await;
     assert!(
-        started.active_job.is_some() && !queued,
-        "the push starts once a slot frees up"
+        started.active_job.is_some() && queued,
+        "the push starts once a slot frees up and keeps its settlement check"
     );
     fixture.stop().await;
     Ok(())
@@ -956,6 +958,68 @@ async fn has_row(fixture: &Fixture, key_space: &str, link: &RepositoryLink) -> b
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
         other => panic!("unexpected read {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn cancelled_queue_settles() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
+    use aruna_operations::jobs::repository::links::change_link;
+    use aruna_operations::jobs::store::{CancelRequestOutcome, set_cancel_requested};
+    for paused in [false, true] {
+        let fixture = build_fixture(false).await?;
+        let server = remote(LINK_TOKEN).await;
+        let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+        drain(&fixture).await?;
+        let started = current(&fixture, &link).await.0;
+        let job_id = started.active_job.ok_or("no push")?;
+        let pause = |paused| {
+            LinkChange::Patch(LinkPatch {
+                paused: Some(paused),
+                ..Default::default()
+            })
+        };
+        if paused {
+            change_link(&fixture.context, &started, pause(true)).await?;
+        }
+        // The job is cancelled before it runs, so its runner never settles the link.
+        let storage = &fixture.context.storage_handle;
+        let cancelled = set_cancel_requested(storage, job_id, unix_timestamp_millis()).await?;
+        assert!(matches!(cancelled, CancelRequestOutcome::Cancelled(_)));
+        let key = link.link_id.to_bytes().to_vec();
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(queued),
+            ..
+        }) = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: LINK_QUEUE_KEYSPACE.to_string(),
+                key: key.clone().into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            return Err("the running push kept no check".into());
+        };
+        let mut entry: LinkQueueEntry = postcard::from_bytes(&queued)?;
+        entry.due_at_ms = 0;
+        let value = postcard::to_allocvec(&entry)?;
+        write_value(storage, LINK_QUEUE_KEYSPACE, key, value).await?;
+        drain(&fixture).await?;
+        let settled = current(&fixture, &link).await.0;
+        assert!(settled.active_job.is_none());
+        assert!(!has_row(&fixture, LINK_QUEUE_KEYSPACE, &link).await);
+        let settled = if paused {
+            change_link(&fixture.context, &settled, pause(false))
+                .await?
+                .ok_or("link missing")?
+        } else {
+            settled
+        };
+        let event = current_event(&fixture.context, link.document_id).await?;
+        let next = start_push(&fixture.context, &settled, event, false).await?;
+        assert_ne!(next, job_id);
+        fixture.stop().await;
+    }
+    Ok(())
 }
 
 #[tokio::test]
