@@ -492,10 +492,13 @@ pub async fn project_create_events(
         } else {
             true
         };
-        // A merge that arrived after later events still has to apply; it neither moves the
-        // registry nor the status back, it only queues its own materialization.
-        if registry_exists
-            && !needs_materialization
+        // A merge older than the recorded status still has to apply, so it only queues its own
+        // job; an equal status means that event's job is already queued.
+        let superseded = status_cache
+            .get(&document_id)
+            .and_then(Option::as_ref)
+            .is_some_and(|status| status.event_id > event.event_id);
+        if superseded
             && let MetadataEventPayload::ApplyBatch { batch, .. } = &event.payload
             && !dot_applied(context, &event.record.graph_iri, batch).await?
         {
