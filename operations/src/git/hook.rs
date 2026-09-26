@@ -4,7 +4,7 @@
 
 use super::push::{PushRequest, encode};
 use aruna_blob::git::command;
-use aruna_core::git::{LfsObject, RefUpdate, ZERO_OID};
+use aruna_core::git::{LfsObject, RefUpdate, ZERO_OID, refs_clash};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -199,10 +199,44 @@ pub async fn validate() -> std::io::Result<()> {
     publish(directory, updates, objects, paths, &token).await
 }
 
-/// Refuses updates whose old value no longer matches, before anything is published. A
-/// replicated record can move a ref between the client's ref listing and its push.
+/// Refuses every update Git would refuse after this hook, before anything is published: an
+/// old value that moved, a branch update that does not fast-forward, and a new name that
+/// clashes with an existing one, such as `draft` next to `draft/sub`.
 async fn current(directory: &Path, updates: &[RefUpdate]) -> std::io::Result<()> {
+    let listing = command(directory, &["for-each-ref", "--format=%(refname)"]).await?;
+    let existing = String::from_utf8(listing.to_vec()).map_err(|_| invalid())?;
     for update in updates {
+        let created = update.old == ZERO_OID && update.new != ZERO_OID;
+        let clash = existing
+            .lines()
+            .chain(
+                updates
+                    .iter()
+                    .filter(|other| other.new != ZERO_OID)
+                    .map(|other| other.name.as_str()),
+            )
+            .find(|other| refs_clash(other, &update.name));
+        if let (true, Some(other)) = (created, clash) {
+            return Err(std::io::Error::other(format!(
+                "{} clashes with {other}",
+                update.name
+            )));
+        }
+        let moves = update.old != ZERO_OID && update.new != ZERO_OID;
+        if moves && update.name.starts_with("refs/heads/") {
+            let arguments = [
+                "merge-base",
+                "--is-ancestor",
+                update.old.as_str(),
+                update.new.as_str(),
+            ];
+            if command(directory, &arguments).await.is_err() {
+                return Err(std::io::Error::other(format!(
+                    "{} does not fast-forward; fetch and merge first",
+                    update.name
+                )));
+            }
+        }
         let arguments = ["rev-parse", "--verify", "--quiet", update.name.as_str()];
         let found = match command(directory, &arguments).await {
             Ok(oid) => String::from_utf8(oid.to_vec()).map_err(|_| invalid())?,

@@ -383,6 +383,17 @@ pub fn valid_ref(name: &str, server: bool) -> bool {
         && !name.ends_with('.')
 }
 
+/// Whether two ref names cannot both exist, because one would be a folder of the other.
+pub fn refs_clash(first: &str, second: &str) -> bool {
+    first != second
+        && (first
+            .strip_prefix(second)
+            .is_some_and(|rest| rest.starts_with('/'))
+            || second
+                .strip_prefix(first)
+                .is_some_and(|rest| rest.starts_with('/')))
+}
+
 /// A repository-relative file path without traversal or Git internals.
 pub fn valid_path(path: &str) -> bool {
     !path.is_empty()
@@ -515,6 +526,10 @@ mod tests {
         for name in ["refs/heads/main", "refs/heads/feature/x", "refs/tags/v1.0"] {
             assert!(valid_ref(name, false), "{name}");
         }
+        assert!(refs_clash("refs/heads/draft", "refs/heads/draft/sub"));
+        assert!(refs_clash("refs/heads/draft/sub", "refs/heads/draft"));
+        assert!(!refs_clash("refs/heads/draft", "refs/heads/drafts"));
+        assert!(!refs_clash("refs/heads/draft", "refs/heads/draft"));
         for name in [
             "refs/heads/",
             "refs/heads/a..b",
