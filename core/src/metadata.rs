@@ -1154,10 +1154,8 @@ pub enum MetadataEffect {
         snapshot: Box<GraphReplicaSnapshot>,
     },
     // OR-Set metadata graphs
-    /// Change set `source` would commit against the local graph, published as a
-    /// batch under `actor`. Plans only: the graph is not mutated.
-    /// Plans `source` as dot `(actor, counter)`; a counter above one depends on the actor's
-    /// previous dot, so every replica applies one actor's batches in order.
+    /// Plans `source` as dot `(actor, counter)` without changing the graph. A counter above
+    /// one depends on the actor's previous dot, so replicas apply one actor's batches in order.
     PlanBatch {
         graph_iri: String,
         actor: [u8; 32],

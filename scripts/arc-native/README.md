@@ -1,3 +1,7 @@
+<!-- Native Git, Git LFS and ARCitect guide: setup, behavior and limits. -->
+<!-- Copyright (c) 2026 The Aruna Contributors -->
+<!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
+
 # Native Aruna Git, LFS and ARCitect
 
 Every metadata document automatically receives an ARC Git repository during metadata
