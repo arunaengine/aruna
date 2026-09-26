@@ -151,10 +151,8 @@ pub struct RepositoryLinkResponse {
     pub direction: String,
     /// enabled, paused or failed.
     pub status: String,
-    /// Failure reason such as remote_changed, token_rejected, source_unavailable,
-    /// requirements_unmet or owner_not_holder. An enabled pull link shows update_available, or
-    /// local_changed when a local edit holds the update back. An enabled push link shows
-    /// review_declined after a declined community review. These are information, not failures.
+    /// Failure reason such as remote_changed or token_rejected. On enabled links, update_available,
+    /// local_changed and review_declined are information, not failures.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// A check that failed after the repository had already published the last push.
@@ -186,7 +184,7 @@ pub struct LinkJobResponse {
     pub status_url: String,
 }
 
-pub(super) fn link_example() -> serde_json::Value {
+pub(in crate::routes) fn link_example() -> serde_json::Value {
     serde_json::json!({
         "link_id": "01ARZ3NDEKTSV4RRFFQ69G5FAY", "document_id": "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
         "group_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "connector_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
@@ -210,7 +208,11 @@ fn timestamp(value: SystemTime) -> String {
 }
 
 /// `holds` is false once the owner node lost the dataset; such a link cannot push any more.
-pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> RepositoryLinkResponse {
+pub(in crate::routes) fn response(
+    link: RepositoryLink,
+    queued: bool,
+    holds: bool,
+) -> RepositoryLinkResponse {
     let info = link.info_reason().map(str::to_string);
     let pull = link.pull().cloned();
     let findings = match &link.status {
@@ -287,7 +289,7 @@ pub(super) fn response(link: RepositoryLink, queued: bool, holds: bool) -> Repos
     }
 }
 
-pub(super) fn link_error(error: LinkError) -> ServerError {
+pub(in crate::routes) fn link_error(error: LinkError) -> ServerError {
     match error {
         LinkError::NotFound => ServerError::NotFound,
         LinkError::Exists
@@ -395,18 +397,18 @@ pub(crate) async fn ensure_requirements(
     ))
 }
 
-pub(super) fn seal_error(error: TransferError) -> ServerError {
+pub(in crate::routes) fn seal_error(error: TransferError) -> ServerError {
     match error {
         TransferError::Permanent(message) => ServerError::BadRequestReason(message),
         _ => ServerError::ServiceUnavailableReason("the link token could not be sealed".into()),
     }
 }
 
-pub(super) fn parse_ulid(value: &str) -> ServerResult<Ulid> {
+pub(in crate::routes) fn parse_ulid(value: &str) -> ServerResult<Ulid> {
     Ulid::from_string(value).map_err(|_| ServerError::BadRequest)
 }
 
-pub(super) fn metadata_json(
+pub(in crate::routes) fn metadata_json(
     state: &ServerState,
     value: Option<serde_json::Value>,
 ) -> ServerResult<String> {
@@ -421,7 +423,7 @@ pub(super) fn metadata_json(
 }
 
 /// READ on the dataset gates every link route.
-pub(super) async fn readable(
+pub(in crate::routes) async fn readable(
     state: &ServerState,
     auth: Option<AuthContext>,
     document_id: &str,
@@ -442,7 +444,7 @@ pub(super) async fn readable(
 
 /// Managing needs metadata WRITE in the connector group, as the creator or a group admin,
 /// on the link's owner node.
-pub(super) async fn managed(
+pub(in crate::routes) async fn managed(
     state: &ServerState,
     auth: Option<AuthContext>,
     document_id: &str,
@@ -466,7 +468,7 @@ pub(super) async fn managed(
     Ok((auth, link))
 }
 
-pub(super) async fn change(
+pub(in crate::routes) async fn change(
     state: &ServerState,
     link: &RepositoryLink,
     change: LinkChange,
@@ -494,7 +496,7 @@ async fn responses(
     Ok(views)
 }
 
-pub(super) async fn view(
+pub(in crate::routes) async fn view(
     state: &ServerState,
     document_id: Ulid,
     link_id: Ulid,
@@ -508,7 +510,7 @@ pub(super) async fn view(
         .ok_or(ServerError::NotFound)
 }
 
-pub(super) async fn job_response(
+pub(in crate::routes) async fn job_response(
     state: &ServerState,
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
@@ -702,5 +704,5 @@ pub async fn list_repository_links(
 }
 
 #[cfg(test)]
-#[path = "repository_links_tests.rs"]
+#[path = "links_tests.rs"]
 pub(crate) mod tests;

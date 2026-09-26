@@ -432,7 +432,7 @@ async fn repository_source(
     auth: &AuthContext,
     source: &ImportRoCrateSource,
 ) -> ServerResult<()> {
-    use super::repository_links::{connector_kind, ensure_capable, validate_record_id};
+    use super::repository::links::{connector_kind, ensure_capable, validate_record_id};
     use aruna_operations::jobs::repository::Action;
     let ImportRoCrateSource::Repository {
         group_id,

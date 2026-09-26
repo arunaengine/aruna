@@ -14,7 +14,7 @@ use crate::metadata::{
     serialize_jsonld_object,
 };
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
-use crate::routes::repository_links::{
+use crate::routes::repository::links::{
     connector, ensure_capable, ensure_requirements, validate_record_id,
 };
 use crate::server::state::ServerState;

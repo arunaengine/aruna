@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::routes::repository_links::tests::{Linked, setup, setup_crate};
+use crate::routes::repository::links::tests::{Linked, setup, setup_crate};
 use aruna_core::metadata::{INVENIO_PROFILE_IRI, ZENODO_PROFILE_IRI};
 
 async fn check(linked: &Linked, request: CheckRequest) -> ServerResult<CheckResponse> {

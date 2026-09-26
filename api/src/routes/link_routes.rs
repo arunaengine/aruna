@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::repository_links::{
+use super::repository::links::{
     LinkJobResponse, PatchLinkRequest, RepositoryLinkResponse, RotateTokenRequest, change,
     ensure_capable, job_response, link_error, link_example, managed, metadata_json, parse_ulid,
     readable, seal_error, view,

@@ -28,8 +28,6 @@ pub mod pid;
 pub mod placement;
 pub mod policies;
 pub mod repository;
-pub mod repository_check;
-pub mod repository_links;
 pub mod rocrate_import;
 pub mod search;
 pub mod staging;
@@ -75,8 +73,8 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(placement::router())
         .merge(rocrate_import::router())
         .merge(repository::router())
-        .merge(repository_links::router())
-        .merge(repository_check::router())
+        .merge(repository::links::router())
+        .merge(repository::check::router())
         .merge(link_routes::router())
         .merge(notifications::router())
         .merge(policies::router())

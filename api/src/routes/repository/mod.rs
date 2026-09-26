@@ -22,6 +22,9 @@ use super::rocrate_import::{
     SubmitImportResponse,
 };
 
+pub mod check;
+pub mod links;
+
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
         .routes(routes!(import_record))
@@ -113,9 +116,8 @@ pub async fn search_records(
         aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
-    let kind =
-        super::repository_links::connector_kind(&state, query.group_id, query.connector_id).await?;
-    super::repository_links::ensure_capable(kind, Action::Search)?;
+    let kind = links::connector_kind(&state, query.group_id, query.connector_id).await?;
+    links::ensure_capable(kind, Action::Search)?;
     aruna_operations::jobs::repository::search(
         kind,
         &state.get_ctx(),
@@ -295,10 +297,9 @@ pub async fn import_record(
                 aruna_core::structs::identity::auth::Permission::READ,
             )
             .await?;
-            let kind =
-                super::repository_links::connector_kind(&state, group_id, connector_id).await?;
-            super::repository_links::ensure_capable(kind, Action::Import)?;
-            super::repository_links::ensure_capable(kind, Action::Search)?;
+            let kind = links::connector_kind(&state, group_id, connector_id).await?;
+            links::ensure_capable(kind, Action::Import)?;
+            links::ensure_capable(kind, Action::Search)?;
             resolve(
                 kind,
                 &state.get_ctx(),

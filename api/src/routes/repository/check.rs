@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::repository_links::{connector, metadata_json, parse_ulid, readable, requirements};
+use super::links::{connector, metadata_json, parse_ulid, readable, requirements};
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ProfileFindingResponse, ServerError, ServerResult};
 use crate::metadata::ensure_metadata_scope;
@@ -259,5 +259,5 @@ pub async fn check_repository(
 }
 
 #[cfg(test)]
-#[path = "repository_check_tests.rs"]
+#[path = "check_tests.rs"]
 mod tests;
