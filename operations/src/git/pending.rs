@@ -11,19 +11,29 @@ use crate::metadata::update_document::{
 };
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, PENDING, PendingMerge, ZERO_OID};
-use aruna_core::metadata::{MetadataEffect, MetadataEvent};
+use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use std::sync::{LazyLock, Mutex};
 use tracing::warn;
 use ulid::Ulid;
 
-/// The local row of a pending merge, written with the push record that brings it.
+/// Orders pending merges as they are accepted; later ones build on earlier ones.
+static SEQUENCE: LazyLock<Mutex<ulid::Generator>> = LazyLock::new(Default::default);
+
+/// The local row of a pending merge, written with the push record that brings it. Keys
+/// sort by acceptance, so merges apply in the order their pushes moved `main`.
 pub fn entry(
     document_id: Ulid,
     merge: &PendingMerge,
 ) -> Result<(String, byteview::ByteView, byteview::ByteView), GitError> {
+    let sequence = SEQUENCE
+        .lock()
+        .map_err(|_| GitError::Unavailable)?
+        .generate()
+        .map_err(|_| GitError::Unavailable)?;
     let mut key = document_id.to_bytes().to_vec();
-    key.extend_from_slice(merge.new.as_bytes());
+    key.extend_from_slice(&sequence.to_bytes());
     let value = postcard::to_allocvec(merge).map_err(|_| GitError::Invalid)?;
     Ok((PENDING.into(), key.into(), value.into()))
 }
@@ -45,6 +55,7 @@ pub async fn apply(
                     "Pushed metadata could not be merged into the document");
                 records::remove(context, PENDING, key).await?;
             }
+            // Later merges build on this one, so they wait too.
             Err(error) => return Err(error),
         }
     }
@@ -121,4 +132,28 @@ async fn apply_one(
         }
     }
     Err(GitError::Stale)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    #[test]
+    fn rows_keep_order() {
+        let merge = |new: char| PendingMerge {
+            user_id: aruna_core::UserId::new(Ulid::from(1), RealmId([1; 32])),
+            old: ZERO_OID.into(),
+            new: new.to_string().repeat(40),
+        };
+        let document = Ulid::from(9);
+        // Commit ids sort the other way; the rows must still follow acceptance.
+        let keys: Vec<_> = ['f', 'a', 'c']
+            .into_iter()
+            .map(|new| entry(document, &merge(new)).expect("row").1.to_vec())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+    }
 }
