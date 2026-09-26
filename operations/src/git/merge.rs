@@ -107,7 +107,11 @@ pub async fn edit(
         .pop()
         .ok_or(GitError::Unavailable)?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
-    Ok(version(info, &projection.state, &tags))
+    // The answer shows the state after the edit, which the projection does not know yet.
+    let mut after = projection.state.clone();
+    after.refs.insert(branch_ref(branch)?, new.clone());
+    after.made.insert(new);
+    Ok(version(info, &after, &tags))
 }
 
 /// The version a merge produced and whether the target simply moved forward.
