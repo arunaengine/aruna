@@ -13,6 +13,7 @@ use crate::structs::execution::harvest::RepositoryConnectorKind;
 use crate::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier};
 use serde_json::{Value, json};
 
+#[path = "projection.rs"]
 mod projection;
 pub use projection::normalize_metadata;
 
@@ -607,4 +608,5 @@ fn native_properties(value: &Value, path: &str, result: &mut Vec<Value>) {
 }
 
 #[cfg(test)]
+#[path = "invenio_tests.rs"]
 mod tests;
