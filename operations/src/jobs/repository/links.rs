@@ -696,6 +696,37 @@ pub async fn list_links(
     storage: &StorageHandle,
     document_id: Ulid,
 ) -> Result<Vec<(RepositoryLink, bool)>, LinkError> {
+    let links = document_links(storage, document_id).await?;
+    let reads = links
+        .iter()
+        .map(|link| (LINK_QUEUE_KEYSPACE.to_string(), id_key(link.link_id)))
+        .collect::<Vec<_>>();
+    if reads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let event = send(
+        storage,
+        StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        },
+    )
+    .await?;
+    let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+        return Err(LinkError::Unexpected(format!("{event:?}")));
+    };
+    Ok(links
+        .into_iter()
+        .zip(values)
+        .map(|(link, (_, queued))| (link, queued.is_some()))
+        .collect())
+}
+
+/// All links of the document, read page by page.
+pub(crate) async fn document_links(
+    storage: &StorageHandle,
+    document_id: Ulid,
+) -> Result<Vec<RepositoryLink>, LinkError> {
     let mut links = Vec::new();
     let mut start = None;
     loop {
@@ -722,32 +753,9 @@ pub async fn list_links(
         }
         match next_start_after {
             Some(next) => start = Some(next),
-            None => break,
+            None => return Ok(links),
         }
     }
-    let reads = links
-        .iter()
-        .map(|link| (LINK_QUEUE_KEYSPACE.to_string(), id_key(link.link_id)))
-        .collect::<Vec<_>>();
-    if reads.is_empty() {
-        return Ok(Vec::new());
-    }
-    let event = send(
-        storage,
-        StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        },
-    )
-    .await?;
-    let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-        return Err(LinkError::Unexpected(format!("{event:?}")));
-    };
-    Ok(links
-        .into_iter()
-        .zip(values)
-        .map(|(link, (_, queued))| (link, queued.is_some()))
-        .collect())
 }
 
 pub async fn read_link(

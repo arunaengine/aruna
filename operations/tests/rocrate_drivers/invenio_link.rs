@@ -1058,6 +1058,65 @@ async fn deleted_dataset_unlinks() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn paged_links_unlinked() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_fixture(false).await?;
+    let server = remote(LINK_TOKEN).await;
+    let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
+    let storage = &fixture.context.storage_handle;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(secret),
+        ..
+    }) = storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: LINK_SECRET_KEYSPACE.to_string(),
+            key: link.link_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        return Err("link token missing".into());
+    };
+    // One link more than a 256 row queue page, each with its own token.
+    let mut links = vec![link.clone()];
+    for seed in 1..=256u64 {
+        let mut copy = link.clone();
+        copy.link_id = ulid::Ulid::from_parts(seed, 1);
+        let key = link_key(copy.document_id, copy.link_id);
+        write_value(storage, REPOSITORY_LINK_KEYSPACE, key, copy.to_bytes()?).await?;
+        let id = copy.link_id.to_bytes().to_vec();
+        write_value(storage, LINK_SECRET_KEYSPACE, id, secret.to_vec()).await?;
+        links.push(copy);
+    }
+    // The original link sorts last; without its creation check only the deletion queues it.
+    storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: LINK_QUEUE_KEYSPACE.to_string(),
+            key: link.link_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    drive(
+        DeleteDocumentOperation::new(fixture.actor.clone(), fixture.group_id, doc_id(1)),
+        &fixture.context,
+    )
+    .await?;
+    replay_event_log(fixture.context.as_ref()).await?;
+    process_prune_batch(fixture.context.as_ref()).await?;
+    for link in &links {
+        assert!(has_row(&fixture, LINK_QUEUE_KEYSPACE, link).await);
+        due_now(&fixture, link).await?;
+    }
+    drain(&fixture).await?;
+    assert!(list_links(storage, doc_id(1)).await?.is_empty());
+    for link in &links {
+        assert!(!has_row(&fixture, LINK_SECRET_KEYSPACE, link).await);
+        assert!(!has_row(&fixture, LINK_QUEUE_KEYSPACE, link).await);
+    }
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn registration_awaits_mapping() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdentifier};
     use aruna_operations::jobs::persistent_id::run_register_identifiers;

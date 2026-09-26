@@ -9,10 +9,10 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
+use aruna_core::keyspaces::LINK_QUEUE_KEYSPACE;
 use aruna_core::repository::{
     LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
-    RepositoryLink, link_prefix,
+    RepositoryLink,
 };
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
@@ -28,8 +28,8 @@ use ulid::Ulid;
 
 use super::TransferError;
 use super::links::{
-    ChangeLinkOperation, LinkChange, LinkError, change_link, ensure_lineage, id_key, read_link,
-    schedule_drain,
+    ChangeLinkOperation, LinkChange, LinkError, change_link, document_links, ensure_lineage,
+    id_key, read_link, schedule_drain,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
@@ -58,23 +58,9 @@ pub(crate) async fn queue_rows(
     let now_ms = unix_timestamp_millis();
     let mut candidates = Vec::new();
     for document_id in documents {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: REPOSITORY_LINK_KEYSPACE.to_string(),
-                prefix: Some(ByteView::from(link_prefix(document_id))),
-                start: None,
-                limit: QUEUE_PAGE,
-                txn_id: None,
-            })
-            .await;
-        let values = match event {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => return Err(LinkError::Unexpected(format!("{other:?}"))),
-        };
-        let gone = !values.is_empty() && document_gone(storage, document_id).await?;
-        for (_, value) in values {
-            let link = RepositoryLink::from_bytes(&value)?;
+        let links = document_links(storage, document_id).await?;
+        let gone = !links.is_empty() && document_gone(storage, document_id).await?;
+        for link in links {
             let pushes = link.status == LinkStatus::Enabled || link.retries_on_change();
             if gone || (pushes && link.pull().is_none()) {
                 candidates.push((link.link_id, document_id));
