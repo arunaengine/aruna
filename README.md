@@ -49,6 +49,7 @@ Aruna helps organizations share and organize research data and metadata while ke
 - **Distributed full-text search**: Per-node [Tantivy](https://github.com/quickwit-oss/tantivy) indexes with fan-out queries and authorization filtering.
 - **Built-in replication and synchronization**: Metadata edits converge across holders. Blob copies move through explicit copy or replication requests; each node owns its S3 keys, versions, and current heads.
 - **Interoperable using open standards**: [OIDC](https://openid.net/connect/) for authentication, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) for data referencing, [OAI-PMH](https://www.openarchives.org/pmh/) for metadata harvesting.
+- **Native Git for datasets**: Clone, branch and push each dataset as an [ARC](https://arc-rdm.org/) Git repository with Git LFS; edits sync both ways with the metadata.
 - **Repository publishing**: Publish datasets with a DOI to [Zenodo](https://zenodo.org/) or other [InvenioRDM](https://inveniordm.docs.cern.ch/) repositories, import records, and keep both in sync.
 - **Compute jobs**: Run container workloads with Docker, Apptainer, or Kubernetes through the portal or GA4GH TES API.
 - **Interactive notebooks**: Work with `.ipynb` notebooks in the portal, run cells in live sessions, and access files in S3 buckets.
@@ -206,6 +207,19 @@ a DOI and a public record without copying files by hand. Records can also be imp
   metadata.
 - **Links**: keep a dataset and a record in sync. Changes go to a draft, and the researcher decides
   when to publish. Pull links fetch new versions from the repository.
+
+## Native Git for datasets
+
+Every dataset is also a Git repository in the [ARC](https://arc-rdm.org/) layout, served by each
+node that holds it. Use `git` and `git lfs` with an Aruna token as the password.
+
+- **Two-way sync**: a push to `main` updates the dataset metadata, and metadata edits appear as
+  new commits on `main`.
+- **Branches and tags**: other branches are drafts until they are merged into `main`.
+- **History API**: `/api/v1/metadata/{id}/versions`, `/compare`, `/branches` and `/tags` give the
+  same history as plain JSON.
+
+See the [native Git guide](scripts/arc-native/README.md) for setup and details.
 
 ## License
 
