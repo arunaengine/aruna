@@ -15,6 +15,8 @@ pub struct GitState {
     pub locks: BTreeMap<String, LfsLock>,
     /// Claims that lost to a held lock; they are decided when that lock's unlock is known.
     pub waiting: Vec<LfsLock>,
+    /// Released locks and the record that released them.
+    pub released: Vec<(LfsLock, Ulid)>,
     pub revision: Option<Ulid>,
     /// The graph digest of the newest applied snapshot.
     pub digest: Option<[u8; 32]>,
@@ -86,6 +88,7 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
             .map(|lock| (lock.path.clone(), lock.clone()))
             .collect();
         state.waiting = newest.waiting.clone();
+        state.released = newest.released.clone();
         state.revision = newest.revision;
         state.digest = newest.digest;
         for (_, checkpoint) in chain.iter().rev() {
@@ -187,6 +190,13 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                     locked_at_ms: record.occurred_at_ms,
                     claim: record.event_id,
                 };
+                // A claim made while an already released lock was held was refused.
+                let refused = state.released.iter().any(|(lock, unlocked)| {
+                    lock.path == *path && lock.claim < claim.claim && claim.claim < *unlocked
+                });
+                if refused {
+                    continue;
+                }
                 // The earliest claim holds, also when it arrives late; the other one waits.
                 match state.locks.get(path) {
                     Some(held) if held.claim < claim.claim => state.waiting.push(claim),
@@ -208,7 +218,9 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                     .find(|(_, lock)| lock.id == *id)
                     .map(|(path, _)| path.clone());
                 if let Some(path) = released {
-                    state.locks.remove(&path);
+                    if let Some(lock) = state.locks.remove(&path) {
+                        state.released.push((lock, record.event_id));
+                    }
                     // Claims made while the lock was held were refused; the first later one holds.
                     let unlocked = record.event_id;
                     state
@@ -391,6 +403,20 @@ mod tests {
         let released = record(35, 1, GitChange::Unlock { id: Ulid::from(2) });
         let state = done(&[late, lock(20, 1, 2), released], &Ancestry::new());
         assert!(state.locks.is_empty());
+        // Claim 15 arrives after a checkpoint that saw claim 10 held until unlock 20.
+        let mut folded = checkpoint(30, None, &[], &[10, 20]);
+        if let GitChange::Checkpoint(checkpoint) = &mut folded.change {
+            let held = LfsLock {
+                id: Ulid::from(1),
+                path: "a.bin".into(),
+                user_id: UserId::new(Ulid::from(1), RealmId([1; 32])),
+                locked_at_ms: 0,
+                claim: Ulid::from(10),
+            };
+            checkpoint.released = vec![(held, Ulid::from(20))];
+        }
+        let state = done(&[folded, lock(15, 2, 4)], &Ancestry::new());
+        assert!(state.locks.is_empty());
     }
 
     #[test]
@@ -417,6 +443,7 @@ mod tests {
                 lfs: Vec::new(),
                 locks: Vec::new(),
                 waiting: Vec::new(),
+                released: Vec::new(),
                 revision: None,
                 covered: vec![Ulid::from(10), Ulid::from(20)],
             })),
@@ -457,6 +484,7 @@ mod tests {
                 lfs: Vec::new(),
                 locks: Vec::new(),
                 waiting: Vec::new(),
+                released: Vec::new(),
                 revision: None,
                 covered: covered.iter().copied().map(Ulid::from).collect(),
             })),

@@ -15,7 +15,7 @@ use crate::s3::object::get::{GetObjectInput, get_object_info};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CHECKPOINT_AFTER, GitChange, GitCheckpoint, GitEffect, GitEvent, GitSnapshot, GitStatus,
-    LinkedObject, RefUpdate, STATUS, StoredObject, ZERO_OID,
+    LinkedObject, RELEASED_LOCKS, RefUpdate, STATUS, StoredObject, ZERO_OID,
 };
 use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
 use aruna_core::metadata::{
@@ -346,6 +346,15 @@ async fn checkpoint(
         lfs: state.new_lfs.clone(),
         locks: state.locks.values().cloned().collect(),
         waiting: state.waiting.clone(),
+        // Only recent releases matter; an older late claim is decided without them.
+        released: state
+            .released
+            .iter()
+            .rev()
+            .take(RELEASED_LOCKS)
+            .rev()
+            .cloned()
+            .collect(),
         revision: state.revision,
         covered: state.applied.clone(),
     }));

@@ -21,6 +21,8 @@ pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 /// Records not covered by a checkpoint; holders write a checkpoint well before this.
 pub const MAX_RECORDS: usize = 1024;
 pub const CHECKPOINT_AFTER: usize = 256;
+/// Released locks a checkpoint remembers for deciding late claims.
+pub const RELEASED_LOCKS: usize = 1024;
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,6 +330,9 @@ pub struct GitCheckpoint {
     pub locks: Vec<LfsLock>,
     /// Claims that lost to a held lock and may still win if that lock was released earlier.
     pub waiting: Vec<LfsLock>,
+    /// Recently released locks with the unlock record, so a late claim made while one of
+    /// them was held is refused as a full replay would refuse it.
+    pub released: Vec<(LfsLock, Ulid)>,
     pub revision: Option<Ulid>,
     pub covered: Vec<Ulid>,
 }
