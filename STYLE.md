@@ -6,7 +6,7 @@
 
 **The location explains the domain. The name explains the action or concept. The code exposes sequence and ownership. Comments explain reasons that are not apparent from the code.**
 
-This root `STYLE.md` is the canonical policy. `CONTRIBUTING.md`, the source guide, and agent instructions should reference it instead of maintaining separate copies.
+This root `STYLE.md` is the canonical policy. `CONTRIBUTING.md`, `REPO_STRUCTURE.md`, and agent instructions should reference it instead of maintaining separate copies.
 
 Apply this policy to repository-owned production code, tests, helpers, scripts, source assets, and development tooling. Preserve behavior and external contracts during every naming or layout change. Generated code, third-party material, required interface names, and mandatory notices require narrow, explicit exceptions.
 

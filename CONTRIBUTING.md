@@ -12,7 +12,7 @@ In any case please also acknowledge our [Code of Conduct](CODE_OF_CONDUCT.md)
 ## Developer Contributions Guidance
 
 Where new behavior belongs, and the request and startup paths end to end, are
-described in [docs/source-guide.md](docs/source-guide.md).
+described in [REPO_STRUCTURE.md](REPO_STRUCTURE.md).
 
 During local work, use focused checks for the changed behavior and run
 `just lint`, which runs the style checker self-tests and checker together with
@@ -48,7 +48,7 @@ threshold, the shared-prefix exception, term limits, and hoisting.
   `api/src/routes/{execution,access,storage}/`; records under
   `core/src/structs/{placement,identity,storage,execution}/`; effect adapters
   under `operations/src/effect_adapters/`. See
-  [docs/source-guide.md](docs/source-guide.md) for the full map.
+  [REPO_STRUCTURE.md](REPO_STRUCTURE.md) for the full map.
 
 ### Workflow
 

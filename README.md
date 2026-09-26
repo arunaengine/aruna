@@ -49,6 +49,7 @@ Aruna helps organizations share and organize research data and metadata while ke
 - **Distributed full-text search**: Per-node [Tantivy](https://github.com/quickwit-oss/tantivy) indexes with fan-out queries and authorization filtering.
 - **Built-in replication and synchronization**: Metadata edits converge across holders. Blob copies move through explicit copy or replication requests; each node owns its S3 keys, versions, and current heads.
 - **Interoperable using open standards**: [OIDC](https://openid.net/connect/) for authentication, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) for data referencing, [OAI-PMH](https://www.openarchives.org/pmh/) for metadata harvesting.
+- **Repository publishing**: Publish datasets with a DOI to [Zenodo](https://zenodo.org/) or other [InvenioRDM](https://inveniordm.docs.cern.ch/) repositories, import records, and keep both in sync.
 - **Compute jobs**: Run container workloads with Docker, Apptainer, or Kubernetes through the portal or GA4GH TES API.
 - **Interactive notebooks**: Work with `.ipynb` notebooks in the portal, run cells in live sessions, and access files in S3 buckets.
 - **AI assistant tools**: Authenticated [MCP](https://modelcontextprotocol.io/) access to Aruna context, data, metadata, and compute operations.
@@ -56,453 +57,155 @@ Aruna helps organizations share and organize research data and metadata while ke
 
 ## Architecture and Goals
 
-Research data rarely lives in one place. Universities, labs, archives, and infrastructure providers have their own storage systems, policies, and responsibilities. Aruna connects these systems so researchers can find and work with data across participating nodes, while each organization decides how its data is stored and who can access it.
+Research data is spread across universities, labs and archives. Each of them has its own storage
+and its own rules. Aruna connects these places without taking control away from them.
 
-Nodes are organized into **realms**, which define a shared trust boundary for an institute, consortium, or project network. Each node belongs to one realm. Membership alone does not grant access to data: permissions are assigned explicitly through groups, roles, and paths.
+- **Nodes**: each organization runs its own node. It decides where its data lives and who may
+  access it.
+- **Realms**: nodes that trust each other form a realm, for example an institute or a consortium.
+  Joining a realm does not grant access to data. Access comes only from groups, roles and paths.
+- **Peer-to-peer network**: nodes find and reach each other with
+  [iroh](https://www.iroh.computer/), also behind NATs and firewalls. No central server is needed.
 
-### Data, metadata, and access
+The goal is FAIR research data: findable, accessible, interoperable and reusable, while each
+institution stays responsible for its own data.
 
-Each Aruna node exposes an **S3-compatible API** for the tools, scripts, and workflow systems researchers already use. Virtual buckets bring together local data, replicated copies, and references to remote resources. Aruna tracks where each object lives and whether to keep a local copy or fetch it when needed.
+### Data
 
-> [!NOTE]
-> Object keys for `PutObject`, `CreateMultipartUpload`, `UploadPart`, and `CompleteMultipartUpload` must be non-empty relative paths; they are rejected if they begin with `/`, contain an exact `..` path segment, or contain control characters.
- 
-Metadata is stored as **RO-Crate JSON-LD**, describing datasets alongside their files, people, instruments, software, and workflows. A CRDT-based triple store merges concurrent metadata edits across nodes. Users, groups, and other management resources also synchronize between nodes, allowing them to reconcile changes after a network outage.
+- Every node offers an S3 API, so existing tools and scripts work without changes.
+- A virtual bucket can hold local files, copies and references to files on other nodes. Aruna
+  decides whether to keep a local copy or fetch a file when it is needed.
+- Files are hashed with BLAKE3. This detects damaged data and stores identical files only once.
+- Copies between nodes are checked while they stream in, so a broken transfer is caught early.
 
-File contents are hashed with **BLAKE3** for integrity checks and deduplication within each storage backend. Replication uses Bao-tree verified streaming to check data as it arrives. Each node owns its local object keys and versions; copying a file to another node creates a copy managed by that node.
+### Metadata
 
-### Network and research workflows
-
-The network layer uses **iroh** for peer discovery, authenticated connections, and data exchange, including connections across NATs and firewalls.
-
-Researchers can search across nodes, describe datasets, share files, and run compute jobs through the same system. Aruna supports GA4GH DRS for data references, OAI-PMH for metadata harvesting, and GA4GH TES for compute execution. Policies and permissions govern access throughout these workflows.
-
-The goal is practical support for FAIR research data: making it findable, accessible, interoperable, and reusable across the institutions responsible for it.
+- Metadata is stored as RO-Crate JSON-LD. This common format describes a dataset together with
+  its files, people, instruments, software and workflows.
+- Edits made on different nodes merge automatically. Nodes catch up after a network outage.
+- Users and groups are shared between the nodes of a realm in the same way.
 
 ## Getting Started
 
-Try the [public v3 portal](https://v3.aruna-engine.org) and follow the [portal documentation](https://v3.aruna-engine.org/app/docs/v1), or explore the REST API in [Swagger UI](https://api.node-1.v3.aruna-engine.org/swagger-ui/). To run Aruna locally, start with the 3-node demo deployment below.
+Pick the way that fits you, fastest first:
+
+1. **Try it online**: use the [public v3 portal](https://v3.aruna-engine.org), read the
+   [portal documentation](https://v3.aruna-engine.org/app/docs/v1) or explore the
+   [Swagger UI](https://api.node-1.v3.aruna-engine.org/swagger-ui/).
+2. **Run a local cluster**: start three nodes on your machine with one command.
+3. **Run a single node**: start one node from the scripts or from source.
 
 ### Prerequisites
 
-#### For local builds
+- **Local cluster**: `docker` with Compose v2, `curl`, `ss` and optionally `just`.
+- **Building from source**: Rust `1.97.1` (see [rust-toolchain.toml](rust-toolchain.toml)),
+  OpenSSL development headers and the `mold` linker.
 
-- Rust `1.97.1` (see [rust-toolchain.toml](rust-toolchain.toml), for source builds)
-- OpenSSL development headers
-- `mold` linker
-
-#### For local test deployments
-
-- `curl` (`ss` for cluster setup)
-- `docker`
-- Docker Compose v2 (`docker compose`)
-- `just` (optional, for convenience)
-
-### Run a single node with an external identity provider
-
-Start one node with:
+### Run a local cluster
 
 ```bash
-just local
+just local-cluster        # three nodes
+just local-cluster-oidc   # three nodes plus a local Keycloak login
+just preview              # three nodes, Keycloak and a web portal per node
 ```
 
-or invoke [scripts/local_deploy.sh](scripts/local_deploy.sh) directly.
+Each command:
 
-The default example configuration exposes:
+- builds Aruna and starts three nodes,
+- waits until every node is ready,
+- prints the URLs of each node, the test logins and an `ADMIN_TOKEN` for API calls.
 
-- the REST API and Swagger UI on `http://127.0.0.1:3000/swagger-ui`
-- the S3 endpoint on `http://127.0.0.1:1337`
+Logs and credentials are written to `target/test-deploy/`. Press Ctrl-C to stop the cluster. If
+the terminal is already closed, run `just stop`.
 
-The repository also tracks a `.env` holding a demonstration profile whose keys are
-published. A node refuses to start while `REALM_PUBLIC_KEY`, `NODE_PUBLIC_KEY`,
-`REALM_PRIVATE_KEY` or `NODE_PRIVATE_KEY` still holds one of those published keys, and
-names it. Replace them with your own, or pass `--dangerously-use-default-env` (or set
-`ARUNA_DANGEROUSLY_USE_DEFAULT_ENV=1`) to start anyway, which logs a warning per key.
+Two settings help when the defaults do not fit:
 
-### Evaluate a local cluster
+- `ARUNA_TEST_DEPLOY_BASE_PORT` moves all ports, for example when a port is already taken.
+- `ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1` exits once the cluster is ready, for use in scripts.
 
-For a quick end-to-end evaluation, run:
+### Run a single node
 
-```bash
-just local-cluster
-# or
-just local-cluster-oidc
-```
-
-This demo deployment:
-
-- builds the workspace in release mode
-- launches 3 local Aruna nodes
-- waits for `/readyz` on each node's ops port
-- writes per-node logs, `summary.txt` and a private `credentials.txt` to `target/test-deploy/`
-- prints an `ADMIN_TOKEN=...` line for use in authenticated API calls during the session
-- prints a summary listing every node's API, portal, S3 and ops URLs next to the test logins
-
-`just preview` additionally serves the portal. The portal has its own listener,
-so each node exposes the SPA on a separate port from the REST API; the REST port
-redirects `/` to the Swagger UI.
-
-Docker images use the same website build: stage its `dist/` contents in the
-ignored `.portal-embed/` directory before building, or set the
-`PORTAL_EMBED_DIR` build argument to another staged directory in the build context.
-The Dockerfile copies those assets to `/run/portal`; without staged assets the
-image is headless. Portal source belongs in the separate website repository,
-not a second maintained bundle under `docker/`.
-
-Useful overrides:
-
-- `ARUNA_TEST_DEPLOY_BASE_PORT` shifts the entire local port range
-- `ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1` exits once the cluster is ready instead of keeping it running
-
-Ctrl-C stops the cluster again. A deployment that outlived its terminal is
-stopped with:
-
-```bash
-just stop
-```
-
-It interrupts a deploy script that still monitors the nodes, stops every node
-named by a pid file under `target/test-deploy/`, and removes the Keycloak
-compose project. Logs, `summary.txt` and `credentials.txt` stay in place.
-
-`just local-cluster-oidc` extends the same 3-node startup check with a local Keycloak instance.
-
-### Run a single node from source
-
-To run a node directly from source, copy the example environment file and start the main binary from the workspace root:
+`just local` starts one node that uses an external identity provider. To start a node from
+source instead:
 
 ```bash
 cp .env.example .env
 cargo run -p aruna
 ```
 
-The default example configuration exposes:
+The node then serves:
 
 - the REST API and Swagger UI on `http://127.0.0.1:3000/swagger-ui`
-- the S3 endpoint on `http://127.0.0.1:1337`
+- the S3 API on `http://127.0.0.1:1337`
 
-## State And Onboarding
+> [!WARNING]
+> The tracked `.env` contains demo keys that are public. A node refuses to start with them, so
+> that no real node runs on known keys. Set your own `REALM_*_KEY` and `NODE_*_KEY` values. For
+> a quick local test only, `--dangerously-use-default-env` starts the node anyway.
 
-A node started without an `ONBOARDING_SECRET` initializes a new realm on first boot and persists its identity under `STORAGE_PATH`. It does not log the initial administrator secret. The local deployment scripts stop the node and use `aruna-doctor recover-admin` against its database to mint a secret for the initial administrator claim.
+## Running a Node
 
-Additional nodes join an existing realm by setting `ONBOARDING_SECRET` on their first boot.
+### First start
 
-Onboarding only takes effect on a fresh data directory. Once a node has persisted state, later `.env` changes, including a new `ONBOARDING_SECRET`, do not re-bootstrap or re-onboard it. To repeat an onboarding or bootstrap flow, point the node at a fresh `STORAGE_PATH`.
+- The first node creates a new realm when it starts for the first time. Its identity is saved
+  under `STORAGE_PATH`.
+- Further nodes join that realm by setting `ONBOARDING_SECRET` before their first start.
+- This happens only once per data directory. Later `.env` changes do not onboard a node again.
+  To start over, use an empty `STORAGE_PATH`.
+- The admin secret is never logged, so it cannot leak through log files. Create one with
+  `aruna-doctor recover-admin`. The local scripts do this for you.
 
-For a ready-made multi-node onboarding flow, use `just local-cluster` instead of walking through the onboarding APIs manually.
+### Backups
 
-### Stored credentials
-
-Secrets of source connectors, repository connectors and group storage backends are encrypted at
-rest. So are Invenio link tokens and S3 secret keys. The encryption key is derived from the
-node's secret key, which the node keeps in its state under `STORAGE_PATH`. Only the same node
-can decrypt these secrets, and a restart derives the same key again. Back up `STORAGE_PATH` as a
-whole to keep them usable. A node restored without its state, or with another identity, cannot
-decrypt them: register the connector and backend secrets again with their `PUT` routes and
-replace each link token with `PUT .../token`. Secrets stored before this encryption are
-encrypted by the migrate run described under Upgrading.
+Aruna encrypts stored secrets, such as connector tokens and S3 secret keys. The key comes from the
+node's identity in `STORAGE_PATH`. Always back up the whole `STORAGE_PATH`: a node restored
+without it cannot read its secrets anymore.
 
 ### Upgrading
 
-After upgrading a node, stop it and run `aruna-doctor migrate <STORAGE_PATH>` once before the new
-version starts. The run rewrites rows that older versions stored in an earlier layout: job records
-and their checkpoints, PID mappings and their queued publishes, and the realm configuration. It
-rebuilds the identifier index from the PID mappings and encrypts plain stored secrets. The output
-counts scanned and rewritten rows per kind and lists secret rows it could not read; those stay
-unchanged. A second run changes nothing. Without the migration the new version cannot read the old
-rows.
+1. Stop the node.
+2. Run `aruna-doctor migrate <STORAGE_PATH>`.
+3. Start the new version.
 
-## Interactive Session Networking
+The new version cannot read data stored in an older layout without this step. Running it twice
+is safe.
 
-Interactive notebook sessions run in a container that must reach this node's S3 plane and nothing
-else. With the Docker executor the node creates an internal bridge network named `aruna-sessions`
-from `ARUNA_COMPUTE_DOCKER_SESSION_SUBNET` (default `172.30.255.0/24`). The network has no external
-route, and the node serves S3 on the bridge's gateway address, the first host address of that
-subnet, on the port from `S3_ADDRESS`.
+### Durability
 
-The bridge gives session containers a host-side S3 endpoint. It does not isolate other host services
-that bind that address or all interfaces. Restrict those listeners appropriately, and keep the S3
-port free on the bridge gateway. Pick a subnet that does not overlap an existing host network.
+`ARUNA_FJALL_PERSIST_MODE` chooses between speed and safety:
 
-Kubernetes keeps its existing S3-only network policy, and Apptainer keeps the host network. On
-Kubernetes the Aruna node's controller service account needs the `create` verb on `pods/exec`:
-the node talks to a session's kernel through an exec into the running pod. The task workload
-service account stays unprivileged, with its token unmounted.
+- `buffer` (default): faster. Safe when Aruna crashes, but the latest writes can be lost on power
+  loss or an operating system crash.
+- `sync_all`: slower. Every write is on disk before Aruna confirms it.
 
-Some clusters need policies the standard Kubernetes ones cannot express. List those manifests in
-`ARUNA_COMPUTE_K8S_POLICY_MANIFESTS`, a comma-separated list of YAML files and directories; a
-directory contributes its `*.yaml` and `*.yml` files in name order, and a file may hold several
-documents. Every document needs an `apiVersion`, a `kind` and a `metadata.name`, and its namespace
-must be absent or the compute namespace. The node applies them next to its own network policies at
-startup and before each job, so its service account needs `create`, `get` and `patch` on those
-kinds in that namespace. An unreadable file, an invalid document or a kind the cluster does not
-serve stops the node.
+Keep free disk space for imports: an RO-Crate import briefly needs about twice the archive's size.
 
-A Cilium cluster is the common case: the S3 endpoint often resolves to the ingress load balancer,
-and Cilium treats that traffic as its reserved `ingress` entity, which no `ipBlock` rule matches. A
-CiliumNetworkPolicy with `toEntities: [ingress]` on the S3 port, selecting pods labelled
-`aruna-engine.org/network: s3`, opens it. DNS egress is allowed by port with no peer, because a
-node-local resolver runs on a host address that is neither a pod nor a CIDR peer.
+### Notebook sessions
 
-Kubernetes workspaces and sessions need a pod-reachable endpoint in `ARUNA_COMPUTE_S3_URL`
-or `S3_PUBLIC_URL`. `ARUNA_COMPUTE_K8S_S3_PORT` defaults to that URL's explicit or known
-scheme port, falling back to 443. `ARUNA_COMPUTE_LOCAL_ONLY` disables workspaces and
-sessions for that executor.
+Notebook sessions run user code. To limit what that code can reach, a session can only talk to
+its node's S3 API.
 
-The session images are built from `scripts/session-python` and `scripts/session-deno`, which share
-the helper in `scripts/session-helper`. Build them with their `build.sh`; the runtime catalog names
-`harbor.computational.bio.uni-giessen.de/aruna/aruna-session-python:0.2.0` and `harbor.computational.bio.uni-giessen.de/aruna/aruna-session-deno:0.1.0`.
-Python notebooks accept `requirements.txt` for pip packages or `environment.yml` for one Conda
-environment shared by the Python kernel and Bash cells. Use **Dependencies** in the notebook
-to save the definition and restart the kernel to install changes.
+- **Docker**: sessions use the internal network `aruna-sessions`. Its subnet is
+  `172.30.255.0/24` unless `ARUNA_COMPUTE_DOCKER_SESSION_SUBNET` sets another one. Choose a subnet
+  that no other host network uses.
+- **Kubernetes**: set an S3 URL that pods can reach in `ARUNA_COMPUTE_S3_URL` or `S3_PUBLIC_URL`.
+  The node's service account needs `create` on `pods/exec` to talk to the notebook kernel.
+  Clusters with special network setups, such as Cilium, can add policies with
+  `ARUNA_COMPUTE_K8S_POLICY_MANIFESTS`.
+- **Apptainer**: sessions are not limited and use the host network.
 
-On Kubernetes with `ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER` set, a session sees a folder of its
-workspace bucket below its working directory: `data/` at `/work/data` unless the submission's
-`session_mount` names another bucket folder (an empty prefix is the whole bucket) and kernel
-folder. Files written there land in the bucket and objects put into the bucket show up there.
-The mount follows S3 semantics: files are written in one go, and there is no append or rename.
-Without the driver, or on Docker and Apptainer, a session reaches its bucket over S3 only.
+## Publishing to Invenio and Zenodo
 
-## Durability Configuration
+Researchers can publish datasets to Zenodo or another InvenioRDM repository. This gives a dataset
+a DOI and a public record without copying files by hand. Records can also be imported.
 
-`ARUNA_FJALL_PERSIST_MODE` controls the Fjall persist mode used by Aruna's local storage engine and document-sync metadata state.
-
-| Value | Durability contract |
-| --- | --- |
-| `buffer` (default) | Flushes data to OS buffers before local Fjall persistence returns. This keeps write latency low and protects against an application crash, but recently acknowledged writes are not guaranteed after an OS crash or power loss. |
-| `sync_all` | Flushes data and metadata with `fsync` before local Fjall persistence returns. This gives stronger local crash durability at higher write latency. |
-
-The setting does not change replication, authorization, or RO-Crate semantics. Metadata requests marked `MetadataRequestDurability::WalAlreadyDurable` have already been accepted by the metadata event-log phase, so document-sync projection flushes may be deferred. The event-log write and later projection flush still use the configured Fjall mode; `buffer` does not become fsync-durable because a request is WAL-first.
-
-Object-backed RO-Crate imports copy the archive into a hidden seekable spool. Until that spool is
-deleted at the end of the import, the importing node can temporarily use roughly twice the archive's
-stored bytes; operators should reserve capacity accordingly.
-
-### Repository publishing: Invenio and Zenodo
-
-The native REST API publishes crates to repositories and imports records through durable jobs.
-The routes are generic; Invenio (including Zenodo) is the first repository kind.
-`GET /api/v1/metadata/repository/kinds` lists every kind that can publish, with its
-`capabilities` (`drafts`, `reserve_identifier`, `versions`, `review`, `pull`, `search`,
-`import`, `release_date` and `identifier_kind`), its requirement `profiles` and its mapping rule
-`targets`. An action the kind cannot do answers 400 with code `not_supported`: publishing,
-checks and links need a kind that publishes, `parent_id` and `published_id` need `versions`,
-imports need `import`, `keep_updated` needs `pull`, and DOI or URL lookups need `search`. Record
-ids are checked by the kind. A connector keeps its kind; replacing it with another kind answers
-400. Harvest-only kinds such as `oai_pmh` are not listed.
-
-A repository's requirements have three layers, all reported as Profile validation findings
-(`code`, `severity`, `focus_node`, `path`, `rule`, `message`). Built-in SHACL requirement
-Profiles check the crate metadata: `https://w3id.org/aruna/profiles/repository/zenodo` needs the
-DataCite fields (one plain text title and publication date, creators from `author` and `creator`
-with a name or family name, and a license as a warning), and
-`https://w3id.org/aruna/profiles/repository/invenio` also needs a `publisher`, as text or as an
-entity with a `name`. Zenodo endpoints use the first, other InvenioRDM instances the second.
-Mapping rules, embedded as JSON data per kind, say which crate entities become which repository
-objects and fields. They can group entities (with file pairs such as `_1` and `_2`) and require
-relations with a minimum, maximum or exact count, in either direction; breaks report
-`mapping_violation`. Content rules limit the files of a target (count, file size, total size and
-a `fastq`, `bam` or `cram` format read from the first bytes, also inside gzip or BGZF) and report
-`content_violation`. The check and the export count the same files: an Invenio record holds at
-most 100 files, and the crate metadata and export report count as two of them. Rules that the
-node would not evaluate never load. Only the crate satisfies requirements; `metadata` overrides
-never do, and a record whose mapped fields lack a required field, for example creators cleared
-by an override, fails the job before any repository write.
-
-`POST /api/v1/metadata/{document_id}/repository/check` with `group_id`, `connector_id` and an
-optional `metadata` object checks the dataset without storing or sending anything. It answers
-`kind`, `profile` (`iri`, `revision`), `ready` (no finding is a violation), `findings` (at most
-100, violations first, with `omitted_findings` counting the rest; structural crate violations
-have rule `structural`) and `mapping`, which says what each crate entity becomes. It requires READ on the dataset and on the
-connector group's metadata path.
-
-Create an Invenio repository
-connector with `POST /api/v1/metadata/groups/{group_id}/repositories`, `kind` set to `invenio`
-and `endpoint` set to the repository API root, for example `https://zenodo.org/api/` or
-`https://sandbox.zenodo.org/api/`. Store a repository personal access token in
-`secret_config.token` for private imports. Exports require the requesting user's
-own Invenio/Zenodo access token in `repository.access_token`; the connector token is never used
-for publishing. The node's egress policy applies to all requests.
-
-Search published records with
-`GET /api/v1/metadata/groups/{group_id}/repositories/{connector_id}/records`, passing `q`,
-`page` and `size` as query parameters. Results use the native repository
-JSON representation. Pages start at 1, size is at most 25, and `all_versions=true` includes
-older published versions. Search requires READ on the connector group's metadata path and does
-not import data.
-
-Import a record with `POST /api/v1/metadata/repository/imports`:
-
-```json
-{
-  "group_id": "<connector-group-id>",
-  "connector_id": "<repository-connector-id>",
-  "record_id": "1234567",
-  "mode": "copy",
-  "all_versions": true,
-  "target": {"bucket": "research", "prefix": "zenodo/1234567"},
-  "metadata": {"group_id": "<destination-group-id>", "path": "datasets/zenodo", "public": false},
-  "idempotency_key": "import-zenodo-1234567"
-}
-```
-
-Instead of `record_id`, name the record by `doi` (a version DOI selects that version, a concept
-DOI the latest one) or by `url`, a record page or API URL on the connector's repository. Give
-exactly one of the three.
-
-Every accessible published version becomes a separate dataset within the imported crate by
-default. Set `all_versions: false` to import only the selected version. Mode `copy` copies files
-and checks their source sizes and checksums. Mode `reference` creates native Aruna object
-references, reading repository bytes on demand; the target bucket and connector must share
-a group. Mode `metadata` skips attached files and file-list requests, allowing metadata imports
-without access to restricted data. References depend on remote availability and credentials.
-Each version contains `invenio-record.json`, preserving the complete returned record JSON
-and, in copy/reference modes, file-list metadata, including
-DOIs, concept identifiers, timestamps, relations, creator identifiers and custom fields.
-Foreign identifiers remain provenance; Aruna assigns local document and object identities.
-Filenames are encoded in storage paths so repeated or unsafe source names cannot collide.
-Source names remain in the metadata. Missing files, incomplete pagination and checksum
-failures fail the transfer. Hidden edit histories and inaccessible or deleted records are
-not exposed by the repository API and cannot be reconstructed. Native metadata scalar values
-are queryable as `additionalProperty` entries whose `propertyID` is a JSON-pointer-style path,
-such as `metadata/funding/0/award/number`. Partial publication dates use their earliest day for
-crate validation; `https://w3id.org/aruna/invenio/publicationDate` retains the exact original
-date or interval, which is restored on export when the mapped date has not been edited.
-
-Export with `POST /api/v1/metadata/{document_id}/repository/exports`:
-
-```json
-{
-  "repository": {
-    "group_id": "<connector-group-id>",
-    "connector_id": "<repository-connector-id>",
-    "access_token": "<personal-access-token>",
-    "publish": false
-  },
-  "idempotency_key": "export-research-dataset"
-}
-```
-
-Exports create native Invenio records with each data file uploaded separately under its crate
-path. Files can be listed and downloaded directly through Invenio/Zenodo. The RO-Crate JSON is
-also retained as a provenance file for fields without a native equivalent. Repository metadata
-is derived from the crate's standard schema.org
-fields; optional `repository.metadata` fields override the mapping. Imported native metadata,
-including affiliations, funding, relations and resource type, is retained when its corresponding
-crate fields are unchanged. Custom fields are also restored; the destination must support
-their vocabulary. Override controlled vocabulary fields for the target repository as needed.
-Source identifiers become provenance relations;
-the transfer does not claim an existing source DOI as a newly issued repository DOI.
-Exports with omitted files fail. Web data entities, `File` entities with an `https://` identifier
-and no Aruna bytes, stay in the crate and become `references` relations. The request fails with
-400, code `requirements_unmet` and the `findings` when the crate does not meet the repository's
-requirements. A crate with more files than the record holds fails the job before a draft is
-created. Creator identifiers are sent only for ORCID, GND, ISNI and ROR.
-Every new draft reserves its DOI, which `result.repository.identifier` shows;
-`result.repository.concept_identifier` is the DOI of every version.
-`publish: false` (the default) leaves an unpublished draft with restricted file access;
-`publish: true` publishes after verifying every uploaded file. Repository validation and
-publication permissions still apply. Set `repository.public_files: true` explicitly to make
-the files public; otherwise files remain restricted. This also applies to existing drafts,
-whose metadata is replaced by the mapped crate metadata. When the connector names a
-`community`, publishing a record's first version submits it to that community for review
-instead, and `result.repository.in_review` is true.
-
-Set `repository.published_id` to an existing published record ID to create its next version
-under the same parent identifier. This requires permission on that record. A new-version draft
-inherits repository access settings and may already exist; unexpected files cause a failure.
-Supply `draft_id` alongside `published_id` when recovering that draft. Metadata updates use the
-captured draft revision and fail on conflicts. Metadata and the complete file set are checked
-before and after publication; the upstream publication action has no atomic revision guard.
-Exporting an imported history remains one crate snapshot unless versions are submitted
-separately. Original publication timestamps and hidden edit histories are not recreated.
-
-The user's personal token determines the owning Invenio/Zenodo account; bibliographic authors
-come from the crate's creators. Aruna encrypts the token for the job's retention period, binding
-it to the requesting user, node, connector and endpoint. It is never echoed in responses,
-debug output or public job results. Each export submission requires the user's token; changing the
-token changes the idempotency identity. No shared publishing account is selected implicitly.
-
-The response provides job status and report URLs; the existing job API also supports cancellation.
-Successful exports include `result.repository` with the record ID, parent ID, revision, assigned
-DOI and concept DOI when available, API URL, page URL and publication state. Both transfers
-support `idempotency_key`.
-An ambiguous draft-creation response stops
-automatic creation; inspect the repository and supply `repository.draft_id` in a new request
-to reuse the unpublished draft. Failed or cancelled transfers leave remote drafts available
-for inspection. Import requires connector-group READ and destination WRITE, and with
-`keep_updated` also connector-group WRITE, as managing a link does. Export requires crate WRITE,
-because it publishes the dataset under a repository record, and connector-group WRITE. Queued
-identifier registration checks WRITE on the dataset as the submitting user.
-
-A link keeps a dataset in sync with one Invenio record lineage. Create it with
-`POST /api/v1/metadata/{document_id}/repository/links` and a body with `group_id`, `connector_id`
-and the user's `access_token`. It requires WRITE on the dataset and on the connector group's
-metadata path. Set `parent_id` to continue an existing record, for example the
-imported source. The node that creates the link must hold the dataset; it seals the token for
-that link and becomes the link's owner. Creation fails with 400, code `requirements_unmet` and
-the `findings` when the crate does not meet the repository's requirements. The first push is queued right away. Later changes push
-10 seconds after the last change, at most 5 minutes after the first waiting one, as one
-`export_rocrate` job, and `POST .../links/{link_id}/push` queues one at once. Pushes update one
-open draft, which keeps its reserved DOI (`remote.identifier` with `remote.identifier_reserved`;
-the link's `identifier_kind` is `doi`) and is kept even when a push fails. Publish it with
-`POST .../links/{link_id}/publish`, or set `auto_publish` to publish once the draft has been
-quiet for 15 minutes. With a connector community, the first version goes to community review
-and `remote.review` shows `pending`, then `accepted` or `declined`. A declined review shows
-reason `review_declined` on the enabled link: pushes still update the draft, `auto_publish`
-waits, and an explicit publish submits the draft again. After a publish, the next
-push creates a new version. A check that fails after the repository published becomes
-`warning`; the published record and DOI are always kept. `remote.state` sums up the repository
-side: `none`, `draft`, `review` or `published`.
-
-A push fails the link instead of leaving out files or overwriting remote edits. Reasons are
-`remote_changed` when the draft was edited in the repository, a file appeared there or the
-lineage has a newer version, `token_rejected`, `source_unavailable` when a file has no
-readable copy or a referenced origin changed, `requirements_unmet` with the `findings` on the
-link, and `owner_not_holder`. A link that failed on unmet requirements retries after the next
-dataset change.
-`POST .../links/{link_id}/accept-remote` makes the repository's current state the new base and
-enables the link again. `PATCH` pauses or resumes a link and changes its options,
-`PUT .../token` replaces the token, and `DELETE` removes the link and its token. Pausing or
-deleting cancels a running push. Only the link creator may publish, replace the token or change
-`auto_publish`, `public_files` and `metadata`; group admins may pause, resume, push, accept
-remote changes and delete. Deleting the dataset removes its links and their tokens as well.
-Remote records always stay.
-
-Set `keep_updated: true` on an import to keep the new dataset updated from the record lineage.
-The import then creates a pull link (`direction: "pull"`) owned by the importing node. It asks
-the repository once a day for a new version, with the connector's token if the connector has
-one, and waits longer after busy or unreachable answers. A new version or repository edit shows
-as reason `update_available` on the enabled link. `POST .../links/{link_id}/pull` imports it as
-an `import_rocrate` job, and with `auto_update: true` (on import or through `PATCH`) this
-happens by itself. The new version becomes a new `versions/{id}/` part with its files in the
-first import's mode, the dataset root takes its metadata through a normal metadata update and
-its identifiers are registered. After a local edit of the dataset, automatic updates stop and
-the link shows `local_changed`; an explicit pull then overwrites the root metadata but keeps
-local parts and files. One dataset cannot have an enabled push link and an enabled pull link
-for the same record lineage.
-
-Imports and pushes record the version DOI, concept DOI, record ID and parent ID as secondary
-identifiers of the dataset, with origin `imported` or `published`. Exports add them to the crate
-they send without editing the dataset. `GET /api/v1/metadata/{document_id}/pids` lists them, and
-`GET /api/v1/pid/lookup?kind=doi&value=<doi>` lists every readable dataset that holds one
-identifier, published ones first. Any node of the realm answers it; 404 means no readable match.
-
-The opt-in `invenio::live::native_repository` test exercises a real local Invenio instance.
-Set `ARUNA_INVENIO_ENDPOINT` to its loopback API URL, `ARUNA_INVENIO_TOKEN_FILE` to an
-owner-readable personal-token file, and `ARUNA_INVENIO_USER_ID` to the corresponding numeric
-account ID. Run `cargo test -p aruna-operations --test rocrate_drivers
-invenio::live::native_repository -- --ignored --exact`. It creates and publishes disposable
-records, checks ownership and restricted access, creates another version, and tests search,
-copy imports, reference reads and metadata-only imports. Use a disposable repository with
-external DOI registration and email disabled.
-
-The opt-in `invenio::live::pull_update` test publishes two versions on the same instance, imports
-the first with `keep_updated` and checks that the daily check pulls the second with its DOI.
-
-The opt-in `invenio::live::zenodo_reference` test imports a public Zenodo record in copy,
-reference and metadata modes and compares every file with the bytes Zenodo serves. It needs
-network access to zenodo.org. `ARUNA_ZENODO_RECORD` selects the record, default `16623955`.
+- **Check**: see what a dataset still lacks before anything is sent.
+- **Export**: create a record with a reserved DOI, as a draft or published. It uses the
+  researcher's own token, so the record belongs to them.
+- **Import**: bring in a record by ID, DOI or URL. Copy its files, reference them, or take only the
+  metadata.
+- **Links**: keep a dataset and a record in sync. Changes go to a draft, and the researcher decides
+  when to publish. Pull links fetch new versions from the repository.
 
 ## License
 
