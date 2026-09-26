@@ -5,6 +5,7 @@
 use super::snapshot::execute;
 use super::{GitError, records};
 use crate::driver::DriverContext;
+use crate::metadata::get_document::load_document_record;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
     update_metadata_document,
@@ -12,9 +13,11 @@ use crate::metadata::update_document::{
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, PENDING, PendingMerge, ZERO_OID};
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use std::sync::{LazyLock, Mutex};
+use std::collections::BTreeSet;
+use std::sync::{Arc, LazyLock, Mutex};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -135,6 +138,52 @@ async fn apply_one(
         }
     }
     Err(GitError::Stale)
+}
+
+const DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Applies this node's pending merges at startup and then every minute, so a merge left by
+/// a restart or a failed attempt lands without waiting for Git traffic on its document.
+pub fn spawn_drain(context: Arc<DriverContext>, shutdown: &Shutdown) {
+    let token = shutdown.token();
+    shutdown.spawn(async move {
+        loop {
+            drain(&context).await;
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(DRAIN_INTERVAL) => {}
+            }
+        }
+    });
+}
+
+async fn drain(context: &DriverContext) {
+    let Some(store) = context
+        .metadata_handle
+        .as_ref()
+        .and_then(|handle| handle.git())
+    else {
+        return;
+    };
+    let rows = match records::prefixed::<PendingMerge>(context, PENDING, Vec::new()).await {
+        Ok(rows) => rows,
+        Err(error) => return warn!(%error, "Pending metadata merges unreadable"),
+    };
+    let documents: BTreeSet<Ulid> = rows
+        .iter()
+        .filter_map(|(key, _)| <[u8; 16]>::try_from(key.get(..16)?).ok())
+        .map(Ulid::from_bytes)
+        .collect();
+    for id in documents {
+        let Ok(Some(document)) = load_document_record(context, id).await else {
+            continue;
+        };
+        let _guard = super::project::lock(id).await;
+        // The same refresh as Git traffic: rebuilds a missing cache, then applies the merges.
+        if let Err(error) = Box::pin(super::snapshot::refresh(context, store, &document)).await {
+            warn!(document_id = %id, %error, "Pushed metadata waits");
+        }
+    }
 }
 
 #[cfg(test)]
