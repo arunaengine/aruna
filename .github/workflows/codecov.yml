@@ -79,7 +79,7 @@ jobs:
           --with-requirements scripts/arc-native/requirements.txt
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
           exec cargo nextest run -p aruna --test git_native --all-features --locked
-          --profile ci --run-ignored only --no-tests fail --test-threads 1'
+          --profile ci --run-ignored only --no-tests fail'
 
       # nextest never runs doctests; they stay in the measured set.
       - name: Run instrumented doctests
