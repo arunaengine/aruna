@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::git::{GitChange, GitCheckpoint, GitRecord, LfsLock, StoredObject, ZERO_OID};
+use aruna_core::git::{
+    GitChange, GitCheckpoint, GitRecord, LfsLock, StoredObject, ZERO_OID, refs_clash,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 
@@ -12,7 +14,11 @@ pub struct GitState {
     pub lfs: BTreeMap<String, StoredObject>,
     pub locks: BTreeMap<String, LfsLock>,
     pub revision: Option<Ulid>,
+    /// The graph digest of the newest applied snapshot.
+    pub digest: Option<[u8; 32]>,
     pub packs: Vec<StoredObject>,
+    /// Commits nodes made themselves; only their Aruna trailers are trusted.
+    pub made: BTreeSet<String>,
     /// The newest checkpoint the state starts from.
     pub checkpoint: Option<Ulid>,
     /// Records applied on top of that checkpoint; the next checkpoint covers exactly these.
@@ -20,6 +26,7 @@ pub struct GitState {
     /// Packs and LFS objects those records added.
     pub new_packs: Vec<StoredObject>,
     pub new_lfs: Vec<StoredObject>,
+    pub new_made: Vec<String>,
 }
 
 /// Known answers to "is the first commit an ancestor of the second".
@@ -77,7 +84,9 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
             .map(|lock| (lock.path.clone(), lock.clone()))
             .collect();
         state.revision = newest.revision;
+        state.digest = newest.digest;
         for (_, checkpoint) in chain.iter().rev() {
+            state.made.extend(checkpoint.made.iter().cloned());
             for pack in &checkpoint.packs {
                 if !state.packs.contains(pack) {
                     state.packs.push(pack.clone());
@@ -103,14 +112,10 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                 refs,
                 lfs,
                 revision,
+                digest,
+                made,
             } => {
-                if let Some(revision) = revision {
-                    // An equal or older snapshot lost a race to one already applied.
-                    if state.revision.is_some_and(|applied| applied >= *revision) {
-                        continue;
-                    }
-                    state.revision = Some(*revision);
-                }
+                // Objects always stay: other records may build on a losing record's commits.
                 if let Some(pack) = pack.as_deref()
                     && !state.packs.contains(pack)
                 {
@@ -124,6 +129,16 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                         state.new_lfs.push(object.clone());
                     }
                 }
+                for commit in made {
+                    if state.made.insert(commit.clone()) {
+                        state.new_made.push(commit.clone());
+                    }
+                }
+                let snapshot = revision.is_some();
+                if snapshot && digest.is_some() && *digest == state.digest {
+                    continue;
+                }
+                let mut applied = false;
                 for update in refs {
                     let current = state.refs.get(&update.name).cloned();
                     let matches = current.as_deref().unwrap_or(ZERO_OID) == update.old;
@@ -137,13 +152,17 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                                 false
                             })
                         });
-                    if matches || forward {
+                    // Git cannot store `a` next to `a/b`; a clashing new name loses.
+                    let clash = current.is_none()
+                        && state.refs.keys().any(|name| refs_clash(name, &update.name));
+                    if (matches || forward) && !clash {
+                        applied = true;
                         if update.new == ZERO_OID {
                             state.refs.remove(&update.name);
                         } else {
                             state.refs.insert(update.name.clone(), update.new.clone());
                         }
-                    } else if update.new != ZERO_OID {
+                    } else if update.new != ZERO_OID && !snapshot {
                         let name = update.name.trim_start_matches("refs/");
                         state.refs.insert(
                             format!("refs/conflicts/{name}/{}", record.event_id),
@@ -151,14 +170,30 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                         );
                     }
                 }
+                // An outdated snapshot is dropped; the server makes a current one.
+                if snapshot && (applied || refs.is_empty()) {
+                    state.revision = *revision;
+                    state.digest = *digest;
+                }
             }
             GitChange::Lock { id, path } => {
-                state.locks.entry(path.clone()).or_insert_with(|| LfsLock {
-                    id: *id,
-                    path: path.clone(),
-                    user_id: record.user_id,
-                    locked_at_ms: record.occurred_at_ms,
-                });
+                // The earliest claim wins, also when it arrives after a later one.
+                let earlier = state
+                    .locks
+                    .get(path)
+                    .is_none_or(|held| record.event_id < held.claim);
+                if earlier {
+                    state.locks.insert(
+                        path.clone(),
+                        LfsLock {
+                            id: *id,
+                            path: path.clone(),
+                            user_id: record.user_id,
+                            locked_at_ms: record.occurred_at_ms,
+                            claim: record.event_id,
+                        },
+                    );
+                }
             }
             GitChange::Unlock { id } => state.locks.retain(|_, lock| lock.id != *id),
             // Only the newest complete chain seeds the state; other checkpoints' records apply.
@@ -209,6 +244,8 @@ mod tests {
                 }],
                 lfs: Vec::new(),
                 revision: revision.map(Ulid::from),
+                digest: revision.map(|revision| [revision as u8; 32]),
+                made: Vec::new(),
             },
         )
     }
@@ -263,14 +300,58 @@ mod tests {
     fn duplicate_snapshots() {
         let records = [
             update(10, "refs/heads/aruna", ZERO_OID, &oid('b'), Some(5)),
+            // The same graph captured by another holder is skipped, not kept as a conflict.
             update(20, "refs/heads/aruna", ZERO_OID, &oid('c'), Some(5)),
-            update(30, "refs/heads/aruna", &oid('b'), &oid('d'), Some(4)),
-            update(40, "refs/heads/aruna", &oid('b'), &oid('e'), Some(6)),
+            update(30, "refs/heads/aruna", &oid('b'), &oid('d'), Some(6)),
+            // An outdated snapshot is dropped; its pack still stays.
+            update(40, "refs/heads/aruna", &oid('b'), &oid('e'), Some(7)),
         ];
-        let state = done(&records, &Ancestry::new());
-        assert_eq!(state.refs.get("refs/heads/aruna"), Some(&oid('e')));
+        let ancestry = Ancestry::from([((oid('d'), oid('e')), false)]);
+        let state = done(&records, &ancestry);
+        assert_eq!(state.refs.get("refs/heads/aruna"), Some(&oid('d')));
         assert_eq!(state.refs.len(), 1);
         assert_eq!(state.revision, Some(Ulid::from(6)));
+        assert_eq!(state.digest, Some([6; 32]));
+    }
+
+    #[test]
+    fn clashing_names_conflict() {
+        let records = [
+            update(10, "refs/heads/draft", ZERO_OID, &oid('b'), None),
+            update(20, "refs/heads/draft/sub", ZERO_OID, &oid('c'), None),
+        ];
+        let state = done(&records, &Ancestry::new());
+        assert_eq!(state.refs.get("refs/heads/draft"), Some(&oid('b')));
+        assert!(!state.refs.contains_key("refs/heads/draft/sub"));
+        let kept = format!("refs/conflicts/heads/draft/sub/{}", Ulid::from(20));
+        assert_eq!(state.refs.get(&kept), Some(&oid('c')));
+    }
+
+    #[test]
+    fn late_lock_wins() {
+        let lock = |id: u128, user: u128, lock: u128| {
+            record(
+                id,
+                user,
+                GitChange::Lock {
+                    id: Ulid::from(lock),
+                    path: "a.bin".into(),
+                },
+            )
+        };
+        let mut late = checkpoint(40, None, &[], &[30]);
+        if let GitChange::Checkpoint(checkpoint) = &mut late.change {
+            checkpoint.locks = vec![LfsLock {
+                id: Ulid::from(3),
+                path: "a.bin".into(),
+                user_id: UserId::new(Ulid::from(2), RealmId([1; 32])),
+                locked_at_ms: 0,
+                claim: Ulid::from(30),
+            }];
+        }
+        let state = done(&[late, lock(20, 1, 2)], &Ancestry::new());
+        assert_eq!(state.locks["a.bin"].id, Ulid::from(2));
+        assert_eq!(state.locks["a.bin"].claim, Ulid::from(20));
     }
 
     #[test]
@@ -291,6 +372,8 @@ mod tests {
             GitChange::Checkpoint(Box::new(GitCheckpoint {
                 previous: None,
                 packs: vec![pack.clone()],
+                made: Vec::new(),
+                digest: None,
                 refs: vec![("refs/heads/main".into(), oid('c'))],
                 lfs: Vec::new(),
                 locks: Vec::new(),
@@ -325,6 +408,8 @@ mod tests {
             GitChange::Checkpoint(Box::new(GitCheckpoint {
                 previous: previous.map(Ulid::from),
                 packs: Vec::new(),
+                made: Vec::new(),
+                digest: None,
                 refs: refs
                     .iter()
                     .map(|(name, seed)| (name.to_string(), oid(*seed)))

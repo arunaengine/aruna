@@ -7,24 +7,22 @@ use super::changes::{EntityChange, entity_changes};
 use super::project::{Projection, lock};
 use super::push::record;
 use super::snapshot::{execute, refresh};
+use super::state::GitState;
 use crate::driver::DriverContext;
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
-    CommitInfo, FileChange, GitEffect, GitEvent, RefUpdate, ZERO_OID, valid_ref,
+    CommitInfo, FileChange, GitEffect, GitEvent, RefUpdate, ZERO_OID, refs_clash, valid_ref,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use tokio::sync::OwnedMutexGuard;
 use ulid::Ulid;
 
 /// Branches that only the server moves or that hold the live metadata.
 const PROTECTED: [&str; 2] = ["main", "aruna"];
 const MAX_VERSIONS: usize = 200;
-/// Only commits this node made and signed carry trustworthy Aruna trailers.
-const SERVICE_EMAIL: &str = "git@aruna.local";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
@@ -218,12 +216,9 @@ pub(super) async fn peeled_tags(
     Ok(tags)
 }
 
-pub(super) fn version(
-    commit: CommitInfo,
-    refs: &BTreeMap<String, String>,
-    tags: &[Named],
-) -> Version {
-    let branches = refs
+pub(super) fn version(commit: CommitInfo, state: &GitState, tags: &[Named]) -> Version {
+    let branches = state
+        .refs
         .iter()
         .filter(|(_, target)| **target == commit.commit)
         .filter_map(|(name, _)| name.strip_prefix("refs/heads/"))
@@ -234,8 +229,8 @@ pub(super) fn version(
         .filter(|tag| tag.version == commit.commit)
         .map(|tag| tag.name.clone())
         .collect();
-    // A client can write any trailer; only this node's signed commits are believed.
-    let trusted = commit.signed && commit.committer_email == SERVICE_EMAIL;
+    // A client can write any trailer; only commits a node recorded as its own are believed.
+    let trusted = state.made.contains(&commit.commit);
     let trailer = |key| trusted.then(|| trailer(&commit.message, key)).flatten();
     Version {
         user_id: trailer("Aruna-User:"),
@@ -287,7 +282,7 @@ pub async fn list(
     let tags = peeled_tags(store, auth, id, &projection).await?;
     let versions = commits
         .into_iter()
-        .map(|commit| version(commit, &projection.state.refs, &tags))
+        .map(|commit| version(commit, &projection.state, &tags))
         .collect();
     Ok((versions, next))
 }
@@ -315,7 +310,7 @@ pub async fn show(
     )
     .await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
-    Ok((version(info, &projection.state.refs, &tags), files))
+    Ok((version(info, &projection.state, &tags), files))
 }
 
 pub async fn compare(
@@ -355,17 +350,17 @@ pub async fn branches(
     store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-) -> Result<Vec<Version>, GitError> {
+) -> Result<Vec<(String, Version)>, GitError> {
     let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
     let mut heads = Vec::new();
     for (name, target) in &projection.state.refs {
-        if name.starts_with("refs/heads/") {
+        if let Some(short) = name.strip_prefix("refs/heads/") {
             let info = log(store, auth, id, (target, None), 0, 1)
                 .await?
                 .pop()
                 .ok_or(GitError::Unavailable)?;
-            heads.push(version(info, &projection.state.refs, &tags));
+            heads.push((short.to_string(), version(info, &projection.state, &tags)));
         }
     }
     Ok(heads)
@@ -414,6 +409,16 @@ pub async fn change_ref(
     if peeled.is_none() || peeled.as_deref() != expected {
         expect(current, expected)?;
     }
+    // Git cannot store `a` next to `a/b`.
+    if target.is_some()
+        && let Some(other) = projection
+            .state
+            .refs
+            .keys()
+            .find(|other| refs_clash(other, &name))
+    {
+        return Err(GitError::Refused(format!("{name} clashes with {other}")));
+    }
     let new = match target {
         Some(_) if current.is_some() => return Err(GitError::Exists),
         Some(target) => resolve(store, auth, id, target).await?,
@@ -430,15 +435,8 @@ pub async fn change_ref(
         old,
         new: new.clone(),
     };
-    record(
-        context,
-        auth,
-        &document,
-        vec![update],
-        Bytes::new(),
-        Vec::new(),
-    )
-    .await?;
+    let nothing = (Bytes::new(), Vec::new());
+    record(context, auth, &document, vec![update], nothing, Vec::new()).await?;
     Ok(Named { name, version: new })
 }
 
@@ -476,7 +474,7 @@ pub async fn conflicts(
                 .await?
                 .pop()
                 .ok_or(GitError::Unavailable)?;
-            kept.push((conflict, version(info, &projection.state.refs, &tags)));
+            kept.push((conflict, version(info, &projection.state, &tags)));
         }
     }
     Ok(kept)
@@ -503,6 +501,24 @@ pub async fn conflict_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trailers_need_record() {
+        let commit = CommitInfo {
+            commit: "a".repeat(40),
+            parents: Vec::new(),
+            author_name: "Aruna".into(),
+            author_email: "git@aruna.local".into(),
+            committer_email: "git@aruna.local".into(),
+            authored_at_s: 0,
+            message: "Edit\n\nAruna-User: someone".into(),
+            signed: true,
+        };
+        let mut state = GitState::default();
+        assert_eq!(version(commit.clone(), &state, &[]).user_id, None);
+        state.made.insert("a".repeat(40));
+        assert_eq!(version(commit, &state, &[]).user_id.as_deref(), Some("someone"));
+    }
 
     #[test]
     fn conflict_names() {

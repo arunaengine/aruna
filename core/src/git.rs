@@ -289,12 +289,16 @@ pub struct GitRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitChange {
     /// A pack of new objects and the ref updates it makes. A server snapshot names the
-    /// metadata event it represents in `revision`; older or equal revisions are ignored.
+    /// metadata event it represents in `revision` and the graph it captured in `digest`; a
+    /// snapshot whose updates no longer match is dropped, since the server makes a new one.
     Objects {
         pack: Option<Box<StoredObject>>,
         refs: Vec<RefUpdate>,
         lfs: Vec<StoredObject>,
         revision: Option<Ulid>,
+        digest: Option<[u8; 32]>,
+        /// Commits the recording node made itself, whose Aruna trailers can be trusted.
+        made: Vec<String>,
     },
     /// Claims an LFS lock; the earliest claim on a path wins.
     Lock {
@@ -315,6 +319,10 @@ pub enum GitChange {
 pub struct GitCheckpoint {
     pub previous: Option<Ulid>,
     pub packs: Vec<StoredObject>,
+    /// Commits nodes made themselves since `previous`.
+    pub made: Vec<String>,
+    /// The graph digest of the newest applied snapshot.
+    pub digest: Option<[u8; 32]>,
     pub refs: Vec<(String, String)>,
     pub lfs: Vec<StoredObject>,
     pub locks: Vec<LfsLock>,
@@ -328,6 +336,8 @@ pub struct LfsLock {
     pub path: String,
     pub user_id: UserId,
     pub locked_at_ms: u64,
+    /// The record that claimed the lock; the earliest claim on a path wins.
+    pub claim: Ulid,
 }
 
 /// An exact Aruna object version, readable from its node through a routed get.
@@ -422,6 +432,8 @@ impl GitRecord {
                     refs,
                     lfs,
                     revision,
+                    made,
+                    ..
                 } => {
                     (!refs.is_empty() || revision.is_some())
                         && refs.iter().all(|update| {
@@ -435,6 +447,7 @@ impl GitRecord {
                         })
                         && pack.as_deref().is_none_or(StoredObject::valid)
                         && lfs.iter().all(StoredObject::valid)
+                        && made.iter().all(|commit| hex(commit, 40))
                 }
                 GitChange::Lock { path, .. } => valid_path(path),
                 GitChange::Unlock { .. } => true,
@@ -518,6 +531,8 @@ mod tests {
             }],
             lfs: Vec::new(),
             revision,
+            digest: None,
+            made: Vec::new(),
         })
     }
 

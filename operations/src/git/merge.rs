@@ -99,14 +99,15 @@ pub async fn edit(
             old: head,
             new: new.clone(),
         };
-        record(context, auth, &document, vec![update], bytes, lfs).await?;
+        let made = vec![new.clone()];
+        record(context, auth, &document, vec![update], (bytes, lfs), made).await?;
     }
     let info = log(store, auth, id, (&new, None), 0, 1)
         .await?
         .pop()
         .ok_or(GitError::Unavailable)?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
-    Ok(version(info, &projection.state.refs, &tags))
+    Ok(version(info, &projection.state, &tags))
 }
 
 /// The version a merge produced and whether the target simply moved forward.
@@ -213,6 +214,11 @@ async fn merge_into(
         MergeOutcome::Failed(error) => return Err(GitError::Refused(error)),
     };
     let mut bytes = Bytes::new();
+    let made = if fast_forward || new == target {
+        Vec::new()
+    } else {
+        vec![new.clone()]
+    };
     if new != target {
         let paths: Vec<String> = diff(store, auth, id, Some(&target), &new)
             .await?
@@ -234,7 +240,7 @@ async fn merge_into(
         );
     }
     if !updates.is_empty() {
-        record(context, auth, document, updates, bytes, Vec::new()).await?;
+        record(context, auth, document, updates, (bytes, Vec::new()), made).await?;
     }
     Ok(Merged {
         version: new,

@@ -79,16 +79,11 @@ pub async fn branches(
         Ok(heads) => Json(BranchList {
             branches: heads
                 .into_iter()
-                .flat_map(|head| {
-                    let version = head.commit.commit.clone();
-                    let names = head.branches.clone();
-                    let head = version_view(head);
-                    names.into_iter().map(move |name| BranchView {
-                        protected: versions::protected(&name),
-                        name,
-                        version: version.clone(),
-                        head: head.clone(),
-                    })
+                .map(|(name, head)| BranchView {
+                    protected: versions::protected(&name),
+                    name,
+                    version: head.commit.commit.clone(),
+                    head: version_view(head),
                 })
                 .collect(),
         })

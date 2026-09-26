@@ -75,7 +75,12 @@ pub async fn accept(
     {
         return Err(GitError::Invalid);
     }
-    let (state, _) = reduce(&records::scan(context, id).await?, &Ancestry::new());
+    let (mut state, _) = reduce(&records::scan(context, id).await?, &Ancestry::new());
+    // The refs this node served the pushing client; a replay without ancestry answers can
+    // disagree with them about fast-forwarded branches.
+    if let Some(served) = super::project::served(id) {
+        state.refs = served;
+    }
     for update in &request.refs {
         if update.name == "refs/heads/main" && update.new == ZERO_OID {
             return Err(GitError::Refused(
@@ -105,7 +110,15 @@ pub async fn accept(
         };
         lfs.push(location.filter(|_| valid).ok_or(GitError::Invalid)?);
     }
-    record(context, auth, &document, request.refs, pack, lfs).await
+    record(
+        context,
+        auth,
+        &document,
+        request.refs,
+        (pack, lfs),
+        Vec::new(),
+    )
+    .await
 }
 
 /// Refuses changes to files another user locked.
@@ -125,14 +138,15 @@ pub(super) fn unlocked(
     }
 }
 
-/// Stores a non-empty pack and publishes the ref updates as one replicated record.
+/// Stores a non-empty pack and publishes the ref updates as one replicated record. `made`
+/// lists commits this node created itself.
 pub(super) async fn record(
     context: &DriverContext,
     auth: &AuthContext,
     document: &MetadataRegistryRecord,
     refs: Vec<RefUpdate>,
-    pack: Bytes,
-    lfs: Vec<StoredObject>,
+    (pack, lfs): (Bytes, Vec<StoredObject>),
+    made: Vec<String>,
 ) -> Result<GitRecord, GitError> {
     let pack = if objects_in(&pack) == 0 {
         None
@@ -144,6 +158,8 @@ pub(super) async fn record(
         refs,
         lfs,
         revision: None,
+        digest: None,
+        made,
     };
     publish::publish(context, document, auth.user_id, change).await
 }

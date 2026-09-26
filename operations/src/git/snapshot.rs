@@ -243,6 +243,7 @@ async fn generate(
     document: &MetadataRegistryRecord,
     projection: &Projection,
     source: (Ulid, String),
+    digest: [u8; 32],
 ) -> Result<(), GitError> {
     let (event_id, jsonld) = source;
     let event: Option<MetadataEventRecord> = records::load(
@@ -302,14 +303,19 @@ async fn generate(
         old: refs.get(name).cloned().unwrap_or_else(|| ZERO_OID.into()),
         new,
     };
+    let mut made = vec![aruna.clone()];
+    made.extend(main.iter().cloned());
     let mut updates = vec![update("refs/heads/aruna", aruna.clone())];
     updates.extend(main.map(|main| update("refs/heads/main", main)));
     updates.retain(|update| update.old != update.new);
+    made.retain(|commit| updates.iter().any(|update| update.new == *commit));
     let change = GitChange::Objects {
         pack: pack.map(Box::new),
         refs: updates,
         lfs,
         revision: Some(event_id),
+        digest: Some(digest),
+        made,
     };
     publish::publish(context, document, user, change).await?;
     let status = GitStatus {
@@ -334,6 +340,8 @@ async fn checkpoint(
     let change = GitChange::Checkpoint(Box::new(GitCheckpoint {
         previous: state.checkpoint,
         packs: state.new_packs.clone(),
+        made: state.new_made.clone(),
+        digest: state.digest,
         refs: state.refs.clone().into_iter().collect(),
         lfs: state.new_lfs.clone(),
         locks: state.locks.values().cloned().collect(),
@@ -366,14 +374,21 @@ async fn update(
     let mut projection = project(context, store, document).await?;
     let leading = first(context, &projection.holders);
     let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
+    // The graph's content decides, so a late older edit that changes it is captured too.
     if let Some(source) = current(context, document, revision, materializing).await?
-        && projection
-            .state
-            .revision
-            .is_none_or(|applied| applied < source.0)
+        && let Ok(canonical) = craqle::canonicalize_jsonld(&source.1)
+        && projection.state.digest != Some(canonical.digest)
         && (leading || overdue)
     {
-        generate(context, store, document, &projection, source).await?;
+        generate(
+            context,
+            store,
+            document,
+            &projection,
+            source,
+            canonical.digest,
+        )
+        .await?;
         projection = project(context, store, document).await?;
     }
     let uncovered = publish::uncovered(&projection.records).len();

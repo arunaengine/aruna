@@ -11,6 +11,7 @@ use aruna_core::UserId;
 use aruna_core::git::{DocumentLocks, GitChange, GitEffect, GitEvent, GitRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use tokio::sync::OwnedMutexGuard;
 use ulid::Ulid;
@@ -20,6 +21,16 @@ static LOCKS: LazyLock<DocumentLocks> = LazyLock::new(DocumentLocks::default);
 /// Serializes projection, snapshots and pushes of one document on this node.
 pub async fn lock(document_id: Ulid) -> OwnedMutexGuard<()> {
     LOCKS.lock(document_id).await
+}
+
+/// The refs each document's cache last served, which a push must build on.
+static SERVED: LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Ulid, BTreeMap<String, String>>>,
+> = LazyLock::new(Default::default);
+
+/// The refs this node last served for the document, if it projected it.
+pub fn served(document_id: Ulid) -> Option<BTreeMap<String, String>> {
+    SERVED.lock().ok()?.get(&document_id).cloned()
 }
 
 pub struct Projection {
@@ -98,6 +109,9 @@ pub async fn project(
                 target: state.refs.clone(),
             };
             execute(store, effect, actor).await?;
+            if let Ok(mut served) = SERVED.lock() {
+                served.insert(id, state.refs.clone());
+            }
             return Ok(Projection {
                 state,
                 records,

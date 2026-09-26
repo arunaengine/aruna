@@ -345,6 +345,15 @@ def exercise(root):
     status, heads = api(metadata_url + "/branches")
     assert any(item["name"] == "rest/draft" and item["head"]["version"] == edited["version"]
                for item in heads["branches"]), heads
+    names = [item["name"] for item in heads["branches"]]
+    assert len(names) == len(set(names)), names
+    status, clash = api(metadata_url + "/branches", "POST", {"name": "rest/draft/sub", "from": "main"})
+    assert status == 400 and clash["code"] == "refused", clash
+    command(source, env, "fetch", "origin")
+    rejected = command(source, env, "push", "--force", "origin", "HEAD~1:refs/heads/main", success=False)
+    assert remote_main(source, env) == head
+    status, after = api(metadata_url + "/branches")
+    assert [item["version"] for item in after["branches"] if item["name"] == "main"] == [head], after
     claim = json.dumps({"refs": [{"name": "refs/heads/main", "old": head, "new": "a" * 40}],
                         "lfs": [], "paths": []}).encode()
     forged = urllib.request.Request(metadata_url + "/git/push", method="POST",
