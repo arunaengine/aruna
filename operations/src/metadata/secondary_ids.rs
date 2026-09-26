@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_row_and_index() {
+    fn writes_with_index() {
         let document_id = Ulid::from_bytes([3; 16]);
         let mut op = operation(document_id);
         started(&mut op);
@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_retries_then_fails() {
+    fn conflict_exhausts_retries() {
         let document_id = Ulid::from_bytes([3; 16]);
         let mut op = operation(document_id);
         for attempt in 1..=COMMIT_ATTEMPTS {

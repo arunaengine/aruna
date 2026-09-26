@@ -185,7 +185,7 @@ fn auto_publish_waits() {
     assert_eq!(link.publish_due_ms(), None);
     link.begin(job(1), SystemTime::now()).unwrap();
     link.finish(job(1), &pushed("d", false, None), SystemTime::UNIX_EPOCH);
-    assert_eq!(link.publish_due_ms(), Some(AUTO_PUBLISH_QUIET_MS));
+    assert_eq!(link.publish_due_ms(), Some(PUBLISH_QUIET_MS));
     // A declined review waits for an explicit publish, which submits the draft again.
     link.remote.review = LinkReview::Declined;
     assert_eq!(link.publish_due_ms(), None);
@@ -228,12 +228,12 @@ fn debounces_queued_changes() {
         (next.due_at_ms, next.first_at_ms),
         (5_000 + LINK_DEBOUNCE_MS, 1_000)
     );
-    let late = LinkQueueEntry::debounce(document, Some(&next), 1_000 + LINK_DEBOUNCE_CAP_MS);
-    assert_eq!(late.due_at_ms, 1_000 + LINK_DEBOUNCE_CAP_MS);
+    let late = LinkQueueEntry::debounce(document, Some(&next), 1_000 + DEBOUNCE_CAP_MS);
+    assert_eq!(late.due_at_ms, 1_000 + DEBOUNCE_CAP_MS);
     // An old auto_publish wait is no change, so a new change still gets its quiet time.
     let publish = LinkQueueEntry {
         document_id: document,
-        due_at_ms: 1_000 + AUTO_PUBLISH_QUIET_MS,
+        due_at_ms: 1_000 + PUBLISH_QUIET_MS,
         first_at_ms: 1_000,
     };
     let change = LinkQueueEntry::debounce(document, Some(&publish), 600_000);
@@ -456,7 +456,7 @@ fn pull_checks_versions() {
 }
 
 #[test]
-fn pull_checks_back_off() {
+fn pull_check_backoff() {
     let mut link = pulling(true);
     let now = SystemTime::UNIX_EPOCH;
     let waits = (0..12)

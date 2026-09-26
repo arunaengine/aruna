@@ -20,9 +20,9 @@ use crate::{NodeId, UserId};
 /// Quiet time after a change before a link pushes, so a burst of edits becomes one push.
 pub const LINK_DEBOUNCE_MS: u64 = 10_000;
 /// Longest wait after the first queued change, so constant editing still pushes.
-pub const LINK_DEBOUNCE_CAP_MS: u64 = 300_000;
+pub const DEBOUNCE_CAP_MS: u64 = 300_000;
 /// Quiet time after the last push before auto_publish publishes the draft.
-pub const AUTO_PUBLISH_QUIET_MS: u64 = 900_000;
+pub const PUBLISH_QUIET_MS: u64 = 900_000;
 /// How often a link asks the repository about a pending community review.
 pub const REVIEW_POLL_MS: u64 = 3_600_000;
 /// A failed link keeps at most this many requirement findings.
@@ -251,15 +251,13 @@ impl LinkQueueEntry {
     /// A publish or review wait is due past the cap; a change after it starts a new debounce.
     pub fn debounce(document_id: Ulid, previous: Option<&Self>, now_ms: u64) -> Self {
         let first_at_ms = previous
-            .filter(|entry| {
-                entry.due_at_ms <= entry.first_at_ms.saturating_add(LINK_DEBOUNCE_CAP_MS)
-            })
+            .filter(|entry| entry.due_at_ms <= entry.first_at_ms.saturating_add(DEBOUNCE_CAP_MS))
             .map_or(now_ms, |entry| entry.first_at_ms.min(now_ms));
         Self {
             document_id,
             due_at_ms: now_ms
                 .saturating_add(LINK_DEBOUNCE_MS)
-                .min(first_at_ms.saturating_add(LINK_DEBOUNCE_CAP_MS)),
+                .min(first_at_ms.saturating_add(DEBOUNCE_CAP_MS)),
             first_at_ms,
         }
     }
@@ -509,7 +507,7 @@ impl RepositoryLink {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_millis() as u64);
         self.publish_waits()
-            .then(|| pushed_ms.saturating_add(AUTO_PUBLISH_QUIET_MS))
+            .then(|| pushed_ms.saturating_add(PUBLISH_QUIET_MS))
     }
 
     /// Whether the displayed revision differs from the last pushed one.

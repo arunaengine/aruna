@@ -548,7 +548,7 @@ fn aborting_rejects_events() {
 }
 
 #[test]
-fn finish_schedules_follow_ups() {
+fn finish_requeues_link() {
     let mut record = RepositoryRecord {
         id: "draft-1".into(),
         url: "https://zenodo.org/api/records/draft-1/draft".into(),
@@ -584,7 +584,7 @@ fn finish_schedules_follow_ups() {
     let entry = queued_entry(&effects).expect("auto_publish waits for a quiet draft");
     assert_eq!(
         entry.due_at_ms,
-        NOW_MS + aruna_core::repository::AUTO_PUBLISH_QUIET_MS
+        NOW_MS + aruna_core::repository::PUBLISH_QUIET_MS
     );
 
     // A change queued during the push keeps its earlier check.
@@ -599,7 +599,7 @@ fn finish_schedules_follow_ups() {
 }
 
 #[test]
-fn draft_needs_running_push() {
+fn draft_needs_push() {
     let record = RepositoryRecord {
         id: "draft-1".into(),
         url: "https://zenodo.org/api/records/draft-1/draft".into(),
@@ -657,7 +657,7 @@ fn pulling() -> RepositoryLink {
 }
 
 #[test]
-fn pull_links_never_push() {
+fn pull_never_pushes() {
     let mut link = pulling();
     link.pull_mut().unwrap().next_check_ms = 5_000;
     let mut op = operation(LinkChange::Create {
@@ -701,7 +701,7 @@ fn pull_links_never_push() {
 }
 
 #[test]
-fn pull_check_replaces_row() {
+fn check_replaces_row() {
     // A finished check moves the queued check to its next due time, even when it is later.
     let mut op = operation(LinkChange::Checked(PullCheck::Unavailable));
     let queued = LinkQueueEntry {

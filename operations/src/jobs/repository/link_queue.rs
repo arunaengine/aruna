@@ -627,7 +627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_keeps_newer_change() {
+    async fn retry_keeps_newer() {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let (link_id, document_id) = (Ulid::from_parts(1, 1), Ulid::from_parts(1, 2));

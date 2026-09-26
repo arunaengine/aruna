@@ -626,7 +626,7 @@ async fn queued_push_recovers() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn full_job_slots_wait() -> Result<(), Box<dyn std::error::Error>> {
+async fn full_slots_wait() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;
     let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;

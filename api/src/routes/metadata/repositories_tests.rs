@@ -87,7 +87,7 @@ async fn create(setup: &Setup) -> RepositoryResponse {
 }
 
 #[tokio::test]
-async fn crud_never_serializes_secret() {
+async fn crud_hides_secret() {
     let setup = setup().await;
     let created = create(&setup).await;
     assert!(created.has_secret_config);

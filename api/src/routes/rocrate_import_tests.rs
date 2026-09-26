@@ -141,7 +141,7 @@ async fn invenio_denies_connector() {
 }
 
 #[tokio::test]
-async fn invenio_names_one_record() {
+async fn one_record_required() {
     use crate::routes::repository::{RepositoryImportRequest, import_record};
     let (_root, state, user, group) = submit_state().await;
     let request = |record_id: Option<&str>, doi: Option<&str>| RepositoryImportRequest {
@@ -185,7 +185,7 @@ async fn invenio_names_one_record() {
 }
 
 #[tokio::test]
-async fn keep_updated_needs_write() {
+async fn update_needs_write() {
     use crate::routes::repository::{RepositoryImportRequest, import_record};
     let (_root, state, user, group) = submit_state().await;
     seed_bucket(&state, "target", group, user).await;

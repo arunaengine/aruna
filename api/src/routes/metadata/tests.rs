@@ -4385,7 +4385,7 @@ mod authorization {
 }
 
 #[tokio::test]
-async fn pid_lookup_hides_private() {
+async fn lookup_hides_private() {
     use crate::routes::pid::{
         LookupQuery, SecondaryKindView, list_persistent_ids, lookup_identifier,
     };
