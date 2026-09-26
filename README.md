@@ -45,7 +45,7 @@ contains, how it was created and how it can be reused.
 
 - **Web portal**: browse files, edit datasets, manage access and follow compute runs in the browser.
 - **Works with your existing tools**: every node offers an [S3](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html)-compatible interface, so common tools, scripts and workflow systems work without changes.
-- **Rich dataset descriptions**: datasets are described with [RO-Crate](https://www.researchobject.org/ro-crate/), a widely used standard that covers files, people, instruments, software and workflows.
+- **Rich dataset descriptions**: datasets are described with [RO-Crate](https://www.researchobject.org/ro-crate/), a widely used standard that covers files, people, instruments, software and workflows. Crates reference other crates to connect datasets with their sources and the analyses that produced them.
 - **Quality checks**: profiles specify which details a dataset description should include, and Aruna highlights anything missing.
 - **Search across nodes**: find datasets on all connected nodes, limited to what you are allowed to see.
 - **Groups and permissions**: control who can access your data, with permissions for individuals, groups and roles.
@@ -76,7 +76,9 @@ Aruna helps institutions share data while retaining control over its storage and
   central server is needed, and a node keeps working when others are offline. Changes are shared
   again once the nodes can reach each other.
 - **Data and description together**: files and their descriptions move together, so a dataset stays
-  understandable wherever it is used.
+  understandable wherever it is used. Crates reference other crates, forming a provenance graph
+  that connects source data, analyses and results. These links help researchers trace how a result
+  was produced and understand what they need to reproduce it.
 
 The goal is to make research data FAIR: findable, accessible, interoperable and reusable, while each
 institution stays responsible for its own data.
