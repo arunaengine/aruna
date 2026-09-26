@@ -188,12 +188,27 @@ pub(super) fn now_ms() -> u64 {
         })
 }
 
+/// The value of `key` in the message's final trailer block, the lines after its last blank line.
 fn trailer(message: &str, key: &str) -> Option<String> {
-    message
+    let block = message
+        .trim_end()
+        .rsplit_once("\n\n")
+        .map(|(_, block)| block)?;
+    block
         .lines()
-        .rev()
         .find_map(|line| line.strip_prefix(key))
         .map(|value| value.trim().to_string())
+}
+
+/// A caller's commit message without lines that look like Aruna trailers.
+pub(super) fn plain(message: &str) -> String {
+    message
+        .lines()
+        .filter(|line| !line.trim_start().to_ascii_lowercase().starts_with("aruna-"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// Commits named by each tag, peeled so annotated tags compare with commits.
@@ -517,7 +532,19 @@ mod tests {
         let mut state = GitState::default();
         assert_eq!(version(commit.clone(), &state, &[]).user_id, None);
         state.made.insert("a".repeat(40));
-        assert_eq!(version(commit, &state, &[]).user_id.as_deref(), Some("someone"));
+        assert_eq!(
+            version(commit.clone(), &state, &[]).user_id.as_deref(),
+            Some("someone")
+        );
+        let injected = format!(
+            "{}\n\nAruna-User: someone",
+            plain("Edit\nAruna-Revision: 01M")
+        );
+        let commit = CommitInfo {
+            message: injected,
+            ..commit
+        };
+        assert_eq!(version(commit, &state, &[]).metadata_event_id, None);
     }
 
     #[test]

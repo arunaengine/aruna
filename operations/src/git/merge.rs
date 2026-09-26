@@ -8,7 +8,7 @@ use super::push::{record, unlocked};
 use super::snapshot::{current, execute, linked};
 use super::versions::{
     Version, WriteOptions, branch_ref, diff, expect, log, now_ms, open, parse_conflict,
-    peeled_tags, protected, resolve, rocrate, version,
+    peeled_tags, plain, protected, resolve, rocrate, version,
 };
 use super::{GitError, MergeConflict};
 use crate::driver::DriverContext;
@@ -79,7 +79,7 @@ pub async fn edit(
             jsonld,
             objects,
         },
-        message: format!("{}\n\nAruna-User: {}\n", summary.trim(), auth.user_id),
+        message: format!("{}\n\nAruna-User: {}\n", plain(&summary), auth.user_id),
     };
     let new = match execute(store, effect, auth.user_id).await? {
         GitEvent::Edited(Ok(new)) => new,
@@ -196,7 +196,7 @@ async fn merge_into(
         document_id: id,
         target: target.clone(),
         source: source.to_string(),
-        message: format!("{}\n\nAruna-User: {}\n", summary.trim(), auth.user_id),
+        message: format!("{}\n\nAruna-User: {}\n", plain(&summary), auth.user_id),
     };
     let GitEvent::Merged(outcome) = execute(store, effect, auth.user_id).await? else {
         return Err(GitError::Unavailable);
