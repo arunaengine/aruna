@@ -369,8 +369,44 @@ pub struct RoCrateExportParams {
 #[serde(deny_unknown_fields)]
 #[schema(as = SubmitRoCrateExportRequest)]
 pub struct SubmitExportRequest {
+    /// Set only by the repository export route; this route refuses it as an unknown field.
+    #[serde(skip)]
+    pub destination: Option<RepositoryExportRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryExportRequest {
+    pub group_id: String,
+    pub connector_id: String,
+    #[serde(default)]
+    pub draft_id: Option<String>,
+    #[serde(default)]
+    pub published_id: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub publish: bool,
+    #[serde(default)]
+    pub public_files: bool,
+    #[serde(default, skip_serializing_if = "omit_token")]
+    #[schema(write_only = true, required = true)]
+    pub access_token: Option<String>,
+}
+
+fn omit_token(_: &Option<String>) -> bool {
+    true
+}
+
+impl std::fmt::Debug for RepositoryExportRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepositoryExportRequest")
+            .field("group_id", &self.group_id)
+            .field("connector_id", &self.connector_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

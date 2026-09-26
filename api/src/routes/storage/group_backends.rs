@@ -52,7 +52,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(backend_reclaim_status))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[schema(as = CreateGroupBackendRequest)]
 pub struct CreateBackendRequest {
     pub name: String,
@@ -66,6 +66,22 @@ pub struct CreateBackendRequest {
     /// Omitted means `retain`: tenant storage is never reclaimed by default.
     #[serde(default)]
     pub cleanup: Option<CleanupPolicy>,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for CreateBackendRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateBackendRequest")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self.secret_config.keys().collect::<Vec<_>>(),
+            )
+            .field("cleanup", &self.cleanup)
+            .finish()
+    }
 }
 
 /// Wire form of the cleanup strategy. Durations cross the API as seconds so no

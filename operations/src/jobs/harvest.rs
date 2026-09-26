@@ -13,7 +13,8 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
 use aruna_core::structs::execution::harvest::{
     HarvestCursor, HarvestGranularity, HarvestJobSpec, HarvestProvenance, HarvestRecordState,
-    HarvestSource, IncomingRecord, ProvenanceDecision, RepositoryConnector, provenance_decision,
+    HarvestSource, IncomingRecord, ProvenanceDecision, RepositoryConnector,
+    RepositoryConnectorKind, provenance_decision,
 };
 use aruna_core::structs::execution::job::{JobError, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -100,6 +101,11 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
     let connector = read_connector(ctx, source.group_id, source.connector_id)
         .await?
         .ok_or_else(|| permanent("repository connector not found"))?;
+    if connector.kind != RepositoryConnectorKind::OaiPmh {
+        return Err(permanent(
+            "harvest requires an OAI-PMH repository connector",
+        ));
+    }
 
     let net = ctx
         .driver
@@ -524,6 +530,7 @@ async fn update_document(
         UpdateDocumentMutation::ReplaceRoCrate {
             jsonld: dc_to_jsonld(record),
         },
+        None,
         Some(internal_token(source.created_by, realm_id)),
     )
     .await?;

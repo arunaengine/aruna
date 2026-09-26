@@ -422,6 +422,7 @@ fn export_job(job_id: JobId, owner: UserId, expires_at_ms: u64) -> JobRecord {
     let mut record = JobRecord::new(
         job_id,
         JobPayload::ExportRoCrate(ExportRoCrateSpec {
+            destination: None,
             auth_context: auth_for(owner).unwrap(),
             document_id,
             limits: RoCrateLimits::default(),
@@ -436,6 +437,7 @@ fn export_job(job_id: JobId, owner: UserId, expires_at_ms: u64) -> JobRecord {
     record.finished_at_ms = Some(2_000);
     record.report_digest = Some(digest);
     record.result = Some(JobResultPayload::ExportRoCrate(ExportRoCrateResult {
+        repository: None,
         artifact: Some(artifact),
         included: 1,
         omitted: ExportOmissionCounts::default(),

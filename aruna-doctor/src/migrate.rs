@@ -1,27 +1,39 @@
-//! Re-encodes legacy job and realm rows that are missing current fields.
+//! Re-encodes legacy job, realm and PID mapping rows and seals plain secret rows with the node key.
 //! Rows already current stay unchanged, the projection cache is cleared and repeats are safe.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
+use aruna::identity::PersistedNodeState;
 use aruna_core::NodeId;
+use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
 use aruna_core::keyspaces::{
-    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    BACKEND_SECRET_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
+    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, SECONDARY_ID_KEYSPACE, SOURCE_SECRET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
+use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
-    JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
+    JobRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
+use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
+use aruna_core::structs::storage::group_backend::GroupStorageSecret;
+use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
+use aruna_storage::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use ulid::Ulid;
+
+mod jobs;
+mod mappings;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {
@@ -37,6 +49,24 @@ pub struct MigrateOutput {
     pub projections_cleared: usize,
     pub realm_configs_scanned: usize,
     pub realm_configs_rewritten: usize,
+    pub secrets_scanned: usize,
+    pub secrets_sealed: usize,
+    /// Secret rows left unchanged because they could not be read, as `keyspace/key: reason`.
+    pub secrets_skipped: Vec<String>,
+    pub mappings_scanned: usize,
+    pub mappings_rewritten: usize,
+    /// Queued document publishes; those carrying a legacy mapping are rewritten.
+    pub outbox_scanned: usize,
+    pub outbox_rewritten: usize,
+    /// Identifier index rows written or removed so the index matches the mappings.
+    pub identifier_index_written: usize,
+    pub identifier_index_removed: usize,
+    /// Local job records; export jobs gain empty repository fields.
+    pub jobs_scanned: usize,
+    pub jobs_rewritten: usize,
+    /// Checkpoints of RO-Crate import and export jobs.
+    pub checkpoints_scanned: usize,
+    pub checkpoints_rewritten: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -58,6 +88,11 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let conflict_rows = db.keyspace(FAMILY_CONFLICT_KEYSPACE, KeyspaceCreateOptions::default)?;
     let cache_rows = db.keyspace(FAMILY_PROJECTION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let config_rows = db.keyspace(REALM_CONFIG_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let mapping_rows = db.keyspace(ID_MAPPING_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let outbox_rows = db.keyspace(SYNC_OUTBOX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let index_rows = db.keyspace(SECONDARY_ID_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let job_rows = db.keyspace(JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let state_rows = db.keyspace(JOB_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -67,6 +102,27 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         rewrites::<ConflictRecord, LegacyConflict>(&db, &conflict_rows, FAMILY_CONFLICT_KEYSPACE)?;
     let projections = keys(&db, &cache_rows)?;
     let configs = realm_configs(&db, &config_rows)?;
+    let mappings =
+        rewrites::<PersistentIdMapping, LegacyMapping>(&db, &mapping_rows, ID_MAPPING_KEYSPACE)?;
+    let outbox = mappings::outbox_rows(&db, &outbox_rows, SYNC_OUTBOX_KEYSPACE)?;
+    let index = mappings::index_rebuild(
+        &db,
+        &mapping_rows,
+        &mappings.rows,
+        &index_rows,
+        ID_MAPPING_KEYSPACE,
+    )?;
+    let jobs = rewrites::<JobRecord, jobs::LegacyJob>(&db, &job_rows, JOB_KEYSPACE)?;
+    let kinds = jobs::checkpoint_kinds(&db, &job_rows, &jobs.rows, JOB_KEYSPACE)?;
+    let checkpoints = jobs::checkpoint_rows(&db, &state_rows, &kinds, JOB_STATE_KEYSPACE)?;
+    let secret_key = node_key(&db)?;
+    let mut secrets = Vec::new();
+    let mut secrets_skipped = Vec::new();
+    for name in SEALED_KEYSPACES {
+        let rows = db.keyspace(name, KeyspaceCreateOptions::default)?;
+        let sealed = seal_rows(&db, &rows, name, secret_key.as_ref(), &mut secrets_skipped)?;
+        secrets.push((rows, sealed));
+    }
 
     let mut txn = db.write_tx()?;
     for (keyspace, rows) in [
@@ -74,13 +130,27 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&pending_rows, &pending.rows),
         (&conflict_rows, &conflicts.rows),
         (&config_rows, &configs.rows),
-    ] {
+        (&mapping_rows, &mappings.rows),
+        (&outbox_rows, &outbox.rows),
+        (&index_rows, &index.writes),
+        (&job_rows, &jobs.rows),
+        (&state_rows, &checkpoints.rows),
+    ]
+    .into_iter()
+    .chain(
+        secrets
+            .iter()
+            .map(|(keyspace, sealed)| (keyspace, &sealed.rows)),
+    ) {
         for (key, value) in rows {
             txn.insert(keyspace.clone(), key.clone(), value.clone());
         }
     }
     for key in &projections {
         txn.remove(cache_rows.clone(), key.clone());
+    }
+    for key in &index.removes {
+        txn.remove(index_rows.clone(), key.clone());
     }
     txn.commit()?.map_err(|_| {
         ExplorerError::Decode("migration conflicted with a running node".to_string())
@@ -97,7 +167,70 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         projections_cleared: projections.len(),
         realm_configs_scanned: configs.scanned,
         realm_configs_rewritten: configs.rows.len(),
+        secrets_scanned: secrets.iter().map(|(_, sealed)| sealed.scanned).sum(),
+        secrets_sealed: secrets.iter().map(|(_, sealed)| sealed.rows.len()).sum(),
+        secrets_skipped,
+        mappings_scanned: mappings.scanned,
+        mappings_rewritten: mappings.rows.len(),
+        outbox_scanned: outbox.scanned,
+        outbox_rewritten: outbox.rows.len(),
+        identifier_index_written: index.writes.len(),
+        identifier_index_removed: index.removes.len(),
+        jobs_scanned: jobs.scanned,
+        jobs_rewritten: jobs.rows.len(),
+        checkpoints_scanned: checkpoints.scanned,
+        checkpoints_rewritten: checkpoints.rows.len(),
     })
+}
+
+/// The key the node seals secret rows with, derived like the node does at startup.
+fn node_key(db: &OptimisticTxDatabase) -> Result<Option<CredentialEncryptionKey>, ExplorerError> {
+    let rows = db.keyspace(NODE_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let Some(value) = db.read_tx().get(&rows, NODE_STATE_KEY)? else {
+        return Ok(None);
+    };
+    let state = postcard::from_bytes::<PersistedNodeState>(&value)
+        .map_err(|error| decode_error(NODE_STATE_KEYSPACE, NODE_STATE_KEY, error))?;
+    Ok(Some(CredentialEncryptionKey::derive(&state.net_secret_key)))
+}
+
+/// Seals plain secret rows; rows that already open with the node key stay unchanged.
+/// Rows that are neither are added to `skipped` and left as they are.
+fn seal_rows(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+    name: &str,
+    secret_key: Option<&CredentialEncryptionKey>,
+    skipped: &mut Vec<String>,
+) -> Result<Rewrites, ExplorerError> {
+    let plain = |value: &[u8]| match name {
+        SOURCE_SECRET_KEYSPACE => SourceConnectorSecret::from_bytes(value).is_ok(),
+        CONNECTOR_SECRET_KEYSPACE => RepositoryConnectorSecret::from_bytes(value).is_ok(),
+        BACKEND_SECRET_KEYSPACE => GroupStorageSecret::from_bytes(value).is_ok(),
+        _ => false,
+    };
+    let mut scanned = 0;
+    let mut rows = Vec::new();
+    for entry in db.read_tx().iter(keyspace) {
+        let (key, value) = entry.into_inner()?;
+        scanned += 1;
+        let Some(secret_key) = secret_key else {
+            skipped.push(row_note(name, &key, "no node state to derive the key from"));
+            continue;
+        };
+        let aad = row_aad(name, &key);
+        if open_bytes(secret_key, &value, &aad).is_ok() {
+            continue;
+        }
+        if !plain(&value) {
+            skipped.push(row_note(name, &key, "neither sealed nor a plain secret"));
+            continue;
+        }
+        let sealed = seal_bytes(secret_key, &value, &aad)
+            .map_err(|error| decode_error(name, &key, error))?;
+        rows.push((key.to_vec(), sealed));
+    }
+    Ok(Rewrites { scanned, rows })
 }
 
 /// Rows of one keyspace that must be written back, plus how many were read.
@@ -196,7 +329,11 @@ where
 }
 
 fn decode_error(name: &str, key: &[u8], error: impl std::fmt::Display) -> ExplorerError {
-    ExplorerError::Decode(format!("{name}/{}: {error}", hex::encode(key)))
+    ExplorerError::Decode(row_note(name, key, error))
+}
+
+fn row_note(name: &str, key: &[u8], reason: impl std::fmt::Display) -> String {
+    format!("{name}/{}: {reason}", hex::encode(key))
 }
 
 /// Previous shape of `PhysicalExecutionResult`, before the bounded stdout and
@@ -402,7 +539,7 @@ mod tests {
             .expect("record signs")
     }
 
-    fn write(path: &Path, keyspace: &str, entries: Vec<(&[u8], Vec<u8>)>) {
+    pub(super) fn write(path: &Path, keyspace: &str, entries: Vec<(&[u8], Vec<u8>)>) {
         let db = OptimisticTxDatabase::builder(path).open().unwrap();
         let keyspace = db
             .keyspace(keyspace, KeyspaceCreateOptions::default)
@@ -414,7 +551,7 @@ mod tests {
         txn.commit().unwrap().unwrap();
     }
 
-    fn read(path: &Path, keyspace: &str) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    pub(super) fn read(path: &Path, keyspace: &str) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let db = OptimisticTxDatabase::builder(path).open().unwrap();
         let keyspace = db
             .keyspace(keyspace, KeyspaceCreateOptions::default)
@@ -577,5 +714,74 @@ mod tests {
 
         assert!(error.to_string().contains(FAMILY_RECORD_KEYSPACE));
         assert!(error.to_string().contains(&hex::encode(b"bad")));
+    }
+
+    #[test]
+    fn seals_plain_secrets() {
+        use aruna::identity::{
+            BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+        };
+        use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes};
+        use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, SOURCE_SECRET_KEYSPACE};
+        use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
+        use std::collections::HashMap;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let state = PersistedNodeState {
+            boot_origin: BootOrigin::Onboarded,
+            status: PersistedNodeStatus::PendingOnboarding,
+            realm_id: REALM,
+            net_secret_key: [11u8; 32],
+            onboarding_phase: None,
+            onboarding_sync_ticket: None,
+            identity: PersistedNodeIdentity::User {
+                owner: aruna_core::UserId::nil(REALM),
+            },
+        };
+        // Only the node_state row holds the identity; another row that decodes must not win.
+        let other = PersistedNodeState {
+            net_secret_key: [99u8; 32],
+            ..state.clone()
+        };
+        write(
+            &path,
+            NODE_STATE_KEYSPACE,
+            vec![
+                (b"another", postcard::to_allocvec(&other).unwrap()),
+                (b"node_state", postcard::to_allocvec(&state).unwrap()),
+            ],
+        );
+        let plain = SourceConnectorSecret::new(
+            Ulid::from_bytes([1u8; 16]),
+            HashMap::from([("token".to_string(), "canary-61d0".to_string())]),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        write(
+            &path,
+            SOURCE_SECRET_KEYSPACE,
+            vec![(b"row", plain.clone()), (b"junk", vec![0xff; 3])],
+        );
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        // An unreadable row is reported and kept, and the readable one is still sealed.
+        assert_eq!((output.secrets_scanned, output.secrets_sealed), (2, 1));
+        assert_eq!(output.secrets_skipped.len(), 1);
+        assert!(output.secrets_skipped[0].starts_with(SOURCE_SECRET_KEYSPACE));
+        assert_eq!(
+            read(&path, SOURCE_SECRET_KEYSPACE)[b"junk".as_slice()],
+            vec![0xff; 3]
+        );
+        let sealed = &read(&path, SOURCE_SECRET_KEYSPACE)[b"row".as_slice()];
+        assert!(!sealed.windows(11).any(|window| window == b"canary-61d0"));
+        let key = CredentialEncryptionKey::derive(&[11u8; 32]);
+        let aad = aruna_storage::row_aad(SOURCE_SECRET_KEYSPACE, b"row");
+        assert_eq!(open_bytes(&key, sealed, &aad).unwrap(), plain);
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!((again.secrets_sealed, again.secrets_skipped.len()), (0, 1));
     }
 }

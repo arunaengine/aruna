@@ -25,6 +25,7 @@ use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{JOB_ENTRY_KEYSPACE, JOB_STATE_KEYSPACE};
 use aruna_core::metadata::MetadataValidationViolation;
+use aruna_core::repository::RepositoryPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::execution::job::{
@@ -33,6 +34,7 @@ use aruna_core::structs::execution::job::{
     RoCrateMediaType, SYSTEM_ENTRY_PREFIX, job_entry_key, rocrate_plan_key,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdentifier};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, object_permission_path,
 };
@@ -63,7 +65,8 @@ use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::route_metadata_create;
+use crate::metadata::forward::{route_metadata_create, route_metadata_update};
+use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
@@ -120,8 +123,9 @@ struct ImportPlan {
     entries: Vec<ImportEntryPlan>,
 }
 
+/// Progress an import job keeps under its id; public so the doctor can migrate stored rows.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ImportCheckpoint {
+pub struct ImportCheckpoint {
     refs: RoCrateCheckpointRefs,
     phase: ImportPhase,
     input: Option<ImportInput>,
@@ -137,6 +141,10 @@ struct ImportCheckpoint {
     rolled_back: u64,
     failure: Option<String>,
     cancelled: bool,
+    /// Repository identifiers registered on the created document during cleanup.
+    identifiers: Vec<SecondaryIdentifier>,
+    /// Set when the import keeps or updates a pull link.
+    pull: Option<super::repository::pull::PullProgress>,
 }
 
 impl Default for ImportCheckpoint {
@@ -157,6 +165,8 @@ impl Default for ImportCheckpoint {
             rolled_back: 0,
             failure: None,
             cancelled: false,
+            identifiers: Vec::new(),
+            pull: None,
         }
     }
 }
@@ -218,41 +228,51 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
         }
 
         let result = match checkpoint.phase {
-            ImportPhase::Acquire => acquire_source(ctx, spec).await.map(|input| {
-                checkpoint.refs.hidden_locations = vec![input.location.clone()];
-                checkpoint.input = Some(input);
-                checkpoint.phase = ImportPhase::Inspect;
-            }),
-            ImportPhase::Inspect => {
-                inspect_source(ctx, spec, &checkpoint)
-                    .await
-                    .map(|(inspection, metadata_json)| {
-                        checkpoint.inspection = Some(inspection);
-                        checkpoint.metadata_json = Some(metadata_json);
-                        checkpoint.phase = ImportPhase::Validate;
-                    })
-            }
-            ImportPhase::Validate => match validate_source(ctx, spec, &mut checkpoint).await {
-                Ok(validated) => {
-                    plan = Some(validated);
-                    Ok(())
+            ImportPhase::Acquire => Box::pin(acquire_source(ctx, spec, &mut checkpoint))
+                .await
+                .map(|input| {
+                    checkpoint.refs.hidden_locations = vec![input.location.clone()];
+                    checkpoint.input = Some(input);
+                    checkpoint.phase = ImportPhase::Inspect;
+                }),
+            ImportPhase::Inspect => Box::pin(inspect_source(ctx, spec, &checkpoint)).await.map(
+                |(inspection, metadata_json)| {
+                    checkpoint.inspection = Some(inspection);
+                    checkpoint.metadata_json = Some(metadata_json);
+                    checkpoint.phase = ImportPhase::Validate;
+                },
+            ),
+            ImportPhase::Validate => {
+                match Box::pin(validate_source(ctx, spec, &mut checkpoint)).await {
+                    Ok(validated) => {
+                        plan = Some(validated);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
             ImportPhase::Write => match plan.as_ref() {
-                Some(plan) => write_next(ctx, spec, &mut checkpoint, plan).await,
+                Some(plan) => Box::pin(write_next(ctx, spec, &mut checkpoint, plan)).await,
                 None => Err(ImportFailure::Permanent(
                     "import plan is missing".to_string(),
                 )),
             },
             ImportPhase::Rewrite => match plan.as_ref() {
-                Some(plan) => rewrite_crate(ctx, spec, &mut checkpoint, plan).await,
+                Some(plan) => Box::pin(rewrite_crate(ctx, spec, &mut checkpoint, plan)).await,
                 None => Err(ImportFailure::Permanent(
                     "import plan is missing".to_string(),
                 )),
             },
-            ImportPhase::Create => create_document(ctx, spec, &mut checkpoint).await,
-            ImportPhase::Cleanup => cleanup_source(ctx, spec, plan.as_ref(), &mut checkpoint).await,
+            ImportPhase::Create if updates_link(spec) => match plan.as_ref() {
+                Some(plan) => Box::pin(update_document(ctx, spec, &mut checkpoint, plan)).await,
+                None => Err(ImportFailure::Permanent(
+                    "import plan is missing".to_string(),
+                )),
+            },
+            ImportPhase::Create => Box::pin(create_document(ctx, spec, &mut checkpoint)).await,
+            ImportPhase::Cleanup => {
+                Box::pin(cleanup_source(ctx, spec, plan.as_ref(), &mut checkpoint)).await
+            }
             ImportPhase::Done => return import_outcome(&checkpoint, spec),
         };
 
@@ -360,11 +380,60 @@ pub(crate) async fn cleanup_after_panic(
     JobRunOutcome::Failed(JobError::permanent(message))
 }
 
+fn transfer_failure(error: super::repository::TransferError) -> ImportFailure {
+    use super::repository::TransferError;
+    match error {
+        TransferError::Permanent(message) => ImportFailure::Permanent(message),
+        error @ TransferError::Refused(_) => ImportFailure::Permanent(error.to_string()),
+        TransferError::Retryable(message) => ImportFailure::Retryable(message),
+        TransferError::Cancelled => ImportFailure::Cancelled,
+        TransferError::Interrupted => ImportFailure::Interrupted,
+    }
+}
+
 async fn acquire_source(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
+    checkpoint: &mut ImportCheckpoint,
 ) -> Result<ImportInput, ImportFailure> {
     match &spec.source {
+        ImportRoCrateSource::Repository {
+            group_id,
+            connector_id,
+            record_id,
+            options,
+            pull,
+        } => {
+            use super::repository::{Action, ensure_supported};
+            let kind = super::repository::connector_kind(&ctx.driver, *group_id, *connector_id)
+                .await
+                .map_err(transfer_failure)?;
+            ensure_supported(kind, Action::Import).map_err(transfer_failure)?;
+            if pull.is_some() {
+                ensure_supported(kind, Action::Pull).map_err(transfer_failure)?;
+            }
+            let (artifact, found, progress) = super::repository::acquire(
+                kind,
+                ctx,
+                spec,
+                *group_id,
+                *connector_id,
+                record_id,
+                options,
+                pull.as_ref(),
+            )
+            .await
+            .map_err(transfer_failure)?;
+            checkpoint.identifiers = found;
+            checkpoint.pull = progress;
+            Ok(ImportInput {
+                location: artifact.location,
+                size: artifact.size,
+                blake3: artifact.blake3,
+                upload_id: None,
+                eln: false,
+            })
+        }
         ImportRoCrateSource::Upload { upload_id } => {
             let record = claim_rocrate_upload(
                 &ctx.driver.storage_handle,
@@ -814,7 +883,7 @@ async fn write_next(
         row.detail.version_id = Some(entry.version_id);
         write_report(ctx, &row).await?;
     }
-    let body = payload_stream(
+    let mut body = payload_stream(
         ctx,
         &input.location,
         input.size,
@@ -823,6 +892,44 @@ async fn write_next(
         ctx.shutdown.clone(),
     )
     .await?;
+    let reference = super::repository::reference_kind(&ctx.driver, spec)
+        .await
+        .map_err(transfer_failure)?
+        .filter(|kind| super::repository::is_reference(*kind, &entry.path));
+    if let Some(kind) = reference {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| ImportFailure::Retryable(error.to_string()))?;
+            if bytes.len() as u64 + chunk.len() as u64 > spec.limits.metadata_bytes {
+                return Err(ImportFailure::Permanent(
+                    "reference descriptor exceeds limit".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let descriptor = serde_json::from_slice(&bytes)
+            .map_err(|_| ImportFailure::Permanent("invalid reference descriptor".into()))?;
+        let metadata = super::repository::write_reference(
+            kind,
+            ctx,
+            spec,
+            bucket_info,
+            &entry.target_key,
+            entry.version_id,
+            &descriptor,
+        )
+        .await
+        .map_err(transfer_failure)?;
+        let arn = entry_arn(spec, ctx.owner_node_id, entry)?;
+        row.detail.size = Some(metadata.content_length);
+        row.detail.arn = Some(arn.to_string());
+        row.detail.w3id = Some(arn.to_w3id());
+        write_report(ctx, &row).await?;
+        queue_import(ctx, spec, entry).await?;
+        checkpoint.imported = checkpoint.imported.saturating_add(1);
+        checkpoint.next_entry = checkpoint.next_entry.saturating_add(1);
+        return Ok(());
+    }
     let quota = drive(
         GetConfigOperation::new(spec.auth_context.realm_id),
         &ctx.driver,
@@ -908,19 +1015,29 @@ async fn write_next(
         _ => {}
     }
     checkpoint.next_entry = checkpoint.next_entry.saturating_add(1);
-    let _ = drive(
+    let _ = queue_import(ctx, spec, entry).await;
+    Ok(())
+}
+
+async fn queue_import(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    entry: &ImportEntryPlan,
+) -> Result<(), ImportFailure> {
+    drive(
         LiveVersionOperation::new(LiveVersionInput {
             local_node_id: ctx.owner_node_id,
             auth_context: spec.auth_context.clone(),
             bucket: spec.target.bucket.clone(),
             key: entry.target_key.clone(),
-            version_id: result.version_id,
+            version_id: entry.version_id,
             delete_marker: false,
         }),
         &ctx.driver,
     )
-    .await;
-    Ok(())
+    .await
+    .map(|_| ())
+    .map_err(|error| ImportFailure::Retryable(error.to_string()))
 }
 
 async fn rewrite_crate(
@@ -931,6 +1048,9 @@ async fn rewrite_crate(
 ) -> Result<(), ImportFailure> {
     let validated = validate_document(&plan.metadata_json).map_err(validation_failure)?;
     let reports = load_reports(ctx).await?;
+    let reference = super::repository::reference_kind(&ctx.driver, spec)
+        .await
+        .map_err(transfer_failure)?;
     let mut targets = HashMap::new();
     for entry in &plan.entries {
         let Some(file_id) = &entry.described_id else {
@@ -939,22 +1059,31 @@ async fn rewrite_crate(
         let report = reports
             .get(&entry.path)
             .ok_or_else(|| ImportFailure::Permanent("import report row is missing".to_string()))?;
-        let hash: [u8; 32] = report
-            .detail
-            .blake3
-            .as_deref()
-            .ok_or_else(|| ImportFailure::Permanent("imported hash is missing".to_string()))
-            .and_then(|hash| {
-                hex::decode(hash)
-                    .ok()
-                    .and_then(|hash| hash.try_into().ok())
-                    .ok_or_else(|| ImportFailure::Permanent("imported hash is invalid".to_string()))
-            })?;
+        let w3id = entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id();
+        let hash_w3id =
+            if reference.is_some_and(|kind| super::repository::is_reference(kind, &entry.path)) {
+                w3id.clone()
+            } else {
+                let hash: [u8; 32] = report
+                    .detail
+                    .blake3
+                    .as_deref()
+                    .ok_or_else(|| ImportFailure::Permanent("imported hash is missing".to_string()))
+                    .and_then(|hash| {
+                        hex::decode(hash)
+                            .ok()
+                            .and_then(|hash| hash.try_into().ok())
+                            .ok_or_else(|| {
+                                ImportFailure::Permanent("imported hash is invalid".to_string())
+                            })
+                    })?;
+                format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash))
+            };
         targets.insert(
             file_id.clone(),
             RewriteTarget {
-                w3id: entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id(),
-                hash_w3id: format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash)),
+                w3id,
+                hash_w3id,
                 local_path: entry.path.clone(),
             },
         );
@@ -1018,6 +1147,9 @@ async fn create_document(
         Ok(created) => {
             checkpoint.created = true;
             checkpoint.phase = ImportPhase::Cleanup;
+            if let Some(pull) = checkpoint.pull.as_mut() {
+                pull.revision = Some(created.event_id);
+            }
             emit_metadata_created(
                 &ctx.driver,
                 spec.auth_context.realm_id,
@@ -1034,6 +1166,130 @@ async fn create_document(
     }
 }
 
+fn updates_link(spec: &ImportRoCrateSpec) -> bool {
+    matches!(
+        &spec.source,
+        ImportRoCrateSource::Repository {
+            pull: Some(RepositoryPull::Update { .. }),
+            ..
+        }
+    )
+}
+
+/// Replaces the linked dataset's crate with the merged one through the normal update, unless the
+/// dataset changed since the pull read it. A retry finds its own update by the minted versions.
+async fn update_document(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    checkpoint: &mut ImportCheckpoint,
+    plan: &ImportPlan,
+) -> Result<(), ImportFailure> {
+    // Pausing or deleting the link while the files were imported cancels the update.
+    if let ImportRoCrateSource::Repository {
+        pull: Some(RepositoryPull::Update { link_id }),
+        ..
+    } = &spec.source
+    {
+        super::repository::pull::running(ctx, spec, *link_id)
+            .await
+            .map_err(transfer_failure)?;
+    }
+    ensure_metadata_permission(ctx, spec).await?;
+    let jsonld = checkpoint
+        .rewritten_json
+        .clone()
+        .ok_or_else(|| ImportFailure::Permanent("rewritten RO-Crate is missing".to_string()))?;
+    let base = checkpoint
+        .pull
+        .as_ref()
+        .and_then(|pull| pull.base)
+        .ok_or_else(|| ImportFailure::Permanent("pull base revision is missing".to_string()))?;
+    let (current, event_id) = Box::pin(crate::jobs::export::crate_jsonld(
+        &ctx.driver,
+        &spec.auth_context,
+        spec.document_id,
+        spec.limits.metadata_bytes,
+    ))
+    .await
+    .map_err(transfer_failure)?;
+    let revision = if event_id == base {
+        let actor = Actor {
+            node_id: ctx.owner_node_id,
+            user_id: spec.auth_context.user_id,
+            realm_id: spec.auth_context.realm_id,
+        };
+        let record =
+            crate::metadata::get_document::load_document_record(&ctx.driver, spec.document_id)
+                .await
+                .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
+        // The holder refuses the update inside its transaction when an edit landed after `base`.
+        match Box::pin(route_metadata_update(
+            &ctx.driver,
+            actor,
+            record.as_ref(),
+            spec.document_id,
+            None,
+            UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+            Some(base),
+            Some(AuthToken::internal(spec.auth_context.clone())),
+        ))
+        .await
+        {
+            Ok(updated) => updated.last_event_id,
+            Err(MetadataWriteError::Update(UpdateDocumentError::RevisionConflict { .. })) => {
+                return Err(ImportFailure::Permanent(
+                    "the dataset changed while the pull updated it; check it and pull again"
+                        .to_string(),
+                ));
+            }
+            Err(error) => return Err(classify_metadata(error)),
+        }
+    } else {
+        let own = plan
+            .entries
+            .iter()
+            .find(|entry| entry.described_id.is_some())
+            .map(|entry| entry_arn(spec, ctx.owner_node_id, entry).map(|arn| arn.to_w3id()))
+            .transpose()?;
+        if !own.is_some_and(|w3id| current.contains(&w3id)) {
+            return Err(ImportFailure::Permanent(
+                "the dataset changed while the pull ran; pull again".to_string(),
+            ));
+        }
+        event_id
+    };
+    if let Some(pull) = checkpoint.pull.as_mut() {
+        pull.revision = Some(revision);
+    }
+    checkpoint.created = true;
+    checkpoint.phase = ImportPhase::Cleanup;
+    Ok(())
+}
+
+/// Queues the source repository identifiers for the created document. The queued job waits
+/// for the PID authority, so cleanup never does.
+async fn register_identifiers(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+    identifiers: Vec<SecondaryIdentifier>,
+) -> Result<(), ImportFailure> {
+    crate::jobs::service::submit_identifiers(
+        &ctx.driver,
+        RegisterIdentifiersSpec {
+            document_id: spec.document_id,
+            identifiers,
+            auth_context: spec.auth_context.clone(),
+        },
+        ctx.owner_node_id,
+        format!("identifiers/{}", ctx.job_id),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        ImportFailure::Retryable(format!("queueing repository identifiers failed: {error}"))
+    })
+}
+
 async fn cleanup_source(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
@@ -1043,20 +1299,31 @@ async fn cleanup_source(
     if let Some(plan) = plan.filter(|_| rollback_required(checkpoint)) {
         checkpoint.rolled_back = rollback_writes(ctx, spec, plan, checkpoint).await?;
     }
-    let Some(input) = checkpoint.input.as_ref() else {
-        checkpoint.refs.hidden_locations.clear();
-        checkpoint.phase = ImportPhase::Done;
-        return Ok(());
-    };
-    crate::blob::hidden::delete_hidden(&ctx.driver, &input.location)
-        .await
-        .map_err(ImportFailure::Retryable)?;
-    if let Some(upload_id) = input.upload_id {
-        delete_rocrate_upload(&ctx.driver.storage_handle, upload_id, ctx.job_id)
+    if let Some(input) = checkpoint.input.as_ref() {
+        crate::blob::hidden::delete_hidden(&ctx.driver, &input.location)
             .await
             .map_err(ImportFailure::Retryable)?;
+        if let Some(upload_id) = input.upload_id {
+            delete_rocrate_upload(&ctx.driver.storage_handle, upload_id, ctx.job_id)
+                .await
+                .map_err(ImportFailure::Retryable)?;
+        }
     }
     checkpoint.refs.hidden_locations.clear();
+    if checkpoint.created && !checkpoint.identifiers.is_empty() {
+        register_identifiers(ctx, spec, checkpoint.identifiers.clone()).await?;
+        checkpoint.identifiers.clear();
+    }
+    Box::pin(super::repository::pull::settle_import(
+        ctx,
+        spec,
+        checkpoint.pull.as_ref(),
+        checkpoint.failure.as_deref(),
+    ))
+    .await
+    .map_err(|error| {
+        ImportFailure::Retryable(format!("recording the pull link failed: {error}"))
+    })?;
     checkpoint.phase = ImportPhase::Done;
     Ok(())
 }

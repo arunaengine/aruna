@@ -71,12 +71,13 @@ use crate::metadata::api::{
 use crate::metadata::forward::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::structs::identity::auth::AuthContext;
 
 mod archive;
 pub(crate) use archive::*;
 
-const METADATA_PATH: &str = "ro-crate-metadata.json";
-const REPORT_PATH: &str = "aruna-export-report.json";
+const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
+const REPORT_PATH: &str = aruna_core::repository::rules::CRATE_FILES[1];
 const REMOTE_ATTEMPTS: usize = 8;
 const MAX_LOCAL_CANDIDATES: usize = REMOTE_ATTEMPTS / 2;
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
@@ -104,24 +105,44 @@ enum ExportPhase {
     Publish,
 }
 
+/// Progress an export job keeps under its id; public so the doctor can migrate stored rows.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ExportCheckpoint {
+pub struct ExportCheckpoint {
+    pub(crate) repository_started: bool,
+    pub(crate) repository_complete: bool,
+    pub(crate) repository_metadata: Option<[u8; 32]>,
+    pub(crate) repository: Option<aruna_core::repository::RepositoryRecord>,
+    /// A link's resolved lineage base: the latest published version it continues.
+    pub(crate) repository_base: Option<String>,
+    pub(crate) link_failure: Option<aruna_core::repository::LinkFailure>,
+    /// File keys the repository record holds after the upload.
+    pub(crate) repository_files: Vec<String>,
+    /// The dataset's identifiers when the snapshot was taken.
+    pub(crate) identity: aruna_core::repository::ExportIdentity,
     refs: RoCrateCheckpointRefs,
     phase: ExportPhase,
     winning_event_id: Option<Ulid>,
     context_digest: Option<[u8; 32]>,
     dataset_digest: Option<[u8; 32]>,
-    raw_jsonld: Option<String>,
+    pub(crate) raw_jsonld: Option<String>,
     entities: Vec<ExportEntity>,
     rewritten_jsonld: Option<Vec<u8>>,
     report_json: Option<Vec<u8>>,
     report: Vec<ExportReportRow>,
-    artifact: Option<ArtifactRef>,
+    pub(crate) artifact: Option<ArtifactRef>,
 }
 
 impl Default for ExportCheckpoint {
     fn default() -> Self {
         Self {
+            repository_started: false,
+            repository_complete: false,
+            repository_metadata: None,
+            repository: None,
+            repository_base: None,
+            link_failure: None,
+            repository_files: Vec::new(),
+            identity: Default::default(),
             refs: RoCrateCheckpointRefs::default(),
             phase: ExportPhase::Snapshot,
             winning_event_id: None,
@@ -134,6 +155,49 @@ impl Default for ExportCheckpoint {
             report: Vec::new(),
             artifact: None,
         }
+    }
+}
+
+impl ExportCheckpoint {
+    /// The snapshot revision this export pushed, with its dataset digest.
+    pub(crate) fn pushed_revision(&self) -> Option<(Ulid, Option<[u8; 32]>)> {
+        self.winning_event_id
+            .map(|event_id| (event_id, self.dataset_digest))
+    }
+
+    /// Why a push failed: a recorded refusal, left-out files, or the job message.
+    pub(crate) fn push_failure(&self, message: &str) -> aruna_core::repository::LinkFailure {
+        use aruna_core::repository::LinkFailure;
+        if let Some(failure) = &self.link_failure {
+            return failure.clone();
+        }
+        if blocking_omissions(&self.report) > 0 {
+            return LinkFailure::SourceUnavailable;
+        }
+        LinkFailure::Other(message.to_string())
+    }
+
+    /// Archive paths of the crate's data entities, by entity id.
+    pub(crate) fn archive_paths(&self) -> HashMap<&str, &str> {
+        self.entities
+            .iter()
+            .filter_map(|entity| Some((entity.entity_id.as_str(), entity.zip_path.as_deref()?)))
+            .collect()
+    }
+
+    /// The finished push as a link outcome, once the repository holds the complete record.
+    pub(crate) fn pushed_outcome(&self) -> Option<aruna_core::repository::PushOutcome> {
+        let record = self
+            .repository
+            .clone()
+            .filter(|_| self.repository_complete)?;
+        let (event_id, dataset_digest) = self.pushed_revision()?;
+        Some(aruna_core::repository::PushOutcome::Pushed {
+            record: Box::new(record),
+            event_id,
+            dataset_digest,
+            files: self.repository_files.clone(),
+        })
     }
 }
 
@@ -262,6 +326,18 @@ pub(crate) struct EntityIdentity {
 }
 
 pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome {
+    let outcome = run_export(ctx, spec).await;
+    match spec
+        .destination
+        .as_ref()
+        .and_then(|target| target.link.as_ref())
+    {
+        Some(link) => super::repository::push::settle(ctx, spec, link, outcome).await,
+        None => outcome,
+    }
+}
+
+async fn run_export(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome {
     let mut checkpoint = match read_export_checkpoint(ctx, ctx.job_id).await {
         Ok(Some(checkpoint)) => checkpoint,
         Ok(None) => ExportCheckpoint::default(),
@@ -418,6 +494,12 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
                 }
             }
             ExportPhase::Publish => {
+                if let Some(destination) = &spec.destination
+                    && let Err(error) =
+                        repository_export(ctx, spec, destination, &mut checkpoint).await
+                {
+                    return failure_outcome(error);
+                }
                 let outcome = publish_export(ctx, &checkpoint).await;
                 if matches!(&outcome, JobRunOutcome::Cancelled) {
                     discard_artifact(ctx, &mut checkpoint, true).await;
@@ -435,43 +517,224 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
     }
 }
 
+async fn repository_export(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &aruna_core::repository::RepositoryDestination,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<(), ExportFailure> {
+    use super::repository::check::{check_content, check_crate, unmet};
+    use super::repository::{Action, TransferError, deposit, ensure_supported, repository};
+    use aruna_core::repository::LinkFailure;
+    if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
+        return Err(ExportFailure::Permanent(
+            "repository export requires a complete crate with no omitted files".into(),
+        ));
+    }
+    let exported = if checkpoint.repository_complete {
+        Ok(())
+    } else {
+        Box::pin(async {
+            let view =
+                repository(&ctx.driver, destination.group_id, destination.connector_id).await?;
+            let kind = view.connector.kind;
+            ensure_supported(kind, Action::Publish)?;
+            if destination.published_id.is_some() {
+                ensure_supported(kind, Action::Versions)?;
+            }
+            // The snapshot must still meet the requirements before this job writes remotely.
+            if checkpoint.repository.is_none() {
+                let jsonld = checkpoint.raw_jsonld.as_deref().ok_or_else(|| {
+                    TransferError::Permanent("source crate metadata missing".into())
+                })?;
+                let endpoint = &view.connector.endpoint;
+                let checked = check_crate(&ctx.driver, kind, endpoint, jsonld).await?;
+                if !checked.ready {
+                    return Err(unmet(checked.findings));
+                }
+                let findings = check_content(ctx, spec, kind, checkpoint).await?;
+                if !findings.is_empty() {
+                    return Err(unmet(findings));
+                }
+            }
+            deposit(kind, ctx, spec, destination, checkpoint).await
+        })
+        .await
+    };
+    // Queued on every run of this phase, so a failed queue is retried; the dedup key joins.
+    let result = match exported {
+        Ok(()) => match checkpoint.repository.as_ref() {
+            Some(record) => register_published(ctx, spec, record).await,
+            None => Ok(()),
+        },
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(TransferError::Permanent(message)) => Err(ExportFailure::Permanent(message)),
+        Err(TransferError::Retryable(message)) => Err(ExportFailure::Retryable(message)),
+        Err(TransferError::Cancelled) => Err(ExportFailure::Cancelled),
+        Err(TransferError::Interrupted) => Err(ExportFailure::Interrupted),
+        Err(error @ TransferError::Refused(_)) => {
+            let message = match &error {
+                TransferError::Refused(LinkFailure::RequirementsUnmet(findings)) => format!(
+                    "the crate does not meet the repository's requirements: {}",
+                    findings
+                        .iter()
+                        .map(|finding| finding.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                error => error.to_string(),
+            };
+            if let TransferError::Refused(failure) = error {
+                checkpoint.link_failure = Some(failure);
+            }
+            persist_checkpoint(ctx, checkpoint)
+                .await
+                .map_err(ExportFailure::Retryable)?;
+            Err(ExportFailure::Permanent(message))
+        }
+    }
+}
+
+/// Queues the record's identifiers as `Published` identifiers of the exported dataset.
+/// The dedup key names this job, so a rerun of the publish phase joins the queued job.
+async fn register_published(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    record: &aruna_core::repository::RepositoryRecord,
+) -> Result<(), super::repository::TransferError> {
+    if record.identifiers.is_empty() {
+        return Ok(());
+    }
+    crate::jobs::service::submit_identifiers(
+        &ctx.driver,
+        aruna_core::structs::secondary_id::RegisterIdentifiersSpec {
+            document_id: spec.document_id,
+            identifiers: record.identifiers.clone(),
+            auth_context: spec.auth_context.clone(),
+        },
+        ctx.owner_node_id,
+        format!("identifiers/{}", ctx.job_id),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        super::repository::TransferError::Retryable(format!("queueing identifiers failed: {error}"))
+    })
+}
+
+/// Reads the dataset's PID and live identifiers from its PID authority.
+async fn export_identity(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+) -> Result<aruna_core::repository::ExportIdentity, ExportFailure> {
+    let mapping = crate::metadata::persistent_id::forward::read_pid_routed(
+        &ctx.driver,
+        spec.auth_context.realm_id,
+        spec.document_id,
+    )
+    .await
+    .map_err(|error| ExportFailure::Retryable(format!("reading identifiers failed: {error}")))?;
+    let Some(mapping) = mapping.filter(|mapping| !mapping.is_retired()) else {
+        return Ok(Default::default());
+    };
+    Ok(aruna_core::repository::ExportIdentity {
+        own: mapping
+            .is_active()
+            .then(|| mapping.pid.clone())
+            .into_iter()
+            .collect(),
+        identifiers: mapping.secondary_identifiers.into_iter().collect(),
+        references: Vec::new(),
+    })
+}
+
+/// The crate JSON-LD a repository export of the dataset would start from, with its revision.
+pub(crate) async fn crate_jsonld(
+    context: &std::sync::Arc<DriverContext>,
+    auth: &AuthContext,
+    document_id: Ulid,
+    metadata_bytes: u64,
+) -> Result<(String, Ulid), super::repository::TransferError> {
+    use super::repository::TransferError;
+    match read_crate(context, auth, document_id, metadata_bytes).await {
+        Ok((jsonld, event_id, _)) => Ok((jsonld, event_id)),
+        Err(ExportFailure::Permanent(message)) => Err(TransferError::Permanent(message)),
+        Err(ExportFailure::Validation(_)) => Err(TransferError::Permanent(
+            "the dataset crate is invalid".into(),
+        )),
+        Err(error) => Err(TransferError::Retryable(format!("{error:?}"))),
+    }
+}
+
+/// The crate a dataset exports with its event and context digest: the raw revision, else a
+/// scaffold's rendered graph, the crate the dataset view shows.
+async fn read_crate(
+    context: &std::sync::Arc<DriverContext>,
+    auth: &AuthContext,
+    document_id: Ulid,
+    metadata_bytes: u64,
+) -> Result<(String, Ulid, [u8; 32]), ExportFailure> {
+    // Route the raw revision from a document holder; a job on a job-control bucket
+    // rarely holds the document's bucket. The holder re-checks READ for this peer.
+    let routed = |view| {
+        export_rocrate_routed(
+            context,
+            auth.realm_id,
+            ExportMetadataRequest {
+                document_id,
+                auth: Some(auth.clone()),
+                view,
+                limit: None,
+                offset: None,
+                after: None,
+            },
+            Some(AuthToken::internal(auth.clone())),
+            metadata_bytes,
+        )
+    };
+    Ok(match routed(RoCrateExportView::Raw).await {
+        Ok(ExportMetadataResult::Raw { raw, .. }) => (
+            raw.revision.jsonld,
+            raw.revision.winning_event_id,
+            raw.revision.context_digest,
+        ),
+        Err(MetadataApiError::NotFound) => match routed(RoCrateExportView::Full).await {
+            Ok(ExportMetadataResult::Full { record, jsonld }) => {
+                let digest = aruna_core::metadata::raw_context_digest(&jsonld)
+                    .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
+                (jsonld, record.last_event_id, digest)
+            }
+            Ok(_) => return Err(unexpected_view()),
+            Err(error) => return Err(snapshot_read_failure(error)),
+        },
+        Ok(_) => return Err(unexpected_view()),
+        Err(error) => return Err(snapshot_read_failure(error)),
+    })
+}
+
 async fn snapshot_export(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    // Route the raw revision from a document holder; a job on a job-control bucket
-    // rarely holds the document's bucket. The holder re-checks READ for this peer.
-    let export = export_rocrate_routed(
+    let (jsonld, winning_event_id, context_digest) = read_crate(
         &ctx.driver,
-        spec.auth_context.realm_id,
-        ExportMetadataRequest {
-            document_id: spec.document_id,
-            auth: Some(spec.auth_context.clone()),
-            view: RoCrateExportView::Raw,
-            limit: None,
-            offset: None,
-            after: None,
-        },
-        Some(AuthToken::internal(spec.auth_context.clone())),
+        &spec.auth_context,
+        spec.document_id,
         spec.limits.metadata_bytes,
     )
-    .await
-    .map_err(snapshot_read_failure)?;
-    let ExportMetadataResult::Raw { raw, .. } = export else {
-        return Err(ExportFailure::Permanent(
-            "raw export returned an unexpected view".to_string(),
-        ));
-    };
-    if raw.revision.jsonld.len() as u64 > spec.limits.metadata_bytes {
+    .await?;
+    if jsonld.len() as u64 > spec.limits.metadata_bytes {
         return Err(ExportFailure::Permanent(format!(
             "RO-Crate metadata exceeds the {} byte limit",
             spec.limits.metadata_bytes
         )));
     }
-    let canonical =
-        craqle::validate_rocrate_jsonld(&raw.revision.jsonld).map_err(map_crate_error)?;
-    let document: JsonValue = serde_json::from_str(&raw.revision.jsonld)
+    let canonical = craqle::validate_rocrate_jsonld(&jsonld).map_err(map_crate_error)?;
+    let document: JsonValue = serde_json::from_str(&jsonld)
         .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
     let entities = recognize_entities(&document, &canonical.nquads, spec.auth_context.realm_id)?;
     if entities.len() as u64 > spec.limits.max_entries {
@@ -481,10 +744,27 @@ async fn snapshot_export(
         )));
     }
 
-    checkpoint.winning_event_id = Some(raw.revision.winning_event_id);
-    checkpoint.context_digest = Some(raw.revision.context_digest);
+    let identity = export_identity(ctx, spec).await?;
+    let jsonld = if identity.identifiers.is_empty() {
+        jsonld
+    } else {
+        let mut document = document;
+        aruna_core::repository::fields::add_root_identifiers(&mut document, &identity);
+        document.to_string()
+    };
+
+    let mut identity = identity;
+    identity.references = entities
+        .iter()
+        .filter(|entity| entity.omission == Some(ReasonCode::External))
+        .map(|entity| entity.entity_id.clone())
+        .filter(|id| web_entity(id))
+        .collect();
+    checkpoint.winning_event_id = Some(winning_event_id);
+    checkpoint.context_digest = Some(context_digest);
     checkpoint.dataset_digest = Some(canonical.digest);
-    checkpoint.raw_jsonld = Some(raw.revision.jsonld);
+    checkpoint.identity = identity;
+    checkpoint.raw_jsonld = Some(jsonld);
     checkpoint.entities = entities;
     checkpoint.phase = ExportPhase::Resolve;
     ctx.progress.set_total(checkpoint.entities.len() as u64);
@@ -1023,6 +1303,10 @@ async fn resolve_alias_txn(
         resolved_version: Some(alias.version_id),
         expected_blake3: Some(alias.blake3_hash),
     }))
+}
+
+fn unexpected_view() -> ExportFailure {
+    ExportFailure::Permanent("metadata export returned an unexpected view".to_string())
 }
 
 fn snapshot_read_failure(error: MetadataApiError) -> ExportFailure {

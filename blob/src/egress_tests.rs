@@ -3,7 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::invenio::{InvenioClient, InvenioError, head_reference, read_reference};
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use bytes::Bytes;
 use opendal::{Operator, services};
+use reqwest::Method;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -228,6 +234,23 @@ fn refuses_scheme_downgrade() {
 }
 
 #[tokio::test]
+async fn sends_user_agent() {
+    let server = TestServer::spawn(ok_body("data")).await;
+    let guard = EgressGuard::build(EgressPolicy::loopback(), fixed_lookup(server.address)).unwrap();
+
+    let response = guard
+        .request(server.url("/"))
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let request = server.seen()[0].to_ascii_lowercase();
+    assert!(request.contains("user-agent: aruna/"), "{request}");
+}
+
+#[tokio::test]
 async fn strips_redirect_auth() {
     // reqwest drops Authorization across hosts; pin it instead of assuming it.
     let target = TestServer::spawn(ok_body("data")).await;
@@ -310,4 +333,100 @@ async fn drops_stalled_peer() {
 
     assert!(error.is_timeout(), "expected a timeout, got {error:?}");
     task.abort();
+}
+
+fn invenio_access(endpoint: &str) -> ResolvedSourceAccess {
+    ResolvedSourceAccess::OpenDal {
+        kind: SourceConnectorKind::Invenio,
+        config: HashMap::from([
+            ("endpoint".to_string(), endpoint.to_string()),
+            ("record_id".to_string(), "abcde-12345".to_string()),
+            ("file_key".to_string(), "data.txt".to_string()),
+        ]),
+        path: "content".to_string(),
+        version: None,
+    }
+}
+
+#[tokio::test]
+async fn invenio_paths_screened() {
+    // Search, import, reference reads and pushes all go through the guard (#346).
+    let server = TestServer::spawn(ok_body("{}")).await;
+    let strict = EgressGuard::build(EgressPolicy::strict(), fixed_lookup(server.address)).unwrap();
+    let endpoint = format!("https://repo.test:{}/api/", server.address.port());
+    let token = Some("repository-token".to_string());
+    let client = InvenioClient::with_guard(&strict, &endpoint, token, 1024).unwrap();
+    let file = client
+        .url(&["records", "abcde-12345", "files", "data.txt", "content"])
+        .unwrap();
+    let search = client.url(&["records"]).unwrap();
+    assert!(client.json(Method::GET, search, None).await.is_err());
+    assert!(client.download(file.clone()).await.is_err());
+    assert!(client.head(file).await.is_err());
+    let draft = client
+        .url(&[
+            "records",
+            "abcde-12345",
+            "draft",
+            "files",
+            "data.txt",
+            "content",
+        ])
+        .unwrap();
+    let body = futures::stream::iter([Ok::<_, aruna_core::stream::StreamError>(
+        Bytes::from_static(b"data"),
+    )]);
+    assert!(
+        client
+            .upload(draft, 4, BackendStream::new(body))
+            .await
+            .is_err()
+    );
+    let access = invenio_access(&endpoint);
+    assert!(head_reference(&strict, &access).await.is_err());
+    assert!(read_reference(&strict, &access, None).await.is_err());
+    assert_eq!(server.hits(), 0);
+
+    // A literal private host is refused before any request is sent.
+    let literal = InvenioClient::with_guard(&strict, "http://169.254.169.254/api/", None, 1024);
+    let literal = literal.unwrap();
+    let url = literal.url(&["records"]).unwrap();
+    assert!(matches!(
+        literal.json(Method::GET, url, None).await,
+        Err(InvenioError::Egress)
+    ));
+
+    // Counterfactual: the fixture policy lets the same search through.
+    let open = EgressGuard::build(EgressPolicy::loopback(), fixed_lookup(server.address)).unwrap();
+    let endpoint = format!("http://repo.test:{}/api/", server.address.port());
+    let client = InvenioClient::with_guard(&open, &endpoint, None, 1024).unwrap();
+    let search = client.url(&["records"]).unwrap();
+    assert!(client.json(Method::GET, search, None).await.is_ok());
+    assert_eq!(server.hits(), 1);
+}
+
+#[tokio::test]
+async fn invenio_redirect_refused() {
+    // A file redirect to a denied address is refused, whether literal or resolved from a name.
+    let denied: SocketAddr = "169.254.169.254:80".parse().unwrap();
+    for location in ["http://169.254.169.254/file", "http://blocked.test/file"] {
+        let entry = TestServer::spawn(redirect_to(location)).await;
+        let guard = EgressGuard::build(
+            EgressPolicy::loopback(),
+            host_lookup(vec![("repo.test", entry.address), ("blocked.test", denied)]),
+        )
+        .unwrap();
+        let endpoint = format!("http://repo.test:{}/api/", entry.address.port());
+        let client = InvenioClient::with_guard(&guard, &endpoint, None, 1024).unwrap();
+        let file = client
+            .url(&["records", "abcde-12345", "files", "data.txt", "content"])
+            .unwrap();
+        assert!(client.download(file).await.is_err(), "{location}");
+        let access = invenio_access(&endpoint);
+        assert!(
+            read_reference(&guard, &access, None).await.is_err(),
+            "{location}"
+        );
+        assert_eq!(entry.hits(), 2, "only the repository answered: {location}");
+    }
 }

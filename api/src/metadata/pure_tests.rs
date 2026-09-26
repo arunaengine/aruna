@@ -170,3 +170,12 @@ fn query_envelope_serializes() {
     assert!(!roundtrip.complete);
     assert_eq!(roundtrip.failed_partitions, vec!["partition-a"]);
 }
+
+#[test]
+fn export_refuses_destination() {
+    let destination = json!({"destination": {"group_id": "g", "connector_id": "c"}});
+    assert!(serde_json::from_value::<SubmitExportRequest>(destination).is_err());
+    let plain = json!({"idempotency_key": "run-1"});
+    let request = serde_json::from_value::<SubmitExportRequest>(plain).unwrap();
+    assert!(request.destination.is_none());
+}

@@ -461,6 +461,7 @@ pub(super) async fn run_device_batch(
         document_id,
         public: record.public,
         mutation: UpdateDocumentMutation::ApplyBatch { batch, authored },
+        expected_revision: None,
     });
     update_metadata_document(operation, context.as_ref())
         .await

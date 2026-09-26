@@ -71,8 +71,7 @@
   sh:description "The action that carried out the run, the RO-Crate root mentions it." ;
   sh:order 4 ;
   sh:nodeKind sh:IRI ;
-  sh:class schema:CreateAction ;
-  sh:node <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction> .
+  sh:class schema:CreateAction .
 
 <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction> a sh:NodeShape ;
   sh:targetClass schema:CreateAction ;
@@ -158,7 +157,6 @@
   sh:order 5 ;
   sh:nodeKind sh:IRI ;
   sh:class schema:SoftwareApplication ;
-  sh:node <https://w3id.org/aruna/profiles/process-run-crate#shape-SoftwareApplication> ;
   sh:maxCount 1 .
 
 <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-containerImage> a sh:PropertyShape ;
@@ -168,7 +166,6 @@
   sh:order 6 ;
   sh:nodeKind sh:IRI ;
   sh:class <https://w3id.org/ro/terms/workflow-run#ContainerImage> ;
-  sh:node <https://w3id.org/aruna/profiles/process-run-crate#shape-ContainerImage> ;
   sh:maxCount 1 .
 
 <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-agent-presence> a sh:PropertyShape ;
@@ -186,7 +183,6 @@
   sh:order 7 ;
   sh:nodeKind sh:IRI ;
   sh:class schema:Person ;
-  sh:node <https://w3id.org/aruna/profiles/process-run-crate#shape-Person> ;
   sh:maxCount 1 .
 
 <https://w3id.org/aruna/profiles/process-run-crate#shape-CreateAction-object> a sh:PropertyShape ;

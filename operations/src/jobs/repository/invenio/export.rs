@@ -1,0 +1,903 @@
+//! Publishes mapped metadata and individual crate files as a native repository record.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+use aruna_blob::hash::Hasher;
+use aruna_blob::invenio::{InvenioClient, InvenioError};
+use aruna_core::repository::invenio::{
+    export_fields, missing_fields, record_id, record_identifiers, validate_id,
+};
+use aruna_core::repository::{
+    ExportIdentity, LinkFailure, LinkTarget, RepositoryDestination, RepositoryRecord,
+};
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
+use aruna_core::structs::execution::job::{ArtifactRef, ExportRoCrateSpec};
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::secondary_id::IdentifierOrigin;
+use futures_util::StreamExt;
+use http::Method;
+use serde_json::{Value, json};
+
+use super::connect;
+use super::verify::{
+    complete_fields, complete_metadata, matches_access, metadata_digest, verify_file, verify_files,
+    verify_metadata,
+};
+use crate::harvest::create_connector::INVENIO_COMMUNITY;
+use crate::jobs::executor::JobContext;
+use crate::jobs::export::{ExportCheckpoint, persist_checkpoint};
+use crate::jobs::import::archive::{ArchiveCompression, ArchiveEntry};
+use crate::jobs::repository::check::{inspect_artifact, unmet, uploads};
+use crate::jobs::repository::push::{guard, record_draft};
+use crate::jobs::repository::{Action, TransferError, interruptible, supports};
+use crate::jobs::service::read_artifact_range;
+
+pub(crate) async fn repository_export(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &RepositoryDestination,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<(), TransferError> {
+    let prepared;
+    let destination = match &destination.link {
+        Some(target) => {
+            prepared =
+                crate::jobs::repository::push::prepare(ctx, spec, destination, target, checkpoint)
+                    .await?;
+            &prepared
+        }
+        None => destination,
+    };
+    if checkpoint.repository.is_none() {
+        if checkpoint.repository_started && destination.draft_id.is_none() {
+            let recovery = if destination.link.is_some() {
+                "inspect the repository drafts and link the dataset again"
+            } else {
+                "inspect the repository and retry with its draft_id"
+            };
+            return Err(TransferError::Permanent(format!(
+                "draft creation outcome is unknown; {recovery}"
+            )));
+        }
+        let jsonld = checkpoint
+            .raw_jsonld
+            .clone()
+            .ok_or_else(|| TransferError::Permanent("source crate metadata missing".into()))?;
+        let identity = checkpoint.identity.clone();
+        let fence = async || {
+            checkpoint.repository_started = true;
+            persist_checkpoint(ctx, checkpoint)
+                .await
+                .map_err(TransferError::Retryable)
+        };
+        // Not interruptible: a created draft must reach the checkpoint and the link.
+        let record = create_draft(ctx, spec, destination, &jsonld, &identity, fence).await?;
+        checkpoint.repository = Some(record.clone());
+        persist_checkpoint(ctx, checkpoint)
+            .await
+            .map_err(TransferError::Retryable)?;
+        if let Some(target) = &destination.link {
+            record_draft(ctx, spec, target, &record).await?;
+        }
+    }
+    if checkpoint.repository_metadata.is_none()
+        && supports(RepositoryConnectorKind::Invenio, Action::ReserveIdentifier)
+        && let Some(record) = checkpoint
+            .repository
+            .as_ref()
+            .filter(|r| r.identifier.is_none())
+    {
+        let reserved = interruptible(ctx, reserve_doi(ctx, spec, destination, record)).await?;
+        if reserved != *record {
+            checkpoint.repository = Some(reserved.clone());
+            persist_checkpoint(ctx, checkpoint)
+                .await
+                .map_err(TransferError::Retryable)?;
+            if let Some(target) = &destination.link {
+                record_draft(ctx, spec, target, &reserved).await?;
+            }
+        }
+    }
+    if checkpoint.repository_metadata.is_none() {
+        let record = checkpoint
+            .repository
+            .as_ref()
+            .ok_or_else(|| TransferError::Permanent("repository draft missing".into()))?;
+        let jsonld = checkpoint
+            .raw_jsonld
+            .as_deref()
+            .ok_or_else(|| TransferError::Permanent("source crate metadata missing".into()))?;
+        let identity = &checkpoint.identity;
+        let (record, digest) = interruptible(
+            ctx,
+            prepare_draft(ctx, spec, destination, record, jsonld, identity),
+        )
+        .await?;
+        checkpoint.repository = Some(record.clone());
+        checkpoint.repository_metadata = Some(digest);
+        persist_checkpoint(ctx, checkpoint)
+            .await
+            .map_err(TransferError::Retryable)?;
+        if let Some(target) = &destination.link {
+            record_draft(ctx, spec, target, &record).await?;
+        }
+    }
+    let record = checkpoint
+        .repository
+        .as_ref()
+        .ok_or_else(|| TransferError::Permanent("repository draft missing".into()))?;
+    let artifact = checkpoint
+        .artifact
+        .as_ref()
+        .ok_or_else(|| TransferError::Permanent("export artifact missing".into()))?;
+    let metadata = checkpoint
+        .repository_metadata
+        .ok_or_else(|| TransferError::Permanent("repository metadata checkpoint missing".into()))?;
+    let uploads = uploads(RepositoryConnectorKind::Invenio, "file", checkpoint)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let deposited = interruptible(
+        ctx,
+        deposit(ctx, spec, destination, record, artifact, metadata, &uploads),
+    )
+    .await;
+    let (record, files) = match deposited {
+        Ok(deposited) => deposited,
+        Err(error) => {
+            if let Some(target) = &destination.link {
+                observe_revision(ctx, spec, destination, target, record, metadata).await;
+            }
+            return Err(error);
+        }
+    };
+    checkpoint.repository = Some(record);
+    checkpoint.repository_files = files;
+    checkpoint.repository_complete = true;
+    persist_checkpoint(ctx, checkpoint)
+        .await
+        .map_err(TransferError::Retryable)
+}
+
+/// Stores the draft revision after this job's file writes on the link, so the next push
+/// does not mistake them for a remote edit. Changed metadata is left for that check.
+async fn observe_revision(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &RepositoryDestination,
+    target: &LinkTarget,
+    record: &RepositoryRecord,
+    metadata: [u8; 32],
+) {
+    let observed = async {
+        let client = connect(
+            &ctx.driver,
+            &spec.auth_context,
+            destination.group_id,
+            destination.connector_id,
+            Permission::WRITE,
+            spec.limits.metadata_bytes,
+            destination.credential.as_ref(),
+        )
+        .await?;
+        let url = client.url(&["records", &record.id, "draft"])?;
+        let current = client.json(Method::GET, url, None).await?;
+        let unchanged = metadata_digest(&current) == metadata;
+        let current = record_from(&client, &current)?;
+        Ok::<_, TransferError>(Some(current).filter(|current| {
+            unchanged
+                && !current.published
+                && current.parent_id == record.parent_id
+                && current.revision_id != record.revision_id
+        }))
+    };
+    let current = match observed.await {
+        Ok(Some(current)) => current,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "Reading the draft revision after a failed push failed");
+            return;
+        }
+    };
+    if let Err(error) = record_draft(ctx, spec, target, &current).await {
+        tracing::warn!(%error, "Recording the draft revision after a failed push failed");
+    }
+}
+
+pub(crate) async fn create_draft(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &RepositoryDestination,
+    jsonld: &str,
+    identity: &ExportIdentity,
+    fence: impl AsyncFnOnce() -> Result<(), TransferError>,
+) -> Result<RepositoryRecord, TransferError> {
+    let credential = destination
+        .credential
+        .as_ref()
+        .ok_or_else(|| invalid("a personal repository login is required"))?;
+    let client = connect(
+        &ctx.driver,
+        &spec.auth_context,
+        destination.group_id,
+        destination.connector_id,
+        Permission::WRITE,
+        spec.limits.metadata_bytes,
+        Some(credential),
+    )
+    .await?;
+    if destination.metadata_json.len() as u64 > spec.limits.metadata_bytes {
+        return Err(invalid("repository metadata exceeds limit"));
+    }
+    let overrides: Value = serde_json::from_str(&destination.metadata_json)
+        .map_err(|_| invalid("invalid repository metadata"))?;
+    let document: Value =
+        serde_json::from_str(jsonld).map_err(|_| invalid("invalid source crate"))?;
+    let mut fields = mapped_fields(&client, &document, &overrides, identity)?;
+    if fields.to_string().len() as u64 > spec.limits.metadata_bytes {
+        return Err(invalid("mapped repository metadata exceeds limit"));
+    }
+    let parent = if let Some(id) = &destination.published_id {
+        validate_id(id)?;
+        let source = client
+            .json(Method::GET, client.url(&["records", id])?, None)
+            .await?;
+        if source["is_published"] != true {
+            return Err(invalid("new version requires a published record"));
+        }
+        Some(
+            source["parent"]["id"]
+                .as_str()
+                .ok_or_else(|| invalid("missing parent identity"))?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let record = if let Some(id) = &destination.draft_id {
+        validate_id(id)?;
+        client
+            .json(Method::GET, client.url(&["records", id, "draft"])?, None)
+            .await?
+    } else if let Some(id) = &destination.published_id {
+        guard(ctx, spec, destination).await?;
+        client
+            .json(
+                Method::POST,
+                client.url(&["records", id, "versions"])?,
+                None,
+            )
+            .await?
+    } else {
+        fields["files"] = json!({"enabled": true});
+        fields["access"] = json!({"record": "public", "files": if destination.public_files { "public" } else { "restricted" }});
+        guard(ctx, spec, destination).await?;
+        fence().await?;
+        client
+            .json(Method::POST, client.url(&["records"])?, Some(&fields))
+            .await?
+    };
+    let parent_id = record["parent"]["id"]
+        .as_str()
+        .ok_or_else(|| invalid("missing draft parent"))?
+        .to_string();
+    if parent.is_some_and(|parent| parent != parent_id) {
+        return Err(invalid("new version belongs to another record"));
+    }
+    if record["is_published"] != false {
+        return Err(invalid("export requires an unpublished draft"));
+    }
+    let id = record_id(&record)?.to_string();
+    if destination
+        .draft_id
+        .as_ref()
+        .is_some_and(|requested| requested != &id)
+    {
+        return Err(invalid("draft identity mismatch"));
+    }
+    record_from(&client, &record)
+}
+
+/// The record fields mapped from the crate and overrides; a record that would lack a required
+/// field is refused with findings before any remote write.
+fn mapped_fields(
+    client: &InvenioClient<'_>,
+    document: &Value,
+    overrides: &Value,
+    identity: &ExportIdentity,
+) -> Result<Value, TransferError> {
+    let fields = export_fields(document, overrides, identity)?;
+    let missing = missing_fields(&fields["metadata"], client.endpoint());
+    if !missing.is_empty() {
+        return Err(unmet(missing));
+    }
+    Ok(fields)
+}
+
+/// Reserves the draft's DOI in its own step, after the draft is stored, so a failed
+/// reservation retries without losing the draft.
+async fn reserve_doi(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &RepositoryDestination,
+    record: &RepositoryRecord,
+) -> Result<RepositoryRecord, TransferError> {
+    let credential = destination
+        .credential
+        .as_ref()
+        .ok_or_else(|| invalid("a personal repository login is required"))?;
+    let client = connect(
+        &ctx.driver,
+        &spec.auth_context,
+        destination.group_id,
+        destination.connector_id,
+        Permission::WRITE,
+        spec.limits.metadata_bytes,
+        Some(credential),
+    )
+    .await?;
+    guard(ctx, spec, destination).await?;
+    let url = client.url(&["records", &record.id, "draft", "pids", "doi"])?;
+    match client.json(Method::POST, url, None).await {
+        Ok(reserved)
+            if record_id(&reserved)? == record.id
+                && reserved["parent"]["id"] == record.parent_id.as_str() =>
+        {
+            record_from(&client, &reserved)
+        }
+        Ok(_) => Err(invalid("draft identity changed while reserving its DOI")),
+        Err(error @ (InvenioError::Transport | InvenioError::Status(401 | 403 | 429))) => {
+            Err(error.into())
+        }
+        // A repository without a DOI provider still publishes; the next push tries again.
+        Err(error) => {
+            tracing::warn!(%error, "Reserving the draft DOI failed");
+            Ok(record.clone())
+        }
+    }
+}
+
+/// The repository's record as the link and job see it; drafts point at the draft endpoint.
+pub(super) fn record_from(
+    client: &InvenioClient<'_>,
+    record: &Value,
+) -> Result<RepositoryRecord, TransferError> {
+    let id = record_id(record)?.to_string();
+    let published = record["is_published"] == true;
+    let url = if published {
+        client.url(&["records", &id])?
+    } else {
+        client.url(&["records", &id, "draft"])?
+    };
+    Ok(RepositoryRecord {
+        url: url.to_string(),
+        published,
+        parent_id: record["parent"]["id"]
+            .as_str()
+            .ok_or_else(|| invalid("missing parent identity"))?
+            .to_string(),
+        revision_id: record["revision_id"]
+            .as_u64()
+            .ok_or_else(|| invalid("missing record revision"))?,
+        identifier: record["pids"]["doi"]["identifier"]
+            .as_str()
+            .map(str::to_string),
+        html_url: page_url(client, record),
+        concept_identifier: record["parent"]["pids"]["doi"]["identifier"]
+            .as_str()
+            .map(str::to_string),
+        in_review: false,
+        warning: None,
+        identifiers: record_identifiers(client.endpoint(), record, IdentifierOrigin::Published),
+        id,
+    })
+}
+
+/// The file keys of a draft or published record.
+pub(super) async fn file_keys(
+    client: &InvenioClient<'_>,
+    id: &str,
+    published: bool,
+) -> Result<Vec<String>, TransferError> {
+    let url = if published {
+        client.url(&["records", id, "files"])?
+    } else {
+        client.url(&["records", id, "draft", "files"])?
+    };
+    let files = client.json(Method::GET, url, None).await?;
+    Ok(files["entries"]
+        .as_array()
+        .ok_or_else(|| invalid("missing repository files"))?
+        .iter()
+        .filter_map(|file| file["key"].as_str().map(str::to_string))
+        .collect())
+}
+
+pub(crate) async fn prepare_draft(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &RepositoryDestination,
+    record: &RepositoryRecord,
+    jsonld: &str,
+    identity: &ExportIdentity,
+) -> Result<(RepositoryRecord, [u8; 32]), TransferError> {
+    let credential = destination
+        .credential
+        .as_ref()
+        .ok_or_else(|| invalid("personal login missing"))?;
+    let client = connect(
+        &ctx.driver,
+        &spec.auth_context,
+        destination.group_id,
+        destination.connector_id,
+        Permission::WRITE,
+        spec.limits.metadata_bytes,
+        Some(credential),
+    )
+    .await?;
+    let document: Value =
+        serde_json::from_str(jsonld).map_err(|_| invalid("invalid crate metadata"))?;
+    let overrides: Value = serde_json::from_str(&destination.metadata_json)
+        .map_err(|_| invalid("invalid metadata overrides"))?;
+    let mut fields = mapped_fields(&client, &document, &overrides, identity)?;
+    fields["files"] = json!({"enabled": true});
+    let url = client.url(&["records", &record.id, "draft"])?;
+    let current = client.json(Method::GET, url.clone(), None).await?;
+    if record_id(&current)? != record.id
+        || current["parent"]["id"] != record.parent_id
+        || current["is_published"] != false
+    {
+        return Err(invalid("repository draft identity changed"));
+    }
+    // Keeping pids holds the reserved DOI; file access follows the current setting.
+    fields["pids"] = current["pids"].clone();
+    let files = if destination.public_files {
+        "public"
+    } else {
+        "restricted"
+    };
+    let mut access = json!({"record": current["access"]["record"].as_str().unwrap_or("public"),
+        "files": files});
+    if current["access"]["embargo"].is_object() {
+        access["embargo"] = current["access"]["embargo"].clone();
+    }
+    fields["access"] = access;
+    let draft = if destination.draft_id.is_some() || destination.published_id.is_some() {
+        if current["revision_id"].as_u64() == Some(record.revision_id) {
+            guard(ctx, spec, destination).await?;
+            client.update(url, &fields, record.revision_id).await?
+        } else if current["revision_id"]
+            .as_u64()
+            .is_some_and(|revision| revision > record.revision_id)
+            && complete_metadata(&fields["metadata"], &current["metadata"])
+            && complete_fields(&fields["custom_fields"], &current["custom_fields"])
+            && matches_access(&fields["access"], &current)
+        {
+            current
+        } else {
+            return Err(invalid(
+                "draft changed after an ambiguous metadata update; inspect and recover with draft_id",
+            ));
+        }
+    } else {
+        current
+    };
+    if record_id(&draft)? != record.id
+        || draft["parent"]["id"] != record.parent_id
+        || draft["is_published"] != false
+    {
+        return Err(invalid("repository draft identity changed"));
+    }
+    verify_metadata(&fields, &draft)?;
+    if destination.draft_id.is_none()
+        && destination.published_id.is_none()
+        && draft["revision_id"].as_u64() != Some(record.revision_id)
+    {
+        return Err(invalid("repository metadata changed during creation"));
+    }
+    let mut record = record.clone();
+    record.revision_id = draft["revision_id"]
+        .as_u64()
+        .ok_or_else(|| invalid("missing draft revision"))?;
+    Ok((record, metadata_digest(&draft)))
+}
+
+pub(crate) async fn deposit(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &RepositoryDestination,
+    record: &RepositoryRecord,
+    artifact: &ArtifactRef,
+    metadata: [u8; 32],
+    uploads: &HashSet<String>,
+) -> Result<(RepositoryRecord, Vec<String>), TransferError> {
+    let credential = destination
+        .credential
+        .as_ref()
+        .ok_or_else(|| invalid("a personal repository login is required"))?;
+    let client = connect(
+        &ctx.driver,
+        &spec.auth_context,
+        destination.group_id,
+        destination.connector_id,
+        Permission::WRITE,
+        spec.limits.metadata_bytes,
+        Some(credential),
+    )
+    .await?;
+    if client.url(&["records", &record.id, "draft"])?.as_str() != record.url {
+        return Err(invalid(
+            "repository connector endpoint changed during export",
+        ));
+    }
+    let (draft, published) = match client
+        .json(
+            Method::GET,
+            client.url(&["records", &record.id, "draft"])?,
+            None,
+        )
+        .await
+    {
+        Ok(draft) => (draft, false),
+        Err(InvenioError::Status(404)) if destination.publish => (
+            client
+                .json(Method::GET, client.url(&["records", &record.id])?, None)
+                .await?,
+            true,
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    if record_id(&draft)? != record.id
+        || draft["is_published"] != published
+        || draft["parent"]["id"] != record.parent_id
+    {
+        return Err(invalid(
+            "export record identity or publication state changed",
+        ));
+    }
+    let checked = Box::pin(async {
+        if metadata_digest(&draft) != metadata {
+            return Err(invalid("repository metadata changed after preparation"));
+        }
+        let inspection = inspect_artifact(ctx, spec, artifact).await?;
+        let files_url = if published {
+            client.url(&["records", &record.id, "files"])?
+        } else {
+            client.url(&["records", &record.id, "draft", "files"])?
+        };
+        let files = client.json(Method::GET, files_url, None).await?;
+        let entries = files["entries"]
+            .as_array()
+            .ok_or_else(|| invalid("missing draft files"))?;
+        // Only the files the rules' file target takes are uploaded.
+        let local = inspection
+            .entries
+            .iter()
+            .filter(|entry| !entry.directory && uploads.contains(&entry.path))
+            .collect::<Vec<_>>();
+        let paths = local
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<HashSet<_>>();
+        // A link keeps one draft in step with the dataset, so files the dataset dropped go.
+        let replace = destination.link.as_ref().filter(|_| !published);
+        let mut remote = std::collections::BTreeMap::new();
+        for file in entries {
+            let key = file["key"]
+                .as_str()
+                .ok_or_else(|| invalid("missing repository file key"))?;
+            if let Some(target) = replace
+                && !paths.contains(key)
+            {
+                // A file this link never pushed was added in the repository.
+                if !target.files.iter().any(|pushed| pushed == key) {
+                    return Err(TransferError::Refused(LinkFailure::RemoteChanged));
+                }
+                guard(ctx, spec, destination).await?;
+                let url = client.url(&["records", &record.id, "draft", "files", key])?;
+                client.delete(url).await?;
+                continue;
+            }
+            if remote.insert(key, file).is_some() || !paths.contains(key) {
+                return Err(invalid(
+                    "repository draft contains duplicate or unrelated files",
+                ));
+            }
+        }
+        ctx.progress.set_total(paths.len() as u64);
+        ctx.progress.set_current(0);
+        let mut verified = std::collections::BTreeMap::new();
+        for (index, entry) in local.into_iter().enumerate() {
+            if !published {
+                guard(ctx, spec, destination).await?;
+            }
+            let existing = remote.get(entry.path.as_str()).copied();
+            let hash = upload_entry(
+                ctx,
+                &client,
+                record,
+                artifact,
+                entry,
+                existing,
+                published,
+                replace.is_some(),
+            )
+            .await?;
+            verified.insert(entry.path.clone(), (hash, entry.uncompressed_size));
+            ctx.progress.set_current(index as u64 + 1);
+        }
+        let done = Box::pin(finish(
+            ctx,
+            spec,
+            destination,
+            &client,
+            record,
+            published,
+            metadata,
+            &verified,
+        ));
+        let keys = verified.keys().cloned().collect();
+        Ok((done.await?, keys))
+    });
+    match checked.await {
+        // The record was published by an earlier attempt, so a failed check only warns.
+        Err(TransferError::Permanent(message)) if published => {
+            let mut result = record_from(&client, &draft)?;
+            result.warning = Some(message);
+            let keys = file_keys(&client, &record.id, true).await?;
+            Ok((result, keys))
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_entry(
+    ctx: &JobContext,
+    client: &InvenioClient<'_>,
+    record: &RepositoryRecord,
+    artifact: &ArtifactRef,
+    entry: &ArchiveEntry,
+    mut existing: Option<&Value>,
+    published: bool,
+    replace: bool,
+) -> Result<Hasher, TransferError> {
+    if entry.compression != ArchiveCompression::Stored
+        || entry.compressed_size != entry.uncompressed_size
+    {
+        return Err(invalid("repository snapshot entry is not stored verbatim"));
+    }
+    let range = entry.data_offset
+        ..entry
+            .data_offset
+            .checked_add(entry.uncompressed_size)
+            .filter(|end| *end <= artifact.size)
+            .ok_or_else(|| invalid("repository file exceeds snapshot"))?;
+    let mut read = read_artifact_range(&ctx.driver, artifact, range.clone())
+        .await
+        .map_err(TransferError::Retryable)?;
+    let mut expected = Hasher::new();
+    let mut size = 0u64;
+    while let Some(chunk) = read.blob.next().await {
+        let chunk = chunk.map_err(|_| TransferError::Retryable("crate file read failed".into()))?;
+        size = size
+            .checked_add(chunk.len() as u64)
+            .filter(|size| *size <= entry.uncompressed_size)
+            .ok_or_else(|| invalid("crate file exceeds snapshot size"))?;
+        expected.update(&chunk);
+    }
+    if size != entry.uncompressed_size || expected.finalize().crc32 != entry.crc32.to_be_bytes() {
+        return Err(invalid("crate file differs from snapshot"));
+    }
+    let key = &entry.path;
+    let commit_url = client.url(&["records", &record.id, "draft", "files", key, "commit"])?;
+    if replace
+        && existing.is_some_and(|file| {
+            file["checksum"].is_string() && verify_file(file, &expected, size, false).is_err()
+        })
+    {
+        let url = client.url(&["records", &record.id, "draft", "files", key])?;
+        client.delete(url).await?;
+        existing = None;
+    }
+    if let Some(file) = existing
+        && file["checksum"].is_string()
+    {
+        verify_file(file, &expected, size, false)?;
+        if file["status"] == "completed" {
+            return Ok(expected);
+        }
+        if published {
+            return Err(invalid("published record contains an incomplete file"));
+        }
+        let file = client.json(Method::POST, commit_url, None).await?;
+        verify_file(&file, &expected, size, true)?;
+        return Ok(expected);
+    }
+    if published {
+        return Err(invalid("published record is missing a complete crate file"));
+    }
+    if existing.is_none() {
+        client
+            .json(
+                Method::POST,
+                client.url(&["records", &record.id, "draft", "files"])?,
+                Some(&json!([{"key": key}])),
+            )
+            .await?;
+    }
+    let read = read_artifact_range(&ctx.driver, artifact, range)
+        .await
+        .map_err(TransferError::Retryable)?;
+    let hasher = Arc::new(Mutex::new(Hasher::new()));
+    let hash_copy = hasher.clone();
+    let stream = read.blob.map(move |chunk| {
+        if let Ok(bytes) = &chunk {
+            hash_copy
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .update(bytes);
+        }
+        chunk
+    });
+    client
+        .upload(
+            client.url(&["records", &record.id, "draft", "files", key, "content"])?,
+            size,
+            BackendStream::new(stream),
+        )
+        .await?;
+    if hasher
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .finalize()
+        .blake3
+        != expected.finalize().blake3
+    {
+        return Err(invalid("crate file changed while uploading"));
+    }
+    let file = client.json(Method::POST, commit_url, None).await?;
+    verify_file(&file, &expected, size, true)?;
+    Ok(expected)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    destination: &RepositoryDestination,
+    client: &InvenioClient<'_>,
+    record: &RepositoryRecord,
+    published: bool,
+    metadata: [u8; 32],
+    files: &std::collections::BTreeMap<String, (Hasher, u64)>,
+) -> Result<RepositoryRecord, TransferError> {
+    let current_url = if published {
+        client.url(&["records", &record.id])?
+    } else {
+        client.url(&["records", &record.id, "draft"])?
+    };
+    let current = client.json(Method::GET, current_url, None).await?;
+    if metadata_digest(&current) != metadata {
+        return Err(invalid("repository metadata changed before publication"));
+    }
+    if current["parent"]["id"] != record.parent_id {
+        return Err(invalid("repository parent changed"));
+    }
+    if !destination.public_files && current["access"]["files"] != "restricted" {
+        return Err(invalid(
+            "repository file access is more public than requested",
+        ));
+    }
+    verify_files(client, record, published, files).await?;
+    if !destination.publish || published {
+        return record_from(client, &current);
+    }
+    guard(ctx, spec, destination).await?;
+    if let Some(community) = review_community(ctx, destination, &current).await? {
+        submit_review(client, record, &current, &community).await?;
+        let draft_url = client.url(&["records", &record.id, "draft"])?;
+        let mut result = record_from(client, &client.json(Method::GET, draft_url, None).await?)?;
+        result.in_review = true;
+        return Ok(result);
+    }
+    let result = client
+        .json(
+            Method::POST,
+            client.url(&["records", &record.id, "draft", "actions", "publish"])?,
+            None,
+        )
+        .await?;
+    if record_id(&result)? != record.id || result["is_published"] != true {
+        return Err(invalid("repository did not confirm publication"));
+    }
+    // Publishing cannot be undone, so later mismatches become a warning on the record.
+    let mut published = record_from(client, &result)?;
+    published.warning = if metadata_digest(&result) != metadata {
+        Some("published metadata changed".into())
+    } else if result["parent"]["id"] != record.parent_id {
+        Some("published parent changed".into())
+    } else if !destination.public_files && result["access"]["files"] != "restricted" {
+        Some("published file access is more public than requested".into())
+    } else {
+        verify_files(client, record, true, files)
+            .await
+            .err()
+            .map(|error| error.to_string())
+    };
+    Ok(published)
+}
+
+/// The connector's community when this draft is a record's first version, which needs review.
+async fn review_community(
+    ctx: &JobContext,
+    destination: &RepositoryDestination,
+    draft: &Value,
+) -> Result<Option<String>, TransferError> {
+    if draft["versions"]["index"] != 1
+        || !supports(RepositoryConnectorKind::Invenio, Action::Review)
+    {
+        return Ok(None);
+    }
+    let view = crate::jobs::repository::repository(
+        &ctx.driver,
+        destination.group_id,
+        destination.connector_id,
+    )
+    .await?;
+    Ok(view
+        .connector
+        .public_config
+        .get(INVENIO_COMMUNITY)
+        .filter(|community| !community.is_empty())
+        .cloned())
+}
+
+/// Submits the draft to the community; a submission still open stays as it is.
+async fn submit_review(
+    client: &InvenioClient<'_>,
+    record: &RepositoryRecord,
+    draft: &Value,
+    community: &str,
+) -> Result<(), TransferError> {
+    if draft["parent"]["review"]["status"] == "submitted" {
+        return Ok(());
+    }
+    let found = client
+        .json(Method::GET, client.url(&["communities", community])?, None)
+        .await?;
+    let id = found["id"]
+        .as_str()
+        .ok_or_else(|| invalid("community has no id"))?;
+    let request = json!({"receiver": {"community": id}, "type": "community-submission"});
+    client
+        .json(
+            Method::PUT,
+            client.url(&["records", &record.id, "draft", "review"])?,
+            Some(&request),
+        )
+        .await?;
+    client
+        .json(
+            Method::POST,
+            client.url(&["records", &record.id, "draft", "actions", "submit-review"])?,
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// The record's page for people, kept only on the repository's own origin.
+fn page_url(client: &InvenioClient<'_>, record: &Value) -> Option<String> {
+    let page = url::Url::parse(record["links"]["self_html"].as_str()?).ok()?;
+    let endpoint = url::Url::parse(client.endpoint()).ok()?;
+    (page.origin() == endpoint.origin() && page.username().is_empty() && page.password().is_none())
+        .then(|| page.to_string())
+}
+
+pub(super) fn invalid(message: &str) -> TransferError {
+    TransferError::Permanent(message.into())
+}

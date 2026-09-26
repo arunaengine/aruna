@@ -5,10 +5,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -22,6 +23,7 @@ use ulid::Ulid;
 
 use super::metrics::{InFlightGuard, StorageMetrics, StorageMetricsSnapshot};
 use super::owner::TransactionOwner;
+use super::sealing::{open_event, seal_effect};
 use super::telemetry::{effect_kind, storage_effect_kind, storage_effect_span, storage_event_kind};
 
 pub type EffectHandle = (StorageEffect, ResponseSender, Span, Instant, InFlightGuard);
@@ -86,6 +88,7 @@ pub struct StorageHandle {
     pub(super) metrics: Arc<StorageMetrics>,
     pub(super) transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
     pub(super) worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    pub(super) secret_key: Arc<OnceLock<CredentialEncryptionKey>>,
 }
 
 #[derive(Debug)]
@@ -140,9 +143,16 @@ impl StorageHandle {
                 metrics: Arc::new(StorageMetrics::default()),
                 transaction_cleanup: Arc::new(Mutex::new(BTreeMap::new())),
                 worker: Arc::new(Mutex::new(None)),
+                secret_key: Arc::new(OnceLock::new()),
             },
             StorageReceivers { foreground, bulk },
         )
+    }
+
+    /// Seals connector and backend secret rows with `key` from now on, for this
+    /// handle and all its clones. Set once at startup; a later key is ignored.
+    pub fn seal_secrets(&self, key: CredentialEncryptionKey) {
+        let _ = self.secret_key.set(key);
     }
 
     /// A handle whose effects dispatch on the bulk lane, served only when the
@@ -308,7 +318,18 @@ impl StorageHandle {
     pub(super) async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
-        let event = self.dispatch_queued(effect).await;
+        let (effect, opening) = match self.secret_key.get() {
+            Some(key) => match seal_effect(key, effect) {
+                Ok(sealed) => sealed,
+                Err(error) => return self.observe_storage_event(StorageEvent::Error { error }),
+            },
+            None => (effect, None),
+        };
+        let mut event = self.dispatch_queued(effect).await;
+        if let (Some(key), Some(opening)) = (self.secret_key.get(), opening) {
+            event = open_event(key, opening, event)
+                .unwrap_or_else(|error| self.observe_storage_event(StorageEvent::Error { error }));
+        }
         record_stage("storage", started.elapsed());
         event
     }

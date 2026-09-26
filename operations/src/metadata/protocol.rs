@@ -120,6 +120,8 @@ pub enum MetadataTransportMessage {
         /// record copy may be stale, so only an explicit request value travels.
         public: Option<bool>,
         mutation: UpdateDocumentMutation,
+        /// The holder refuses the update when the document moved past this event.
+        expected_revision: Option<Ulid>,
     },
     ForwardDeleteDocument {
         auth_token: Option<AuthToken>,
@@ -476,6 +478,21 @@ pub enum MetadataTransportMessage {
             aruna_core::structs::identity::group_delete::GroupDeletionError,
         >,
     },
+    /// Readable documents in the node's reverse index that hold one external identifier.
+    LookupIdentifier {
+        auth_token: Option<AuthToken>,
+        kind: aruna_core::structs::secondary_id::SecondaryIdKind,
+        value: String,
+        endpoint: Option<String>,
+    },
+    IdentifierMatches {
+        result: Result<Vec<crate::metadata::secondary_ids::IdentifierMatch>, MetadataReadError>,
+    },
+    /// A forwarded update refused because the document moved past the expected revision.
+    ForwardedRevisionConflict {
+        expected: Ulid,
+        current: Ulid,
+    },
 }
 
 /// One document as a holder serves it to a device.
@@ -567,6 +584,11 @@ pub enum PersistentIdRequest {
     },
     /// Trusted realm-peer read used by the authenticated typed status route.
     Status,
+    /// Union external identifiers into the mapping; needs WRITE on the document.
+    AddIdentifiers {
+        identifiers: Vec<aruna_core::structs::secondary_id::SecondaryIdentifier>,
+        occurred_at_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -888,6 +910,7 @@ mod tests {
             mutation: UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: "{}".to_string(),
             },
+            expected_revision: None,
         });
         assert_auth_token(MetadataTransportMessage::ForwardDeleteDocument {
             auth_token: Some(AuthToken::bearer("delete-token").unwrap()),

@@ -23,6 +23,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::jobs::repository::link_queue::queue_deleted;
 
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 
@@ -359,14 +360,20 @@ async fn process_prune_job(
         });
     };
 
-    match metadata_handle.prune_if_deleted(graph_iri.clone()).await {
-        Ok(_) => Ok(ProcessedJobGroup {
+    // A retry after a failed link queueing finds the graph already pruned, so it queues again.
+    let pruned = match metadata_handle.prune_if_deleted(graph_iri.clone()).await {
+        Ok(_) => queue_deleted(context, &graph_iri)
+            .await
+            .map_err(|error| format!("queueing the repository links failed: {error}")),
+        Err(error) => Err(error.to_string()),
+    };
+    match pruned {
+        Ok(()) => Ok(ProcessedJobGroup {
             completed_keys: job_keys,
             processed: 1,
         }),
         Err(error) => {
-            reschedule_prune_job(&context.storage_handle, &job_keys, &job, error.to_string())
-                .await?;
+            reschedule_prune_job(&context.storage_handle, &job_keys, &job, error).await?;
             Ok(ProcessedJobGroup {
                 completed_keys: Vec::new(),
                 processed: 1,

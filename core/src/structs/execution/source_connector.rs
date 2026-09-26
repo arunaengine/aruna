@@ -21,6 +21,9 @@ pub enum SourceConnectorKind {
     /// A directory the owner offers from their own device. It resolves only on
     /// that device, against a registration the device stores locally.
     LocalDirectory,
+    /// A file of an Invenio record read through a repository connector. It is
+    /// only created by reference imports, never registered as a source connector.
+    Invenio,
 }
 
 impl SourceConnectorKind {
@@ -32,6 +35,7 @@ impl SourceConnectorKind {
             Self::Ftp => "ftp",
             Self::ArunaNative => "aruna_native",
             Self::LocalDirectory => "local_directory",
+            Self::Invenio => "invenio",
         }
     }
 }
@@ -87,11 +91,21 @@ impl SourceConnector {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceConnectorSecret {
     pub connector_id: Ulid,
     pub secret_config: HashMap<String, String>,
     pub updated_at: SystemTime,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl fmt::Debug for SourceConnectorSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceConnectorSecret")
+            .field("connector_id", &self.connector_id)
+            .field("keys", &self.secret_config.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl SourceConnectorSecret {
@@ -128,6 +142,21 @@ mod tests {
 
     fn test_user_id(seed: u8) -> UserId {
         UserId::local(Ulid::from_bytes([seed; 16]), RealmId([seed; 32]))
+    }
+
+    #[test]
+    fn debug_hides_secrets() {
+        let secret = SourceConnectorSecret::new(
+            Ulid::from_bytes([1u8; 16]),
+            HashMap::from([("token".to_string(), "canary-7f3a".to_string())]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+
+        let rendered = format!("{secret:?}");
+
+        assert!(!rendered.contains("canary-7f3a"));
+        assert!(rendered.contains("token"));
     }
 
     #[test]

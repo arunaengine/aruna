@@ -54,6 +54,8 @@ pub struct UpdateDocumentConfig {
     pub document_id: Ulid,
     pub public: bool,
     pub mutation: UpdateDocumentMutation,
+    /// The newest event the caller based the change on; any later event fails the update.
+    pub expected_revision: Option<Ulid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,6 +142,8 @@ pub enum UpdateDocumentError {
     PlacementFenced,
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
+    #[error("the document changed since revision {expected}; it is now at {current}")]
+    RevisionConflict { expected: Ulid, current: Ulid },
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -756,6 +760,17 @@ impl UpdateDocumentOperation {
                         Ok(history) => history,
                         Err(error) => return self.fail(error),
                     };
+                // Log keys end in the event id, so the last one is the newest event.
+                let current = values
+                    .last()
+                    .and_then(|(key, _)| key.get(16..32))
+                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                    .map_or(Ulid::nil(), Ulid::from_bytes);
+                if let Some(expected) = self.config.expected_revision
+                    && expected != current
+                {
+                    return self.fail(UpdateDocumentError::RevisionConflict { expected, current });
+                }
                 if self
                     .raw_budget
                     .as_ref()
@@ -1090,6 +1105,7 @@ mod pure_tests {
             document_id: record.document_id,
             public: true,
             mutation,
+            expected_revision: None,
         }
     }
 
@@ -1646,6 +1662,60 @@ mod pure_tests {
                 txn_id: Some(write_txn),
                 ..
             })] if *write_txn == txn_id
+        ));
+    }
+
+    fn guarded_step(expected: Ulid) -> (UpdateDocumentOperation, Effects) {
+        let actor = actor();
+        let record = record(&actor);
+        let mut config = config(
+            actor,
+            &record,
+            UpdateDocumentMutation::ReplaceRoCrate {
+                jsonld: replace_jsonld(record.document_id, "pulled"),
+            },
+        );
+        config.expected_revision = Some(expected);
+        let mut operation = UpdateDocumentOperation::new(config);
+        operation.start();
+        operation.step(registry_read(&record));
+        operation.step(realm_config_read(&record));
+        operation.step(batch_planned(&record));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_parts(21, 21),
+        }));
+        operation.step(registry_read(&record));
+        operation.step(raw_missing_budget(&record));
+        let effects = operation.step(raw_events(&record));
+        (operation, effects)
+    }
+
+    #[test]
+    fn rejects_stale_revision() {
+        let stale = Ulid::from_parts(0, 7);
+        let (operation, effects) = guarded_step(stale);
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+                if *txn_id == Ulid::from_parts(21, 21)
+        ));
+        assert_eq!(
+            operation.finalize(),
+            Err(UpdateDocumentError::RevisionConflict {
+                expected: stale,
+                current: Ulid::from_parts(1, 1),
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_current_revision() {
+        let (_, effects) = guarded_step(Ulid::from_parts(1, 1));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite { .. })]
         ));
     }
 

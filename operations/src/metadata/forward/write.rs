@@ -265,6 +265,7 @@ pub async fn create_metadata_authorized(
     Ok(record)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn route_metadata_update(
     context: &Arc<DriverContext>,
     actor: Actor,
@@ -272,6 +273,7 @@ pub async fn route_metadata_update(
     document_id: Ulid,
     public: Option<bool>,
     mutation: UpdateDocumentMutation,
+    expected_revision: Option<Ulid>,
     auth_token: Option<AuthToken>,
 ) -> Result<MetadataRegistryRecord, MetadataWriteError> {
     let config = load_realm_config(context, actor.realm_id)
@@ -279,9 +281,11 @@ pub async fn route_metadata_update(
         .ok_or_else(|| {
             MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
         })?;
-    // On a device a selected document is edited locally and queued; a holder
-    // sees the change set when the intake drain forwards it.
-    if let Some(replica) = device_replica(context, &config, Some(actor.node_id), document_id).await
+    // On a device a selected document is edited locally and queued; a holder sees the change set
+    // when the intake drain forwards it. Only a holder can check an expected revision.
+    if expected_revision.is_none()
+        && let Some(replica) =
+            device_replica(context, &config, Some(actor.node_id), document_id).await
         && accepts_edits(&replica)
     {
         return apply_local_edit(context, actor.user_id, actor.node_id, &replica, mutation)
@@ -326,6 +330,7 @@ pub async fn route_metadata_update(
                 document_id,
                 public: public.unwrap_or(record.public),
                 mutation: mutation.clone(),
+                expected_revision,
             }),
             context.as_ref(),
         )
@@ -345,6 +350,7 @@ pub async fn route_metadata_update(
             document_id,
             public,
             mutation,
+            expected_revision,
         },
         local_holds.then_some(local_node_id),
         local_capacity,
@@ -373,6 +379,9 @@ pub async fn route_metadata_update(
         MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
             UpdateDocumentError::MetadataError(MetadataError::ProfileValidation(findings)).into(),
         ),
+        MetadataTransportMessage::ForwardedRevisionConflict { expected, current } => {
+            Err(UpdateDocumentError::RevisionConflict { expected, current }.into())
+        }
         other => Err(unexpected_response(other)),
     }
 }
@@ -734,6 +743,7 @@ pub(crate) async fn apply_forwarded_write(
             document_id,
             public,
             mutation,
+            expected_revision,
             ..
         } => {
             Box::pin(async {
@@ -763,6 +773,7 @@ pub(crate) async fn apply_forwarded_write(
                     document_id,
                     public: public.unwrap_or(record.public),
                     mutation,
+                    expected_revision,
                 });
                 match update_metadata_document(operation, context.as_ref()).await {
                     Ok(record) => MetadataTransportMessage::ForwardedRecord {
@@ -770,6 +781,9 @@ pub(crate) async fn apply_forwarded_write(
                     },
                     Err(UpdateDocumentError::RawLimit) => {
                         MetadataTransportMessage::MetadataHistoryCapacity
+                    }
+                    Err(UpdateDocumentError::RevisionConflict { expected, current }) => {
+                        MetadataTransportMessage::ForwardedRevisionConflict { expected, current }
                     }
                     Err(UpdateDocumentError::MetadataError(MetadataError::InvalidInput(
                         message,

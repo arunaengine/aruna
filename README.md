@@ -191,6 +191,27 @@ Onboarding only takes effect on a fresh data directory. Once a node has persiste
 
 For a ready-made multi-node onboarding flow, use `just local-cluster` instead of walking through the onboarding APIs manually.
 
+### Stored credentials
+
+Secrets of source connectors, repository connectors and group storage backends are encrypted at
+rest. So are Invenio link tokens and S3 secret keys. The encryption key is derived from the
+node's secret key, which the node keeps in its state under `STORAGE_PATH`. Only the same node
+can decrypt these secrets, and a restart derives the same key again. Back up `STORAGE_PATH` as a
+whole to keep them usable. A node restored without its state, or with another identity, cannot
+decrypt them: register the connector and backend secrets again with their `PUT` routes and
+replace each link token with `PUT .../token`. Secrets stored before this encryption are
+encrypted by the migrate run described under Upgrading.
+
+### Upgrading
+
+After upgrading a node, stop it and run `aruna-doctor migrate <STORAGE_PATH>` once before the new
+version starts. The run rewrites rows that older versions stored in an earlier layout: job records
+and their checkpoints, PID mappings and their queued publishes, and the realm configuration. It
+rebuilds the identifier index from the PID mappings and encrypts plain stored secrets. The output
+counts scanned and rewritten rows per kind and lists secret rows it could not read; those stay
+unchanged. A second run changes nothing. Without the migration the new version cannot read the old
+rows.
+
 ## Interactive Session Networking
 
 Interactive notebook sessions run in a container that must reach this node's S3 plane and nothing
@@ -256,6 +277,232 @@ The setting does not change replication, authorization, or RO-Crate semantics. M
 Object-backed RO-Crate imports copy the archive into a hidden seekable spool. Until that spool is
 deleted at the end of the import, the importing node can temporarily use roughly twice the archive's
 stored bytes; operators should reserve capacity accordingly.
+
+### Repository publishing: Invenio and Zenodo
+
+The native REST API publishes crates to repositories and imports records through durable jobs.
+The routes are generic; Invenio (including Zenodo) is the first repository kind.
+`GET /api/v1/metadata/repository/kinds` lists every kind that can publish, with its
+`capabilities` (`drafts`, `reserve_identifier`, `versions`, `review`, `pull`, `search`,
+`import`, `release_date` and `identifier_kind`), its requirement `profiles` and its mapping rule
+`targets`. An action the kind cannot do answers 400 with code `not_supported`: publishing,
+checks and links need a kind that publishes, `parent_id` and `published_id` need `versions`,
+imports need `import`, `keep_updated` needs `pull`, and DOI or URL lookups need `search`. Record
+ids are checked by the kind. A connector keeps its kind; replacing it with another kind answers
+400. Harvest-only kinds such as `oai_pmh` are not listed.
+
+A repository's requirements have three layers, all reported as Profile validation findings
+(`code`, `severity`, `focus_node`, `path`, `rule`, `message`). Built-in SHACL requirement
+Profiles check the crate metadata: `https://w3id.org/aruna/profiles/repository/zenodo` needs the
+DataCite fields (one plain text title and publication date, creators from `author` and `creator`
+with a name or family name, and a license as a warning), and
+`https://w3id.org/aruna/profiles/repository/invenio` also needs a `publisher`, as text or as an
+entity with a `name`. Zenodo endpoints use the first, other InvenioRDM instances the second.
+Mapping rules, embedded as JSON data per kind, say which crate entities become which repository
+objects and fields. They can group entities (with file pairs such as `_1` and `_2`) and require
+relations with a minimum, maximum or exact count, in either direction; breaks report
+`mapping_violation`. Content rules limit the files of a target (count, file size, total size and
+a `fastq`, `bam` or `cram` format read from the first bytes, also inside gzip or BGZF) and report
+`content_violation`. The check and the export count the same files: an Invenio record holds at
+most 100 files, and the crate metadata and export report count as two of them. Rules that the
+node would not evaluate never load. Only the crate satisfies requirements; `metadata` overrides
+never do, and a record whose mapped fields lack a required field, for example creators cleared
+by an override, fails the job before any repository write.
+
+`POST /api/v1/metadata/{document_id}/repository/check` with `group_id`, `connector_id` and an
+optional `metadata` object checks the dataset without storing or sending anything. It answers
+`kind`, `profile` (`iri`, `revision`), `ready` (no finding is a violation), `findings` (at most
+100, violations first, with `omitted_findings` counting the rest; structural crate violations
+have rule `structural`) and `mapping`, which says what each crate entity becomes. It requires READ on the dataset and on the
+connector group's metadata path.
+
+Create an Invenio repository
+connector with `POST /api/v1/metadata/groups/{group_id}/repositories`, `kind` set to `invenio`
+and `endpoint` set to the repository API root, for example `https://zenodo.org/api/` or
+`https://sandbox.zenodo.org/api/`. Store a repository personal access token in
+`secret_config.token` for private imports. Exports require the requesting user's
+own Invenio/Zenodo access token in `repository.access_token`; the connector token is never used
+for publishing. The node's egress policy applies to all requests.
+
+Search published records with
+`GET /api/v1/metadata/groups/{group_id}/repositories/{connector_id}/records`, passing `q`,
+`page` and `size` as query parameters. Results use the native repository
+JSON representation. Pages start at 1, size is at most 25, and `all_versions=true` includes
+older published versions. Search requires READ on the connector group's metadata path and does
+not import data.
+
+Import a record with `POST /api/v1/metadata/repository/imports`:
+
+```json
+{
+  "group_id": "<connector-group-id>",
+  "connector_id": "<repository-connector-id>",
+  "record_id": "1234567",
+  "mode": "copy",
+  "all_versions": true,
+  "target": {"bucket": "research", "prefix": "zenodo/1234567"},
+  "metadata": {"group_id": "<destination-group-id>", "path": "datasets/zenodo", "public": false},
+  "idempotency_key": "import-zenodo-1234567"
+}
+```
+
+Instead of `record_id`, name the record by `doi` (a version DOI selects that version, a concept
+DOI the latest one) or by `url`, a record page or API URL on the connector's repository. Give
+exactly one of the three.
+
+Every accessible published version becomes a separate dataset within the imported crate by
+default. Set `all_versions: false` to import only the selected version. Mode `copy` copies files
+and checks their source sizes and checksums. Mode `reference` creates native Aruna object
+references, reading repository bytes on demand; the target bucket and connector must share
+a group. Mode `metadata` skips attached files and file-list requests, allowing metadata imports
+without access to restricted data. References depend on remote availability and credentials.
+Each version contains `invenio-record.json`, preserving the complete returned record JSON
+and, in copy/reference modes, file-list metadata, including
+DOIs, concept identifiers, timestamps, relations, creator identifiers and custom fields.
+Foreign identifiers remain provenance; Aruna assigns local document and object identities.
+Filenames are encoded in storage paths so repeated or unsafe source names cannot collide.
+Source names remain in the metadata. Missing files, incomplete pagination and checksum
+failures fail the transfer. Hidden edit histories and inaccessible or deleted records are
+not exposed by the repository API and cannot be reconstructed. Native metadata scalar values
+are queryable as `additionalProperty` entries whose `propertyID` is a JSON-pointer-style path,
+such as `metadata/funding/0/award/number`. Partial publication dates use their earliest day for
+crate validation; `https://w3id.org/aruna/invenio/publicationDate` retains the exact original
+date or interval, which is restored on export when the mapped date has not been edited.
+
+Export with `POST /api/v1/metadata/{document_id}/repository/exports`:
+
+```json
+{
+  "repository": {
+    "group_id": "<connector-group-id>",
+    "connector_id": "<repository-connector-id>",
+    "access_token": "<personal-access-token>",
+    "publish": false
+  },
+  "idempotency_key": "export-research-dataset"
+}
+```
+
+Exports create native Invenio records with each data file uploaded separately under its crate
+path. Files can be listed and downloaded directly through Invenio/Zenodo. The RO-Crate JSON is
+also retained as a provenance file for fields without a native equivalent. Repository metadata
+is derived from the crate's standard schema.org
+fields; optional `repository.metadata` fields override the mapping. Imported native metadata,
+including affiliations, funding, relations and resource type, is retained when its corresponding
+crate fields are unchanged. Custom fields are also restored; the destination must support
+their vocabulary. Override controlled vocabulary fields for the target repository as needed.
+Source identifiers become provenance relations;
+the transfer does not claim an existing source DOI as a newly issued repository DOI.
+Exports with omitted files fail. Web data entities, `File` entities with an `https://` identifier
+and no Aruna bytes, stay in the crate and become `references` relations. The request fails with
+400, code `requirements_unmet` and the `findings` when the crate does not meet the repository's
+requirements. A crate with more files than the record holds fails the job before a draft is
+created. Creator identifiers are sent only for ORCID, GND, ISNI and ROR.
+Every new draft reserves its DOI, which `result.repository.identifier` shows;
+`result.repository.concept_identifier` is the DOI of every version.
+`publish: false` (the default) leaves an unpublished draft with restricted file access;
+`publish: true` publishes after verifying every uploaded file. Repository validation and
+publication permissions still apply. Set `repository.public_files: true` explicitly to make
+the files public; otherwise files remain restricted. This also applies to existing drafts,
+whose metadata is replaced by the mapped crate metadata. When the connector names a
+`community`, publishing a record's first version submits it to that community for review
+instead, and `result.repository.in_review` is true.
+
+Set `repository.published_id` to an existing published record ID to create its next version
+under the same parent identifier. This requires permission on that record. A new-version draft
+inherits repository access settings and may already exist; unexpected files cause a failure.
+Supply `draft_id` alongside `published_id` when recovering that draft. Metadata updates use the
+captured draft revision and fail on conflicts. Metadata and the complete file set are checked
+before and after publication; the upstream publication action has no atomic revision guard.
+Exporting an imported history remains one crate snapshot unless versions are submitted
+separately. Original publication timestamps and hidden edit histories are not recreated.
+
+The user's personal token determines the owning Invenio/Zenodo account; bibliographic authors
+come from the crate's creators. Aruna encrypts the token for the job's retention period, binding
+it to the requesting user, node, connector and endpoint. It is never echoed in responses,
+debug output or public job results. Each export submission requires the user's token; changing the
+token changes the idempotency identity. No shared publishing account is selected implicitly.
+
+The response provides job status and report URLs; the existing job API also supports cancellation.
+Successful exports include `result.repository` with the record ID, parent ID, revision, assigned
+DOI and concept DOI when available, API URL, page URL and publication state. Both transfers
+support `idempotency_key`.
+An ambiguous draft-creation response stops
+automatic creation; inspect the repository and supply `repository.draft_id` in a new request
+to reuse the unpublished draft. Failed or cancelled transfers leave remote drafts available
+for inspection. Import requires connector-group READ and destination WRITE, and with
+`keep_updated` also connector-group WRITE, as managing a link does. Export requires crate WRITE,
+because it publishes the dataset under a repository record, and connector-group WRITE. Queued
+identifier registration checks WRITE on the dataset as the submitting user.
+
+A link keeps a dataset in sync with one Invenio record lineage. Create it with
+`POST /api/v1/metadata/{document_id}/repository/links` and a body with `group_id`, `connector_id`
+and the user's `access_token`. It requires WRITE on the dataset and on the connector group's
+metadata path. Set `parent_id` to continue an existing record, for example the
+imported source. The node that creates the link must hold the dataset; it seals the token for
+that link and becomes the link's owner. Creation fails with 400, code `requirements_unmet` and
+the `findings` when the crate does not meet the repository's requirements. The first push is queued right away. Later changes push
+10 seconds after the last change, at most 5 minutes after the first waiting one, as one
+`export_rocrate` job, and `POST .../links/{link_id}/push` queues one at once. Pushes update one
+open draft, which keeps its reserved DOI (`remote.identifier` with `remote.identifier_reserved`;
+the link's `identifier_kind` is `doi`) and is kept even when a push fails. Publish it with
+`POST .../links/{link_id}/publish`, or set `auto_publish` to publish once the draft has been
+quiet for 15 minutes. With a connector community, the first version goes to community review
+and `remote.review` shows `pending`, then `accepted` or `declined`. A declined review shows
+reason `review_declined` on the enabled link: pushes still update the draft, `auto_publish`
+waits, and an explicit publish submits the draft again. After a publish, the next
+push creates a new version. A check that fails after the repository published becomes
+`warning`; the published record and DOI are always kept. `remote.state` sums up the repository
+side: `none`, `draft`, `review` or `published`.
+
+A push fails the link instead of leaving out files or overwriting remote edits. Reasons are
+`remote_changed` when the draft was edited in the repository, a file appeared there or the
+lineage has a newer version, `token_rejected`, `source_unavailable` when a file has no
+readable copy or a referenced origin changed, `requirements_unmet` with the `findings` on the
+link, and `owner_not_holder`. A link that failed on unmet requirements retries after the next
+dataset change.
+`POST .../links/{link_id}/accept-remote` makes the repository's current state the new base and
+enables the link again. `PATCH` pauses or resumes a link and changes its options,
+`PUT .../token` replaces the token, and `DELETE` removes the link and its token. Pausing or
+deleting cancels a running push. Only the link creator may publish, replace the token or change
+`auto_publish`, `public_files` and `metadata`; group admins may pause, resume, push, accept
+remote changes and delete. Deleting the dataset removes its links and their tokens as well.
+Remote records always stay.
+
+Set `keep_updated: true` on an import to keep the new dataset updated from the record lineage.
+The import then creates a pull link (`direction: "pull"`) owned by the importing node. It asks
+the repository once a day for a new version, with the connector's token if the connector has
+one, and waits longer after busy or unreachable answers. A new version or repository edit shows
+as reason `update_available` on the enabled link. `POST .../links/{link_id}/pull` imports it as
+an `import_rocrate` job, and with `auto_update: true` (on import or through `PATCH`) this
+happens by itself. The new version becomes a new `versions/{id}/` part with its files in the
+first import's mode, the dataset root takes its metadata through a normal metadata update and
+its identifiers are registered. After a local edit of the dataset, automatic updates stop and
+the link shows `local_changed`; an explicit pull then overwrites the root metadata but keeps
+local parts and files. One dataset cannot have an enabled push link and an enabled pull link
+for the same record lineage.
+
+Imports and pushes record the version DOI, concept DOI, record ID and parent ID as secondary
+identifiers of the dataset, with origin `imported` or `published`. Exports add them to the crate
+they send without editing the dataset. `GET /api/v1/metadata/{document_id}/pids` lists them, and
+`GET /api/v1/pid/lookup?kind=doi&value=<doi>` lists every readable dataset that holds one
+identifier, published ones first. Any node of the realm answers it; 404 means no readable match.
+
+The opt-in `invenio::live::native_repository` test exercises a real local Invenio instance.
+Set `ARUNA_INVENIO_ENDPOINT` to its loopback API URL, `ARUNA_INVENIO_TOKEN_FILE` to an
+owner-readable personal-token file, and `ARUNA_INVENIO_USER_ID` to the corresponding numeric
+account ID. Run `cargo test -p aruna-operations --test rocrate_drivers
+invenio::live::native_repository -- --ignored --exact`. It creates and publishes disposable
+records, checks ownership and restricted access, creates another version, and tests search,
+copy imports, reference reads and metadata-only imports. Use a disposable repository with
+external DOI registration and email disabled.
+
+The opt-in `invenio::live::pull_update` test publishes two versions on the same instance, imports
+the first with `keep_updated` and checks that the daily check pulls the second with its DOI.
+
+The opt-in `invenio::live::zenodo_reference` test imports a public Zenodo record in copy,
+reference and metadata modes and compares every file with the bytes Zenodo serves. It needs
+network access to zenodo.org. `ARUNA_ZENODO_RECORD` selects the record, default `16623955`.
 
 ## License
 

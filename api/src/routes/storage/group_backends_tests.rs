@@ -164,3 +164,20 @@ async fn lists_empty_backends() {
 
     assert!(listed.backends.is_empty());
 }
+
+#[test]
+fn request_hides_secrets() {
+    let request = CreateBackendRequest {
+        name: "n".into(),
+        kind: "s3".into(),
+        public_config: HashMap::new(),
+        secret_config: HashMap::from([(
+            "secret_access_key".to_string(),
+            "canary-8d4f".to_string(),
+        )]),
+        cleanup: None,
+    };
+    let text = format!("{request:?}");
+    assert!(!text.contains("canary-8d4f"), "{text}");
+    assert!(text.contains("secret_access_key"), "{text}");
+}

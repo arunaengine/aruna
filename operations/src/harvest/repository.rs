@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
@@ -18,7 +18,7 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 pub use crate::connectors::repository::StorageReadError;
-use crate::storage_read::parse_storage_read;
+use crate::storage_read::{parse_storage_iter, parse_storage_read};
 
 pub const HARVEST_PAGE_SIZE: usize = 128;
 
@@ -72,6 +72,24 @@ pub fn read_connector_effect(
     })
 }
 
+pub fn read_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: CONNECTOR_SECRET_KEYSPACE.to_string(),
+        key: connector_secret_key(connector_id),
+        txn_id,
+    })
+}
+
+pub fn iter_connectors_effect(group_id: GroupId, start_after: Option<Key>) -> Effect {
+    Effect::Storage(StorageEffect::Iter {
+        key_space: CONNECTOR_INDEX_KEYSPACE.to_string(),
+        prefix: Some(connector_prefix(group_id)),
+        start: start_after.map(IterStart::After),
+        limit: HARVEST_PAGE_SIZE,
+        txn_id: None,
+    })
+}
+
 pub fn read_source_effect(group_id: GroupId, source_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: HARVEST_SOURCE_KEYSPACE.to_string(),
@@ -119,6 +137,18 @@ pub fn write_provenance_effect(
 
 pub fn parse_connector_read(event: Event) -> Result<Option<RepositoryConnector>, StorageReadError> {
     parse_storage_read(event, RepositoryConnector::from_bytes)
+}
+
+pub fn parse_secret_read(
+    event: Event,
+) -> Result<Option<RepositoryConnectorSecret>, StorageReadError> {
+    parse_storage_read(event, RepositoryConnectorSecret::from_bytes)
+}
+
+pub fn parse_connector_iter(
+    event: Event,
+) -> Result<(Vec<RepositoryConnector>, Option<Key>), StorageReadError> {
+    parse_storage_iter(event, RepositoryConnector::from_bytes)
 }
 
 pub fn parse_source_read(event: Event) -> Result<Option<HarvestSource>, StorageReadError> {

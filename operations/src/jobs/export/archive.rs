@@ -74,16 +74,20 @@ pub(super) fn plan_export(
     let unrewritten = scan_unrewritten(&document, &replacements);
     rewrite_ids(&mut document, &replacements);
     checkpoint.report = build_rows(&checkpoint.entities, &unrewritten);
-    let has_omissions = checkpoint.report.iter().any(|row| {
-        matches!(
-            row.code,
-            ReasonCode::External
-                | ReasonCode::Denied
-                | ReasonCode::Missing
-                | ReasonCode::Offline
-                | ReasonCode::Unsupported
-        )
-    });
+    let has_omissions = if spec.destination.is_some() {
+        blocking_omissions(&checkpoint.report) > 0
+    } else {
+        checkpoint.report.iter().any(|row| {
+            matches!(
+                row.code,
+                ReasonCode::External
+                    | ReasonCode::Denied
+                    | ReasonCode::Missing
+                    | ReasonCode::Offline
+                    | ReasonCode::Unsupported
+            )
+        })
+    };
     checkpoint.report_json = if has_omissions {
         let report = build_report(checkpoint)?;
         add_report(&mut document)?;
@@ -1177,6 +1181,7 @@ pub(super) async fn publish_export(
     }
     let (included, omitted) = report_counts(&checkpoint.report);
     JobRunOutcome::Succeeded(JobResultPayload::ExportRoCrate(ExportRoCrateResult {
+        repository: checkpoint.repository.clone(),
         artifact: Some(artifact),
         included,
         omitted,
@@ -1201,6 +1206,25 @@ pub(super) fn report_counts(rows: &[ExportReportRow]) -> (u64, ExportOmissionCou
     (included, omitted)
 }
 
+/// Omissions a repository record cannot hold; web data entities stay as `references`.
+pub(crate) fn blocking_omissions(rows: &[ExportReportRow]) -> usize {
+    rows.iter()
+        .filter(|row| match row.code {
+            ReasonCode::External => !web_entity(&row.detail.entity_id),
+            ReasonCode::Denied
+            | ReasonCode::Missing
+            | ReasonCode::Offline
+            | ReasonCode::Unsupported => true,
+            _ => false,
+        })
+        .count()
+}
+
+/// A data entity on the web, which a crate may name without carrying its bytes.
+pub(crate) fn web_entity(entity_id: &str) -> bool {
+    entity_id.starts_with("https://") || entity_id.starts_with("http://")
+}
+
 pub(super) async fn discard_artifact(
     ctx: &JobContext,
     checkpoint: &mut ExportCheckpoint,
@@ -1216,12 +1240,20 @@ pub(super) async fn discard_artifact(
     }
 }
 
-pub(super) async fn read_export_checkpoint(
+pub(crate) async fn read_export_checkpoint(
     ctx: &JobContext,
     job_id: JobId,
 ) -> Result<Option<ExportCheckpoint>, String> {
+    stored_checkpoint(&ctx.driver.storage_handle, job_id).await
+}
+
+/// The checkpoint an export job left, also after the job ended.
+pub(crate) async fn stored_checkpoint(
+    storage: &aruna_storage::StorageHandle,
+    job_id: JobId,
+) -> Result<Option<ExportCheckpoint>, String> {
     read_state(
-        &ctx.driver.storage_handle,
+        storage,
         JOB_STATE_KEYSPACE,
         ByteView::from(job_id.to_bytes().to_vec()),
         "export checkpoint",
@@ -1229,7 +1261,7 @@ pub(super) async fn read_export_checkpoint(
     .await
 }
 
-pub(super) async fn persist_checkpoint(
+pub(crate) async fn persist_checkpoint(
     ctx: &JobContext,
     checkpoint: &ExportCheckpoint,
 ) -> Result<(), String> {

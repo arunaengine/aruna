@@ -6,10 +6,14 @@ use crate::NodeId;
 use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::keyspaces::SECONDARY_ID_KEYSPACE;
 use crate::structs::execution::job::JobId;
 use crate::structs::placement::record::PlacementRef;
+use crate::structs::secondary_id::{SecondaryIdentifier, insert_identifier};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+use byteview::ByteView;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use ulid::Ulid;
 
 /// What a persistent identifier resolves to. Only `Conceptual` is built now; a
@@ -93,6 +97,9 @@ pub struct PersistentIdMapping {
     pub withdrawn_by: Option<UserId>,
     pub withdrawal_reason: Option<String>,
     pub revision: PersistentIdRevision,
+    /// External identifiers such as repository DOIs. A grow-only set where `Published` outranks
+    /// `Imported`, so every merge order converges. Live rows keep reverse index rows.
+    pub secondary_identifiers: BTreeSet<SecondaryIdentifier>,
 }
 
 impl PersistentIdMapping {
@@ -138,6 +145,7 @@ impl PersistentIdMapping {
             withdrawn_by: None,
             withdrawal_reason: None,
             revision,
+            secondary_identifiers: BTreeSet::new(),
         }
     }
 
@@ -266,15 +274,83 @@ impl PersistentIdMapping {
             self.minted_at_ms = Some(minted_at_ms);
             self.minted_by = incoming.minted_by;
         }
+        self.add_identifiers(incoming.secondary_identifiers.iter().cloned());
         *self != before
+    }
+
+    /// Unions identifiers with the origin rule and returns whether any changed.
+    pub fn add_identifiers(
+        &mut self,
+        identifiers: impl IntoIterator<Item = SecondaryIdentifier>,
+    ) -> bool {
+        let mut changed = false;
+        for identifier in identifiers {
+            changed |= insert_identifier(&mut self.secondary_identifiers, identifier);
+        }
+        changed
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
 
+    /// Also reads the shape before the secondary identifiers, so old rows and signed oplog
+    /// entries still replay; they read with an empty identifier set.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        match postcard::from_bytes(bytes) {
+            Ok(mapping) => Ok(mapping),
+            Err(error) => match postcard::take_from_bytes::<LegacyMapping>(bytes) {
+                Ok((legacy, [])) => Ok(legacy.into()),
+                _ => Err(error.into()),
+            },
+        }
+    }
+}
+
+/// Previous shape of `PersistentIdMapping`, before the secondary identifiers.
+#[derive(Serialize, Deserialize)]
+pub struct LegacyMapping {
+    pub pid: String,
+    pub target: Ulid,
+    pub kind: PersistentIdKind,
+    pub provider: PersistentIdProvider,
+    pub status: PersistentIdStatus,
+    pub requested_at_ms: Option<u64>,
+    pub requested_by: Option<UserId>,
+    pub job_id: Option<JobId>,
+    pub public: Option<bool>,
+    pub permission_path: Option<String>,
+    pub minted_at_ms: Option<u64>,
+    pub minted_by: Option<UserId>,
+    pub failure: Option<PersistentIdFailure>,
+    pub withdrawn_at_ms: Option<u64>,
+    pub withdrawn_by: Option<UserId>,
+    pub withdrawal_reason: Option<String>,
+    pub revision: PersistentIdRevision,
+}
+
+impl From<LegacyMapping> for PersistentIdMapping {
+    fn from(legacy: LegacyMapping) -> Self {
+        Self {
+            pid: legacy.pid,
+            target: legacy.target,
+            kind: legacy.kind,
+            provider: legacy.provider,
+            status: legacy.status,
+            requested_at_ms: legacy.requested_at_ms,
+            requested_by: legacy.requested_by,
+            job_id: legacy.job_id,
+            public: legacy.public,
+            permission_path: legacy.permission_path,
+            minted_at_ms: legacy.minted_at_ms,
+            minted_by: legacy.minted_by,
+            failure: legacy.failure,
+            withdrawn_at_ms: legacy.withdrawn_at_ms,
+            withdrawn_by: legacy.withdrawn_by,
+            withdrawal_reason: legacy.withdrawal_reason,
+            revision: legacy.revision,
+            secondary_identifiers: BTreeSet::new(),
+        }
     }
 }
 
@@ -285,6 +361,10 @@ fn status_supersedes(local: &PersistentIdMapping, incoming: &PersistentIdMapping
         // The first terminal transition wins and remains the durable cause.
         (true, true) => revision_key(incoming.revision) < revision_key(local.revision),
         (false, false) => match (local.status, incoming.status) {
+            // Identifier additions advance an active row, so the later one must win.
+            (PersistentIdStatus::Active, PersistentIdStatus::Active) => {
+                revision_key(incoming.revision) > revision_key(local.revision)
+            }
             (PersistentIdStatus::Active, _) => false,
             (_, PersistentIdStatus::Active) => true,
             _ => revision_key(incoming.revision) > revision_key(local.revision),
@@ -294,6 +374,42 @@ fn status_supersedes(local: &PersistentIdMapping, incoming: &PersistentIdMapping
 
 fn revision_key(revision: PersistentIdRevision) -> (u64, Ulid) {
     (revision.occurred_at_ms, revision.event_id)
+}
+
+/// Reverse index rows of a live mapping, pointing at its document. Writing them again is
+/// idempotent, so each writer of the row writes all of them. Retired rows keep none.
+pub fn secondary_index_entries(mapping: &PersistentIdMapping) -> Vec<(String, ByteView, ByteView)> {
+    if mapping.is_retired() {
+        return Vec::new();
+    }
+    secondary_index_keys(mapping)
+        .map(|(keyspace, key)| {
+            (
+                keyspace,
+                key,
+                ByteView::from(mapping.target.to_bytes().to_vec()),
+            )
+        })
+        .collect()
+}
+
+/// Reverse index rows a retired mapping removes; empty while the mapping is live.
+pub fn secondary_index_deletes(mapping: &PersistentIdMapping) -> Vec<(String, ByteView)> {
+    if !mapping.is_retired() {
+        return Vec::new();
+    }
+    secondary_index_keys(mapping).collect()
+}
+
+fn secondary_index_keys(
+    mapping: &PersistentIdMapping,
+) -> impl Iterator<Item = (String, ByteView)> + '_ {
+    mapping.secondary_identifiers.iter().map(|identifier| {
+        (
+            SECONDARY_ID_KEYSPACE.to_string(),
+            ByteView::from(identifier.index_key(mapping.target)),
+        )
+    })
 }
 
 /// Mapping key: the document id alone, so a re-mint resolves the same row.
@@ -336,6 +452,7 @@ pub struct MintPersistentSpec {
 mod tests {
     use super::*;
     use crate::structs::identity::realm::RealmId;
+    use crate::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 
     fn user() -> UserId {
         UserId::local(Ulid::from_bytes([2; 16]), RealmId([3; 32]))
@@ -447,6 +564,69 @@ mod tests {
         assert!(mapping.is_active());
     }
 
+    fn doi(value: &str, origin: IdentifierOrigin) -> SecondaryIdentifier {
+        SecondaryIdentifier::new(SecondaryIdKind::Doi, value, None, origin).unwrap()
+    }
+
+    #[test]
+    fn merge_unions_identifiers() {
+        let id = Ulid::from_bytes([1; 16]);
+        let mut left = active_mapping(id, revision(1, 5));
+        left.secondary_identifiers
+            .insert(doi("10.1/a", IdentifierOrigin::Imported));
+        left.revision = revision(2, 6);
+        let mut right = active_mapping(id, revision(1, 5));
+        right
+            .secondary_identifiers
+            .insert(doi("10.1/b", IdentifierOrigin::Published));
+        right
+            .secondary_identifiers
+            .insert(doi("10.1/a", IdentifierOrigin::Published));
+        right.revision = revision(3, 7);
+
+        let mut forward = left.clone();
+        assert!(forward.merge(&right));
+        let mut backward = right.clone();
+        assert!(!backward.merge(&left));
+        assert_eq!(forward, backward);
+        // The later revision wins, so holders record the same sync revision.
+        assert_eq!(forward.revision, revision(3, 7));
+        assert_eq!(
+            forward.secondary_identifiers,
+            BTreeSet::from([
+                doi("10.1/a", IdentifierOrigin::Published),
+                doi("10.1/b", IdentifierOrigin::Published),
+            ])
+        );
+        assert!(!forward.clone().merge(&left));
+
+        let entries = secondary_index_entries(&forward);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|(keyspace, key, value)| {
+            keyspace == SECONDARY_ID_KEYSPACE
+                && key.ends_with(&id.to_bytes())
+                && value.as_ref() == id.to_bytes()
+        }));
+        assert!(secondary_index_deletes(&forward).is_empty());
+    }
+
+    #[test]
+    fn retired_drops_index() {
+        let id = Ulid::from_bytes([1; 16]);
+        let mut mapping = active_mapping(id, revision(1, 5));
+        mapping
+            .secondary_identifiers
+            .insert(doi("10.1/a", IdentifierOrigin::Imported));
+        assert!(mapping.mark_tombstoned(revision(2, 6)));
+        assert!(secondary_index_entries(&mapping).is_empty());
+        let deletes = secondary_index_deletes(&mapping);
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(
+            deletes[0].1.as_ref(),
+            doi("10.1/a", IdentifierOrigin::Imported).index_key(id)
+        );
+    }
+
     #[test]
     fn change_follows_row() {
         let id = Ulid::from_bytes([9; 16]);
@@ -462,6 +642,16 @@ mod tests {
         assert_eq!(change.current.actor, node(7));
         assert_eq!(change.kind, DocumentChangeKind::Upsert);
         assert_eq!(change.placement, placement);
+    }
+
+    #[test]
+    fn reads_legacy_mapping() {
+        let mapping = active_mapping(Ulid::from_bytes([9; 16]), revision(1, 7));
+        let bytes = mapping.to_bytes().unwrap();
+        // Postcard is positional: the old shape is the current one without the empty set.
+        let legacy = &bytes[..bytes.len() - 1];
+        assert_eq!(PersistentIdMapping::from_bytes(legacy).unwrap(), mapping);
+        assert!(PersistentIdMapping::from_bytes(&legacy[..legacy.len() - 1]).is_err());
     }
 
     #[test]

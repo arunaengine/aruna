@@ -4,12 +4,15 @@
 
 use aruna_core::structs::execution::job::{JobError, JobResultPayload};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdFailure};
 use aruna_core::time::unix_timestamp_millis;
 
 use crate::metadata::AuthToken;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::persistent_id::forward::{fail_pid_routed, mint_pid_routed};
+use crate::metadata::persistent_id::forward::{
+    add_identifiers_routed, fail_pid_routed, mint_pid_routed,
+};
 
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 
@@ -55,6 +58,50 @@ pub async fn run_mint_pid(ctx: &JobContext, spec: &MintPersistentSpec) -> JobRun
             }
             JobRunOutcome::Failed(JobError::retryable(format!("persistent id mint: {error}")))
         }
+    }
+}
+
+/// How long identifier registration waits for a missing mapping without using attempts.
+const IDENTIFIER_WAIT_MS: u64 = 600_000;
+
+/// Adds repository identifiers through the document's authority. An unreachable authority
+/// defers the job without using an attempt, so registration waits for it instead of failing.
+pub async fn run_register_identifiers(
+    ctx: &JobContext,
+    spec: &RegisterIdentifiersSpec,
+) -> JobRunOutcome {
+    let result = add_identifiers_routed(
+        &ctx.driver,
+        spec.auth_context.realm_id,
+        spec.document_id,
+        spec.identifiers.clone(),
+        unix_timestamp_millis(),
+        spec.auth_context.clone(),
+    )
+    .await;
+    match result {
+        Ok((_, changed)) => JobRunOutcome::Succeeded(JobResultPayload::Identifiers { changed }),
+        // The authority may not have the mapping yet; after the wait, attempts bound the retries.
+        Err(MetadataApiError::NotFound)
+            if unix_timestamp_millis().saturating_sub(ctx.job_id.timestamp_ms())
+                < IDENTIFIER_WAIT_MS =>
+        {
+            JobRunOutcome::Deferred(JobError::retryable(
+                "registering identifiers is waiting for the persistent id mapping",
+            ))
+        }
+        Err(error @ MetadataApiError::NotFound) => JobRunOutcome::Failed(JobError::retryable(
+            format!("registering identifiers: {error}"),
+        )),
+        Err(error @ (MetadataApiError::Forbidden | MetadataApiError::Unauthorized)) => {
+            tracing::warn!(document_id = %spec.document_id, %error, "identifiers not registered");
+            JobRunOutcome::Failed(JobError::permanent(format!(
+                "registering identifiers: {error}"
+            )))
+        }
+        Err(error) => JobRunOutcome::Deferred(JobError::retryable(format!(
+            "registering identifiers: {error}"
+        ))),
     }
 }
 

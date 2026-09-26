@@ -289,6 +289,7 @@ fn too_many_requests(retry_after: u64) -> Response {
         details: None,
         violations: None,
         findings: None,
+        omitted_findings: None,
         quota: None,
     })
     .unwrap_or_else(|_| b"{\"error\":\"too many requests\"}".to_vec());

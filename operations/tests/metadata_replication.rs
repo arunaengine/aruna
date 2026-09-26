@@ -237,6 +237,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
             mutation: UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#.to_string(),
             },
+            expected_revision: None,
         }),
         nodes[0].context.as_ref(),
     )
@@ -484,6 +485,7 @@ async fn seed_and_update(
             mutation: UpdateDocumentMutation::UpsertDataEntity {
                 jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#.to_string(),
             },
+            expected_revision: None,
         }),
         nodes[0].context.as_ref(),
     )
@@ -718,6 +720,7 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
             mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: updated_jsonld,
             },
+            expected_revision: None,
         }),
         nodes[0].context.as_ref(),
     )

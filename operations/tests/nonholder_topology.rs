@@ -1105,6 +1105,7 @@ async fn update_routed(
                 UpdateDocumentMutation::UpsertDataEntity {
                     jsonld: jsonld.to_string(),
                 },
+                None,
                 Some(realm.bearer_token()),
             )
             .await

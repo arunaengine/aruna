@@ -295,6 +295,14 @@ pub enum ImportRoCrateSource {
         connector_id: Ulid,
         path: String,
     },
+    Repository {
+        group_id: GroupId,
+        connector_id: Ulid,
+        record_id: String,
+        options: crate::repository::ImportOptions,
+        /// Set when the import keeps a pull link or updates one.
+        pull: Option<crate::repository::RepositoryPull>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +367,7 @@ pub struct ImportRoCrateSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRoCrateSpec {
+    pub destination: Option<crate::repository::RepositoryDestination>,
     pub auth_context: AuthContext,
     pub document_id: Ulid,
     pub limits: RoCrateLimits,
@@ -523,6 +532,7 @@ pub struct ExportOmissionCounts {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRoCrateResult {
+    pub repository: Option<crate::repository::RepositoryRecord>,
     pub artifact: Option<ArtifactRef>,
     pub included: u64,
     pub omitted: ExportOmissionCounts,
@@ -592,6 +602,8 @@ pub enum JobPayload {
     /// One object copy the request path handed off because its source must be
     /// pulled from a reference first. Safe to requeue: a rerun copies again.
     CopyObject(CopyJobSpec),
+    /// Adds repository identifiers to a document's PID mapping. Internal and idempotent.
+    RegisterIdentifiers(crate::structs::secondary_id::RegisterIdentifiersSpec),
 }
 
 impl ExecutionSpec {
@@ -622,7 +634,8 @@ impl JobPayload {
             | Self::WriteRunCrate { .. }
             | Self::TerminalCleanup { .. }
             | Self::ExportRoCrate(_)
-            | Self::MintPersistentId(_) => None,
+            | Self::MintPersistentId(_)
+            | Self::RegisterIdentifiers(_) => None,
         }
     }
 
@@ -640,6 +653,7 @@ impl JobPayload {
             JobPayload::MintPersistentId(_) => "mint_persistent_id",
             JobPayload::StoragePurge(_) => "storage_purge",
             JobPayload::CopyObject(_) => "copy_object",
+            JobPayload::RegisterIdentifiers(_) => "register_identifiers",
         }
     }
 
@@ -656,7 +670,8 @@ impl JobPayload {
             JobPayload::CopyObject(_) => "bytes",
             JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
-            | JobPayload::TerminalCleanup { .. } => "steps",
+            | JobPayload::TerminalCleanup { .. }
+            | JobPayload::RegisterIdentifiers(_) => "steps",
         }
     }
 
@@ -673,7 +688,8 @@ impl JobPayload {
             | JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. }
-            | JobPayload::CopyObject(_) => JobExecutionClass::InProcess,
+            | JobPayload::CopyObject(_)
+            | JobPayload::RegisterIdentifiers(_) => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }
@@ -681,7 +697,9 @@ impl JobPayload {
     pub fn is_internal(&self) -> bool {
         matches!(
             self,
-            JobPayload::WriteRunCrate { .. } | JobPayload::TerminalCleanup { .. }
+            JobPayload::WriteRunCrate { .. }
+                | JobPayload::TerminalCleanup { .. }
+                | JobPayload::RegisterIdentifiers(_)
         )
     }
 
@@ -716,6 +734,17 @@ impl JobPayload {
     /// create; a differing digest is a `JobPlanConflict`.
     pub fn plan_digest(&self) -> [u8; 32] {
         let bytes = match self {
+            JobPayload::ExportRoCrate(spec) => {
+                let mut spec = spec.clone();
+                if let Some(credential) = spec
+                    .destination
+                    .as_mut()
+                    .and_then(|destination| destination.credential.as_mut())
+                {
+                    credential.sealed = crate::credential_encryption::EncryptedS3Secret::empty();
+                }
+                postcard::to_allocvec(&JobPayload::ExportRoCrate(spec))
+            }
             JobPayload::ImportRoCrate(spec) => {
                 let mut spec = spec.clone();
                 spec.document_id = Ulid::nil();

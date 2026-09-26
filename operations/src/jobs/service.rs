@@ -17,6 +17,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{JobOwnerError, RealmId};
+use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::placement::record::{
     DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
 };
@@ -414,6 +415,41 @@ pub(crate) async fn submit_mint_local(
     .await
 }
 
+/// Queues identifier registration on this node. The key names the calling job, so a replayed
+/// step joins the job it already queued.
+pub(crate) async fn submit_identifiers(
+    context: &DriverContext,
+    spec: aruna_core::structs::secondary_id::RegisterIdentifiersSpec,
+    owner_node_id: NodeId,
+    key: String,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let created_by = spec.auth_context.user_id;
+    let dedup_key = Some(key.into_bytes());
+    let job_id = mint_local_job(
+        context,
+        created_by.realm_id,
+        owner_node_id,
+        dedup_key.as_deref(),
+    )
+    .await?;
+    submit_local_job(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::RegisterIdentifiers(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            retention_ms: crate::jobs::JOB_RETENTION_MS,
+            workspace_mode: WorkspaceMode::None,
+            workspace_bucket: None,
+            active_cap: None,
+        },
+        job_id,
+    )
+    .await
+}
+
 pub async fn submit_rocrate_import(
     context: &DriverContext,
     spec: ImportRoCrateSpec,
@@ -703,7 +739,56 @@ async fn readable_job(
     if let Some(record) = read_owned_job(context, auth.user_id, job_id).await? {
         return Ok(Some(record));
     }
-    joined_pid_job(context, auth, job_id).await
+    if let Some(record) = joined_pid_job(context, auth, job_id).await? {
+        return Ok(Some(record));
+    }
+    linked_push_job(context, auth, job_id).await
+}
+
+/// A repository link push runs as the link creator. A group admin of the link's group, who may
+/// manage the link and read the dataset, reads the push as their own, like a joined PID job.
+async fn linked_push_job(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+) -> Result<Option<JobRecord>, String> {
+    let Some(mut record) = read_job_record(&context.storage_handle, job_id, None).await? else {
+        return Ok(None);
+    };
+    let JobPayload::ExportRoCrate(spec) = &record.payload else {
+        return Ok(None);
+    };
+    let Some(destination) = spec.destination.as_ref().filter(|dest| dest.link.is_some()) else {
+        return Ok(None);
+    };
+    if record.created_by.realm_id != auth.realm_id {
+        return Ok(None);
+    }
+    // The report lists the dataset's files, so the admin also needs READ on the dataset.
+    let Some(document) = load_document_record(context, spec.document_id)
+        .await
+        .map_err(|error| format!("{error:?}"))?
+    else {
+        return Ok(None);
+    };
+    let checks = [
+        (
+            group_admin_path(auth.realm_id, destination.group_id),
+            Permission::WRITE,
+        ),
+        (document.permission_path, Permission::READ),
+    ];
+    for (path, permission) in checks {
+        let extras = PolicyRequestExtras::rest();
+        match authorize(context, auth.realm_id, auth, &path, &permission, extras).await {
+            Ok(()) => {}
+            Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => return Ok(None),
+            Err(AuthorizeError::CheckFailed(error)) => return Err(error),
+            Err(AuthorizeError::Storage(error)) => return Err(error.to_string()),
+        }
+    }
+    record.created_by = auth.user_id;
+    Ok(Some(record))
 }
 
 /// A `MintPersistentId` job the caller did not submit is readable while the
@@ -803,9 +888,34 @@ pub async fn read_owned_report(
     last_key: Option<Vec<u8>>,
     limit: usize,
 ) -> Result<JobReportLookup, String> {
-    let Some(record) = read_owned_job(context, user_id, job_id).await? else {
+    let record = read_owned_job(context, user_id, job_id).await?;
+    report_page(context, record, expected_digest, last_key, limit).await
+}
+
+/// The report of a job the caller may read, owned or not (see `readable_job`).
+pub(crate) async fn read_visible_report(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+    expected_digest: Option<[u8; 32]>,
+    last_key: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<JobReportLookup, String> {
+    let record = readable_job(context, auth, job_id).await?;
+    report_page(context, record, expected_digest, last_key, limit).await
+}
+
+async fn report_page(
+    context: &DriverContext,
+    record: Option<JobRecord>,
+    expected_digest: Option<[u8; 32]>,
+    last_key: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<JobReportLookup, String> {
+    let Some(record) = record else {
         return Ok(JobReportLookup::NotFound);
     };
+    let job_id = record.job_id;
     let key_limit = match &record.payload {
         JobPayload::ImportRoCrate(spec) => spec.limits.key_bytes,
         JobPayload::ExportRoCrate(spec) => spec.limits.key_bytes,
@@ -877,13 +987,14 @@ pub async fn read_session_reason(
 
 pub async fn read_report_routed(
     context: &DriverContext,
-    user_id: UserId,
+    auth: &AuthContext,
     job_id: JobId,
     expected_digest: Option<[u8; 32]>,
     last_key: Option<Vec<u8>>,
     limit: usize,
     auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<JobReportLookup, JobRouteError> {
+    let user_id = auth.user_id;
     let job_id = if family_of_alias(context, job_id).await?.is_some() {
         match super::lifecycle::routing::session_job(context, user_id, job_id).await {
             Ok((_, Some(physical))) => physical,
@@ -895,7 +1006,7 @@ pub async fn read_report_routed(
         job_id
     };
     let Some(net) = context.net_handle.as_ref() else {
-        return read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
+        return read_visible_report(context, auth, job_id, expected_digest, last_key, limit)
             .await
             .map_err(JobRouteError::Internal);
     };
@@ -913,7 +1024,7 @@ pub async fn read_report_routed(
         .with_responder(responder);
     match drive(operation, context).await? {
         JobRouteOutcome::Local => {
-            read_owned_report(context, user_id, job_id, expected_digest, last_key, limit)
+            read_visible_report(context, auth, job_id, expected_digest, last_key, limit)
                 .await
                 .map_err(JobRouteError::Internal)
         }

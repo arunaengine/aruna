@@ -135,6 +135,9 @@ impl DocumentSyncService {
                 )),
             };
         }
+        if let DocumentTarget::RepositoryLink { .. } = target {
+            return self.apply_link(target, Some(bytes), change).await;
+        }
         if let DocumentTarget::MetadataGraphLifecycle { graph_iri } = target {
             let record: GraphLifecycleRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -283,6 +286,9 @@ impl DocumentSyncService {
         // flipped to Withdrawn, so a delete for it is a no-op rather than an error.
         if let DocumentTarget::PersistentIdMapping { .. } = target {
             return Ok(());
+        }
+        if let DocumentTarget::RepositoryLink { .. } = target {
+            return self.apply_link(target, None, change).await;
         }
         if let DocumentTarget::MetadataRegistry {
             group_id,

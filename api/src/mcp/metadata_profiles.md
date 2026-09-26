@@ -37,6 +37,13 @@ RO-Crate community profiles under `https://w3id.org/ro/wfrun/` and
 `https://w3id.org/workflowhub/workflow-ro-crate/` are never Profile tags.
 Exactly one Profile tag is supported; more than one is rejected.
 
+The built-in repository requirement Profiles need no registered document:
+`https://w3id.org/aruna/profiles/repository/zenodo` (the DataCite fields) and
+`https://w3id.org/aruna/profiles/repository/invenio` (the DataCite fields and a
+publisher). Naming one in `conformsTo` validates the Dataset on every write
+with the shapes the node ships; their revision is `builtin`.
+`GET /metadata/repository/kinds` returns these shapes.
+
 ## Validation on writes
 
 `POST /metadata` and `PUT /metadata/{document_id}/rocrate` validate a tagged

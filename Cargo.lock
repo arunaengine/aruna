@@ -266,7 +266,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "ahash 0.8.12",
  "aruna-blob",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "aruna-core",
  "aruna-net",
@@ -398,6 +398,7 @@ dependencies = [
  "reqwest 0.13.5",
  "rustix",
  "serde",
+ "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "tempfile",
@@ -411,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -441,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "rustix",
  "serde_json",
@@ -451,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -460,8 +461,10 @@ dependencies = [
  "byteview",
  "cel-interpreter",
  "chacha20poly1305",
+ "chrono",
  "craqle",
  "ed25519-dalek 3.0.0",
+ "flate2",
  "futures",
  "getrandom 0.4.3",
  "globset",
@@ -491,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "ahash 0.8.12",
  "aruna",
@@ -533,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -561,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -584,6 +587,7 @@ dependencies = [
  "futures-util",
  "globset",
  "hex",
+ "http 1.5.0",
  "iroh",
  "irokle",
  "jsonwebtoken",
@@ -596,6 +600,7 @@ dependencies = [
  "proptest",
  "quick-xml 0.42.0",
  "rand 0.10.2",
+ "reqwest 0.13.5",
  "schemars",
  "serde",
  "serde_json",
@@ -617,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -634,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -2026,7 +2031,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.3.0"
-source = "git+https://github.com/arunaengine/craqle?rev=1d82db828e870a2bd5a8e6c623cb662d7dc0fd01#95e9c5e346135e30639f62bd095ac01de13359de"
+source = "git+https://github.com/arunaengine/craqle?rev=4621f4e36136398bf1da8bca6961d51f46ceb767#4621f4e36136398bf1da8bca6961d51f46ceb767"
 dependencies = [
  "blake3",
  "chrono",

@@ -23,9 +23,15 @@ pub const MAX_TOKEN_LEN: usize = 4096;
 /// is validated without a realm document registering it.
 pub const CRATE_PROFILE_IRI: &str = "https://w3id.org/ro/wfrun/process/0.5";
 
+/// Requirements of a Zenodo record: the DataCite fields.
+pub const ZENODO_PROFILE_IRI: &str = "https://w3id.org/aruna/profiles/repository/zenodo";
+
+/// Requirements of an InvenioRDM record: the DataCite fields and a publisher.
+pub const INVENIO_PROFILE_IRI: &str = "https://w3id.org/aruna/profiles/repository/invenio";
+
 /// Whether the node validates this IRI from its own embedded shapes.
 pub fn is_builtin_profile(iri: &str) -> bool {
-    iri == CRATE_PROFILE_IRI
+    iri == CRATE_PROFILE_IRI || crate::repository::builtin_profile(iri).is_some()
 }
 
 /// Supported RO-Crate specification IRIs and the remaining RO-Crate community profiles (workflow run
@@ -65,6 +71,9 @@ mod specification_tests {
         assert!(is_builtin_profile(CRATE_PROFILE_IRI));
         assert!(!is_rocrate_specification(CRATE_PROFILE_IRI));
         assert!(!is_builtin_profile("https://w3id.org/ro/wfrun/process/0.4"));
+        for iri in [super::ZENODO_PROFILE_IRI, super::INVENIO_PROFILE_IRI] {
+            assert!(is_builtin_profile(iri) && !is_rocrate_specification(iri));
+        }
     }
 }
 

@@ -18,6 +18,7 @@ use crate::document_sync::{
 use crate::error::{NetError, Result};
 
 use super::admin::{apply_admin_operation, coalescible_config_op, flush_config_run};
+use super::links::apply_link_event;
 use super::materialize::reduced_admin_target;
 use super::metadata::{MetadataOutcome, apply_metadata_event, apply_policy_event};
 use super::satisfied_dependencies;
@@ -144,6 +145,11 @@ pub(super) async fn apply_batch_event(
         }
     ) {
         let outcome = apply_metadata_event(service, topic_id, identity, event).await?;
+        record_metadata(outcome, state);
+        return Ok(());
+    }
+    if matches!(event.target(), DocumentTarget::RepositoryLink { .. }) {
+        let outcome = apply_link_event(service, topic_id, actor_id, identity, event).await?;
         record_metadata(outcome, state);
         return Ok(());
     }

@@ -262,6 +262,7 @@ async fn metadata_roundtrip_works() -> Result<(), Box<dyn std::error::Error>> {
             mutation: UpdateDocumentMutation::ReplaceRoCrate {
                 jsonld: updated_jsonld,
             },
+            expected_revision: None,
         }),
         test.context.as_ref(),
     )

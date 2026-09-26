@@ -33,6 +33,295 @@ use std::time::SystemTime;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn invenio_requires_auth() {
+    use crate::metadata::RepositoryExportRequest;
+    use crate::routes::repository::{
+        RepositoryImportRequest, SubmitRepositoryExport, export_record, import_record,
+    };
+    let (_root, state, user) = plain_state(test_limits()).await;
+    for auth in [None, restricted(user)] {
+        let group_id = Ulid::generate().to_string();
+        let import = RepositoryImportRequest {
+            group_id: group_id.clone(),
+            connector_id: Ulid::generate().to_string(),
+            record_id: Some("42".into()),
+            doi: None,
+            url: None,
+            options: Default::default(),
+            keep_updated: false,
+            auto_update: None,
+            target: ImportTargetRequest {
+                bucket: "target".into(),
+                prefix: String::new(),
+            },
+            metadata: ImportMetadataRequest {
+                group_id: group_id.clone(),
+                path: "datasets/import".into(),
+                public: false,
+            },
+            idempotency_key: None,
+        };
+        let result =
+            import_record(State(state.clone()), Extension(auth.clone()), Json(import)).await;
+        assert!(matches!(
+            result,
+            Err(ServerError::Unauthorized | ServerError::Forbidden)
+        ));
+        let query = crate::routes::repository::RepositorySearch {
+            q: "dataset".into(),
+            page: 1,
+            size: 25,
+            all_versions: false,
+        };
+        let result = crate::routes::repository::search_records(
+            State(state.clone()),
+            Extension(auth.clone()),
+            axum::extract::Path((group_id.clone(), Ulid::generate().to_string())),
+            axum::extract::Query(query),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ServerError::Unauthorized | ServerError::Forbidden)
+        ));
+        let export = SubmitRepositoryExport {
+            repository: RepositoryExportRequest {
+                group_id,
+                connector_id: Ulid::generate().to_string(),
+                draft_id: None,
+                published_id: None,
+                metadata: serde_json::json!({}),
+                publish: true,
+                public_files: false,
+                access_token: Some("author-token".into()),
+            },
+            idempotency_key: None,
+        };
+        let result = export_record(
+            State(state.clone()),
+            Extension(auth),
+            axum::extract::Path("invalid".into()),
+            Json(export),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ServerError::Unauthorized | ServerError::Forbidden)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn invenio_denies_connector() {
+    use crate::routes::repository::{RepositoryImportRequest, import_record};
+    let (_root, state, user, group) = submit_state().await;
+    let request = RepositoryImportRequest {
+        group_id: Ulid::generate().to_string(),
+        connector_id: Ulid::generate().to_string(),
+        record_id: Some("42".into()),
+        doi: None,
+        url: None,
+        options: Default::default(),
+        keep_updated: false,
+        auto_update: None,
+        target: ImportTargetRequest {
+            bucket: "target".into(),
+            prefix: "import".into(),
+        },
+        metadata: ImportMetadataRequest {
+            group_id: group.to_string(),
+            path: "crate".into(),
+            public: false,
+        },
+        idempotency_key: None,
+    };
+    let result = import_record(State(state), Extension(auth(user)), Json(request)).await;
+    assert!(matches!(result, Err(ServerError::Forbidden)));
+}
+
+#[tokio::test]
+async fn one_record_required() {
+    use crate::routes::repository::{RepositoryImportRequest, import_record};
+    let (_root, state, user, group) = submit_state().await;
+    let request = |record_id: Option<&str>, doi: Option<&str>| RepositoryImportRequest {
+        group_id: group.to_string(),
+        connector_id: Ulid::generate().to_string(),
+        record_id: record_id.map(str::to_string),
+        doi: doi.map(str::to_string),
+        url: None,
+        options: Default::default(),
+        keep_updated: false,
+        auto_update: None,
+        target: ImportTargetRequest {
+            bucket: "target".into(),
+            prefix: "import".into(),
+        },
+        metadata: ImportMetadataRequest {
+            group_id: group.to_string(),
+            path: "crate".into(),
+            public: false,
+        },
+        idempotency_key: None,
+    };
+    for (record_id, doi) in [(None, None), (Some("42"), Some("10.5281/zenodo.42"))] {
+        let result = import_record(
+            State(state.clone()),
+            Extension(auth(user)),
+            Json(request(record_id, doi)),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
+    }
+    let lone = parse_import_source(ImportSourceRequest::Repository {
+        group_id: group.to_string(),
+        connector_id: Ulid::generate().to_string(),
+        record_id: "42".into(),
+        options: Default::default(),
+        keep_updated: false,
+        auto_update: Some(true),
+    });
+    assert!(matches!(lone, Err(ServerError::BadRequestReason(_))));
+}
+
+#[tokio::test]
+async fn update_needs_write() {
+    use crate::routes::repository::{RepositoryImportRequest, import_record};
+    let (_root, state, user, group) = submit_state().await;
+    seed_bucket(&state, "target", group, user).await;
+    // The connector's group is another owner's; the caller only reads it.
+    let shared = Ulid::generate();
+    grant_reader(&state, user, shared).await;
+    let connector_id = aruna_operations::driver::drive(
+        aruna_operations::harvest::create_connector::CreateConnectorOperation::new(
+            aruna_operations::harvest::create_connector::CreateConnectorInput {
+                group_id: shared,
+                created_by: user,
+                name: "zenodo".into(),
+                kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
+                endpoint: "https://zenodo.example/api/".into(),
+                public_config: Default::default(),
+                secret_config: Default::default(),
+            },
+        ),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .unwrap()
+    .connector
+    .connector_id;
+    let request = |keep_updated| RepositoryImportRequest {
+        group_id: shared.to_string(),
+        connector_id: connector_id.to_string(),
+        record_id: Some("42".into()),
+        doi: None,
+        url: None,
+        options: Default::default(),
+        keep_updated,
+        auto_update: None,
+        target: ImportTargetRequest {
+            bucket: "target".into(),
+            prefix: "import".into(),
+        },
+        metadata: ImportMetadataRequest {
+            group_id: group.to_string(),
+            path: "crate".into(),
+            public: false,
+        },
+        idempotency_key: None,
+    };
+    let import = |keep_updated| {
+        import_record(
+            State(state.clone()),
+            Extension(auth(user)),
+            Json(request(keep_updated)),
+        )
+    };
+    let once = import(false).await;
+    assert!(
+        once.is_ok(),
+        "a one-time import needs only READ on the connector group"
+    );
+    let kept = import(true).await;
+    assert!(matches!(kept, Err(ServerError::Forbidden)));
+}
+
+#[test]
+fn invenio_openapi_contract() {
+    let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
+    let search = "/metadata/groups/{group_id}/repositories/{connector_id}/records";
+    assert!(openapi["paths"][search]["get"]["responses"]["200"].is_object());
+    for path in [
+        "/metadata/repository/imports",
+        "/metadata/{document_id}/repository/exports",
+    ] {
+        let operation = &openapi["paths"][path]["post"];
+        assert!(operation["responses"]["202"].is_object());
+        assert_eq!(
+            operation["security"][0],
+            serde_json::json!({"bearer_auth": []})
+        );
+    }
+    let request =
+        serde_json::json!({"group_id": "group", "connector_id": "connector", "metadata": {}});
+    let default: crate::metadata::RepositoryExportRequest =
+        serde_json::from_value(request.clone()).unwrap();
+    assert!(!default.publish);
+    assert!(!default.public_files);
+    let mut configured = request;
+    configured["publish"] = serde_json::json!(true);
+    let configured: crate::metadata::RepositoryExportRequest =
+        serde_json::from_value(configured).unwrap();
+    assert!(configured.publish);
+}
+
+#[test]
+fn invenio_mode_contract() {
+    for mode in ["copy", "reference", "metadata"] {
+        let request: crate::routes::repository::RepositoryImportRequest =
+            serde_json::from_value(serde_json::json!({
+                "group_id": "group", "connector_id": "connector", "record_id": "42", "mode": mode,
+                "all_versions": false, "target": {"bucket": "target", "prefix": "import"},
+                "metadata": {"group_id": "group", "path": "crate", "public": false}
+            }))
+            .unwrap();
+        assert!(!request.options.all_versions);
+        assert_eq!(serde_json::to_value(&request).unwrap()["mode"], mode);
+    }
+    let options: crate::routes::repository::ImportOptionsRequest =
+        serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(options.all_versions);
+    assert!(matches!(
+        options.mode,
+        crate::routes::repository::ImportDataMode::Copy
+    ));
+}
+
+#[test]
+fn invenio_login_private() {
+    let request: crate::metadata::RepositoryExportRequest =
+        serde_json::from_value(serde_json::json!({
+            "group_id": "group", "connector_id": "connector", "access_token": "author-private-token"
+        }))
+        .unwrap();
+    assert_eq!(
+        request.access_token.as_deref(),
+        Some("author-private-token")
+    );
+    assert!(
+        serde_json::to_value(&request)
+            .unwrap()
+            .get("access_token")
+            .is_none()
+    );
+    assert!(!format!("{request:?}").contains("author-private-token"));
+    let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
+    assert_eq!(
+        openapi["components"]["schemas"]["RepositoryExportRequest"]["properties"]["access_token"]["writeOnly"],
+        true
+    );
+}
+
 fn realm() -> RealmId {
     RealmId::from_bytes([1u8; 32])
 }
@@ -118,6 +407,47 @@ async fn grant(state: &ServerState, user: UserId, group: Ulid) {
         GROUP_KEYSPACE,
         group.to_bytes().into(),
         group_doc.to_bytes(&actor).unwrap().into(),
+    )
+    .await;
+}
+
+/// Creates `group` owned by another user, with `reader` in its default viewer role.
+async fn grant_reader(state: &ServerState, reader: UserId, group: Ulid) {
+    let owner = UserId::local(Ulid::generate(), realm());
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: owner,
+        realm_id: realm(),
+    };
+    let mut group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm(), group);
+    group_auth
+        .roles
+        .values_mut()
+        .find(|role| role.name == "viewer")
+        .unwrap()
+        .assigned_users
+        .insert(reader);
+    let group_doc = Group {
+        display_name: "shared-group".to_string(),
+        group_id: group,
+        realm_id: realm(),
+        roles: group_auth.roles.keys().copied().collect(),
+        owner,
+    };
+    let auth_doc = group_auth.to_bytes(&actor).unwrap();
+    write_doc(
+        state,
+        AUTH_KEYSPACE,
+        group.to_bytes().into(),
+        auth_doc.into(),
+    )
+    .await;
+    let group_bytes = group_doc.to_bytes(&actor).unwrap();
+    write_doc(
+        state,
+        GROUP_KEYSPACE,
+        group.to_bytes().into(),
+        group_bytes.into(),
     )
     .await;
 }

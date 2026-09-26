@@ -21,7 +21,7 @@ use aruna_core::structs::storage::metadata_registry::{
 };
 use aruna_core::structs::{
     PersistentIdFailure, PersistentIdMapping, PersistentIdRevision, persistent_id_change,
-    persistent_id_key, persistent_id_target,
+    persistent_id_key, persistent_id_target, secondary_index_deletes, secondary_index_entries,
 };
 use aruna_core::types::TxnId;
 use byteview::ByteView;
@@ -135,6 +135,33 @@ pub async fn mint_persistent_id(
     Err(PersistentIdError::Storage(
         StorageError::TransactionConflict,
     ))
+}
+
+/// Adds external identifiers on this node's row; callers route to the PID authority first.
+pub async fn add_secondary_ids(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    document_id: Ulid,
+    identifiers: Vec<aruna_core::structs::secondary_id::SecondaryIdentifier>,
+    occurred_at_ms: u64,
+) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
+    let route = mapping_route(ctx, realm_id, document_id).await?;
+    let result = crate::driver::drive(
+        crate::metadata::secondary_ids::AddIdentifiersOperation::new(
+            crate::metadata::secondary_ids::AddIdentifiersInput {
+                document_id,
+                identifiers,
+                route,
+                occurred_at_ms,
+            },
+        ),
+        ctx,
+    )
+    .await?;
+    if result.1 {
+        schedule_drain(ctx).await;
+    }
+    Ok(result)
 }
 
 /// Record a terminal provider failure on the same intent. Projection absence
@@ -271,7 +298,7 @@ pub struct MappingRoute {
     pub generation: u64,
 }
 
-async fn mapping_route(
+pub(crate) async fn mapping_route(
     ctx: &DriverContext,
     realm_id: RealmId,
     document_id: Ulid,
@@ -410,6 +437,7 @@ async fn admin_withdraw_txn(
         ),
     ));
     write_entries(ctx, writes, txn_id).await?;
+    delete_entries(ctx, secondary_index_deletes(&mapping), txn_id).await?;
     Ok(Some(mapping))
 }
 
@@ -435,7 +463,7 @@ pub fn tombstone_transition(
 
 pub type TransitionEntry = (String, ByteView, ByteView);
 
-/// Row, sync sidecar, shard-manifest entry, and outbox publish, so an accepted
+/// Row, identifier index, sync sidecar, shard-manifest entry and outbox publish, so an accepted
 /// transition is either fully durable and replicated or not taken.
 pub fn transition_entries(
     route: &Option<MappingRoute>,
@@ -447,6 +475,7 @@ pub fn transition_entries(
         ByteView::from(persistent_id_key(mapping.target)),
         ByteView::from(mapping.to_bytes().map_err(PersistentIdError::Conversion)?),
     )];
+    writes.extend(secondary_index_entries(mapping));
     if let Some(route) = route {
         let change = persistent_id_change(mapping, route.placement);
         writes.push(sync_revision_entry(&target, &change).map_err(PersistentIdError::Conversion)?);
@@ -502,6 +531,30 @@ async fn write_entries(
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
         other => Err(PersistentIdError::Unavailable(format!(
             "unexpected persistent id write event: {other:?}"
+        ))),
+    }
+}
+
+async fn delete_entries(
+    ctx: &DriverContext,
+    deletes: Vec<(String, ByteView)>,
+    txn_id: TxnId,
+) -> Result<(), PersistentIdError> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    match ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
+        other => Err(PersistentIdError::Unavailable(format!(
+            "unexpected persistent id delete event: {other:?}"
         ))),
     }
 }

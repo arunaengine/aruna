@@ -340,6 +340,7 @@ async fn preserve_reference(
     let (version_id, _changed) = write_reference_version(
         context,
         ReferenceWrite {
+            preassigned_version_id: None,
             group_id: input.group_id,
             user_id: input.user_id,
             realm_id: input.realm_id,

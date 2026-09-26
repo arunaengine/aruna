@@ -21,7 +21,7 @@ use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CreateBackendInput {
     pub group_id: GroupId,
     pub created_by: UserId,
@@ -30,6 +30,24 @@ pub struct CreateBackendInput {
     pub public_config: HashMap<String, String>,
     pub secret_config: HashMap<String, String>,
     pub cleanup: CleanupStrategy,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for CreateBackendInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateBackendInput")
+            .field("group_id", &self.group_id)
+            .field("created_by", &self.created_by)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self.secret_config.keys().collect::<Vec<_>>(),
+            )
+            .field("cleanup", &self.cleanup)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

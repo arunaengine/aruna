@@ -67,13 +67,14 @@ pub fn validate_connector_input(
         return Err(ValidationError::EmptyName);
     }
 
-    // ftp is refused because opendal cannot constrain its passive data address;
-    // a local directory is registered on its own device, not as a realm connector.
+    // ftp is refused because opendal cannot constrain its passive data address; a local
+    // directory is registered on its device and Invenio files come from repository connectors.
     if matches!(
         kind,
         SourceConnectorKind::Ftp
             | SourceConnectorKind::ArunaNative
             | SourceConnectorKind::LocalDirectory
+            | SourceConnectorKind::Invenio
     ) {
         return Err(ValidationError::UnsupportedConnectorKind { kind });
     }
@@ -188,6 +189,11 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorRules {
         SourceConnectorKind::LocalDirectory => SourceConnectorRules {
             required_public_keys: &[OFFERED_DIRECTORY_BUCKET],
             allowed_public_keys: &[OFFERED_DIRECTORY_BUCKET],
+            allowed_secret_keys: &[],
+        },
+        SourceConnectorKind::Invenio => SourceConnectorRules {
+            required_public_keys: &[],
+            allowed_public_keys: &[],
             allowed_secret_keys: &[],
         },
     }

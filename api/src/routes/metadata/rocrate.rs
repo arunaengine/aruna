@@ -14,10 +14,14 @@ use crate::metadata::{
     serialize_jsonld_object,
 };
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::routes::repository::links::{
+    connector, ensure_capable, ensure_requirements, validate_record_id,
+};
 use crate::server::state::ServerState;
 use aruna_core::structs::execution::job::ExportRoCrateSpec;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::jobs::repository::{Action, TransferError, seal_token};
 use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::metadata::api::ExportMetadataRequest;
 use aruna_operations::metadata::forward::{
@@ -227,7 +231,9 @@ registry view. A path-restricted delegated token is refused even when it would p
 - `status_url`, `report_url` and `artifact_url` are absolute and point at the owning node, the only
   node that can serve them.
 - Submissions are idempotent per caller when `idempotency_key` is set: replaying the same key
-  returns the same job with `created` false, while reusing it for a different document conflicts."#,
+  returns the same job with `created` false, while reusing it for a different document conflicts.
+- Repository exports use `POST /metadata/{document_id}/repository/exports`; a `destination` field
+  here is refused as an unknown field."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = SubmitExportRequest,
@@ -277,14 +283,103 @@ pub async fn submit_rocrate_export(
     ensure_permission_with(
         &state,
         &auth,
-        record.permission_path,
+        record.permission_path.clone(),
         Permission::READ,
         PolicyRequestExtras::operation("metadata.read"),
     )
     .await?;
+    // Publishing the dataset as a repository record needs WRITE on it.
+    if request.destination.is_some() {
+        Box::pin(crate::auth::ensure_permission(
+            &state,
+            &auth,
+            record.permission_path,
+            Permission::WRITE,
+        ))
+        .await?;
+    }
+    let mut access_token = None;
+    let mut destination = request
+        .destination
+        .map(|destination| {
+            access_token = Some(
+                destination
+                    .access_token
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| {
+                        ServerError::BadRequestReason(
+                            "a personal repository access_token is required".into(),
+                        )
+                    })?,
+            );
+            if destination.metadata.to_string().len() as u64 > state.rocrate_limits().metadata_bytes
+            {
+                return Err(ServerError::BadRequestReason(
+                    "repository metadata exceeds limit".into(),
+                ));
+            }
+            if !destination.metadata.is_null() && !destination.metadata.is_object() {
+                return Err(ServerError::BadRequestReason(
+                    "metadata overrides must be an object".into(),
+                ));
+            }
+            Ok(aruna_core::repository::RepositoryDestination {
+                group_id: ulid::Ulid::from_string(&destination.group_id)
+                    .map_err(|_| ServerError::BadRequest)?,
+                connector_id: ulid::Ulid::from_string(&destination.connector_id)
+                    .map_err(|_| ServerError::BadRequest)?,
+                draft_id: destination.draft_id,
+                published_id: destination.published_id,
+                metadata_json: destination.metadata.to_string(),
+                publish: destination.publish,
+                public_files: destination.public_files,
+                credential: None,
+                link: None,
+            })
+        })
+        .transpose()?;
+    if let Some(destination) = &mut destination {
+        crate::metadata::ensure_metadata_scope(
+            &state,
+            &auth,
+            destination.group_id,
+            Permission::WRITE,
+        )
+        .await?;
+        let view = connector(&state, destination.group_id, destination.connector_id).await?;
+        let kind = view.connector.kind;
+        ensure_capable(kind, Action::Publish)?;
+        if destination.published_id.is_some() {
+            ensure_capable(kind, Action::Versions)?;
+        }
+        for id in destination
+            .draft_id
+            .iter()
+            .chain(destination.published_id.iter())
+        {
+            validate_record_id(kind, id)?;
+        }
+        Box::pin(ensure_requirements(&state, &auth, document_id, &view)).await?;
+        destination.credential = Some(
+            seal_token(
+                &state.get_ctx(),
+                auth.user_id,
+                &view,
+                None,
+                access_token.as_deref().unwrap_or_default(),
+            )
+            .map_err(|error| match error {
+                TransferError::Permanent(message) => ServerError::BadRequestReason(message),
+                _ => ServerError::ServiceUnavailableReason(
+                    "repository login could not be prepared".into(),
+                ),
+            })?,
+        );
+    }
     let result = submit_export_job(
         &state.get_ctx(),
         ExportRoCrateSpec {
+            destination,
             auth_context: auth,
             document_id,
             limits: state.rocrate_limits().clone(),
@@ -415,6 +510,7 @@ pub async fn replace_metadata_rocrate(
         UpdateDocumentMutation::ReplaceRoCrate {
             jsonld: serialize_jsonld_object(&request.rocrate)?,
         },
+        None,
         forwarded_auth_token(bearer_token)?,
     )
     .await
@@ -522,6 +618,7 @@ pub async fn add_data_entity(
         UpdateDocumentMutation::UpsertDataEntity {
             jsonld: serialize_jsonld_entity(&entity)?,
         },
+        None,
         forwarded_auth_token(bearer_token)?,
     )
     .await
@@ -626,6 +723,7 @@ pub async fn add_contextual_entity(
         UpdateDocumentMutation::UpsertContextualEntity {
             jsonld: serialize_jsonld_entity(&entity)?,
         },
+        None,
         forwarded_auth_token(bearer_token)?,
     )
     .await

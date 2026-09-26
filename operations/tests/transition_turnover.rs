@@ -127,6 +127,7 @@ async fn turnover_moves_holder() -> TestResult<()> {
             jsonld: r#"{"@id":"./turned-over.txt","@type":"File","name":"turned-over.txt"}"#
                 .to_string(),
         },
+        None,
         Some(realm.bearer_token()),
     )
     .await?;

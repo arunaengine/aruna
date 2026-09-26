@@ -321,6 +321,36 @@ pub async fn preview_submission(
     assess_write(context, Ulid::nil(), group_id.into(), jsonld).await
 }
 
+/// Evaluates a crate against the Profile `iri` whether or not the crate names it, and stores
+/// nothing. Built-in and public Profiles resolve; structural crate violations are findings too.
+pub async fn check_profile(
+    context: &DriverContext,
+    iri: &str,
+    jsonld: &str,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    let preview =
+        evaluate_tagged(context, Ulid::nil(), ProfileScope::PublicOnly, iri, jsonld).await?;
+    let mut status = preview.status;
+    if !preview.structural_violations.is_empty() {
+        status.state = ProfileValidationState::Invalid;
+    }
+    status
+        .findings
+        .extend(preview.structural_violations.into_iter().map(|violation| {
+            ProfileValidationFinding {
+                code: violation.code,
+                severity: ProfileValidationSeverity::Violation,
+                focus_node: Some(violation.entity_id.unwrap_or_else(|| "./".into())),
+                path: Some(violation.pointer).filter(|pointer| !pointer.is_empty()),
+                rule: "structural".into(),
+                message: violation.message,
+                profile_revision: status.profile_revision.clone(),
+                completeness: ProfileValidationCompleteness::Complete,
+            }
+        }));
+    Ok(status)
+}
+
 struct ProfileAssessment {
     findings: Vec<ProfileValidationFinding>,
     structural: Vec<MetadataValidationViolation>,
@@ -746,7 +776,7 @@ async fn resolve_profile(
             requested_iri: requested_iri.to_string(),
             revision: BUILTIN_REVISION.to_string(),
             shapes_graph_iri: format!("{requested_iri}#shapes/{BUILTIN_REVISION}"),
-            shapes: vec![shapes.to_string()],
+            shapes: shapes.iter().map(|shapes| shapes.to_string()).collect(),
         }),
         None => resolve_registered_profile(context, requested_iri, scope).await,
     }

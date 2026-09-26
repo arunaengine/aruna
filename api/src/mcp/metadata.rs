@@ -432,6 +432,7 @@ impl McpServer {
             document_id,
             input.public,
             UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+            None,
             crate::metadata::forwarded_auth_token(request_bearer(&parts)).map_err(server_error)?,
         )
         .await

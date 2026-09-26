@@ -963,6 +963,30 @@ impl MetadataHandle {
             | MetadataTransportMessage::SearchObjects { .. }) => {
                 (self.bucket_request(context, peer, message).await, None)
             }
+            MetadataTransportMessage::LookupIdentifier {
+                auth_token,
+                kind,
+                value,
+                endpoint,
+            } => {
+                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                    Ok(auth) => match self.inner.net_handle.as_ref() {
+                        Some(net_handle) => crate::metadata::secondary_ids::lookup_local(
+                            context.as_ref(),
+                            *net_handle.realm_id(),
+                            auth.as_ref(),
+                            kind,
+                            &value,
+                            endpoint.as_deref(),
+                        )
+                        .await
+                        .map_err(|_| MetadataReadError::Unavailable),
+                        None => Err(MetadataReadError::Unavailable),
+                    },
+                    Err(error) => Err(error),
+                };
+                (MetadataTransportMessage::IdentifierMatches { result }, None)
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)

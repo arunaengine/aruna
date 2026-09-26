@@ -156,6 +156,19 @@ impl EgressGuard {
         screen_host(&self.policy, host)?;
         Ok(self.plain.get(url))
     }
+
+    /// Screens repository requests and refuses redirects for authenticated writes.
+    pub fn repository_request(
+        &self,
+        method: reqwest::Method,
+        url: Url,
+    ) -> Result<reqwest::RequestBuilder, EgressError> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
+        screen_host(&self.policy, host)?;
+        Ok(self.opendal.request(method, url))
+    }
 }
 
 /// A hop may never weaken the transport the caller chose: once the original
@@ -193,7 +206,9 @@ fn guarded_client(
         }),
     };
 
+    // Some repositories, such as Zenodo, refuse requests without a user agent.
     Ok(reqwest::Client::builder()
+        .user_agent(concat!("aruna/", env!("CARGO_PKG_VERSION")))
         .dns_resolver(Arc::new(ScreenedResolver { policy, lookup }))
         .redirect(redirect)
         .no_proxy()

@@ -133,6 +133,7 @@ async fn bao_node(realm_id: RealmId) -> BaoNode {
 
 fn remote_spec(realm_id: RealmId, user_id: UserId) -> ExportRoCrateSpec {
     ExportRoCrateSpec {
+        destination: None,
         auth_context: AuthContext {
             user_id,
             realm_id,
@@ -306,6 +307,7 @@ fn versions_roundtrip() {
         let entities = recognized_entities(&imported, realm_id).expect("entities resolve");
         assert!(entities.is_empty());
         let spec = ExportRoCrateSpec {
+            destination: None,
             auth_context: AuthContext {
                 user_id: UserId::nil(realm_id),
                 realm_id,
@@ -558,6 +560,7 @@ async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u
                 .is_some_and(|path| described.values().any(|value| value == path))
     }));
     let spec = ExportRoCrateSpec {
+        destination: None,
         auth_context: AuthContext {
             user_id: UserId::nil(realm_id),
             realm_id,

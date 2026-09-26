@@ -134,6 +134,9 @@ pub(crate) async fn head_staging_source(
     if crate::fs_source::is_local_access(access) {
         return crate::fs_source::head_local(access).await;
     }
+    if is_invenio(access) {
+        return crate::invenio::head_reference(guard, access).await;
+    }
     let (operator, path, version) = build_source_operator(guard, access).await?;
     let metadata = match version {
         Some(version) => operator.stat_with(path).version(version).await,
@@ -163,6 +166,9 @@ pub(crate) async fn read_staging_source(
 > {
     if crate::fs_source::is_local_access(access) {
         return crate::fs_source::read_local(access, range).await;
+    }
+    if is_invenio(access) {
+        return crate::invenio::read_reference(guard, access, range).await;
     }
     let (operator, path, version) = build_source_operator(guard, access).await?;
     let metadata = head_staging_source(guard, access).await?;
@@ -329,13 +335,19 @@ async fn build_source_operator<'access>(
                 // address, so the data socket cannot be screened.
                 SourceConnectorKind::Ftp
                 | SourceConnectorKind::ArunaNative
-                | SourceConnectorKind::LocalDirectory => {
+                | SourceConnectorKind::LocalDirectory
+                | SourceConnectorKind::Invenio => {
                     return Err(StagingSourceError::UnsupportedKind(kind.to_string()));
                 }
             };
             Ok((operator, path.as_str(), version.as_deref()))
         }
     }
+}
+
+fn is_invenio(access: &ResolvedSourceAccess) -> bool {
+    let ResolvedSourceAccess::OpenDal { kind, .. } = access;
+    *kind == SourceConnectorKind::Invenio
 }
 
 fn build_service<B>(

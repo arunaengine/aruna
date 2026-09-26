@@ -18,6 +18,7 @@ pub mod device;
 pub mod drs;
 pub mod execution;
 pub mod info;
+pub mod link_routes;
 pub mod management_relay;
 pub mod metadata;
 pub mod notifications;
@@ -26,6 +27,7 @@ pub mod onboarding;
 pub mod pid;
 pub mod placement;
 pub mod policies;
+pub mod repository;
 pub mod rocrate_import;
 pub mod search;
 pub mod staging;
@@ -70,6 +72,10 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(pid::router())
         .merge(placement::router())
         .merge(rocrate_import::router())
+        .merge(repository::router())
+        .merge(repository::links::router())
+        .merge(repository::check::router())
+        .merge(link_routes::router())
         .merge(notifications::router())
         .merge(policies::router())
         .merge(search::router())
@@ -162,6 +168,10 @@ pub(crate) mod tests {
         ("DELETE", "/access/groups/{id}/members/{user_id}"),
         ("DELETE", "/access/groups/{id}/roles/{role_id}"),
         ("DELETE", "/metadata/{document_id}"),
+        (
+            "DELETE",
+            "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
         ("DELETE", "/system/notifications/watches/{id}"),
         ("DELETE", "/pid/{document_id}"),
         ("DELETE", "/access/credentials/{access_key_id}"),
@@ -213,6 +223,26 @@ pub(crate) mod tests {
         ),
         ("GET", "/metadata/groups/{group_id}"),
         ("GET", "/metadata/groups/{group_id}/path"),
+        ("GET", "/metadata/groups/{group_id}/repositories"),
+        (
+            "GET",
+            "/metadata/groups/{group_id}/repositories/{connector_id}/records",
+        ),
+        ("GET", "/metadata/repository/kinds"),
+        ("GET", "/metadata/{document_id}/repository/links"),
+        ("GET", "/metadata/{document_id}/repository/links/{link_id}"),
+        (
+            "PATCH",
+            "/metadata/{document_id}/repository/links/{link_id}",
+        ),
+        (
+            "DELETE",
+            "/metadata/{document_id}/repository/links/{link_id}",
+        ),
+        (
+            "GET",
+            "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
         ("GET", "/data/groups/{group_id}/storage/backends"),
         (
             "GET",
@@ -257,6 +287,7 @@ pub(crate) mod tests {
         ("GET", "/oai"),
         ("GET", "/access/onboarding/secrets/{id}/status"),
         ("GET", "/pid/{document_id}"),
+        ("GET", "/pid/lookup"),
         ("GET", "/profile/{document_id}"),
         ("GET", "/access/policies/effective"),
         ("GET", "/access/policies/group/{group_id}"),
@@ -337,6 +368,31 @@ pub(crate) mod tests {
         ("POST", "/metadata/profile/validation/preview"),
         ("POST", "/metadata/references/preflight"),
         ("POST", "/metadata/rocrate/imports"),
+        ("POST", "/metadata/groups/{group_id}/repositories"),
+        ("POST", "/metadata/repository/imports"),
+        ("POST", "/metadata/{document_id}/repository/exports"),
+        ("POST", "/metadata/{document_id}/repository/check"),
+        ("POST", "/metadata/{document_id}/repository/links"),
+        (
+            "POST",
+            "/metadata/{document_id}/repository/links/{link_id}/push",
+        ),
+        (
+            "POST",
+            "/metadata/{document_id}/repository/links/{link_id}/publish",
+        ),
+        (
+            "POST",
+            "/metadata/{document_id}/repository/links/{link_id}/accept-remote",
+        ),
+        (
+            "POST",
+            "/metadata/{document_id}/repository/links/{link_id}/pull",
+        ),
+        (
+            "PUT",
+            "/metadata/{document_id}/repository/links/{link_id}/token",
+        ),
         ("POST", "/metadata/rocrate/uploads"),
         ("POST", "/metadata/sparql/query"),
         (
@@ -388,6 +444,10 @@ pub(crate) mod tests {
         ("PUT", "/data/groups/{group_id}/storage/routing"),
         ("PUT", "/system/realm/quota"),
         ("PUT", "/metadata/{document_id}/rocrate"),
+        (
+            "PUT",
+            "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
         ("PUT", "/access/policies/group/{group_id}"),
         ("PUT", "/access/policies/realm"),
     ];

@@ -20,6 +20,7 @@ pub mod prune;
 pub mod quota;
 pub mod reconcile;
 pub mod records;
+pub mod repository;
 mod rocrate_jsonld;
 mod route;
 pub mod runtime;

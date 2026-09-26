@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::endpoint_screening;
 use crate::harvest::repository::connector_writes;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CreateConnectorInput {
     pub group_id: GroupId,
     pub created_by: UserId,
@@ -28,6 +28,24 @@ pub struct CreateConnectorInput {
     pub endpoint: String,
     pub public_config: HashMap<String, String>,
     pub secret_config: HashMap<String, String>,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl std::fmt::Debug for CreateConnectorInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateConnectorInput")
+            .field("group_id", &self.group_id)
+            .field("created_by", &self.created_by)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("endpoint", &self.endpoint)
+            .field("public_config", &self.public_config)
+            .field(
+                "secret_keys",
+                &self.secret_config.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +76,14 @@ pub enum CreateConnectorError {
     EmptyEndpoint,
     #[error("endpoint `{0}` must be spelled as the http client parses it")]
     AmbiguousEndpoint(String),
+    #[error("repository endpoint must use https outside loopback")]
+    InsecureEndpoint,
+    #[error("repository connector does not accept public key `{0}`")]
+    UnknownPublicKey(String),
+    #[error("repository connector does not accept secret key `{0}`")]
+    UnknownSecretKey(String),
+    #[error("repository connector value for `{0}` must not be empty")]
+    EmptyValue(String),
     #[error("CreateRepositoryConnector failed")]
     Failed,
     #[error("state [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
@@ -95,18 +121,14 @@ impl CreateConnectorOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
-        if self.input.name.trim().is_empty() {
-            return self.emit_error(CreateConnectorError::EmptyName);
-        }
-        if self.input.endpoint.trim().is_empty() {
-            return self.emit_error(CreateConnectorError::EmptyEndpoint);
-        }
-        // Every harvest fetch is built from this string, so a spelling the http
-        // client reads as another host fails here rather than at first use.
-        if !endpoint_screening::is_canonical(&self.input.endpoint) {
-            return self.emit_error(CreateConnectorError::AmbiguousEndpoint(
-                self.input.endpoint.clone(),
-            ));
+        if let Err(error) = validate_connector(
+            &self.input.name,
+            self.input.kind,
+            &self.input.endpoint,
+            &self.input.public_config,
+            &self.input.secret_config,
+        ) {
+            return self.emit_error(error);
         }
 
         let now = SystemTime::now();
@@ -167,6 +189,84 @@ impl CreateConnectorOperation {
         smallvec![]
     }
 }
+
+/// Checks a connector definition before any write; update applies the same rules.
+pub fn validate_connector(
+    name: &str,
+    kind: RepositoryConnectorKind,
+    endpoint: &str,
+    public_config: &HashMap<String, String>,
+    secret_config: &HashMap<String, String>,
+) -> Result<(), CreateConnectorError> {
+    if name.trim().is_empty() {
+        return Err(CreateConnectorError::EmptyName);
+    }
+    if endpoint.trim().is_empty() {
+        return Err(CreateConnectorError::EmptyEndpoint);
+    }
+    // Every fetch is built from this string, so a spelling the http client
+    // reads as another host fails here rather than at first use.
+    if !endpoint_screening::is_canonical(endpoint) {
+        return Err(CreateConnectorError::AmbiguousEndpoint(
+            endpoint.to_string(),
+        ));
+    }
+    match kind {
+        RepositoryConnectorKind::OaiPmh => Ok(()),
+        RepositoryConnectorKind::Invenio => {
+            validate_invenio(endpoint, public_config, secret_config)
+        }
+    }
+}
+
+fn validate_invenio(
+    endpoint: &str,
+    public_config: &HashMap<String, String>,
+    secret_config: &HashMap<String, String>,
+) -> Result<(), CreateConnectorError> {
+    let url = url::Url::parse(endpoint)
+        .map_err(|_| CreateConnectorError::AmbiguousEndpoint(endpoint.to_string()))?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err(CreateConnectorError::InsecureEndpoint);
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(CreateConnectorError::AmbiguousEndpoint(
+            endpoint.to_string(),
+        ));
+    }
+    for (key, value) in public_config {
+        if key != INVENIO_COMMUNITY {
+            return Err(CreateConnectorError::UnknownPublicKey(key.clone()));
+        }
+        if value.trim().is_empty() {
+            return Err(CreateConnectorError::EmptyValue(key.clone()));
+        }
+    }
+    for (key, value) in secret_config {
+        if key != INVENIO_TOKEN {
+            return Err(CreateConnectorError::UnknownSecretKey(key.clone()));
+        }
+        if value.trim().is_empty() {
+            return Err(CreateConnectorError::EmptyValue(key.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Public config key naming the Invenio community new records are submitted to.
+pub const INVENIO_COMMUNITY: &str = "community";
+/// Secret config key of the optional read token an Invenio connector keeps.
+pub const INVENIO_TOKEN: &str = "token";
 
 impl Operation for CreateConnectorOperation {
     type Output = CreateConnectorResult;
@@ -275,6 +375,55 @@ mod tests {
             });
             assert_eq!(op.start().len(), 1, "{endpoint}");
         }
+    }
+
+    #[test]
+    fn invenio_rules_enforced() {
+        let invenio = |endpoint: &str, public: &[(&str, &str)], secret: &[(&str, &str)]| {
+            let map = |pairs: &[(&str, &str)]| {
+                pairs
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect::<HashMap<_, _>>()
+            };
+            validate_connector(
+                "repo",
+                RepositoryConnectorKind::Invenio,
+                endpoint,
+                &map(public),
+                &map(secret),
+            )
+        };
+        assert!(
+            invenio(
+                "https://zenodo.org/api/",
+                &[("community", "c")],
+                &[("token", "t")]
+            )
+            .is_ok()
+        );
+        assert!(invenio("http://127.0.0.1:5000/api/", &[], &[]).is_ok());
+        assert!(invenio("http://localhost/api", &[], &[]).is_ok());
+        assert_eq!(
+            invenio("http://zenodo.org/api/", &[], &[]),
+            Err(CreateConnectorError::InsecureEndpoint)
+        );
+        assert_eq!(
+            invenio("https://zenodo.org/api/", &[("root", "/")], &[]),
+            Err(CreateConnectorError::UnknownPublicKey("root".into()))
+        );
+        assert_eq!(
+            invenio("https://zenodo.org/api/", &[], &[("password", "p")]),
+            Err(CreateConnectorError::UnknownSecretKey("password".into()))
+        );
+        assert_eq!(
+            invenio("https://zenodo.org/api/", &[], &[("token", " ")]),
+            Err(CreateConnectorError::EmptyValue("token".into()))
+        );
+        assert!(matches!(
+            invenio("https://zenodo.org/api/?q=1", &[], &[]),
+            Err(CreateConnectorError::AmbiguousEndpoint(_))
+        ));
     }
 
     // a wrong event in the write state errors

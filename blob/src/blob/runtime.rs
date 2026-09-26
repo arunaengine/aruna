@@ -386,6 +386,18 @@ impl BlobHandle {
         self.handler.egress.request(url)
     }
 
+    pub(crate) fn egress(&self) -> &crate::egress::EgressGuard {
+        &self.handler.egress
+    }
+
+    pub fn repository_request(
+        &self,
+        method: reqwest::Method,
+        url: reqwest::Url,
+    ) -> Result<reqwest::RequestBuilder, aruna_core::egress::EgressError> {
+        self.handler.egress.repository_request(method, url)
+    }
+
     /// Holds every tenant backend an effect names for as long as the guard
     /// lives. The driver keeps it for the whole operation, so the metadata
     /// transaction behind the bytes and its rollback are both covered.

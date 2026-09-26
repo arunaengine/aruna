@@ -28,7 +28,7 @@ use tracing::warn;
 use super::runtime::JobsRuntime;
 use super::service::{
     ArtifactLookup, CancelJobOutcome, JobReportLookup, OwnedArtifact, cancel_owned_job,
-    local_status, read_artifact_range, read_owned_artifact, read_owned_job, read_owned_report,
+    local_status, read_artifact_range, read_owned_artifact, read_owned_job, read_visible_report,
     resolve_job_owner,
 };
 use super::staging::read_staging_checkpoint;
@@ -249,7 +249,7 @@ async fn prepare_response(
             }
             prepare_report(
                 context,
-                auth.user_id,
+                &auth,
                 job_id,
                 expected_digest,
                 last_key,
@@ -361,14 +361,14 @@ async fn prepare_status(
 
 async fn prepare_report(
     context: &DriverContext,
-    user_id: UserId,
+    auth: &AuthContext,
     job_id: JobId,
     expected_digest: Option<[u8; 32]>,
     last_key: Option<Vec<u8>>,
     limit: usize,
 ) -> PreparedResponse {
     let response =
-        match read_owned_report(context, user_id, job_id, expected_digest, last_key, limit).await {
+        match read_visible_report(context, auth, job_id, expected_digest, last_key, limit).await {
             Ok(JobReportLookup::NotFound) => JobResponse::NotFound,
             Ok(JobReportLookup::Pending(state)) => JobResponse::ReportPending(state),
             Ok(JobReportLookup::CursorConflict) => JobResponse::ReportConflict,

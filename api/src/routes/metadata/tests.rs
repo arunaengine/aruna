@@ -83,12 +83,12 @@ async fn state_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::
     Ok(load_realm_nodes(ctx.as_ref(), state.get_realm_id(), state.get_node_id()).await)
 }
 
-struct TestState {
+pub(crate) struct TestState {
     _storage_dir: TempDir,
     _metadata_dir: TempDir,
-    auth: AuthContext,
-    group_id: Ulid,
-    state: Arc<ServerState>,
+    pub(crate) auth: AuthContext,
+    pub(crate) group_id: Ulid,
+    pub(crate) state: Arc<ServerState>,
 }
 
 fn projected(response: MetadataRoCrateResponse) -> ProjectedRoCrateResponse {
@@ -4027,7 +4027,7 @@ async fn setup_state() -> TestState {
 }
 
 // Net-capable variant for tests that need node discovery or cursor signing.
-async fn setup_network_state() -> TestState {
+pub(crate) async fn setup_network_state() -> TestState {
     let (storage_dir, storage_handle) = test_storage();
     let metadata_dir = tempfile::tempdir().unwrap();
     let realm_id = test_realm_id(3);
@@ -4131,7 +4131,7 @@ async fn setup_network_state() -> TestState {
     }
 }
 
-async fn drain_metadata_background(state: &ServerState) {
+pub(crate) async fn drain_metadata_background(state: &ServerState) {
     let ctx = state.get_ctx();
     let drained = drain_projection_queue(ctx.as_ref()).await.unwrap();
     if drained.markers_examined == 0 {
@@ -4382,4 +4382,108 @@ mod authorization {
             "a private document stays hidden from anonymous readers"
         );
     }
+}
+
+#[tokio::test]
+async fn lookup_hides_private() {
+    use crate::routes::pid::{
+        LookupQuery, SecondaryKindView, list_persistent_ids, lookup_identifier,
+    };
+    use aruna_core::structs::secondary_id::{
+        IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier,
+    };
+    let test = setup_network_state().await;
+    let (_, Json(created)) = create_metadata_document(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Extension(None),
+        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
+            group_id: test.group_id.to_string(),
+            path: "datasets/imported".to_string(),
+            name: "Imported".to_string(),
+            description: "Imported from a repository".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: None,
+            public: false,
+        })),
+    )
+    .await
+    .unwrap();
+    drain_metadata_background(test.state.as_ref()).await;
+    let document_id = Ulid::from_string(&created.summary.document_id).unwrap();
+    let identifiers = vec![
+        SecondaryIdentifier::new(
+            SecondaryIdKind::Doi,
+            "10.5281/Zenodo.42",
+            None,
+            IdentifierOrigin::Imported,
+        )
+        .unwrap(),
+        SecondaryIdentifier::new(
+            SecondaryIdKind::InvenioParent,
+            "abcde-12345",
+            Some("https://zenodo.org/api/"),
+            IdentifierOrigin::Published,
+        )
+        .unwrap(),
+    ];
+    let (_, changed) = aruna_operations::metadata::persistent_id::forward::add_identifiers_routed(
+        &test.state.get_ctx(),
+        test.state.get_realm_id(),
+        document_id,
+        identifiers,
+        aruna_core::time::unix_timestamp_millis(),
+        test.auth.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+
+    let lookup = |auth: Option<AuthContext>, value: &str| {
+        lookup_identifier(
+            State(test.state.clone()),
+            Extension(auth),
+            Extension(None),
+            Query(LookupQuery {
+                kind: SecondaryKindView::Doi,
+                value: value.to_string(),
+                endpoint: None,
+            }),
+        )
+    };
+    let Json(found) = lookup(Some(test.auth.clone()), "https://doi.org/10.5281/zenodo.42")
+        .await
+        .unwrap();
+    let found = serde_json::to_value(found).unwrap();
+    assert_eq!(
+        found,
+        serde_json::json!({"matches": [{"document_id": document_id.to_string(), "origin": "imported"}]})
+    );
+    let stranger = AuthContext {
+        user_id: aruna_core::UserId::local(Ulid::generate(), test.auth.realm_id),
+        ..test.auth.clone()
+    };
+    for auth in [None, Some(stranger)] {
+        let hidden = lookup(auth, "doi:10.5281/zenodo.42").await;
+        assert!(matches!(hidden, Err(ServerError::NotFound)));
+    }
+    let missing = lookup(Some(test.auth.clone()), "10.5281/zenodo.43").await;
+    assert!(matches!(missing, Err(ServerError::NotFound)));
+
+    let Json(listed) = list_persistent_ids(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Path(document_id.to_string()),
+    )
+    .await
+    .unwrap();
+    let listed = serde_json::to_value(listed).unwrap();
+    assert_eq!(
+        listed[0]["secondary_identifiers"],
+        serde_json::json!([
+            {"kind": "doi", "value": "10.5281/zenodo.42", "origin": "imported"},
+            {"kind": "invenio_parent", "value": "abcde-12345", "endpoint": "https://zenodo.org/api",
+                "origin": "published"}
+        ])
+    );
 }

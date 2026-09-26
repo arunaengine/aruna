@@ -17,7 +17,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase, OnboardingSecretError};
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
@@ -61,8 +61,6 @@ pub enum IdentityError {
     #[error("unexpected storage event while loading node state: {0}")]
     UnexpectedStorageEvent(String),
 }
-
-const STATE_RECORD_KEY: &[u8] = b"node_state";
 
 /// The persisted identity boundary.
 pub struct IdentityStore {
@@ -250,7 +248,7 @@ pub(crate) async fn load_node_state(
     match storage
         .send_effect(Effect::Storage(StorageEffect::Read {
             key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(STATE_RECORD_KEY),
+            key: ByteView::from(NODE_STATE_KEY),
             txn_id: None,
         }))
         .await
@@ -274,7 +272,7 @@ pub(crate) async fn persist_node_state(
     match storage
         .send_effect(Effect::Storage(StorageEffect::Write {
             key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(STATE_RECORD_KEY),
+            key: ByteView::from(NODE_STATE_KEY),
             value: ByteView::from(value),
             txn_id: None,
         }))

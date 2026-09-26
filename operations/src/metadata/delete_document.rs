@@ -18,6 +18,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::secondary_index_deletes;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
@@ -60,6 +61,8 @@ pub struct DeleteDocumentOperation {
     holder_peers: Vec<NodeId>,
     registry_peers: Vec<NodeId>,
     mapping_route: Option<MappingRoute>,
+    /// Reverse index rows the PID tombstone removes in the same transaction.
+    pid_index_deletes: Vec<(String, ByteView)>,
     /// Buckets the tombstones publish onto, read inside the write transaction.
     fence: crate::placement::fence::WriteFence,
     txn_id: Option<Ulid>,
@@ -90,6 +93,7 @@ enum DeleteDocumentState {
     WriteDeleteOutbox,
     ReadPidMapping,
     WritePidTombstone,
+    DeletePidIndex,
     CommitTransaction,
     SchedulePruneQueue,
     PruneGraph,
@@ -143,6 +147,7 @@ impl DeleteDocumentOperation {
             holder_peers: Vec::new(),
             registry_peers: Vec::new(),
             mapping_route: None,
+            pid_index_deletes: Vec::new(),
             fence: Default::default(),
             txn_id: None,
             phase_source: crate::metadata::MetadataPhaseSource::default(),
@@ -773,7 +778,8 @@ impl DeleteDocumentOperation {
             ),
         };
         match transition {
-            Ok(Some((_, writes))) => {
+            Ok(Some((mapping, writes))) => {
+                self.pid_index_deletes = secondary_index_deletes(&mapping);
                 self.state = DeleteDocumentState::WritePidTombstone;
                 smallvec![Effect::Storage(StorageEffect::BatchWrite {
                     writes,
@@ -796,8 +802,16 @@ impl DeleteDocumentOperation {
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(DeleteDocumentError::MissingTransaction);
                 };
-                self.state = DeleteDocumentState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                let deletes = std::mem::take(&mut self.pid_index_deletes);
+                if deletes.is_empty() {
+                    self.state = DeleteDocumentState::CommitTransaction;
+                    return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+                }
+                self.state = DeleteDocumentState::DeletePidIndex;
+                smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                    deletes,
+                    txn_id: Some(txn_id),
+                })]
             }
             Event::Storage(StorageEvent::Error { error }) => {
                 self.fail(DeleteDocumentError::SyncDelete(format!(
@@ -806,6 +820,26 @@ impl DeleteDocumentOperation {
             }
             other => {
                 self.unexpected_event("persistent id tombstone write result", format!("{other:?}"))
+            }
+        }
+    }
+
+    fn delete_pid_index(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(DeleteDocumentError::MissingTransaction);
+                };
+                self.state = DeleteDocumentState::CommitTransaction;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                self.fail(DeleteDocumentError::SyncDelete(format!(
+                    "persistent id index delete failed: {error}"
+                )))
+            }
+            other => {
+                self.unexpected_event("persistent id index delete result", format!("{other:?}"))
             }
         }
     }
@@ -985,6 +1019,7 @@ impl Operation for DeleteDocumentOperation {
             // Commit the PID tombstone with the registry row to prevent a crash leaving it active.
             DeleteDocumentState::ReadPidMapping => self.read_pid_mapping(event),
             DeleteDocumentState::WritePidTombstone => self.write_pid_tombstone(event),
+            DeleteDocumentState::DeletePidIndex => self.delete_pid_index(event),
             DeleteDocumentState::CommitTransaction => self.commit_transaction(event),
             DeleteDocumentState::SchedulePruneQueue => self.schedule_prune_queue(event),
             DeleteDocumentState::PruneGraph => self.prune_graph(event),

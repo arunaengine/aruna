@@ -100,6 +100,7 @@ pub async fn stage_reference_blob(
     let (version_id, _changed) = write_reference_version(
         context,
         ReferenceWrite {
+            preassigned_version_id: None,
             group_id: input.group_id,
             user_id: input.user_id,
             realm_id: input.realm_id,
@@ -129,6 +130,7 @@ pub async fn stage_reference_blob(
 /// One reference version to record: freshly resolved through a connector, or
 /// cloned from a version that already carries the binding.
 pub struct ReferenceWrite {
+    pub preassigned_version_id: Option<Ulid>,
     pub group_id: GroupId,
     pub user_id: UserId,
     pub realm_id: RealmId,
@@ -151,7 +153,7 @@ pub async fn write_reference_version(
     context: &DriverContext,
     write: ReferenceWrite,
 ) -> Result<(Ulid, bool), MaterializeReferenceError> {
-    let version_id = Ulid::generate();
+    let version_id = write.preassigned_version_id.unwrap_or_else(Ulid::generate);
     let now = SystemTime::now();
 
     let txn_id = match context
@@ -177,6 +179,29 @@ pub async fn write_reference_version(
         policies.extend(write.inherited_policies.iter().copied());
         if let Some((connector, fingerprint)) = write.connector_guard.as_ref() {
             guard_connector_unchanged(context, txn_id, connector, *fingerprint).await?;
+        }
+
+        if write.preassigned_version_id.is_some()
+            && let Some(existing) =
+                read_blob_version(context, txn_id, &write.bucket, &write.key, version_id).await?
+        {
+            if !matches!(
+                &existing.state,
+                BlobVersionState::Reference { source, cached_metadata, .. }
+                    if source == &write.version_source
+                        && source_metadata_matches(cached_metadata, &write.metadata)
+            ) {
+                return Err(
+                    StorageError::WriteError("planned reference version changed".into()).into(),
+                );
+            }
+            let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id });
+            return match send_storage_effect(context, commit).await? {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    Ok((version_id, false))
+                }
+                _ => Err(StorageError::WriteError("unexpected commit event".into()).into()),
+            };
         }
 
         let existing_pointer =
@@ -206,6 +231,7 @@ pub async fn write_reference_version(
                 ..
             }),
         ) = (existing_pointer.as_ref(), existing_version.as_ref())
+            && write.preassigned_version_id.is_none()
             && source == &write.version_source
             && source_metadata_matches(cached_metadata, &write.metadata)
         {
@@ -1095,5 +1121,71 @@ mod tests {
         );
         let usage = read_usage_counters(context, usage_group_key(group_id)).await;
         assert_eq!(usage.referenced_bytes, 8);
+    }
+
+    #[tokio::test]
+    async fn reference_resumes_version() {
+        let test_context = setup_driver_context().await;
+        let context = &test_context.driver_context;
+        let group_id = Ulid::generate();
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let node_id = iroh::SecretKey::generate().public();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
+        let (server, endpoint) = spawn_reference_server("ref-data").await;
+        let connector = create_http_connector(context, group_id, &endpoint).await;
+        let original = stage_reference_blob(
+            context,
+            MaterializeReferenceInput {
+                group_id,
+                user_id,
+                realm_id,
+                node_id,
+                connector_id: connector.connector_id,
+                source_path: "folder/file.txt".into(),
+                bucket: "bucket-a".into(),
+                key: "object.txt".into(),
+                expected_bucket: bucket.clone(),
+                inherited_policies: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        let planned = Ulid::generate();
+        let input = |size| ReferenceWrite {
+            preassigned_version_id: Some(planned),
+            group_id,
+            user_id,
+            realm_id,
+            node_id,
+            bucket: "bucket-a".into(),
+            key: "object.txt".into(),
+            expected_bucket: Some(bucket.clone()),
+            version_source: original.version_source.clone(),
+            metadata: SourceMetadata {
+                content_length: size,
+                ..original.source_metadata.clone()
+            },
+            inherited_policies: Vec::new(),
+            connector_guard: None,
+        };
+        assert_eq!(
+            write_reference_version(context, input(8)).await.unwrap(),
+            (planned, true)
+        );
+        assert_ne!(planned, original.version_id);
+        assert_eq!(
+            write_reference_version(context, input(8)).await.unwrap(),
+            (planned, false)
+        );
+        assert!(write_reference_version(context, input(9)).await.is_err());
+        assert_eq!(
+            read_usage_counters(context, usage_group_key(group_id))
+                .await
+                .referenced_bytes,
+            16
+        );
     }
 }

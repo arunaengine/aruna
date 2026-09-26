@@ -267,6 +267,16 @@ pub async fn process_materialization_batch(
         .max()
         .unwrap_or(0);
     let timings = process_job_groups(context, jobs).await?;
+    // Finished jobs may queue link pushes, and the link drain stops once its queue is empty.
+    if timings.processed > 0
+        && let Some(task_handle) = &context.task_handle
+    {
+        crate::jobs::repository::link_queue::restore_link_timer(
+            &context.storage_handle,
+            task_handle,
+        )
+        .await;
+    }
     if job_count > 0 {
         info!(
             event = "pipeline.materialization.summary",
@@ -788,6 +798,13 @@ async fn plan_finish_chunk(
         }
     }
 
+    // Linked repositories learn of the change in the same commit as the new status.
+    match crate::jobs::repository::link_queue::queue_rows(storage, superseding.keys().copied())
+        .await
+    {
+        Ok(rows) => plan.writes.extend(rows),
+        Err(error) => warn!(%error, "Failed to queue repository link pushes after materialization"),
+    }
     plan.superseding = superseding;
     Ok(plan)
 }

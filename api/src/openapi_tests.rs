@@ -42,6 +42,7 @@ const OPTIONAL_AUTH: &[(&str, &str)] = &[
     ("/metadata/{document_id}/sparql/query", "post"),
     ("/metadata/sparql/query", "post"),
     ("/metadata/search", "get"),
+    ("/pid/lookup", "get"),
     ("/system/info", "get"),
     ("/system/realm", "get"),
     ("/ga4gh/drs/v1/objects", "post"),

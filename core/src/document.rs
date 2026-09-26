@@ -13,10 +13,11 @@ use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
     GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE,
-    NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
-    WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
+    NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REPOSITORY_LINK_KEYSPACE, USER_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
+use crate::repository::link_key;
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 use crate::structs::identity::realm::RealmId;
@@ -86,6 +87,11 @@ pub enum DocumentTarget {
     /// so a reader resolves the rule's holders from a ref without any catalog.
     PlacementPolicy {
         policy_id: Ulid,
+    },
+    /// One repository link of a document. Only its owner node writes it; holders keep a copy.
+    RepositoryLink {
+        document_id: Ulid,
+        link_id: Ulid,
     },
 }
 
@@ -378,7 +384,8 @@ impl DocumentTarget {
             Self::MetadataRegistry { document_id, .. }
             | Self::MetadataCreateEvent { document_id, .. }
             | Self::MetadataDocumentLifecycle { document_id }
-            | Self::PersistentIdMapping { document_id } => TopicId::metadata(*document_id),
+            | Self::PersistentIdMapping { document_id }
+            | Self::RepositoryLink { document_id, .. } => TopicId::metadata(*document_id),
             Self::MetadataGraphLifecycle { graph_iri } => {
                 TopicId::metadata(graph_lifecycle_topic(graph_iri))
             }
@@ -406,6 +413,7 @@ impl DocumentTarget {
             Self::WatchSubscription { .. } => WATCH_SUBSCRIPTIONS_KEYSPACE,
             Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
             Self::PlacementPolicy { .. } => PLACEMENT_POLICY_KEYSPACE,
+            Self::RepositoryLink { .. } => REPOSITORY_LINK_KEYSPACE,
         }
     }
 
@@ -450,6 +458,10 @@ impl DocumentTarget {
             }
             Self::NodeInfo { node_id, .. } => ByteView::from(node_info_key(*node_id)),
             Self::PlacementPolicy { policy_id } => ByteView::from(placement_policy_key(*policy_id)),
+            Self::RepositoryLink {
+                document_id,
+                link_id,
+            } => ByteView::from(link_key(*document_id, *link_id)),
         }
     }
 
@@ -468,6 +480,7 @@ impl DocumentTarget {
                 | Self::MetadataGraphLifecycle { .. }
                 | Self::PersistentIdMapping { .. }
                 | Self::PlacementPolicy { .. }
+                | Self::RepositoryLink { .. }
         )
     }
 

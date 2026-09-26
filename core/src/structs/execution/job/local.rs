@@ -195,6 +195,10 @@ pub enum JobResultPayload {
         /// Hex blake3 of the copied bytes; empty when the backend reported none.
         blake3: String,
     },
+    /// Whether the registration added an identifier the mapping did not hold.
+    Identifiers {
+        changed: bool,
+    },
 }
 
 impl JobResultPayload {
@@ -211,6 +215,7 @@ impl JobResultPayload {
             JobResultPayload::PersistentId { .. } => "persistent_id",
             JobResultPayload::StoragePurge(_) => "storage_purge",
             JobResultPayload::CopyObject { .. } => "copy_object",
+            JobResultPayload::Identifiers { .. } => "identifiers",
         }
     }
 
@@ -334,6 +339,7 @@ impl JobResultPayload {
                 "report_digest": hex::encode(result.report_digest),
             }),
             JobResultPayload::ExportRoCrate(result) => serde_json::json!({
+                "repository": result.repository,
                 "artifact": result.artifact.as_ref().map(|artifact| serde_json::json!({
                     "blake3": hex::encode(artifact.blake3),
                     "size": artifact.size,
@@ -396,6 +402,7 @@ impl JobResultPayload {
                 "bytes": bytes,
                 "blake3": blake3,
             }),
+            JobResultPayload::Identifiers { changed } => serde_json::json!({ "changed": changed }),
         }
     }
 }

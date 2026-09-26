@@ -21,7 +21,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.93"
+version = "3.0.0-alpha.94"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -71,8 +71,8 @@ cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
-# Pinned to craqle 0.3.0 main with the legacy topic cursor replay; it resolves the irokle below.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "1d82db828e870a2bd5a8e6c623cb662d7dc0fd01", features = [
+# Pinned to craqle 0.3.0 main with nested SHACL shapes and the search rebuild fix; it resolves the irokle below.
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "4621f4e36136398bf1da8bca6961d51f46ceb767", features = [
     "iroh",
     "shacl-core",
 ] }

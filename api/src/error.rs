@@ -64,6 +64,13 @@ pub enum ServerError {
     BadRequestMessage(String),
     #[error("Metadata validation failed")]
     MetadataValidation(Vec<MetadataValidationViolation>),
+    /// The dataset crate does not meet the repository's requirements; the body lists findings.
+    /// The second value counts findings left out of the capped list.
+    #[error("the dataset does not meet the repository's requirements")]
+    RequirementsUnmet(Vec<ProfileValidationFinding>, usize),
+    /// The connector's repository kind cannot do the requested action.
+    #[error("{0}")]
+    NotSupported(String),
     #[error("Metadata Profile validation failed")]
     MetadataProfileValidation(Vec<ProfileValidationFinding>),
     #[error("Bad gateway")]
@@ -180,6 +187,9 @@ pub struct ErrorResponse {
     /// Structured Profile validation findings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub findings: Option<Vec<ProfileFindingResponse>>,
+    /// How many further findings the capped findings list leaves out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omitted_findings: Option<usize>,
     /// The exact standing-quota refusal behind a 409, when one caused it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<QuotaDeniedResponse>,
@@ -284,6 +294,7 @@ impl ErrorResponse {
             details: None,
             violations: None,
             findings: None,
+            omitted_findings: None,
             quota: None,
         }
     }
@@ -363,8 +374,13 @@ impl ServerError {
         if let ServerError::MetadataValidation(violations) = self {
             body = body.with_violations(violations.iter().cloned().map(Into::into).collect());
         }
-        if let ServerError::MetadataProfileValidation(findings) = self {
+        if let ServerError::MetadataProfileValidation(findings)
+        | ServerError::RequirementsUnmet(findings, _) = self
+        {
             body = body.with_findings(findings.iter().cloned().map(Into::into).collect());
+        }
+        if let ServerError::RequirementsUnmet(_, omitted) = self {
+            body.omitted_findings = Some(*omitted).filter(|omitted| *omitted > 0);
         }
         if let ServerError::ComputeQuotaDenied(denied) = self {
             body = body.with_quota((*denied).into());
@@ -389,7 +405,9 @@ impl ServerError {
             | ServerError::ReservedLabel(_)
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_)
-            | ServerError::MetadataValidation(_) => StatusCode::BAD_REQUEST,
+            | ServerError::MetadataValidation(_)
+            | ServerError::RequirementsUnmet(..)
+            | ServerError::NotSupported(_) => StatusCode::BAD_REQUEST,
             ServerError::MetadataProfileValidation(findings) => {
                 if profile_validation_unavailable(findings) {
                     StatusCode::SERVICE_UNAVAILABLE
@@ -425,6 +443,8 @@ impl ServerError {
             | ServerError::BadRequestReason(_)
             | ServerError::BadRequestMessage(_) => "Bad request".to_string(),
             ServerError::MetadataValidation(_) => "Validation failed".to_string(),
+            ServerError::RequirementsUnmet(..) => "requirements_unmet".to_string(),
+            ServerError::NotSupported(_) => "not_supported".to_string(),
             ServerError::MetadataProfileValidation(findings) => findings.first().map_or_else(
                 || "profile_validation_failed".to_string(),
                 |finding| finding.code.clone(),

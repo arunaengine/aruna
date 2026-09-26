@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::StructuredId;
 use aruna_core::errors::{BlobError, SourceResolutionError, StagingSourceError};
+use aruna_core::repository::RepositoryPull;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
     ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
@@ -74,6 +75,19 @@ pub struct UploadRoCrateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImportSourceRequest {
+    Repository {
+        group_id: String,
+        connector_id: String,
+        record_id: String,
+        #[serde(flatten)]
+        options: super::repository::ImportOptionsRequest,
+        /// Creates a pull link that keeps the new dataset updated from the record lineage.
+        #[serde(default)]
+        keep_updated: bool,
+        /// With keep_updated, imports new versions without asking; default false.
+        #[serde(default)]
+        auto_update: Option<bool>,
+    },
     Upload {
         upload_id: String,
     },
@@ -299,10 +313,10 @@ taken: READ on the source, WRITE on the target bucket, and WRITE on the metadata
                 "report_url": "https://node.example.test/api/v1/compute/jobs/01JJOB0123456789ABCDEFGHIJ/report"
             })
         ),
-        (status = 400, description = "Malformed ids, an empty or oversized bucket, prefix or metadata path, an unsafe path segment, or an expired or oversized source", body = ErrorResponse),
+        (status = 400, description = "Malformed ids, an empty or oversized bucket, prefix or metadata path, an unsafe path segment, an expired or oversized source, or a repository source whose kind cannot import (code not_supported) or does not accept the record id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, is a path-restricted delegated token, names another user's upload, or lacks READ on the source or WRITE on the target bucket or metadata path", body = ErrorResponse),
-        (status = 404, description = "The upload, source object or version, connector source, or target bucket does not exist", body = ErrorResponse),
+        (status = 404, description = "The upload, source object or version, connector source, repository connector, or target bucket does not exist", body = ErrorResponse),
         (status = 409, description = "Idempotency key bound to a different plan, an upload already claimed by another job, a reached active-job cap, or a standing compute quota refusal, which reports the exact scope, dimension and numbers in `quota`", body = ErrorResponse),
         (status = 502, description = "The connector source's staging backend could not be reached; retryable", body = ErrorResponse),
         (status = 503, description = "The job could not be placed right now; the unchanged request may be retried", body = ErrorResponse)
@@ -315,7 +329,31 @@ pub async fn submit_import(
     Json(request): Json<SubmitImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let source = parse_import_source(request.source)?;
+    let mut source = parse_import_source(request.source)?;
+    Box::pin(repository_source(&state, &auth, &source)).await?;
+    if let ImportRoCrateSource::Repository {
+        group_id,
+        pull: Some(RepositoryPull::Keep { owner_node_url, .. }),
+        ..
+    } = &mut source
+    {
+        // A pull link is managed like any link of the connector group.
+        Box::pin(crate::metadata::ensure_metadata_scope(
+            &state,
+            &auth,
+            *group_id,
+            Permission::WRITE,
+        ))
+        .await?;
+        *owner_node_url = state
+            .interface_state()
+            .await
+            .rest
+            .map(|rest| rest.api_base_url)
+            .ok_or_else(|| {
+                ServerError::InternalError("REST interface URL is unavailable".into())
+            })?;
+    }
     let target = parse_import_target(request.target, state.rocrate_limits().key_bytes)?;
     let metadata = parse_import_metadata(request.metadata, state.rocrate_limits().key_bytes)?;
     let mut spec = ImportRoCrateSpec {
@@ -387,8 +425,62 @@ pub async fn submit_import(
     ))
 }
 
+/// A repository source needs READ on the connector group, a connector whose kind imports, and a
+/// record id that kind accepts; keep_updated also needs pull links.
+async fn repository_source(
+    state: &ServerState,
+    auth: &AuthContext,
+    source: &ImportRoCrateSource,
+) -> ServerResult<()> {
+    use super::repository::links::{connector_kind, ensure_capable, validate_record_id};
+    use aruna_operations::jobs::repository::Action;
+    let ImportRoCrateSource::Repository {
+        group_id,
+        connector_id,
+        record_id,
+        pull,
+        ..
+    } = source
+    else {
+        return Ok(());
+    };
+    crate::metadata::ensure_metadata_scope(state, auth, *group_id, Permission::READ).await?;
+    let kind = connector_kind(state, *group_id, *connector_id).await?;
+    ensure_capable(kind, Action::Import)?;
+    if pull.is_some() {
+        ensure_capable(kind, Action::Pull)?;
+    }
+    validate_record_id(kind, record_id)
+}
+
 fn parse_import_source(source: ImportSourceRequest) -> ServerResult<ImportRoCrateSource> {
     match source {
+        ImportSourceRequest::Repository {
+            group_id,
+            connector_id,
+            record_id,
+            options,
+            keep_updated,
+            auto_update,
+        } => {
+            if auto_update.is_some() && !keep_updated {
+                return Err(ServerError::BadRequestReason(
+                    "auto_update needs keep_updated".into(),
+                ));
+            }
+            // The owner node URL is filled in once the request is accepted.
+            let pull = keep_updated.then(|| RepositoryPull::Keep {
+                auto_update: auto_update.unwrap_or(false),
+                owner_node_url: String::new(),
+            });
+            Ok(ImportRoCrateSource::Repository {
+                options: options.into(),
+                group_id: parse_ulid(&group_id)?,
+                connector_id: parse_ulid(&connector_id)?,
+                record_id,
+                pull,
+            })
+        }
         ImportSourceRequest::Upload { upload_id } => Ok(ImportRoCrateSource::Upload {
             upload_id: parse_ulid(&upload_id)?,
         }),
@@ -465,6 +557,9 @@ async fn fast_source_check(
     idempotency_key: Option<&str>,
 ) -> ServerResult<()> {
     match source {
+        ImportRoCrateSource::Repository { group_id, .. } => {
+            crate::metadata::ensure_metadata_scope(state, auth, *group_id, Permission::READ).await
+        }
         ImportRoCrateSource::Upload { upload_id } => {
             let record = load_rocrate_upload(&state.get_ctx(), *upload_id)
                 .await

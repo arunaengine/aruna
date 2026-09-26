@@ -224,6 +224,7 @@ pub(super) enum MetadataFanoutOperation {
     BucketSearch,
     ObjectSearch,
     ReferencePreflight,
+    IdentifierLookup,
 }
 
 impl MetadataFanoutOperation {
@@ -234,6 +235,7 @@ impl MetadataFanoutOperation {
             Self::BucketSearch => "bucket_search",
             Self::ObjectSearch => "object_search",
             Self::ReferencePreflight => "reference_preflight",
+            Self::IdentifierLookup => "identifier_lookup",
         }
     }
 }
@@ -277,6 +279,14 @@ pub(super) fn fanout_node_span(
         ),
         MetadataFanoutOperation::ReferencePreflight => debug_span!(
             "metadata.operation.reference_preflight_node",
+            peer = ?node_id,
+            local,
+            elapsed_ms = field::Empty,
+            hit_count = field::Empty,
+            result = field::Empty,
+        ),
+        MetadataFanoutOperation::IdentifierLookup => debug_span!(
+            "metadata.operation.identifier_lookup_node",
             peer = ?node_id,
             local,
             elapsed_ms = field::Empty,
@@ -640,6 +650,79 @@ pub async fn search_buckets_distributed(
         .collect::<Vec<_>>();
     hits.truncate(limit);
     Ok(BucketSearchExecution { hits, fanout_stats })
+}
+
+type Matches = Vec<crate::metadata::secondary_ids::IdentifierMatch>;
+
+/// Asks every realm node's reverse index, since each node indexes only the mappings it holds.
+/// Returns the merged readable matches and whether any node failed to answer.
+pub async fn lookup_identifier_distributed(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    auth: Option<super::AuthContext>,
+    bearer_token: Option<String>,
+    identifier: (
+        aruna_core::structs::secondary_id::SecondaryIdKind,
+        String,
+        Option<String>,
+    ),
+) -> Result<(Matches, bool), MetadataApiError> {
+    let handle = context
+        .metadata_handle
+        .clone()
+        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
+    let local_call: MetadataNodeCall<Matches> = metadata_node_call(
+        (context.clone(), auth, realm_id, identifier.clone()),
+        |(context, auth, realm_id, (kind, value, endpoint)), _| async move {
+            crate::metadata::secondary_ids::lookup_local(
+                &context,
+                realm_id,
+                auth.as_ref(),
+                kind,
+                &value,
+                endpoint.as_deref(),
+            )
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)
+        },
+    );
+    let remote_call: MetadataNodeCall<Matches> = metadata_node_call(
+        (handle, fanout_bearer(bearer_token.as_deref()), identifier),
+        |(handle, auth_token, (kind, value, endpoint)), node_id| async move {
+            handle
+                .request_identifier_lookup(node_id, auth_token, kind, value, endpoint)
+                .await
+        },
+    );
+    let (parts, stats) = run_metadata_fanout(
+        context,
+        realm_id,
+        local_node_id,
+        MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), None, true),
+        MetadataFanoutOperation::IdentifierLookup,
+        local_call,
+        remote_call,
+        record_lookup_result,
+        map_read_error,
+    )
+    .await?;
+    let matches = crate::metadata::secondary_ids::merge_matches(
+        parts.into_iter().flat_map(|(_, matches)| matches),
+    );
+    Ok((matches, stats.nodes_failed > 0 || stats.discovery_failed))
+}
+
+fn record_lookup_result(span: &Span, result: &Result<Matches, MetadataReadError>) {
+    match result {
+        Ok(matches) => {
+            span.record("result", "ok");
+            span.record("hit_count", matches.len() as u64);
+        }
+        Err(_) => {
+            span.record("result", "error");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]

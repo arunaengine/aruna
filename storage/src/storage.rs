@@ -8,6 +8,7 @@ mod metrics;
 mod owner;
 mod persistence;
 mod records;
+mod sealing;
 mod shutdown;
 mod telemetry;
 #[cfg(test)]
@@ -23,6 +24,7 @@ pub use handle::{
 pub use metrics::{InFlightGuard, StorageMetricsSnapshot};
 pub use owner::TransactionOwner;
 pub use persistence::FjallPersistPolicy;
+pub use sealing::{SEALED_KEYSPACES, row_aad};
 pub use worker::FjallStorage;
 
 pub(in crate::storage) use handle::{
