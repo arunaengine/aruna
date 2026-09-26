@@ -10,7 +10,9 @@ use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role, SessionKind};
+use aruna_core::structs::identity::auth::{
+    Actor, AuthContext, PathRestriction, Permission, Role, SessionKind,
+};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
@@ -320,6 +322,7 @@ async fn issue_user_session(
     user_id: UserId,
     expiry: u64,
     kind: SessionKind,
+    restrictions: Option<Vec<PathRestriction>>,
 ) -> ServerResult<String> {
     let created = drive(
         CreateSessionOperation::new(CreateSessionConfig {
@@ -330,6 +333,7 @@ async fn issue_user_session(
             node_capabilities: state.node_capabilities().clone(),
             kind,
             label: None,
+            restrictions,
         }),
         &state.get_ctx(),
     )
@@ -667,13 +671,14 @@ async fn register_user(
     summary = "Issue a realm bearer token",
     description = r#"Mints a realm bearer token for the calling user, valid for 24 hours.
 
-**Authentication**: a realm bearer token without path restrictions, which refreshes itself, or an
+**Authentication**: a realm bearer token, which refreshes itself, or an
 OIDC token from a configured issuer whose subject has been registered at
 `POST /access/users/register`. The token is always minted for the caller and never on behalf of
 somebody else.
 
 **Behavior**
 - The token preserves a bound session's kind; an OIDC or unbound caller receives a `portal` session.
+- The token keeps the path restrictions of the presented token, so renewal never widens access.
 - The token is returned in this response only, so a lost one has to be reissued here.
 
 **Limits**
@@ -688,7 +693,7 @@ somebody else.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token, or this node knows no user for the presented OIDC subject", body = ErrorResponse),
-        (status = 403, description = "The presented token is path-restricted, or its user is an alias of the canonical user of that OIDC subject", body = ErrorResponse),
+        (status = 403, description = "The user is an alias of the canonical user of that OIDC subject", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -698,17 +703,14 @@ async fn get_token(
     headers: HeaderMap,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
-    let (user_id, kind) = match auth {
+    let (user_id, kind, restrictions) = match auth {
         Some(aruna_ctx) => {
-            if aruna_ctx.path_restrictions.is_some() {
-                return Err(ServerError::Forbidden);
-            }
             ensure_token_subject(&state, aruna_ctx.user_id).await?;
             let kind = aruna_ctx
                 .session
                 .as_ref()
                 .map_or(SessionKind::Portal, |session| session.kind);
-            (aruna_ctx.user_id, kind)
+            (aruna_ctx.user_id, kind, aruna_ctx.path_restrictions)
         }
         None => {
             let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
@@ -722,14 +724,14 @@ async fn get_token(
             )
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
-            (user.user_id, SessionKind::Portal)
+            (user.user_id, SessionKind::Portal, None)
         }
     };
 
     let expiry = now_timestamp()
         .checked_add(TOKEN_EXPIRY_SECONDS)
         .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
-    let token = issue_user_session(&state, user_id, expiry, kind).await?;
+    let token = issue_user_session(&state, user_id, expiry, kind, restrictions).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
 }

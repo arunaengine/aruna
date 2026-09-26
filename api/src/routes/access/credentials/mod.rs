@@ -105,7 +105,7 @@ struct DelegationScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NormalizedRestriction {
+pub(crate) struct NormalizedRestriction {
     scope: DelegationScope,
     permission: Permission,
 }
@@ -202,7 +202,9 @@ fn parse_normalized_restriction(
         .map(|scope| NormalizedRestriction { scope, permission })
 }
 
-fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRestriction> {
+pub(crate) fn serialize_restrictions(
+    restrictions: &[NormalizedRestriction],
+) -> Vec<PathRestriction> {
     restrictions
         .iter()
         .map(NormalizedRestriction::to_path_restriction)
@@ -359,9 +361,14 @@ pub async fn create_s3_credentials(
     {
         return Err(ServerError::BadRequest);
     }
-    let path_restrictions =
-        build_credential_restrictions(&auth, &state, group_id, request.path_restrictions.clone())
-            .await?;
+    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
+    let path_restrictions = build_credential_restrictions(
+        &auth,
+        &state,
+        &group_root,
+        request.path_restrictions.clone(),
+    )
+    .await?;
     authorize_credential_issuance(&auth, &state, group_id, path_restrictions.as_deref()).await?;
     let path_restrictions = path_restrictions.as_deref().map(serialize_restrictions);
     if let Some(restrictions) = path_restrictions.as_deref()
@@ -521,16 +528,15 @@ fn credential_expiry(now: SystemTime, expires_in_seconds: Option<u64>) -> Server
         .ok_or(ServerError::BadRequest)
 }
 
-async fn build_credential_restrictions(
+/// Narrows the caller's restrictions to `root` and the requested scopes; never widens them.
+pub(crate) async fn build_credential_restrictions(
     auth: &AuthContext,
     state: &ServerState,
-    group_id: Ulid,
+    root: &str,
     requested_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
-    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
-    let auth_restrictions = normalize_auth_restrictions(auth, &group_root)?;
-    let requested_restrictions =
-        normalize_requested_restrictions(requested_restrictions, &group_root)?;
+    let auth_restrictions = normalize_auth_restrictions(auth, root)?;
+    let requested_restrictions = normalize_requested_restrictions(requested_restrictions, root)?;
 
     validate_requested_restrictions(auth, state, requested_restrictions.as_deref()).await?;
 

@@ -1307,6 +1307,7 @@ async fn foreign_realm_unimplemented() {
             node_capabilities: NodeCapabilities::management_node(foreign_signing_key).unwrap(),
 
             session: None,
+            restrictions: None,
         })
         .unwrap(),
         node.context.as_ref(),
@@ -1391,6 +1392,7 @@ async fn refresh_preserves_kind() {
             kind: "assistant".to_string(),
             label: None,
             expires_in_seconds: Some(600),
+            path_restrictions: None,
         })
         .send()
         .await
@@ -1415,7 +1417,7 @@ async fn refresh_preserves_kind() {
 }
 
 #[tokio::test]
-async fn scoped_token_rejected() {
+async fn refresh_keeps_scope() {
     let issuer = "https://issuer.example";
     let kid = "main-key";
     let signing_key = generate_signing_key();
@@ -1433,6 +1435,10 @@ async fn scoped_token_rejected() {
     )
     .await;
     let scoped_token = sign_scoped_token(&node, UserId::from_string(&registered.id).unwrap());
+    let scope = handle_token(&node.state, &scoped_token)
+        .await
+        .unwrap()
+        .restrictions;
 
     let token_response = reqwest::Client::new()
         .get(format!("{}/api/v1/access/token", node.base_url))
@@ -1441,7 +1447,11 @@ async fn scoped_token_rejected() {
         .await
         .unwrap();
 
-    assert_eq!(token_response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(token_response.status(), StatusCode::OK);
+    let refreshed: GetTokenResponse = token_response.json().await.unwrap();
+    let claims = handle_token(&node.state, &refreshed.token).await.unwrap();
+    assert!(scope.is_some());
+    assert_eq!(claims.restrictions, scope);
 
     node.server_task.abort();
     node.net.shutdown().await;

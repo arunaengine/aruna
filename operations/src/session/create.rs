@@ -12,7 +12,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::{NodeCapabilities, SessionKind, SessionRef};
+use aruna_core::structs::identity::auth::{
+    NodeCapabilities, PathRestriction, SessionKind, SessionRef,
+};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::types::{Effects, TxnId};
@@ -32,6 +34,7 @@ pub struct CreateSessionConfig {
     pub node_capabilities: NodeCapabilities,
     pub kind: SessionKind,
     pub label: Option<String>,
+    pub restrictions: Option<Vec<PathRestriction>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +157,7 @@ impl CreateSessionOperation {
             realm_id: self.config.realm_id,
             node_capabilities: self.config.node_capabilities.clone(),
             session: Some(session_ref),
+            restrictions: self.config.restrictions.clone(),
         })?;
         self.session = Some(UserSession {
             sid: self.sid.clone(),
@@ -407,6 +411,7 @@ mod pure_tests {
             node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
             kind: SessionKind::Portal,
             label: None,
+            restrictions: None,
         }
     }
 

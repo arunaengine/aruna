@@ -310,6 +310,7 @@ pub(crate) async fn create_bearer_token(
             node_capabilities,
 
             session: None,
+            restrictions: None,
         })?,
         context,
     )

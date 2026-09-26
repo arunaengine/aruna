@@ -11,6 +11,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
+use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::s3::session::{
@@ -394,7 +395,8 @@ async fn session_scope(
     group_id: Ulid,
 ) -> ServerResult<Option<Vec<PathRestriction>>> {
     ensure_membership(state, auth, group_id).await?;
-    let restrictions = build_credential_restrictions(auth, state, group_id, None).await?;
+    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
+    let restrictions = build_credential_restrictions(auth, state, &group_root, None).await?;
     authorize_credential_issuance(auth, state, group_id, restrictions.as_deref()).await?;
     Ok(restrictions.as_deref().map(serialize_restrictions))
 }

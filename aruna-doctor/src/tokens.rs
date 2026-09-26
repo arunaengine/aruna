@@ -186,6 +186,7 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
             node_capabilities: config.node_capabilities,
 
             session: None,
+            restrictions: None,
         })?,
         &driver_ctx,
     )
