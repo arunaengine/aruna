@@ -44,7 +44,7 @@ dc:shape-Dataset-creators a sh:PropertyShape ;
   sh:node dc:shape-Creator ;
   sh:message "The dataset needs creators; each person needs a name or family name and each organization a name." .
 
-# Members are property shapes: craqle skips sh:property of shapes reached through sh:node.
+# A creator needs one plain name, or one family name when it is not an organization.
 dc:shape-Creator a sh:NodeShape ;
   sh:or (
     [ sh:path schema:name ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ]
