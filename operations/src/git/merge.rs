@@ -13,7 +13,8 @@ use super::versions::{
 use super::{GitError, MergeConflict};
 use crate::driver::DriverContext;
 use crate::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation, update_metadata_document,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    update_metadata_document,
 };
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, GitSnapshot, MergeOutcome, RefUpdate, ZERO_OID};
@@ -250,7 +251,7 @@ async fn update_metadata(
     old: &str,
     new: &str,
 ) -> Result<(), GitError> {
-    let (_, graph) = current(context, document, None, false)
+    let (revision, graph) = current(context, document, None, false)
         .await?
         .ok_or(GitError::Unavailable)?;
     let effect = GitEffect::MergeMetadata {
@@ -280,12 +281,16 @@ async fn update_metadata(
         document_id: document.document_id,
         public: document.public,
         mutation: UpdateDocumentMutation::ReplaceRoCrate { jsonld },
-        expected_revision: None,
+        // An edit that lands while the merge runs must not be overwritten; retry instead.
+        expected_revision: Some(revision),
     });
     update_metadata_document(operation, context)
         .await
         .map(|_| ())
-        .map_err(|error| GitError::Refused(error.to_string()))
+        .map_err(|error| match error {
+            UpdateDocumentError::RevisionConflict { .. } => GitError::Stale,
+            other => GitError::Refused(other.to_string()),
+        })
 }
 
 /// Merges a kept conflict into its branch and removes it in the same record.
