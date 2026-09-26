@@ -15,6 +15,7 @@ pub mod effects;
 pub mod egress;
 pub mod errors;
 pub mod events;
+pub mod git;
 pub mod handle;
 pub mod id;
 pub mod jobs;

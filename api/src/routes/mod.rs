@@ -17,6 +17,7 @@ pub mod audit;
 pub mod device;
 pub mod drs;
 pub mod execution;
+pub mod git;
 pub mod info;
 pub mod link_routes;
 pub mod management_relay;
@@ -68,6 +69,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(execution::jobs::router())
         .merge(execution::job::audit::router())
         .merge(metadata::router())
+        .merge(git::router())
         .merge(oai::router())
         .merge(pid::router())
         .merge(placement::router())
@@ -97,6 +99,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
             crate::rate_limit::principal_middleware,
         ))
         .layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(git::credentials))
         .layer(from_fn_with_state(
             state.clone(),
             request_tracing_middleware,
@@ -142,6 +145,33 @@ pub(crate) mod tests {
     /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
     /// A route added or removed without this fixture changing is a regression.
     const RUNTIME_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/metadata/{document_id}/git"),
+        ("POST", "/metadata/{document_id}/git/push"),
+        ("GET", "/metadata/{document_id}/git/rocrate"),
+        ("GET", "/git/{repository}/info/refs"),
+        ("POST", "/git/{repository}/{service}"),
+        ("POST", "/git/{repository}/info/lfs/objects/batch"),
+        ("GET", "/git/{repository}/info/lfs/objects/{oid}"),
+        ("PUT", "/git/{repository}/info/lfs/objects/{oid}"),
+        ("GET", "/git/{repository}/info/lfs/locks"),
+        ("POST", "/git/{repository}/info/lfs/locks"),
+        ("POST", "/git/{repository}/info/lfs/locks/verify"),
+        ("POST", "/git/{repository}/info/lfs/locks/{id}/unlock"),
+        ("GET", "/metadata/{document_id}/versions"),
+        ("GET", "/metadata/{document_id}/versions/{version}"),
+        ("GET", "/metadata/{document_id}/versions/{version}/rocrate"),
+        ("GET", "/metadata/{document_id}/compare"),
+        ("GET", "/metadata/{document_id}/branches"),
+        ("POST", "/metadata/{document_id}/branches"),
+        ("DELETE", "/metadata/{document_id}/branches/{name}"),
+        ("PUT", "/metadata/{document_id}/branches/{name}/rocrate"),
+        ("POST", "/metadata/{document_id}/branches/{name}/merge"),
+        ("GET", "/metadata/{document_id}/tags"),
+        ("POST", "/metadata/{document_id}/tags"),
+        ("DELETE", "/metadata/{document_id}/tags/{name}"),
+        ("GET", "/metadata/{document_id}/conflicts"),
+        ("POST", "/metadata/{document_id}/conflicts/{id}/merge"),
+        ("DELETE", "/metadata/{document_id}/conflicts/{id}"),
         ("POST", "/access/groups/{id}/join-requests"),
         ("GET", "/access/groups/{id}/join-requests"),
         ("DELETE", "/access/groups/{id}/join-requests/{request_id}"),

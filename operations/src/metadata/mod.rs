@@ -5,6 +5,7 @@
 pub mod api;
 pub mod audit;
 pub(crate) mod builtin;
+pub mod checkpoint;
 pub mod contact;
 pub mod create_document;
 pub mod delete_document;

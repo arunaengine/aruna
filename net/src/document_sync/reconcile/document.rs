@@ -340,18 +340,19 @@ impl DocumentSyncService {
                 ));
                 continue;
             }
-            let mut entries = Vec::new();
+            let mut revision_entries = Vec::new();
             if let Some(revision) = &apply.lifecycle_revision {
-                entries.push(
+                revision_entries.push(
                     sync_revision_entry(&apply.target, revision)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
                 );
                 if let Some(manifest) = shard_manifest_entry(&apply.target, revision)
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?
                 {
-                    entries.push(manifest);
+                    revision_entries.push(manifest);
                 }
             }
+            let mut entries = Vec::new();
             let mut event_entries = create_projection_entries(&apply.record)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             if let Some((_, _, value)) = event_entries.first_mut() {
@@ -364,7 +365,7 @@ impl DocumentSyncService {
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
                 );
             }
-            candidates.push((apply, entries));
+            candidates.push((apply, revision_entries, entries));
         }
 
         let txn_id = start_storage_transaction(&self.storage).await?;
@@ -373,7 +374,7 @@ impl DocumentSyncService {
         let mut accepted_candidates = Vec::with_capacity(candidates.len());
         let mut create_acceptances: BTreeMap<Ulid, MetadataEventRecord> = BTreeMap::new();
         let mut deferred_cursor_topics = BTreeSet::new();
-        for (apply, entries) in candidates {
+        for (apply, revision_entries, mut entries) in candidates {
             let fenced = match create_fence_txn(&self.storage, &apply.record, txn_id).await {
                 Ok(fenced) => fenced,
                 Err(error) => {
@@ -400,7 +401,30 @@ impl DocumentSyncService {
                             return Err(error);
                         }
                     };
-                if stale {
+                // One lifecycle target carries every event, so an older concurrent event
+                // still belongs in the log; only the lifecycle revision must not regress.
+                if !stale {
+                    entries.extend(revision_entries);
+                } else if match transaction_read(
+                    &self.storage,
+                    aruna_core::keyspaces::EVENT_LOG_KEYSPACE.to_string(),
+                    aruna_core::storage_entries::event_log_key(
+                        apply.record.record.document_id,
+                        apply.record.event_id,
+                    ),
+                    Some(txn_id),
+                )
+                .await
+                {
+                    Ok(logged) => logged.is_some(),
+                    Err(error) => {
+                        let _ = self
+                            .storage
+                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                            .await;
+                        return Err(error);
+                    }
+                } {
                     continue;
                 }
             }

@@ -460,6 +460,9 @@ pub(super) fn error_from_craqle(error: CraqleError) -> MetadataError {
             }
             other => MetadataError::Backend(other.to_string()),
         },
+        CraqleError::Merge(error @ craqle::MergeError::MissingDependencies(_)) => {
+            MetadataError::MissingDependencies(error.to_string())
+        }
         CraqleError::SyncInputRejected(message) => MetadataError::InvalidInput(message),
         CraqleError::MultiGraphUpdateUnsupported => {
             MetadataError::InvalidInput("unsupported update across multiple graphs".to_string())
@@ -643,9 +646,10 @@ pub(super) fn plan_batch(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     graph_iri: &str,
-    actor: [u8; 32],
+    dot: ([u8; 32], u64),
     source: &MetadataBatchSource,
 ) -> Result<MetadataBatch, CraqleError> {
+    let (actor, counter) = dot;
     let graph = GraphId::new(graph_iri);
     // Planning against a graph this node has not materialized yet would omit
     // the removals the change set needs, so the caller must retry instead.
@@ -654,22 +658,46 @@ pub(super) fn plan_batch(
             "metadata graph `{graph_iri}` is not materialized yet"
         ))));
     }
-    let changes = match source {
+    let plan = || match source {
         MetadataBatchSource::ReplaceRoCrate { jsonld } => {
-            node.plan_rocrate_document_checked(auth, &graph, jsonld)?
+            node.plan_rocrate_document_checked(auth, &graph, jsonld)
         }
         MetadataBatchSource::UpsertDataEntity { jsonld } => {
-            node.plan_patch_data(auth, &craqle_patch_request(&graph, jsonld)?)?
+            node.plan_patch_data(auth, &craqle_patch_request(&graph, jsonld)?)
         }
         MetadataBatchSource::UpsertContextualEntity { jsonld } => {
-            node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)?
+            node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)
         }
     };
-    let base_clock = node.vector_clock(&graph)?;
+    // A merge landing mid-plan would let the batch witness dots the plan never saw, so
+    // the plan only counts when the graph clock stayed the same around it.
+    let mut attempt = 0;
+    let (changes, mut base_clock) = loop {
+        attempt += 1;
+        let before = node.vector_clock(&graph)?;
+        let planned = plan();
+        let after = node.vector_clock(&graph)?;
+        match planned {
+            Ok(changes) if before == after => break (changes, before),
+            Err(error)
+                if attempt < 8 && error.kind() == craqle::CraqleErrorKind::StalePreparedState => {}
+            Err(error) => return Err(error),
+            Ok(_) if attempt < 8 => {}
+            Ok(_) => {
+                return Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
+                    "metadata graph `{graph_iri}` kept changing while planning"
+                ))));
+            }
+        }
+    };
+    // The clock keeps one counter per actor, so a later dot must never land first.
+    if counter > 1 {
+        base_clock.advance(ActorId::from_bytes(actor), counter - 1);
+    }
     let batch = Batch::from_changes(
         graph,
         ActorId::from_bytes(actor),
-        1,
+        counter,
         base_clock,
         changes,
         chrono::Utc::now(),

@@ -21,6 +21,8 @@ pub struct EnqueueDraftInput {
 #[derive(Debug, PartialEq)]
 pub struct EnqueueDraftOperation {
     input: EnqueueDraftInput,
+    /// The edit's advanced CRDT actor, stored atomically with the entry.
+    actor: Option<aruna_core::metadata::MetadataActor>,
     state: EnqueueDraftState,
     output: Option<Result<PublishEntry, EnqueueDraftError>>,
 }
@@ -62,9 +64,15 @@ impl EnqueueDraftOperation {
     pub fn new(input: EnqueueDraftInput) -> Self {
         Self {
             input,
+            actor: None,
             state: EnqueueDraftState::Init,
             output: None,
         }
+    }
+
+    pub fn with_actor(mut self, actor: aruna_core::metadata::MetadataActor) -> Self {
+        self.actor = Some(actor);
+        self
     }
 
     fn emit_write(&mut self, txn_id: TxnId) -> Effects {
@@ -73,8 +81,15 @@ impl EnqueueDraftOperation {
             Ok(entry) => entry,
             Err(error) => return fail(self, EnqueueDraftError::ConversionError(error)),
         };
+        let mut writes = vec![entry];
+        if let Some(actor) = &self.actor {
+            match aruna_core::storage_entries::metadata_actor_entry(actor) {
+                Ok(entry) => writes.push(entry),
+                Err(error) => return fail(self, EnqueueDraftError::ConversionError(error)),
+            }
+        }
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![entry],
+            writes,
             txn_id: Some(txn_id),
         })]
     }

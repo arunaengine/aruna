@@ -23,6 +23,23 @@ fn main() {
     if let Some(code) = aruna_compute::dispatch_helper() {
         std::process::exit(code);
     }
+    if std::env::args().nth(1).as_deref() == Some("--git-hook")
+        || std::env::args_os().next().is_some_and(|path| {
+            std::path::Path::new(&path)
+                .file_name()
+                .is_some_and(|name| name == "pre-receive")
+        })
+    {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .and_then(|runtime| runtime.block_on(aruna_operations::git::hook::validate()));
+        if let Err(error) = &result {
+            // Git relays hook stderr to the pushing client as its rejection reason.
+            eprintln!("aruna: {error}");
+        }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     run_runtime();
 }
 

@@ -17,9 +17,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::{
     ApplyRoCrateRequest, DeadLetterRecord, MaterializationState, MaterializationStatusRecord,
-    MetadataBatch, MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataEventPayload, MetadataEventRecord, MetadataGraphPolicy, MetadataMaterializationRecord,
-    MetadataRawRevision, MetadataRequestDurability, deterministic_materialization_actor,
+    MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
+    MetadataEventRecord, MetadataGraphPolicy, MetadataMaterializationRecord, MetadataRawRevision,
+    MetadataRequestDurability, deterministic_materialization_actor,
 };
 use aruna_core::storage_entries::{
     dead_letter_entry, dead_letter_key, document_job_entry, document_job_key, document_job_prefix,
@@ -41,7 +41,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use crate::tasks::queue_backoff::{due_after, retry_delay_ms};
+use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_after_ms, retry_delay_ms};
 
 use super::iri_index::MetadataIriError;
 use super::profile::validation::{assess_render, violation_count};
@@ -121,6 +121,10 @@ enum FinishedMaterializationJob {
         job_key: Vec<u8>,
         job: MetadataMaterializationRecord,
         status: MaterializationStatusRecord,
+        /// Waits for causal dependencies still in transit, so it retries soon.
+        waiting: bool,
+        /// A merge that later events never make obsolete.
+        merge: bool,
     },
     Parked {
         job_key: Vec<u8>,
@@ -723,13 +727,22 @@ async fn plan_finish_chunk(
                 job_key,
                 job,
                 status,
+                waiting,
+                merge,
             } => {
                 let old_index_delete = (
                     MATERIALIZATION_JOB_KEYSPACE.to_string(),
                     ByteView::from(job_key),
                 );
                 let current = guard_status(&snapshot, &planned, job.document_id);
-                if current.is_some_and(|current| retry_already_advanced(current, &job)) {
+                let advanced = |current: &MaterializationStatusRecord| {
+                    if merge {
+                        current.event_id == job.event_id && current.attempts > job.attempts
+                    } else {
+                        retry_already_advanced(current, &job)
+                    }
+                };
+                if current.is_some_and(advanced) {
                     plan.deletes.push(old_index_delete);
                     plan.deletes.push((
                         DOCUMENT_JOB_KEYSPACE.to_string(),
@@ -738,10 +751,17 @@ async fn plan_finish_chunk(
                     continue;
                 }
                 let attempts = job.attempts.saturating_add(1);
+                // A dependency that stays missing is checked rarely, not every two seconds.
+                let delay = if waiting {
+                    let cap = if attempts > 30 { 300_000 } else { 2_000 };
+                    retry_after_ms(attempts, RETRY_BASE_MS, cap)
+                } else {
+                    retry_delay_ms(attempts)
+                };
                 let next_job = MetadataMaterializationRecord {
                     document_id: job.document_id,
                     event_id: job.event_id,
-                    due_at_ms: unix_timestamp_millis().saturating_add(retry_delay_ms(attempts)),
+                    due_at_ms: unix_timestamp_millis().saturating_add(delay),
                     attempts,
                     failures: status.failures,
                     parks: job.parks,
@@ -1449,9 +1469,17 @@ async fn filter_live_jobs(
     let mut live = Vec::with_capacity(jobs.len());
     let mut dead = Vec::new();
     for ((key, job), event) in jobs.into_iter().zip(events) {
-        let advanced = statuses
-            .get(&job.document_id)
-            .is_some_and(|status| retry_already_advanced(status, &job));
+        let merge = event
+            .as_ref()
+            .and_then(|event| postcard::from_bytes::<MetadataEventRecord>(event).ok())
+            .is_some_and(|event| merges(&event));
+        let advanced = statuses.get(&job.document_id).is_some_and(|status| {
+            if merge {
+                status.event_id == job.event_id && status.attempts > job.attempts
+            } else {
+                retry_already_advanced(status, &job)
+            }
+        });
         if event.is_none() || advanced {
             dead.push((key, job));
         } else {
@@ -1525,6 +1553,11 @@ fn defer_materialization_job(
             job_key: job_key.to_vec(),
             job: job.clone(),
             status: materialization_failure_status(job, event, message, failures, false),
+            waiting: matches!(
+                error,
+                MetadataMaterializationError::Metadata(MetadataError::MissingDependencies(_))
+            ),
+            merge: merges(event),
         }
     }
 }
@@ -1542,8 +1575,15 @@ async fn process_materialization_job(
     }
     let document_job_key = document_job_key(job.document_id, job.event_id).to_vec();
 
-    let obsolescence = job_obsolescence(group.status.as_ref(), &job);
     let event = read_create_event(&context.storage_handle, job.document_id, job.event_id).await;
+    // A merge commutes, so a later materialized event never makes an earlier one obsolete;
+    // skipping it would drop a concurrent edit that arrived late.
+    let obsolescence = match job_obsolescence(group.status.as_ref(), &job) {
+        MaterializationJobObsolescence::Final if event.as_ref().is_ok_and(merges) => {
+            MaterializationJobObsolescence::Live
+        }
+        other => other,
+    };
     match obsolescence {
         MaterializationJobObsolescence::Live => {}
         MaterializationJobObsolescence::Final => {
@@ -1611,6 +1651,28 @@ async fn process_materialization_job(
     match apply_result {
         Ok(materialized) => {
             let raw_revision = materialized.raw_revision;
+            // Boxed so callers' futures stay shallow enough to prove `Send`.
+            let capture: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> = Box::pin(
+                crate::git::snapshot::capture(context, &event.record, raw_revision.as_ref()),
+            );
+            if let Err(error) = capture.await {
+                return Ok(ProcessedMaterializationJob::deferred(
+                    defer_materialization_job(
+                        &job_key,
+                        &job,
+                        &event,
+                        &MetadataMaterializationError::UnexpectedEvent(error.to_string()),
+                    ),
+                    craqle_elapsed,
+                ));
+            }
+            let checkpoint: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> = Box::pin(
+                crate::metadata::checkpoint::after_materialization(context, &event.record),
+            );
+            if let Err(error) = checkpoint.await {
+                // The next materialization of this document checks the window again.
+                warn!(document_id = %event.record.document_id, %error, "Metadata checkpoint failed");
+            }
             let iri_index_writes = match project_materialized_iris(context, &event).await {
                 Ok(writes) => writes,
                 Err(error) => {
@@ -1746,12 +1808,18 @@ async fn older_job_exists(
         {
             continue;
         }
-        if !materialization_event_exists(storage, pending).await? {
-            warn!(document_id = %pending.document_id, event_id = %pending.event_id, "Deleting orphan metadata materialization job");
-            delete_materialization_job(storage, materialization_job_key(pending).to_vec()).await?;
-            continue;
+        match read_create_event(storage, pending.document_id, pending.event_id).await {
+            // Merges commute and wait for their own dependencies, so an earlier merge never
+            // holds back later work; blocking on it could wait for a dot a later event carries.
+            Ok(event) if merges(&event) => continue,
+            Ok(_) => return Ok(true),
+            Err(MetadataMaterializationError::CreateEventMissing { .. }) => {
+                warn!(document_id = %pending.document_id, event_id = %pending.event_id, "Deleting orphan metadata materialization job");
+                delete_materialization_job(storage, materialization_job_key(pending).to_vec())
+                    .await?;
+            }
+            Err(error) => return Err(error),
         }
-        return Ok(true);
     }
     Ok(false)
 }
@@ -1828,6 +1896,14 @@ fn status_is_final(status: &MaterializationStatusRecord) -> bool {
     matches!(
         status.state,
         MaterializationState::Materialized | MaterializationState::Failed
+    )
+}
+
+/// Batches and checkpoints merge by dot, in any order and more than once.
+fn merges(event: &MetadataEventRecord) -> bool {
+    matches!(
+        event.payload,
+        MetadataEventPayload::ApplyBatch { .. } | MetadataEventPayload::Checkpoint { .. }
     )
 }
 
@@ -2039,8 +2115,11 @@ async fn materialize_create_event(
     event: &MetadataEventRecord,
     raw_state_cache: &mut RawStateCache,
 ) -> Result<MaterializedCreateEvent, MetadataMaterializationError> {
-    if let MetadataEventPayload::ApplyBatch { batch, .. } = &event.payload {
-        return merge_batch_event(context, event, batch, raw_state_cache).await;
+    if let MetadataEventPayload::ApplyBatch { .. } | MetadataEventPayload::Checkpoint { .. } =
+        &event.payload
+    {
+        let change = graph_materialization_effect(event, None, false);
+        return merge_batch_event(context, event, change, raw_state_cache).await;
     }
     let raw_plan =
         crate::metadata::raw_revision::prepare_raw_event(context, event, raw_state_cache).await?;
@@ -2073,13 +2152,13 @@ async fn materialize_create_event(
     }
 }
 
-/// Merges the origin's batch, then re-renders and re-validates the graph. The
-/// merge is order independent and idempotent by dot, so every holder converges
-/// whatever order events arrive in.
+/// Merges the origin's batch or joins a checkpoint's graph state, then re-renders and
+/// re-validates the graph. Both are order independent and idempotent by dot, so every
+/// holder converges whatever order events arrive in.
 async fn merge_batch_event(
     context: &DriverContext,
     event: &MetadataEventRecord,
-    batch: &MetadataBatch,
+    change: Effect,
     raw_state_cache: &mut RawStateCache,
 ) -> Result<MaterializedCreateEvent, MetadataMaterializationError> {
     let metadata_handle = context
@@ -2107,14 +2186,9 @@ async fn merge_batch_event(
             )));
         }
     }
-    match metadata_handle
-        .send_effect(Effect::Metadata(MetadataEffect::MergeBatch {
-            graph_iri: event.record.graph_iri.clone(),
-            batch: batch.clone(),
-        }))
-        .await
-    {
-        Event::Metadata(MetadataEvent::BatchMerged { .. }) => {}
+    match metadata_handle.send_effect(change).await {
+        Event::Metadata(MetadataEvent::BatchMerged { .. })
+        | Event::Metadata(MetadataEvent::SnapshotInstalled { .. }) => {}
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
         other => {
             return Err(MetadataMaterializationError::UnexpectedEvent(format!(
@@ -2263,6 +2337,19 @@ fn graph_materialization_effect(
                 batch: batch.clone(),
             })
         }
+        // A checkpoint without graph state joins an empty snapshot, which changes nothing.
+        MetadataEventPayload::Checkpoint { snapshot } => {
+            Effect::Metadata(MetadataEffect::InstallSnapshot {
+                graph_iri: event.record.graph_iri.clone(),
+                snapshot: snapshot.clone().unwrap_or_else(|| {
+                    Box::new(craqle::GraphReplicaSnapshot {
+                        graph: craqle::GraphId::new(&event.record.graph_iri),
+                        clock: craqle::VectorClock::default(),
+                        quads: Vec::new(),
+                    })
+                }),
+            })
+        }
     }
 }
 
@@ -2332,6 +2419,7 @@ fn materialization_failure_kind(
         | MetadataMaterializationError::UnexpectedEvent(_)
         | MetadataMaterializationError::Metadata(
             MetadataError::ChannelClosed
+            | MetadataError::MissingDependencies(_)
             | MetadataError::TaskJoin(_)
             | MetadataError::HandleMissing
             | MetadataError::Persist(_)
@@ -2376,28 +2464,23 @@ async fn write_status_job(
     }
 }
 
-async fn materialization_event_exists(
-    storage: &StorageHandle,
-    job: &MetadataMaterializationRecord,
-) -> Result<bool, MetadataMaterializationError> {
-    match read_create_event(storage, job.document_id, job.event_id).await {
-        Ok(_) => Ok(true),
-        Err(MetadataMaterializationError::CreateEventMissing { .. }) => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
 async fn job_is_live(
     storage: &StorageHandle,
     job: &MetadataMaterializationRecord,
 ) -> Result<bool, MetadataMaterializationError> {
-    if !materialization_event_exists(storage, job).await? {
-        return Ok(false);
-    }
+    let event = match read_create_event(storage, job.document_id, job.event_id).await {
+        Ok(event) => event,
+        Err(MetadataMaterializationError::CreateEventMissing { .. }) => return Ok(false),
+        Err(error) => return Err(error),
+    };
     let status = read_materialization_status(storage, job.document_id, None).await?;
-    Ok(!status
-        .as_ref()
-        .is_some_and(|status| retry_already_advanced(status, job)))
+    Ok(!status.as_ref().is_some_and(|status| {
+        if merges(&event) {
+            status.event_id == job.event_id && status.attempts > job.attempts
+        } else {
+            retry_already_advanced(status, job)
+        }
+    }))
 }
 
 #[cfg(test)]

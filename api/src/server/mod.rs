@@ -27,7 +27,11 @@ const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Body-streaming routes: upload duration counts against the handler, so a
 // deadline here truncates legitimate slow transfers.
-const TIMEOUT_EXEMPT_ROUTES: &[&str] = &["/metadata/rocrate/uploads"];
+const TIMEOUT_EXEMPT_ROUTES: &[&str] = &[
+    "/metadata/rocrate/uploads",
+    "/git/{repository}/info/lfs/objects/{oid}",
+    "/git/{repository}/{service}",
+];
 
 #[derive(Clone, Debug)]
 pub struct Server {
@@ -148,7 +152,7 @@ impl Server {
     }
 }
 
-fn is_exempt(matched: Option<&str>) -> bool {
+pub(crate) fn is_exempt(matched: Option<&str>) -> bool {
     matched.is_some_and(|path| {
         TIMEOUT_EXEMPT_ROUTES
             .iter()

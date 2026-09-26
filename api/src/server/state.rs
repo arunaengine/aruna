@@ -204,6 +204,7 @@ struct AssistantConnections {
 /// (driver context, semaphores, locks, caches) rather than duplicating them.
 #[derive(Clone, Debug)]
 pub struct ServerState {
+    git: Option<Arc<aruna_blob::git::GitStore>>,
     // Contains necessary drivers for request handling.
     driver_ctx: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -310,6 +311,7 @@ impl ServerState {
         let assistant_client =
             crate::routes::assistant::egress::outbound_client(&node_capabilities);
         let state = Self {
+            git: None,
             driver_ctx,
             jobs_runtime,
             metrics: Arc::new(NodeMetrics::new()),
@@ -374,6 +376,19 @@ impl ServerState {
 
     pub fn get_ctx(&self) -> Arc<DriverContext> {
         self.driver_ctx.clone()
+    }
+
+    pub fn with_git(mut self, root: PathBuf, helper: PathBuf) -> Self {
+        let store = Arc::new(aruna_blob::git::GitStore::new(root, helper));
+        self.git = Some(match &self.driver_ctx.metadata_handle {
+            Some(handle) => handle.install_git(store),
+            None => store,
+        });
+        self
+    }
+
+    pub fn git(&self) -> Option<&aruna_blob::git::GitStore> {
+        self.git.as_deref()
     }
 
     pub fn metrics(&self) -> Arc<NodeMetrics> {

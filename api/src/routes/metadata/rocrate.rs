@@ -481,6 +481,7 @@ caller's own token.
         (status = 401, description = "Missing or invalid bearer token, or a holder rejected the forwarded credential", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
         (status = 404, description = "No holder knows this document", body = ErrorResponse),
+        (status = 412, description = "A newer edit landed after `expected_revision`; nothing was written", body = ErrorResponse),
         (status = 503, description = "Realm placement view unreadable, the document has no usable holder, the revision exceeds the stored-document limit, or no holder accepted the forwarded write; the write was not accepted and may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -497,6 +498,12 @@ pub async fn replace_metadata_rocrate(
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
+    let expected_revision = request
+        .expected_revision
+        .as_deref()
+        .map(str::parse::<ulid::Ulid>)
+        .transpose()
+        .map_err(|_| ServerError::BadRequestMessage("expected_revision is not a ULID".into()))?;
     let updated = run_update_metadata_document(
         &ctx,
         Actor {
@@ -510,7 +517,7 @@ pub async fn replace_metadata_rocrate(
         UpdateDocumentMutation::ReplaceRoCrate {
             jsonld: serialize_jsonld_object(&request.rocrate)?,
         },
-        None,
+        expected_revision,
         forwarded_auth_token(bearer_token)?,
     )
     .await

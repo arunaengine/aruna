@@ -49,6 +49,20 @@ jobs:
       - name: Run workspace tests
         run: cargo nextest run --workspace --all-targets --all-features --locked --profile ci
 
+      - name: Install uv
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: uv@0.11.28
+
+      # Real Git, Git LFS and ARC clients; the node itself converts ARCs with arctrl.
+      - name: Run native Git tests
+        run: >-
+          uv run --no-project --python 3.13
+          --with-requirements scripts/arc-native/requirements.txt
+          sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
+          exec cargo nextest run -p aruna --test git_native --all-features --locked
+          --profile ci --run-ignored only --no-tests fail'
+
       # nextest never runs doctests; this keeps them in the gate.
       - name: Run doctests
         run: cargo test --workspace --all-features --locked --doc

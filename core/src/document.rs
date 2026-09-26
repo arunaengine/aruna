@@ -11,9 +11,9 @@ use ulid::Ulid;
 use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
-    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
-    GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE,
-    NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GIT_RECORD_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
     REPOSITORY_LINK_KEYSPACE, USER_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
@@ -51,6 +51,11 @@ pub enum DocumentTarget {
         document_id: Ulid,
     },
     MetadataCreateEvent {
+        document_id: Ulid,
+        event_id: Ulid,
+    },
+    /// One immutable Git record of a metadata document, on the document's topic.
+    GitRecord {
         document_id: Ulid,
         event_id: Ulid,
     },
@@ -383,6 +388,7 @@ impl DocumentTarget {
             Self::User { user_id } => TopicId::users(user_id.realm_id),
             Self::MetadataRegistry { document_id, .. }
             | Self::MetadataCreateEvent { document_id, .. }
+            | Self::GitRecord { document_id, .. }
             | Self::MetadataDocumentLifecycle { document_id }
             | Self::PersistentIdMapping { document_id }
             | Self::RepositoryLink { document_id, .. } => TopicId::metadata(*document_id),
@@ -405,6 +411,7 @@ impl DocumentTarget {
             Self::User { .. } => USER_KEYSPACE,
             Self::MetadataRegistry { .. } => METADATA_INDEX_KEYSPACE,
             Self::MetadataCreateEvent { .. } => EVENT_LOG_KEYSPACE,
+            Self::GitRecord { .. } => GIT_RECORD_KEYSPACE,
             Self::MetadataDocumentLifecycle { .. } => DOCUMENT_LIFECYCLE_KEYSPACE,
             Self::MetadataGraphLifecycle { .. } => GRAPH_LIFECYCLE_KEYSPACE,
             Self::PersistentIdMapping { .. } => ID_MAPPING_KEYSPACE,
@@ -439,6 +446,10 @@ impl DocumentTarget {
                 document_id,
                 event_id,
             } => event_log_key(*document_id, *event_id),
+            Self::GitRecord {
+                document_id,
+                event_id,
+            } => crate::git::git_record_key(*document_id, *event_id),
             Self::MetadataDocumentLifecycle { document_id } => document_lifecycle_key(*document_id),
             Self::MetadataGraphLifecycle { graph_iri } => graph_lifecycle_key(graph_iri),
             Self::PersistentIdMapping { document_id } => {
@@ -476,6 +487,7 @@ impl DocumentTarget {
                 | Self::User { .. }
                 | Self::MetadataRegistry { .. }
                 | Self::MetadataCreateEvent { .. }
+                | Self::GitRecord { .. }
                 | Self::MetadataDocumentLifecycle { .. }
                 | Self::MetadataGraphLifecycle { .. }
                 | Self::PersistentIdMapping { .. }

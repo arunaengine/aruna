@@ -302,6 +302,20 @@ impl AnnounceTopicOperation {
                     placement: self.placement,
                 })
             }
+            DocumentTarget::GitRecord {
+                document_id,
+                event_id,
+            } => {
+                let record: aruna_core::git::GitRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if record.document_id != *document_id || record.event_id != *event_id {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "Git record target {document_id}/{event_id} does not match payload {}/{}",
+                        record.document_id, record.event_id
+                    )));
+                }
+                Ok(aruna_core::git::record_change(&record))
+            }
             DocumentTarget::MetadataDocumentLifecycle { document_id } => {
                 let record: MetadataLifecycleRecord = postcard::from_bytes(bytes)
                     .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;

@@ -1,0 +1,59 @@
+diff --git a/packages/renderer/src/App.vue b/packages/renderer/src/App.vue
+index 09ccfb8..25eb516 100644
+--- a/packages/renderer/src/App.vue
++++ b/packages/renderer/src/App.vue
+@@ -413,7 +413,6 @@ const restoreGitDialog = () => {
+           text="Commit"
+           icon="rule"
+           requiresARC
+-          requiresUser
+           requiresGit
+           @clicked="AppProperties.state = AppProperties.STATES.GIT_COMMIT"
+         >
+@@ -423,7 +422,6 @@ const restoreGitDialog = () => {
+           text="DataHUB Sync"
+           icon="published_with_changes"
+           requiresARC
+-          requiresUser
+           requiresGit
+           @clicked="AppProperties.state = AppProperties.STATES.GIT_SYNC"
+         >
+diff --git a/packages/renderer/src/views/GitCommitView.vue b/packages/renderer/src/views/GitCommitView.vue
+index fd8f13e..7b45a8d 100644
+--- a/packages/renderer/src/views/GitCommitView.vue
++++ b/packages/renderer/src/views/GitCommitView.vue
+@@ -251,13 +251,16 @@ const reset = async()=>{
+
+ const init = async()=>{
+
+-  if(!AppProperties.user)
+-    AppProperties.state = AppProperties.STATES.HOME;
+-
+   await GitService.parse_status();
+
+-  iProps.commit.name = AppProperties.user.name;
+-  iProps.commit.email = AppProperties.user.email;
++  const readIdentity = async key => {
++    const result = await window.ipc.invoke('GitService.run', {
++      args: ['config', '--get', key], cwd: ArcControlService.props.arc_root, silent: true
++    });
++    return result[0] ? result[1].trim() : '';
++  };
++  iProps.commit.name = AppProperties.user?.name || await readIdentity('user.name');
++  iProps.commit.email = AppProperties.user?.email || await readIdentity('user.email');
+   iProps.commit.msg = '';
+ };
+
+diff --git a/packages/renderer/src/views/GitSyncView.vue b/packages/renderer/src/views/GitSyncView.vue
+index 6c4060b..f0808fe 100644
+--- a/packages/renderer/src/views/GitSyncView.vue
++++ b/packages/renderer/src/views/GitSyncView.vue
+@@ -479,7 +479,7 @@ const inspectArc = url =>{
+               There is an interactive git rebase in progress.<br>By aborting the merge process you revert back to the last commit.
+             </a_tooltip>
+           </a_btn>
+-          <a_btn label="Push" @click="push" icon='cloud_upload' :disabled='!iProps.remote || !AppProperties.user || AppProperties.git_dialog_state.visible'>
++          <a_btn label="Push" @click="push" icon='cloud_upload' :disabled='!iProps.remote || AppProperties.git_dialog_state.visible'>
+             <a_tooltip>
+               Upload the current status of your ARC to the DataHUB
+             </a_tooltip>

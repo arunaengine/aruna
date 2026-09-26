@@ -50,6 +50,7 @@ pub(crate) enum StartupPhase {
     RestoreLifecycleTimers,
     WarmMetadata,
     SweepSessions,
+    DrainGitMerges,
     RecoverChild,
 }
 
@@ -66,6 +67,7 @@ pub(crate) const STARTUP_PHASES: &[StartupPhase] = &[
     StartupPhase::RestoreLifecycleTimers,
     StartupPhase::WarmMetadata,
     StartupPhase::SweepSessions,
+    StartupPhase::DrainGitMerges,
     StartupPhase::RecoverChild,
 ];
 
@@ -186,6 +188,9 @@ pub(crate) async fn start(
             }
             StartupPhase::WarmMetadata => spawn_metadata_warmup(driver_ctx.clone(), &shutdown),
             StartupPhase::SweepSessions => spawn_session_sweep(driver_ctx.clone(), &shutdown),
+            StartupPhase::DrainGitMerges => {
+                aruna_operations::git::pending::spawn_drain(driver_ctx.clone(), &shutdown)
+            }
             StartupPhase::RecoverChild => {
                 let recovery_config = RecoveryConfig {
                     realm_id,
@@ -436,7 +441,7 @@ mod tests {
 mod pure_tests {
     use super::*;
 
-    const ALL_PHASES: [StartupPhase; 10] = [
+    const ALL_PHASES: [StartupPhase; 11] = [
         StartupPhase::Ready,
         StartupPhase::CorePublication,
         StartupPhase::RecoverStaleJobs,
@@ -446,6 +451,7 @@ mod pure_tests {
         StartupPhase::RestoreLifecycleTimers,
         StartupPhase::WarmMetadata,
         StartupPhase::SweepSessions,
+        StartupPhase::DrainGitMerges,
         StartupPhase::RecoverChild,
     ];
 
