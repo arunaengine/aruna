@@ -205,7 +205,7 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
                 0
             });
             overall_max = overall_max.max(datestamp_ms);
-            apply_record(
+            Box::pin(apply_record(
                 ctx,
                 &source,
                 &actor,
@@ -213,7 +213,7 @@ async fn harvest(ctx: &JobContext, spec: &HarvestJobSpec) -> Result<HarvestCount
                 record,
                 datestamp_ms,
                 &mut counts,
-            )
+            ))
             .await?;
         }
         ctx.progress.advance(page.records.len() as u64);
@@ -475,7 +475,7 @@ async fn create_document(
     record: &OaiRecord,
 ) -> Result<(), HarvestFailure> {
     let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
-    let created = route_metadata_create(
+    let created = Box::pin(route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor: actor.clone(),
             group_id: source.group_id,
@@ -488,7 +488,7 @@ async fn create_document(
         }),
         ctx.driver.clone(),
         Some(internal_token(source.created_by, realm_id)),
-    )
+    ))
     .await;
     match created {
         Ok(_) => Ok(()),
@@ -521,7 +521,7 @@ async fn update_document(
     stored: Option<&MetadataRegistryRecord>,
     record: &OaiRecord,
 ) -> Result<(), MetadataWriteError> {
-    route_metadata_update(
+    Box::pin(route_metadata_update(
         &ctx.driver,
         actor.clone(),
         stored,
@@ -532,7 +532,7 @@ async fn update_document(
         },
         None,
         Some(internal_token(source.created_by, realm_id)),
-    )
+    ))
     .await?;
     Ok(())
 }
