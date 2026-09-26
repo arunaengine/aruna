@@ -5,6 +5,7 @@
 use super::snapshot::execute;
 use super::{GitError, records};
 use crate::driver::DriverContext;
+use crate::jobs::metadata_class::metadata_error_transient;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
@@ -130,7 +131,9 @@ async fn apply_one(
                 error @ (MetadataError::InvalidInput(_)
                 | MetadataError::Validation(_)
                 | MetadataError::ProfileValidation(_)),
-            )) => return Err(GitError::Refused(error.to_string())),
+            )) if !metadata_error_transient(&error) => {
+                return Err(GitError::Refused(error.to_string()));
+            }
             Err(error) => {
                 warn!(document_id = %document.document_id, %error, "Pushed metadata waits");
                 return Err(GitError::Unavailable);
