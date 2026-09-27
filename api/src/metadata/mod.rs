@@ -14,10 +14,11 @@ use aruna_core::errors::StorageError;
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document as run_origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::api::{
@@ -30,6 +31,7 @@ use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDoc
 use aruna_operations::metadata::forward::{CreateAuthorizedError, create_metadata_authorized};
 use aruna_operations::metadata::get_document::load_document_record as load_metadata_record_by_document_from_operations;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -311,12 +313,40 @@ async fn ensure_record_writable(
     .await
 }
 
+/// A device edits its replica without a holder's check, so only its unrestricted owner may write.
+async fn ensure_device_owner(state: &ServerState, auth: &AuthContext) -> ServerResult<()> {
+    if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
+        return Ok(());
+    }
+    let Ok(config) = drive(
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    let node_id = state.get_node_id().to_string();
+    let owner = config
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .and_then(|node| node.kind.owner());
+    match owner {
+        Some(owner) if owner != auth.user_id || auth.path_restrictions.is_some() => {
+            Err(ServerError::Forbidden)
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(crate) async fn local_write_record(
     state: &ServerState,
     auth: &AuthContext,
     document_id: Ulid,
     extras: PolicyRequestExtras,
 ) -> ServerResult<Option<MetadataRegistryRecord>> {
+    ensure_device_owner(state, auth).await?;
     let context = state.get_ctx();
     if !run_origin_holds_document(
         &context,
