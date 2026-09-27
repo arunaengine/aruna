@@ -86,8 +86,11 @@ jobs:
         run: cargo test --workspace --all-features --locked --doc
 
       - name: Collect coverage
+        # Each thread exports one large instrumented binary; grcov's default of three threads here
+        # ran the 16 GB runner out of memory once the native Git tests added their binary.
         run: |
           grcov . \
+            --threads 2 \
             --binary-path ./target/debug/deps/ \
             --source-dir . \
             --output-type lcov \
