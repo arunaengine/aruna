@@ -929,6 +929,7 @@ async fn patch_user_info(
             name: request.name,
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
+            system: false,
         }),
         &state.get_ctx(),
     )
@@ -1472,6 +1473,7 @@ async fn update_user(
             name: request.name,
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
+            system: false,
         }),
         &state.get_ctx(),
     )
