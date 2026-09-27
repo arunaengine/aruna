@@ -202,13 +202,14 @@ impl CreateServiceOperation {
             ),
             sync_revision_entry(&document_target, &initial_sync_change(actor, placement))?,
         ];
+        // Ownership first, so receivers admit the name change as the owning group's administrator.
         for operation in [
-            AdminDocumentOperation::UserNameSet {
-                name: user.name.clone(),
-            },
             AdminDocumentOperation::UserAttributeSet {
                 key: SERVICE_GROUP_ATTRIBUTE.to_string(),
                 value: group.clone(),
+            },
+            AdminDocumentOperation::UserNameSet {
+                name: user.name.clone(),
             },
         ] {
             let event = reducer_state.apply_operation(actor, operation)?;
