@@ -524,7 +524,7 @@ fn seed_admin_events(
     Ok(events)
 }
 
-fn initial_sync_change(actor: &Actor, placement: PlacementRef) -> DocumentChange {
+pub(crate) fn initial_sync_change(actor: &Actor, placement: PlacementRef) -> DocumentChange {
     let updated_at_ms = current_timestamp_ms();
     DocumentChange {
         base: None,
