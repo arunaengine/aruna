@@ -281,3 +281,7 @@ async fn create_token(
         }),
     ))
 }
+
+#[cfg(test)]
+#[path = "service_accounts_tests.rs"]
+mod tests;
