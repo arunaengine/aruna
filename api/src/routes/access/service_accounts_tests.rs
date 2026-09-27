@@ -132,7 +132,7 @@ async fn admin_creates_lists() {
 }
 
 #[tokio::test]
-async fn token_acts_as_account() {
+async fn token_carries_account() {
     // The token carries the account, and scopes are judged by the account's own access.
     let fixture = fixture().await;
     let account = create(&fixture, &fixture.admin).await.unwrap();

@@ -38,10 +38,10 @@ const SERVICE_LABEL: &str = "service account";
 
 #[derive(OpenApi)]
 #[openapi(tags((name = "access/service-accounts", description = "Service accounts of a group")))]
-pub struct ServiceAccountsApiDoc;
+pub struct ServiceApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ServiceAccountsApiDoc::openapi())
+    OpenApiRouter::with_openapi(ServiceApiDoc::openapi())
         .routes(routes!(create_account, list_accounts))
         .routes(routes!(create_token))
 }
