@@ -57,9 +57,6 @@ pub struct UpdateUserInput {
     pub remove_attributes: Vec<String>,
     /// Set by operations that authorized the change themselves; only they may touch reserved keys.
     pub system: bool,
-    /// One of these accounts must stay an active human; read in the write transaction so a
-    /// concurrent change to them conflicts instead of passing.
-    pub keep_active: Vec<UserId>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -127,8 +124,6 @@ pub enum UpdateUserError {
     InvalidAttributeValue(String),
     #[error("too many user attributes")]
     TooManyAttributes,
-    #[error("no other active human account would remain")]
-    NoActiveAccount,
     #[error(transparent)]
     AuthorizationError(#[from] AuthorizationError),
     #[error(transparent)]
@@ -289,15 +284,7 @@ impl UpdateUserOperation {
                     REALM_CONFIG_KEYSPACE.to_string(),
                     ByteView::from(*self.input.actor.realm_id.as_bytes()),
                 ),
-            ]
-            .into_iter()
-            .chain(self.input.keep_active.iter().map(|user_id| {
-                (
-                    USER_KEYSPACE.to_string(),
-                    ByteView::from(user_id.to_bytes()),
-                )
-            }))
-            .collect(),
+            ],
             txn_id: Some(txn_id),
         })]
     }
@@ -307,13 +294,12 @@ impl UpdateUserOperation {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
         };
-        let (values, kept) = values.split_at(values.len().min(4));
         let [
             (_, user_value),
             (_, reducer_state_value),
             (_, revision_value),
             (_, realm_config_value),
-        ] = values
+        ] = values.as_slice()
         else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::BatchReadResult) with user, admin state, document revision, and realm config values",
@@ -321,9 +307,6 @@ impl UpdateUserOperation {
             );
         };
 
-        if let Err(error) = self.check_kept(kept) {
-            return self.fail(error);
-        }
         match self.emit_write_user(
             txn_id,
             user_value.clone(),
@@ -334,22 +317,6 @@ impl UpdateUserOperation {
             Ok(effects) => effects,
             Err(error) => self.fail(error),
         }
-    }
-
-    fn check_kept(&self, kept: &[(Key, Option<ByteView>)]) -> Result<(), UpdateUserError> {
-        if self.input.keep_active.is_empty() {
-            return Ok(());
-        }
-        for (_, value) in kept {
-            let Some(bytes) = value else {
-                continue;
-            };
-            let user = User::from_bytes(bytes)?;
-            if !user.is_deactivated() && user.service_group().is_none() {
-                return Ok(());
-            }
-        }
-        Err(UpdateUserError::NoActiveAccount)
     }
 
     fn emit_write_user(
@@ -855,7 +822,6 @@ mod pure_tests {
             ]),
             remove_attributes: vec!["old".to_string()],
             system: false,
-            keep_active: Vec::new(),
         }
     }
 

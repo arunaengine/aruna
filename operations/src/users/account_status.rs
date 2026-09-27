@@ -22,10 +22,9 @@ use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
-use crate::users::update_user::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
+use crate::users::update_user::{UpdateUserInput, UpdateUserOperation};
 
 const REALM_ADMIN_ROLE: &str = "realm_admin";
-const NO_ACTIVE_ACCOUNT: &str = "no other active human account would remain";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccountStatusConfig {
@@ -49,8 +48,8 @@ pub enum AccountStatusError {
     NotFound,
     #[error("caller may not change this account")]
     Unauthorized,
-    #[error("the realm must keep one active human administrator")]
-    LastAdministrator,
+    #[error("a realm administrator cannot be deactivated; remove the role first")]
+    Administrator,
     #[error("account update failed: {0}")]
     Update(String),
     #[error("credential cutoff failed: {0}")]
@@ -69,8 +68,7 @@ pub enum AccountStatusError {
 enum AccountStatusState {
     Init,
     ReadRecords,
-    Authorize { admins: Option<Vec<UserId>> },
-    ReadAdmins,
+    Authorize { administrator: bool },
     UpdateUser,
     WriteCutoff,
     Finish,
@@ -82,8 +80,6 @@ enum AccountStatusState {
 #[derive(Debug, PartialEq)]
 pub struct AccountStatusOperation {
     config: AccountStatusConfig,
-    /// Other administrators, of which the status write itself must still see one active.
-    keep_active: Vec<UserId>,
     state: AccountStatusState,
     output: Option<Result<(), AccountStatusError>>,
 }
@@ -92,7 +88,6 @@ impl AccountStatusOperation {
     pub fn new(config: AccountStatusConfig) -> Self {
         Self {
             config,
-            keep_active: Vec::new(),
             state: AccountStatusState::Init,
             output: None,
         }
@@ -148,8 +143,8 @@ impl AccountStatusOperation {
             .as_deref()
             .map(RealmAuthorizationDocument::from_bytes)
             .transpose();
-        let admins = match realm_auth {
-            Ok(realm_auth) => remaining_admins(realm_auth.as_ref(), &target, &self.config),
+        let administrator = match realm_auth {
+            Ok(realm_auth) => holds_admin_role(realm_auth.as_ref(), &self.config.target),
             Err(error) => return self.fail(error.into()),
         };
         let realm_id = self.config.actor.realm_id;
@@ -157,7 +152,7 @@ impl AccountStatusOperation {
             Some(group_id) => format!("/{realm_id}/g/{group_id}/admin"),
             None => format!("/{realm_id}/admin/config"),
         };
-        self.state = AccountStatusState::Authorize { admins };
+        self.state = AccountStatusState::Authorize { administrator };
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: self.config.auth_context.clone(),
@@ -168,7 +163,7 @@ impl AccountStatusOperation {
         ))]
     }
 
-    fn handle_authorized(&mut self, event: Event, admins: Option<Vec<UserId>>) -> Effects {
+    fn handle_authorized(&mut self, event: Event, administrator: bool) -> Effects {
         let allowed = match event {
             Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => allowed,
             other => return self.unexpected("authorization result", other),
@@ -178,41 +173,9 @@ impl AccountStatusOperation {
             Ok(false) => return self.fail(AccountStatusError::Unauthorized),
             Err(error) => return self.fail(error.into()),
         }
-        let Some(admins) = admins else {
-            return self.next_write();
-        };
-        if admins.is_empty() {
-            return self.fail(AccountStatusError::LastAdministrator);
-        }
-        self.keep_active = admins.clone();
-        self.state = AccountStatusState::ReadAdmins;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: admins.iter().map(Self::user_read).collect(),
-            txn_id: None,
-        })]
-    }
-
-    fn handle_admins(&mut self, event: Event) -> Effects {
-        let values = match event {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
-            other => return self.unexpected("batch read result", other),
-        };
-        let mut active = 0;
-        for (_, value) in values {
-            let Some(bytes) = value else {
-                continue;
-            };
-            match User::from_bytes(&bytes) {
-                Ok(user) if !user.is_deactivated() && user.service_group().is_none() => {
-                    active += 1;
-                }
-                Ok(_) => {}
-                Err(error) => return self.fail(error.into()),
-            }
-        }
-        if active == 0 {
-            return self.fail(AccountStatusError::LastAdministrator);
+        // No deactivation lowers the administrator count, so no count must agree across nodes.
+        if administrator && !self.config.active {
+            return self.fail(AccountStatusError::Administrator);
         }
         self.next_write()
     }
@@ -261,13 +224,9 @@ impl AccountStatusOperation {
                 set_attributes,
                 remove_attributes,
                 system: true,
-                keep_active: self.keep_active.clone(),
             }),
             |result| Event::SubOperation(SubOperationEvent::UserUpdated {
-                result: result.map(|_| ()).map_err(|error| match error {
-                    UpdateUserError::NoActiveAccount => NO_ACTIVE_ACCOUNT.to_string(),
-                    error => error.to_string(),
-                }),
+                result: result.map(|_| ()).map_err(|error| error.to_string()),
             }),
         ))]
     }
@@ -275,11 +234,6 @@ impl AccountStatusOperation {
     fn handle_updated(&mut self, event: Event) -> Effects {
         match event {
             Event::SubOperation(SubOperationEvent::UserUpdated { result: Ok(()) }) => self.finish(),
-            Event::SubOperation(SubOperationEvent::UserUpdated { result: Err(error) })
-                if error == NO_ACTIVE_ACCOUNT =>
-            {
-                self.fail(AccountStatusError::LastAdministrator)
-            }
             Event::SubOperation(SubOperationEvent::UserUpdated { result: Err(error) }) => {
                 self.fail(AccountStatusError::Update(error))
             }
@@ -306,27 +260,13 @@ impl AccountStatusOperation {
     }
 }
 
-/// Other realm administrators, of which one must stay an active human. `None` when the change
-/// cannot remove the last one: a reactivation, or a target that is no human administrator.
-fn remaining_admins(
-    realm_auth: Option<&RealmAuthorizationDocument>,
-    target: &User,
-    config: &AccountStatusConfig,
-) -> Option<Vec<UserId>> {
-    let realm_auth = realm_auth?;
-    let admins = realm_auth
-        .roles
-        .values()
-        .filter(|role| role.name == REALM_ADMIN_ROLE)
-        .flat_map(|role| role.assigned_users.iter().copied());
-    let mut admins: Vec<UserId> = admins.collect();
-    admins.sort();
-    admins.dedup();
-    if config.active || target.service_group().is_some() || !admins.contains(&config.target) {
-        return None;
-    }
-    admins.retain(|user_id| *user_id != config.target);
-    Some(admins)
+fn holds_admin_role(realm_auth: Option<&RealmAuthorizationDocument>, target: &UserId) -> bool {
+    realm_auth.is_some_and(|realm_auth| {
+        realm_auth
+            .roles
+            .values()
+            .any(|role| role.name == REALM_ADMIN_ROLE && role.assigned_users.contains(target))
+    })
 }
 
 impl Operation for AccountStatusOperation {
@@ -353,8 +293,9 @@ impl Operation for AccountStatusOperation {
     fn step(&mut self, event: Event) -> Effects {
         match std::mem::replace(&mut self.state, AccountStatusState::Error) {
             AccountStatusState::ReadRecords => self.handle_records(event),
-            AccountStatusState::Authorize { admins } => self.handle_authorized(event, admins),
-            AccountStatusState::ReadAdmins => self.handle_admins(event),
+            AccountStatusState::Authorize { administrator } => {
+                self.handle_authorized(event, administrator)
+            }
             AccountStatusState::UpdateUser => self.handle_updated(event),
             AccountStatusState::WriteCutoff => self.handle_cutoff(event),
             AccountStatusState::Init => self.unexpected("no event before start", event),
@@ -496,46 +437,19 @@ mod tests {
     }
 
     #[test]
-    fn sole_admin_kept() {
+    fn administrator_kept_active() {
+        // A realm administrator is refused before anything is written, cutoff included.
         let fixture = fixture();
         let mut operation = operation(&fixture, false);
         operation.start();
         operation.step(records(
             user_bytes(&fixture, fixture.target, &[]),
             None,
-            realm_auth(&fixture, &[fixture.target]),
+            realm_auth(&fixture, &[fixture.target, fixture.other]),
         ));
         let effects = operation.step(allowed());
         assert!(effects.is_empty());
-        assert_eq!(failure(operation), AccountStatusError::LastAdministrator);
-    }
-
-    #[test]
-    fn inactive_admins_uncounted() {
-        // Another administrator only counts while active and human.
-        let fixture = fixture();
-        for attributes in [
-            [(DEACTIVATED_ATTRIBUTE, "true")],
-            [(SERVICE_GROUP_ATTRIBUTE, "01ARZ3NDEKTSV4RRFFQ69G5FAV")],
-        ] {
-            let mut operation = operation(&fixture, false);
-            operation.start();
-            operation.step(records(
-                user_bytes(&fixture, fixture.target, &[]),
-                None,
-                realm_auth(&fixture, &[fixture.target, fixture.other]),
-            ));
-            let effects = operation.step(allowed());
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 1
-            ));
-            let key = ByteView::from(Vec::new());
-            operation.step(Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![(key, Some(user_bytes(&fixture, fixture.other, &attributes)))],
-            }));
-            assert_eq!(failure(operation), AccountStatusError::LastAdministrator);
-        }
+        assert_eq!(failure(operation), AccountStatusError::Administrator);
     }
 
     #[test]
@@ -546,13 +460,9 @@ mod tests {
         operation.step(records(
             user_bytes(&fixture, fixture.target, &[]),
             None,
-            realm_auth(&fixture, &[fixture.target, fixture.other]),
+            realm_auth(&fixture, &[fixture.other]),
         ));
-        operation.step(allowed());
-        let key = ByteView::from(Vec::new());
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(key, Some(user_bytes(&fixture, fixture.other, &[])))],
-        }));
+        let effects = operation.step(allowed());
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         // The cutoff comes first, so a failed status write never leaves old credentials usable.
         let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
@@ -564,31 +474,6 @@ mod tests {
             result: Ok(()),
         }));
         assert_eq!(operation.finalize(), Ok(()));
-    }
-
-    #[test]
-    fn concurrent_last_refused() {
-        // The status write rechecks the other administrators inside its transaction.
-        let fixture = fixture();
-        let mut operation = operation(&fixture, false);
-        operation.start();
-        operation.step(records(
-            user_bytes(&fixture, fixture.target, &[]),
-            None,
-            realm_auth(&fixture, &[fixture.target, fixture.other]),
-        ));
-        operation.step(allowed());
-        let key = ByteView::from(Vec::new());
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(key, Some(user_bytes(&fixture, fixture.other, &[])))],
-        }));
-        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-            result: Ok(()),
-        }));
-        operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
-            result: Err(NO_ACTIVE_ACCOUNT.to_string()),
-        }));
-        assert_eq!(failure(operation), AccountStatusError::LastAdministrator);
     }
 
     #[test]

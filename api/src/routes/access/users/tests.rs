@@ -1525,7 +1525,7 @@ async fn alias_token_rejected() {
 
 #[tokio::test]
 async fn deactivation_cuts_tokens() {
-    // A deactivated account loses its tokens and gets no new ones; the last admin stays.
+    // A deactivated account loses its tokens and gets no new ones; an administrator is refused.
     let issuer = "https://issuer.example";
     let kid = "main-key";
     let signing_key = generate_signing_key();

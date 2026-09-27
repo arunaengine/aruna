@@ -35,9 +35,9 @@ fn map_status_error(error: AccountStatusError) -> ServerError {
     match error {
         AccountStatusError::NotFound => ServerError::NotFound,
         AccountStatusError::Unauthorized => ServerError::Forbidden,
-        AccountStatusError::LastAdministrator => {
-            ServerError::Conflict("the realm must keep one active human administrator".to_string())
-        }
+        AccountStatusError::Administrator => ServerError::Conflict(
+            "a realm administrator cannot be deactivated; remove the role first".to_string(),
+        ),
         error => ServerError::InternalError(error.to_string()),
     }
 }
@@ -64,7 +64,8 @@ A service account never changes any account's status.
 - Repeating the same change succeeds again.
 
 **Limits**
-- The realm keeps at least one active human account holding the `realm_admin` role."#,
+- An account holding the `realm_admin` role is never deactivated, so no node can remove the
+  realm's administrators through this route; remove the role first. Reactivation is allowed."#,
     params(("id" = String, Path, description = "User id in the form `<ulid>@<realm>`")),
     request_body(
         content = AccountStatusRequest,
@@ -76,7 +77,7 @@ A service account never changes any account's status.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm, the caller is a service account, or the caller lacks the administration grant", body = ErrorResponse),
         (status = 404, description = "This node holds no account with that id", body = ErrorResponse),
-        (status = 409, description = "The change would leave no active human realm administrator", body = ErrorResponse)
+        (status = 409, description = "The account holds the realm administrator role", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

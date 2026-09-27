@@ -943,7 +943,6 @@ async fn patch_user_info(
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
             system: false,
-            keep_active: Vec::new(),
         }),
         &state.get_ctx(),
     )
@@ -1489,7 +1488,6 @@ async fn update_user(
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
             system: false,
-            keep_active: Vec::new(),
         }),
         &state.get_ctx(),
     )
