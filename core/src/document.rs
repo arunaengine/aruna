@@ -532,7 +532,8 @@ impl DocumentTarget {
             }
             // Realm-shared: every node's info/heartbeat document rides one topic
             // (no node id in the suffix) so all realm nodes receive every peer's.
-            Self::NodeInfo { .. } => bytes.extend_from_slice(b"/node-info"),
+            // v2 leaves the unbounded heartbeat history behind; Irokle 0.3 admission walks it all.
+            Self::NodeInfo { .. } => bytes.extend_from_slice(b"/node-info-v2"),
             // Realm-shared: every node subscribes so an access key created on any
             // node replicates to all, making the credential valid realm-wide.
             other => {
