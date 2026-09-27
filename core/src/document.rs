@@ -54,11 +54,6 @@ pub enum DocumentTarget {
         document_id: Ulid,
         event_id: Ulid,
     },
-    /// One immutable Git record of a metadata document, on the document's topic.
-    GitRecord {
-        document_id: Ulid,
-        event_id: Ulid,
-    },
     MetadataDocumentLifecycle {
         document_id: Ulid,
     },
@@ -97,6 +92,11 @@ pub enum DocumentTarget {
     RepositoryLink {
         document_id: Ulid,
         link_id: Ulid,
+    },
+    /// One immutable Git record of a metadata document, on the document's topic.
+    GitRecord {
+        document_id: Ulid,
+        event_id: Ulid,
     },
 }
 
