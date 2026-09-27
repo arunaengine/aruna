@@ -22,9 +22,10 @@ use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
-use crate::users::update_user::{UpdateUserInput, UpdateUserOperation};
+use crate::users::update_user::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
 
 const REALM_ADMIN_ROLE: &str = "realm_admin";
+const NO_ACTIVE_ACCOUNT: &str = "no other active human account would remain";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccountStatusConfig {
@@ -76,11 +77,13 @@ enum AccountStatusState {
     Error,
 }
 
-/// Account status is a reserved user attribute; deactivation also writes a realm-wide cutoff so
+/// Account status is a reserved user attribute; deactivation first writes a realm-wide cutoff so
 /// every credential issued before it is denied on every node.
 #[derive(Debug, PartialEq)]
 pub struct AccountStatusOperation {
     config: AccountStatusConfig,
+    /// Other administrators, of which the status write itself must still see one active.
+    keep_active: Vec<UserId>,
     state: AccountStatusState,
     output: Option<Result<(), AccountStatusError>>,
 }
@@ -89,6 +92,7 @@ impl AccountStatusOperation {
     pub fn new(config: AccountStatusConfig) -> Self {
         Self {
             config,
+            keep_active: Vec::new(),
             state: AccountStatusState::Init,
             output: None,
         }
@@ -175,11 +179,12 @@ impl AccountStatusOperation {
             Err(error) => return self.fail(error.into()),
         }
         let Some(admins) = admins else {
-            return self.update_user();
+            return self.next_write();
         };
         if admins.is_empty() {
             return self.fail(AccountStatusError::LastAdministrator);
         }
+        self.keep_active = admins.clone();
         self.state = AccountStatusState::ReadAdmins;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: admins.iter().map(Self::user_read).collect(),
@@ -209,7 +214,31 @@ impl AccountStatusOperation {
         if active == 0 {
             return self.fail(AccountStatusError::LastAdministrator);
         }
-        self.update_user()
+        self.next_write()
+    }
+
+    /// Deactivation cuts credentials off before it marks the account, so a failure between the
+    /// two leaves an active account without old credentials, and a retry completes it.
+    fn next_write(&mut self) -> Effects {
+        if self.config.active {
+            return self.update_user();
+        }
+        // The grace also cuts off tokens another node mints before the status reaches it.
+        let cutoff = self.config.now.saturating_add(REVOCATION_GRACE_SECS);
+        self.state = AccountStatusState::WriteCutoff;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            RevokeTokenOperation::new(RevokeTokenConfig {
+                actor: self.config.actor.clone(),
+                token_hash: user_cutoff_hash(&self.config.target),
+                expires_at: user_cutoff_expiry(cutoff),
+                token_owner: self.config.target,
+                admission: RevokeTokenAdmission::Privileged,
+                now: self.config.now,
+            }),
+            |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
+                result: result.map(|_| ()).map_err(|error| error.to_string()),
+            }),
+        ))]
     }
 
     fn update_user(&mut self) -> Effects {
@@ -232,46 +261,36 @@ impl AccountStatusOperation {
                 set_attributes,
                 remove_attributes,
                 system: true,
+                keep_active: self.keep_active.clone(),
             }),
             |result| Event::SubOperation(SubOperationEvent::UserUpdated {
-                result: result.map(|_| ()).map_err(|error| error.to_string()),
+                result: result.map(|_| ()).map_err(|error| match error {
+                    UpdateUserError::NoActiveAccount => NO_ACTIVE_ACCOUNT.to_string(),
+                    error => error.to_string(),
+                }),
             }),
         ))]
     }
 
     fn handle_updated(&mut self, event: Event) -> Effects {
-        let result = match event {
-            Event::SubOperation(SubOperationEvent::UserUpdated { result }) => result,
-            other => return self.unexpected("user update result", other),
-        };
-        if let Err(error) = result {
-            return self.fail(AccountStatusError::Update(error));
+        match event {
+            Event::SubOperation(SubOperationEvent::UserUpdated { result: Ok(()) }) => self.finish(),
+            Event::SubOperation(SubOperationEvent::UserUpdated { result: Err(error) })
+                if error == NO_ACTIVE_ACCOUNT =>
+            {
+                self.fail(AccountStatusError::LastAdministrator)
+            }
+            Event::SubOperation(SubOperationEvent::UserUpdated { result: Err(error) }) => {
+                self.fail(AccountStatusError::Update(error))
+            }
+            other => self.unexpected("user update result", other),
         }
-        if self.config.active {
-            return self.finish();
-        }
-        // The grace also cuts off tokens another node mints before the status reaches it.
-        let cutoff = self.config.now.saturating_add(REVOCATION_GRACE_SECS);
-        self.state = AccountStatusState::WriteCutoff;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            RevokeTokenOperation::new(RevokeTokenConfig {
-                actor: self.config.actor.clone(),
-                token_hash: user_cutoff_hash(&self.config.target),
-                expires_at: user_cutoff_expiry(cutoff),
-                token_owner: self.config.target,
-                admission: RevokeTokenAdmission::Privileged,
-                now: self.config.now,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
-                result: result.map(|_| ()).map_err(|error| error.to_string()),
-            }),
-        ))]
     }
 
     fn handle_cutoff(&mut self, event: Event) -> Effects {
         match event {
             Event::SubOperation(SubOperationEvent::TokenRevoked { result: Ok(()) }) => {
-                self.finish()
+                self.update_user()
             }
             Event::SubOperation(SubOperationEvent::TokenRevoked { result: Err(error) }) => {
                 self.fail(AccountStatusError::Cutoff(error))
@@ -535,15 +554,41 @@ mod tests {
             values: vec![(key, Some(user_bytes(&fixture, fixture.other, &[])))],
         }));
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
+        // The cutoff comes first, so a failed status write never leaves old credentials usable.
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
             result: Ok(()),
         }));
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         assert!(!operation.is_complete());
-        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+        operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
             result: Ok(()),
         }));
         assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn concurrent_last_refused() {
+        // The status write rechecks the other administrators inside its transaction.
+        let fixture = fixture();
+        let mut operation = operation(&fixture, false);
+        operation.start();
+        operation.step(records(
+            user_bytes(&fixture, fixture.target, &[]),
+            None,
+            realm_auth(&fixture, &[fixture.target, fixture.other]),
+        ));
+        operation.step(allowed());
+        let key = ByteView::from(Vec::new());
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(key, Some(user_bytes(&fixture, fixture.other, &[])))],
+        }));
+        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+            result: Ok(()),
+        }));
+        operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
+            result: Err(NO_ACTIVE_ACCOUNT.to_string()),
+        }));
+        assert_eq!(failure(operation), AccountStatusError::LastAdministrator);
     }
 
     #[test]

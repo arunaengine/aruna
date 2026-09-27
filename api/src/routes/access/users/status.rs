@@ -59,6 +59,8 @@ A service account never changes any account's status.
 - Reactivation lets the account sign in again. Tokens and credentials cut off by the deactivation
   stay invalid, including those issued in the five minutes after it.
 - Group memberships, roles and owned data stay as they are.
+- Deactivation writes the cutoff before the status. If the status write fails, old credentials
+  stay cut off while the account still counts as active; repeating the request completes it.
 - Repeating the same change succeeds again.
 
 **Limits**
