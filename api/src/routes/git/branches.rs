@@ -6,7 +6,7 @@ use super::versions::{
     BranchList, BranchView, MergeConflictView, MergeView, NamedView, TagList, VersionView,
     expected, failure, named_view, store, version_view,
 };
-use crate::auth::require_realm_auth;
+use crate::auth::{require_realm_auth, require_unrestricted_auth};
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -177,7 +177,7 @@ pub async fn delete_branch(
 
 #[utoipa::path(put, path = "/metadata/{document_id}/branches/{name}/rocrate", tag = "metadata/versions",
     security(("bearer_auth" = [])), summary = "Edit a draft branch's metadata",
-    description = "Replaces a draft branch's metadata with the given RO-Crate as a new version on that branch.\n\n**Authentication**: realm bearer token with WRITE on the metadata document.\n\n**Behavior**: ISA workbooks, `ro-crate-metadata.json` and `aruna-metadata.json` are regenerated; other files stay. Equivalent workbooks keep their bytes. `main` is edited through `PUT /metadata/{document_id}/rocrate`. `If-Match` with the head version refuses a moved branch with 412.",
+    description = "Replaces a draft branch's metadata with the given RO-Crate as a new version on that branch.\n\n**Authentication**: realm bearer token without path restrictions and with WRITE on the metadata document.\n\n**Behavior**: ISA workbooks, `ro-crate-metadata.json` and `aruna-metadata.json` are regenerated; other files stay. Equivalent workbooks keep their bytes. `main` is edited through `PUT /metadata/{document_id}/rocrate`. `If-Match` with the head version refuses a moved branch with 412.",
     params(("document_id" = String, Path, description = "Metadata document ID"),
            ("name" = String, Path, description = "URL-encoded draft branch name"),
            ("If-Match" = Option<String>, Header, description = "Expected head version")),
@@ -195,7 +195,7 @@ pub async fn edit(
     headers: HeaderMap,
     Json(request): Json<EditDraft>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     if !request.rocrate.is_object() {
         return Err(ServerError::BadRequestMessage(
             "rocrate must be a JSON-LD object".into(),
