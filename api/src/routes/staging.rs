@@ -22,6 +22,7 @@ use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_operations::auth::permission_rules::permission_rules;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
@@ -862,7 +863,8 @@ pub async fn get_staging_job(
     description = r#"Lists a bucket's live objects in key order, saying for each whether it is stored here or referenced.
 
 **Authentication**: realm bearer token with READ on the bucket, checked against the group that owns
-the bucket, which is resolved first.
+the bucket, which is resolved first. Keys the caller may not read, for example under a deny or
+outside a path restriction, are left out of the page.
 
 **Behavior**
 - This is a node-local listing of the bucket as this node currently sees it, so objects written
@@ -917,18 +919,17 @@ pub async fn list_references(
 ) -> ServerResult<(StatusCode, Json<ReferenceListResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let bucket_info = load_bucket_info(&state, &query.bucket).await?;
-    ensure_permission(
-        &state,
-        &auth,
-        bucket_permission_path(
-            state.get_realm_id(),
-            bucket_info.group_id,
-            state.get_node_id(),
-            &query.bucket,
-        ),
-        Permission::READ,
-    )
-    .await?;
+    let bucket_path = bucket_permission_path(
+        state.get_realm_id(),
+        bucket_info.group_id,
+        state.get_node_id(),
+        &query.bucket,
+    );
+    ensure_permission(&state, &auth, bucket_path.clone(), Permission::READ).await?;
+    // Denies and path restrictions below the bucket hide single keys from the page.
+    let rules = permission_rules(&state.get_ctx(), &auth, &bucket_path)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
 
     let continuation_token = decode_reference_cursor(query.cursor.as_deref())?;
     let limit = query
@@ -954,6 +955,12 @@ pub async fn list_references(
     let entries = result
         .objects
         .into_iter()
+        .filter(|object| {
+            rules.allows(
+                &format!("{bucket_path}/{}", object.head.key),
+                &Permission::READ,
+            )
+        })
         .map(|object| ReferenceListEntry {
             size: object
                 .location
