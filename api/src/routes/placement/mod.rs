@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::server::state::ServerState;
@@ -808,8 +808,8 @@ pub async fn create_placement_policy(
     summary = "Read one placement policy by reference",
     description = r#"Returns one authenticated placement policy document named by its id and definition digest.
 
-**Authentication**: realm bearer token; this is the one placement route that needs no
-realm-configuration permission.
+**Authentication**: realm bearer token without path restrictions; this is the one placement route
+that needs no realm-configuration permission.
 
 **Behavior**
 - Both the id and the `digest` of the definition are required, because an id alone could be answered
@@ -836,7 +836,7 @@ realm-configuration permission.
         })),
         (status = 400, description = "The id or digest could not be parsed", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted or from another realm", body = ErrorResponse),
         (status = 404, description = "No holder has a policy with that id and digest; a mismatched digest is a 404 rather than a substituted rule", body = ErrorResponse),
         (status = 503, description = "No holder answered, or the publication could not be verified here; never a denial", body = ErrorResponse)
     ),
@@ -848,7 +848,7 @@ pub async fn get_placement_policy(
     Path(policy_id): Path<String>,
     Query(query): Query<PolicyRefQuery>,
 ) -> ServerResult<Json<PolicyResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let policy_ref = PolicyRefBody {
         policy_id,
         digest: query.digest,

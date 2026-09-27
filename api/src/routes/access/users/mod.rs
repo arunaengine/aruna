@@ -4,7 +4,7 @@
 
 mod vault;
 
-use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_realm_auth};
+use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server::state::ServerState;
@@ -1573,8 +1573,8 @@ async fn owned_devices(
     summary = "List the calling user's devices",
     description = r#"Lists the devices the calling user has enrolled, plus the enrollments still in flight.
 
-**Authentication**: realm bearer token. It always lists the caller's own devices and takes no user
-id, so it grants no view of anybody else's.
+**Authentication**: realm bearer token without path restrictions. It always lists the caller's own
+devices and takes no user id, so it grants no view of anybody else's.
 
 **Behavior**
 - An enrolled device is a realm member of kind `User` owned by the caller; it reads `enrolled` and
@@ -1613,7 +1613,7 @@ id, so it grants no view of anybody else's.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1622,7 +1622,7 @@ async fn list_user_devices(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<UserDevicesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let devices = owned_devices(&state, auth.user_id).await?;
     Ok((StatusCode::OK, Json(UserDevicesResponse { devices })))
 }
@@ -1634,8 +1634,8 @@ async fn list_user_devices(
     summary = "Revoke one of the calling user's devices",
     description = r#"Revokes a device enrollment of the calling user, making its secret unredeemable from here on.
 
-**Authentication**: realm bearer token. Only a device owned by the caller can be revoked; a device
-owned by anybody else answers 404 rather than admitting it exists.
+**Authentication**: realm bearer token without path restrictions. Only a device owned by the caller
+can be revoked; a device owned by anybody else answers 404 rather than admitting it exists.
 
 **Behavior**
 - `id` is what `GET /access/users/me/devices` reported: an enrollment id while the enrollment is
@@ -1651,7 +1651,7 @@ owned by anybody else answers 404 rather than admitting it exists.
     responses(
         (status = 204, description = "Device enrollment revoked, or the device evicted from the realm"),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No device of the calling user carries this id, including one an earlier call already revoked", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
@@ -1663,7 +1663,7 @@ async fn revoke_user_device(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(device_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let device = owned_devices(&state, auth.user_id)
         .await?
         .into_iter()

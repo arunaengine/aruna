@@ -6,7 +6,7 @@ use super::{
     authorize_credential_issuance, build_credential_restrictions, format_node_id,
     format_system_time, serialize_restrictions,
 };
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
@@ -190,8 +190,8 @@ pub async fn create_s3_session(
     summary = "List the caller's S3 sessions",
     description = r#"Lists the caller's own S3 sessions on the node serving the request.
 
-**Authentication**: realm bearer token; a path-restricted token sees the same sessions, since the
-listing is scoped to the caller and carries no permission of its own.
+**Authentication**: realm bearer token without path restrictions, because the listing covers every
+group of the caller.
 
 **Behavior**
 - No secret is listed: neither the signing secret nor the session token is part of a summary.
@@ -227,7 +227,7 @@ listing is scoped to the caller and carries no permission of its own.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm", body = ErrorResponse)
+        (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -235,7 +235,7 @@ pub async fn list_s3_sessions(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<S3SessionsResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let now = SystemTime::now();
     let issued_by = *state.get_node_id().as_bytes();
     let s3_endpoint = state
@@ -260,8 +260,8 @@ pub async fn list_s3_sessions(
     summary = "Rotate an active S3 session",
     description = r#"Rotates the secret and session token of an active S3 session inside its refresh window.
 
-**Authentication**: realm bearer token of the session's owner, who must still be a member of the
-session's group with READ or WRITE on some path under its data root.
+**Authentication**: realm bearer token of the session's owner without path restrictions. The owner
+must still be a member of the session's group with READ or WRITE on some path under its data root.
 
 **Behavior**
 - The access key id is kept while the signing secret and session token are rotated in place, so the
@@ -298,7 +298,7 @@ session's group with READ or WRITE on some path under its data root.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token, or one with no remaining lifetime", body = ErrorResponse),
-        (status = 403, description = "The caller is no longer a member of the group, or lacks readable access under its data path", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted, the caller is no longer a member of the group, or lacks readable access under its data path", body = ErrorResponse),
         (status = 404, description = "Session not found on this node, or it belongs to another user", body = ErrorResponse),
         (status = 409, description = "The session is idle, expired, or not yet in its refresh window", body = ErrorResponse)
     ),
@@ -310,7 +310,7 @@ pub async fn refresh_s3_session(
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<SessionTokenResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let session = drive(GetS3Operation::new(access_key_id.clone()), &state.get_ctx())
         .await
@@ -351,8 +351,8 @@ pub async fn refresh_s3_session(
     summary = "Revoke an S3 session",
     description = r#"Deletes one of the caller's own S3 sessions from the node that issued it.
 
-**Authentication**: realm bearer token of the session's owner; group membership is not rechecked,
-so a session stays revocable after the caller left its group.
+**Authentication**: realm bearer token of the session's owner without path restrictions; group
+membership is not rechecked, so a session stays revocable after the caller left its group.
 
 **Behavior**
 - The access key, its signing secret and its session token stop authenticating S3 requests as soon
@@ -365,7 +365,7 @@ so a session stays revocable after the caller left its group.
     responses(
         (status = 204, description = "Session deleted from this node"),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token belongs to another realm", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "Session not found on this node, or it belongs to another user", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -375,7 +375,7 @@ pub async fn revoke_s3_session(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     drive(
         RevokeS3Operation::new(RevokeS3Config {
             access_key: access_key_id,

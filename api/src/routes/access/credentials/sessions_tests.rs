@@ -316,6 +316,42 @@ async fn revoke_drops_session() {
 }
 
 #[tokio::test]
+async fn restricted_cannot_manage() {
+    // Listing, rotating and revoking cover every group of the owner, so a restricted token
+    // must not reach them and must leave the session untouched.
+    let (_directory, state, mut auth) = setup_node().await;
+    let issuer = *state.get_node_id().as_bytes();
+    let issued = issue_session(&state, auth.user_id, Ulid::generate(), issuer).await;
+    auth.path_restrictions = Some(vec![PathRestriction {
+        pattern: format!("/{}/g/{}/data/**", auth.realm_id, Ulid::generate()),
+        permission: aruna_core::structs::identity::auth::Permission::READ,
+    }]);
+
+    let listed = list_s3_sessions(State(state.clone()), Extension(Some(auth.clone()))).await;
+    assert!(matches!(listed, Err(ServerError::Forbidden)));
+    let refreshed = refresh_s3_session(
+        State(state.clone()),
+        Extension(Some(auth.clone())),
+        Extension(Some(ValidatedBearer::new_for_test("bearer"))),
+        Path(issued.access_key_id.clone()),
+    )
+    .await;
+    assert!(matches!(refreshed, Err(ServerError::Forbidden)));
+    let revoked = revoke_s3_session(
+        State(state.clone()),
+        Extension(Some(auth)),
+        Path(issued.access_key_id.clone()),
+    )
+    .await;
+    assert!(matches!(revoked, Err(ServerError::Forbidden)));
+    assert!(
+        stored_session(&state, &issued.access_key_id)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn revoke_hides_foreign() {
     // Another user's key must answer as unknown rather than denied.
     let (_directory, state, auth) = setup_node().await;

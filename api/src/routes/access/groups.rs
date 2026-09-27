@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::{
-    ValidatedBearer, ensure_permission, permission_granted, require_realm_auth,
-    require_unrestricted_auth,
+    ValidatedBearer, ensure_permission, permission_granted, require_unrestricted_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
@@ -563,8 +562,8 @@ pub async fn create_group(
     summary = "List the groups of this realm",
     description = r#"Lists this realm's groups, optionally with their roles and permission paths.
 
-**Authentication**: realm bearer token; no group membership is needed, because every realm member
-sees each group's id, realm and display name.
+**Authentication**: realm bearer token without path restrictions; no group membership is needed,
+because every realm member sees each group's id, realm and display name.
 
 **Behavior**
 - This is a node-local read of the replicated group directory, so a group created elsewhere can be
@@ -604,7 +603,7 @@ sees each group's id, realm and display name.
         ),
         (status = 400, description = "The `include` parameter names an unsupported extra", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
+        (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -613,7 +612,7 @@ pub async fn list_groups(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<ListGroupsQuery>,
 ) -> ServerResult<(StatusCode, Json<ListGroupsResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let include_roles = parse_group_include(query.include.as_deref())?;
     let limit = query.limit_or(100).clamp(1, 1_000);
     let offset = query.offset_or(0);
@@ -687,8 +686,8 @@ async fn build_api_groups(
     summary = "Read one group's directory entry",
     description = r#"Returns one group's directory entry together with its roles.
 
-**Authentication**: realm bearer token; no group membership is needed, because every realm member
-may look up any group in the realm.
+**Authentication**: realm bearer token without path restrictions; no group membership is needed,
+because every realm member may look up any group in the realm.
 
 **Behavior**
 - A member receives the full role list including the users assigned to each role; a non-member
@@ -723,6 +722,7 @@ may look up any group in the realm.
         ),
         (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -743,7 +743,7 @@ pub(crate) async fn run_get_group(
     auth: Option<AuthContext>,
     group_id: &str,
 ) -> ServerResult<GroupInfoResponse> {
-    let auth = require_realm_auth(state, auth)?;
+    let auth = require_unrestricted_auth(state, auth)?;
     let group_id = parse_group_id(group_id)?;
     let (group, auth_doc) = load_group(state, group_id).await?;
     let is_member = is_group_member(&auth_doc, auth.user_id);
@@ -1750,9 +1750,9 @@ pub struct DataPathsQuery {
     summary = "Browse the data permission paths of a group",
     description = r#"Returns one page of the data permission paths a group's role grants are written against.
 
-**Authentication**: realm bearer token and membership in the group. Every page is additionally
-authorized as a data read, needing READ on the group's data root at the bucket level and READ on the
-bucket or listed prefix inside one, so a path-restricted token sees only what it may read.
+**Authentication**: realm bearer token without path restrictions and membership in the group.
+Every page is additionally authorized as a data read, needing READ on the group's data root at the
+bucket level and READ on the bucket or listed prefix inside one.
 
 **Behavior**
 - Entries are folders ending at the delimiter and objects as leaves, scoped to this node, so a
@@ -1789,7 +1789,7 @@ bucket or listed prefix inside one, so a path-restricted token sees only what it
         ),
         (status = 400, description = "Malformed group id, a prefix outside this node's group data path, or an unreadable continuation token", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, the caller is not a member of the group, or the caller lacks READ on the browsed path", body = ErrorResponse)
+        (status = 403, description = "Token is path-restricted or belongs to another realm, the caller is not a member of the group, or the caller lacks READ on the browsed path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1799,7 +1799,7 @@ pub async fn list_data_paths(
     Path(group_id): Path<String>,
     Query(query): Query<DataPathsQuery>,
 ) -> ServerResult<(StatusCode, Json<DataPathsResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let (_, auth_doc) = load_group(&state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
