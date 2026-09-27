@@ -90,6 +90,9 @@ pub enum SubOperationEvent {
     TokenRevoked {
         result: Result<(), String>,
     },
+    UserUpdated {
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
