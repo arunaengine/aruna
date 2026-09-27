@@ -45,6 +45,7 @@ pub async fn advertise(
         return Err(ServerError::BadRequest);
     }
     let auth = require_realm_auth(&state, auth)?;
+    refuse_scoped_push(&auth, query.service == "git-receive-pack")?;
     git::repository(
         &state.get_ctx(),
         &auth,
@@ -74,7 +75,7 @@ pub async fn advertise(
 #[utoipa::path(post, path = "/git/{repository}/{service}", tag = "metadata/git",
     security(("bearer_auth" = []), ("basic_auth" = [])),
     summary = "Execute native Git fetch or push",
-    description = "Executes the requested Git smart HTTP service.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password; upload-pack requires READ and receive-pack requires WRITE.\n\n**Behavior**: ARC validation and LFS availability checks precede ref publication. A push to main then merges its ISA and aruna-metadata.json changes into the metadata document as the pushing user; a refused update rejects the push. Atomic pushes use Git's native transaction support.",
+    description = "Executes the requested Git smart HTTP service.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password; upload-pack requires READ and receive-pack requires WRITE and a token without path restrictions.\n\n**Behavior**: ARC validation and LFS availability checks precede ref publication. A push to main then merges its ISA and aruna-metadata.json changes into the metadata document as the pushing user; a refused update rejects the push. Atomic pushes use Git's native transaction support.",
     params(("repository" = String, Path, description = "Document ID followed by .git"),
            ("service" = String, Path, description = "git-upload-pack or git-receive-pack")),
     responses((status = 200, description = "Git protocol result", content_type = "application/x-git-upload-pack-result"),
@@ -91,6 +92,7 @@ pub async fn rpc(
         return Err(ServerError::NotFound);
     }
     let auth = require_realm_auth(&state, auth)?;
+    refuse_scoped_push(&auth, service == "git-receive-pack")?;
     git::repository(
         &state.get_ctx(),
         &auth,
@@ -139,6 +141,7 @@ async fn serve(
     } else {
         Permission::READ
     };
+    refuse_scoped_push(&auth, permission == Permission::WRITE)?;
     let (_, repository) = git::repository(&state.get_ctx(), &auth, id, permission)
         .await
         .map_err(map_error)?;
@@ -193,4 +196,13 @@ async fn serve(
         );
     }
     Ok(response)
+}
+
+/// A push merges crate content as the pusher, and the ARC then links objects with the pusher's
+/// full access, so a path-restricted token may only fetch.
+fn refuse_scoped_push(auth: &AuthContext, push: bool) -> ServerResult<()> {
+    if push && auth.path_restrictions.is_some() {
+        return Err(ServerError::Forbidden);
+    }
+    Ok(())
 }

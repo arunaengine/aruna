@@ -9,7 +9,7 @@ mod snapshot;
 mod transport;
 mod versions;
 
-use crate::auth::{map_authorize_error, require_realm_auth};
+use crate::auth::{map_authorize_error, require_unrestricted_auth};
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -121,7 +121,7 @@ async fn base_url(state: &ServerState, id: Ulid) -> ServerResult<String> {
 #[utoipa::path(post, path = "/metadata/{document_id}/git/push", tag = "metadata/git",
     security(("bearer_auth" = [])),
     summary = "Record a validated native Git push",
-    description = "Stores the objects of one push and publishes its ref updates to every holder of the document.\n\n**Authentication**: realm bearer token with WRITE on the document.\n\n**Behavior**: only the node's own receive hook may call it, proven by the `X-Aruna-Push-Key` header of the running push; other calls answer 403. It is called before Git moves refs. The body is a four-byte big-endian length, a JSON object with `refs`, `lfs` and `paths`, then the Git pack. Paths locked by another user or unknown LFS objects refuse the push.",
+    description = "Stores the objects of one push and publishes its ref updates to every holder of the document.\n\n**Authentication**: realm bearer token without path restrictions and with WRITE on the document.\n\n**Behavior**: only the node's own receive hook may call it, proven by the `X-Aruna-Push-Key` header of the running push; other calls answer 403. It is called before Git moves refs. The body is a four-byte big-endian length, a JSON object with `refs`, `lfs` and `paths`, then the Git pack. Paths locked by another user or unknown LFS objects refuse the push.",
     params(("document_id" = String, Path, description = "Metadata document ID")),
     request_body(content = Vec<u8>, content_type = "application/x-aruna-git-push"),
     responses((status = 204, description = "Push recorded"), (status = 400, description = "Malformed push"),
@@ -137,7 +137,7 @@ pub async fn push(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let (request, pack) = git::push::decode(body).map_err(map_error)?;
     let key = headers
         .get("x-aruna-push-key")
