@@ -198,7 +198,7 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
             })),
         (status = 400, description = "Unknown session kind, a lifetime outside the allowed range, or restrictions without a read or write scope", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "A requested scope exceeds the caller's access, or the token belongs to another realm", body = ErrorResponse),
+        (status = 403, description = "A requested scope exceeds the caller's access, the user is deactivated, or the token belongs to another realm", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -222,6 +222,7 @@ pub async fn create_session(
     let now = unix_timestamp_secs();
     let expiry = bound_session_expiry(now, request.expires_in_seconds, bearer.expires_at_secs())
         .map_err(map_create_error)?;
+    crate::routes::access::users::ensure_active(&state, auth.user_id).await?;
     let restrictions = session_restrictions(&state, &auth, request.path_restrictions).await?;
     let created = drive(
         CreateSessionOperation::new(CreateSessionConfig {

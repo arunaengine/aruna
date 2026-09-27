@@ -353,6 +353,15 @@ async fn ensure_token_subject(state: &Arc<ServerState>, user_id: UserId) -> Serv
         .map_err(map_subject_error)
 }
 
+/// Refuses new tokens for a deactivated account; an account this node does not know passes.
+pub(crate) async fn ensure_active(state: &ServerState, user_id: UserId) -> ServerResult<()> {
+    match drive(ReadUserOperation::new(user_id), &state.get_ctx()).await {
+        Ok(user) if user.is_deactivated() => Err(ServerError::Forbidden),
+        Ok(_) | Err(ReadUserError::NotFound) => Ok(()),
+        Err(error) => Err(ServerError::InternalError(error.to_string())),
+    }
+}
+
 async fn read_current_user(state: &ServerState, user_id: UserId) -> ServerResult<User> {
     drive(ReadUserOperation::new(user_id), &state.get_ctx())
         .await
@@ -693,7 +702,7 @@ somebody else.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token, or this node knows no user for the presented OIDC subject", body = ErrorResponse),
-        (status = 403, description = "The user is an alias of the canonical user of that OIDC subject", body = ErrorResponse),
+        (status = 403, description = "The user is deactivated, or an alias of the canonical user of that OIDC subject", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -728,6 +737,7 @@ async fn get_token(
         }
     };
 
+    ensure_active(&state, user_id).await?;
     let expiry = now_timestamp()
         .checked_add(TOKEN_EXPIRY_SECONDS)
         .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
