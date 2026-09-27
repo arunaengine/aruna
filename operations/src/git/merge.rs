@@ -65,7 +65,7 @@ pub async fn edit(
         .cloned()
         .ok_or(GitError::NotFound)?;
     expect(Some(&head), expected)?;
-    let objects = linked(context, &document, &jsonld, auth.user_id).await;
+    let objects = linked(context, &document, &jsonld, auth).await;
     let lfs = objects.iter().map(|linked| linked.object.clone()).collect();
     let summary = message.unwrap_or_else(|| "Edit metadata".to_string());
     let effect = GitEffect::Edit {

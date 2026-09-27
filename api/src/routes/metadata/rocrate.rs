@@ -9,9 +9,9 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
     JsonLdObject, MetadataDocumentSummary, MetadataRoCrateResponse, MetadataRoCrateView,
     ReplaceRoCrateRequest, RoCrateExportParams, SubmitExportRequest, SubmitExportResponse,
-    forwarded_auth_token, load_document_record, local_write_record, map_api_error,
-    map_export_response, map_export_view, map_write_error, parse_document_id,
-    serialize_jsonld_object,
+    crate_entities, ensure_readable_files, forwarded_auth_token, load_document_record,
+    local_write_record, map_api_error, map_export_response, map_export_view, map_write_error,
+    parse_document_id, serialize_jsonld_object,
 };
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
 use crate::routes::repository::links::{
@@ -495,6 +495,7 @@ pub async fn replace_metadata_rocrate(
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
+    ensure_readable_files(&state, &auth, &crate_entities(&request.rocrate)).await?;
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
@@ -609,6 +610,7 @@ pub async fn add_data_entity(
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
+    ensure_readable_files(&state, &auth, &crate_entities(&entity)).await?;
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
@@ -714,6 +716,7 @@ pub async fn add_contextual_entity(
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
+    ensure_readable_files(&state, &auth, &crate_entities(&entity)).await?;
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;

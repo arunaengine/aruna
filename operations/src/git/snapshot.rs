@@ -24,6 +24,7 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{event_log_key, materialization_status_key};
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -102,8 +103,9 @@ pub(super) async fn current(
 async fn resolve(
     context: &DriverContext,
     exact: &VersionedObjectArn,
-    user: UserId,
+    auth: &AuthContext,
 ) -> Result<StoredObject, GitError> {
+    let user = auth.user_id;
     let node = context
         .net_handle
         .as_ref()
@@ -124,7 +126,7 @@ async fn resolve(
         authorize(
             context,
             exact.realm_id,
-            &author(user),
+            auth,
             &path,
             &Permission::READ,
             PolicyRequestExtras::rest(),
@@ -146,7 +148,7 @@ async fn resolve(
         (info.size, info.hashes, Some(bucket.group_id))
     } else {
         let request = BaoReadRequest {
-            auth_context: author(user),
+            auth_context: auth.clone(),
             realm_id: exact.realm_id,
             target: BaoReadTarget::ExactVersion(exact.clone()),
             expected_blake3: None,
@@ -177,19 +179,13 @@ async fn resolve(
     })
 }
 
-/// File entities that name an exact Aruna object version. An object the author cannot
-/// read stays out of the ARC; its entity still describes it in the metadata.
-pub(super) async fn linked(
-    context: &DriverContext,
-    document: &MetadataRegistryRecord,
-    jsonld: &str,
-    user: UserId,
-) -> Vec<LinkedObject> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(jsonld) else {
-        return Vec::new();
-    };
-    let mut linked = Vec::new();
-    for entity in value["@graph"].as_array().into_iter().flatten() {
+/// File entities of `entities` that name an exact object version of this realm.
+fn exact_files<'a>(
+    entities: impl Iterator<Item = &'a serde_json::Value>,
+    realm_id: RealmId,
+) -> Vec<(String, VersionedObjectArn)> {
+    let mut files = Vec::new();
+    for entity in entities {
         let listed = |value: &serde_json::Value| -> Vec<String> {
             let values = value
                 .as_array()
@@ -218,23 +214,53 @@ pub(super) async fn linked(
         let Some(exact) = crate::jobs::export::entity_identity(id, &urls).exact else {
             continue;
         };
-        if exact.realm_id != document.realm_id {
-            continue;
+        if exact.realm_id == realm_id {
+            files.push((id.to_string(), exact));
         }
-        match resolve(context, &exact, user).await {
-            Ok(object) => linked.push(LinkedObject {
-                entity: id.to_string(),
-                object,
-            }),
-            Err(error) => {
-                tracing::warn!(entity = id, %error, "Leaving unreadable object out of the ARC")
-            }
-        }
-        if linked.len() >= 10_000 {
+        if files.len() >= 10_000 {
             break;
         }
     }
+    files
+}
+
+/// File entities that name an exact Aruna object version. An object the caller cannot
+/// read stays out of the ARC; its entity still describes it in the metadata.
+pub(super) async fn linked(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    jsonld: &str,
+    auth: &AuthContext,
+) -> Vec<LinkedObject> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(jsonld) else {
+        return Vec::new();
+    };
+    let entities = value["@graph"].as_array().into_iter().flatten();
+    let mut linked = Vec::new();
+    for (entity, exact) in exact_files(entities, document.realm_id) {
+        match resolve(context, &exact, auth).await {
+            Ok(object) => linked.push(LinkedObject { entity, object }),
+            Err(error) => {
+                tracing::warn!(entity, %error, "Leaving unreadable object out of the ARC")
+            }
+        }
+    }
     linked
+}
+
+/// The first File entity naming an exact object `auth` cannot read. The ARC later links objects
+/// as the metadata event's author, so a restricted writer must only name objects it may read.
+pub async fn unreadable_file(
+    context: &DriverContext,
+    auth: &AuthContext,
+    entities: &[serde_json::Value],
+) -> Option<String> {
+    for (entity, exact) in exact_files(entities.iter(), auth.realm_id) {
+        if resolve(context, &exact, auth).await.is_err() {
+            return Some(entity);
+        }
+    }
+    None
 }
 
 async fn generate(
@@ -256,7 +282,7 @@ async fn generate(
         .as_ref()
         .map_or(UserId::nil(document.realm_id), |event| event.user_id);
     let occurred_at_ms = event.map_or(document.updated_at_ms, |event| event.occurred_at_ms);
-    let objects = linked(context, document, &jsonld, user).await;
+    let objects = linked(context, document, &jsonld, &author(user)).await;
     let lfs: Vec<StoredObject> = objects.iter().map(|linked| linked.object.clone()).collect();
     let refs = &projection.state.refs;
     let effect = GitEffect::Generate {

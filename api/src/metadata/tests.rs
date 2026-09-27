@@ -145,3 +145,66 @@ async fn device_edit_owner() {
     let refused = local_write_record(&state, &stranger, document_id, extras()).await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
 }
+
+#[tokio::test]
+async fn restricted_names_readable() {
+    // A restricted writer may not name an object it cannot read; unrestricted writers and
+    // entities without an exact object are not checked here.
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+    let (_storage_dir, storage_handle) = test_storage();
+    let realm_id = test_realm_id();
+    let node_id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
+    let state = test_state(
+        Arc::new(test_context(storage_handle)),
+        realm_id,
+        node_id,
+        NodeCapabilities::user_node(realm_id).unwrap(),
+    )
+    .await;
+    let exact = VersionedObjectArn::new(
+        realm_id,
+        node_id,
+        "bucket".to_string(),
+        "secret.csv".to_string(),
+        Ulid::generate(),
+    )
+    .unwrap();
+    let crate_value = serde_json::json!({
+        "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork"},
+            {"@id": "secret.csv", "@type": "File", "contentUrl": exact.to_w3id()}
+        ]
+    });
+    let plain = serde_json::json!({"@id": "notes.txt", "@type": "File"});
+    let auth = AuthContext {
+        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let restricted = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/{}/meta/**", Ulid::generate()),
+            permission: Permission::WRITE,
+        }]),
+        ..auth.clone()
+    };
+
+    let entities = crate_entities(&crate_value);
+    assert!(
+        ensure_readable_files(&state, &auth, &entities)
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        ensure_readable_files(&state, &restricted, &entities).await,
+        Err(ServerError::Forbidden)
+    ));
+    let single = crate_entities(&plain);
+    assert!(
+        ensure_readable_files(&state, &restricted, &single)
+            .await
+            .is_ok()
+    );
+}

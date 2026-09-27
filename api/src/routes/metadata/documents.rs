@@ -6,9 +6,10 @@ use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
-    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, forwarded_auth_token,
-    local_write_record, map_api_error, map_write_error, parse_document_id, run_create_metadata,
-    run_document_list, serialize_jsonld_object,
+    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, crate_entities,
+    ensure_readable_files, forwarded_auth_token, local_write_record, map_api_error,
+    map_write_error, parse_document_id, run_create_metadata, run_document_list,
+    serialize_jsonld_object,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -144,7 +145,10 @@ pub async fn create_metadata_document(
             },
         ),
         CreateMetadataRequest::RoCrate(request) => (
-            parse_group_id(&request.group_id)?,
+            {
+                ensure_readable_files(&state, &auth, &crate_entities(&request.rocrate)).await?;
+                parse_group_id(&request.group_id)?
+            },
             request.path,
             request.public,
             CreateDocumentPayload::RoCrate {

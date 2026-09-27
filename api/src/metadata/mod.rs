@@ -21,6 +21,7 @@ use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document as run_origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
+use aruna_operations::git::snapshot::unreadable_file;
 use aruna_operations::metadata::api::{
     ApiQueryMode, ExportMetadataResult, ListVisibleRequest, MetadataApiError, MetadataFanoutStats,
     MetadataListOrder, MetadataReferenceEntry, MetadataReferencesExecution,
@@ -311,6 +312,29 @@ async fn ensure_record_writable(
         extras,
     )
     .await
+}
+
+/// A restricted writer may name only objects it can read, since the ARC links them as the author.
+pub(crate) async fn ensure_readable_files(
+    state: &ServerState,
+    auth: &AuthContext,
+    entities: &[serde_json::Value],
+) -> ServerResult<()> {
+    if auth.path_restrictions.is_none() {
+        return Ok(());
+    }
+    match unreadable_file(&state.get_ctx(), auth, entities).await {
+        Some(_) => Err(ServerError::Forbidden),
+        None => Ok(()),
+    }
+}
+
+/// The entities of a crate, or the single entity a route adds.
+pub(crate) fn crate_entities(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    match value["@graph"].as_array() {
+        Some(graph) => graph.clone(),
+        None => vec![value.clone()],
+    }
 }
 
 /// A device edits its replica without a holder's check, so only its unrestricted owner may write.
