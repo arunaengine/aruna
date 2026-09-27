@@ -462,6 +462,7 @@ pub(crate) mod tests {
         ("PUT", "/access/users/me/assistant/chats/{id}"),
         ("PUT", "/access/users/me/assistant/chats/{id}/turns/{seq}"),
         ("PUT", "/access/users/me/vault"),
+        ("PUT", "/access/users/{id}/status"),
         ("PUT", "/compute/config"),
         ("PUT", "/data/buckets/{bucket}/placement"),
         ("PUT", "/data/buckets/{bucket}/storage/routing"),

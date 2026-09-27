@@ -1522,3 +1522,99 @@ async fn alias_token_rejected() {
     node.net.shutdown().await;
     oidc_task.abort();
 }
+
+#[tokio::test]
+async fn deactivation_cuts_tokens() {
+    // A deactivated account loses its tokens and gets no new ones; the last admin stays.
+    let issuer = "https://issuer.example";
+    let kid = "main-key";
+    let signing_key = generate_signing_key();
+    let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+    let node = spawn_test_node(provider, true).await;
+    let admin_id = node.realm_admin_id.to_string();
+    let admin_token = sign_aruna_token(&node, node.realm_admin_id, None);
+    let admin_record = User {
+        user_id: node.realm_admin_id,
+        name: "Admin".to_string(),
+        subject_ids: Vec::new(),
+        alias_user_ids: Default::default(),
+        attributes: Default::default(),
+    };
+    let actor = Actor {
+        node_id: node.net.node_id(),
+        user_id: node.realm_admin_id,
+        realm_id: node.realm_id,
+    };
+    node.context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: USER_KEYSPACE.to_string(),
+            key: ByteView::from(node.realm_admin_id.to_bytes()),
+            value: ByteView::from(admin_record.to_bytes(&actor).unwrap()),
+            txn_id: None,
+        }))
+        .await;
+    let (user, user_token) = register_via_oidc(
+        &node,
+        issuer,
+        kid,
+        &signing_key,
+        "user-subject",
+        "User",
+        None,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let status = |id: &str, token: &str, active: bool| {
+        client
+            .put(format!("{}/api/v1/access/users/{id}/status", node.base_url))
+            .bearer_auth(token.to_string())
+            .json(&serde_json::json!({ "active": active }))
+            .send()
+    };
+    let me = |token: &str| {
+        client
+            .get(format!("{}/api/v1/access/users/me", node.base_url))
+            .bearer_auth(token.to_string())
+            .send()
+    };
+
+    let refused = status(&admin_id, &user_token, false).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let kept = status(&admin_id, &admin_token, false).await.unwrap();
+    assert_eq!(kept.status(), StatusCode::CONFLICT);
+
+    let done = status(&user.id, &admin_token, false).await.unwrap();
+    assert_eq!(done.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        me(&user_token).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let oidc_token = sign_oidc_token(issuer, kid, &signing_key, "user-subject", Some("User"));
+    let renewed = client
+        .get(format!("{}/api/v1/access/token", node.base_url))
+        .bearer_auth(&oidc_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(renewed.status(), StatusCode::FORBIDDEN);
+    assert_eq!(me(&admin_token).await.unwrap().status(), StatusCode::OK);
+
+    let done = status(&user.id, &admin_token, true).await.unwrap();
+    assert_eq!(done.status(), StatusCode::NO_CONTENT);
+    let renewed = client
+        .get(format!("{}/api/v1/access/token", node.base_url))
+        .bearer_auth(&oidc_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(renewed.status(), StatusCode::OK);
+    assert_eq!(
+        me(&user_token).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    node.server_task.abort();
+    node.net.shutdown().await;
+    oidc_task.abort();
+}

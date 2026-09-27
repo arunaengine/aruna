@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod status;
 mod vault;
 
 use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_unrestricted_auth};
@@ -81,6 +82,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(list_user_devices))
         .routes(routes!(revoke_user_device))
         .routes(routes!(evict_device))
+        .merge(status::router())
         .merge(vault::router())
 }
 
@@ -852,6 +854,7 @@ user document and takes no user id.
 **Limits**
 - The name is trimmed and must be 1 to 256 characters.
 - An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes.
+- Keys starting with `aruna-engine.org/` hold the account status and are rejected here.
 - An attribute value is at most 4096 bytes and carries no control characters.
 - A user holds at most 128 attributes."#,
     request_body(
@@ -1409,6 +1412,7 @@ path and additionally passes the realm request policies.
 **Limits** (the same as for the self-service profile update)
 - The name is trimmed and must be 1 to 256 characters.
 - An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes.
+- Keys starting with `aruna-engine.org/` hold the account status and are rejected here.
 - An attribute value is at most 4096 bytes and carries no control characters.
 - A user holds at most 128 attributes."#,
     params(("id" = String, Path, description = "User id in the form `<ulid>@<realm>` of the user to update; the caller's own id for a self-service update")),
