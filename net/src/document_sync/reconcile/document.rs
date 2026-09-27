@@ -293,6 +293,10 @@ impl DocumentSyncService {
                 .target()
                 .sync_topic_id(self.realm_id, &event.placement());
             if target_topic_id != topic_id {
+                // Heartbeats left on the retired node info topic are republished, so drop them.
+                if matches!(event.target(), DocumentTarget::NodeInfo { .. }) {
+                    continue;
+                }
                 warn!(
                     %topic_id,
                     %target_topic_id,
