@@ -4,6 +4,7 @@
 
 pub mod check;
 pub mod create;
+pub mod list;
 
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
