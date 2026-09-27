@@ -21,6 +21,16 @@ pub fn bearer_token_hash(token: &str) -> String {
     credential_hash(token)
 }
 
+/// Revocation hash that stands for every credential of one user issued before a cutoff.
+pub fn user_cutoff_hash(user_id: &crate::UserId) -> String {
+    credential_hash(format!("aruna user cutoff {user_id}"))
+}
+
+/// Revocation expiry that keeps a user cutoff until every older token has expired.
+pub fn user_cutoff_expiry(cutoff: u64) -> u64 {
+    cutoff.saturating_add(MAX_TOKEN_LIFETIME)
+}
+
 /// Shape check for a replicated revocation entry, so a realm-wide revocation
 /// set can never be filled with arbitrary strings.
 pub fn valid_token_hash(hash: &str) -> bool {

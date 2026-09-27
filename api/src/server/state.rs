@@ -7,6 +7,7 @@ use crate::error::OidcError;
 use crate::openapi::ApiDoc;
 use crate::routes::management_relay::ManagementUrlCache;
 use aruna_core::NodeId;
+use aruna_core::UserId;
 use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -20,7 +21,7 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_token_revoked,
+    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_token_revoked, realm_user_cutoff,
 };
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
@@ -711,6 +712,14 @@ impl ArunaValidationState for ServerState {
         // The issuing realm's replicated config is the only revocation
         // authority; it is expiry-bounded, so the durable set stays limited.
         realm_token_revoked(&self.driver_ctx.storage_handle, *realm_id, token_hash).await
+    }
+
+    async fn user_cutoff(
+        &self,
+        realm_id: &RealmId,
+        user_id: &UserId,
+    ) -> Result<Option<u64>, ArunaBearerError> {
+        realm_user_cutoff(&self.driver_ctx.storage_handle, *realm_id, user_id).await
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {

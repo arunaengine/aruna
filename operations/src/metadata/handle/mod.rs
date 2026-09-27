@@ -47,7 +47,7 @@ use super::profile::shacl::{
 use super::query_cache::MetadataQueryCache;
 use super::summary_cache::summary_cache;
 use crate::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_token_revoked,
+    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_token_revoked, realm_user_cutoff,
 };
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
@@ -308,6 +308,17 @@ impl ArunaValidationState for AuthValidationState {
         }
     }
 
+    async fn user_cutoff(
+        &self,
+        realm_id: &RealmId,
+        user_id: &UserId,
+    ) -> Result<Option<u64>, ArunaBearerError> {
+        match self.realm_id {
+            Some(_) => realm_user_cutoff(&self.storage_handle, *realm_id, user_id).await,
+            None => Ok(None),
+        }
+    }
+
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
         match load_auth_state::<HashSet<RealmId>>(&self.storage_handle, REALMS_LIST_KEY).await {
             Ok(trusted) => trusted.contains(realm_id),
@@ -336,6 +347,14 @@ impl ArunaValidationState for RevocationBlindValidation<'_> {
         _token_hash: &str,
     ) -> Result<bool, ArunaBearerError> {
         Ok(false)
+    }
+
+    async fn user_cutoff(
+        &self,
+        _realm_id: &RealmId,
+        _user_id: &UserId,
+    ) -> Result<Option<u64>, ArunaBearerError> {
+        Ok(None)
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {

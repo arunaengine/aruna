@@ -10,11 +10,12 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secr
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::identity::s3_session::S3Session;
+use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::structs::storage::blob::{
     BucketInfo, UserAccess, bucket_permission_path, group_permission_path, object_permission_path,
 };
 use aruna_core::{NodeId, UserId};
+use aruna_operations::auth::bearer_token::realm_user_cutoff;
 use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
 use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
@@ -155,6 +156,8 @@ impl S3Access for AuthProvider {
                 "Credential issuer not in realm"
             ));
         }
+        self.check_cutoff(&access_key_id, &user_access.user_identity)
+            .await?;
 
         let required_permission = match &action {
             Action::Read => Permission::READ,
@@ -441,6 +444,21 @@ impl AuthProvider {
         self.admit_credential_at(&session.as_user_access(), now)
     }
 
+    /// Denies a credential issued before its owner's cutoff, like a bearer token issued before it.
+    async fn check_cutoff(&self, access_key_id: &str, user_id: &UserId) -> S3Result<()> {
+        let key_id = access_key_id
+            .strip_prefix(SESSION_ACCESS_PREFIX)
+            .unwrap_or(access_key_id);
+        let issued = ulid::Ulid::from_string(key_id).map_or(0, |id| id.timestamp_ms() / 1000);
+        let cutoff = realm_user_cutoff(&self.driver_ctx.storage_handle, self.realm_id, user_id)
+            .await
+            .map_err(|_| s3_error!(ServiceUnavailable, "Revocation state is unavailable"))?;
+        if cutoff.is_some_and(|cutoff| issued < cutoff) {
+            return Err(s3_error!(AccessDenied, "Credential has been revoked"));
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self))]
     async fn query_user_access(&self, access_key_id: &str) -> S3Result<UserAccess> {
         // Legacy-format key ids can never match a stored credential; reject them
@@ -706,6 +724,55 @@ mod tests {
             )
             .unwrap();
         session
+    }
+
+    #[tokio::test]
+    async fn cutoff_denies_older() {
+        // A user cutoff denies S3 keys issued before it and keeps later keys usable.
+        use aruna_core::auth::{user_cutoff_expiry, user_cutoff_hash};
+        use aruna_core::document::DocumentTarget;
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::structs::identity::realm::{RealmConfigDocument, TokenRevocation};
+        use ulid::Ulid;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path().to_str().unwrap());
+        let user = UserId::local(Ulid::generate(), provider.realm_id);
+        let cutoff = aruna_core::time::unix_timestamp_secs() + 60;
+        let mut config = RealmConfigDocument::new(provider.realm_id, Vec::new(), 3);
+        config.revoked_tokens.push(TokenRevocation {
+            token_hash: user_cutoff_hash(&user),
+            expires_at: user_cutoff_expiry(cutoff),
+        });
+        let target = DocumentTarget::RealmConfig {
+            realm_id: provider.realm_id,
+        };
+        provider
+            .driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config
+                    .to_bytes(&aruna_core::structs::identity::auth::Actor {
+                        node_id: provider.node_id,
+                        user_id: user,
+                        realm_id: provider.realm_id,
+                    })
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await;
+        let older = Ulid::generate().to_string();
+        let later = Ulid::from_parts((cutoff + 1) * 1000, 0).to_string();
+
+        for key in [older.clone(), format!("{SESSION_ACCESS_PREFIX}{older}")] {
+            let error = provider.check_cutoff(&key, &user).await.unwrap_err();
+            assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+        }
+        provider.check_cutoff(&later, &user).await.unwrap();
+        let other = UserId::local(Ulid::generate(), provider.realm_id);
+        provider.check_cutoff(&older, &other).await.unwrap();
     }
 
     #[tokio::test]

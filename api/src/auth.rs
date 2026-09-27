@@ -450,6 +450,14 @@ impl ArunaValidationState for RevocationBlindState<'_> {
         Ok(false)
     }
 
+    async fn user_cutoff(
+        &self,
+        _realm_id: &aruna_core::structs::identity::realm::RealmId,
+        _user_id: &aruna_core::UserId,
+    ) -> Result<Option<u64>, ArunaBearerError> {
+        Ok(None)
+    }
+
     async fn is_trusted_realm(
         &self,
         realm_id: &aruna_core::structs::identity::realm::RealmId,
