@@ -96,6 +96,8 @@ pub async fn publish_with(
     if !record.validate() {
         return Err(GitError::Invalid);
     }
+    let mut fence = crate::placement::fence::WriteFence::default();
+    fence.add(record.realm_id, &config, [record.placement]);
     let target = DocumentTarget::GitRecord {
         document_id: record.document_id,
         event_id: record.event_id,
@@ -117,10 +119,10 @@ pub async fn publish_with(
         record.placement,
         false,
     )
-    .fenced_at(crate::placement::fence::write_generation(&config, &record.placement).unwrap_or(0));
+    .fenced_at(fence.generation(&record.realm_id, &record.placement));
     writes.push(outbox_write_entry(&outbox).map_err(|_| GitError::Invalid)?);
     writes.extend(extra);
-    records::commit(context, writes).await?;
+    records::commit(context, writes, &fence).await?;
     if let Some(tasks) = context.task_handle.as_ref() {
         // The record is durable; a missed wake-up only delays replication to the next drain.
         let _ = tasks.send_effect(schedule_drain_effect()).await;

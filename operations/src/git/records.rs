@@ -4,6 +4,7 @@
 
 use super::GitError;
 use crate::driver::DriverContext;
+use crate::placement::fence::WriteFence;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -180,6 +181,7 @@ pub(super) async fn scan(
 pub(super) async fn commit(
     context: &DriverContext,
     writes: Vec<(String, byteview::ByteView, byteview::ByteView)>,
+    fence: &WriteFence,
 ) -> Result<(), GitError> {
     let storage = &context.storage_handle;
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
@@ -190,15 +192,28 @@ pub(super) async fn commit(
     else {
         return Err(GitError::Unavailable);
     };
-    if !matches!(
-        storage
-            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(txn_id),
-            }))
-            .await,
-        Event::Storage(StorageEvent::BatchWriteResult { .. })
-    ) {
+    // A holder's close during a handover either refuses this write or conflicts its commit.
+    let admitted = fence.is_empty()
+        || matches!(
+            storage
+                .send_effect(Effect::Storage(StorageEffect::BatchRead {
+                    reads: fence.reads(),
+                    txn_id: Some(txn_id),
+                }))
+                .await,
+            Event::Storage(StorageEvent::BatchReadResult { values }) if fence.admits(&values)
+        );
+    if !admitted
+        || !matches!(
+            storage
+                .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: Some(txn_id),
+                }))
+                .await,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        )
+    {
         storage
             .send_effect(Effect::Storage(StorageEffect::AbortTransaction { txn_id }))
             .await;
@@ -272,5 +287,66 @@ pub(super) async fn remove(
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         _ => Err(GitError::Unavailable),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
+    use ulid::Ulid;
+
+    #[tokio::test]
+    async fn closed_fence_refuses() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().to_str().expect("path");
+        let context = DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(path).expect("storage"),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = RealmId::from_bytes([13; 32]);
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([7; 16]),
+            shard: 3,
+        };
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.strategies.push(PlacementStrategy {
+            strategy_id: placement.strategy_id,
+            name: "default".to_string(),
+            replica_count: Some(1),
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 16,
+        });
+        config.snapshot_candidate_map();
+        let mut fence = WriteFence::default();
+        fence.add(realm_id, &config, [placement]);
+        let row = |key: &[u8]| {
+            (
+                "git_test".to_string(),
+                key.to_vec().into(),
+                vec![1u8].into(),
+            )
+        };
+
+        commit(&context, vec![row(b"open")], &fence)
+            .await
+            .expect("an open fence admits the write");
+        // The departing holder reported the bucket drained at this write's generation.
+        crate::placement::fence::close(&context.storage_handle, &realm_id, &placement, 1)
+            .await
+            .expect("close");
+        assert!(matches!(
+            commit(&context, vec![row(b"late")], &fence).await,
+            Err(GitError::Unavailable)
+        ));
+        let stored = |key: &'static [u8]| load::<u8>(&context, "git_test", key.to_vec());
+        assert!(matches!(stored(b"open").await, Ok(Some(1))));
+        assert!(matches!(stored(b"late").await, Ok(None)));
     }
 }

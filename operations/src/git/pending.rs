@@ -234,7 +234,9 @@ mod tests {
             .map(|id| entry(Ulid::from(id), &merge).expect("row"))
             .collect();
         let keys: Vec<_> = rows.iter().map(|row| row.1.to_vec()).collect();
-        records::commit(&context, rows).await.expect("commit");
+        records::commit(&context, rows, &Default::default())
+            .await
+            .expect("commit");
         let read = records::prefixed::<PendingMerge>(&context, PENDING, Vec::new())
             .await
             .expect("read");
