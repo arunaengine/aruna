@@ -111,7 +111,12 @@ fn map_check_error(error: ServiceCheckError) -> ServerError {
     params(("id" = String, Path, description = "Group ULID")),
     request_body(content = CreateServiceRequest, example = json!({ "name": "Nightly import" })),
     responses(
-        (status = 201, description = "The new service account", body = ServiceAccountResponse),
+        (status = 201, description = "The new service account", body = ServiceAccountResponse,
+            example = json!({
+                "id": "01JCNCTR0123456789ABCDEFGH@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                "name": "Nightly import",
+                "active": true
+            })),
         (status = 400, description = "The group id or the name is invalid", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or from another realm, the caller is a service account, or the caller is no group administrator", body = ErrorResponse)
@@ -162,7 +167,12 @@ async fn create_account(
 `/{realm}/g/{group}/admin`. A service account never lists them."#,
     params(("id" = String, Path, description = "Group ULID")),
     responses(
-        (status = 200, description = "The group's service accounts", body = ListServiceResponse),
+        (status = 200, description = "The group's service accounts", body = ListServiceResponse,
+            example = json!({ "accounts": [{
+                "id": "01JCNCTR0123456789ABCDEFGH@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA",
+                "name": "Nightly import",
+                "active": true
+            }] })),
         (status = 400, description = "The group id is invalid", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or from another realm, the caller is a service account, or the caller is no group administrator", body = ErrorResponse)
@@ -217,7 +227,14 @@ async fn list_accounts(
         })
     ),
     responses(
-        (status = 201, description = "Token issued; it is shown only here", body = CreateSessionResponse),
+        (status = 201, description = "Token issued; it is shown only here", body = CreateSessionResponse,
+            example = json!({
+                "session_id": "01JCNCTR0123456789ABCDEFGJ",
+                "kind": "api",
+                "label": "service account",
+                "token": "EXAMPLE-SESSION-TOKEN-PLACEHOLDER",
+                "expires_at": "2026-04-09T12:00:00Z"
+            })),
         (status = 400, description = "Invalid ids, lifetime or restrictions", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not administer the group's service accounts, or a scope exceeds the service account's access", body = ErrorResponse),
