@@ -57,6 +57,36 @@ pub fn path_within(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// Whether restrictions allow every path below `root`: one allow must cover the whole subtree
+/// and no deny may reach into it. Group-wide checks ask for a literal `root/**` this way.
+pub fn restrictions_cover_subtree<'a>(
+    restrictions: impl IntoIterator<Item = (&'a str, &'a Permission)>,
+    root: &str,
+    required: &Permission,
+) -> bool {
+    let mut covered = false;
+    for (pattern, permission) in restrictions {
+        match permission {
+            Permission::DENY => {
+                let literal = &pattern[..pattern.find(GLOB_CHARS).unwrap_or(pattern.len())];
+                let literal = literal.trim_end_matches('/');
+                if literal.is_empty() || root.starts_with(literal) || path_within(literal, root) {
+                    return false;
+                }
+            }
+            Permission::READ if *required != Permission::READ => {}
+            _ => {
+                covered |= pattern == "/**"
+                    || pattern.ends_with("/**")
+                        && pattern_root(pattern).is_some_and(|base| path_within(root, base));
+            }
+        }
+    }
+    covered
+}
+
+const GLOB_CHARS: [char; 6] = ['*', '?', '[', ']', '{', '}'];
+
 /// The literal subtree a pattern grants on: the pattern itself when it holds no
 /// wildcard, the parent of a trailing `/**`, and nothing otherwise, so an
 /// unsupported wildcard never widens a derived scope.
@@ -241,6 +271,53 @@ mod tests {
     #[test]
     fn malformed_never_matches() {
         assert!(!permission_pattern_matches("/realm/[", "/realm/anything"));
+    }
+
+    #[test]
+    fn subtree_needs_cover() {
+        use super::restrictions_cover_subtree;
+        let root = "/r/g/G/meta";
+        let check = |patterns: &[(&str, Permission)], required: Permission| {
+            restrictions_cover_subtree(
+                patterns
+                    .iter()
+                    .map(|(pattern, permission)| (*pattern, permission)),
+                root,
+                &required,
+            )
+        };
+        assert!(check(
+            &[("/r/g/G/**", Permission::WRITE)],
+            Permission::WRITE
+        ));
+        assert!(check(
+            &[("/r/g/G/meta/**", Permission::READ)],
+            Permission::READ
+        ));
+        assert!(!check(
+            &[("/r/g/G/meta/**", Permission::READ)],
+            Permission::WRITE
+        ));
+        // A top-level wildcard or a subtree below the root covers only part of it.
+        assert!(!check(
+            &[("/r/g/G/meta/*", Permission::WRITE)],
+            Permission::WRITE
+        ));
+        assert!(!check(
+            &[("/r/g/G/meta/a/**", Permission::WRITE)],
+            Permission::WRITE
+        ));
+        // A deny inside the subtree removes the cover; one elsewhere does not.
+        let denied = [
+            ("/r/g/G/**", Permission::WRITE),
+            ("/r/g/G/meta/private/**", Permission::DENY),
+        ];
+        assert!(!check(&denied, Permission::WRITE));
+        let elsewhere = [
+            ("/r/g/G/**", Permission::WRITE),
+            ("/r/g/G/data/**", Permission::DENY),
+        ];
+        assert!(check(&elsewhere, Permission::WRITE));
     }
 
     #[test]
