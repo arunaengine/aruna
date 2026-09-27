@@ -105,7 +105,7 @@ struct DelegationScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NormalizedRestriction {
+pub(crate) struct NormalizedRestriction {
     scope: DelegationScope,
     permission: Permission,
 }
@@ -150,6 +150,15 @@ impl DelegationScope {
 
     fn is_within(&self, root: &str) -> bool {
         path_within(&self.root, root)
+    }
+
+    /// Whether every path of `other` lies in this scope.
+    fn contains(&self, other: &Self) -> bool {
+        if self.recursive {
+            path_within(&other.root, &self.root)
+        } else {
+            !other.recursive && other.root == self.root
+        }
     }
 
     fn intersect_group_root(&self, group_root: &str) -> Option<Self> {
@@ -202,7 +211,9 @@ fn parse_normalized_restriction(
         .map(|scope| NormalizedRestriction { scope, permission })
 }
 
-fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRestriction> {
+pub(crate) fn serialize_restrictions(
+    restrictions: &[NormalizedRestriction],
+) -> Vec<PathRestriction> {
     restrictions
         .iter()
         .map(NormalizedRestriction::to_path_restriction)
@@ -359,9 +370,14 @@ pub async fn create_s3_credentials(
     {
         return Err(ServerError::BadRequest);
     }
-    let path_restrictions =
-        build_credential_restrictions(&auth, &state, group_id, request.path_restrictions.clone())
-            .await?;
+    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
+    let path_restrictions = build_credential_restrictions(
+        &auth,
+        &state,
+        &group_root,
+        request.path_restrictions.clone(),
+    )
+    .await?;
     authorize_credential_issuance(&auth, &state, group_id, path_restrictions.as_deref()).await?;
     let path_restrictions = path_restrictions.as_deref().map(serialize_restrictions);
     if let Some(restrictions) = path_restrictions.as_deref()
@@ -521,16 +537,20 @@ fn credential_expiry(now: SystemTime, expires_in_seconds: Option<u64>) -> Server
         .ok_or(ServerError::BadRequest)
 }
 
-async fn build_credential_restrictions(
+/// Narrows the caller's restrictions to `root` and the requested scopes; never widens them.
+pub(crate) async fn build_credential_restrictions(
     auth: &AuthContext,
     state: &ServerState,
-    group_id: Ulid,
+    root: &str,
     requested_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
-    let group_root = group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
-    let auth_restrictions = normalize_auth_restrictions(auth, &group_root)?;
-    let requested_restrictions =
-        normalize_requested_restrictions(requested_restrictions, &group_root)?;
+    let auth_restrictions = normalize_auth_restrictions(auth, root)?;
+    let requested_restrictions = normalize_requested_restrictions(requested_restrictions, root)?;
+    if let (Some(parent), Some(requested)) = (&auth_restrictions, &requested_restrictions)
+        && !contained(parent, requested)
+    {
+        return Err(ServerError::Forbidden);
+    }
 
     validate_requested_restrictions(auth, state, requested_restrictions.as_deref()).await?;
 
@@ -629,6 +649,24 @@ async fn validate_requested_restrictions(
     }
 
     Ok(())
+}
+
+/// Requested allows replace the inherited ones, so each must lie inside one of them; a point
+/// permission check cannot show that a whole subtree is covered.
+fn contained(parent: &[NormalizedRestriction], requested: &[NormalizedRestriction]) -> bool {
+    requested
+        .iter()
+        .filter(|scope| scope.permission != Permission::DENY)
+        .all(|scope| {
+            parent.iter().any(|allowed| {
+                let permitted = match allowed.permission {
+                    Permission::WRITE => true,
+                    Permission::READ => scope.permission == Permission::READ,
+                    Permission::DENY => false,
+                };
+                permitted && allowed.scope.contains(&scope.scope)
+            })
+        })
 }
 
 fn merge_effective_restrictions(

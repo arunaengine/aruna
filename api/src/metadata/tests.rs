@@ -80,3 +80,131 @@ async fn missing_group_forbidden() {
 
     assert!(matches!(result, Err(ServerError::Forbidden)));
 }
+
+#[tokio::test]
+async fn device_edit_owner() {
+    // A device edits its replica without a holder's check, so only its unrestricted owner passes.
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    let (_storage_dir, storage_handle) = test_storage();
+    let realm_id = test_realm_id();
+    let node_id = iroh::SecretKey::from_bytes(&[12u8; 32]).public();
+    let owner = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let actor = Actor {
+        node_id,
+        user_id: owner,
+        realm_id,
+    };
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.ensure_node(node_id, RealmNodeKind::User { owner });
+    storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: realm_id.as_bytes().to_vec().into(),
+            value: config.to_bytes(&actor).unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+    let state = test_state(
+        Arc::new(test_context(storage_handle)),
+        realm_id,
+        node_id,
+        NodeCapabilities::user_node(realm_id).unwrap(),
+    )
+    .await;
+    let auth = AuthContext {
+        user_id: owner,
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let document_id = Ulid::generate();
+    let extras = PolicyRequestExtras::rest;
+
+    // The owner passes the gate and only then meets the missing placement.
+    let owned = local_write_record(&state, &auth, document_id, extras()).await;
+    assert!(
+        matches!(owned, Err(ServerError::ServiceUnavailable)),
+        "{owned:?}"
+    );
+    let restricted = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/{}/meta/**", Ulid::generate()),
+            permission: Permission::WRITE,
+        }]),
+        ..auth.clone()
+    };
+    let refused = local_write_record(&state, &restricted, document_id, extras()).await;
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
+    let stranger = AuthContext {
+        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        ..auth
+    };
+    let refused = local_write_record(&state, &stranger, document_id, extras()).await;
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
+}
+
+#[tokio::test]
+async fn restricted_names_readable() {
+    // A restricted writer may not name an object it cannot read; unrestricted writers and
+    // entities without an exact object are not checked here.
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+    let (_storage_dir, storage_handle) = test_storage();
+    let realm_id = test_realm_id();
+    let node_id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
+    let state = test_state(
+        Arc::new(test_context(storage_handle)),
+        realm_id,
+        node_id,
+        NodeCapabilities::user_node(realm_id).unwrap(),
+    )
+    .await;
+    let exact = VersionedObjectArn::new(
+        realm_id,
+        node_id,
+        "bucket".to_string(),
+        "secret.csv".to_string(),
+        Ulid::generate(),
+    )
+    .unwrap();
+    let crate_value = serde_json::json!({
+        "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork"},
+            {"@id": "secret.csv", "@type": "File", "contentUrl": exact.to_w3id()}
+        ]
+    });
+    let plain = serde_json::json!({"@id": "notes.txt", "@type": "File"});
+    let auth = AuthContext {
+        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let restricted = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/{}/meta/**", Ulid::generate()),
+            permission: Permission::WRITE,
+        }]),
+        ..auth.clone()
+    };
+
+    let entities = crate_entities(&crate_value);
+    assert!(
+        ensure_readable_files(&state, &auth, &entities)
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        ensure_readable_files(&state, &restricted, &entities).await,
+        Err(ServerError::Forbidden)
+    ));
+    let single = crate_entities(&plain);
+    assert!(
+        ensure_readable_files(&state, &restricted, &single)
+            .await
+            .is_ok()
+    );
+}

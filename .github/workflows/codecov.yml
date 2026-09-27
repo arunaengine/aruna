@@ -86,8 +86,12 @@ jobs:
         run: cargo test --workspace --all-features --locked --doc
 
       - name: Collect coverage
+        # LLVM exports use Rayon's pool, independently of grcov's parser threads.
+        env:
+          RAYON_NUM_THREADS: 1
         run: |
           grcov . \
+            --threads 2 \
             --binary-path ./target/debug/deps/ \
             --source-dir . \
             --output-type lcov \

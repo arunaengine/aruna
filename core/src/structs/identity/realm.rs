@@ -4,7 +4,10 @@
 
 use crate::NodeId;
 use crate::UserId;
-use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained};
+use crate::auth::{
+    MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS, revocation_live, revocation_retained,
+    user_cutoff_hash,
+};
 use crate::errors::ConversionError;
 use crate::reducer::{AdminDocumentState, RevocationIndex};
 use crate::structs::execution::job::{JobId, SubmissionId};
@@ -633,6 +636,16 @@ impl RealmConfigDocument {
         self.revoked_tokens
             .iter()
             .any(|entry| entry.token_hash == token_hash && revocation_live(entry.expires_at, now))
+    }
+
+    /// Unix seconds before which every credential of this user is denied, if a cutoff is live.
+    pub fn user_cutoff(&self, user_id: &UserId, now: u64) -> Option<u64> {
+        let hash = user_cutoff_hash(user_id);
+        self.revoked_tokens
+            .iter()
+            .filter(|entry| entry.token_hash == hash && revocation_live(entry.expires_at, now))
+            .map(|entry| entry.expires_at.saturating_sub(MAX_TOKEN_LIFETIME))
+            .max()
     }
 
     /// Unions the locally accepted revocations with the reducer's materialized
@@ -1345,6 +1358,26 @@ mod test {
         assert_eq!(config.revoked_tokens.len(), 1);
         config.merge_revocations(&reducer_state, 1_001 + REVOCATION_GRACE_SECS + 1);
         assert!(config.revoked_tokens.is_empty());
+    }
+
+    #[test]
+    fn user_cutoff_latest() {
+        // The latest live cutoff of a user wins; other users and lapsed cutoffs deny nothing.
+        let realm_id = RealmId([9u8; 32]);
+        let user = crate::UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
+        let other = crate::UserId::local(Ulid::from_bytes([10u8; 16]), realm_id);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        for cutoff in [1_000, 2_000] {
+            config.revoked_tokens.push(TokenRevocation {
+                token_hash: crate::auth::user_cutoff_hash(&user),
+                expires_at: crate::auth::user_cutoff_expiry(cutoff),
+            });
+        }
+
+        assert_eq!(config.user_cutoff(&user, 2_500), Some(2_000));
+        assert_eq!(config.user_cutoff(&other, 2_500), None);
+        let lapsed = crate::auth::user_cutoff_expiry(2_000) + 1;
+        assert_eq!(config.user_cutoff(&user, lapsed), None);
     }
 
     #[test]

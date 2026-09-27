@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::UserId;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
@@ -36,6 +37,12 @@ pub trait ArunaValidationState: Sync {
         realm_id: &RealmId,
         token_hash: &str,
     ) -> Result<bool, ArunaBearerError>;
+    /// Unix seconds before which the issuing realm denies every token of this user.
+    async fn user_cutoff(
+        &self,
+        realm_id: &RealmId,
+        user_id: &UserId,
+    ) -> Result<Option<u64>, ArunaBearerError>;
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool;
 
     /// The wall clock claim validation judges against, injectable so a test can
@@ -116,6 +123,38 @@ pub async fn realm_token_revoked(
     }
 }
 
+/// The user's cutoff in the realm's replicated revocation set, read like the token revocation.
+pub async fn realm_user_cutoff(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    user_id: &UserId,
+) -> Result<Option<u64>, ArunaBearerError> {
+    let target = DocumentTarget::RealmConfig { realm_id };
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => match RealmConfigDocument::from_bytes(&bytes) {
+            Ok(config) => Ok(config.user_cutoff(user_id, unix_timestamp_secs())),
+            Err(error) => {
+                warn!(error = %error, "Failed to decode realm config for user cutoff");
+                Err(ArunaBearerError::RevocationUnavailable)
+            }
+        },
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        other => {
+            warn!(event = ?other, "Failed to read realm config for user cutoff");
+            Err(ArunaBearerError::RevocationUnavailable)
+        }
+    }
+}
+
 pub async fn validate_bearer_token<S>(
     state: &S,
     token: &str,
@@ -160,6 +199,14 @@ where
         RealmId::from_base64(&claims.claims.iss).map_err(|_| ArunaBearerError::InvalidIssuerKey)?;
     let token_hash = bearer_token_hash(token);
     if state.is_token_revoked(&issuer_realm, &token_hash).await? {
+        return Err(ArunaBearerError::TokenRevoked);
+    }
+    let user_id = UserId::from_string(&claims.claims.sub)?;
+    if state
+        .user_cutoff(&issuer_realm, &user_id)
+        .await?
+        .is_some_and(|cutoff| claims.claims.iat < cutoff)
+    {
         return Err(ArunaBearerError::TokenRevoked);
     }
 
@@ -424,6 +471,14 @@ mod tests {
             _token_hash: &str,
         ) -> Result<bool, ArunaBearerError> {
             Ok(false)
+        }
+
+        async fn user_cutoff(
+            &self,
+            _realm_id: &RealmId,
+            _user_id: &aruna_core::UserId,
+        ) -> Result<Option<u64>, ArunaBearerError> {
+            Ok(None)
         }
 
         async fn is_trusted_realm(&self, _realm_id: &RealmId) -> bool {

@@ -26,7 +26,9 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::MetadataError;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};
+use aruna_core::structs::identity::auth::{
+    Actor, AuthContext, PathRestriction, Permission, TokenClaims,
+};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
@@ -328,6 +330,70 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert!(!user_config.token_revoked(&hash, unix_timestamp_secs()));
+
+    shutdown(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_revokes_itself() -> Result<(), Box<dyn std::error::Error>> {
+    // A forwarded path-restricted token may retire itself but no other token of its user.
+    let realm = Realm::new();
+    let (nodes, _config) = build_realm(&realm, 3, 1).await?;
+    let user_node = nodes.last().expect("user node");
+    let scoped = realm.signed(
+        realm.user_id,
+        Some(vec![PathRestriction {
+            pattern: format!("/{}/g/{}/data/**", realm.realm_id, Ulid::generate()),
+            permission: Permission::READ,
+        }]),
+    );
+    let AuthToken::Bearer(scoped_string) = &scoped else {
+        unreachable!()
+    };
+    let scoped_string = scoped_string.as_str().to_string();
+
+    let other = realm.bearer_string();
+    let refused = forward_token_revoke(
+        &user_node.context,
+        realm.realm_id,
+        scoped.clone(),
+        other.clone(),
+    )
+    .await;
+    assert!(refused.is_err());
+    forward_token_revoke(
+        &user_node.context,
+        realm.realm_id,
+        scoped,
+        scoped_string.clone(),
+    )
+    .await?;
+
+    let own = bearer_token_hash(&scoped_string);
+    wait_for_convergence("the scoped self revocation did not converge", || async {
+        let mut pending = 0;
+        for node in nodes.iter().filter(|node| node.sync_eligible) {
+            let config = drive(
+                GetConfigOperation::new(realm.realm_id),
+                node.context.as_ref(),
+            )
+            .await?;
+            if !config.token_revoked(&own, unix_timestamp_secs()) {
+                pending += 1;
+            }
+        }
+        Ok::<usize, Box<dyn std::error::Error>>(pending)
+    })
+    .await?;
+    for node in nodes.iter().filter(|node| node.sync_eligible) {
+        let config = drive(
+            GetConfigOperation::new(realm.realm_id),
+            node.context.as_ref(),
+        )
+        .await?;
+        assert!(!config.token_revoked(&bearer_token_hash(&other), unix_timestamp_secs()));
+    }
 
     shutdown(nodes).await;
     Ok(())
@@ -781,6 +847,10 @@ impl Realm {
     /// A valid realm token for any subject, which is what a stolen or borrowed
     /// credential looks like to an ingress.
     fn token_for(&self, user_id: UserId) -> AuthToken {
+        self.signed(user_id, None)
+    }
+
+    fn signed(&self, user_id: UserId, restrictions: Option<Vec<PathRestriction>>) -> AuthToken {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let claims = TokenClaims {
             sub: user_id.to_string(),
@@ -790,7 +860,7 @@ impl Realm {
             jti: Ulid::generate().to_string(),
             sid: None,
             session_kind: None,
-            restrictions: None,
+            restrictions,
             issuer_pubkey: None,
             delegation_signature: None,
         };

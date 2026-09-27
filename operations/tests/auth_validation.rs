@@ -55,6 +55,14 @@ impl ArunaValidationState for TestAuthState {
         Ok(self.revoked_hashes.contains(token_hash))
     }
 
+    async fn user_cutoff(
+        &self,
+        _realm_id: &RealmId,
+        _user_id: &aruna_core::UserId,
+    ) -> Result<Option<u64>, ArunaBearerError> {
+        Ok(None)
+    }
+
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
         self.trusted_realms.contains(realm_id)
     }

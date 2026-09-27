@@ -7,6 +7,12 @@ use thiserror::Error;
 pub const MAX_USER_ATTRIBUTES: usize = 128;
 pub const ATTRIBUTE_KEY_BYTES: usize = 128;
 pub const ATTRIBUTE_VALUE_BYTES: usize = 4096;
+/// Prefix of attributes that only Aruna operations set, never a user update.
+pub const RESERVED_PREFIX: &str = "aruna-engine.org/";
+/// Present while the account is deactivated.
+pub const DEACTIVATED_ATTRIBUTE: &str = "aruna-engine.org/deactivated";
+/// Group that owns a service account.
+pub const SERVICE_GROUP_ATTRIBUTE: &str = "aruna-engine.org/service-group";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum UserAttributeError {
@@ -18,10 +24,15 @@ pub enum UserAttributeError {
     TooManyAttributes,
 }
 
+pub fn is_reserved_attribute(key: &str) -> bool {
+    key.starts_with(RESERVED_PREFIX)
+}
+
 pub fn validate_attribute_key(key: &str) -> Result<(), UserAttributeError> {
-    if key.is_empty()
+    let name = key.strip_prefix(RESERVED_PREFIX).unwrap_or(key);
+    if name.is_empty()
         || key.len() > ATTRIBUTE_KEY_BYTES
-        || !key
+        || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
     {
@@ -69,6 +80,15 @@ mod tests {
             "a1",
         ] {
             assert_eq!(validate_attribute_key(key), Ok(()));
+        }
+    }
+
+    #[test]
+    fn reserved_attribute_keys() {
+        assert_eq!(validate_attribute_key(super::DEACTIVATED_ATTRIBUTE), Ok(()));
+        assert!(super::is_reserved_attribute(super::SERVICE_GROUP_ATTRIBUTE));
+        for key in ["aruna-engine.org/", "aruna-engine.org/a/b", "other.org/key"] {
+            assert!(validate_attribute_key(key).is_err());
         }
     }
 

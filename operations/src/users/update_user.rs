@@ -27,7 +27,8 @@ use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use aruna_core::user::validation::{
-    UserAttributeError, validate_attribute_count, validate_attribute_key, validate_attribute_value,
+    UserAttributeError, is_reserved_attribute, validate_attribute_count, validate_attribute_key,
+    validate_attribute_value,
 };
 use aruna_core::{DOCUMENT_STATE_KEYSPACE, SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
@@ -54,6 +55,8 @@ pub struct UpdateUserInput {
     pub name: Option<String>,
     pub set_attributes: HashMap<String, String>,
     pub remove_attributes: Vec<String>,
+    /// Set by operations that authorized the change themselves; only they may touch reserved keys.
+    pub system: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -197,6 +200,12 @@ impl UpdateUserOperation {
         }
         self.target_user_id = Some(target_user_id);
 
+        if self.input.system {
+            self.state = UpdateUserState::StartTransaction;
+            return Ok(smallvec![Effect::Storage(
+                StorageEffect::StartTransaction { read: false }
+            )]);
+        }
         if self.input.auth_context.user_id == target_user_id {
             if self.input.auth_context.path_restrictions.is_some() {
                 return Err(UpdateUserError::Unauthorized);
@@ -724,6 +733,16 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
         user.name = trimmed.to_string();
     }
 
+    let reserved = input
+        .remove_attributes
+        .iter()
+        .chain(input.set_attributes.keys())
+        .find(|key| is_reserved_attribute(key));
+    if let Some(key) = reserved
+        && !input.system
+    {
+        return Err(UpdateUserError::InvalidAttributeKey(key.clone()));
+    }
     let mut removals = HashSet::new();
     for key in &input.remove_attributes {
         validate_attribute_key(key)?;
@@ -802,6 +821,7 @@ mod pure_tests {
                 ("department".to_string(), "biology".to_string()),
             ]),
             remove_attributes: vec!["old".to_string()],
+            system: false,
         }
     }
 
@@ -1203,6 +1223,30 @@ mod pure_tests {
                 "display name".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn reserved_needs_system() {
+        // Account status and service ownership change only through their own operations.
+        use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let mut input = input(realm_id, user_id, user_id);
+        input.remove_attributes = vec![DEACTIVATED_ATTRIBUTE.to_string()];
+        input.set_attributes.clear();
+        let mut user = stored_user(user_id);
+        user.attributes
+            .insert(DEACTIVATED_ATTRIBUTE.to_string(), "true".to_string());
+
+        assert_eq!(
+            super::apply_updates(&mut user, &input),
+            Err(UpdateUserError::InvalidAttributeKey(
+                DEACTIVATED_ATTRIBUTE.to_string()
+            ))
+        );
+        input.system = true;
+        assert_eq!(super::apply_updates(&mut user, &input), Ok(()));
+        assert!(!user.is_deactivated());
     }
 
     #[test]

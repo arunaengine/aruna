@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ensure_permission, permission_granted, require_realm_auth};
+use crate::auth::{
+    ensure_permission, permission_granted, require_realm_auth, require_unrestricted_auth,
+};
 use crate::error::{ServerError, ServerResult};
 pub use crate::server::state::PortalStatus;
 use crate::server::state::ServerState;
@@ -2030,8 +2032,8 @@ pub async fn load_realm_usage(
     summary = "Report this node's and the realm's storage usage",
     description = r#"Reports this node's own storage counters together with the realm-wide totals.
 
-**Authentication**: realm bearer token. No further permission is checked, because the figures are
-realm-wide totals and not per-caller views.
+**Authentication**: realm bearer token without path restrictions. No further permission is
+checked, because the figures are realm-wide totals and not per-caller views.
 
 **Behavior**
 - The flat fields are this node's own counters, while `realm` is the total summed from every realm
@@ -2069,7 +2071,7 @@ realm-wide totals and not per-caller views.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
-        (status = 403, description = "Caller is not a member of this realm", body = crate::error::ErrorResponse)
+        (status = 403, description = "Token is path-restricted, or the caller is not a member of this realm", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -2077,7 +2079,7 @@ pub async fn get_usage(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<UsageResponse>)> {
-    require_realm_auth(&state, auth)?;
+    require_unrestricted_auth(&state, auth)?;
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
     let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
     let mut response = UsageResponse::new(local, realm);

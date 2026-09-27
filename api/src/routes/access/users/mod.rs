@@ -2,15 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod status;
 mod vault;
 
-use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_realm_auth};
+use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role, SessionKind};
+use aruna_core::structs::identity::auth::{
+    Actor, AuthContext, PathRestriction, Permission, Role, SessionKind,
+};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
@@ -79,6 +82,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(list_user_devices))
         .routes(routes!(revoke_user_device))
         .routes(routes!(evict_device))
+        .merge(status::router())
         .merge(vault::router())
 }
 
@@ -320,6 +324,7 @@ async fn issue_user_session(
     user_id: UserId,
     expiry: u64,
     kind: SessionKind,
+    restrictions: Option<Vec<PathRestriction>>,
 ) -> ServerResult<String> {
     let created = drive(
         CreateSessionOperation::new(CreateSessionConfig {
@@ -330,6 +335,7 @@ async fn issue_user_session(
             node_capabilities: state.node_capabilities().clone(),
             kind,
             label: None,
+            restrictions,
         }),
         &state.get_ctx(),
     )
@@ -347,6 +353,15 @@ async fn ensure_token_subject(state: &Arc<ServerState>, user_id: UserId) -> Serv
     drive(SubjectCheckOperation::new(user_id), &state.get_ctx())
         .await
         .map_err(map_subject_error)
+}
+
+/// Refuses new tokens for a deactivated account; an account this node does not know passes.
+pub(crate) async fn ensure_active(state: &ServerState, user_id: UserId) -> ServerResult<()> {
+    match drive(ReadUserOperation::new(user_id), &state.get_ctx()).await {
+        Ok(user) if user.is_deactivated() => Err(ServerError::Forbidden),
+        Ok(_) | Err(ReadUserError::NotFound) => Ok(()),
+        Err(error) => Err(ServerError::InternalError(error.to_string())),
+    }
 }
 
 async fn read_current_user(state: &ServerState, user_id: UserId) -> ServerResult<User> {
@@ -667,13 +682,14 @@ async fn register_user(
     summary = "Issue a realm bearer token",
     description = r#"Mints a realm bearer token for the calling user, valid for 24 hours.
 
-**Authentication**: a realm bearer token without path restrictions, which refreshes itself, or an
+**Authentication**: a realm bearer token, which refreshes itself, or an
 OIDC token from a configured issuer whose subject has been registered at
 `POST /access/users/register`. The token is always minted for the caller and never on behalf of
 somebody else.
 
 **Behavior**
 - The token preserves a bound session's kind; an OIDC or unbound caller receives a `portal` session.
+- The token keeps the path restrictions of the presented token, so renewal never widens access.
 - The token is returned in this response only, so a lost one has to be reissued here.
 
 **Limits**
@@ -688,7 +704,7 @@ somebody else.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token, or this node knows no user for the presented OIDC subject", body = ErrorResponse),
-        (status = 403, description = "The presented token is path-restricted, or its user is an alias of the canonical user of that OIDC subject", body = ErrorResponse),
+        (status = 403, description = "The user is deactivated, or an alias of the canonical user of that OIDC subject", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -698,17 +714,14 @@ async fn get_token(
     headers: HeaderMap,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
-    let (user_id, kind) = match auth {
+    let (user_id, kind, restrictions) = match auth {
         Some(aruna_ctx) => {
-            if aruna_ctx.path_restrictions.is_some() {
-                return Err(ServerError::Forbidden);
-            }
             ensure_token_subject(&state, aruna_ctx.user_id).await?;
             let kind = aruna_ctx
                 .session
                 .as_ref()
                 .map_or(SessionKind::Portal, |session| session.kind);
-            (aruna_ctx.user_id, kind)
+            (aruna_ctx.user_id, kind, aruna_ctx.path_restrictions)
         }
         None => {
             let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
@@ -722,14 +735,15 @@ async fn get_token(
             )
             .await
             .map_err(|err| ServerError::InternalError(err.to_string()))?;
-            (user.user_id, SessionKind::Portal)
+            (user.user_id, SessionKind::Portal, None)
         }
     };
 
+    ensure_active(&state, user_id).await?;
     let expiry = now_timestamp()
         .checked_add(TOKEN_EXPIRY_SECONDS)
         .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
-    let token = issue_user_session(&state, user_id, expiry, kind).await?;
+    let token = issue_user_session(&state, user_id, expiry, kind, restrictions).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
 }
@@ -840,6 +854,7 @@ user document and takes no user id.
 **Limits**
 - The name is trimmed and must be 1 to 256 characters.
 - An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes.
+- Keys starting with `aruna-engine.org/` hold the account status and are rejected here.
 - An attribute value is at most 4096 bytes and carries no control characters.
 - A user holds at most 128 attributes."#,
     request_body(
@@ -927,6 +942,7 @@ async fn patch_user_info(
             name: request.name,
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
+            system: false,
         }),
         &state.get_ctx(),
     )
@@ -1396,6 +1412,7 @@ path and additionally passes the realm request policies.
 **Limits** (the same as for the self-service profile update)
 - The name is trimmed and must be 1 to 256 characters.
 - An attribute key is ASCII letters, digits, dot, underscore, hyphen or colon of at most 128 bytes.
+- Keys starting with `aruna-engine.org/` hold the account status and are rejected here.
 - An attribute value is at most 4096 bytes and carries no control characters.
 - A user holds at most 128 attributes."#,
     params(("id" = String, Path, description = "User id in the form `<ulid>@<realm>` of the user to update; the caller's own id for a self-service update")),
@@ -1470,6 +1487,7 @@ async fn update_user(
             name: request.name,
             set_attributes: request.set_attributes,
             remove_attributes: request.remove_attributes,
+            system: false,
         }),
         &state.get_ctx(),
     )
@@ -1571,8 +1589,8 @@ async fn owned_devices(
     summary = "List the calling user's devices",
     description = r#"Lists the devices the calling user has enrolled, plus the enrollments still in flight.
 
-**Authentication**: realm bearer token. It always lists the caller's own devices and takes no user
-id, so it grants no view of anybody else's.
+**Authentication**: realm bearer token without path restrictions. It always lists the caller's own
+devices and takes no user id, so it grants no view of anybody else's.
 
 **Behavior**
 - An enrolled device is a realm member of kind `User` owned by the caller; it reads `enrolled` and
@@ -1611,7 +1629,7 @@ id, so it grants no view of anybody else's.
             })
         ),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1620,7 +1638,7 @@ async fn list_user_devices(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<UserDevicesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let devices = owned_devices(&state, auth.user_id).await?;
     Ok((StatusCode::OK, Json(UserDevicesResponse { devices })))
 }
@@ -1632,8 +1650,8 @@ async fn list_user_devices(
     summary = "Revoke one of the calling user's devices",
     description = r#"Revokes a device enrollment of the calling user, making its secret unredeemable from here on.
 
-**Authentication**: realm bearer token. Only a device owned by the caller can be revoked; a device
-owned by anybody else answers 404 rather than admitting it exists.
+**Authentication**: realm bearer token without path restrictions. Only a device owned by the caller
+can be revoked; a device owned by anybody else answers 404 rather than admitting it exists.
 
 **Behavior**
 - `id` is what `GET /access/users/me/devices` reported: an enrollment id while the enrollment is
@@ -1649,7 +1667,7 @@ owned by anybody else answers 404 rather than admitting it exists.
     responses(
         (status = 204, description = "Device enrollment revoked, or the device evicted from the realm"),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No device of the calling user carries this id, including one an earlier call already revoked", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
@@ -1661,7 +1679,7 @@ async fn revoke_user_device(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(device_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let device = owned_devices(&state, auth.user_id)
         .await?
         .into_iter()

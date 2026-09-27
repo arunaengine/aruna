@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::user::validation::{DEACTIVATED_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
 
 impl ConfigValidationCache {
     pub(in crate::document_sync) fn invalidate(&mut self) {
@@ -577,13 +578,63 @@ pub(in crate::document_sync) async fn validate_user_authority(
             auth.roles.values(),
         )
     };
-    if !self_service && !management_bootstrap && !realm_admin {
+    let group_admin = if self_service || management_bootstrap || realm_admin {
+        false
+    } else if let Some(group_id) = service_owner(event, previous_state, current_user.as_ref()) {
+        let Some(auth) = read_group_authorization(storage, group_id).await? else {
+            return Ok(AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::GroupAuthorization(group_id)),
+                reason: "group authorization state is unavailable".to_string(),
+            });
+        };
+        has_write_permission(
+            event.actor.user_id,
+            &format!("/{realm_id}/g/{group_id}/admin"),
+            auth.roles.values(),
+        )
+    } else {
+        false
+    };
+    if !self_service && !management_bootstrap && !realm_admin && !group_admin {
         return Ok(AdminEventValidation::Rejected(
             "actor lacks current user write authority".to_string(),
         ));
     }
 
     Ok(AdminEventValidation::Accepted)
+}
+
+/// The group whose administrators may apply this event to a service account: the owner named by
+/// the event creating a new account, else the stored owner for name and status changes.
+fn service_owner(
+    event: &AdminDocumentEvent,
+    previous_state: Option<&AdminDocumentState>,
+    current_user: Option<&User>,
+) -> Option<GroupId> {
+    let attributes = previous_state.map(AdminDocumentState::materialized_user_attributes);
+    let stored = current_user.and_then(User::service_group).or_else(|| {
+        attributes
+            .as_ref()
+            .and_then(|attributes| attributes.get(SERVICE_GROUP_ATTRIBUTE))
+            .and_then(|group| group.parse().ok())
+    });
+    match &event.op {
+        AdminDocumentOperation::UserAttributeSet { key, value }
+            if key == SERVICE_GROUP_ATTRIBUTE =>
+        {
+            let fresh =
+                current_user.is_none() && attributes.is_none_or(|attributes| attributes.is_empty());
+            fresh.then(|| value.parse().ok()).flatten()
+        }
+        AdminDocumentOperation::UserAttributeSet { key, .. }
+        | AdminDocumentOperation::UserAttributeRemoved { key }
+            if key == DEACTIVATED_ATTRIBUTE =>
+        {
+            stored
+        }
+        AdminDocumentOperation::UserNameSet { .. } => stored,
+        _ => None,
+    }
 }
 
 pub(in crate::document_sync) async fn validate_group_authority(

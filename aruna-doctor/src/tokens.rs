@@ -186,6 +186,7 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
             node_capabilities: config.node_capabilities,
 
             session: None,
+            restrictions: None,
         })?,
         &driver_ctx,
     )
@@ -453,6 +454,14 @@ impl ArunaValidationState for DoctorValidationState {
         token_hash: &str,
     ) -> Result<bool, ArunaBearerError> {
         Ok(self.revoked_token_hashes.contains(token_hash))
+    }
+
+    async fn user_cutoff(
+        &self,
+        _realm_id: &RealmId,
+        _user_id: &aruna_core::UserId,
+    ) -> Result<Option<u64>, ArunaBearerError> {
+        Ok(None)
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {

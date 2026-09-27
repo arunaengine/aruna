@@ -5,7 +5,10 @@
 use aruna_core::UserId;
 use aruna_core::auth::valid_token_lifetime;
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::{NodeCapabilities, SessionRef, TokenClaims};
+use aruna_core::permission_path::validate_restriction_limits;
+use aruna_core::structs::identity::auth::{
+    NodeCapabilities, PathRestriction, SessionRef, TokenClaims,
+};
 use aruna_core::structs::identity::realm::RealmId;
 use base64::Engine;
 use chrono::Months;
@@ -22,6 +25,7 @@ pub struct CreateTokenConfig {
     pub realm_id: RealmId,
     pub node_capabilities: NodeCapabilities,
     pub session: Option<SessionRef>,
+    pub restrictions: Option<Vec<PathRestriction>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -48,6 +52,8 @@ pub enum CreateTokenError {
     InvalidTimestamp,
     #[error("Token lifetime exceeds the revocable maximum")]
     LifetimeTooLong,
+    #[error("Token restrictions exceed the allowed size")]
+    RestrictionsTooLarge,
     #[error(transparent)]
     EncodingError(#[from] jsonwebtoken::errors::Error),
 }
@@ -68,6 +74,10 @@ pub fn mint_token(config: &CreateTokenConfig) -> Result<String, CreateTokenError
     if !valid_token_lifetime(iat, exp) {
         return Err(CreateTokenError::LifetimeTooLong);
     }
+    if let Some(restrictions) = &config.restrictions {
+        validate_restriction_limits(restrictions)
+            .map_err(|_| CreateTokenError::RestrictionsTooLarge)?;
+    }
 
     let claims = |issuer_pubkey, delegation_signature| TokenClaims {
         sub: config.user_id.to_string(),
@@ -77,7 +87,7 @@ pub fn mint_token(config: &CreateTokenConfig) -> Result<String, CreateTokenError
         jti: Ulid::generate().to_string(),
         sid: config.session.as_ref().map(|session| session.sid.clone()),
         session_kind: config.session.as_ref().map(|session| session.kind),
-        restrictions: None,
+        restrictions: config.restrictions.clone(),
         issuer_pubkey,
         delegation_signature,
     };
@@ -207,6 +217,7 @@ mod test {
             node_capabilities: capabilities,
 
             session: None,
+            restrictions: None,
         };
 
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
@@ -226,6 +237,7 @@ mod test {
             realm_id,
             node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
             session: None,
+            restrictions: None,
         })
         .unwrap();
 
@@ -250,6 +262,7 @@ mod test {
                 sid: sid.clone(),
                 kind: SessionKind::Assistant,
             }),
+            restrictions: None,
         })
         .unwrap();
         let claims = jsonwebtoken::dangerous::insecure_decode::<TokenClaims>(&token)

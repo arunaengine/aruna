@@ -8,6 +8,8 @@ pub mod vault;
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::identity::auth::Actor;
+use crate::types::GroupId;
+use crate::user::validation::{DEACTIVATED_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -36,6 +38,17 @@ impl User {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn is_deactivated(&self) -> bool {
+        self.attributes.contains_key(DEACTIVATED_ATTRIBUTE)
+    }
+
+    /// The owning group when this account is a service account.
+    pub fn service_group(&self) -> Option<GroupId> {
+        self.attributes
+            .get(SERVICE_GROUP_ATTRIBUTE)
+            .and_then(|group| group.parse().ok())
     }
 }
 

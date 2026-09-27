@@ -450,6 +450,14 @@ impl ArunaValidationState for RevocationBlindState<'_> {
         Ok(false)
     }
 
+    async fn user_cutoff(
+        &self,
+        _realm_id: &aruna_core::structs::identity::realm::RealmId,
+        _user_id: &aruna_core::UserId,
+    ) -> Result<Option<u64>, ArunaBearerError> {
+        Ok(None)
+    }
+
     async fn is_trusted_realm(
         &self,
         realm_id: &aruna_core::structs::identity::realm::RealmId,
@@ -1012,6 +1020,7 @@ mod test {
                 node_capabilities: capabilities,
 
                 session: None,
+                restrictions: None,
             })
             .unwrap(),
             &driver_ctx,
@@ -1461,6 +1470,7 @@ mod test {
             realm_id,
             node_capabilities: capabilities,
             session: None,
+            restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let management_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1501,6 +1511,7 @@ mod test {
             realm_id,
             node_capabilities: capabilities,
             session: None,
+            restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let server_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1639,6 +1650,7 @@ mod test {
                 realm_id,
                 node_capabilities: capabilities.clone(),
                 session: None,
+                restrictions: None,
             })
             .unwrap(),
             &driver_ctx,
@@ -1749,6 +1761,7 @@ mod test {
             realm_id,
             node_capabilities: capabilities.clone(),
             session: None,
+            restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let management_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1792,6 +1805,7 @@ mod test {
             node_capabilities: capabilities,
 
             session: None,
+            restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let management_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1840,6 +1854,7 @@ mod test {
             node_capabilities: capabilities,
 
             session: None,
+            restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let server_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1873,6 +1888,7 @@ mod test {
             realm_id,
             node_capabilities: capabilities,
             session: None,
+            restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let server_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -1905,6 +1921,7 @@ mod test {
             realm_id: RealmId([0u8; 32]),
             node_capabilities: capabilities,
             session: None,
+            restrictions: None,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         let server_token = drive(token_operation, &driver_ctx).await.unwrap();
@@ -2063,6 +2080,7 @@ mod test {
                 node_capabilities: capabilities,
 
                 session: None,
+                restrictions: None,
             })
             .unwrap(),
             &driver_ctx,

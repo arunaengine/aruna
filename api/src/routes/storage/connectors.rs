@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::auth::{parse_group_id, require_realm_auth};
+use crate::auth::{parse_group_id, require_realm_auth, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::SourceResolutionError;
@@ -929,7 +929,8 @@ pub async fn check_stored_connector(
     summary = "Browse the entries under a connector path",
     description = r#"Lists one level below a path at the connector's source, using its stored credentials.
 
-**Authentication**: realm bearer token with READ on the group's data path.
+**Authentication**: realm bearer token without path restrictions and with READ on the group's data
+path.
 
 **Behavior**
 - The listing never descends: a directory is returned as an entry of kind `dir` and is browsed with
@@ -989,7 +990,7 @@ pub async fn check_stored_connector(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
-            description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
+            description = "Token is path-restricted or from another realm, or no READ on the group's data path, including when the group does not exist",
             body = ErrorResponse
         ),
         (
@@ -1011,7 +1012,7 @@ pub async fn list_connector_entries(
     Path((group_id, connector_id)): Path<(String, String)>,
     Query(query): Query<ConnectorEntriesQuery>,
 ) -> ServerResult<Json<ConnectorEntriesResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;

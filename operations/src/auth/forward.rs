@@ -166,11 +166,12 @@ pub(crate) async fn apply_token_revoke(
     let MetadataTransportMessage::ForwardTokenRevocation { auth_token, .. } = &message else {
         return reject("unexpected token revocation message");
     };
-    if !matches!(auth_token, AuthToken::Bearer(_)) {
+    let AuthToken::Bearer(caller_token) = auth_token else {
         return MetadataTransportMessage::ForwardedWriteDenied {
             error: WriteAuthError::Unauthorized,
         };
-    }
+    };
+    let caller_hash = bearer_token_hash(caller_token.as_str());
     let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
         Ok(auth) => auth,
         Err(error) => return forward_auth_error(error),
@@ -196,7 +197,10 @@ pub(crate) async fn apply_token_revoke(
             error: WriteAuthError::Forbidden,
         };
     }
-    if auth.user_id != subject.user_id
+    // A path-restricted caller may retire only the token it presented, never another one.
+    let self_service = auth.user_id == subject.user_id
+        && (auth.path_restrictions.is_none() || caller_hash == bearer_token_hash(&token));
+    if !self_service
         && let Err(error) = authorize_write(
             context,
             auth.clone(),
@@ -216,7 +220,7 @@ pub(crate) async fn apply_token_revoke(
             token_hash: bearer_token_hash(&token),
             expires_at,
             token_owner: subject.user_id,
-            admission: if auth.user_id == subject.user_id {
+            admission: if self_service {
                 RevokeTokenAdmission::SelfService
             } else {
                 RevokeTokenAdmission::Privileged

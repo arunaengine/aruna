@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::auth::bearer_token_hash;
+use aruna_core::auth::{bearer_token_hash, user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
@@ -25,6 +25,7 @@ use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, decode_bearer_token, realm_token_revoked,
+    realm_user_cutoff,
 };
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
@@ -70,6 +71,14 @@ impl ArunaValidationState for PeerAuthState {
         token_hash: &str,
     ) -> Result<bool, ArunaBearerError> {
         realm_token_revoked(&self.storage, *realm_id, token_hash).await
+    }
+
+    async fn user_cutoff(
+        &self,
+        realm_id: &RealmId,
+        user_id: &aruna_core::UserId,
+    ) -> Result<Option<u64>, ArunaBearerError> {
+        realm_user_cutoff(&self.storage, *realm_id, user_id).await
     }
 
     async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
@@ -144,6 +153,65 @@ async fn peer_denies_token() -> TestResult<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn peer_applies_cutoff() -> TestResult<()> {
+    // A user cutoff written on node A denies that user's older tokens on node B,
+    // while tokens issued at or after the cutoff and other users stay valid.
+    let signing_key = generate_signing_key();
+    let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+    let nodes = build_realm_nodes(realm_id, 2).await?;
+    let user_id = UserId::local(Ulid::generate(), realm_id);
+    let other_id = UserId::local(Ulid::generate(), realm_id);
+    let now = aruna_core::time::unix_timestamp_secs();
+    let cutoff = now + 1;
+    let (older, _) = mint_token_at(&signing_key, realm_id, user_id, now);
+    let (newer, _) = mint_token_at(&signing_key, realm_id, user_id, cutoff);
+    let (other, _) = mint_token_at(&signing_key, realm_id, other_id, now);
+
+    drive(
+        RevokeTokenOperation::new(RevokeTokenConfig {
+            actor: Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: other_id,
+                realm_id,
+            },
+            token_hash: user_cutoff_hash(&user_id),
+            expires_at: user_cutoff_expiry(cutoff),
+            token_owner: user_id,
+            admission: RevokeTokenAdmission::Privileged,
+            now,
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "the user cutoff never reached the peer node",
+        || async {
+            Ok(usize::from(
+                realm_user_cutoff(&nodes[1].context.storage_handle, realm_id, &user_id)
+                    .await?
+                    .is_none(),
+            ))
+        },
+    )
+    .await?;
+
+    let peer = peer_auth(&nodes[1], realm_id);
+    assert!(matches!(
+        decode_bearer_token(&peer, &older).await,
+        Err(ArunaBearerError::TokenRevoked)
+    ));
+    decode_bearer_token(&peer, &newer)
+        .await
+        .expect("a token issued at the cutoff stays valid");
+    decode_bearer_token(&peer, &other)
+        .await
+        .expect("another user's token stays valid");
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
 fn peer_auth(node: &TestNode, realm_id: RealmId) -> PeerAuthState {
     PeerAuthState {
         storage: node.context.storage_handle.clone(),
@@ -154,6 +222,15 @@ fn peer_auth(node: &TestNode, realm_id: RealmId) -> PeerAuthState {
 /// Returns the signed token and its expiry, which bounds the revocation entry.
 fn mint_token(signing_key: &SigningKey, realm_id: RealmId, user_id: UserId) -> (String, u64) {
     let now = chrono::Utc::now().timestamp().max(0) as u64;
+    mint_token_at(signing_key, realm_id, user_id, now)
+}
+
+fn mint_token_at(
+    signing_key: &SigningKey,
+    realm_id: RealmId,
+    user_id: UserId,
+    now: u64,
+) -> (String, u64) {
     let expires_at = now + 600;
     let claims = TokenClaims {
         sub: user_id.to_string(),

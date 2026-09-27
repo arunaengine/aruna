@@ -96,6 +96,39 @@ async fn reference_auth_succeeds() {
 }
 
 #[tokio::test]
+async fn references_hide_denied() {
+    // A key under a deny restriction is left out, the rest of the page stays.
+    let test = setup_state().await;
+    seed_reference_objects(&test).await;
+    let mut auth = test.auth_bucket_read.clone();
+    let restrictions = auth.path_restrictions.as_mut().unwrap();
+    let denied = format!("{}/data/b-external", restrictions[0].pattern);
+    restrictions.push(PathRestriction {
+        pattern: denied,
+        permission: Permission::DENY,
+    });
+
+    let (_, Json(page)) = list_references(
+        State(test.state.clone()),
+        Extension(Some(auth)),
+        Query(ReferenceListQuery {
+            bucket: test.bucket.clone(),
+            prefix: Some("data/".to_string()),
+            limit: Some(10),
+            cursor: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let keys: Vec<&str> = page
+        .entries
+        .iter()
+        .map(|entry| entry.key.as_str())
+        .collect();
+    assert_eq!(keys, ["data/a-materialized", "data/c-native"]);
+}
+
+#[tokio::test]
 async fn references_list_bindings() {
     let test = setup_state().await;
     let origin = seed_reference_objects(&test).await;
@@ -688,10 +721,16 @@ async fn setup_state() -> TestState {
         auth_bucket_read: AuthContext {
             user_id: with_source_read,
             realm_id,
-            path_restrictions: Some(vec![PathRestriction {
-                pattern: bucket_path,
-                permission: Permission::READ,
-            }]),
+            path_restrictions: Some(vec![
+                PathRestriction {
+                    pattern: bucket_path.clone(),
+                    permission: Permission::READ,
+                },
+                PathRestriction {
+                    pattern: format!("{bucket_path}/**"),
+                    permission: Permission::READ,
+                },
+            ]),
             session: None,
         },
         auth_source_read: AuthContext {

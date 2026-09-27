@@ -10,7 +10,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::{
-    compile_permission_matcher, readable_roots, validate_restriction_limits,
+    compile_permission_matcher, readable_roots, restrictions_cover_subtree,
+    validate_restriction_limits,
 };
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission, Role};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -163,6 +164,12 @@ impl PermissionRules {
         let Some(restrictions) = self.restrictions.as_ref() else {
             return true;
         };
+        if let Some(root) = path.strip_suffix("/**") {
+            let patterns = restrictions
+                .iter()
+                .map(|restriction| (restriction.matcher.glob().glob(), &restriction.permission));
+            return restrictions_cover_subtree(patterns, root, required);
+        }
 
         let mut allowed = false;
         for restriction in restrictions {

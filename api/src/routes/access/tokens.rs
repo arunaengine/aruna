@@ -252,6 +252,7 @@ mod tests {
                 node_capabilities: capabilities,
 
                 session: None,
+                restrictions: None,
             })
             .unwrap(),
             &ctx,
@@ -518,6 +519,7 @@ mod tests {
                 node_capabilities: foreign_capabilities,
 
                 session: None,
+                restrictions: None,
             })
             .unwrap(),
             &state.get_ctx(),

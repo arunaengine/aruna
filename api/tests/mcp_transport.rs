@@ -223,6 +223,7 @@ async fn setup_fixture() -> Fixture {
             realm_id,
             node_capabilities: capabilities,
             session: None,
+            restrictions: None,
         })
         .unwrap(),
         &context,
