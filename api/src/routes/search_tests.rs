@@ -316,6 +316,7 @@ async fn attach_file(fx: &Fixture, document_id: &str, name: &str) {
         Json(ReplaceRoCrateRequest {
             rocrate,
             public: Some(true),
+            expected_revision: None,
         }),
     )
     .await

@@ -5,6 +5,7 @@
 #![allow(clippy::result_large_err)]
 #![recursion_limit = "256"]
 
+pub mod arc;
 mod autoindex;
 pub mod bao_tree;
 pub mod blob;
@@ -13,8 +14,10 @@ pub mod error;
 mod framing;
 mod fs_source;
 mod fs_write;
+pub mod git;
 pub mod hash;
 pub mod invenio;
 mod messages;
 pub mod opendal;
+pub mod repo;
 pub mod s3;

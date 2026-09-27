@@ -18,13 +18,13 @@ use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventRecord,
-    MetadataLifecycleRecord,
+    GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventPayload,
+    MetadataEventRecord, MetadataLifecycleRecord,
 };
 use aruna_core::storage_entries::{
-    delete_projection_entry, document_lifecycle_entry, event_log_key, graph_lifecycle_key,
-    lifecycle_revision_change, pending_projection_key, pending_projection_target,
-    registry_delete_entries,
+    delete_projection_entry, document_job_entry, document_lifecycle_entry, event_log_key,
+    graph_lifecycle_key, lifecycle_revision_change, materialization_job_entry,
+    pending_projection_key, pending_projection_target, registry_delete_entries,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -411,6 +411,8 @@ pub async fn project_create_events(
     let mut needs_materialization_drain = false;
     let mut projected = 0usize;
     let mut projected_records = Vec::new();
+    // Graphs that only receive a late merge job; their lifecycle still fences the write.
+    let mut late_graphs = BTreeSet::new();
     let mut fence = crate::placement::fence::WriteFence::default();
 
     for event in events {
@@ -490,6 +492,23 @@ pub async fn project_create_events(
         } else {
             true
         };
+        // A merge older than the recorded status still has to apply, so it only queues its own
+        // job; an equal status means that event's job is already queued.
+        let superseded = status_cache
+            .get(&document_id)
+            .and_then(Option::as_ref)
+            .is_some_and(|status| status.event_id > event.event_id);
+        if superseded
+            && let MetadataEventPayload::ApplyBatch { batch, .. } = &event.payload
+            && !dot_applied(context, &event.record.graph_iri, batch).await?
+        {
+            let job = new_materialization_job(&event, aruna_core::time::unix_timestamp_millis());
+            writes.push(materialization_job_entry(&job)?);
+            writes.push(document_job_entry(&job)?);
+            late_graphs.insert(event.record.graph_iri.clone());
+            needs_materialization_drain = true;
+            continue;
+        }
         let needs_projection =
             !registry_exists || event_is_newer || holders_changed || needs_materialization;
 
@@ -620,6 +639,7 @@ pub async fn project_create_events(
         let graph_iris = projected_records
             .iter()
             .map(|record| record.graph_iri.clone())
+            .chain(late_graphs)
             .collect::<BTreeSet<_>>();
         transactional_projection_write(context, writes, graph_iris, &fence).await?;
         if let Some(metadata_handle) = context.metadata_handle.as_ref() {
@@ -1038,6 +1058,35 @@ pub fn create_outbox_record(
         generation: 0,
         updated_at: event.occurred_at_ms / 1_000,
         allow_genesis,
+    }
+}
+
+async fn dot_applied(
+    context: &DriverContext,
+    graph_iri: &str,
+    batch: &aruna_core::metadata::MetadataBatch,
+) -> Result<bool, MetadataProjectionError> {
+    let Some(handle) = context.metadata_handle.as_ref() else {
+        return Ok(true);
+    };
+    match handle
+        .send_metadata_effect(aruna_core::metadata::MetadataEffect::ContainsDot {
+            graph_iri: graph_iri.to_string(),
+            actor: batch.actor,
+            counter: batch.counter,
+        })
+        .await
+    {
+        Event::Metadata(aruna_core::metadata::MetadataEvent::ContainsDotResult {
+            contains,
+            ..
+        }) => Ok(contains),
+        Event::Metadata(aruna_core::metadata::MetadataEvent::Error { error, .. }) => {
+            Err(error.into())
+        }
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
     }
 }
 

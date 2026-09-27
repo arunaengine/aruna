@@ -92,7 +92,7 @@ fn storage_is_transient(error: &StorageError) -> bool {
 /// A missing graph is a durable registry row whose materialization has not
 /// caught up, which the read API already reports as service unavailable. Only a
 /// rejected document stays permanent.
-fn metadata_error_transient(error: &MetadataError) -> bool {
+pub(crate) fn metadata_error_transient(error: &MetadataError) -> bool {
     match error {
         MetadataError::ProfileValidation(findings) => {
             !findings.is_empty()

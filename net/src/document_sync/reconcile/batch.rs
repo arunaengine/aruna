@@ -154,6 +154,17 @@ pub(super) async fn apply_batch_event(
         return Ok(());
     }
     if matches!(
+        &event,
+        DocumentEvent::Upsert {
+            target: DocumentTarget::GitRecord { .. },
+            ..
+        }
+    ) {
+        let outcome = super::git::apply_git_event(service, topic_id, identity, event).await?;
+        record_metadata(outcome, state);
+        return Ok(());
+    }
+    if matches!(
         event.target(),
         DocumentTarget::PersistentIdMapping { .. } | DocumentTarget::PlacementPolicy { .. }
     ) {

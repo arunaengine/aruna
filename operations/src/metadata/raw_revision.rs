@@ -548,7 +548,8 @@ fn event_matches_state(event: &MetadataEventRecord, state: &RawRevisionState) ->
         }
         MetadataEventPayload::UpsertDataEntity { .. }
         | MetadataEventPayload::UpsertContextualEntity { .. }
-        | MetadataEventPayload::ApplyBatch { .. } => true,
+        | MetadataEventPayload::ApplyBatch { .. }
+        | MetadataEventPayload::Checkpoint { .. } => true,
     }
 }
 

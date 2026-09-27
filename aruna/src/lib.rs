@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 // Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 #![allow(clippy::result_large_err)]
 
 pub mod application;

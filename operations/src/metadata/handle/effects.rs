@@ -11,7 +11,7 @@ use aruna_core::handle::Handle;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults};
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use async_trait::async_trait;
-use craqle::{ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, GraphId};
+use craqle::{ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, GraphId, RoCrateError};
 use tracing::{Instrument, Span, debug_span, field, warn};
 
 use super::entity_convert::{
@@ -158,6 +158,13 @@ impl MetadataHandle {
                             exists: false,
                         }));
                     }
+                    // A deleted graph applies nothing more, so nothing is left to apply.
+                    MetadataEffect::ContainsDot { graph_iri, .. } => {
+                        return Some(Event::Metadata(MetadataEvent::ContainsDotResult {
+                            graph_iri: graph_iri.clone(),
+                            contains: true,
+                        }));
+                    }
                     _ if effect_rejects_deleted(effect) => {
                         return Some(Event::Metadata(MetadataEvent::Error {
                             graph_iri: Some(graph_iri.to_string()),
@@ -300,9 +307,11 @@ pub(super) fn metadata_effect_kind(effect: &MetadataEffect) -> &'static str {
         MetadataEffect::DeleteGraph { .. } => "delete_graph",
         MetadataEffect::ListGraphs => "list_graphs",
         MetadataEffect::ContainsGraph { .. } => "contains_graph",
+        MetadataEffect::ContainsDot { .. } => "contains_dot",
         MetadataEffect::PlanBatch { .. } => "plan_batch",
         MetadataEffect::MergeBatch { .. } => "merge_batch",
         MetadataEffect::GraphSnapshot { .. } => "graph_snapshot",
+        MetadataEffect::ExportVersioned { .. } => "export_versioned",
         MetadataEffect::InstallSnapshot { .. } => "install_snapshot",
     }
 }
@@ -318,6 +327,7 @@ pub(super) fn metadata_event_kind(event: &MetadataEvent) -> &'static str {
         MetadataEvent::GraphSyncScheduled { .. } => "graph_sync_scheduled",
         MetadataEvent::GraphPolicyResult { .. } => "graph_policy_result",
         MetadataEvent::RoCrateExportResult { .. } => "rocrate_export_result",
+        MetadataEvent::VersionedExport { .. } => "versioned_export",
         MetadataEvent::RoCrateSummaryResult { .. } => "rocrate_summary_result",
         MetadataEvent::RoCratePageResult { .. } => "rocrate_page_result",
         MetadataEvent::SearchResult { .. } => "search_result",
@@ -325,6 +335,7 @@ pub(super) fn metadata_event_kind(event: &MetadataEvent) -> &'static str {
         MetadataEvent::GraphDeleted { .. } => "graph_deleted",
         MetadataEvent::GraphListResult { .. } => "graph_list_result",
         MetadataEvent::ContainsGraphResult { .. } => "contains_graph_result",
+        MetadataEvent::ContainsDotResult { .. } => "contains_dot_result",
         MetadataEvent::BatchPlanned { .. } => "batch_planned",
         MetadataEvent::BatchMerged { .. } => "batch_merged",
         MetadataEvent::GraphSnapshotResult { .. } => "graph_snapshot_result",
@@ -359,7 +370,8 @@ pub(crate) fn metadata_read_error(error: MetadataError) -> MetadataReadError {
         | MetadataError::ProfileValidation(_)
         | MetadataError::Persist(_)
         | MetadataError::Storage(_)
-        | MetadataError::Backend(_) => MetadataReadError::Unavailable,
+        | MetadataError::Backend(_)
+        | MetadataError::MissingDependencies(_) => MetadataReadError::Unavailable,
     }
 }
 
@@ -379,7 +391,9 @@ pub(super) fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         | MetadataEffect::ExportRoCrateSummary { graph_iri }
         | MetadataEffect::DeleteGraph { graph_iri }
         | MetadataEffect::ContainsGraph { graph_iri }
+        | MetadataEffect::ContainsDot { graph_iri, .. }
         | MetadataEffect::GraphSnapshot { graph_iri }
+        | MetadataEffect::ExportVersioned { graph_iri }
         | MetadataEffect::InstallSnapshot { graph_iri, .. }
         | MetadataEffect::PlanBatch { graph_iri, .. }
         | MetadataEffect::MergeBatch { graph_iri, .. } => Some(graph_iri.clone()),
@@ -770,6 +784,24 @@ fn export_effect(
             );
             result
         }
+        MetadataEffect::ExportVersioned { graph_iri } => {
+            // The version only counts when no dot landed during the export.
+            let graph = GraphId::new(&graph_iri);
+            for _ in 0..8 {
+                let before = node.vector_clock(&graph)?;
+                let jsonld = node.export_rocrate(auth, &graph)?;
+                if node.vector_clock(&graph)? == before {
+                    return Ok(MetadataEvent::VersionedExport {
+                        graph_iri: graph_iri.clone(),
+                        jsonld,
+                        version: aruna_core::metadata::graph_version(&before),
+                    });
+                }
+            }
+            Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
+                "metadata graph `{graph_iri}` kept changing while exporting"
+            ))))
+        }
         MetadataEffect::ExportRoCrateSummary { graph_iri } => {
             let call_span = debug_span!(
                 "metadata.backend.craqle.export_rocrate_summary",
@@ -919,6 +951,25 @@ fn graph_effect(
             );
             result
         }
+        MetadataEffect::ContainsDot {
+            graph_iri,
+            actor,
+            counter,
+        } => {
+            let graph = GraphId::new(&graph_iri);
+            let dot = craqle::Dot {
+                actor: craqle::ActorId::from_bytes(actor),
+                counter,
+            };
+            let contains = match node.contains_graph(&graph) {
+                Ok(true) => node.vector_clock(&graph).map(|clock| clock.contains(&dot)),
+                other => other,
+            };
+            contains.map(|contains| MetadataEvent::ContainsDotResult {
+                graph_iri: graph_iri.clone(),
+                contains,
+            })
+        }
         _ => unreachable!("effect family routed incorrectly"),
     }
 }
@@ -992,6 +1043,7 @@ fn sync_effect(
         MetadataEffect::PlanBatch {
             graph_iri,
             actor,
+            counter,
             source,
         } => {
             let call_span = debug_span!(
@@ -1004,7 +1056,7 @@ fn sync_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| plan_batch(node, auth, &graph_iri, actor, &source))
+                .in_scope(|| plan_batch(node, auth, &graph_iri, (actor, counter), &source))
                 .map(|batch| {
                     call_span.record("batch_ops", batch.ops.len() as u64);
                     MetadataEvent::BatchPlanned {
@@ -1083,13 +1135,15 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         | MetadataEffect::GetGraphPolicy { .. }) => policy_effect(&node, &auth, effect),
         effect @ (MetadataEffect::ExportRoCrate { .. }
         | MetadataEffect::ExportRoCrateSummary { .. }
-        | MetadataEffect::ExportRoCratePage { .. }) => export_effect(&node, &auth, effect),
+        | MetadataEffect::ExportRoCratePage { .. }
+        | MetadataEffect::ExportVersioned { .. }) => export_effect(&node, &auth, effect),
         MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::QueryGraphs { .. }
         | MetadataEffect::SyncBestEffort { .. } => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
-        | MetadataEffect::ContainsGraph { .. }) => graph_effect(&node, &auth, effect),
+        | MetadataEffect::ContainsGraph { .. }
+        | MetadataEffect::ContainsDot { .. }) => graph_effect(&node, &auth, effect),
         effect @ (MetadataEffect::GraphSnapshot { .. }
         | MetadataEffect::InstallSnapshot { .. }
         | MetadataEffect::PlanBatch { .. }

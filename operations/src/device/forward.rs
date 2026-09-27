@@ -451,6 +451,27 @@ pub(super) async fn run_device_batch(
             ForwardAuthError::Forbidden => SyncRefusal::Forbidden,
             ForwardAuthError::Unavailable(_) => SyncRefusal::Unavailable,
         })?;
+    // An edit whose dependencies never reached this holder would wait in its log forever;
+    // the device retries it instead, or learns the dependency was refused.
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    for (actor, counter) in &batch.base_clock.0 {
+        let known = metadata
+            .send_metadata_effect(MetadataEffect::ContainsDot {
+                graph_iri: record.graph_iri.clone(),
+                actor: actor.0,
+                counter: *counter,
+            })
+            .await;
+        if !matches!(
+            known,
+            Event::Metadata(MetadataEvent::ContainsDotResult { contains: true, .. })
+        ) {
+            return Err(SyncRefusal::Unavailable);
+        }
+    }
     let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
         actor: Actor {
             node_id: net_handle.node_id(),

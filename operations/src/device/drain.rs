@@ -31,6 +31,7 @@ use crate::metadata::update_document::UpdateDocumentError;
 use crate::placement::process_placements::load_realm_config;
 
 use super::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue, exhausted, retry_due_ms};
+use super::edit::{refused_edit, reject_edit};
 use super::publish_queue::{
     MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishKind, PublishState, entry_with_state, publish_entry,
     read_publish_entry, scan_publish_queue,
@@ -383,6 +384,14 @@ async fn publish_edit(
             document_id: None,
         };
     };
+    let dot = (batch.actor, batch.counter);
+    if refused_edit(context, *document_id, dot).await {
+        return PublishState::Failed {
+            reason: "an earlier edit it builds on was refused".to_string(),
+            retryable: false,
+            document_id: Some(*document_id),
+        };
+    }
     match apply_batch_routed(
         context,
         realm_id,
@@ -400,11 +409,17 @@ async fn publish_edit(
                 document_id: *document_id,
             }
         }
-        Err(error) if permanent(&error) => PublishState::Failed {
-            reason: error.to_string(),
-            retryable: false,
-            document_id: Some(*document_id),
-        },
+        Err(error) if permanent(&error) => {
+            // Later edits must neither reuse this actor nor wait for this dot.
+            if !reject_edit(context, *document_id, dot).await {
+                warn!(%document_id, "Could not record a refused offline edit");
+            }
+            PublishState::Failed {
+                reason: error.to_string(),
+                retryable: false,
+                document_id: Some(*document_id),
+            }
+        }
         Err(error) => publishing_retry(*document_id, claim.attempts, error.to_string()),
     }
 }

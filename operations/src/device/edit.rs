@@ -8,10 +8,14 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
+use aruna_core::events::StorageEvent;
+use aruna_core::keyspaces::METADATA_ACTOR_KEYSPACE;
 use aruna_core::metadata::{
-    MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
+    MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent,
 };
+use aruna_core::storage_entries::{metadata_actor_entry, metadata_actor_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::{TaskEvent, TaskKey};
 use craqle::ActorId;
@@ -38,16 +42,6 @@ pub enum DeviceEditError {
     QueueFull { limit: usize },
 }
 
-/// CRDT actor of one offline edit, unique per device and draft so two edits
-/// never claim the same dot even when the same document is edited twice.
-pub fn device_edit_actor(node_id: NodeId, draft_id: Ulid) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"aruna-device-edit-v1\0");
-    hasher.update(node_id.as_bytes());
-    hasher.update(&draft_id.to_bytes());
-    *hasher.finalize().as_bytes()
-}
-
 /// Applies one edit to the local replica and queues it for the realm.
 ///
 /// The holder merges the same craqle batch so both sides converge; the drain confirms the record.
@@ -66,12 +60,25 @@ pub async fn apply_local_edit(
     let authored = authored_source(mutation).ok_or_else(|| {
         DeviceEditError::Invalid("this mutation is not authored on a device".to_string())
     })?;
-    let draft_id = Ulid::generate();
-    let actor = device_edit_actor(node_id, draft_id);
-    let batch = plan_local(context, &record, &authored, actor).await?;
+    let _guard = crate::metadata::update_document::document_lock(record.document_id).await;
+    let current = read_actor(context, record.document_id).await?;
+    let mut draft_id = Ulid::generate();
+    if let Some(current) = &current
+        && draft_id <= current.last_event_id
+    {
+        draft_id = current
+            .last_event_id
+            .increment()
+            .map_err(|_| DeviceEditError::Unavailable)?;
+    }
+    let actor = MetadataActor::next(current.as_ref(), record.document_id, node_id, draft_id)
+        .ok_or(DeviceEditError::Unavailable)?;
+    let mut batch = plan_local(context, &record, &authored, (actor.actor, actor.counter)).await?;
+    // Holders never get refused dots, so a new edit must not wait for them.
+    actor.strip(&mut batch.base_clock);
     let entry = PublishEntry::edit(draft_id, owner, &record, batch.clone(), authored);
     drive(
-        EnqueueDraftOperation::new(EnqueueDraftInput { entry }),
+        EnqueueDraftOperation::new(EnqueueDraftInput { entry }).with_actor(actor),
         context.as_ref(),
     )
     .await
@@ -116,13 +123,77 @@ fn authored_source(mutation: UpdateDocumentMutation) -> Option<MetadataBatchSour
     }
 }
 
-/// Plans the submission under this edit's actor without changing the graph.
+/// Marks an edit the realm permanently refused, so later edits start a fresh actor and
+/// never depend on it. Returns whether the actor record was updated.
+pub(super) async fn reject_edit(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+    dot: ([u8; 32], u64),
+) -> bool {
+    let _guard = crate::metadata::update_document::document_lock(document_id).await;
+    let Ok(Some(mut current)) = read_actor(context, document_id).await else {
+        return false;
+    };
+    current.reject(dot.0, dot.1);
+    let Ok((key_space, key, value)) = metadata_actor_entry(&current) else {
+        return false;
+    };
+    matches!(
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            })
+            .await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    )
+}
+
+/// Whether an edit depends on one the realm permanently refused.
+pub(super) async fn refused_edit(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+    dot: ([u8; 32], u64),
+) -> bool {
+    read_actor(context, document_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|current| current.refused(dot.0, dot.1))
+}
+
+/// This device's CRDT actor for the document, if it edited the document before.
+async fn read_actor(
+    context: &Arc<DriverContext>,
+    document_id: Ulid,
+) -> Result<Option<MetadataActor>, DeviceEditError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_ACTOR_KEYSPACE.to_string(),
+            key: metadata_actor_key(document_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| postcard::from_bytes(&bytes).map_err(|_| DeviceEditError::Unavailable))
+            .transpose(),
+        _ => Err(DeviceEditError::Unavailable),
+    }
+}
+
+/// Plans the submission under this device's actor without changing the graph.
 async fn plan_local(
     context: &Arc<DriverContext>,
     record: &MetadataRegistryRecord,
     authored: &MetadataBatchSource,
-    actor: [u8; 32],
+    dot: ([u8; 32], u64),
 ) -> Result<MetadataBatch, DeviceEditError> {
+    let (actor, counter) = dot;
     let metadata = context
         .metadata_handle
         .as_ref()
@@ -131,6 +202,7 @@ async fn plan_local(
         .send_metadata_effect(MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
             actor,
+            counter,
             source: authored.clone(),
         })
         .await
@@ -269,7 +341,7 @@ pub fn accepts_edits(replica: &ReplicaRecord) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceEditError, apply_local_edit, device_edit_actor, replays_edit};
+    use super::{DeviceEditError, apply_local_edit, read_actor, replays_edit};
     use crate::device::publish_queue::{
         MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, PublishState, publish_entry,
     };
@@ -292,25 +364,6 @@ mod tests {
 
     fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    #[test]
-    fn separates_edit_actors() {
-        // Two edits must never claim the same dot, and the same edit must
-        // derive the same actor after a restart.
-        let draft = Ulid::generate();
-        assert_eq!(
-            device_edit_actor(node(1), draft),
-            device_edit_actor(node(1), draft)
-        );
-        assert_ne!(
-            device_edit_actor(node(1), draft),
-            device_edit_actor(node(2), draft)
-        );
-        assert_ne!(
-            device_edit_actor(node(1), draft),
-            device_edit_actor(node(1), Ulid::generate())
-        );
     }
 
     fn record() -> MetadataRegistryRecord {
@@ -353,9 +406,12 @@ mod tests {
         entry
     }
 
-    #[tokio::test]
-    async fn queue_preserves_graph() {
-        // Planning must not expose an edit that cannot enter the durable queue.
+    /// A device node whose replica already holds the document's graph.
+    async fn device() -> (
+        tempfile::TempDir,
+        Arc<DriverContext>,
+        MetadataRegistryRecord,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(
             dir.path().join("storage").to_str().expect("storage path"),
@@ -403,6 +459,65 @@ mod tests {
                 .await,
             Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         ));
+        (dir, context, record)
+    }
+
+    fn contact(name: &str) -> crate::metadata::update_document::UpdateDocumentMutation {
+        crate::metadata::update_document::UpdateDocumentMutation::UpsertContextualEntity {
+            jsonld: format!(r##"{{"@id":"#{name}","@type":"Person","name":"{name}"}}"##),
+        }
+    }
+
+    fn replica(record: &MetadataRegistryRecord) -> ReplicaRecord {
+        let mut replica = ReplicaRecord::new(
+            record.document_id,
+            record.group_id,
+            record.document_path.clone(),
+            ReplicaOrigin::Realm,
+        );
+        replica.record = Some(Box::new(record.clone()));
+        replica
+    }
+
+    #[tokio::test]
+    async fn edits_share_actor() {
+        // Reusing the device's actor keeps clocks small; its dots must stay ordered.
+        let (_dir, context, record) = device().await;
+        let owner = UserId::local(Ulid::generate(), record.realm_id);
+        for name in ["ada", "grace"] {
+            apply_local_edit(&context, owner, node(1), &replica(&record), contact(name))
+                .await
+                .expect("edit applies");
+        }
+        let batches: Vec<MetadataBatch> =
+            crate::device::sync_status::read_publish_entries(&context)
+                .await
+                .into_iter()
+                .filter_map(|entry| match entry.kind {
+                    PublishKind::Edit { batch, .. } => Some(*batch),
+                    PublishKind::Create => None,
+                })
+                .collect();
+        let [first, second] = batches.as_slice() else {
+            panic!("expected two queued edits, got {batches:?}");
+        };
+        assert_eq!((first.actor, first.counter), (second.actor, 1));
+        assert_eq!(second.counter, 2);
+        assert!(second.base_clock.contains(&craqle::Dot {
+            actor: craqle::ActorId::from_bytes(first.actor),
+            counter: 1,
+        }));
+        let stored = read_actor(&context, record.document_id)
+            .await
+            .expect("actor readable")
+            .expect("actor stored");
+        assert_eq!((stored.actor, stored.counter), (first.actor, 2));
+    }
+
+    #[tokio::test]
+    async fn queue_preserves_graph() {
+        // Planning must not expose an edit that cannot enter the durable queue.
+        let (_dir, context, record) = device().await;
         let owner = UserId::local(Ulid::generate(), record.realm_id);
         for _ in 0..MAX_PUBLISH_ENTRIES {
             let entry = PublishEntry::new(
@@ -455,6 +570,8 @@ mod tests {
                 limit: MAX_PUBLISH_ENTRIES
             })
         );
+        // The refused edit must not consume a dot either.
+        assert_eq!(read_actor(&context, record.document_id).await, Ok(None));
         assert_eq!(
             metadata
                 .export_rocrate_jsonld(record.graph_iri.clone())

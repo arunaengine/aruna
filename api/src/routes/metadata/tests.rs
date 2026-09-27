@@ -242,6 +242,7 @@ async fn public_routes_work() {
         Json(ReplaceRoCrateRequest {
             rocrate: serde_json::from_str(&paged_jsonld).unwrap(),
             public: Some(true),
+            expected_revision: None,
         }),
     )
     .await
@@ -1441,6 +1442,7 @@ async fn replacement_summary_withheld() {
         Json(ReplaceRoCrateRequest {
             rocrate: serde_json::from_str(&rocrate).unwrap(),
             public: Some(true),
+            expected_revision: None,
         }),
     )
     .await
@@ -2617,6 +2619,7 @@ async fn page_size_clamped() {
         Json(ReplaceRoCrateRequest {
             rocrate: serde_json::from_str(&rocrate).unwrap(),
             public: Some(true),
+            expected_revision: None,
         }),
     )
     .await

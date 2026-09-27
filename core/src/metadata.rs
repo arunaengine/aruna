@@ -204,6 +204,11 @@ pub enum MetadataEventPayload {
         batch: MetadataBatch,
         authored: MetadataBatchSource,
     },
+    /// Starts a new history window: raw budgets count events from here on. The graph
+    /// state it carries joins every holder's graph, so holders converge on it.
+    Checkpoint {
+        snapshot: Option<Box<GraphReplicaSnapshot>>,
+    },
 }
 
 /// The author's submission behind a planned batch.
@@ -240,6 +245,7 @@ impl MetadataEventPayload {
             Self::UpsertDataEntity { .. } => MetadataAuditOperation::UpsertDataEntity,
             Self::UpsertContextualEntity { .. } => MetadataAuditOperation::UpsertContextualEntity,
             Self::ApplyBatch { authored, .. } => authored.audit_operation(),
+            Self::Checkpoint { .. } => MetadataAuditOperation::Checkpoint,
         }
     }
 
@@ -250,6 +256,7 @@ impl MetadataEventPayload {
                 | Self::UpsertDataEntity { .. }
                 | Self::UpsertContextualEntity { .. }
                 | Self::ApplyBatch { .. }
+                | Self::Checkpoint { .. }
         )
     }
 
@@ -261,6 +268,7 @@ impl MetadataEventPayload {
             Self::UpsertDataEntity { .. } => "upsert_data_entity",
             Self::UpsertContextualEntity { .. } => "upsert_contextual_entity",
             Self::ApplyBatch { .. } => "apply_batch",
+            Self::Checkpoint { .. } => "checkpoint",
         }
     }
 }
@@ -305,6 +313,94 @@ pub struct RawOriginBudget {
     pub byte_limit: u64,
     pub events: u32,
     pub encoded_bytes: u64,
+}
+
+/// This node's CRDT actor for one document. Reusing it keeps vector clocks bounded by the
+/// number of writing nodes; the counter and last event id only ever grow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataActor {
+    pub document_id: Ulid,
+    pub actor: [u8; 32],
+    pub counter: u64,
+    pub last_event_id: Ulid,
+    /// Actors and the first counter the realm permanently refused; those dots never apply.
+    pub rejected: Vec<([u8; 32], u64)>,
+}
+
+impl MetadataActor {
+    /// The next dot after `current`. A node without one, whose storage was reset, or whose
+    /// actor had an edit refused starts a fresh actor, so it never repeats a dot.
+    pub fn next(
+        current: Option<&Self>,
+        document_id: Ulid,
+        node_id: NodeId,
+        event_id: Ulid,
+    ) -> Option<Self> {
+        let rejected = current.map_or_else(Vec::new, |current| current.rejected.clone());
+        match current {
+            Some(current)
+                if !current
+                    .rejected
+                    .iter()
+                    .any(|(actor, _)| *actor == current.actor) =>
+            {
+                Some(Self {
+                    document_id,
+                    actor: current.actor,
+                    counter: current.counter.checked_add(1)?,
+                    last_event_id: event_id,
+                    rejected,
+                })
+            }
+            _ => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"aruna-metadata-actor-v2\0");
+                hasher.update(node_id.as_bytes());
+                hasher.update(&document_id.to_bytes());
+                hasher.update(&event_id.to_bytes());
+                Some(Self {
+                    document_id,
+                    actor: *hasher.finalize().as_bytes(),
+                    counter: 1,
+                    last_event_id: event_id,
+                    rejected,
+                })
+            }
+        }
+    }
+
+    /// Records that the realm refused `(actor, counter)`; that dot and every later one of
+    /// the same actor can never apply anywhere.
+    pub fn reject(&mut self, actor: [u8; 32], counter: u64) {
+        match self.rejected.iter_mut().find(|(known, _)| *known == actor) {
+            Some((_, first)) => *first = (*first).min(counter),
+            None => self.rejected.push((actor, counter)),
+        }
+    }
+
+    /// Whether `(actor, counter)` depends on or is a refused dot.
+    pub fn refused(&self, actor: [u8; 32], counter: u64) -> bool {
+        self.rejected
+            .iter()
+            .any(|(known, first)| *known == actor && counter >= *first)
+    }
+
+    /// Removes refused dots from `clock`, so a new edit does not wait for them.
+    pub fn strip(&self, clock: &mut VectorClock) {
+        for (actor, first) in &self.rejected {
+            let key = craqle::ActorId::from_bytes(*actor);
+            if clock.0.get(&key).is_some_and(|seen| seen >= first) {
+                match first.checked_sub(1).filter(|kept| *kept > 0) {
+                    Some(kept) => {
+                        clock.0.insert(key, kept);
+                    }
+                    None => {
+                        clock.0.remove(&key);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub fn raw_quotas(
@@ -874,6 +970,12 @@ pub enum MetadataClockRelation {
     Concurrent,
 }
 
+/// A short version of a graph: it changes with every applied dot, also a late, older one.
+pub fn graph_version(clock: &VectorClock) -> String {
+    let bytes = postcard::to_allocvec(clock).unwrap_or_default();
+    hex::encode(blake3::hash(&bytes).as_bytes())
+}
+
 pub fn compare_metadata_clocks(local: &VectorClock, remote: &VectorClock) -> MetadataClockRelation {
     let mut local_ahead = false;
     let mut remote_ahead = false;
@@ -1043,8 +1145,18 @@ pub enum MetadataEffect {
     ContainsGraph {
         graph_iri: String,
     },
+    /// Whether the graph already applied dot `(actor, counter)`.
+    ContainsDot {
+        graph_iri: String,
+        actor: [u8; 32],
+        counter: u64,
+    },
     // Device replicas
     GraphSnapshot {
+        graph_iri: String,
+    },
+    /// Exports the graph together with the [`graph_version`] it was exported at.
+    ExportVersioned {
         graph_iri: String,
     },
     InstallSnapshot {
@@ -1052,11 +1164,12 @@ pub enum MetadataEffect {
         snapshot: Box<GraphReplicaSnapshot>,
     },
     // OR-Set metadata graphs
-    /// Change set `source` would commit against the local graph, published as a
-    /// batch under `actor`. Plans only: the graph is not mutated.
+    /// Plans `source` as dot `(actor, counter)` without changing the graph. A counter above
+    /// one depends on the actor's previous dot, so replicas apply one actor's batches in order.
     PlanBatch {
         graph_iri: String,
         actor: [u8; 32],
+        counter: u64,
         source: MetadataBatchSource,
     },
     MergeBatch {
@@ -1125,7 +1238,16 @@ pub enum MetadataEvent {
         graph_iri: String,
         exists: bool,
     },
+    ContainsDotResult {
+        graph_iri: String,
+        contains: bool,
+    },
     // Device replicas
+    VersionedExport {
+        graph_iri: String,
+        jsonld: String,
+        version: String,
+    },
     GraphSnapshotResult {
         graph_iri: String,
         snapshot: Box<GraphReplicaSnapshot>,
@@ -1177,6 +1299,9 @@ pub enum MetadataError {
     Storage(#[from] StorageError),
     #[error("metadata backend error: {0}")]
     Backend(String),
+    /// A batch depends on events this replica has not merged yet; it applies once they arrive.
+    #[error("metadata causal dependencies missing: {0}")]
+    MissingDependencies(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1736,5 +1861,52 @@ mod tests {
             decoded.findings[0].profile_revision,
             Some(revision.to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::*;
+
+    #[test]
+    fn actors_stay_distinct() {
+        let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let document = Ulid::from(1);
+        let first = MetadataActor::next(None, document, node, Ulid::from(10)).expect("first");
+        assert_eq!(first.counter, 1);
+        let second =
+            MetadataActor::next(Some(&first), document, node, Ulid::from(11)).expect("next");
+        assert_eq!((second.actor, second.counter), (first.actor, 2));
+        // A node that lost its record must not reuse the old actor's dots.
+        let reset = MetadataActor::next(None, document, node, Ulid::from(12)).expect("reset");
+        assert_ne!(reset.actor, first.actor);
+        let other = MetadataActor::next(None, Ulid::from(2), node, Ulid::from(10)).expect("other");
+        assert_ne!(other.actor, first.actor);
+    }
+
+    #[test]
+    fn refused_actor_retires() {
+        let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let document = Ulid::from(1);
+        let first = MetadataActor::next(None, document, node, Ulid::from(5)).expect("first");
+        let mut second =
+            MetadataActor::next(Some(&first), document, node, Ulid::from(6)).expect("second");
+        second.reject(first.actor, 2);
+        assert!(second.refused(first.actor, 2) && second.refused(first.actor, 3));
+        assert!(!second.refused(first.actor, 1));
+        let fresh =
+            MetadataActor::next(Some(&second), document, node, Ulid::from(7)).expect("fresh");
+        assert_ne!(fresh.actor, first.actor);
+        assert_eq!(fresh.counter, 1);
+        assert_eq!(fresh.rejected, vec![(first.actor, 2)]);
+        let mut clock = VectorClock::default();
+        clock.advance(craqle::ActorId::from_bytes(first.actor), 3);
+        clock.advance(craqle::ActorId::from_bytes([9; 32]), 4);
+        fresh.strip(&mut clock);
+        assert_eq!(
+            clock.0.get(&craqle::ActorId::from_bytes(first.actor)),
+            Some(&1)
+        );
+        assert_eq!(clock.0.get(&craqle::ActorId::from_bytes([9; 32])), Some(&4));
     }
 }

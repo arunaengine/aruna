@@ -60,6 +60,12 @@ impl DocumentSyncService {
             )
             .await;
         }
+        if let DocumentTarget::GitRecord { .. } = target {
+            // Git records only arrive through the reconcile loop, which validates them.
+            return Err(NetError::Bootstrap(
+                "Git records must be applied through document reconcile".to_string(),
+            ));
+        }
         if let DocumentTarget::MetadataDocumentLifecycle { document_id } = target {
             let record: MetadataLifecycleRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -280,6 +286,10 @@ impl DocumentSyncService {
             return Ok(());
         }
         if let DocumentTarget::MetadataDocumentLifecycle { .. } = target {
+            return Ok(());
+        }
+        // Git records are immutable history; checkpoints supersede them instead.
+        if let DocumentTarget::GitRecord { .. } = target {
             return Ok(());
         }
         // A minted PID is a permanent identity: the row is never removed, only

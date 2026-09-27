@@ -562,6 +562,9 @@ fn materialization_effect(event: &MetadataEventRecord) -> Effect {
                 batch: batch.clone(),
             })
         }
+        MetadataEventPayload::Checkpoint { .. } => {
+            unreachable!("recovery fixtures contain no checkpoints")
+        }
     }
 }
 

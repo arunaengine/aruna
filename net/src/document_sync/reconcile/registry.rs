@@ -741,7 +741,10 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
     let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: record.document_id(),
     };
-    if lifecycle_stale_txn(storage, &target, change, txn_id).await? {
+    // One lifecycle target carries every event: an older concurrent upsert still belongs in
+    // the event log, but never moves the lifecycle revision back.
+    let stale = lifecycle_stale_txn(storage, &target, change, txn_id).await?;
+    if stale && !matches!(record, MetadataLifecycleRecord::Upsert { .. }) {
         return Ok(None);
     }
     let mut acceptance_to_write = None;
@@ -784,6 +787,19 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
         }
     }
 
+    if let MetadataLifecycleRecord::Upsert { event } = record
+        && stale
+        && transaction_read(
+            storage,
+            aruna_core::keyspaces::EVENT_LOG_KEYSPACE.to_string(),
+            aruna_core::storage_entries::event_log_key(event.record.document_id, event.event_id),
+            Some(txn_id),
+        )
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
     let mut entries = match record {
         MetadataLifecycleRecord::Upsert { event } => create_projection_entries(event)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -794,6 +810,9 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
             create_acceptance_entry(event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?,
         );
+    }
+    if stale {
+        return Ok(Some(entries));
     }
     entries.push(
         sync_revision_entry(&target, change)

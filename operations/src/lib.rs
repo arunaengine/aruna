@@ -17,6 +17,7 @@ pub mod driver;
 pub(crate) mod effect_adapters;
 pub(crate) mod endpoint_screening;
 pub mod forward;
+pub mod git;
 pub mod groups;
 pub mod harvest;
 pub mod jobs;

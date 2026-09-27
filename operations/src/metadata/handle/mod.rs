@@ -254,6 +254,7 @@ impl From<MetadataSearchStorage> for SearchStorage {
 }
 
 struct MetadataInner {
+    git: std::sync::OnceLock<Arc<aruna_blob::git::GitStore>>,
     node: Arc<CraqleNode>,
     storage_handle: StorageHandle,
     auth_validation: AuthValidationState,
@@ -478,6 +479,7 @@ impl MetadataHandle {
         });
         Ok(Self {
             inner: Arc::new(MetadataInner {
+                git: std::sync::OnceLock::new(),
                 node: Arc::new(node),
                 auth_validation: AuthValidationState::new(
                     storage_handle.clone(),
@@ -511,6 +513,17 @@ impl MetadataHandle {
             inner: self.inner.clone(),
             storage_priority: StoragePriority::Bulk,
         }
+    }
+
+    pub fn install_git(
+        &self,
+        store: Arc<aruna_blob::git::GitStore>,
+    ) -> Arc<aruna_blob::git::GitStore> {
+        self.inner.git.get_or_init(|| store).clone()
+    }
+
+    pub fn git(&self) -> Option<&aruna_blob::git::GitStore> {
+        self.inner.git.get().map(Arc::as_ref)
     }
 
     fn lifecycle_storage(&self) -> StorageHandle {

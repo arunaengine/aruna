@@ -37,6 +37,7 @@ async fn plan_entity(
         .send_metadata_effect(MetadataEffect::PlanBatch {
             graph_iri: graph_iri.to_string(),
             actor: [actor; 32],
+            counter: 1,
             source: MetadataBatchSource::UpsertContextualEntity {
                 jsonld: format!(r##"{{"@id":"#{name}","@type":"Person","name":"{name}"}}"##),
             },
@@ -90,6 +91,7 @@ async fn plan_needs_graph() {
         .send_metadata_effect(MetadataEffect::PlanBatch {
             graph_iri: "urn:test:orset:absent".to_string(),
             actor: [7u8; 32],
+            counter: 1,
             source: MetadataBatchSource::UpsertDataEntity {
                 jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#.to_string(),
             },

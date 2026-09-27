@@ -739,7 +739,7 @@ async fn load_bucket(
     }
 }
 
-fn upload_body_stream(
+pub(crate) fn upload_body_stream(
     body: Body,
     deadline: Instant,
 ) -> BackendStream<Result<Bytes, aruna_core::stream::StreamError>> {

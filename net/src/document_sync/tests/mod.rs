@@ -45,6 +45,7 @@ use tempfile::TempDir;
 
 mod admin_validation;
 mod fanout;
+mod git;
 mod group_targets;
 mod lifecycle;
 mod links;
