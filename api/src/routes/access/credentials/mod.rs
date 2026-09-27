@@ -152,6 +152,15 @@ impl DelegationScope {
         path_within(&self.root, root)
     }
 
+    /// Whether every path of `other` lies in this scope.
+    fn contains(&self, other: &Self) -> bool {
+        if self.recursive {
+            path_within(&other.root, &self.root)
+        } else {
+            !other.recursive && other.root == self.root
+        }
+    }
+
     fn intersect_group_root(&self, group_root: &str) -> Option<Self> {
         if path_within(&self.root, group_root) {
             return Some(self.clone());
@@ -537,6 +546,11 @@ pub(crate) async fn build_credential_restrictions(
 ) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
     let auth_restrictions = normalize_auth_restrictions(auth, root)?;
     let requested_restrictions = normalize_requested_restrictions(requested_restrictions, root)?;
+    if let (Some(parent), Some(requested)) = (&auth_restrictions, &requested_restrictions)
+        && !contained(parent, requested)
+    {
+        return Err(ServerError::Forbidden);
+    }
 
     validate_requested_restrictions(auth, state, requested_restrictions.as_deref()).await?;
 
@@ -635,6 +649,24 @@ async fn validate_requested_restrictions(
     }
 
     Ok(())
+}
+
+/// Requested allows replace the inherited ones, so each must lie inside one of them; a point
+/// permission check cannot show that a whole subtree is covered.
+fn contained(parent: &[NormalizedRestriction], requested: &[NormalizedRestriction]) -> bool {
+    requested
+        .iter()
+        .filter(|scope| scope.permission != Permission::DENY)
+        .all(|scope| {
+            parent.iter().any(|allowed| {
+                let permitted = match allowed.permission {
+                    Permission::WRITE => true,
+                    Permission::READ => scope.permission == Permission::READ,
+                    Permission::DENY => false,
+                };
+                permitted && allowed.scope.contains(&scope.scope)
+            })
+        })
 }
 
 fn merge_effective_restrictions(
