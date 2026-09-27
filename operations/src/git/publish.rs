@@ -13,6 +13,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::git::{GitChange, GitRecord, MAX_RECORDS, git_record_entry, record_change};
 use aruna_core::handle::Handle;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
@@ -29,7 +30,17 @@ pub async fn holders(
     let config = load_realm_config(context, document.realm_id)
         .await
         .ok_or(GitError::Unavailable)?;
-    let holders = resolve_shard_holders(&config, &document.placement);
+    holders_in(&config, node, document)
+}
+
+/// The holders in `config`; a write takes its fence from the same config, so a cutover
+/// between two reads cannot pair an old holder check with the new generation.
+fn holders_in(
+    config: &RealmConfigDocument,
+    node: NodeId,
+    document: &MetadataRegistryRecord,
+) -> Result<Vec<NodeId>, GitError> {
+    let holders = resolve_shard_holders(config, &document.placement);
     if !holders.contains(&node) {
         return Err(GitError::NotHolder);
     }
@@ -63,7 +74,6 @@ pub async fn publish_with(
     change: GitChange,
     extra: Vec<(String, byteview::ByteView, byteview::ByteView)>,
 ) -> Result<GitRecord, GitError> {
-    let peers = holders(context, document).await?;
     let config = load_realm_config(context, document.realm_id)
         .await
         .ok_or(GitError::Unavailable)?;
@@ -72,6 +82,7 @@ pub async fn publish_with(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or(GitError::Unavailable)?;
+    let peers = holders_in(&config, node_id, document)?;
     let existing = records::scan(context, document.document_id).await?;
     if !matches!(change, GitChange::Checkpoint(_)) && uncovered(&existing).len() >= MAX_RECORDS {
         return Err(GitError::Full);
