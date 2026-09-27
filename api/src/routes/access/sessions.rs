@@ -93,7 +93,7 @@ fn parse_session_kind(kind: &str) -> ServerResult<SessionKind> {
     }
 }
 
-fn map_create_error(error: CreateSessionError) -> ServerError {
+pub(crate) fn map_create_error(error: CreateSessionError) -> ServerError {
     match error {
         CreateSessionError::InvalidExpiry => {
             ServerError::BadRequestReason("session expiry is invalid".to_string())
@@ -109,7 +109,7 @@ fn map_create_error(error: CreateSessionError) -> ServerError {
 }
 
 /// The caller's own restrictions, narrowed to the requested scopes when any are given.
-async fn session_restrictions(
+pub(crate) async fn session_restrictions(
     state: &ServerState,
     auth: &AuthContext,
     requested: Option<Vec<CreatePathRestriction>>,

@@ -5,6 +5,7 @@
 pub mod credentials;
 pub mod group_join;
 pub mod groups;
+pub mod service_accounts;
 pub mod sessions;
 pub mod tokens;
 pub mod users;

@@ -81,6 +81,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(notifications::router())
         .merge(policies::router())
         .merge(search::router())
+        .merge(access::service_accounts::router())
         .merge(access::sessions::router())
         .merge(execution::tes::router())
         .merge(access::tokens::router())
@@ -285,6 +286,7 @@ pub(crate) mod tests {
         ("GET", "/data/groups/{group_id}/storage/routing"),
         ("GET", "/access/groups/{id}"),
         ("GET", "/access/groups/{id}/data/paths"),
+        ("GET", "/access/groups/{id}/service-accounts"),
         ("GET", "/access/groups/{id}/members"),
         ("GET", "/access/groups/{id}/usage"),
         ("PATCH", "/access/groups/{id}"),
@@ -387,6 +389,11 @@ pub(crate) mod tests {
         ),
         ("POST", "/access/groups/{id}/leave"),
         ("POST", "/access/groups/{id}/members"),
+        ("POST", "/access/groups/{id}/service-accounts"),
+        (
+            "POST",
+            "/access/groups/{id}/service-accounts/{account_id}/tokens",
+        ),
         ("POST", "/access/groups/{id}/roles"),
         ("POST", "/compute/jobs"),
         ("POST", "/compute/jobs/{job_id}/cancel"),
