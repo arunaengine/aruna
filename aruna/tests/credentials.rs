@@ -13,9 +13,9 @@ use aruna_core::structs::storage::blob::group_permission_path;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use reqwest::StatusCode;
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_restricted_credentials,
-    create_s3_credentials, get_user_access, s3_client, sign_scoped_token, spawn_complete_seed,
-    spawn_seed_node,
+    TestResult, create_bearer_token, create_group_http, create_s3_credentials, get_user_access,
+    request_credentials, s3_client, sign_scoped_token, spawn_complete_seed, spawn_seed_node,
+    wait_group_http,
 };
 
 fn create_request_restriction(pattern: String, permission: Permission) -> CreatePathRestriction {
@@ -77,8 +77,10 @@ async fn scoped_auth_inherits() -> TestResult<()> {
         }],
     )?;
 
+    wait_group_http(&seed.base_url, &admin_token, &group.group_id).await?;
+
     let credentials =
-        create_restricted_credentials(&seed.base_url, &scoped_token, &group.group_id, None).await?;
+        request_credentials(&seed.base_url, &scoped_token, &group.group_id, None).await?;
     let access = get_user_access(seed.context.as_ref(), &credentials.access_key_id).await?;
 
     assert_eq!(
@@ -117,7 +119,9 @@ async fn narrower_scope_stored() -> TestResult<()> {
         }],
     )?;
 
-    let credentials = create_restricted_credentials(
+    wait_group_http(&seed.base_url, &admin_token, &group.group_id).await?;
+
+    let credentials = request_credentials(
         &seed.base_url,
         &scoped_token,
         &group.group_id,
@@ -206,7 +210,9 @@ async fn readonly_scope_stored() -> TestResult<()> {
         }],
     )?;
 
-    let credentials = create_restricted_credentials(
+    wait_group_http(&seed.base_url, &admin_token, &group.group_id).await?;
+
+    let credentials = request_credentials(
         &seed.base_url,
         &scoped_token,
         &group.group_id,
@@ -301,8 +307,10 @@ async fn scoped_list_denies() -> TestResult<()> {
             permission: Permission::WRITE,
         }],
     )?;
+    wait_group_http(&seed.base_url, &admin_token, &group.group_id).await?;
+
     let credentials =
-        create_restricted_credentials(&seed.base_url, &scoped_token, &group.group_id, None).await?;
+        request_credentials(&seed.base_url, &scoped_token, &group.group_id, None).await?;
     let client = s3_client(s3_endpoint, &credentials);
 
     let blocked_list = client.list_objects_v2().bucket("blocked").send().await;

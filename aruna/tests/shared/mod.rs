@@ -440,7 +440,16 @@ pub(crate) async fn create_restricted_credentials(
     path_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> TestResult<S3Credentials> {
     wait_group_http(base_url, bearer_token, group_id).await?;
+    request_credentials(base_url, bearer_token, group_id, path_restrictions).await
+}
 
+/// Requests credentials without the group wait, for path-restricted tokens the group route refuses.
+pub(crate) async fn request_credentials(
+    base_url: &str,
+    bearer_token: &str,
+    group_id: &str,
+    path_restrictions: Option<Vec<CreatePathRestriction>>,
+) -> TestResult<S3Credentials> {
     let client = reqwest::Client::new();
     let deadline = Instant::now() + WAIT_CAP;
     let mut interval = Duration::from_millis(100);
