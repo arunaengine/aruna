@@ -1,10 +1,12 @@
-//! Validates received ARC and LFS content, then merges main into metadata before refs move.
+//! Validates received ARC, RO-Crate and LFS content, then merges main into metadata before
+//! refs move.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::push::{PushRequest, encode};
 use aruna_blob::git::command;
 use aruna_core::git::{LfsObject, RefUpdate, ZERO_OID, refs_clash};
+use aruna_core::repo_layout::Layout;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -81,7 +83,6 @@ pub async fn validate() -> std::io::Result<()> {
             return Err(invalid());
         }
     }
-    let arc = std::env::var("ARUNA_GIT_ARC").as_deref() == Ok("1");
     let mut objects = Vec::new();
     for revision in revisions {
         let entries = command(directory, &["ls-tree", "-rlz", &revision]).await?;
@@ -132,15 +133,14 @@ pub async fn validate() -> std::io::Result<()> {
                 }
             }
         }
-        if arc {
+        if Layout::detect(paths.iter().map(String::as_str)) == Layout::RoCrate {
+            aruna_blob::rocrate::check(directory, &revision).await?;
+        } else {
             let converted = aruna_blob::arc::export(directory, &revision).await?;
             if let Some(error) = converted["error"].as_str() {
                 return Err(std::io::Error::other(error.to_string()));
             }
             if converted.get("rocrate").is_none() {
-                return Err(invalid());
-            }
-            if !paths.contains("isa.investigation.xlsx") {
                 return Err(invalid());
             }
             let workbook = command(
@@ -169,6 +169,12 @@ pub async fn validate() -> std::io::Result<()> {
             }
         }
     }
+    for update in &updates {
+        let moves = update.old != ZERO_OID && update.new != ZERO_OID;
+        if moves && update.name.starts_with("refs/heads/") {
+            aruna_blob::rocrate::kept(directory, &update.old, &update.new).await?;
+        }
+    }
     let url = std::env::var("ARUNA_GIT_LFS_URL").map_err(|_| invalid())?;
     let token = std::env::var("ARUNA_GIT_TOKEN").map_err(|_| invalid())?;
     objects.sort_by(|left, right| left.oid.cmp(&right.oid));
@@ -195,7 +201,7 @@ pub async fn validate() -> std::io::Result<()> {
     unlocked(&url, &paths, &token).await?;
     // The node applies pushed metadata after it recorded the push; checking here keeps a
     // push whose metadata cannot merge from being accepted at all.
-    if arc && let Some((old, new)) = main {
+    if let Some((old, new)) = main {
         mergeable(directory, &old, &new, &token).await?;
     }
     publish(directory, updates, objects, paths, &token).await
@@ -368,7 +374,8 @@ async fn publish(
     .map(|_| ())
 }
 
-/// Checks that the ISA and `aruna-metadata.json` edits on main merge into the document.
+/// Checks that the metadata edits on main, ISA and `aruna-metadata.json` for an ARC or
+/// `ro-crate-metadata.json` for a plain RO-Crate, merge into the document.
 async fn mergeable(directory: &Path, old: &str, new: &str, token: &str) -> std::io::Result<()> {
     let url = std::env::var("ARUNA_GIT_METADATA_URL").map_err(|_| invalid())?;
     let fetch = async |path: &str| -> std::io::Result<Value> {

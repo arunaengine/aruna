@@ -30,7 +30,6 @@ pub struct GitRepository {
     pub document_id: Ulid,
     pub group_id: Ulid,
     pub bucket: String,
-    pub arc: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

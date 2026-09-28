@@ -215,11 +215,7 @@ impl GitStore {
                     .env("ARUNA_GIT_TOKEN", request.token)
                     .env("ARUNA_GIT_LFS_URL", request.lfs_url)
                     .env("ARUNA_GIT_METADATA_URL", request.metadata_url)
-                    .env("ARUNA_GIT_PUSH_KEY", request.push_key)
-                    .env(
-                        "ARUNA_GIT_ARC",
-                        if request.repository.arc { "1" } else { "0" },
-                    );
+                    .env("ARUNA_GIT_PUSH_KEY", request.push_key);
                 let output = exchange(process, request.body, true).await?;
                 let boundary = output
                     .windows(4)

@@ -62,7 +62,7 @@ pub async fn accept(
     request: PushRequest,
     pack: Bytes,
 ) -> Result<GitRecord, GitError> {
-    let (document, repository) = super::repository(context, auth, id, Permission::WRITE).await?;
+    let (document, _) = super::repository(context, auth, id, Permission::WRITE).await?;
     if !super::push_key_valid(id, key) {
         return Err(GitError::NotHook);
     }
@@ -116,7 +116,6 @@ pub async fn accept(
         .refs
         .iter()
         .find(|update| update.name == "refs/heads/main" && update.new != ZERO_OID)
-        .filter(|_| repository.arc)
         .map(|update| PendingMerge {
             user_id: auth.user_id,
             old: update.old.clone(),

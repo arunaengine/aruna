@@ -126,7 +126,6 @@ pub async fn repository(
         document_id: id,
         group_id: document.group_id,
         bucket: format!("arc-{}", document.group_id.to_string().to_lowercase()),
-        arc: true,
     };
     Ok((document, repository))
 }
