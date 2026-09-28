@@ -83,6 +83,7 @@ async fn apply_one(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or(GitError::Unavailable)?;
+    let mut files = super::dataset::target(context, store, document, merge).await?;
     for _ in 0..8 {
         let exported = metadata
             .send_metadata_effect(MetadataEffect::ExportVersioned {
@@ -102,13 +103,24 @@ async fn apply_one(
             document_id: document.document_id,
             old: (merge.old != ZERO_OID).then(|| merge.old.clone()),
             new: merge.new.clone(),
-            graph: jsonld,
+            graph: jsonld.clone(),
+            location: files.as_ref().map(|files| files.location().clone()),
         };
-        let jsonld = match execute(store, effect, merge.user_id).await? {
-            GitEvent::MetadataMerged(Ok(Some(jsonld))) => jsonld,
-            GitEvent::MetadataMerged(Ok(None)) => return Ok(()),
+        let merged = match execute(store, effect, merge.user_id).await? {
+            GitEvent::MetadataMerged(Ok(merged)) => merged,
             GitEvent::MetadataMerged(Err(error)) => return Err(GitError::Refused(error)),
             _ => return Err(GitError::Unavailable),
+        };
+        // Pushed files are stored and named by content even when no metadata changed.
+        let stored = match files.as_mut() {
+            Some(files) => {
+                let graph = merged.as_deref().unwrap_or(&jsonld);
+                Box::pin(files.apply(context, store, document, merge, graph)).await?
+            }
+            None => None,
+        };
+        let Some(jsonld) = stored.or(merged) else {
+            return Ok(());
         };
         let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: Actor {
