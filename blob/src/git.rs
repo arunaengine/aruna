@@ -150,6 +150,9 @@ impl GitStore {
                 }
             }
             GitEffect::Initialize(_) => {
+                if configured(&repository, &self.helper).await {
+                    return Ok(GitEvent::Initialized);
+                }
                 tokio::fs::create_dir_all(&self.root).await?;
                 let root = tokio::fs::canonicalize(&self.root).await?;
                 command(
@@ -180,23 +183,14 @@ impl GitStore {
                 }
                 #[cfg(not(unix))]
                 return Err(std::io::Error::other("native Git hosting requires Unix"));
-                for (key, value) in [
-                    (
-                        "core.hooksPath",
-                        hooks
-                            .to_str()
-                            .ok_or_else(|| std::io::Error::other("invalid hook path"))?,
-                    ),
-                    ("http.receivepack", "true"),
-                    ("http.getanyfile", "false"),
-                    ("receive.fsckObjects", "true"),
-                    ("receive.denyNonFastForwards", "true"),
-                    ("core.logAllRefUpdates", "true"),
-                    ("core.fsync", "committed"),
-                ] {
+                let hooks = hooks
+                    .to_str()
+                    .ok_or_else(|| std::io::Error::other("invalid hook path"))?;
+                for (key, value) in settings(hooks) {
                     command(&repository, &["config", key, value]).await?;
                 }
                 tokio::fs::write(repository.join("git-daemon-export-ok"), []).await?;
+                tokio::fs::write(repository.join(SETTINGS), applied(hooks)).await?;
                 Ok(GitEvent::Initialized)
             }
             GitEffect::Http(request) => {
@@ -258,6 +252,48 @@ impl GitStore {
             }
         }
     }
+}
+
+/// Records the settings last applied, so a configured repository needs no Git process.
+const SETTINGS: &str = "aruna-settings";
+
+fn settings(hooks: &str) -> [(&'static str, &str); 7] {
+    [
+        ("core.hooksPath", hooks),
+        ("http.receivepack", "true"),
+        ("http.getanyfile", "false"),
+        ("receive.fsckObjects", "true"),
+        ("receive.denyNonFastForwards", "true"),
+        ("core.logAllRefUpdates", "true"),
+        ("core.fsync", "committed"),
+    ]
+}
+
+fn applied(hooks: &str) -> String {
+    settings(hooks)
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .concat()
+}
+
+/// Whether an earlier setup with the current settings and receive hook is still in place.
+async fn configured(repository: &Path, helper: &Path) -> bool {
+    let Ok(hooks) = tokio::fs::canonicalize(repository.join("hooks")).await else {
+        return false;
+    };
+    let Some(path) = hooks.to_str() else {
+        return false;
+    };
+    for name in ["HEAD", "config", "objects", "refs", "git-daemon-export-ok"] {
+        if tokio::fs::metadata(repository.join(name)).await.is_err() {
+            return false;
+        }
+    }
+    tokio::fs::read_link(hooks.join("pre-receive"))
+        .await
+        .is_ok_and(|link| link == helper)
+        && tokio::fs::read_to_string(repository.join(SETTINGS))
+            .await
+            .is_ok_and(|text| text == applied(path))
 }
 
 pub async fn command(directory: &Path, args: &[&str]) -> std::io::Result<Bytes> {
@@ -417,5 +453,53 @@ mod tests {
             result.as_ref(),
             b"d670460b4b4aece5915caf5c68d12f560a9fe3e4\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_runs_once() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let helper = directory.path().join("helper");
+        let store = GitStore::new(directory.path().join("git"), helper);
+        let id = ulid::Ulid::from(7);
+        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let repository = directory.path().join("git").join(format!("{id}.git"));
+        let config = || async {
+            tokio::fs::metadata(repository.join("config"))
+                .await
+                .expect("config exists")
+                .ino()
+        };
+        store
+            .execute(GitEffect::Initialize(id), actor)
+            .await
+            .expect("repository is set up");
+        let first = config().await;
+        store
+            .execute(GitEffect::Initialize(id), actor)
+            .await
+            .expect("configured repository is accepted");
+        // Git rewrites the config file on every change, so an unchanged file ran no setup.
+        assert_eq!(config().await, first);
+
+        tokio::fs::write(repository.join(SETTINGS), "core.fsync=none\n")
+            .await
+            .expect("older settings");
+        store
+            .execute(GitEffect::Initialize(id), actor)
+            .await
+            .expect("changed settings are applied");
+        assert_ne!(config().await, first);
+
+        tokio::fs::remove_file(repository.join("HEAD"))
+            .await
+            .expect("broken repository");
+        store
+            .execute(GitEffect::Initialize(id), actor)
+            .await
+            .expect("broken repository is repaired");
+        assert!(repository.join("HEAD").exists());
+        assert!(configured(&repository, &directory.path().join("helper")).await);
     }
 }
