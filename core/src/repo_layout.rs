@@ -259,6 +259,46 @@ pub fn git_copy(document: &mut Value, paths: &BTreeMap<String, String>) {
     rename_ids(document, &renamed);
 }
 
+/// The one stable text of a metadata file: two-space indentation, a trailing newline, keys
+/// sorted with `@` keys first, and the descriptor, the root, then entities by `@id`. So one
+/// changed value is a small line diff.
+pub fn metadata_text(document: &Value) -> Vec<u8> {
+    fn sorted(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut keys: Vec<&String> = object.keys().collect();
+                keys.sort();
+                let mut map = serde_json::Map::new();
+                for key in keys {
+                    map.insert(key.clone(), sorted(&object[key]));
+                }
+                Value::Object(map)
+            }
+            Value::Array(values) => Value::Array(values.iter().map(sorted).collect()),
+            value => value.clone(),
+        }
+    }
+    let mut value = sorted(document);
+    let root = root_id(document);
+    if let Some(graph) = value.get_mut("@graph").and_then(Value::as_array_mut) {
+        let rank = |entity: &Value| {
+            let id = entity["@id"].as_str();
+            let place = if id == Some(CRATE_FILE) {
+                0
+            } else if root.is_some() && id == root.as_deref() {
+                1
+            } else {
+                2
+            };
+            (place, id.map(str::to_owned), entity.to_string())
+        };
+        graph.sort_by_cached_key(rank);
+    }
+    let mut text = serde_json::to_vec_pretty(&value).unwrap_or_default();
+    text.push(b'\n');
+    text
+}
+
 /// Replaces every `@id` value found in `renamed`, in entities and in references alike.
 fn rename_ids(value: &mut Value, renamed: &BTreeMap<String, String>) {
     match value {
@@ -533,6 +573,31 @@ mod tests {
             crate_value["@graph"][1]["hasPart"],
             json!([{"@id": "data/a%20b.csv"}])
         );
+    }
+
+    #[test]
+    fn stable_metadata_text() {
+        let person = json!({"name": "Ada", "@type": "Person", "@id": "#ada"});
+        let mut first = document(json!([]), vec![person]);
+        first["@graph"][1]["variableMeasured"] = json!(["depth"]);
+        let mut shuffled = first.clone();
+        shuffled["@graph"].as_array_mut().unwrap().reverse();
+        let text = metadata_text(&first);
+        assert_eq!(text, metadata_text(&shuffled));
+        assert!(text.ends_with(b"}\n"));
+        let lines = String::from_utf8(text).unwrap();
+        assert!(lines.starts_with("{\n  \"@context\""));
+        let ada = lines.find("\"@id\": \"#ada\"").unwrap();
+        assert!(lines.find("\"@id\": \"./\"").unwrap() < ada);
+        assert!(ada < lines[ada..].find("\"name\"").unwrap() + ada);
+        // One added value changes a few lines, not the whole file.
+        let mut second = first.clone();
+        second["@graph"][1]["variableMeasured"] = json!(["depth", "stuff"]);
+        let after = String::from_utf8(metadata_text(&second)).unwrap();
+        let before: BTreeSet<&str> = lines.lines().collect();
+        let added = after.lines().filter(|line| !before.contains(line)).count();
+        assert!(added <= 2, "{added} lines changed");
+        assert_eq!(after.lines().count(), lines.lines().count() + 1);
     }
 
     #[test]

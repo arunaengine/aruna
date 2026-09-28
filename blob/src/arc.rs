@@ -4,7 +4,9 @@
 
 use crate::git::{command, exchange};
 use aruna_core::git::{GitSnapshot, LfsObject, LinkedObject, MAX_GIT_BYTES, MergeOutcome, Refs};
-use aruna_core::repo_layout::{ARUNA_FILE, CRATE_FILE, INVESTIGATION, Layout, metadata_layout};
+use aruna_core::repo_layout::{
+    ARUNA_FILE, CRATE_FILE, INVESTIGATION, Layout, metadata_layout, metadata_text,
+};
 use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -310,6 +312,12 @@ async fn arc_files(
             .decode(content.as_str().ok_or_else(|| failed("invalid ARC file"))?)
             .map_err(std::io::Error::other)?;
         files.insert(path.clone(), ("100644".into(), data));
+    }
+    for path in [CRATE_FILE, ARUNA_FILE] {
+        if let Some((_, data)) = files.get_mut(path) {
+            let value: Value = serde_json::from_slice(data)?;
+            *data = metadata_text(&value);
+        }
     }
     let mut total: usize = files.values().map(|(_, data)| data.len()).sum();
     for path in conversion["required"].as_array().into_iter().flatten() {

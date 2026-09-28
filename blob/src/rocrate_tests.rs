@@ -337,6 +337,36 @@ async fn switches_arc_main() {
 }
 
 #[tokio::test]
+async fn small_snapshot_diffs() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path();
+    git(path, &["init", "-q", "--initial-branch=main"]).await;
+    let mut value = listed();
+    value["@graph"][1]["variableMeasured"] = json!(["depth"]);
+    let (first, _) = crate::arc::generate(path, snapshot(value.to_string()), &Refs::new())
+        .await
+        .expect("generate runs")
+        .expect("snapshot");
+    value["@graph"][1]["variableMeasured"] = json!(["depth", "stuff"]);
+    let refs = Refs::from([
+        ("refs/heads/main".to_string(), first.clone()),
+        ("refs/heads/aruna".to_string(), first.clone()),
+    ]);
+    let (second, _) = crate::arc::generate(path, snapshot(value.to_string()), &refs)
+        .await
+        .expect("generate runs")
+        .expect("snapshot");
+    let stat = git(path, &["diff", "--numstat", &first, &second]).await;
+    let counts: Vec<&str> = stat.split_whitespace().collect();
+    let [added, deleted, file] = counts[..] else {
+        panic!("one changed file expected: {stat}");
+    };
+    assert_eq!(file, CRATE_FILE);
+    let lines = added.parse::<u32>().unwrap() + deleted.parse::<u32>().unwrap();
+    assert!(lines <= 3, "{stat}");
+}
+
+#[tokio::test]
 async fn reports_main_layout() {
     let root = tempfile::tempdir().expect("temporary directory");
     let id = Ulid::from(9);

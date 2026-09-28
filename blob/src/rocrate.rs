@@ -217,8 +217,7 @@ pub fn files(jsonld: &str, objects: &[LinkedObject]) -> std::io::Result<(Files, 
         .map(|(entity, (path, _))| (entity.clone(), path.clone()))
         .collect();
     repo_layout::git_copy(&mut value, &renamed);
-    let mut text = serde_json::to_vec_pretty(&value)?;
-    text.push(b'\n');
+    let text = repo_layout::metadata_text(&value);
     let mut files = Files::new();
     files.insert(CRATE_FILE.into(), ("100644".into(), text));
     let (mut pointers, mut attributes) = (Pointers::new(), String::new());
