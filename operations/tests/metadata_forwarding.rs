@@ -515,6 +515,7 @@ async fn forwarded_invalid_terminal() -> Result<(), Box<dyn std::error::Error>> 
         },
         None,
         Some(realm.bearer_token()),
+        None,
     )
     .await
     .expect_err("invalid forwarded update must fail");

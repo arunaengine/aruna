@@ -39,6 +39,35 @@ use std::collections::HashMap;
 use ulid::Ulid;
 use url::form_urlencoded::Serializer;
 
+/// Longest commit message a metadata write accepts, in bytes.
+pub(crate) const MAX_COMMIT_MESSAGE: usize = 4096;
+
+/// Trims a commit message; an empty one means none. Refuses control characters other than
+/// line breaks and tabs, and messages over [`MAX_COMMIT_MESSAGE`] bytes.
+pub(crate) fn commit_message(message: Option<String>) -> ServerResult<Option<String>> {
+    let Some(message) = message
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return Ok(None);
+    };
+    if message.len() > MAX_COMMIT_MESSAGE {
+        return Err(ServerError::BadRequestMessage(format!(
+            "message exceeds {MAX_COMMIT_MESSAGE} bytes"
+        )));
+    }
+    if message
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(ServerError::BadRequestMessage(
+            "message must be plain text without control characters".into(),
+        ));
+    }
+    Ok(Some(message.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_create_metadata(
     state: &ServerState,
@@ -49,6 +78,7 @@ pub(crate) async fn run_create_metadata(
     path: String,
     public: bool,
     payload: CreateDocumentPayload,
+    message: Option<String>,
 ) -> ServerResult<MetadataRegistryRecord> {
     let ctx = state.get_ctx();
     create_metadata_authorized(
@@ -62,6 +92,7 @@ pub(crate) async fn run_create_metadata(
         path,
         public,
         payload,
+        message,
     )
     .await
     .map_err(|error| match error {

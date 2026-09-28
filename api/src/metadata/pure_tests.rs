@@ -179,3 +179,45 @@ fn export_refuses_destination() {
     let request = serde_json::from_value::<SubmitExportRequest>(plain).unwrap();
     assert!(request.destination.is_none());
 }
+
+#[test]
+fn validates_commit_message() {
+    assert_eq!(commit_message(None).unwrap(), None);
+    assert_eq!(commit_message(Some(" \n\t ".into())).unwrap(), None);
+    assert_eq!(
+        commit_message(Some("  Add run 42\n\nNew LC-MS data \n".into())).unwrap(),
+        Some("Add run 42\n\nNew LC-MS data".into())
+    );
+    let longest = "a".repeat(MAX_COMMIT_MESSAGE);
+    assert_eq!(
+        commit_message(Some(longest.clone())).unwrap(),
+        Some(longest)
+    );
+    for refused in [
+        "a".repeat(MAX_COMMIT_MESSAGE + 1),
+        "Add\0run".into(),
+        "Add\u{1b}[31m".into(),
+    ] {
+        assert!(matches!(
+            commit_message(Some(refused)),
+            Err(ServerError::BadRequestMessage(_))
+        ));
+    }
+}
+
+#[test]
+fn create_accepts_message() {
+    let request: CreateMetadataRequest = serde_json::from_value(json!({
+        "group_id": "01JABCDEF0123456789ABCDEFG",
+        "path": "datasets/run-42",
+        "name": "Run 42",
+        "description": "LC-MS run",
+        "date_published": "2026-04-09",
+        "message": "Add run 42"
+    }))
+    .unwrap();
+    let CreateMetadataRequest::Scaffold(request) = request else {
+        panic!("scaffold fields select the scaffold form");
+    };
+    assert_eq!(request.message.as_deref(), Some("Add run 42"));
+}

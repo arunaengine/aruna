@@ -6,8 +6,8 @@ use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
-    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, crate_entities,
-    ensure_readable_files, forwarded_auth_token, local_write_record, map_api_error,
+    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, commit_message,
+    crate_entities, ensure_readable_files, forwarded_auth_token, local_write_record, map_api_error,
     map_write_error, parse_document_id, run_create_metadata, run_document_list,
     serialize_jsonld_object,
 };
@@ -43,8 +43,12 @@ a holder that re-runs both checks under the caller's own token.
   or present on every replica yet, so a follow-up read can answer 404 or 503 for a moment.
 - A write that can neither be applied locally nor delivered to a holder is refused rather than
   accepted.
+- The optional `message` becomes the Git commit message of the document's ARC snapshot for this
+  revision. The `Aruna-Revision` trailer is always added, and lines starting with `Aruna-` are
+  dropped from the message. Without a message the snapshot keeps the default message.
 
-**Limits**: the document path is normalized before use and must not be empty."#,
+**Limits**: the document path is normalized before use and must not be empty. `message` is plain
+text of at most 4096 bytes after trimming; an empty message counts as none."#,
     request_body(
         content = CreateMetadataRequest,
         description = "Scaffold fields or a full RO-Crate JSON-LD object. Scaffold creation emits RO-Crate 1.3; the RO-Crate form accepts 1.2 and 1.3 contexts and specification IRIs and preserves the submitted version. Both forms reject unknown fields.",
@@ -59,7 +63,8 @@ a holder that re-runs both checks under the caller's own token.
                         "description": "Metadata record for LC-MS run 42",
                         "date_published": "2026-04-09",
                         "license": "https://creativecommons.org/licenses/by/4.0/",
-                        "public": true
+                        "public": true,
+                        "message": "Add LC-MS run 42"
                     })
                 )
             ),
@@ -117,7 +122,7 @@ a holder that re-runs both checks under the caller's own token.
                 )
             )
         ),
-        (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a non-object RO-Crate, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
+        (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path or the new document's path", body = ErrorResponse),
         (status = 409, description = "Concurrent create conflict; the create was not accepted and may be retried", body = ErrorResponse),
@@ -132,6 +137,10 @@ pub async fn create_metadata_document(
     Json(request): Json<CreateMetadataRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
+    let message = commit_message(match &request {
+        CreateMetadataRequest::Scaffold(request) => request.message.clone(),
+        CreateMetadataRequest::RoCrate(request) => request.message.clone(),
+    })?;
     let (group_id, path, public, payload) = match request {
         CreateMetadataRequest::Scaffold(request) => (
             parse_group_id(&request.group_id)?,
@@ -165,6 +174,7 @@ pub async fn create_metadata_document(
         path,
         public,
         payload,
+        message,
     )
     .await?;
 

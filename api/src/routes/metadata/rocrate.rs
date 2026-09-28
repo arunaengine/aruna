@@ -9,9 +9,9 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
     JsonLdObject, MetadataDocumentSummary, MetadataRoCrateResponse, MetadataRoCrateView,
     ReplaceRoCrateRequest, RoCrateExportParams, SubmitExportRequest, SubmitExportResponse,
-    crate_entities, ensure_readable_files, forwarded_auth_token, load_document_record,
-    local_write_record, map_api_error, map_export_response, map_export_view, map_write_error,
-    parse_document_id, serialize_jsonld_object,
+    commit_message, crate_entities, ensure_readable_files, forwarded_auth_token,
+    load_document_record, local_write_record, map_api_error, map_export_response, map_export_view,
+    map_write_error, parse_document_id, serialize_jsonld_object,
 };
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
 use crate::routes::repository::links::{
@@ -418,8 +418,15 @@ caller's own token.
 - The submitted crate replaces the stored one wholesale, so any entity omitted from it is
   dropped.
 - Omitting `public` leaves the current visibility unchanged.
+- The optional `message` becomes the Git commit message of the document's ARC snapshot for this
+  revision. The `Aruna-Revision` trailer is always added, and lines starting with `Aruna-` are
+  dropped from the message. Without a message the snapshot keeps the default message; earlier
+  snapshots keep their messages.
 - Acceptance is durable but asynchronous: the revision may not be materialized, queryable,
-  searchable or present on every replica yet."#,
+  searchable or present on every replica yet.
+
+**Limits**: `message` is plain text of at most 4096 bytes after trimming; an empty message counts
+as none."#,
     params(("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list")),
     request_body(
         content = ReplaceRoCrateRequest,
@@ -430,6 +437,7 @@ caller's own token.
                     summary = "Replace entire RO-Crate",
                     value = json!({
                         "public": true,
+                        "message": "Update the dataset description",
                         "rocrate": {
                             "@context": "https://w3id.org/ro/crate/1.2/context",
                             "@graph": [
@@ -477,7 +485,7 @@ caller's own token.
                 )
             )
         ),
-        (status = 400, description = "Malformed body, a document id that is not a structured metadata id, a non-object RO-Crate, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
+        (status = 400, description = "Malformed body, a document id that is not a structured metadata id, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token, or a holder rejected the forwarded credential", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
         (status = 404, description = "No holder knows this document", body = ErrorResponse),
@@ -495,6 +503,7 @@ pub async fn replace_metadata_rocrate(
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
+    let message = commit_message(request.message)?;
     ensure_readable_files(&state, &auth, &crate_entities(&request.rocrate)).await?;
     let ctx = state.get_ctx();
     let record =
@@ -520,6 +529,7 @@ pub async fn replace_metadata_rocrate(
         },
         expected_revision,
         forwarded_auth_token(bearer_token)?,
+        message,
     )
     .await
     .map_err(map_write_error)?;
@@ -629,6 +639,7 @@ pub async fn add_data_entity(
         },
         None,
         forwarded_auth_token(bearer_token)?,
+        None,
     )
     .await
     .map_err(map_write_error)?;
@@ -735,6 +746,7 @@ pub async fn add_contextual_entity(
         },
         None,
         forwarded_auth_token(bearer_token)?,
+        None,
     )
     .await
     .map_err(map_write_error)?;

@@ -385,6 +385,7 @@ impl McpServer {
             input.path,
             input.public.unwrap_or(false),
             CreateDocumentPayload::RoCrate { jsonld },
+            None,
         )
         .await
         .map_err(|error| match error {
@@ -434,6 +435,7 @@ impl McpServer {
             UpdateDocumentMutation::ReplaceRoCrate { jsonld },
             None,
             crate::metadata::forwarded_auth_token(request_bearer(&parts)).map_err(server_error)?,
+            None,
         )
         .await
         .map_err(crate::metadata::map_write_error)
@@ -1206,6 +1208,7 @@ mod authorization_tests {
             CreateDocumentPayload::RoCrate {
                 jsonld: serde_json::to_string(&draft_crate("MCP authorization fixture")).unwrap(),
             },
+            None,
         )
         .await
         .expect("owner can seed a private document");

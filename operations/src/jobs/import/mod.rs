@@ -1232,6 +1232,7 @@ async fn update_document(
             UpdateDocumentMutation::ReplaceRoCrate { jsonld },
             Some(base),
             Some(AuthToken::internal(spec.auth_context.clone())),
+            None,
         ))
         .await
         {

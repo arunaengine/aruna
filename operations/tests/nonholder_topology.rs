@@ -1107,6 +1107,7 @@ async fn update_routed(
                 },
                 None,
                 Some(realm.bearer_token()),
+                None,
             )
             .await
             {

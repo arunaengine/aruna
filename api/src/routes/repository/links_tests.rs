@@ -55,6 +55,7 @@ pub(crate) async fn setup_crate(root: serde_json::Value, endpoint: &str) -> Link
                     root
                 ]
             }),
+            message: None,
         })),
     )
     .await

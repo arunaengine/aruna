@@ -111,6 +111,8 @@ pub enum MetadataTransportMessage {
         document_path: String,
         public: bool,
         payload: CreateDocumentPayload,
+        /// The author's commit message for the document's ARC snapshot.
+        commit_message: Option<String>,
     },
     ForwardUpdateDocument {
         auth_token: Option<AuthToken>,
@@ -122,6 +124,7 @@ pub enum MetadataTransportMessage {
         mutation: UpdateDocumentMutation,
         /// The holder refuses the update when the document moved past this event.
         expected_revision: Option<Ulid>,
+        commit_message: Option<String>,
     },
     ForwardDeleteDocument {
         auth_token: Option<AuthToken>,
@@ -901,6 +904,7 @@ mod tests {
             payload: CreateDocumentPayload::RoCrate {
                 jsonld: "{}".to_string(),
             },
+            commit_message: None,
         });
         assert_auth_token(MetadataTransportMessage::ForwardUpdateDocument {
             auth_token: Some(AuthToken::bearer("update-token").unwrap()),
@@ -911,6 +915,7 @@ mod tests {
                 jsonld: "{}".to_string(),
             },
             expected_revision: None,
+            commit_message: None,
         });
         assert_auth_token(MetadataTransportMessage::ForwardDeleteDocument {
             auth_token: Some(AuthToken::bearer("delete-token").unwrap()),
@@ -968,6 +973,7 @@ mod tests {
                 date_published: "2026-01-01".to_string(),
                 license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             },
+            commit_message: Some("Add run 42".to_string()),
         };
         let bytes = postcard::to_allocvec(&message).unwrap();
 

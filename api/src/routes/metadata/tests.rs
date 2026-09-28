@@ -139,6 +139,7 @@ async fn public_routes_work() {
             date_published: "2026-01-01".to_string(),
             license: None,
             public: true,
+            message: None,
         })),
     )
     .await
@@ -243,6 +244,7 @@ async fn public_routes_work() {
             rocrate: serde_json::from_str(&paged_jsonld).unwrap(),
             public: Some(true),
             expected_revision: None,
+            message: None,
         }),
     )
     .await
@@ -568,6 +570,7 @@ async fn portal_searches_description() {
                     }
                 ]
             }),
+            message: None,
         })),
     )
     .await
@@ -636,6 +639,7 @@ async fn rocrate_routes_work() {
                     }
                 ]
             }),
+            message: None,
         })),
     )
     .await
@@ -713,6 +717,7 @@ async fn list_uses_registry() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -771,6 +776,7 @@ async fn tombstone_hides_listing() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -880,6 +886,7 @@ async fn private_metadata_hidden() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: false,
+            message: None,
         })),
     )
     .await
@@ -926,6 +933,7 @@ async fn hides_document_existence() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: false,
+            message: None,
         })),
     )
     .await
@@ -1299,6 +1307,7 @@ async fn pending_export_unavailable() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -1356,6 +1365,7 @@ async fn pending_summary_tolerated() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -1408,6 +1418,7 @@ async fn replacement_summary_withheld() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -1443,6 +1454,7 @@ async fn replacement_summary_withheld() {
             rocrate: serde_json::from_str(&rocrate).unwrap(),
             public: Some(true),
             expected_revision: None,
+            message: None,
         }),
     )
     .await
@@ -1616,6 +1628,7 @@ async fn local_partition_executes() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -1668,6 +1681,7 @@ async fn query_applies_visibility() {
                 date_published: "2026-01-01".to_string(),
                 license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public,
+                message: None,
             })),
         )
         .await
@@ -1854,6 +1868,7 @@ async fn user_writes_forward() {
             date_published: "2026-01-01".to_string(),
             license: None,
             public: false,
+            message: None,
         })),
     )
     .await;
@@ -1889,6 +1904,7 @@ async fn user_writes_forward() {
             date_published: "2026-01-01".to_string(),
             license: None,
             public: false,
+            message: None,
         })),
     )
     .await;
@@ -1921,6 +1937,7 @@ async fn user_writes_forward() {
             date_published: "2026-01-01".to_string(),
             license: None,
             public: false,
+            message: None,
         })),
     )
     .await
@@ -1987,6 +2004,7 @@ async fn missing_config_fails() {
             date_published: "2026-01-01".to_string(),
             license: None,
             public: false,
+            message: None,
         })),
     )
     .await;
@@ -2338,6 +2356,7 @@ async fn discovery_failure_partial() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -2394,6 +2413,7 @@ async fn invalid_cursor_rejected() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -2485,6 +2505,7 @@ async fn cursor_suppresses_churn() {
                 date_published: "2026-01-01".to_string(),
                 license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public: true,
+                message: None,
             })),
         )
         .await
@@ -2527,6 +2548,7 @@ async fn cursor_suppresses_churn() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -2589,6 +2611,7 @@ async fn page_size_clamped() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -2620,6 +2643,7 @@ async fn page_size_clamped() {
             rocrate: serde_json::from_str(&rocrate).unwrap(),
             public: Some(true),
             expected_revision: None,
+            message: None,
         }),
     )
     .await
@@ -2833,6 +2857,7 @@ async fn search_tolerates_pending() {
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
         })),
     )
     .await
@@ -3207,6 +3232,7 @@ async fn create_linking_doc(
             path: path.to_string(),
             public,
             rocrate,
+            message: None,
         })),
     )
     .await
@@ -3815,6 +3841,7 @@ async fn create_test_document(
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public,
+            message: None,
         })),
     )
     .await
@@ -4247,6 +4274,7 @@ mod authorization {
             date_published: "2026-01-01".to_string(),
             license: None,
             public,
+            message: None,
         })
     }
 
@@ -4408,6 +4436,7 @@ async fn lookup_hides_private() {
             date_published: "2026-01-01".to_string(),
             license: None,
             public: false,
+            message: None,
         })),
     )
     .await

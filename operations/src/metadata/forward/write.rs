@@ -89,6 +89,7 @@ pub async fn route_metadata_create(
     auth_token: Option<AuthToken>,
 ) -> Result<CreateDocumentResult, MetadataWriteError> {
     let config = operation.config().clone();
+    let commit_message = operation.message().map(str::to_owned);
     match create_metadata_document(operation, context.clone()).await {
         Err(CreateDocumentError::HoldsNoBucket) => {}
         Ok(created) => return Ok(created),
@@ -136,6 +137,7 @@ pub async fn route_metadata_create(
             document_path: config.document_path.clone(),
             public: config.public,
             payload: config.payload.clone(),
+            commit_message,
         },
         None,
         false,
@@ -193,6 +195,7 @@ pub async fn create_metadata_authorized(
     path: String,
     public: bool,
     payload: CreateDocumentPayload,
+    commit_message: Option<String>,
 ) -> Result<MetadataRegistryRecord, CreateAuthorizedError> {
     let path = MetadataRegistryRecord::normalize_document_path(&path);
     if path.is_empty() {
@@ -241,7 +244,8 @@ pub async fn create_metadata_authorized(
             document_path: path,
             public,
             payload,
-        }),
+        })
+        .with_message(commit_message),
         context.clone(),
         auth_token,
     )
@@ -275,6 +279,7 @@ pub async fn route_metadata_update(
     mutation: UpdateDocumentMutation,
     expected_revision: Option<Ulid>,
     auth_token: Option<AuthToken>,
+    commit_message: Option<String>,
 ) -> Result<MetadataRegistryRecord, MetadataWriteError> {
     let config = load_realm_config(context, actor.realm_id)
         .await
@@ -331,7 +336,8 @@ pub async fn route_metadata_update(
                 public: public.unwrap_or(record.public),
                 mutation: mutation.clone(),
                 expected_revision,
-            }),
+            })
+            .with_message(commit_message.clone()),
             context.as_ref(),
         )
         .await
@@ -351,6 +357,7 @@ pub async fn route_metadata_update(
             public,
             mutation,
             expected_revision,
+            commit_message,
         },
         local_holds.then_some(local_node_id),
         local_capacity,
@@ -681,6 +688,7 @@ pub(crate) async fn apply_forwarded_write(
             document_path,
             public,
             payload,
+            commit_message,
             ..
         } => {
             Box::pin(async {
@@ -715,7 +723,8 @@ pub(crate) async fn apply_forwarded_write(
                     Ok(None) => {}
                     Err(error) => return reject(error),
                 }
-                let operation = CreateDocumentOperation::new_forwarded(create_config.clone());
+                let operation = CreateDocumentOperation::new_forwarded(create_config.clone())
+                    .with_message(commit_message);
                 match create_metadata_document(operation, context.clone()).await {
                     Ok(created) => MetadataTransportMessage::ForwardedRecord {
                         record: Box::new(created.record),
@@ -744,6 +753,7 @@ pub(crate) async fn apply_forwarded_write(
             public,
             mutation,
             expected_revision,
+            commit_message,
             ..
         } => {
             Box::pin(async {
@@ -774,7 +784,8 @@ pub(crate) async fn apply_forwarded_write(
                     public: public.unwrap_or(record.public),
                     mutation,
                     expected_revision,
-                });
+                })
+                .with_message(commit_message);
                 match update_metadata_document(operation, context.as_ref()).await {
                     Ok(record) => MetadataTransportMessage::ForwardedRecord {
                         record: Box::new(record),
