@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::project::{Projection, author, lock, project};
+use super::project::{Projection, author, forget, lock, project, recent, remember};
 use super::versions::plain;
 use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
@@ -16,7 +16,7 @@ use crate::s3::object::get::{GetObjectInput, get_object_info};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CHECKPOINT_AFTER, GitChange, GitCheckpoint, GitEffect, GitEvent, GitSnapshot, GitStatus,
-    LinkedObject, RefUpdate, STATUS, StoredObject, ZERO_OID,
+    LinkedObject, PENDING, PendingMerge, RefUpdate, STATUS, StoredObject, ZERO_OID,
 };
 use aruna_core::keyspaces::{
     COMMIT_MESSAGE_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
@@ -404,7 +404,20 @@ pub async fn refresh(
     store: &GitStore,
     document: &MetadataRegistryRecord,
 ) -> Result<Projection, GitError> {
-    update(context, store, document, None, false).await
+    let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
+    if let Some(projection) = recent(context, document, overdue).await? {
+        return Ok(projection);
+    }
+    let projection = update(context, store, document, None, false).await?;
+    // Pushed metadata that still waits must be retried by the next refresh.
+    let prefix = document.document_id.to_bytes().to_vec();
+    if records::prefixed::<PendingMerge>(context, PENDING, prefix)
+        .await
+        .is_ok_and(|rows| rows.is_empty())
+    {
+        remember(document, overdue, &projection);
+    }
+    Ok(projection)
 }
 
 async fn update(
@@ -462,6 +475,7 @@ pub async fn capture(
         return Ok(());
     };
     let _guard = lock(record.document_id).await;
+    forget(record.document_id);
     match update(context, store, record, revision, true).await {
         Ok(_) | Err(GitError::NotHolder) => Ok(()),
         Err(error) => Err(error),

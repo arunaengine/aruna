@@ -134,6 +134,7 @@ pub async fn publish_with(
     writes.push(outbox_write_entry(&outbox).map_err(|_| GitError::Invalid)?);
     writes.extend(extra);
     records::commit(context, writes, &fence).await?;
+    super::project::forget(record.document_id);
     if let Some(tasks) = context.task_handle.as_ref() {
         // The record is durable; a missed wake-up only delays replication to the next drain.
         let _ = tasks.send_effect(schedule_drain_effect()).await;

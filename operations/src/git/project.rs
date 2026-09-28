@@ -11,8 +11,10 @@ use aruna_core::UserId;
 use aruna_core::git::{DocumentLocks, GitChange, GitEffect, GitEvent, GitRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use lru::LruCache;
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
+use std::num::NonZeroUsize;
+use std::sync::{LazyLock, Mutex};
 use tokio::sync::OwnedMutexGuard;
 use ulid::Ulid;
 
@@ -33,10 +35,88 @@ pub fn served(document_id: Ulid) -> Option<BTreeMap<String, String>> {
     SERVED.lock().ok()?.get(&document_id).cloned()
 }
 
+#[derive(Clone)]
 pub struct Projection {
     pub state: GitState,
     pub records: Vec<GitRecord>,
     pub holders: Vec<NodeId>,
+}
+
+/// Documents whose last refresh and ancestry answers this node keeps; older ones drop first.
+const REMEMBERED: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+/// More kept ancestry answers than this for one document are dropped instead.
+const MAX_ANSWERS: usize = 4096;
+
+/// The document's last event, its update time and whether other holders may generate yet.
+type Inputs = (Ulid, u64, bool);
+
+type Recent = Mutex<LruCache<Ulid, (Inputs, Projection)>>;
+static RECENT: LazyLock<Recent> = LazyLock::new(|| Mutex::new(LruCache::new(REMEMBERED)));
+
+/// Answers that a commit is an ancestor never change, so later projections reuse them.
+static ANSWERS: LazyLock<Mutex<LruCache<Ulid, Ancestry>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(REMEMBERED)));
+
+fn inputs(document: &MetadataRegistryRecord, overdue: bool) -> Inputs {
+    (document.last_event_id, document.updated_at_ms, overdue)
+}
+
+/// The projection of the last refresh, if the document, its holders and all its records,
+/// replicated ones included, are unchanged since then.
+pub async fn recent(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    overdue: bool,
+) -> Result<Option<Projection>, GitError> {
+    let Some(projection) = remembered(document, overdue) else {
+        return Ok(None);
+    };
+    let holders = publish::holders(context, document).await?;
+    let records = records::scan(context, document.document_id).await?;
+    Ok((holders == projection.holders && records == projection.records).then_some(projection))
+}
+
+fn remembered(document: &MetadataRegistryRecord, overdue: bool) -> Option<Projection> {
+    let mut recent = RECENT.lock().ok()?;
+    let (known, projection) = recent.get(&document.document_id)?;
+    (*known == inputs(document, overdue)).then(|| projection.clone())
+}
+
+pub fn remember(document: &MetadataRegistryRecord, overdue: bool, projection: &Projection) {
+    if let Ok(mut recent) = RECENT.lock() {
+        let entry = (inputs(document, overdue), projection.clone());
+        recent.put(document.document_id, entry);
+    }
+}
+
+/// Drops the remembered refresh, so the next one projects again.
+pub fn forget(document_id: Ulid) {
+    if let Ok(mut recent) = RECENT.lock() {
+        recent.pop(&document_id);
+    }
+}
+
+fn answered(document_id: Ulid) -> Ancestry {
+    ANSWERS
+        .lock()
+        .ok()
+        .and_then(|mut known| known.get(&document_id).cloned())
+        .unwrap_or_default()
+}
+
+fn learn(document_id: Ulid, ancestry: &Ancestry) {
+    let answers: Ancestry = ancestry
+        .iter()
+        .filter(|(_, answer)| **answer)
+        .map(|(pair, answer)| (pair.clone(), *answer))
+        .collect();
+    if let Ok(mut known) = ANSWERS.lock() {
+        if answers.len() > MAX_ANSWERS {
+            known.pop(&document_id);
+        } else {
+            known.put(document_id, answers);
+        }
+    }
 }
 
 /// Remote holders serve a pack to the user who stored it.
@@ -96,7 +176,10 @@ pub async fn project(
         };
         execute(store, effect, actor).await?;
     }
-    let mut ancestry = Ancestry::new();
+    let mut ancestry = answered(id);
+    if !ancestry.is_empty() {
+        (state, needs) = reduce(&records, &ancestry);
+    }
     // Each round answers every pair the previous one needed, so few rounds suffice.
     for _ in 0..64 {
         if needs.is_empty() {
@@ -109,6 +192,7 @@ pub async fn project(
                 target: state.refs.clone(),
             };
             execute(store, effect, actor).await?;
+            learn(id, &ancestry);
             if let Ok(mut served) = SERVED.lock() {
                 served.insert(id, state.refs.clone());
             }
@@ -129,4 +213,73 @@ pub async fn project(
         (state, needs) = reduce(&records, &ancestry);
     }
     Err(GitError::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::record::PlacementRef;
+
+    fn document() -> MetadataRegistryRecord {
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let document_id = Ulid::generate();
+        MetadataRegistryRecord {
+            realm_id,
+            group_id: Ulid::from_parts(7, 1),
+            document_id,
+            document_path: "datasets/cached".into(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: false,
+            permission_path: String::new(),
+            placement: PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            establishing_event_id: Ulid::from(1),
+            last_event_id: Ulid::from(1),
+        }
+    }
+
+    #[test]
+    fn inputs_decide_reuse() {
+        let document = document();
+        let mut projection = Projection {
+            state: GitState::default(),
+            records: Vec::new(),
+            holders: Vec::new(),
+        };
+        projection
+            .state
+            .refs
+            .insert("refs/heads/main".into(), "a".repeat(40));
+        remember(&document, false, &projection);
+        let reused = remembered(&document, false).expect("unchanged inputs reuse");
+        assert_eq!(reused.state, projection.state);
+        // Other holders may generate once the revision is overdue, so that refreshes again.
+        assert!(remembered(&document, true).is_none());
+        let edited = MetadataRegistryRecord {
+            last_event_id: Ulid::from(2),
+            updated_at_ms: 2,
+            ..document.clone()
+        };
+        assert!(remembered(&edited, false).is_none());
+        forget(document.document_id);
+        assert!(remembered(&document, false).is_none());
+    }
+
+    #[test]
+    fn keeps_true_answers() {
+        let id = Ulid::generate();
+        let pair = |first: char, second: char| (first.to_string(), second.to_string());
+        let ancestry = Ancestry::from([(pair('a', 'b'), true), (pair('b', 'c'), false)]);
+        learn(id, &ancestry);
+        // A missing commit answers false until its pack arrives, so false is asked again.
+        assert_eq!(answered(id), Ancestry::from([(pair('a', 'b'), true)]));
+        let many = (0..=MAX_ANSWERS)
+            .map(|index| ((index.to_string(), "x".into()), true))
+            .collect();
+        learn(id, &many);
+        assert!(answered(id).is_empty());
+    }
 }
