@@ -215,6 +215,16 @@ pub enum GitEffect {
         first: String,
         second: String,
     },
+    /// The commit each revision names, in order; `None` for one that names no commit.
+    Peel {
+        document_id: Ulid,
+        revisions: Vec<String>,
+    },
+    /// The commits the revisions name, without their history; one entry per distinct commit.
+    Commits {
+        document_id: Ulid,
+        revisions: Vec<String>,
+    },
     /// Up to `limit` commits reachable from `revision` but not from `exclude`, newest first,
     /// after skipping `skip`.
     Log {
@@ -273,6 +283,7 @@ pub enum GitEvent {
     GenerateFailed(String),
     Exported(Bytes),
     Resolved(Option<String>),
+    Peeled(Vec<Option<String>>),
     Log(Vec<CommitInfo>),
     Diff(Vec<FileChange>),
     /// The new commit, the unchanged head, or why the metadata cannot become an ARC.

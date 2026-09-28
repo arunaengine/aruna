@@ -43,6 +43,8 @@ impl GitStore {
             }
             GitEffect::Import { document_id, .. }
             | GitEffect::Resolve { document_id, .. }
+            | GitEffect::Peel { document_id, .. }
+            | GitEffect::Commits { document_id, .. }
             | GitEffect::MergeBase { document_id, .. }
             | GitEffect::Log { document_id, .. }
             | GitEffect::Diff { document_id, .. }
@@ -67,6 +69,12 @@ impl GitStore {
             GitEffect::Resolve { revision, .. } => Ok(GitEvent::Resolved(
                 crate::repo::resolve(&repository, &revision).await,
             )),
+            GitEffect::Peel { revisions, .. } => crate::repo::peel(&repository, &revisions)
+                .await
+                .map(GitEvent::Peeled),
+            GitEffect::Commits { revisions, .. } => crate::repo::commits(&repository, &revisions)
+                .await
+                .map(GitEvent::Log),
             GitEffect::MergeBase { first, second, .. } => Ok(GitEvent::Resolved(
                 crate::repo::merge_base(&repository, &first, &second).await,
             )),

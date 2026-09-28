@@ -17,6 +17,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use tokio::sync::OwnedMutexGuard;
 use ulid::Ulid;
 
@@ -105,6 +106,46 @@ pub(super) async fn resolve(
     match execute(store, effect, auth.user_id).await? {
         GitEvent::Resolved(Some(commit)) => Ok(commit),
         GitEvent::Resolved(None) => Err(GitError::NotFound),
+        _ => Err(GitError::Unavailable),
+    }
+}
+
+/// The commit each revision names, in order, read with one Git call.
+async fn peel(
+    store: &GitStore,
+    auth: &AuthContext,
+    id: Ulid,
+    revisions: Vec<String>,
+) -> Result<Vec<String>, GitError> {
+    let effect = GitEffect::Peel {
+        document_id: id,
+        revisions,
+    };
+    match execute(store, effect, auth.user_id).await? {
+        GitEvent::Peeled(commits) => commits
+            .into_iter()
+            .collect::<Option<_>>()
+            .ok_or(GitError::NotFound),
+        _ => Err(GitError::Unavailable),
+    }
+}
+
+/// The commits themselves by id, read with one Git call.
+async fn commits(
+    store: &GitStore,
+    auth: &AuthContext,
+    id: Ulid,
+    revisions: Vec<String>,
+) -> Result<BTreeMap<String, CommitInfo>, GitError> {
+    let effect = GitEffect::Commits {
+        document_id: id,
+        revisions,
+    };
+    match execute(store, effect, auth.user_id).await? {
+        GitEvent::Log(commits) => Ok(commits
+            .into_iter()
+            .map(|commit| (commit.commit.clone(), commit))
+            .collect()),
         _ => Err(GitError::Unavailable),
     }
 }
@@ -218,17 +259,21 @@ pub(super) async fn peeled_tags(
     id: Ulid,
     projection: &Projection,
 ) -> Result<Vec<Named>, GitError> {
-    let mut tags = Vec::new();
-    for name in projection.state.refs.keys() {
-        if let Some(short) = name.strip_prefix("refs/tags/") {
-            let version = resolve(store, auth, id, name).await?;
-            tags.push(Named {
-                name: short.to_string(),
-                version,
-            });
-        }
-    }
-    Ok(tags)
+    let (names, targets): (Vec<_>, Vec<_>) = projection
+        .state
+        .refs
+        .iter()
+        .filter_map(|(name, target)| Some((name.strip_prefix("refs/tags/")?, target.clone())))
+        .unzip();
+    let versions = peel(store, auth, id, targets).await?;
+    Ok(names
+        .into_iter()
+        .zip(versions)
+        .map(|(name, version)| Named {
+            name: name.to_string(),
+            version,
+        })
+        .collect())
 }
 
 pub(super) fn version(commit: CommitInfo, state: &GitState, tags: &[Named]) -> Version {
@@ -368,17 +413,21 @@ pub async fn branches(
 ) -> Result<Vec<(String, Version)>, GitError> {
     let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
-    let mut heads = Vec::new();
-    for (name, target) in &projection.state.refs {
-        if let Some(short) = name.strip_prefix("refs/heads/") {
-            let info = log(store, auth, id, (target, None), 0, 1)
-                .await?
-                .pop()
-                .ok_or(GitError::Unavailable)?;
-            heads.push((short.to_string(), version(info, &projection.state, &tags)));
-        }
-    }
-    Ok(heads)
+    let heads: Vec<_> = projection
+        .state
+        .refs
+        .iter()
+        .filter_map(|(name, target)| Some((name.strip_prefix("refs/heads/")?, target)))
+        .collect();
+    let targets = heads.iter().map(|(_, target)| (*target).clone()).collect();
+    let infos = commits(store, auth, id, targets).await?;
+    heads
+        .into_iter()
+        .map(|(short, target)| {
+            let info = infos.get(target).cloned().ok_or(GitError::Unavailable)?;
+            Ok((short.to_string(), version(info, &projection.state, &tags)))
+        })
+        .collect()
 }
 
 /// Every tag with the commit it names.
@@ -489,18 +538,25 @@ pub async fn conflicts(
 ) -> Result<Vec<(Conflict, Version)>, GitError> {
     let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
-    let mut kept = Vec::new();
-    for (name, target) in &projection.state.refs {
-        if let Some(conflict) = parse_conflict(name, target) {
-            let commit = resolve(store, auth, id, target).await?;
-            let info = log(store, auth, id, (&commit, None), 0, 1)
-                .await?
-                .pop()
-                .ok_or(GitError::Unavailable)?;
-            kept.push((conflict, version(info, &projection.state, &tags)));
-        }
-    }
-    Ok(kept)
+    let kept: Vec<_> = projection
+        .state
+        .refs
+        .iter()
+        .filter_map(|(name, target)| parse_conflict(name, target))
+        .collect();
+    let targets = kept
+        .iter()
+        .map(|conflict| conflict.version.clone())
+        .collect();
+    let peeled = peel(store, auth, id, targets).await?;
+    let infos = commits(store, auth, id, peeled.clone()).await?;
+    kept.into_iter()
+        .zip(peeled)
+        .map(|(conflict, commit)| {
+            let info = infos.get(&commit).cloned().ok_or(GitError::Unavailable)?;
+            Ok((conflict, version(info, &projection.state, &tags)))
+        })
+        .collect()
 }
 
 /// The full ref name of a kept conflict, for discarding it.
