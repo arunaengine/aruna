@@ -5,6 +5,7 @@
 pub mod backends;
 pub mod blob;
 pub mod cleanup;
+pub mod data_identity;
 pub mod delete_audit;
 pub mod group_backend;
 pub mod metadata_registry;
