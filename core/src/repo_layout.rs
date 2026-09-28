@@ -2,10 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::structs::storage::data_identity::{
+    CONTENT_URL, DataEntity, LOCAL_PATH, ObjectLocation, content_id, normalized_id, text_values,
+};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// The root workbook that makes a commit an ARC.
@@ -119,14 +122,171 @@ pub fn root_id(document: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The repository path of an entity: its relative `@id`, or else its `localPath`.
+pub fn entity_path(entity: &Value) -> Option<String> {
+    entity["@id"].as_str().and_then(data_path).or_else(|| {
+        text_values(entity.get(LOCAL_PATH))
+            .iter()
+            .find_map(|path| data_path(&path_id(path)))
+    })
+}
+
+/// Whether an entity is typed as RO-Crate `File`, an alias of schema.org MediaObject.
+pub fn is_file(entity: &Value) -> bool {
+    text_values(entity.get("@type")).iter().any(|kind| {
+        let local = kind
+            .trim_start_matches("http://schema.org/")
+            .trim_start_matches("https://schema.org/");
+        matches!(local, "File" | "MediaObject")
+    })
+}
+
 fn data_paths(document: &Value) -> BTreeSet<String> {
     document["@graph"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|entity| entity["@id"].as_str())
-        .filter_map(data_path)
+        .filter_map(entity_path)
         .collect()
+}
+
+/// The layout the metadata asks for: an ARC when the root is an ISA investigation or any
+/// entity is an ISA study or assay by `additionalType`; otherwise a plain RO-Crate.
+pub fn metadata_layout(document: &Value) -> Layout {
+    let root = root_id(document);
+    let marked = |entity: &Value, kinds: &[&str]| {
+        text_values(entity.get("additionalType"))
+            .iter()
+            .any(|kind| {
+                let local = kind
+                    .trim_start_matches("http://schema.org/")
+                    .trim_start_matches("https://schema.org/")
+                    .trim_start_matches("schema:");
+                kinds.contains(&local)
+            })
+    };
+    let arc = document["@graph"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|entity| {
+            let is_root = root.is_some() && entity["@id"].as_str() == root.as_deref();
+            (is_root && marked(entity, &["Investigation"])) || marked(entity, &["Study", "Assay"])
+        });
+    if arc { Layout::Arc } else { Layout::RoCrate }
+}
+
+/// Repository paths whose files must be stored: File entities that still name a relative
+/// path, and stored entities whose file changed in the pushed commit.
+pub fn unstored_paths(document: &Value, changed: &BTreeSet<String>) -> BTreeSet<String> {
+    document["@graph"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entity| is_file(entity))
+        .filter_map(|entity| {
+            let relative = entity["@id"].as_str().and_then(data_path);
+            let path = entity_path(entity)?;
+            (relative.is_some() || changed.contains(&path)).then_some(path)
+        })
+        .filter(|path| !control_file(path))
+        .collect()
+}
+
+/// Rewrites every entity whose repository path was stored to the normalized data entity
+/// form, including references to it. Returns whether the graph changed.
+pub fn name_stored(document: &mut Value, stored: &BTreeMap<String, StoredFile>) -> bool {
+    let Some(graph) = document["@graph"].as_array_mut() else {
+        return false;
+    };
+    let mut used: BTreeSet<String> = graph
+        .iter()
+        .filter_map(|entity| entity["@id"].as_str().map(str::to_owned))
+        .collect();
+    let mut renamed = BTreeMap::new();
+    let mut changed = false;
+    for entity in graph.iter_mut() {
+        let Some(path) = entity_path(entity).filter(|_| is_file(entity)) else {
+            continue;
+        };
+        let (Some(file), Some(object)) = (stored.get(&path), entity.as_object_mut()) else {
+            continue;
+        };
+        let old = object.get("@id").and_then(Value::as_str).map(str::to_owned);
+        let content = content_id(file.hash);
+        // Keeps the entity's own address when it already names this content.
+        let id = if old.as_deref() == Some(content.as_str()) {
+            content
+        } else {
+            if let Some(old) = &old {
+                used.remove(old);
+            }
+            normalized_id(file.hash, &file.location, &mut used)
+        };
+        let before = object.clone();
+        DataEntity {
+            id: id.clone(),
+            location: file.location.clone(),
+            local_path: Some(path),
+            size: Some(file.size),
+            encoding_format: None,
+        }
+        .apply(object);
+        changed |= *object != before;
+        if let Some(old) = old.filter(|old| *old != id) {
+            renamed.insert(old, id);
+        }
+    }
+    rename_ids(document, &renamed);
+    changed
+}
+
+/// The Git copy of a graph: stored entities get their repository path as `@id` and lose
+/// the Aruna-only `contentUrl` and `localPath`. `paths` maps entity ids to paths.
+pub fn git_copy(document: &mut Value, paths: &BTreeMap<String, String>) {
+    let mut renamed = BTreeMap::new();
+    for entity in document["@graph"].as_array_mut().into_iter().flatten() {
+        let Some(id) = entity["@id"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let (Some(path), Some(object)) = (paths.get(&id), entity.as_object_mut()) else {
+            continue;
+        };
+        object.remove(CONTENT_URL);
+        object.remove(LOCAL_PATH);
+        renamed.insert(id, path_id(path));
+    }
+    rename_ids(document, &renamed);
+}
+
+/// Replaces every `@id` value found in `renamed`, in entities and in references alike.
+fn rename_ids(value: &mut Value, renamed: &BTreeMap<String, String>) {
+    match value {
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| rename_ids(value, renamed)),
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                match value {
+                    Value::String(id) if key == "@id" => {
+                        if let Some(new) = renamed.get(id.as_str()) {
+                            *id = new.clone();
+                        }
+                    }
+                    _ => rename_ids(value, renamed),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A repository file stored as an Aruna object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredFile {
+    pub hash: [u8; 32],
+    pub location: ObjectLocation,
+    pub size: u64,
 }
 
 /// Adds a `File` entity and a root `hasPart` link for each file no entity names yet.
@@ -277,6 +437,104 @@ mod tests {
         ));
     }
 
+    fn stored(key: &str, seed: u8) -> StoredFile {
+        StoredFile {
+            hash: [seed; 32],
+            location: ObjectLocation {
+                bucket: "datasets-g".into(),
+                key: key.into(),
+            },
+            size: 4,
+        }
+    }
+
+    #[test]
+    fn layout_from_markers() {
+        let plain = document(json!([]), Vec::new());
+        assert_eq!(metadata_layout(&plain), Layout::RoCrate);
+        let mut investigation = plain.clone();
+        investigation["@graph"][1]["additionalType"] = json!("Investigation");
+        assert_eq!(metadata_layout(&investigation), Layout::Arc);
+        let study = json!({"@id": "#s", "@type": "Dataset", "additionalType": ["schema:Study"]});
+        assert_eq!(
+            metadata_layout(&document(json!([]), vec![study])),
+            Layout::Arc
+        );
+        // Only the root may make the dataset an investigation.
+        let nested = json!({"@id": "#i", "@type": "Dataset", "additionalType": "Investigation"});
+        assert_eq!(
+            metadata_layout(&document(json!([]), vec![nested])),
+            Layout::RoCrate
+        );
+    }
+
+    #[test]
+    fn names_stored_files() {
+        let files = vec![
+            json!({"@id": "data/a.csv", "@type": "File", "name": "a.csv"}),
+            json!({"@id": "data/b.csv", "@type": "File"}),
+            json!({"@id": "data/c.csv", "@type": "File"}),
+            json!({"@id": "#person", "@type": "Person"}),
+        ];
+        let parts = json!([{"@id": "data/a.csv"}, {"@id": "data/b.csv"}, {"@id": "data/c.csv"}]);
+        let mut crate_value = document(parts, files);
+        let unstored = unstored_paths(&crate_value, &BTreeSet::new());
+        let paths: Vec<&str> = unstored.iter().map(String::as_str).collect();
+        assert_eq!(paths, ["data/a.csv", "data/b.csv", "data/c.csv"]);
+        // Two files with the same content: the second keeps its `s3://` URL as `@id`.
+        let map = BTreeMap::from([
+            ("data/a.csv".to_string(), stored("doc/data/a.csv", 1)),
+            ("data/b.csv".to_string(), stored("doc/data/b.csv", 1)),
+        ]);
+        assert!(name_stored(&mut crate_value, &map));
+        let graph = crate_value["@graph"].as_array().unwrap();
+        let first = &graph[2];
+        assert_eq!(first["@id"], content_id([1; 32]));
+        assert_eq!(first["contentUrl"], "s3://datasets-g/doc/data/a.csv");
+        assert_eq!(first["localPath"], "data/a.csv");
+        assert_eq!(first["name"], "a.csv");
+        assert_eq!(graph[3]["@id"], "s3://datasets-g/doc/data/b.csv");
+        assert_eq!(graph[4]["@id"], "data/c.csv");
+        assert_eq!(
+            graph[1]["hasPart"],
+            json!([{"@id": content_id([1; 32])}, {"@id": "s3://datasets-g/doc/data/b.csv"},
+                {"@id": "data/c.csv"}])
+        );
+        assert!(!name_stored(&mut crate_value, &map), "naming is stable");
+        let unstored = unstored_paths(&crate_value, &BTreeSet::from(["data/a.csv".into()]));
+        assert_eq!(
+            unstored,
+            BTreeSet::from(["data/a.csv".into(), "data/c.csv".into()])
+        );
+        // Changed content gets the new content address.
+        let map = BTreeMap::from([("data/a.csv".to_string(), stored("doc/data/a.csv", 2))]);
+        assert!(name_stored(&mut crate_value, &map));
+        assert_eq!(crate_value["@graph"][2]["@id"], content_id([2; 32]));
+        assert_eq!(
+            entity_path(&crate_value["@graph"][2]).as_deref(),
+            Some("data/a.csv")
+        );
+        let text = crate_value.to_string();
+        validate(Some(text.as_bytes())).expect("normalized crate stays valid");
+    }
+
+    #[test]
+    fn copies_to_git() {
+        let file = json!({"@id": content_id([1; 32]), "@type": "File", "name": "a b.csv",
+            "contentUrl": "s3://datasets-g/doc/data/a b.csv", "localPath": "data/a b.csv"});
+        let mut crate_value = document(json!([{"@id": content_id([1; 32])}]), vec![file]);
+        let paths = BTreeMap::from([(content_id([1; 32]), "data/a b.csv".to_string())]);
+        git_copy(&mut crate_value, &paths);
+        assert_eq!(
+            crate_value["@graph"][2],
+            json!({"@id": "data/a%20b.csv", "@type": "File", "name": "a b.csv"})
+        );
+        assert_eq!(
+            crate_value["@graph"][1]["hasPart"],
+            json!([{"@id": "data/a%20b.csv"}])
+        );
+    }
+
     #[test]
     fn keeps_listed_entities() {
         let entity = json!({"@id": "data/a.csv", "@type": "File"});
@@ -291,5 +549,11 @@ mod tests {
         );
         keeps_entities(&old, &new, &BTreeSet::new()).expect("file and entity removed");
         keeps_entities(&old, &old, &BTreeSet::new()).expect("only the file removed");
+        // A stored entity names its file through `localPath`.
+        let stored = json!({"@id": content_id([1; 32]), "@type": "File",
+            "localPath": "data/a.csv"});
+        let old = document(json!([{"@id": content_id([1; 32])}]), vec![stored]);
+        let error = keeps_entities(&old, &new, &with_file).expect_err("file stays");
+        assert!(matches!(error, CrateError::EntityRemoved(path) if path == "data/a.csv"));
     }
 }
