@@ -4,7 +4,7 @@
 
 use crate::git::{command, exchange};
 use aruna_core::git::{GitSnapshot, LinkedObject, MAX_GIT_BYTES, MergeOutcome, Refs};
-use aruna_core::repo_layout::Layout;
+use aruna_core::repo_layout::{CRATE_FILE, INVESTIGATION, Layout};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -180,11 +180,18 @@ async fn reconcile(
         .get("ro-crate-metadata.json")
         .ok_or_else(|| failed("ARC conversion omitted its RO-Crate"))?;
     let derived: Value = serde_json::from_slice(derived)?;
-    let current = export(directory, main).await.ok();
-    let same = current
-        .as_ref()
-        .and_then(|value| value.get("rocrate"))
-        .is_some_and(|value| entities(value) == entities(&derived));
+    // Plain RO-Crate files hold no workbooks, so client workbooks stay as they are.
+    let plain = !files.contains_key(INVESTIGATION);
+    let current = if plain {
+        None
+    } else {
+        export(directory, main).await.ok()
+    };
+    let same = plain
+        || current
+            .as_ref()
+            .and_then(|value| value.get("rocrate"))
+            .is_some_and(|value| entities(value) == entities(&derived));
     let mut overlay = Files::new();
     for (path, entry) in files {
         let isa = workbook(path) || path == "LICENSE";
@@ -199,6 +206,10 @@ async fn reconcile(
         let existing = command(directory, &["show", &format!("{main}:{path}")])
             .await
             .ok();
+        // A plain RO-Crate keeps its client files at the paths its entities name.
+        if plain && pointers.contains(path) && existing.is_some() {
+            continue;
+        }
         if existing.as_deref() != Some(entry.1.as_slice()) {
             overlay.insert(path.clone(), entry.clone());
         }
@@ -323,6 +334,30 @@ async fn arc_files(
     Ok(Ok((files, pointers)))
 }
 
+/// Snapshot files in the layout of `base`. Without `base`, metadata that cannot become an
+/// ARC falls back to a plain RO-Crate.
+async fn snapshot_files(
+    directory: &Path,
+    source: (Ulid, &str, &[LinkedObject]),
+    base: Option<&str>,
+) -> std::io::Result<Result<(Files, Pointers), String>> {
+    let layout = match base {
+        Some(base) => Some(crate::rocrate::layout(directory, base).await?),
+        None => None,
+    };
+    let (_, jsonld, objects) = source;
+    if layout == Some(Layout::RoCrate) {
+        return crate::rocrate::files(jsonld, objects).map(Ok);
+    }
+    Ok(match (arc_files(directory, source, base).await?, layout) {
+        (Err(error), None) => {
+            tracing::info!(%error, "Metadata is not an ARC; the snapshot is a plain RO-Crate");
+            Ok(crate::rocrate::files(jsonld, objects)?)
+        }
+        (converted, _) => converted,
+    })
+}
+
 /// The author's message, or the default one, followed by the revision `trailer`.
 fn snapshot_message(message: Option<&str>, trailer: &str) -> String {
     let subject = message.unwrap_or("feat: capture Aruna metadata");
@@ -337,17 +372,30 @@ pub async fn generate(
     source: GitSnapshot,
     refs: &Refs,
 ) -> std::io::Result<Result<(String, Option<String>), String>> {
-    let previous = refs.get("refs/heads/aruna").cloned();
     let main = refs.get("refs/heads/main").cloned();
     let converted = (
         source.document_id,
         source.jsonld.as_str(),
         source.objects.as_slice(),
     );
-    let (files, pointers) = match arc_files(directory, converted, main.as_deref()).await? {
+    let (files, pointers) = match snapshot_files(directory, converted, main.as_deref()).await? {
         Ok(converted) => converted,
         Err(error) => return Ok(Err(error)),
     };
+    snapshot_commit(directory, &source, refs, (files, pointers))
+        .await
+        .map(Ok)
+}
+
+/// Commits `files` on `aruna` and, when main must follow, merges them into main.
+pub(crate) async fn snapshot_commit(
+    directory: &Path,
+    source: &GitSnapshot,
+    refs: &Refs,
+    (files, pointers): (Files, Pointers),
+) -> std::io::Result<(String, Option<String>)> {
+    let previous = refs.get("refs/heads/aruna").cloned();
+    let main = refs.get("refs/heads/main").cloned();
     let trailer = format!("\n\nAruna-Revision: {}\n", source.event_id);
     let tree = write_tree(directory, None, &files, &[]).await?;
     if let Some(previous) = &previous {
@@ -357,7 +405,7 @@ pub async fn generate(
             .trim()
             == tree
         {
-            return Ok(Ok((previous.clone(), None)));
+            return Ok((previous.clone(), None));
         }
     }
     let parents: Vec<&str> = previous.iter().map(String::as_str).collect();
@@ -375,7 +423,7 @@ pub async fn generate(
             None => None,
         },
     };
-    Ok(Ok((commit, main)))
+    Ok((commit, main))
 }
 
 /// Commits the snapshot's metadata on top of `head`, keeping client files and equivalent
@@ -391,7 +439,7 @@ pub async fn edit(
         source.jsonld.as_str(),
         source.objects.as_slice(),
     );
-    let (files, pointers) = match arc_files(directory, converted, Some(head)).await? {
+    let (files, pointers) = match snapshot_files(directory, converted, Some(head)).await? {
         Ok(converted) => converted,
         Err(error) => return Ok(Err(error)),
     };
@@ -510,9 +558,17 @@ pub async fn merge(
         return Ok(MergeOutcome::Conflicts(other));
     }
     if !resolvable.is_empty() {
+        // A plain RO-Crate keeps its whole graph in its RO-Crate file.
+        let graph = match crate::rocrate::layout(directory, target).await? {
+            Layout::Arc => metadata_file(directory, target).await,
+            Layout::RoCrate => command(directory, &["show", &format!("{target}:{CRATE_FILE}")])
+                .await
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok()),
+        };
         let (Some(base), Some(graph)) = (
             crate::repo::merge_base(directory, target, source).await,
-            metadata_file(directory, target).await,
+            graph,
         ) else {
             return Ok(MergeOutcome::Conflicts(resolvable));
         };
@@ -521,7 +577,7 @@ pub async fn merge(
             Err(error) => return Ok(MergeOutcome::Failed(error)),
         };
         let converted = (document_id, merged.as_str(), &[][..]);
-        let (files, pointers) = match arc_files(directory, converted, Some(target)).await? {
+        let (files, pointers) = match snapshot_files(directory, converted, Some(target)).await? {
             Ok(converted) => converted,
             Err(error) => return Ok(MergeOutcome::Failed(error)),
         };

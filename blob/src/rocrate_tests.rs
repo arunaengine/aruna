@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::git::{GitSnapshot, Refs};
+use ulid::Ulid;
 
 async fn git(directory: &Path, args: &[&str]) -> String {
     let mut process = Command::new("git");
@@ -169,4 +171,56 @@ async fn merges_added_files() {
     );
     let merged = crate::arc::merge_metadata(path, Some(&head), &head, &live).await;
     assert_eq!(merged.unwrap(), Ok(None));
+}
+
+fn snapshot(jsonld: String) -> GitSnapshot {
+    GitSnapshot {
+        document_id: Ulid::from(7),
+        event_id: Ulid::from(8),
+        occurred_at_ms: 1_700_000_000_000,
+        jsonld,
+        objects: Vec::new(),
+        message: None,
+    }
+}
+
+async fn tree(path: &Path, commit: &str) -> Vec<String> {
+    let listing = git(path, &["ls-tree", "-r", "--name-only", commit]).await;
+    listing.lines().map(str::to_owned).collect()
+}
+
+#[tokio::test]
+async fn keeps_plain_snapshots() {
+    let (directory, first) = repository().await;
+    let path = directory.path();
+    let mut edited = listed();
+    edited["@graph"][1]["name"] = json!("Renamed");
+    let refs = Refs::from([("refs/heads/main".to_string(), first.clone())]);
+    let (aruna, main) = crate::arc::generate(path, snapshot(edited.to_string()), &refs)
+        .await
+        .expect("generate runs")
+        .expect("plain snapshot");
+    assert_eq!(tree(path, &aruna).await, [CRATE_FILE]);
+    let main = main.expect("main follows the metadata");
+    assert_eq!(tree(path, &main).await, ["data/a.csv", CRATE_FILE]);
+    assert_eq!(layout(path, &main).await.unwrap(), Layout::RoCrate);
+    let text = git(path, &["show", &format!("{main}:{CRATE_FILE}")]).await;
+    let written: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(written, edited);
+}
+
+#[tokio::test]
+async fn falls_back_plain() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path();
+    git(path, &["init", "-q", "--initial-branch=main"]).await;
+    let source = snapshot(listed().to_string());
+    // The files a failed ARC conversion leaves the snapshot of a new repository with.
+    let files = files(&source.jsonld, &source.objects).expect("plain files");
+    let (aruna, main) = crate::arc::snapshot_commit(path, &source, &Refs::new(), files)
+        .await
+        .expect("commit");
+    assert_eq!(main.as_deref(), Some(aruna.as_str()));
+    assert_eq!(tree(path, &aruna).await, [CRATE_FILE]);
+    assert_eq!(layout(path, &aruna).await.unwrap(), Layout::RoCrate);
 }
