@@ -48,10 +48,9 @@ fn entities(document: Option<&Value>) -> BTreeMap<String, &Map<String, Value>> {
         .collect()
 }
 
-/// Applies the values changed from `base` to `new` onto the `graph` JSON-LD; ids match
-/// exactly, with a leading `./`, or as the path a stored entity names by `localPath` or by
-/// its `contentUrl` in `location`. Without `base`, the new values replace the graph's.
-/// Returns the merged JSON-LD, or `None` when the graph stays the same.
+/// Applies `base` to `new` changes onto `graph`, matching ids, `./`, or stored paths via
+/// `localPath` or `contentUrl` in `location`. Without `base`, new values replace the graph's.
+/// Returns merged JSON-LD, or `None` if unchanged.
 pub fn merge(
     graph: &str,
     base: Option<&Value>,

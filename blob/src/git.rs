@@ -501,7 +501,11 @@ mod tests {
             .execute(GitEffect::Initialize(id), actor)
             .await
             .expect("repository is set up");
-        let first = config().await;
+        // Keep the original inode allocated while Git replaces the config file.
+        let original = tokio::fs::File::open(repository.join("config"))
+            .await
+            .expect("config exists");
+        let first = original.metadata().await.expect("config metadata").ino();
         store
             .execute(GitEffect::Initialize(id), actor)
             .await

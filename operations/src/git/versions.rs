@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_entities_compare_by_path() {
+    fn compares_stored_paths() {
         let stored = serde_json::json!({"@graph": [{"@id": "https://w3id.org/aruna/data/ab",
             "@type": "File", "name": "a.csv", "contentUrl": "s3://b/doc/data/a.csv",
             "localPath": "data/a.csv"}]});

@@ -547,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_full_path_iri() {
+    fn reads_path_iri() {
         let entity = json!({"@id": content_id([1; 32]), "@type": "File",
             "contentUrl": "s3://datasets-g/doc/data/a.csv", LOCAL_PATH_IRI: "data/a.csv"});
         assert_eq!(entity_path(&entity).as_deref(), Some("data/a.csv"));
