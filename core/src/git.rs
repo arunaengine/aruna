@@ -251,6 +251,11 @@ pub enum GitEffect {
         graph: String,
     },
     Http(Box<GitRequest>),
+    /// The layout of the commit a revision names, if any.
+    Layout {
+        document_id: Ulid,
+        revision: String,
+    },
 }
 
 pub enum GitEvent {
@@ -280,6 +285,7 @@ pub enum GitEvent {
         headers: Vec<(String, String)>,
         body: Bytes,
     },
+    Layout(Option<crate::repo_layout::Layout>),
 }
 
 /// One replicated Git fact of a metadata document. Every holder rebuilds its local

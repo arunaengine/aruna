@@ -51,7 +51,8 @@ impl GitStore {
             | GitEffect::Ancestry { document_id, .. }
             | GitEffect::SetRefs { document_id, .. }
             | GitEffect::Pack { document_id, .. }
-            | GitEffect::Export { document_id, .. } => *document_id,
+            | GitEffect::Export { document_id, .. }
+            | GitEffect::Layout { document_id, .. } => *document_id,
             GitEffect::Http(request) => request.repository.document_id,
         };
         let _lock = self.locks.lock(id).await;
@@ -139,6 +140,14 @@ impl GitStore {
                         .map_err(std::io::Error::other)?
                         .into(),
                 ))
+            }
+            GitEffect::Layout { revision, .. } => {
+                match crate::repo::resolve(&repository, &revision).await {
+                    Some(commit) => crate::rocrate::layout(&repository, &commit)
+                        .await
+                        .map(|layout| GitEvent::Layout(Some(layout))),
+                    None => Ok(GitEvent::Layout(None)),
+                }
             }
             GitEffect::Initialize(_) => {
                 tokio::fs::create_dir_all(&self.root).await?;

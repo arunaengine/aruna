@@ -24,6 +24,7 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEventRecord, MetadataRawRevision,
 };
+use aruna_core::repo_layout::Layout;
 use aruna_core::storage_entries::{event_log_key, materialization_status_key};
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -467,17 +468,31 @@ pub async fn capture(
     }
 }
 
+/// The snapshot status, the projection, and the layout of main when main exists.
 pub async fn status(
     context: &DriverContext,
     store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-) -> Result<(Option<GitStatus>, Projection), GitError> {
+) -> Result<(Option<GitStatus>, Projection, Option<Layout>), GitError> {
     let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
     let _guard = lock(id).await;
     let projection = refresh(context, store, &document).await?;
     let status = records::load(context, STATUS, id.to_bytes().to_vec()).await?;
-    Ok((status, projection))
+    let layout = match projection.state.refs.get("refs/heads/main") {
+        Some(main) => {
+            let effect = GitEffect::Layout {
+                document_id: id,
+                revision: main.clone(),
+            };
+            match execute(store, effect, auth.user_id).await? {
+                GitEvent::Layout(layout) => layout,
+                _ => return Err(GitError::Unavailable),
+            }
+        }
+        None => None,
+    };
+    Ok((status, projection, layout))
 }
 
 pub async fn export(

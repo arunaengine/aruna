@@ -1,4 +1,4 @@
-//! Exposes automatic ARC repository status and ISA-derived metadata for an exact Git commit.
+//! Exposes automatic repository status and the metadata of an exact Git commit.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,6 +6,7 @@ use super::{base_url, map_error};
 use crate::auth::require_realm_auth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_core::repo_layout::Layout;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::git;
 use axum::extract::{Path, Query, State};
@@ -27,14 +28,33 @@ pub struct RepositoryStatus {
     pub error: Option<String>,
     /// Branches, tags and any `refs/conflicts/...` refs replicated for this document.
     pub refs: std::collections::BTreeMap<String, String>,
+    /// Layout of main: `arc` with `isa.investigation.xlsx` at its root, otherwise `rocrate`.
+    /// `null` while the repository has no main branch.
+    pub layout: Option<RepositoryLayout>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RepositoryLayout {
+    Arc,
+    RoCrate,
+}
+
+impl From<Layout> for RepositoryLayout {
+    fn from(layout: Layout) -> Self {
+        match layout {
+            Layout::Arc => Self::Arc,
+            Layout::RoCrate => Self::RoCrate,
+        }
+    }
 }
 
 #[utoipa::path(get, path = "/metadata/{document_id}/git", tag = "metadata/git",
-    security(("bearer_auth" = [])), summary = "Get the automatic ARC repository",
-    description = "Returns the automatic ARC repository and its conversion status.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: any current holder of the document serves the repository from replicated Git records and rebuilds a missing local copy. The protected aruna branch tracks graph snapshots, which are also merged into main. Concurrent pushes to one branch on different holders keep the first; the other is listed under refs/conflicts/. A conversion error means no new valid snapshot was published.",
+    security(("bearer_auth" = [])), summary = "Get the automatic Git repository",
+    description = "Returns the automatic Git repository, its layout and its snapshot status.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: any current holder of the document serves the repository from replicated Git records and rebuilds a missing local copy. The protected aruna branch tracks graph snapshots, which are also merged into main. Concurrent pushes to one branch on different holders keep the first; the other is listed under refs/conflicts/. A main with isa.investigation.xlsx at its root is an ARC and gets ARC snapshots; any other main is a plain RO-Crate and gets ro-crate-metadata.json snapshots. A new repository whose metadata cannot become an ARC starts as a plain RO-Crate. A conversion error means no new valid snapshot was published.",
     params(("document_id" = String, Path, description = "Metadata document ID")),
     responses((status = 200, description = "Repository and conversion status", body = RepositoryStatus,
-               example = json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","bucket":"arc-storage","revision":"01M000000000000000000000001","commit":"1111111111111111111111111111111111111111","error":null,"refs":{"refs/heads/aruna":"1111111111111111111111111111111111111111","refs/heads/main":"1111111111111111111111111111111111111111"}})),
+               example = json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","bucket":"arc-storage","revision":"01M000000000000000000000001","commit":"1111111111111111111111111111111111111111","error":null,"refs":{"refs/heads/aruna":"1111111111111111111111111111111111111111","refs/heads/main":"1111111111111111111111111111111111111111"},"layout":"rocrate"})),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
               (status = 404, description = "Document missing or not held by this node"),
               (status = 503, description = "Metadata or conversion runtime unavailable")))]
@@ -47,7 +67,7 @@ pub async fn repository_status(
     let (_, repository) = git::repository(&state.get_ctx(), &auth, id, Permission::READ)
         .await
         .map_err(map_error)?;
-    let (status, projection) = git::snapshot::status(
+    let (status, projection, layout) = git::snapshot::status(
         &state.get_ctx(),
         state.git().ok_or(ServerError::ServiceUnavailable)?,
         &auth,
@@ -76,6 +96,7 @@ pub async fn repository_status(
             })
             .and_then(|value| value.error),
         refs: projection.state.refs,
+        layout: layout.map(RepositoryLayout::from),
     }))
 }
 
@@ -85,8 +106,8 @@ pub struct RevisionQuery {
 }
 
 #[utoipa::path(get, path = "/metadata/{document_id}/git/rocrate", tag = "metadata/git",
-    security(("bearer_auth" = [])), summary = "Export an ARC commit as RO-Crate",
-    description = "Exports one Git revision as ISA-derived RO-Crate metadata.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: the revision resolves to one commit whose ISA metadata is parsed by pinned ARCtrl. The response names that commit; the collaborative graph and other branches remain unchanged.",
+    security(("bearer_auth" = [])), summary = "Export a commit as RO-Crate",
+    description = "Exports one Git revision as RO-Crate metadata.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: the revision resolves to one commit. The ISA metadata of an ARC commit is parsed by pinned ARCtrl; a plain RO-Crate commit returns its ro-crate-metadata.json with a File entity added for each file no entity describes. The response names that commit; the collaborative graph and other branches remain unchanged.",
     params(("document_id" = String, Path, description = "Metadata document ID"),
            ("revision" = String, Query, description = "Branch, tag or full commit ID")),
     responses((status = 200, description = "Exact commit and derived RO-Crate", body = Value,
@@ -113,4 +134,16 @@ pub async fn export_revision(
     let result: Value =
         serde_json::from_slice(&bytes).map_err(|_| ServerError::ServiceUnavailable)?;
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_layouts() {
+        let name = |layout| serde_json::to_value(RepositoryLayout::from(layout)).unwrap();
+        assert_eq!(name(Layout::Arc), "arc");
+        assert_eq!(name(Layout::RoCrate), "rocrate");
+    }
 }

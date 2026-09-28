@@ -224,3 +224,30 @@ async fn falls_back_plain() {
     assert_eq!(tree(path, &aruna).await, [CRATE_FILE]);
     assert_eq!(layout(path, &aruna).await.unwrap(), Layout::RoCrate);
 }
+
+#[tokio::test]
+async fn reports_main_layout() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let id = Ulid::from(9);
+    let path = root.path().join(format!("{id}.git"));
+    tokio::fs::create_dir(&path).await.expect("folder");
+    git(&path, &["init", "-q", "--initial-branch=main"]).await;
+    let text = listed().to_string();
+    commit(&path, &[(CRATE_FILE, text.as_str())], &[]).await;
+    let store = crate::git::GitStore::new(root.path().to_path_buf(), "helper".into());
+    let layout = async |revision: &str| {
+        let effect = aruna_core::git::GitEffect::Layout {
+            document_id: id,
+            revision: revision.into(),
+        };
+        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        match store.execute(effect, actor).await.expect("layout runs") {
+            aruna_core::git::GitEvent::Layout(layout) => layout,
+            _ => panic!("unexpected event"),
+        }
+    };
+    assert_eq!(layout("main").await, Some(Layout::RoCrate));
+    commit(&path, &[(INVESTIGATION, "PK\x03\x04")], &[]).await;
+    assert_eq!(layout("main").await, Some(Layout::Arc));
+    assert_eq!(layout("missing").await, None);
+}
