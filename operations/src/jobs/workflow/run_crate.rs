@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::StructuredId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::execution::job::{
@@ -10,6 +12,9 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
+use aruna_core::structs::storage::data_identity::{
+    DataEntity, ObjectLocation, normalized_id, parse_hash,
+};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use serde_json::json;
 use ulid::Ulid;
@@ -273,31 +278,64 @@ fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Uli
     };
     let command = command_line(spec);
 
-    // Inputs are the action `object`, keyed by their S3 source URL.
+    // Inputs are the action `object` and outputs its `result`, named by content where known.
+    let mut used = BTreeSet::new();
+    let mut entity = |location: ObjectLocation, hash: Option<[u8; 32]>, file: serde_json::Value| {
+        let id = match hash {
+            Some(hash) => normalized_id(hash, &location, &mut used),
+            None => location.to_url(),
+        };
+        let mut file = file.as_object().cloned().unwrap_or_default();
+        DataEntity {
+            id: id.clone(),
+            location,
+            local_path: None,
+            size: None,
+            encoding_format: None,
+        }
+        .apply(&mut file);
+        (id, serde_json::Value::Object(file))
+    };
     let mut object_ids = Vec::with_capacity(spec.inputs.len());
     let mut part_ids = Vec::new();
     let mut files = Vec::new();
     for input in &spec.inputs {
         let InputSource::S3 { bucket, key, .. } = &input.source;
-        let id = format!("s3://{bucket}/{key}");
         let name = input.name.clone().unwrap_or_else(|| input.dest_key.clone());
+        let captured = record
+            .captured_inputs
+            .iter()
+            .find(|captured| captured.destination_key == input.dest_key);
+        let mut file = json!({ "@type": "File", "name": name });
+        if let Some(captured) = captured {
+            file["contentSize"] = json!(captured.bytes.to_string());
+        }
+        let location = ObjectLocation {
+            bucket: bucket.clone(),
+            key: key.clone(),
+        };
+        let (id, file) = entity(location, captured.map(|captured| captured.blake3), file);
         object_ids.push(json!({ "@id": id.clone() }));
-        files.push(json!({ "@id": id.clone(), "@type": "File", "name": name }));
+        files.push(file);
         part_ids.push(id);
     }
 
-    // Outputs are the action `result`, keyed by their S3 destination URL.
     let mut result_ids = Vec::with_capacity(outputs.len());
     for output in &outputs {
-        let id = format!("s3://{}/{}", output.bucket, output.key);
-        result_ids.push(json!({ "@id": id.clone() }));
-        files.push(json!({
-            "@id": id.clone(),
+        let file = json!({
             "@type": "File",
             "name": output.key.clone(),
             "contentSize": output.size.to_string(),
             "encodingFormat": key_content_type(&output.key)
-        }));
+        });
+        let location = ObjectLocation {
+            bucket: output.bucket.clone(),
+            key: output.key.clone(),
+        };
+        let hash = output.digest.as_deref().and_then(parse_hash);
+        let (id, file) = entity(location, hash, file);
+        result_ids.push(json!({ "@id": id.clone() }));
+        files.push(file);
         part_ids.push(id);
     }
     let has_part: Vec<serde_json::Value> = part_ids
@@ -546,7 +584,7 @@ mod pure_tests {
 
     use aruna_core::UserId;
     use aruna_core::structs::execution::job::{
-        AttemptIntent, InputMode, InputSelection, OutputObject,
+        AttemptIntent, CapturedInput, InputMode, InputSelection, OutputObject,
     };
     use aruna_core::structs::identity::realm::RealmId;
     use serde_json::Value;
@@ -730,6 +768,40 @@ mod pure_tests {
         let root = by_id(descriptor["about"]["@id"].as_str().unwrap());
         assert_eq!(root["name"], "Variant calling");
         assert_eq!(root["description"], "Call variants for sample one");
+    }
+
+    #[test]
+    fn names_by_content() {
+        // Known digests become content addresses; the same content twice keeps one address.
+        let (mut record, spec) = execution_record();
+        record.captured_inputs.push(CapturedInput {
+            destination_key: "inputs/in.txt".to_string(),
+            source_node_id: record.owner_node_id,
+            version_id: Ulid::from_bytes([13; 16]),
+            blake3: [9; 32],
+            bytes: 3,
+            policies: Vec::new(),
+        });
+        if let Some(JobResultPayload::Execution { outputs, .. }) = &mut record.result {
+            outputs[0].digest = Some(hex::encode([9; 32]));
+        }
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let by_url = |url: &str| {
+            graph
+                .iter()
+                .find(|entity| entity["contentUrl"] == url)
+                .expect("entity")
+        };
+        let content = aruna_core::structs::storage::data_identity::content_id([9; 32]);
+        let input = by_url("s3://src/in.txt");
+        assert_eq!(input["@id"], content);
+        assert_eq!(input["contentSize"], "3");
+        let output = by_url("s3://src/out.txt");
+        assert_eq!(output["@id"], "s3://src/out.txt");
+        let action = graph.iter().find(|e| e["@type"] == "CreateAction").unwrap();
+        assert_eq!(action["object"][0]["@id"], content);
+        assert!(craqle::validate_rocrate_jsonld(&value.to_string()).is_ok());
     }
 
     #[test]

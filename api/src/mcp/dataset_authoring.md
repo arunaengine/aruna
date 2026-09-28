@@ -20,7 +20,7 @@ One object becomes one `File` entity:
 
 | Property         | Source                                                    |
 | ---------------- | --------------------------------------------------------- |
-| `@id`            | The object key, or the `s3://bucket/key` URL.              |
+| `@id`            | `content_id` from the listing; `s3://bucket/key` without it. |
 | `contentUrl`     | `s3://bucket/key`, always in that form.                    |
 | `name`           | The key, usually its last segment.                         |
 | `contentSize`    | `size` from the listing, in bytes.                         |
@@ -99,10 +99,10 @@ suggestion beside each field so the user can accept or edit it:
       "datePublished": "2026-09-02",
       "license": { "@id": "https://spdx.org/licenses/CC-BY-4.0" },
       "conformsTo": { "@id": "https://w3id.org/aruna/profile/01JZ8Y6T0K4W7M2N9Q5R3S8V1X" },
-      "hasPart": [{ "@id": "s3://mouse-liver/reads/sample-01.fastq.gz" }]
+      "hasPart": [{ "@id": "https://w3id.org/aruna/data/5d41402abc4b2a76b9719d911017c592ae2f1e03c3c4b7d7e42b1a0e8e2f1d30" }]
     },
     {
-      "@id": "s3://mouse-liver/reads/sample-01.fastq.gz",
+      "@id": "https://w3id.org/aruna/data/5d41402abc4b2a76b9719d911017c592ae2f1e03c3c4b7d7e42b1a0e8e2f1d30",
       "@type": "File",
       "name": "sample-01.fastq.gz",
       "contentUrl": "s3://mouse-liver/reads/sample-01.fastq.gz",

@@ -23,6 +23,7 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
 };
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef, BlobLocationKey};
+use aruna_core::structs::storage::data_identity::{ObjectLocation, normalized_id};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
 use std::collections::HashMap;
@@ -510,26 +511,21 @@ async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u
     );
 
     let realm_id = RealmId::from_bytes([seed; 32]);
-    let node_id = iroh::SecretKey::from_bytes(&[seed.saturating_add(1); 32]).public();
     let payload_hash = *blake3::hash(FIXTURE_BYTES).as_bytes();
+    // Both payloads match, so the second entity keeps its `s3://` URL as `@id`.
+    let mut used = BTreeSet::new();
     let targets = described
         .iter()
-        .enumerate()
-        .map(|(index, (file_id, path))| {
-            let version = Ulid::from_bytes(
-                [seed.saturating_add(u8::try_from(index).unwrap())
-                    .saturating_add(2); 16],
-            );
-            let arn = VersionedObjectArn::new(realm_id, node_id, "fixture", path, version).unwrap();
+        .map(|(file_id, path)| {
+            let location = ObjectLocation {
+                bucket: "fixture".to_string(),
+                key: path.clone(),
+            };
             (
                 file_id.clone(),
                 RewriteTarget {
-                    w3id: arn.to_w3id(),
-                    hash_w3id: format!(
-                        "{}{}",
-                        aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX,
-                        hex::encode(payload_hash)
-                    ),
+                    id: normalized_id(payload_hash, &location, &mut used),
+                    content_url: location.to_url(),
                     local_path: path.clone(),
                 },
             )
@@ -552,8 +548,11 @@ async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u
     let entities = recognized_entities(&imported, realm_id).unwrap();
     assert_eq!(entities.len(), 2);
     assert!(entities.iter().all(|entity| {
-        entity.exact.is_some()
-            && entity.hash == Some(payload_hash)
+        entity
+            .storage_key
+            .as_ref()
+            .is_some_and(|key| key.bucket == "fixture")
+            && (entity.hash == Some(payload_hash) || entity.entity_id.starts_with("s3://"))
             && entity
                 .local_path
                 .as_ref()

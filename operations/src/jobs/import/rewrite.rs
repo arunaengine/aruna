@@ -48,8 +48,10 @@ pub struct ValidatedDocument {
 
 #[derive(Clone, Debug)]
 pub struct RewriteTarget {
-    pub w3id: String,
-    pub hash_w3id: String,
+    /// The normalized `@id`, usually the content address.
+    pub id: String,
+    /// The `s3://` URL of the stored object.
+    pub content_url: String,
     pub local_path: String,
 }
 
@@ -254,7 +256,7 @@ fn rewrite_value(
                 .as_ref()
                 .and_then(|(key, id)| matching_target(targets, id).map(|target| (key, target)))
             {
-                object.insert(id_key.clone(), Value::String(target.w3id.clone()));
+                object.insert(id_key.clone(), Value::String(target.id.clone()));
                 if object.len() > 1 {
                     prepend_value(
                         object,
@@ -272,7 +274,7 @@ fn rewrite_value(
                         } else {
                             SCHEMA_CONTENT_IRI
                         },
-                        Value::String(target.hash_w3id),
+                        Value::String(target.content_url),
                     );
                 }
             }
@@ -470,8 +472,8 @@ mod pure_tests {
 
         let validated = validate_document(&document).unwrap();
         let target = RewriteTarget {
-            w3id: "https://w3id.org/aruna/data/arn:example".to_string(),
-            hash_w3id: format!("https://w3id.org/aruna/data/{}", "a".repeat(64)),
+            id: "https://w3id.org/aruna/data/arn:example".to_string(),
+            content_url: "s3://bucket/data/a.txt".to_string(),
             local_path: "data/a.txt".to_string(),
         };
         let rewritten = rewrite_document(
@@ -504,8 +506,8 @@ mod pure_tests {
 
     fn target(name: &str) -> RewriteTarget {
         RewriteTarget {
-            w3id: format!("https://w3id.org/aruna/data/arn:{name}"),
-            hash_w3id: format!("https://w3id.org/aruna/data/{}", "a".repeat(64)),
+            id: format!("https://w3id.org/aruna/data/arn:{name}"),
+            content_url: "s3://bucket/data/a.txt".to_string(),
             local_path: format!("data/{name}"),
         }
     }
@@ -619,9 +621,10 @@ mod pure_tests {
     #[test]
     fn rewrite_updates_refs() {
         let validated = validate_document(&crate_json("1.1")).unwrap();
+        let id = aruna_core::structs::storage::data_identity::content_id([10; 32]);
         let target = RewriteTarget {
-            w3id: "https://w3id.org/aruna/data/arn:example".to_string(),
-            hash_w3id: format!("https://w3id.org/aruna/data/{}", "a".repeat(64)),
+            id: id.clone(),
+            content_url: "s3://bucket/data/a.txt".to_string(),
             local_path: "data/a.txt".to_string(),
         };
         let rewritten = rewrite_document(
@@ -631,10 +634,9 @@ mod pure_tests {
         .unwrap();
         assert!(rewritten.warnings.is_empty());
         let value: Value = serde_json::from_str(&rewritten.jsonld).unwrap();
-        assert_eq!(
-            value["@graph"][1]["hasPart"]["@id"],
-            "https://w3id.org/aruna/data/arn:example"
-        );
+        assert_eq!(value["@graph"][1]["hasPart"]["@id"], id);
+        assert_eq!(value["@graph"][2]["@id"], id);
+        assert_eq!(value["@graph"][2]["contentUrl"], "s3://bucket/data/a.txt");
         assert_eq!(value["@graph"][2]["localPath"], "data/a.txt");
         assert!(
             value["@context"]

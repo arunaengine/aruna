@@ -31,6 +31,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::data_identity::DataIdentity;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
@@ -215,7 +216,7 @@ fn exact_files<'a>(
             continue;
         }
         let urls = listed(&entity["contentUrl"]);
-        let Some(exact) = crate::jobs::export::entity_identity(id, &urls).exact else {
+        let Some(exact) = DataIdentity::read(id, &urls).exact else {
             continue;
         };
         if exact.realm_id == realm_id {

@@ -56,7 +56,8 @@ pub struct DatasetSearchInput {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ValidateInput {
     /// RO-Crate JSON-LD object with `@context`, `@graph`, a complete `./` Dataset, and descriptor.
-    /// The descriptor targets `./`; one Profile may be named and files use `s3://bucket/key` URLs.
+    /// The descriptor targets `./`; one Profile may be named. Files use their content address as
+    /// `@id` and `s3://bucket/key` as `contentUrl`.
     pub rocrate: JsonPayload,
     /// Target group from `list_groups`. Its private Profile is eligible during validation.
     /// Without a group, only public Profiles resolve.
