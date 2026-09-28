@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::git::{GitSnapshot, Refs};
+use aruna_core::git::{GitSnapshot, LinkedObject, Refs};
 use ulid::Ulid;
 
 async fn git(directory: &Path, args: &[&str]) -> String {
@@ -155,7 +155,7 @@ async fn merges_added_files() {
     let path = directory.path();
     let head = commit(path, &[("data/b.csv", "c\n")], &[]).await;
     let live = listed().to_string();
-    let merged = crate::arc::merge_metadata(path, Some(&first), &head, &live)
+    let merged = crate::arc::merge_metadata(path, (Some(&first), &head), &live, None)
         .await
         .expect("merge runs")
         .expect("merge succeeds")
@@ -169,7 +169,7 @@ async fn merges_added_files() {
             .unwrap()
             .contains(&json!({"@id": "data/b.csv"}))
     );
-    let merged = crate::arc::merge_metadata(path, Some(&head), &head, &live).await;
+    let merged = crate::arc::merge_metadata(path, (Some(&head), &head), &live, None).await;
     assert_eq!(merged.unwrap(), Ok(None));
 }
 
@@ -223,6 +223,117 @@ async fn falls_back_plain() {
     assert_eq!(main.as_deref(), Some(aruna.as_str()));
     assert_eq!(tree(path, &aruna).await, [CRATE_FILE]);
     assert_eq!(layout(path, &aruna).await.unwrap(), Layout::RoCrate);
+}
+
+const OID: &str = "4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393";
+
+/// Metadata with one stored entity and the object it names, linked at `data/c.csv`.
+fn stored() -> (Value, LinkedObject) {
+    let id = aruna_core::structs::storage::data_identity::content_id([5; 32]);
+    let file = json!({"@id": id, "@type": "File", "name": "c.csv",
+        "contentUrl": "s3://datasets-g/doc/data/c.csv", "localPath": "data/c.csv"});
+    let value = document(json!([{"@id": id}]), vec![file]);
+    let node = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
+    let object = aruna_core::git::StoredObject {
+        node_id: node.parse().expect("node id"),
+        group_id: None,
+        bucket: "datasets-g".into(),
+        key: "doc/data/c.csv".into(),
+        version_id: Ulid::from(3),
+        size: 12,
+        sha256: OID.into(),
+        blake3: [5; 32],
+    };
+    let linked = LinkedObject {
+        entity: id,
+        object,
+        path: Some("data/c.csv".into()),
+    };
+    (value, linked)
+}
+
+#[tokio::test]
+async fn snapshots_stored_files() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path();
+    git(path, &["init", "-q", "--initial-branch=main"]).await;
+    let (live, linked) = stored();
+    let mut source = snapshot(live.to_string());
+    source.objects = vec![linked];
+    let (aruna, main) = crate::arc::generate(path, source, &Refs::new())
+        .await
+        .expect("generate runs")
+        .expect("plain snapshot");
+    assert_eq!(main.as_deref(), Some(aruna.as_str()));
+    let listing = tree(path, &aruna).await;
+    assert_eq!(listing, [".gitattributes", "data/c.csv", CRATE_FILE]);
+    let pointer = git(path, &["show", &format!("{aruna}:data/c.csv")]).await;
+    assert!(pointer.contains(&format!("oid sha256:{OID}")));
+    let text = git(path, &["show", &format!("{aruna}:{CRATE_FILE}")]).await;
+    let written: Value = serde_json::from_str(&text).unwrap();
+    let copy = entity(&written, "data/c.csv").expect("entity names its path");
+    assert!(copy.get("contentUrl").is_none() && copy.get("localPath").is_none());
+    assert_eq!(
+        entity(&written, "./").unwrap()["hasPart"],
+        json!([{"@id": "data/c.csv"}])
+    );
+    // A clone pushed back unchanged, or with only a new commit, changes no metadata.
+    git(path, &["reset", "-q", "--hard", &aruna]).await;
+    let head = commit(path, &[], &[]).await;
+    let graph = live.to_string();
+    let merged = crate::arc::merge_metadata(path, (Some(&aruna), &head), &graph, None);
+    assert_eq!(merged.await.unwrap(), Ok(None));
+    // A renamed file entity updates the stored entity instead of adding one.
+    let mut renamed = written.clone();
+    renamed["@graph"][2]["name"] = json!("renamed.csv");
+    let head = commit(path, &[(CRATE_FILE, renamed.to_string().as_str())], &[]).await;
+    let merged = crate::arc::merge_metadata(path, (Some(&aruna), &head), &graph, None);
+    let merged: Value = serde_json::from_str(&merged.await.unwrap().unwrap().unwrap()).unwrap();
+    let graph = merged["@graph"].as_array().unwrap();
+    assert_eq!(graph.len(), 3);
+    assert_eq!(graph[2]["name"], "renamed.csv");
+    assert_eq!(graph[2]["localPath"], "data/c.csv");
+}
+
+#[tokio::test]
+async fn switches_arc_main() {
+    let (directory, first) = repository().await;
+    let path = directory.path();
+    let pointer =
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{OID}\nsize 12\n");
+    let arc_files = [
+        (INVESTIGATION, "PK\x03\x04"),
+        ("aruna-metadata.json", "{}"),
+        ("dataset/c.csv", pointer.as_str()),
+        ("notes.txt", "kept\n"),
+    ];
+    let arc = commit(path, &arc_files, &[]).await;
+    assert_eq!(layout(path, &arc).await.unwrap(), Layout::Arc);
+    let (live, linked) = stored();
+    let mut source = snapshot(live.to_string());
+    source.objects = vec![linked];
+    // A client-edited main: the snapshot is merged into it rather than replacing it.
+    let refs = Refs::from([
+        ("refs/heads/main".to_string(), arc.clone()),
+        ("refs/heads/aruna".to_string(), first),
+    ]);
+    let (_, main) = crate::arc::generate(path, source, &refs)
+        .await
+        .expect("generate runs")
+        .expect("plain snapshot");
+    let main = main.expect("main follows");
+    assert_eq!(layout(path, &main).await.unwrap(), Layout::RoCrate);
+    let listing = tree(path, &main).await;
+    assert_eq!(
+        listing,
+        [
+            ".gitattributes",
+            "data/a.csv",
+            "data/c.csv",
+            "notes.txt",
+            CRATE_FILE
+        ]
+    );
 }
 
 #[tokio::test]
