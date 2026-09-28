@@ -9,7 +9,8 @@ use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::{GetObjectInput, get_object_info, get_object_routed};
+use crate::s3::object::get::{GetObjectInput, get_object_routed};
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::NodeId;
 use aruna_core::git::{LOCAL_OBJECTS, StoredObject};
@@ -17,6 +18,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::dataset_location::default_bucket;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use bytes::Bytes;
@@ -41,13 +43,13 @@ fn index_key(document: &MetadataRegistryRecord, sha256: &str) -> Vec<u8> {
     .concat()
 }
 
-/// This node's group-local ARC bucket, created through ordinary bucket operations.
+/// This node's group-local dataset bucket, created through ordinary bucket operations.
 pub async fn bucket(
     context: &DriverContext,
     document: &MetadataRegistryRecord,
     auth: &AuthContext,
 ) -> Result<BucketInfo, GitError> {
-    let name = format!("arc-{}", document.group_id.to_string().to_lowercase());
+    let name = default_bucket(document.group_id);
     match drive(GetBucketOperation::new(name.clone()), context).await {
         Ok(bucket) if bucket.group_id == document.group_id => return Ok(bucket),
         Ok(_) => return Err(GitError::Conflict),
@@ -85,7 +87,7 @@ pub async fn copy(
     records::load(context, LOCAL_OBJECTS, index_key(document, sha256)).await
 }
 
-/// Stores content under `key` in this node's ARC bucket after checking its SHA-256.
+/// Stores content under `key` in this node's dataset bucket after checking its SHA-256.
 pub async fn store(
     context: &DriverContext,
     auth: &AuthContext,
@@ -97,8 +99,23 @@ pub async fn store(
     if let Some(existing) = copy(context, document, sha256).await? {
         return Ok(existing);
     }
-    let node = local(context)?;
     let bucket = bucket(context, document, auth).await?;
+    let name = default_bucket(document.group_id);
+    let stored = put(context, auth, (&name, bucket), (key, size, sha256), body).await?;
+    records::insert(context, LOCAL_OBJECTS, index_key(document, sha256), &stored).await
+}
+
+/// Writes content to `key` in a bucket of this node through the ordinary put with its
+/// quota, gate and routing guards, after checking its SHA-256.
+pub async fn put(
+    context: &DriverContext,
+    auth: &AuthContext,
+    (name, bucket): (&str, BucketInfo),
+    (key, size, sha256): (String, u64, &str),
+    body: Blob,
+) -> Result<StoredObject, GitError> {
+    let node = local(context)?;
+    let group_id = bucket.group_id;
     let routing = bucket_snapshot(context, &bucket)
         .await
         .map_err(|_| GitError::Unavailable)?;
@@ -109,15 +126,14 @@ pub async fn store(
         .await
         .map_err(|_| GitError::Unavailable)?
         .quota
-        .effective_group_ceiling(&document.group_id);
-    let name = format!("arc-{}", document.group_id.to_string().to_lowercase());
+        .effective_group_ceiling(&group_id);
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
-        group_id: document.group_id,
+        group_id,
         realm_id: auth.realm_id,
         node_id: node,
         request: PutObjectInput {
-            bucket: name.clone(),
+            bucket: name.to_string(),
             key: key.clone(),
             content_length: Some(size),
             body: Some(body),
@@ -146,37 +162,52 @@ pub async fn store(
             | PutObjectError::ChecksumMismatch(_) => GitError::Invalid,
             _ => GitError::Unavailable,
         })?;
-    let input = GetObjectInput {
-        bucket: name.clone(),
-        key: key.clone(),
-        version_id: Some(result.version_id),
-        range: None,
-        group_id: document.group_id,
-        user_identity: auth.user_id,
-        node_id: node,
-    };
-    let info = get_object_info(context, input, auth.path_restrictions.clone())
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    let blake3 = info
-        .hashes
-        .get("blake3")
-        .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
+    let stored = described(context, (name, group_id), &key, Some(result.version_id))
+        .await?
         .ok_or(GitError::Unavailable)?;
-    let stored = StoredObject {
-        node_id: node,
-        group_id: Some(document.group_id),
-        bucket: name,
-        key,
-        version_id: result.version_id,
-        size,
-        sha256: sha256.to_string(),
-        blake3,
-    };
-    records::insert(context, LOCAL_OBJECTS, index_key(document, sha256), &stored).await
+    Ok(stored)
 }
 
-/// Stores a pack in this node's ARC bucket and returns its location for a record.
+/// The size and digests of an object version of this node, or of its current version with
+/// `None`; `None` when there is no such object. Callers authorize the read.
+pub async fn described(
+    context: &DriverContext,
+    (name, group_id): (&str, aruna_core::types::GroupId),
+    key: &str,
+    version: Option<ulid::Ulid>,
+) -> Result<Option<StoredObject>, GitError> {
+    let node = local(context)?;
+    let input = HeadObjectInput {
+        bucket: name.to_string(),
+        key: key.to_string(),
+        version_id: version,
+    };
+    let head = match drive(HeadObjectOperation::new(input), context).await {
+        Ok(head) => head,
+        Err(_) if version.is_none() => return Ok(None),
+        Err(_) => return Err(GitError::Unavailable),
+    };
+    let (Some(location), Some(version_id)) = (head.location, head.version_id) else {
+        return Ok(None);
+    };
+    let digest = |name: &str| location.hashes.get(name).cloned();
+    let blake3 = digest("blake3").and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok());
+    let (Some(blake3), Some(sha256)) = (blake3, digest("sha256")) else {
+        return Ok(None);
+    };
+    Ok(Some(StoredObject {
+        node_id: node,
+        group_id: Some(group_id),
+        bucket: name.to_string(),
+        key: key.to_string(),
+        version_id,
+        size: location.blob_size,
+        sha256: hex::encode(sha256),
+        blake3,
+    }))
+}
+
+/// Stores a pack in this node's dataset bucket and returns its location for a record.
 pub async fn store_pack(
     context: &DriverContext,
     auth: &AuthContext,

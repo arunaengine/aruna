@@ -5,6 +5,7 @@
 pub mod changes;
 pub mod hook;
 pub mod lfs;
+pub mod location;
 pub mod locks;
 pub mod merge;
 pub mod objects;
@@ -26,6 +27,7 @@ use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, GitRepository, GitRequest};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::dataset_location::default_bucket;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -113,7 +115,7 @@ pub async fn document(
     Ok(record)
 }
 
-/// The document's repository on this holder; its LFS content lives in the node's ARC bucket.
+/// The document's repository on this holder; new LFS content goes to the node's dataset bucket.
 pub async fn repository(
     context: &DriverContext,
     auth: &AuthContext,
@@ -125,7 +127,7 @@ pub async fn repository(
     let repository = GitRepository {
         document_id: id,
         group_id: document.group_id,
-        bucket: format!("arc-{}", document.group_id.to_string().to_lowercase()),
+        bucket: default_bucket(document.group_id),
     };
     Ok((document, repository))
 }
