@@ -760,22 +760,58 @@ fn link_raw_entity(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataLifecycleRecord {
-    Upsert { event: Box<MetadataEventRecord> },
-    Delete { event: MetadataDeleteRecord },
+    Upsert {
+        event: Box<MetadataEventRecord>,
+    },
+    Delete {
+        event: MetadataDeleteRecord,
+    },
+    /// An upsert whose author gave a commit message for its ARC snapshot.
+    /// Stored rows depend on the variant order, so new variants go last.
+    UpsertWithMessage {
+        event: Box<MetadataEventRecord>,
+        message: String,
+    },
 }
 
 impl MetadataLifecycleRecord {
+    /// The upsert of `event`, carrying `message` when the author gave one.
+    pub fn for_event(event: MetadataEventRecord, message: Option<String>) -> Self {
+        let event = Box::new(event);
+        match message {
+            Some(message) => Self::UpsertWithMessage { event, message },
+            None => Self::Upsert { event },
+        }
+    }
+
     pub fn document_id(&self) -> Ulid {
         match self {
-            Self::Upsert { event } => event.record.document_id,
+            Self::Upsert { event } | Self::UpsertWithMessage { event, .. } => {
+                event.record.document_id
+            }
             Self::Delete { event } => event.tombstone.document_id,
         }
     }
 
     pub fn event_id(&self) -> Ulid {
         match self {
-            Self::Upsert { event } => event.event_id,
+            Self::Upsert { event } | Self::UpsertWithMessage { event, .. } => event.event_id,
             Self::Delete { event } => event.event_id,
+        }
+    }
+
+    /// The upserted event; `None` for a delete.
+    pub fn upsert(&self) -> Option<&MetadataEventRecord> {
+        match self {
+            Self::Upsert { event } | Self::UpsertWithMessage { event, .. } => Some(event),
+            Self::Delete { .. } => None,
+        }
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::UpsertWithMessage { message, .. } => Some(message),
+            Self::Upsert { .. } | Self::Delete { .. } => None,
         }
     }
 }
@@ -1757,6 +1793,27 @@ mod tests {
             .expect("lifecycle decodes"),
             lifecycle
         );
+    }
+
+    #[test]
+    fn lifecycle_variant_tags() {
+        // Postcard encodes the variant index first; stored rows and sync ops depend on it.
+        let create = create_event(Ulid::from(1), Ulid::from(2));
+        let plain = MetadataLifecycleRecord::for_event(create.clone(), None);
+        let noted = MetadataLifecycleRecord::for_event(create.clone(), Some("Add run".into()));
+        let old = postcard::to_allocvec(&plain).expect("lifecycle serializes");
+        let new = postcard::to_allocvec(&noted).expect("lifecycle serializes");
+
+        assert_eq!(old[0], 0);
+        assert_eq!(new[0], 2);
+        assert_eq!(
+            old[1..],
+            postcard::to_allocvec(&create).expect("event serializes")[..]
+        );
+        let decoded: MetadataLifecycleRecord = postcard::from_bytes(&new).expect("decodes");
+        assert_eq!(decoded.message(), Some("Add run"));
+        assert_eq!(decoded.upsert(), Some(&create));
+        assert_eq!(plain.message(), None);
     }
 
     #[test]

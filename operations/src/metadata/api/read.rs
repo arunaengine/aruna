@@ -376,7 +376,8 @@ pub(super) fn document_lifecycle_deleted(
     let lifecycle: MetadataLifecycleRecord = postcard::from_bytes(value)
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
     let matches = match &lifecycle {
-        MetadataLifecycleRecord::Upsert { event } => {
+        MetadataLifecycleRecord::Upsert { event }
+        | MetadataLifecycleRecord::UpsertWithMessage { event, .. } => {
             event.record.document_id == record.document_id
                 && event.record.graph_iri == record.graph_iri
                 && event.record.realm_id == record.realm_id

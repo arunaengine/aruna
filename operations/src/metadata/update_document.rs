@@ -15,9 +15,9 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    create_acceptance_key, document_lifecycle_entry, event_log_key, event_log_prefix,
-    metadata_actor_entry, metadata_actor_key, profile_validation_entry, raw_budget_entry,
-    raw_budget_key, sync_revision_entry,
+    commit_message_entry, create_acceptance_key, document_lifecycle_entry, event_log_key,
+    event_log_prefix, metadata_actor_entry, metadata_actor_key, profile_validation_entry,
+    raw_budget_entry, raw_budget_key, sync_revision_entry,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -113,6 +113,8 @@ pub struct UpdateDocumentOperation {
     route_profile_status: Option<ProfileValidationStatus>,
     /// The graph version the caller based its change on; any other refuses the update.
     expected_graph: Option<String>,
+    /// The author's commit message for the ARC snapshot of this update.
+    message: Option<String>,
     /// Phase-time and identity sampling; production keeps the defaults.
     phase_source: crate::metadata::MetadataPhaseSource,
     state: UpdateDocumentState,
@@ -214,6 +216,7 @@ impl UpdateDocumentOperation {
             fenced: Vec::new(),
             route_profile_status,
             expected_graph: None,
+            message: None,
             phase_source,
             state: UpdateDocumentState::Init,
             output: None,
@@ -224,6 +227,12 @@ impl UpdateDocumentOperation {
     /// computed from an older graph never removes values that arrived since.
     pub fn with_expected_graph(mut self, version: String) -> Self {
         self.expected_graph = Some(version);
+        self
+    }
+
+    /// Records `message` as the commit message of this update's ARC snapshot.
+    pub fn with_message(mut self, message: Option<String>) -> Self {
+        self.message = message;
         self
     }
 
@@ -391,8 +400,10 @@ impl UpdateDocumentOperation {
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
-        let lifecycle_outbox = create_outbox_record(event, self.realm_config.as_ref(), false)
-            .fenced_at(self.generation_of(&event.record.placement));
+        let message = self.message.as_deref();
+        let lifecycle_outbox =
+            create_outbox_record(event, message, self.realm_config.as_ref(), false)
+                .fenced_at(self.generation_of(&event.record.placement));
         let outbox = (!event.record.holder_node_ids.is_empty()).then_some(&lifecycle_outbox);
         let status = new_pending_status(event, now);
         let job = new_materialization_job(event, now);
@@ -410,9 +421,10 @@ impl UpdateDocumentOperation {
                     .map_err(aruna_core::errors::ConversionError::from)?,
             );
         }
-        let lifecycle = MetadataLifecycleRecord::Upsert {
-            event: Box::new(event.clone()),
-        };
+        if let Some(message) = message {
+            writes.push(commit_message_entry(event, message)?);
+        }
+        let lifecycle = MetadataLifecycleRecord::for_event(event.clone(), self.message.clone());
         writes.push(document_lifecycle_entry(&lifecycle)?);
         if outbox.is_none() {
             let aruna_core::document::DocumentOutboxEvent::Upsert { change, .. } =
@@ -1300,12 +1312,13 @@ mod pure_tests {
     use super::*;
     use aruna_core::document::{
         DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+        DocumentTarget,
     };
     use aruna_core::keyspaces::{
-        DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
-        EVENT_LOG_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
-        METADATA_AUDIT_KEYSPACE, METADATA_INDEX_KEYSPACE, RAW_BUDGET_KEYSPACE,
-        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
+        COMMIT_MESSAGE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE,
+        DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+        MATERIALIZATION_STATUS_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        RAW_BUDGET_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
     };
     use aruna_core::storage_entries::{
         create_acceptance_key, event_log_key, metadata_registry_key, raw_budget_key,
@@ -1969,6 +1982,83 @@ mod pure_tests {
                 ..
             })] if *write_txn == txn_id
         ));
+    }
+
+    #[test]
+    fn update_carries_message() {
+        let writes = |message: Option<&str>| {
+            let actor = actor();
+            let record = record(&actor);
+            let mutation = UpdateDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            };
+            let mut operation = UpdateDocumentOperation::new(config(actor, &record, mutation))
+                .with_message(message.map(str::to_owned));
+            operation.start();
+            operation.step(registry_read(&record));
+            configured(&mut operation, realm_config_read(&record));
+            operation.step(batch_planned(&record));
+            let txn_id = Ulid::from_parts(9, 9);
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            operation.step(registry_read(&record));
+            operation.step(no_window());
+            let size = postcard::experimental::serialized_size(&create_event(&record)).unwrap();
+            operation.step(raw_budget_read(&record, 1, size as u64));
+            let effects = operation.step(raw_events(&record));
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            else {
+                panic!("expected update batch write, got {effects:?}");
+            };
+            writes.clone()
+        };
+        let lifecycles = |writes: &[(String, ByteView, ByteView)]| {
+            let stored = writes
+                .iter()
+                .find(|(keyspace, _, _)| keyspace == DOCUMENT_LIFECYCLE_KEYSPACE)
+                .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
+                .expect("lifecycle row is written");
+            let sent = writes
+                .iter()
+                .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
+                .map(|(_, _, value)| postcard::from_bytes::<DocumentOutboxRecord>(value).unwrap())
+                .find_map(|outbox| match (outbox.target, outbox.event) {
+                    (
+                        DocumentTarget::MetadataDocumentLifecycle { .. },
+                        DocumentOutboxEvent::Upsert { bytes, .. },
+                    ) => Some(postcard::from_bytes(&bytes).unwrap()),
+                    _ => None,
+                })
+                .expect("lifecycle outbox is written");
+            [stored, sent] as [MetadataLifecycleRecord; 2]
+        };
+
+        let plain = writes(None);
+        assert!(
+            plain
+                .iter()
+                .all(|(keyspace, _, _)| keyspace != COMMIT_MESSAGE_KEYSPACE)
+        );
+        for lifecycle in lifecycles(&plain) {
+            assert!(matches!(lifecycle, MetadataLifecycleRecord::Upsert { .. }));
+        }
+
+        let noted = writes(Some("Add the raw file"));
+        let (_, key, value) = noted
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == COMMIT_MESSAGE_KEYSPACE)
+            .expect("message row is written");
+        let event = lifecycles(&noted)[0].upsert().cloned().expect("upsert");
+        assert_eq!(
+            *key,
+            event_log_key(event.record.document_id, event.event_id)
+        );
+        assert_eq!(
+            postcard::from_bytes::<String>(value).unwrap(),
+            "Add the raw file"
+        );
+        for lifecycle in lifecycles(&noted) {
+            assert_eq!(lifecycle.message(), Some("Add the raw file"));
+        }
     }
 
     #[test]

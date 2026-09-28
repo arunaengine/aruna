@@ -448,7 +448,7 @@ mod pure_tests {
         (
             record,
             audit,
-            create_outbox_record(&create_event, None, false),
+            create_outbox_record(&create_event, None, None, false),
         )
     }
 

@@ -156,6 +156,8 @@ struct PendingCreateApply {
     record: MetadataEventRecord,
     bytes: Vec<u8>,
     lifecycle_revision: Option<DocumentChange>,
+    /// The author's commit message for the event's ARC snapshot.
+    message: Option<String>,
 }
 
 /// A permanently rejected sync operation awaiting durable evidence. Evidence is

@@ -18,7 +18,8 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    create_acceptance_entry, create_acceptance_key, profile_validation_entry, raw_budget_entry,
+    commit_message_entry, create_acceptance_entry, create_acceptance_key, profile_validation_entry,
+    raw_budget_entry,
 };
 use aruna_core::structs::execution::job::{
     JobPayload, JobRecord, RETENTION_MS, WorkspaceMode, pid_dedup_key,
@@ -106,6 +107,8 @@ pub struct CreateDocumentOperation {
     pending_realm_config: Option<RealmConfigDocument>,
     pending_placement: Option<PlacementRef>,
     pending_holders: Vec<NodeId>,
+    /// The author's commit message for the ARC snapshot of this create.
+    message: Option<String>,
     /// The phase-time and identity source. Production uses the default source;
     /// tests replace it before the first record is built.
     phase_source: crate::metadata::MetadataPhaseSource,
@@ -191,6 +194,7 @@ impl CreateDocumentOperation {
             pending_realm_config: None,
             pending_placement: None,
             pending_holders: Vec::new(),
+            message: None,
             phase_source: crate::metadata::MetadataPhaseSource::default(),
             output: None,
         }
@@ -227,6 +231,16 @@ impl CreateDocumentOperation {
         &self.config
     }
 
+    /// Records `message` as the commit message of this create's ARC snapshot.
+    pub fn with_message(mut self, message: Option<String>) -> Self {
+        self.message = message;
+        self
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
     /// A pristine operation with the same inputs, for a conflict retry.
     fn fresh_copy(&self) -> Self {
         Self {
@@ -242,6 +256,7 @@ impl CreateDocumentOperation {
             pending_realm_config: None,
             pending_placement: None,
             pending_holders: Vec::new(),
+            message: self.message.clone(),
             phase_source: self.phase_source,
             output: None,
         }
@@ -586,6 +601,9 @@ impl CreateDocumentOperation {
             writes.push(raw_budget_entry(&raw_budget)?);
             writes.push(create_acceptance_entry(&create_event)?);
             writes.push(profile_validation_entry(&status)?);
+            if let Some(message) = &self.message {
+                writes.push(commit_message_entry(&create_event, message)?);
+            }
             Ok(writes)
         });
         match writes.and_then(|mut writes| {

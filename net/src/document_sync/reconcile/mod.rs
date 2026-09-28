@@ -452,6 +452,7 @@ impl DocumentSyncService {
             record,
             bytes,
             lifecycle_revision: None,
+            message: None,
         })
     }
 }
