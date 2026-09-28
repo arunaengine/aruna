@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::structs::storage::data_identity::{
-    CONTENT_URL, DataEntity, LOCAL_PATH, ObjectLocation, content_id, normalized_id, text_values,
+    CONTENT_URL, DataEntity, LOCAL_PATH, LOCAL_PATH_IRI, ObjectLocation, content_id,
+    ensure_local_term, local_paths, normalized_id, text_values,
 };
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
@@ -125,7 +126,7 @@ pub fn root_id(document: &Value) -> Option<String> {
 /// The repository path of an entity: its relative `@id`, or else its `localPath`.
 pub fn entity_path(entity: &Value) -> Option<String> {
     entity["@id"].as_str().and_then(data_path).or_else(|| {
-        text_values(entity.get(LOCAL_PATH))
+        local_paths(entity)
             .iter()
             .find_map(|path| data_path(&path_id(path)))
     })
@@ -224,6 +225,7 @@ pub fn name_stored(document: &mut Value, stored: &BTreeMap<String, StoredFile>) 
             normalized_id(file.hash, &file.location, &mut used)
         };
         let before = object.clone();
+        object.remove(LOCAL_PATH_IRI);
         DataEntity {
             id: id.clone(),
             location: file.location.clone(),
@@ -234,10 +236,17 @@ pub fn name_stored(document: &mut Value, stored: &BTreeMap<String, StoredFile>) 
         .apply(object);
         changed |= *object != before;
         if let Some(old) = old.filter(|old| *old != id) {
+            // References may spell a relative path differently, so its canonical form counts.
+            if let Some(path) = data_path(&old) {
+                renamed.insert(path_id(&path), id.clone());
+            }
             renamed.insert(old, id);
         }
     }
     rename_ids(document, &renamed);
+    if changed {
+        ensure_local_term(document);
+    }
     changed
 }
 
@@ -254,6 +263,7 @@ pub fn git_copy(document: &mut Value, paths: &BTreeMap<String, String>) {
         };
         object.remove(CONTENT_URL);
         object.remove(LOCAL_PATH);
+        object.remove(LOCAL_PATH_IRI);
         renamed.insert(id, path_id(path));
     }
     rename_ids(document, &renamed);
@@ -309,7 +319,11 @@ fn rename_ids(value: &mut Value, renamed: &BTreeMap<String, String>) {
             for (key, value) in object.iter_mut() {
                 match value {
                     Value::String(id) if key == "@id" => {
-                        if let Some(new) = renamed.get(id.as_str()) {
+                        let canonical = data_path(id).map(|path| path_id(&path));
+                        let new = renamed
+                            .get(id.as_str())
+                            .or_else(|| canonical.and_then(|path| renamed.get(&path)));
+                        if let Some(new) = new {
                             *id = new.clone();
                         }
                     }
@@ -506,6 +520,45 @@ mod tests {
             metadata_layout(&document(json!([]), vec![nested])),
             Layout::RoCrate
         );
+    }
+
+    #[test]
+    fn renames_every_spelling() {
+        let files = vec![
+            json!({"@id": "data/a.csv", "@type": "File"}),
+            json!({"@id": "./data/b.csv", "@type": "File"}),
+        ];
+        let parts = json!([{"@id": "./data/a.csv"}, {"@id": "data/b.csv"}]);
+        let mut crate_value = document(parts, files);
+        let map = BTreeMap::from([
+            ("data/a.csv".to_string(), stored("doc/data/a.csv", 1)),
+            ("data/b.csv".to_string(), stored("doc/data/b.csv", 2)),
+        ]);
+        assert!(name_stored(&mut crate_value, &map));
+        assert_eq!(
+            crate_value["@graph"][1]["hasPart"],
+            json!([{"@id": content_id([1; 32])}, {"@id": content_id([2; 32])}])
+        );
+        let context = crate_value["@context"].to_string();
+        assert!(
+            context.contains(LOCAL_PATH_IRI),
+            "localPath term in {context}"
+        );
+    }
+
+    #[test]
+    fn reads_full_path_iri() {
+        let entity = json!({"@id": content_id([1; 32]), "@type": "File",
+            "contentUrl": "s3://datasets-g/doc/data/a.csv", LOCAL_PATH_IRI: "data/a.csv"});
+        assert_eq!(entity_path(&entity).as_deref(), Some("data/a.csv"));
+        let mut crate_value = document(json!([{"@id": content_id([1; 32])}]), vec![entity]);
+        git_copy(
+            &mut crate_value,
+            &BTreeMap::from([(content_id([1; 32]), "data/a.csv".to_string())]),
+        );
+        let copied = &crate_value["@graph"][2];
+        assert_eq!(copied["@id"], "data/a.csv");
+        assert!(copied.get(LOCAL_PATH_IRI).is_none() && copied.get("contentUrl").is_none());
     }
 
     #[test]

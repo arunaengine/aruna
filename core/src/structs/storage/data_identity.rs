@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 
 pub const CONTENT_URL: &str = "contentUrl";
 pub const LOCAL_PATH: &str = "localPath";
+pub const LOCAL_PATH_IRI: &str = "https://w3id.org/ro/terms#localPath";
 
 /// An object named by an `s3://<bucket>/<key>` URL on the node that reads it.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -141,6 +142,40 @@ impl DataEntity {
 }
 
 /// The text values of a compact JSON-LD property, including `{"@id": ...}` references.
+/// The `localPath` values of an entity, under the short term or its full IRI.
+pub fn local_paths(entity: &Value) -> Vec<String> {
+    let mut paths = text_values(entity.get(LOCAL_PATH));
+    paths.extend(text_values(entity.get(LOCAL_PATH_IRI)));
+    paths
+}
+
+/// Defines the `localPath` term in the document context, which RO-Crate contexts lack.
+/// Returns false when the document is not a JSON object.
+pub fn ensure_local_term(document: &mut Value) -> bool {
+    let Some(object) = document.as_object_mut() else {
+        return false;
+    };
+    let mapping = serde_json::json!({ LOCAL_PATH: LOCAL_PATH_IRI });
+    let defines =
+        |value: &Value| value.get(LOCAL_PATH).and_then(Value::as_str) == Some(LOCAL_PATH_IRI);
+    let context = match object.remove("@context") {
+        Some(Value::Array(mut values)) => {
+            if !values.iter().any(defines) {
+                values.push(mapping);
+            }
+            Value::Array(values)
+        }
+        Some(Value::Object(mut context)) => {
+            context.insert(LOCAL_PATH.into(), Value::String(LOCAL_PATH_IRI.into()));
+            Value::Object(context)
+        }
+        Some(context) => Value::Array(vec![context, mapping]),
+        None => mapping,
+    };
+    object.insert("@context".into(), context);
+    true
+}
+
 pub fn text_values(value: Option<&Value>) -> Vec<String> {
     match value {
         Some(Value::String(value)) => vec![value.clone()],

@@ -4,7 +4,7 @@
 
 use crate::repo_layout::{CRATE_FILE, data_path, root_id};
 use crate::structs::storage::data_identity::{
-    CONTENT_URL, LOCAL_PATH, ObjectLocation, text_values,
+    CONTENT_URL, LOCAL_PATH, LOCAL_PATH_IRI, ObjectLocation, text_values,
 };
 use crate::structs::storage::dataset_location::DatasetLocation;
 use serde_json::{Map, Value};
@@ -90,7 +90,9 @@ pub fn merge(
             .to_url()
         });
         let names = |node: &Map<String, Value>| {
-            text_values(node.get(LOCAL_PATH)).contains(&path)
+            [LOCAL_PATH, LOCAL_PATH_IRI]
+                .iter()
+                .any(|key| text_values(node.get(*key)).contains(&path))
                 || url
                     .as_ref()
                     .is_some_and(|url| text_values(node.get(CONTENT_URL)).contains(url))
