@@ -93,6 +93,18 @@ pub(super) async fn open(
     Ok((document, projection, guard))
 }
 
+/// Refreshes under the lock and releases it; the reads that follow use the projection's refs
+/// or immutable commits, so they may overlap other requests.
+async fn read(
+    context: &DriverContext,
+    store: &GitStore,
+    auth: &AuthContext,
+    id: Ulid,
+) -> Result<Projection, GitError> {
+    let (_, projection, _) = open(context, store, auth, id, Permission::READ).await?;
+    Ok(projection)
+}
+
 pub(super) async fn resolve(
     store: &GitStore,
     auth: &AuthContext,
@@ -310,7 +322,7 @@ pub async fn list(
     id: Ulid,
     query: VersionQuery<'_>,
 ) -> Result<(Vec<Version>, Option<String>), GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     let (head, skip) = match query.cursor {
         Some(cursor) => {
             let (head, skip) = cursor.split_once('.').ok_or(GitError::Invalid)?;
@@ -355,7 +367,7 @@ pub async fn show(
     id: Ulid,
     revision: &str,
 ) -> Result<(Version, Vec<FileChange>), GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     let commit = resolve(store, auth, id, revision).await?;
     let info = log(store, auth, id, (&commit, None), 0, 1)
         .await?
@@ -381,7 +393,7 @@ pub async fn compare(
     from: Option<&str>,
     to: &str,
 ) -> Result<Comparison, GitError> {
-    let (_, _, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    read(context, store, auth, id).await?;
     let from = match from {
         Some(from) => Some(resolve(store, auth, id, from).await?),
         None => None,
@@ -411,7 +423,7 @@ pub async fn branches(
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Vec<(String, Version)>, GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
     let heads: Vec<_> = projection
         .state
@@ -437,7 +449,7 @@ pub async fn tags(
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Vec<Named>, GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     peeled_tags(store, auth, id, &projection).await
 }
 
@@ -536,7 +548,7 @@ pub async fn conflicts(
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Vec<(Conflict, Version)>, GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
     let kept: Vec<_> = projection
         .state
@@ -567,7 +579,7 @@ pub async fn conflict_ref(
     id: Ulid,
     conflict: Ulid,
 ) -> Result<String, GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     projection
         .state
         .refs

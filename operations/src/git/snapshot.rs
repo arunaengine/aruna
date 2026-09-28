@@ -476,8 +476,10 @@ pub async fn status(
     id: Ulid,
 ) -> Result<(Option<GitStatus>, Projection, Option<Layout>), GitError> {
     let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
-    let _guard = lock(id).await;
+    let guard = lock(id).await;
     let projection = refresh(context, store, &document).await?;
+    // The layout read names main's commit, so it needs no lock.
+    drop(guard);
     let status = records::load(context, STATUS, id.to_bytes().to_vec()).await?;
     let layout = match projection.state.refs.get("refs/heads/main") {
         Some(main) => {
