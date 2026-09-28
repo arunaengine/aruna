@@ -252,9 +252,8 @@ pub(super) async fn change(
                 .as_str()
                 .is_some_and(|url| url.ends_with("/empty.txt"))
         })
-        .map(|entity| entity["@id"].clone())
-        .ok_or("empty file entity missing")?;
-    let empty = |entity: &Value| entity["@id"] == empty_id;
+        .map(|entity| entity["@id"].clone());
+    let empty = |entity: &Value| empty_id.as_ref() == Some(&entity["@id"]);
     for entity in graph.iter_mut() {
         if entity["@type"] == "Dataset" {
             entity["description"] = json!(text);
