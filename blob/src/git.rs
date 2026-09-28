@@ -29,6 +29,11 @@ impl GitStore {
         }
     }
 
+    /// Whether the local repository still has the required files and settings.
+    pub async fn configured(&self, id: ulid::Ulid) -> bool {
+        configured(&self.root.join(format!("{id}.git")), &self.helper).await
+    }
+
     pub async fn execute(
         &self,
         effect: GitEffect,
@@ -525,11 +530,12 @@ mod tests {
         tokio::fs::remove_file(repository.join("HEAD"))
             .await
             .expect("broken repository");
+        assert!(!store.configured(id).await);
         store
             .execute(GitEffect::Initialize(id), actor)
             .await
             .expect("broken repository is repaired");
         assert!(repository.join("HEAD").exists());
-        assert!(configured(&repository, &directory.path().join("helper")).await);
+        assert!(store.configured(id).await);
     }
 }

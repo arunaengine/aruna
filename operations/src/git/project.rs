@@ -47,8 +47,8 @@ const REMEMBERED: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 /// More kept ancestry answers than this for one document are dropped instead.
 const MAX_ANSWERS: usize = 4096;
 
-/// The document's last event, its update time and whether other holders may generate yet.
-type Inputs = (Ulid, u64, bool);
+/// The node, document's last event, update time and whether other holders may generate yet.
+type Inputs = (Option<NodeId>, Ulid, u64, bool);
 
 type Recent = Mutex<LruCache<Ulid, (Inputs, Projection)>>;
 static RECENT: LazyLock<Recent> = LazyLock::new(|| Mutex::new(LruCache::new(REMEMBERED)));
@@ -57,34 +57,53 @@ static RECENT: LazyLock<Recent> = LazyLock::new(|| Mutex::new(LruCache::new(REME
 static ANSWERS: LazyLock<Mutex<LruCache<Ulid, Ancestry>>> =
     LazyLock::new(|| Mutex::new(LruCache::new(REMEMBERED)));
 
-fn inputs(document: &MetadataRegistryRecord, overdue: bool) -> Inputs {
-    (document.last_event_id, document.updated_at_ms, overdue)
+fn inputs(node: Option<NodeId>, document: &MetadataRegistryRecord, overdue: bool) -> Inputs {
+    (
+        node,
+        document.last_event_id,
+        document.updated_at_ms,
+        overdue,
+    )
 }
 
 /// The projection of the last refresh, if the document, its holders and all its records,
 /// replicated ones included, are unchanged since then.
 pub async fn recent(
     context: &DriverContext,
+    store: &GitStore,
     document: &MetadataRegistryRecord,
     overdue: bool,
 ) -> Result<Option<Projection>, GitError> {
-    let Some(projection) = remembered(document, overdue) else {
+    let node = context.net_handle.as_ref().map(|net| net.node_id());
+    let Some(projection) = remembered(node, document, overdue) else {
         return Ok(None);
     };
+    if !store.configured(document.document_id).await {
+        return Ok(None);
+    }
     let holders = publish::holders(context, document).await?;
     let records = records::scan(context, document.document_id).await?;
     Ok((holders == projection.holders && records == projection.records).then_some(projection))
 }
 
-fn remembered(document: &MetadataRegistryRecord, overdue: bool) -> Option<Projection> {
+fn remembered(
+    node: Option<NodeId>,
+    document: &MetadataRegistryRecord,
+    overdue: bool,
+) -> Option<Projection> {
     let mut recent = RECENT.lock().ok()?;
     let (known, projection) = recent.get(&document.document_id)?;
-    (*known == inputs(document, overdue)).then(|| projection.clone())
+    (*known == inputs(node, document, overdue)).then(|| projection.clone())
 }
 
-pub fn remember(document: &MetadataRegistryRecord, overdue: bool, projection: &Projection) {
+pub fn remember(
+    node: Option<NodeId>,
+    document: &MetadataRegistryRecord,
+    overdue: bool,
+    projection: &Projection,
+) {
     if let Ok(mut recent) = RECENT.lock() {
-        let entry = (inputs(document, overdue), projection.clone());
+        let entry = (inputs(node, document, overdue), projection.clone());
         recent.put(document.document_id, entry);
     }
 }
@@ -243,6 +262,7 @@ mod tests {
 
     #[test]
     fn inputs_decide_reuse() {
+        let node = Some(iroh::SecretKey::from_bytes(&[1; 32]).public());
         let document = document();
         let mut projection = Projection {
             state: GitState::default(),
@@ -253,19 +273,21 @@ mod tests {
             .state
             .refs
             .insert("refs/heads/main".into(), "a".repeat(40));
-        remember(&document, false, &projection);
-        let reused = remembered(&document, false).expect("unchanged inputs reuse");
+        remember(node, &document, false, &projection);
+        let reused = remembered(node, &document, false).expect("unchanged inputs reuse");
         assert_eq!(reused.state, projection.state);
+        let other = Some(iroh::SecretKey::from_bytes(&[2; 32]).public());
+        assert!(remembered(other, &document, false).is_none());
         // Other holders may generate once the revision is overdue, so that refreshes again.
-        assert!(remembered(&document, true).is_none());
+        assert!(remembered(node, &document, true).is_none());
         let edited = MetadataRegistryRecord {
             last_event_id: Ulid::from(2),
             updated_at_ms: 2,
             ..document.clone()
         };
-        assert!(remembered(&edited, false).is_none());
+        assert!(remembered(node, &edited, false).is_none());
         forget(document.document_id);
-        assert!(remembered(&document, false).is_none());
+        assert!(remembered(node, &document, false).is_none());
     }
 
     #[test]

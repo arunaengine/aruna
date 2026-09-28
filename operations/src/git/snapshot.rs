@@ -520,7 +520,7 @@ pub async fn refresh(
     document: &MetadataRegistryRecord,
 ) -> Result<Projection, GitError> {
     let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
-    if let Some(projection) = recent(context, document, overdue).await? {
+    if let Some(projection) = recent(context, store, document, overdue).await? {
         return Ok(projection);
     }
     let projection = update(context, store, document, None, false).await?;
@@ -530,7 +530,8 @@ pub async fn refresh(
         .await
         .is_ok_and(|rows| rows.is_empty())
     {
-        remember(document, overdue, &projection);
+        let node = context.net_handle.as_ref().map(|net| net.node_id());
+        remember(node, document, overdue, &projection);
     }
     Ok(projection)
 }
