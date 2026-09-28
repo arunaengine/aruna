@@ -4,6 +4,7 @@
 
 use crate::git::{command, exchange};
 use aruna_core::git::{GitSnapshot, LinkedObject, MAX_GIT_BYTES, MergeOutcome, Refs};
+use aruna_core::repo_layout::Layout;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -36,6 +37,9 @@ pub async fn export(directory: &Path, revision: &str) -> std::io::Result<Value> 
     let oid = std::str::from_utf8(&oid)
         .map_err(std::io::Error::other)?
         .trim();
+    if crate::rocrate::layout(directory, oid).await? == Layout::RoCrate {
+        return crate::rocrate::export(directory, oid).await;
+    }
     let tree = command(directory, &["ls-tree", "-rlz", oid]).await?;
     let mut files = BTreeMap::new();
     let mut total = 0usize;
@@ -70,7 +74,7 @@ fn failed(error: &str) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
-type Files = BTreeMap<String, (String, Vec<u8>)>;
+pub(crate) type Files = BTreeMap<String, (String, Vec<u8>)>;
 
 /// Writes `base` (or an empty tree) with `files` replaced and `removed` paths dropped.
 async fn write_tree(
@@ -239,7 +243,7 @@ async fn reconcile(
         .map(Some)
 }
 
-type Pointers = std::collections::BTreeSet<String>;
+pub(crate) type Pointers = std::collections::BTreeSet<String>;
 
 /// Converts the snapshot's metadata into ARC files. Data files the metadata needs come
 /// from `base`. Unrepresentable metadata is an `Err` value.
@@ -419,6 +423,9 @@ pub async fn merge_metadata(
     new: &str,
     graph: &str,
 ) -> std::io::Result<Result<Option<String>, String>> {
+    if crate::rocrate::layout(directory, new).await? == Layout::RoCrate {
+        return crate::rocrate::merge_metadata(directory, old, new, graph).await;
+    }
     let derived = export(directory, new).await?;
     if let Some(error) = derived["error"].as_str() {
         return Ok(Err(error.into()));
