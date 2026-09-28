@@ -13,6 +13,7 @@ use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CommitInfo, FileChange, GitEffect, GitEvent, RefUpdate, ZERO_OID, refs_clash, valid_ref,
 };
+use aruna_core::repo_layout::{ARUNA_FILE, entity_path, git_copy, is_file};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
@@ -41,7 +42,7 @@ pub struct Comparison {
     /// `None` compares against an empty ARC.
     pub from: Option<String>,
     pub to: String,
-    /// `None` when either side has no readable ISA metadata.
+    /// `None` when either side has no readable metadata.
     pub entities: Option<Vec<EntityChange>>,
     pub files: Vec<FileChange>,
 }
@@ -217,6 +218,36 @@ pub(super) async fn rocrate(
     };
     let mut value: Value = serde_json::from_slice(&bytes).ok()?;
     value.get_mut("rocrate").map(Value::take)
+}
+
+/// The full metadata graph of a commit: `aruna-metadata.json` of an ARC snapshot, otherwise
+/// its RO-Crate. Stored entities are named by their repository path, as in plain Git copies,
+/// so a version before and after a file was stored compares equal.
+pub(super) async fn graph(
+    store: &GitStore,
+    auth: &AuthContext,
+    id: Ulid,
+    commit: &str,
+) -> Option<Value> {
+    let effect = GitEffect::ReadFile {
+        document_id: id,
+        revision: commit.to_string(),
+        path: ARUNA_FILE.to_string(),
+    };
+    let mut value = match execute(store, effect, auth.user_id).await.ok()? {
+        GitEvent::File(Some(bytes)) => serde_json::from_slice(&bytes).ok()?,
+        GitEvent::File(None) => rocrate(store, auth, id, commit).await?,
+        _ => return None,
+    };
+    let paths: BTreeMap<String, String> = value["@graph"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entity| is_file(entity) && entity.get("localPath").is_some())
+        .filter_map(|entity| Some((entity["@id"].as_str()?.to_owned(), entity_path(entity)?)))
+        .collect();
+    git_copy(&mut value, &paths);
+    Some(value)
 }
 
 pub(super) fn branch_ref(name: &str) -> Result<String, GitError> {
@@ -401,10 +432,10 @@ pub async fn compare(
     let to = resolve(store, auth, id, to).await?;
     let files = diff(store, auth, id, from.as_deref(), &to).await?;
     let before = match &from {
-        Some(from) => rocrate(store, auth, id, from).await,
+        Some(from) => graph(store, auth, id, from).await,
         None => Some(serde_json::json!({ "@graph": [] })),
     };
-    let entities = match (before, rocrate(store, auth, id, &to).await) {
+    let entities = match (before, graph(store, auth, id, &to).await) {
         (Some(before), Some(after)) => Some(entity_changes(&before, &after)),
         _ => None,
     };
@@ -621,6 +652,83 @@ mod tests {
             ..commit
         };
         assert_eq!(version(commit, &state, &[]).metadata_event_id, None);
+    }
+
+    async fn git(path: &std::path::Path, args: &[&str]) -> String {
+        let output = tokio::process::Command::new("git")
+            .current_dir(path)
+            .args(["-c", "user.name=Ada", "-c", "user.email=ada@example.org"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .await
+            .expect("git runs");
+        String::from_utf8(output.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_string()
+    }
+
+    fn metadata(measured: &[&str]) -> Value {
+        serde_json::json!({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"},
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}},
+            {"@id": "./", "@type": "Dataset", "name": "Liver", "description": "Liver runs",
+                "datePublished": "2026-09-28", "variableMeasured": measured,
+                "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}}]})
+    }
+
+    /// Commits `file` holding `value` and returns the commit.
+    async fn commit(path: &std::path::Path, file: &str, value: &Value) -> String {
+        tokio::fs::write(path.join(file), value.to_string())
+            .await
+            .expect("write");
+        git(path, &["add", "-A"]).await;
+        git(path, &["commit", "-q", "-m", "Edit"]).await;
+        git(path, &["rev-parse", "HEAD"]).await
+    }
+
+    #[tokio::test]
+    async fn compares_full_graph() {
+        // ARC snapshots keep the full graph in `aruna-metadata.json`, plain ones in the crate.
+        for file in [ARUNA_FILE, aruna_core::repo_layout::CRATE_FILE] {
+            let root = tempfile::tempdir().expect("directory");
+            let id = Ulid::from(9);
+            let path = root.path().join(format!("{id}.git"));
+            tokio::fs::create_dir(&path).await.expect("folder");
+            git(&path, &["init", "-q", "--initial-branch=main"]).await;
+            let before = commit(&path, file, &metadata(&["depth"])).await;
+            let after = commit(&path, file, &metadata(&["depth", "stuff"])).await;
+            let store = GitStore::new(root.path().to_path_buf(), "helper".into());
+            let auth = super::super::project::author(aruna_core::UserId::nil(
+                aruna_core::structs::identity::realm::RealmId([1; 32]),
+            ));
+            let before = graph(&store, &auth, id, &before).await.expect("before");
+            let after = graph(&store, &auth, id, &after).await.expect("after");
+            let changes = entity_changes(&before, &after);
+            assert_eq!(changes.len(), 1, "{file}");
+            assert_eq!(changes[0].id, "./");
+            assert_eq!(changes[0].properties[0].name, "variableMeasured");
+            assert_eq!(changes[0].properties[0].after.len(), 2);
+        }
+    }
+
+    #[test]
+    fn stored_entities_compare_by_path() {
+        let stored = serde_json::json!({"@graph": [{"@id": "https://w3id.org/aruna/data/ab",
+            "@type": "File", "name": "a.csv", "contentUrl": "s3://b/doc/data/a.csv",
+            "localPath": "data/a.csv"}]});
+        let plain = serde_json::json!({"@graph": [{"@id": "data/a.csv", "@type": "File",
+            "name": "a.csv"}]});
+        let mut copied = stored.clone();
+        let paths = BTreeMap::from([(
+            "https://w3id.org/aruna/data/ab".to_string(),
+            "data/a.csv".to_string(),
+        )]);
+        git_copy(&mut copied, &paths);
+        assert!(entity_changes(&plain, &copied).is_empty());
     }
 
     #[test]
