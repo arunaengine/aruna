@@ -9,6 +9,7 @@ pub mod alpn;
 pub mod audit;
 pub mod auth;
 pub mod compute;
+pub mod crate_merge;
 pub mod credential_encryption;
 pub mod document;
 pub mod effects;
