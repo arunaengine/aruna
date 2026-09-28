@@ -4,6 +4,7 @@
 
 use super::format_timestamp_ms;
 use crate::error::{ProfileFindingResponse, ValidationViolationResponse};
+use crate::routes::git::location::StorageLocationRequest;
 use aruna_core::metadata::{
     ProfileValidationCompleteness, ProfileValidationState, ProfileValidationStatus,
 };
@@ -207,6 +208,9 @@ pub struct CreateScaffoldRequest {
     /// trimming; empty or omitted keeps the default message.
     #[serde(default)]
     pub message: Option<String>,
+    /// Where files pushed through Git are stored; omitted keeps the default location.
+    #[serde(default)]
+    pub storage_location: Option<StorageLocationRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -223,6 +227,9 @@ pub struct CreateRoCrateRequest {
     /// trimming; empty or omitted keeps the default message.
     #[serde(default)]
     pub message: Option<String>,
+    /// Where files pushed through Git are stored; omitted keeps the default location.
+    #[serde(default)]
+    pub storage_location: Option<StorageLocationRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::location::StorageLocation;
 use super::{base_url, map_error};
 use crate::auth::require_realm_auth;
 use crate::error::{ServerError, ServerResult};
@@ -31,6 +32,8 @@ pub struct RepositoryStatus {
     /// Layout of main: `arc` with `isa.investigation.xlsx` at its root, otherwise `rocrate`.
     /// `null` while the repository has no main branch.
     pub layout: Option<RepositoryLayout>,
+    /// Where pushed data files are stored.
+    pub storage_location: StorageLocation,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -51,10 +54,10 @@ impl From<Layout> for RepositoryLayout {
 
 #[utoipa::path(get, path = "/metadata/{document_id}/git", tag = "metadata/git",
     security(("bearer_auth" = [])), summary = "Get the automatic Git repository",
-    description = "Returns the automatic Git repository, its layout and its snapshot status.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: any current holder of the document serves the repository from replicated Git records and rebuilds a missing local copy. The protected aruna branch tracks graph snapshots, which are also merged into main. Concurrent pushes to one branch on different holders keep the first; the other is listed under refs/conflicts/. A main with isa.investigation.xlsx at its root is an ARC and gets ARC snapshots; any other main is a plain RO-Crate and gets ro-crate-metadata.json snapshots. A new repository whose metadata cannot become an ARC starts as a plain RO-Crate. A conversion error means no new valid snapshot was published.",
+    description = "Returns the automatic Git repository, its layout and its snapshot status.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: any current holder of the document serves the repository from replicated Git records and rebuilds a missing local copy. The protected aruna branch tracks graph snapshots, which are also merged into main. Concurrent pushes to one branch on different holders keep the first; the other is listed under refs/conflicts/. The metadata decides the snapshot layout: a root with additionalType Investigation, or a study or assay by additionalType, makes an ARC; any other dataset gets plain RO-Crate snapshots with ro-crate-metadata.json. A main that Aruna generated as an ARC for metadata without these markers switches to a plain RO-Crate with its next snapshot; history is kept. In plain snapshots, data entities that name Aruna objects appear at their localPath, or at their key inside the storage location, as Git LFS pointers. A push to main stores new and changed files of a plain RO-Crate in the storage location and names their entities by content address; removing a file keeps the stored object. A conversion error means no new valid snapshot was published.",
     params(("document_id" = String, Path, description = "Metadata document ID")),
     responses((status = 200, description = "Repository and conversion status", body = RepositoryStatus,
-               example = json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","bucket":"arc-storage","revision":"01M000000000000000000000001","commit":"1111111111111111111111111111111111111111","error":null,"refs":{"refs/heads/aruna":"1111111111111111111111111111111111111111","refs/heads/main":"1111111111111111111111111111111111111111"},"layout":"rocrate"})),
+               example = json!({"document_id":"01M000000000000000000000000","clone_url":"https://node.example/api/v1/git/01M000000000000000000000000.git","lfs_url":"https://node.example/api/v1/git/01M000000000000000000000000.git/info/lfs","bucket":"datasets-01jabcdef0123456789abcdefg","revision":"01M000000000000000000000001","commit":"1111111111111111111111111111111111111111","error":null,"refs":{"refs/heads/aruna":"1111111111111111111111111111111111111111","refs/heads/main":"1111111111111111111111111111111111111111"},"layout":"rocrate","storage_location":{"bucket":"datasets-01jabcdef0123456789abcdefg","prefix":"01M000000000000000000000000/","default":true}})),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
               (status = 404, description = "Document missing or not held by this node"),
               (status = 503, description = "Metadata or conversion runtime unavailable")))]
@@ -65,6 +68,9 @@ pub async fn repository_status(
 ) -> ServerResult<Json<RepositoryStatus>> {
     let auth = require_realm_auth(&state, auth)?;
     let (_, repository) = git::repository(&state.get_ctx(), &auth, id, Permission::READ)
+        .await
+        .map_err(map_error)?;
+    let storage_location = git::location::get(&state.get_ctx(), &auth, id)
         .await
         .map_err(map_error)?;
     let (status, projection, layout) = git::snapshot::status(
@@ -97,6 +103,7 @@ pub async fn repository_status(
             .and_then(|value| value.error),
         refs: projection.state.refs,
         layout: layout.map(RepositoryLayout::from),
+        storage_location: StorageLocation::new(storage_location),
     }))
 }
 

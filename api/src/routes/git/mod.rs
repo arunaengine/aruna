@@ -4,6 +4,7 @@
 
 mod branches;
 mod lfs;
+pub(crate) mod location;
 mod locks;
 mod snapshot;
 mod transport;
@@ -31,6 +32,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(locks::verify))
         .routes(routes!(locks::unlock))
         .routes(routes!(snapshot::repository_status))
+        .routes(routes!(location::get_location, location::put_location))
         .routes(routes!(snapshot::export_revision))
         .routes(routes!(transport::advertise))
         .routes(routes!(transport::rpc))

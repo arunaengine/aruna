@@ -274,6 +274,7 @@ async fn create_doc(fx: &Fixture, group_id: Ulid, path: &str, name: &str) -> Str
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await

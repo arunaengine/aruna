@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
-use crate::error::{ErrorResponse, ServerResult};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
     MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, commit_message,
@@ -14,6 +14,7 @@ use crate::metadata::{
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::git::GitError;
 use aruna_operations::metadata::api::{
     GetVisibleRequest, MetadataLookupRequest, lookup_metadata_path as run_lookup_metadata_path,
 };
@@ -46,6 +47,11 @@ a holder that re-runs both checks under the caller's own token.
 - The optional `message` becomes the Git commit message of the document's ARC snapshot for this
   revision. The `Aruna-Revision` trailer is always added, and lines starting with `Aruna-` are
   dropped from the message. Without a message the snapshot keeps the default message.
+- The optional `storage_location` chooses where files pushed through Git are stored, as with
+  `PUT /metadata/{document_id}/storage-location`. The bucket must exist on this node and allow
+  WRITE under the prefix, except the default `datasets-<group id>` bucket. When this node cannot
+  record the choice for the new document, the document is still created with the default
+  location; check it with `GET /metadata/{document_id}/storage-location`.
 
 **Limits**: the document path is normalized before use and must not be empty. `message` is plain
 text of at most 4096 bytes after trimming; an empty message counts as none."#,
@@ -64,7 +70,8 @@ text of at most 4096 bytes after trimming; an empty message counts as none."#,
                         "date_published": "2026-04-09",
                         "license": "https://creativecommons.org/licenses/by/4.0/",
                         "public": true,
-                        "message": "Add LC-MS run 42"
+                        "message": "Add LC-MS run 42",
+                        "storage_location": { "bucket": "lab-data", "prefix": "proteomics/run-42/" }
                     })
                 )
             ),
@@ -122,9 +129,10 @@ text of at most 4096 bytes after trimming; an empty message counts as none."#,
                 )
             )
         ),
-        (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
+        (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, an invalid storage location bucket or prefix, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path or the new document's path", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path, the new document's path or the chosen storage location", body = ErrorResponse),
+        (status = 404, description = "The chosen storage location names a bucket this node does not have", body = ErrorResponse),
         (status = 409, description = "Concurrent create conflict; the create was not accepted and may be retried", body = ErrorResponse),
         (status = 503, description = "Placement binding unavailable or conflicted, realm configuration unreadable, local clock unhealthy, or no holder accepted the forwarded write; the create was not accepted and may be retried", body = ErrorResponse)
     ),
@@ -141,6 +149,12 @@ pub async fn create_metadata_document(
         CreateMetadataRequest::Scaffold(request) => request.message.clone(),
         CreateMetadataRequest::RoCrate(request) => request.message.clone(),
     })?;
+    let chosen = match &request {
+        CreateMetadataRequest::Scaffold(request) => request.storage_location.as_ref(),
+        CreateMetadataRequest::RoCrate(request) => request.storage_location.as_ref(),
+    }
+    .map(|location| location.location())
+    .transpose()?;
     let (group_id, path, public, payload) = match request {
         CreateMetadataRequest::Scaffold(request) => (
             parse_group_id(&request.group_id)?,
@@ -165,6 +179,15 @@ pub async fn create_metadata_document(
             },
         ),
     };
+    if let Some(chosen) = &chosen {
+        aruna_operations::git::location::precheck(&state.get_ctx(), &auth, group_id, chosen)
+            .await
+            .map_err(|error| match error {
+                GitError::NotFound => ServerError::NotFound,
+                GitError::Authorization(error) => crate::auth::map_authorize_error(error),
+                _ => ServerError::ServiceUnavailable,
+            })?;
+    }
     let result = run_create_metadata(
         &state,
         &auth,
@@ -177,6 +200,15 @@ pub async fn create_metadata_document(
         message,
     )
     .await?;
+    if let Some(chosen) = chosen {
+        let ctx = state.get_ctx();
+        let set = aruna_operations::git::location::record(&ctx, &auth, &result, chosen);
+        // The dataset exists either way; a location not recorded here is set with PUT later.
+        if let Err(error) = set.await {
+            tracing::warn!(document_id = %result.document_id, %error,
+                "Chosen storage location not recorded at create");
+        }
+    }
 
     Ok((
         StatusCode::CREATED,

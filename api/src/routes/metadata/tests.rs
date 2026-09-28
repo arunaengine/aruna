@@ -140,6 +140,7 @@ async fn public_routes_work() {
             license: None,
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -571,6 +572,7 @@ async fn portal_searches_description() {
                 ]
             }),
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -640,6 +642,7 @@ async fn rocrate_routes_work() {
                 ]
             }),
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -718,6 +721,7 @@ async fn list_uses_registry() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -777,6 +781,7 @@ async fn tombstone_hides_listing() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -887,6 +892,7 @@ async fn private_metadata_hidden() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: false,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -934,6 +940,7 @@ async fn hides_document_existence() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: false,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -1308,6 +1315,7 @@ async fn pending_export_unavailable() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -1366,6 +1374,7 @@ async fn pending_summary_tolerated() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -1419,6 +1428,7 @@ async fn replacement_summary_withheld() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -1629,6 +1639,7 @@ async fn local_partition_executes() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -1682,6 +1693,7 @@ async fn query_applies_visibility() {
                 license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public,
                 message: None,
+                storage_location: None,
             })),
         )
         .await
@@ -1869,6 +1881,7 @@ async fn user_writes_forward() {
             license: None,
             public: false,
             message: None,
+            storage_location: None,
         })),
     )
     .await;
@@ -1905,6 +1918,7 @@ async fn user_writes_forward() {
             license: None,
             public: false,
             message: None,
+            storage_location: None,
         })),
     )
     .await;
@@ -1938,6 +1952,7 @@ async fn user_writes_forward() {
             license: None,
             public: false,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -2005,6 +2020,7 @@ async fn missing_config_fails() {
             license: None,
             public: false,
             message: None,
+            storage_location: None,
         })),
     )
     .await;
@@ -2357,6 +2373,7 @@ async fn discovery_failure_partial() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -2414,6 +2431,7 @@ async fn invalid_cursor_rejected() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -2506,6 +2524,7 @@ async fn cursor_suppresses_churn() {
                 license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
                 public: true,
                 message: None,
+                storage_location: None,
             })),
         )
         .await
@@ -2549,6 +2568,7 @@ async fn cursor_suppresses_churn() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -2612,6 +2632,7 @@ async fn page_size_clamped() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -2858,6 +2879,7 @@ async fn search_tolerates_pending() {
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -3233,6 +3255,7 @@ async fn create_linking_doc(
             public,
             rocrate,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -3842,6 +3865,7 @@ async fn create_test_document(
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public,
             message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -3983,7 +4007,7 @@ fn sign_test_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
     .unwrap()
 }
 
-async fn setup_state() -> TestState {
+pub(crate) async fn setup_state() -> TestState {
     let (storage_dir, storage_handle) = test_storage();
     let metadata_dir = tempfile::tempdir().unwrap();
     let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
@@ -4275,6 +4299,7 @@ mod authorization {
             license: None,
             public,
             message: None,
+            storage_location: None,
         })
     }
 
@@ -4437,6 +4462,7 @@ async fn lookup_hides_private() {
             license: None,
             public: false,
             message: None,
+            storage_location: None,
         })),
     )
     .await
