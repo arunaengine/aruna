@@ -5,6 +5,7 @@
 use aruna_core::git::{
     GitChange, GitCheckpoint, GitRecord, LfsLock, StoredObject, ZERO_OID, refs_clash,
 };
+use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 
@@ -33,6 +34,20 @@ pub struct GitState {
     pub new_packs: Vec<StoredObject>,
     pub new_lfs: Vec<StoredObject>,
     pub new_made: Vec<String>,
+    /// The newest chosen storage location and the record that chose it.
+    pub location: Option<(Ulid, DatasetLocation)>,
+}
+
+impl GitState {
+    /// Records the next checkpoint covers: all applied ones but the newest location choice.
+    pub fn coverable(&self) -> Vec<Ulid> {
+        let kept = self.location.as_ref().map(|(id, _)| *id);
+        self.applied
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != kept)
+            .collect()
+    }
 }
 
 /// Known answers to "is the first commit an ancestor of the second".
@@ -245,6 +260,15 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
             }
             // Only the newest complete chain seeds the state; other checkpoints' records apply.
             GitChange::Checkpoint(_) => {}
+            GitChange::Location(location) => {
+                if state
+                    .location
+                    .as_ref()
+                    .is_none_or(|(id, _)| *id < record.event_id)
+                {
+                    state.location = Some((record.event_id, location.clone()));
+                }
+            }
         }
     }
     needs.sort();
@@ -497,6 +521,25 @@ mod tests {
                 covered: covered.iter().copied().map(Ulid::from).collect(),
             })),
         )
+    }
+
+    #[test]
+    fn location_survives_checkpoints() {
+        let chosen = |prefix: &str| DatasetLocation::new("lab-data", prefix).unwrap();
+        let mut records = vec![
+            record(30, 1, GitChange::Location(chosen("new"))),
+            update(10, "refs/heads/main", ZERO_OID, &oid('b'), None),
+            record(20, 1, GitChange::Location(chosen("old"))),
+        ];
+        let state = done(&records, &Ancestry::new());
+        assert_eq!(state.location, Some((Ulid::from(30), chosen("new"))));
+        // The newest choice stays out of the checkpoint, so it keeps applying on top.
+        let covered: Vec<u128> = state.coverable().into_iter().map(u128::from).collect();
+        assert_eq!(covered, vec![10, 20]);
+        records.push(checkpoint(40, None, &[("refs/heads/main", 'b')], &covered));
+        let state = done(&records, &Ancestry::new());
+        assert_eq!(state.location, Some((Ulid::from(30), chosen("new"))));
+        assert_eq!(state.refs.get("refs/heads/main"), Some(&oid('b')));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use crate::keyspaces::GIT_RECORD_KEYSPACE;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
+use crate::structs::storage::dataset_location::DatasetLocation;
 use crate::types::{GroupId, Key, KeySpace, Value};
 use crate::{NodeId, UserId};
 use bytes::Bytes;
@@ -45,6 +46,31 @@ impl LfsObject {
                 .oid
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    /// The object a Git LFS pointer file names, if `bytes` is one.
+    pub fn from_pointer(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > 1024 {
+            return None;
+        }
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut lines = text.lines();
+        if lines.next()? != "version https://git-lfs.github.com/spec/v1" {
+            return None;
+        }
+        let (mut oid, mut size) = (None, None);
+        for line in lines {
+            if let Some(value) = line.strip_prefix("oid sha256:") {
+                oid = Some(value.to_owned());
+            } else if let Some(value) = line.strip_prefix("size ") {
+                size = value.parse().ok();
+            }
+        }
+        let object = Self {
+            oid: oid?,
+            size: size?,
+        };
+        object.valid().then_some(object)
     }
 }
 
@@ -339,6 +365,9 @@ pub enum GitChange {
     /// The state after the records it and its previous checkpoints cover. Records the
     /// chain does not list still apply on top in order, so a late record is never lost.
     Checkpoint(Box<GitCheckpoint>),
+    /// The dataset's chosen storage location; the newest record wins. Checkpoints never
+    /// cover the newest one, so it stays applied.
+    Location(DatasetLocation),
 }
 
 /// Refs, locks and revision are complete; packs, LFS objects and covered records are those
@@ -497,6 +526,7 @@ impl GitRecord {
                         && checkpoint.lfs.iter().all(StoredObject::valid)
                         && checkpoint.locks.iter().all(|lock| valid_path(&lock.path))
                 }
+                GitChange::Location(location) => location.valid(),
             }
     }
 }
@@ -643,6 +673,34 @@ mod tests {
             lfs.extend(std::iter::repeat_n(object, 5000));
         }
         assert!(!large.validate());
+    }
+
+    #[test]
+    fn reads_pointers() {
+        let oid = "a".repeat(64);
+        let pointer =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 12\n");
+        let object = LfsObject::from_pointer(pointer.as_bytes()).expect("pointer");
+        assert_eq!((object.oid, object.size), (oid, 12));
+        assert!(LfsObject::from_pointer(b"plain,csv\n1,2\n").is_none());
+        let short = "version https://git-lfs.github.com/spec/v1\noid sha256:ab\nsize 1\n";
+        assert!(LfsObject::from_pointer(short.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn change_tags() {
+        // Postcard encodes the variant index first; replicated records depend on it.
+        let tag = |change: GitChange| postcard::to_allocvec(&change).unwrap()[0];
+        let unlock = GitChange::Unlock { id: Ulid::from(1) };
+        let location = DatasetLocation::new("lab-data", "runs").unwrap();
+        assert_eq!(tag(unlock), 2);
+        assert_eq!(tag(GitChange::Location(location.clone())), 4);
+        assert!(record(GitChange::Location(location)).validate());
+        let raw = DatasetLocation {
+            bucket: "lab-data".into(),
+            prefix: "../x".into(),
+        };
+        assert!(!record(GitChange::Location(raw)).validate());
     }
 
     #[test]

@@ -390,7 +390,7 @@ async fn checkpoint(
         waiting: state.waiting.clone(),
         released: state.new_released.clone(),
         revision: state.revision,
-        covered: state.applied.clone(),
+        covered: state.coverable(),
     }));
     publish::publish(context, document, owner, change)
         .await
