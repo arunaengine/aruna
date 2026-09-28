@@ -349,6 +349,11 @@ def identities(graph, root, wanted):
 def apply(graph, root, base, new):
     """Applies the values changed from base to new onto graph; without base, new values win."""
     before, after = entities(base), entities(new)
+    for source in (before, after):
+        about = source.get("ro-crate-metadata.json", {}).get("about")
+        identifier = about.get("@id") if isinstance(about, dict) else about
+        if isinstance(identifier, str) and identifier in source and identifier != "./":
+            source["./"] = {**source.pop(identifier), "@id": "./"}
     changed = [identifier for identifier in sorted(set(before) | set(after))
                if identifier != "ro-crate-metadata.json"
                and properties(before.get(identifier)) != properties(after.get(identifier))]

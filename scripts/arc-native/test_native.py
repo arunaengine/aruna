@@ -145,9 +145,9 @@ def exercise(root):
     assert not (source / "aruna-metadata.json").exists()
     assert (source / "ro-crate-metadata.json").is_file()
     generated = json.loads((source / "ro-crate-metadata.json").read_text())
-    generated_root = next(item for item in generated["@graph"] if item.get("@id") == "./")
+    generated_root = root_entity(generated)
     assert generated_root["license"] == {"@id": "https://creativecommons.org/licenses/by/4.0/"}
-    original_metadata = graph(metadata_url)
+    original_metadata = generated
     for _ in range(2):
         status, body = http(metadata_url + "/git")
         assert status == 200 and json.loads(body)["commit"] == initial
@@ -170,7 +170,8 @@ def exercise(root):
     key = location["prefix"] + "data/notes.txt"
     deadline = time.monotonic() + 300
     while not (stored := [item for item in graph(metadata_url)["@graph"]
-                          if item.get("localPath") == "data/notes.txt"]):
+                          if item.get("localPath", item.get("https://w3id.org/ro/terms#localPath"))
+                          == "data/notes.txt"]):
         assert time.monotonic() < deadline, "pushed file was not stored"
         time.sleep(0.1)
     assert stored[0]["@id"].startswith("https://w3id.org/aruna/data/"), stored
