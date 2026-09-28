@@ -2,7 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::repo_layout::{CRATE_FILE, root_id};
+use crate::repo_layout::{CRATE_FILE, data_path, root_id};
+use crate::structs::storage::data_identity::{
+    CONTENT_URL, LOCAL_PATH, ObjectLocation, text_values,
+};
+use crate::structs::storage::dataset_location::DatasetLocation;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -45,9 +49,15 @@ fn entities(document: Option<&Value>) -> BTreeMap<String, &Map<String, Value>> {
 }
 
 /// Applies the values changed from `base` to `new` onto the `graph` JSON-LD; ids match
-/// exactly or with a leading `./`. Without `base`, the new values replace the graph's.
+/// exactly, with a leading `./`, or as the path a stored entity names by `localPath` or by
+/// its `contentUrl` in `location`. Without `base`, the new values replace the graph's.
 /// Returns the merged JSON-LD, or `None` when the graph stays the same.
-pub fn merge(graph: &str, base: Option<&Value>, new: &Value) -> Result<Option<String>, MergeError> {
+pub fn merge(
+    graph: &str,
+    base: Option<&Value>,
+    new: &Value,
+    location: Option<&DatasetLocation>,
+) -> Result<Option<String>, MergeError> {
     let mut document: Value = serde_json::from_str(graph)?;
     let before = document.clone();
     let root = root_id(&document).ok_or(MergeError::MissingRoot)?;
@@ -69,6 +79,25 @@ pub fn merge(graph: &str, base: Option<&Value>, new: &Value) -> Result<Option<St
     if position(&nodes, &root).is_none() {
         return Err(MergeError::MissingRoot);
     }
+    let stored = |nodes: &[Map<String, Value>], id: &str| -> Option<String> {
+        let path = data_path(id)?;
+        let url = location.map(|location| {
+            let key = location.key(&path);
+            ObjectLocation {
+                bucket: location.bucket.clone(),
+                key,
+            }
+            .to_url()
+        });
+        let names = |node: &Map<String, Value>| {
+            text_values(node.get(LOCAL_PATH)).contains(&path)
+                || url
+                    .as_ref()
+                    .is_some_and(|url| text_values(node.get(CONTENT_URL)).contains(url))
+        };
+        let node = nodes.iter().find(|node| names(node))?;
+        node.get("@id")?.as_str().map(str::to_owned)
+    };
     let target = |nodes: &[Map<String, Value>], id: &str| -> String {
         if roots.contains(id) {
             return root.clone();
@@ -78,8 +107,9 @@ pub fn merge(graph: &str, base: Option<&Value>, new: &Value) -> Result<Option<St
         [id, dotted.as_str(), bare]
             .into_iter()
             .find(|candidate| position(nodes, candidate).is_some())
-            .unwrap_or(id)
-            .to_owned()
+            .map(str::to_owned)
+            .or_else(|| stored(nodes, id))
+            .unwrap_or_else(|| id.to_owned())
     };
     let ids: BTreeSet<&String> = old.keys().chain(changed.keys()).collect();
     let mut removed = BTreeSet::new();
@@ -205,7 +235,7 @@ mod tests {
         let base = crate_with(json!([]), Vec::new());
         let file = json!({"@id": "data/a.csv", "@type": "File", "name": "a.csv"});
         let new = crate_with(json!([{"@id": "data/a.csv"}]), vec![file.clone()]);
-        let merged = merge(&live.to_string(), Some(&base), &new).unwrap();
+        let merged = merge(&live.to_string(), Some(&base), &new, None).unwrap();
         let merged: Value = serde_json::from_str(&merged.expect("graph changes")).unwrap();
         assert_eq!(entity(&merged, "data/a.csv"), Some(&file));
         assert_eq!(
@@ -222,14 +252,15 @@ mod tests {
         let base = crate_with(json!([]), Vec::new());
         let mut new = base.clone();
         new["@graph"][1]["name"] = json!("Renamed");
-        let merged = merge(&live.to_string(), Some(&base), &new)
+        let merged = merge(&live.to_string(), Some(&base), &new, None)
             .unwrap()
             .unwrap();
         let merged: Value = serde_json::from_str(&merged).unwrap();
         let root = entity(&merged, "./").unwrap();
         assert_eq!(root["name"], "Renamed");
         assert_eq!(root["description"], "Edited through the API");
-        assert_eq!(merge(&merged.to_string(), Some(&base), &new).unwrap(), None);
+        let again = merge(&merged.to_string(), Some(&base), &new, None).unwrap();
+        assert_eq!(again, None);
     }
 
     #[test]
@@ -239,7 +270,7 @@ mod tests {
         let file = json!({"@id": "data/a.csv", "@type": "File"});
         let base = crate_with(json!([{"@id": "data/a.csv"}]), vec![file]);
         let new = crate_with(json!([]), Vec::new());
-        let merged = merge(&live.to_string(), Some(&base), &new)
+        let merged = merge(&live.to_string(), Some(&base), &new, None)
             .unwrap()
             .unwrap();
         let merged: Value = serde_json::from_str(&merged).unwrap();
@@ -248,11 +279,44 @@ mod tests {
     }
 
     #[test]
+    fn matches_stored_entities() {
+        let id = crate::structs::storage::data_identity::content_id([1; 32]);
+        let file = json!({"@id": id, "@type": "File", "name": "a.csv",
+            "contentUrl": "s3://lab/doc/data/a.csv", "localPath": "data/a.csv"});
+        let live = crate_with(json!([{"@id": id}]), vec![file]);
+        let file = json!({"@id": "data/a.csv", "@type": "File", "name": "a.csv"});
+        let base = crate_with(json!([{"@id": "data/a.csv"}]), vec![file]);
+        // An unchanged push changes nothing.
+        assert_eq!(
+            merge(&live.to_string(), Some(&base), &base, None).unwrap(),
+            None
+        );
+        let mut renamed = base.clone();
+        renamed["@graph"][2]["name"] = json!("b.csv");
+        let merged = merge(&live.to_string(), Some(&base), &renamed, None).unwrap();
+        let merged: Value = serde_json::from_str(&merged.unwrap()).unwrap();
+        assert_eq!(entity(&merged, &id).unwrap()["name"], "b.csv");
+        assert_eq!(entity(&merged, "data/a.csv"), None);
+        // Without `localPath`, the key under the dataset location still matches.
+        let mut live = live;
+        live["@graph"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("localPath");
+        let location = DatasetLocation::new("lab", "doc").unwrap();
+        let removed = crate_with(json!([]), Vec::new());
+        let merged = merge(&live.to_string(), Some(&base), &removed, Some(&location));
+        let merged: Value = serde_json::from_str(&merged.unwrap().unwrap()).unwrap();
+        assert_eq!(entity(&merged, &id), None);
+        assert_eq!(entity(&merged, "./").unwrap().get("hasPart"), None);
+    }
+
+    #[test]
     fn requires_graph_root() {
         let new = crate_with(json!([]), Vec::new());
         let graph = json!({"@graph": []}).to_string();
         assert!(matches!(
-            merge(&graph, None, &new),
+            merge(&graph, None, &new, None),
             Err(MergeError::MissingRoot)
         ));
     }

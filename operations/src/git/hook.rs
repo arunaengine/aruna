@@ -389,7 +389,7 @@ async fn mergeable(directory: &Path, old: &str, new: &str, token: &str) -> std::
     };
     let old = (!old.bytes().all(|byte| byte == b'0')).then_some(old);
     let graph = serde_json::to_string(&current)?;
-    match aruna_blob::arc::merge_metadata(directory, old, new, &graph).await? {
+    match aruna_blob::arc::merge_metadata(directory, (old, new), &graph, None).await? {
         Ok(_) => Ok(()),
         Err(error) => Err(std::io::Error::other(error)),
     }

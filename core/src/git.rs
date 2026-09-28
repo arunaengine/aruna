@@ -106,6 +106,8 @@ pub struct GitSnapshot {
 pub struct LinkedObject {
     pub entity: String,
     pub object: StoredObject,
+    /// The repository path of a plain RO-Crate copy; `None` keeps a relative entity's own.
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -280,11 +282,19 @@ pub enum GitEffect {
         message: String,
     },
     /// Applies the metadata changed from `old` (or nothing) to `new` onto `graph` JSON-LD.
+    /// Paths also match entities stored under `location`.
     MergeMetadata {
         document_id: Ulid,
         old: Option<String>,
         new: String,
         graph: String,
+        location: Option<DatasetLocation>,
+    },
+    /// The raw content of one file of a commit, `None` when the commit has no such file.
+    ReadFile {
+        document_id: Ulid,
+        revision: String,
+        path: String,
     },
     Http(Box<GitRequest>),
     /// The layout of the commit a revision names, if any.
@@ -323,6 +333,7 @@ pub enum GitEvent {
         body: Bytes,
     },
     Layout(Option<crate::repo_layout::Layout>),
+    File(Option<Bytes>),
 }
 
 /// One replicated Git fact of a metadata document. Every holder rebuilds its local

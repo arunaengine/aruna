@@ -7,6 +7,7 @@ use super::versions::plain;
 use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
@@ -24,14 +25,14 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEventRecord, MetadataRawRevision,
 };
-use aruna_core::repo_layout::Layout;
+use aruna_core::repo_layout::{Layout, data_path, entity_path, is_file, metadata_layout, path_id};
 use aruna_core::storage_entries::{event_log_key, materialization_status_key};
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::data_identity::{DataIdentity, text_values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::storage::data_identity::DataIdentity;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
@@ -229,8 +230,72 @@ fn exact_files<'a>(
     files
 }
 
-/// File entities that name an exact Aruna object version. An object the caller cannot
-/// read stays out of the ARC; its entity still describes it in the metadata.
+/// The exact version a data entity names: its versioned ARN, the current version at its
+/// `s3://` location on this node when that holds its content, or a copy of its content.
+async fn located(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    identity: &DataIdentity,
+) -> Vec<VersionedObjectArn> {
+    let realm_id = document.realm_id;
+    if let Some(exact) = identity
+        .exact
+        .as_ref()
+        .filter(|exact| exact.realm_id == realm_id)
+    {
+        return vec![exact.clone()];
+    }
+    let mut found = Vec::new();
+    let node = context.net_handle.as_ref().map(|net| net.node_id());
+    if let (Some(location), Some(node)) = (&identity.location, node)
+        && let Ok(bucket) = drive(GetBucketOperation::new(location.bucket.clone()), context).await
+        && let Ok(Some(object)) = objects::described(
+            context,
+            (&location.bucket, bucket.group_id),
+            &location.key,
+            None,
+        )
+        .await
+        && identity.hash.is_none_or(|hash| hash == object.blake3)
+    {
+        let exact = VersionedObjectArn::new(
+            realm_id,
+            node,
+            &object.bucket,
+            &object.key,
+            object.version_id,
+        );
+        found.extend(exact.ok());
+    }
+    let hash = identity
+        .hash
+        .filter(|_| identity.hash_realm.is_none_or(|realm| realm == realm_id));
+    if let Some(hash) = hash
+        && let Ok(aliases) = drive(ResolvePathsOperation::new(hash), context).await
+    {
+        // Copies on this node come first; a few candidates are enough to find a readable one.
+        let mut aliases: Vec<_> = aliases
+            .into_iter()
+            .filter(|alias| alias.realm_id == realm_id)
+            .collect();
+        aliases.sort_by_key(|alias| Some(alias.node_id) != node);
+        found.extend(aliases.into_iter().take(4).filter_map(|alias| {
+            VersionedObjectArn::new(
+                realm_id,
+                alias.node_id,
+                alias.bucket,
+                alias.key,
+                alias.version_id,
+            )
+            .ok()
+        }));
+    }
+    found
+}
+
+/// File entities that name an Aruna object in any supported form, with the repository path of
+/// a plain copy: `localPath`, the key inside the dataset location, or a layout of the keys.
+/// An object the caller cannot read stays out of the repository; its entity still describes it.
 pub(super) async fn linked(
     context: &DriverContext,
     document: &MetadataRegistryRecord,
@@ -240,15 +305,64 @@ pub(super) async fn linked(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(jsonld) else {
         return Vec::new();
     };
-    let entities = value["@graph"].as_array().into_iter().flatten();
+    let location = super::location::effective(context, document)
+        .await
+        .map(|(location, _)| location)
+        .ok();
     let mut linked = Vec::new();
-    for (entity, exact) in exact_files(entities, document.realm_id) {
-        match resolve(context, &exact, auth).await {
-            Ok(object) => linked.push(LinkedObject { entity, object }),
-            Err(error) => {
-                tracing::warn!(entity, %error, "Leaving unreadable object out of the ARC")
+    let entities = value["@graph"].as_array().into_iter().flatten();
+    for entity in entities.filter(|entity| is_file(entity)).take(10_000) {
+        let Some(id) = entity["@id"].as_str() else {
+            continue;
+        };
+        let identity = DataIdentity::read(id, &text_values(entity.get("contentUrl")));
+        let mut resolved = Err(GitError::NotFound);
+        for exact in located(context, document, &identity).await {
+            resolved = resolve(context, &exact, auth).await;
+            if resolved.is_ok() {
+                break;
             }
         }
+        let object = match resolved {
+            Ok(object) => object,
+            Err(error) if identity.is_aruna() => {
+                tracing::warn!(entity = id, %error, "Leaving unreadable object out of Git");
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let stored = identity.location.as_ref().zip(location.as_ref());
+        let path = entity_path(entity).or_else(|| {
+            let (source, location) = stored?;
+            location
+                .path(&source.bucket, &source.key)
+                .and_then(|path| data_path(&path_id(path)))
+        });
+        linked.push(LinkedObject {
+            entity: id.to_string(),
+            path,
+            object,
+        });
+    }
+    let sources: Vec<_> = linked
+        .iter()
+        .filter(|linked| linked.path.is_none())
+        .map(|linked| {
+            Some(crate::jobs::export::StorageKey {
+                bucket: linked.object.bucket.clone(),
+                key: linked.object.key.clone(),
+            })
+        })
+        .collect();
+    let layout = crate::jobs::export::KeyLayout::new(&sources);
+    for linked in linked.iter_mut().filter(|linked| linked.path.is_none()) {
+        let source = crate::jobs::export::StorageKey {
+            bucket: linked.object.bucket.clone(),
+            key: linked.object.key.clone(),
+        };
+        linked.path = Some(layout.path(&source).unwrap_or_else(|| {
+            crate::jobs::export::synthesized_path(linked.object.blake3, &linked.entity)
+        }));
     }
     linked
 }
@@ -274,7 +388,7 @@ async fn generate(
     document: &MetadataRegistryRecord,
     projection: &Projection,
     source: (Ulid, String),
-    digest: [u8; 32],
+    digest: Option<[u8; 32]>,
 ) -> Result<(), GitError> {
     let (event_id, jsonld) = source;
     let event: Option<MetadataEventRecord> = records::load(
@@ -356,7 +470,7 @@ async fn generate(
         refs: updates,
         lfs,
         revision: Some(event_id),
-        digest: Some(digest),
+        digest,
         made,
     };
     publish::publish(context, document, user, change).await?;
@@ -421,6 +535,33 @@ pub async fn refresh(
     Ok(projection)
 }
 
+/// Whether main is an ARC that Aruna made although the metadata has no ARC markers, as
+/// earlier versions made for every dataset. Such a main switches to a plain RO-Crate.
+async fn misplaced(
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+    projection: &Projection,
+    jsonld: &str,
+) -> Result<bool, GitError> {
+    let Some(main) = projection.state.refs.get("refs/heads/main") else {
+        return Ok(false);
+    };
+    let plain =
+        serde_json::from_str(jsonld).is_ok_and(|value| metadata_layout(&value) == Layout::RoCrate);
+    if !plain || !projection.state.made.contains(main) {
+        return Ok(false);
+    }
+    let effect = GitEffect::Layout {
+        document_id: document.document_id,
+        revision: main.clone(),
+    };
+    let owner = UserId::nil(document.realm_id);
+    Ok(matches!(
+        execute(store, effect, owner).await?,
+        GitEvent::Layout(Some(Layout::Arc))
+    ))
+}
+
 async fn update(
     context: &DriverContext,
     store: &GitStore,
@@ -437,19 +578,24 @@ async fn update(
     // The graph's content decides, so a late older edit that changes it is captured too.
     if let Some(source) = erased(current(context, document, revision, materializing)).await?
         && let Ok(canonical) = craqle::canonicalize_jsonld(&source.1)
-        && projection.state.digest != Some(canonical.digest)
         && (leading || overdue)
     {
-        erased(generate(
-            context,
-            store,
-            document,
-            &projection,
-            source,
-            canonical.digest,
-        ))
-        .await?;
-        projection = erased(project(context, store, document)).await?;
+        let stale = projection.state.digest != Some(canonical.digest);
+        let switch = !stale && erased(misplaced(store, document, &projection, &source.1)).await?;
+        if stale || switch {
+            // A switch records no digest, so the next refresh confirms the new snapshot.
+            let digest = (!switch).then_some(canonical.digest);
+            erased(generate(
+                context,
+                store,
+                document,
+                &projection,
+                source,
+                digest,
+            ))
+            .await?;
+            projection = erased(project(context, store, document)).await?;
+        }
     }
     let uncovered = publish::uncovered(&projection.records).len();
     if uncovered > CHECKPOINT_AFTER && (leading || uncovered > 2 * CHECKPOINT_AFTER) {

@@ -5,10 +5,11 @@
 use crate::arc::{Files, Pointers};
 use crate::git::{command, exchange};
 use aruna_core::crate_merge;
-use aruna_core::git::LinkedObject;
+use aruna_core::git::{LfsObject, LinkedObject};
 use aruna_core::repo_layout::{
     self, CRATE_FILE, CrateError, DataFile, INVESTIGATION, Layout, control_file, data_path,
 };
+use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -64,6 +65,33 @@ async fn blobs(directory: &Path, oids: &[&str]) -> std::io::Result<BTreeMap<Stri
 
 /// Every file of a commit with its size; an LFS pointer reports the size of its content.
 pub async fn data_files(directory: &Path, revision: &str) -> std::io::Result<Vec<DataFile>> {
+    Ok(tree_files(directory, revision)
+        .await?
+        .into_iter()
+        .map(|(path, size, pointer)| DataFile {
+            size: pointer.map_or(size, |pointer| pointer.size),
+            path,
+        })
+        .collect())
+}
+
+/// The LFS pointer files of a commit with the object each names.
+pub async fn pointer_files(
+    directory: &Path,
+    revision: &str,
+) -> std::io::Result<BTreeMap<String, LfsObject>> {
+    Ok(tree_files(directory, revision)
+        .await?
+        .into_iter()
+        .filter_map(|(path, _, pointer)| Some((path, pointer?)))
+        .collect())
+}
+
+/// Every file of a commit with its Git size and the LFS object it points to, if any.
+async fn tree_files(
+    directory: &Path,
+    revision: &str,
+) -> std::io::Result<Vec<(String, u64, Option<LfsObject>)>> {
     let tree = command(directory, &["ls-tree", "-rlz", revision]).await?;
     let mut rows = Vec::new();
     for row in tree.split(|byte| *byte == 0).filter(|row| !row.is_empty()) {
@@ -83,20 +111,10 @@ pub async fn data_files(directory: &Path, revision: &str) -> std::io::Result<Vec
         .map(|(_, oid, _)| *oid)
         .collect();
     let contents = blobs(directory, &small).await?;
-    let pointed = |oid: &str| -> Option<u64> {
-        let bytes = contents
-            .get(oid)
-            .filter(|bytes| bytes.starts_with(POINTER))?;
-        let text = std::str::from_utf8(bytes).ok()?;
-        text.lines()
-            .find_map(|line| line.strip_prefix("size ")?.parse().ok())
-    };
+    let pointed = |oid: &str| LfsObject::from_pointer(contents.get(oid)?);
     Ok(rows
         .iter()
-        .map(|(path, oid, size)| DataFile {
-            path: (*path).to_owned(),
-            size: pointed(oid).unwrap_or(*size),
-        })
+        .map(|(path, oid, size)| ((*path).to_owned(), *size, pointed(oid)))
         .collect())
 }
 
@@ -163,9 +181,9 @@ pub async fn kept(directory: &Path, old: &str, new: &str) -> std::io::Result<()>
 /// Applies the RO-Crate changes from `old` (or nothing) to `new` onto the `graph` JSON-LD.
 pub async fn merge_metadata(
     directory: &Path,
-    old: Option<&str>,
-    new: &str,
+    (old, new): (Option<&str>, &str),
     graph: &str,
+    location: Option<&DatasetLocation>,
 ) -> std::io::Result<Result<Option<String>, String>> {
     let new = match read(directory, new).await? {
         Ok(new) => new,
@@ -175,25 +193,36 @@ pub async fn merge_metadata(
         Some(old) => read(directory, old).await?.ok(),
         None => None,
     };
-    Ok(crate_merge::merge(graph, base.as_ref(), &new).map_err(|error| error.to_string()))
+    let merged = crate_merge::merge(graph, base.as_ref(), &new, location);
+    Ok(merged.map_err(|error| error.to_string()))
 }
 
 /// Snapshot files of a plain RO-Crate: its metadata and an LFS pointer for each linked
-/// object whose entity names a repository path.
+/// object with a repository path. Entities of such objects name that path in the Git copy.
 pub fn files(jsonld: &str, objects: &[LinkedObject]) -> std::io::Result<(Files, Pointers)> {
-    let value: Value = serde_json::from_str(jsonld)?;
+    let mut value: Value = serde_json::from_str(jsonld)?;
+    let mut placed = BTreeMap::new();
+    let mut paths = std::collections::BTreeSet::new();
+    for linked in objects {
+        let Some(path) = linked.path.clone().or_else(|| data_path(&linked.entity)) else {
+            continue;
+        };
+        if control_file(&path) || !paths.insert(path.clone()) {
+            continue;
+        }
+        placed.insert(linked.entity.clone(), (path, linked));
+    }
+    let renamed = placed
+        .iter()
+        .map(|(entity, (path, _))| (entity.clone(), path.clone()))
+        .collect();
+    repo_layout::git_copy(&mut value, &renamed);
     let mut text = serde_json::to_vec_pretty(&value)?;
     text.push(b'\n');
     let mut files = Files::new();
     files.insert(CRATE_FILE.into(), ("100644".into(), text));
     let (mut pointers, mut attributes) = (Pointers::new(), String::new());
-    for linked in objects {
-        let Some(path) = data_path(&linked.entity) else {
-            continue;
-        };
-        if control_file(&path) || files.contains_key(&path) {
-            continue;
-        }
+    for (path, linked) in placed.into_values() {
         let object = &linked.object;
         let mut pointer = POINTER.to_vec();
         pointer.extend(format!("oid sha256:{}\nsize {}\n", object.sha256, object.size).bytes());

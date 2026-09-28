@@ -25,7 +25,7 @@ fn key(id: Ulid, oid: &str) -> String {
 }
 
 /// Where content was originally stored: a replicated record, or an upload not pushed yet.
-async fn locate(
+pub(super) async fn locate(
     context: &DriverContext,
     document: &MetadataRegistryRecord,
     oid: &str,

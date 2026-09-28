@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::git::{command, exchange};
-use aruna_core::git::{GitSnapshot, LinkedObject, MAX_GIT_BYTES, MergeOutcome, Refs};
-use aruna_core::repo_layout::{CRATE_FILE, INVESTIGATION, Layout};
+use aruna_core::git::{GitSnapshot, LfsObject, LinkedObject, MAX_GIT_BYTES, MergeOutcome, Refs};
+use aruna_core::repo_layout::{ARUNA_FILE, CRATE_FILE, INVESTIGATION, Layout, metadata_layout};
+use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -237,12 +238,28 @@ async fn reconcile(
         }
     }
     let mut removed = Vec::new();
-    if !same {
+    // A plain snapshot onto an ARC main drops the ISA workbooks and the ARC graph file.
+    let switching = plain && crate::rocrate::layout(directory, main).await? == Layout::Arc;
+    if !same || switching {
         let listing = command(directory, &["ls-tree", "-r", "-z", "--name-only", main]).await?;
         for path in listing.split(|byte| *byte == 0) {
             let path = std::str::from_utf8(path).map_err(std::io::Error::other)?;
-            if workbook(path) && !files.contains_key(path) {
+            let generated = workbook(path) || (switching && path == ARUNA_FILE);
+            if generated && !path.is_empty() && !files.contains_key(path) {
                 removed.push(path.to_string());
+            }
+        }
+    }
+    if switching {
+        // ARC pointers to objects the plain copy now places elsewhere would become extra files.
+        let placed: std::collections::BTreeSet<String> = pointers
+            .iter()
+            .filter_map(|path| LfsObject::from_pointer(&files.get(path)?.1))
+            .map(|object| object.oid)
+            .collect();
+        for (path, object) in crate::rocrate::pointer_files(directory, main).await? {
+            if placed.contains(&object.oid) && !files.contains_key(&path) {
+                removed.push(path);
             }
         }
     }
@@ -334,23 +351,24 @@ async fn arc_files(
     Ok(Ok((files, pointers)))
 }
 
-/// Snapshot files in the layout of `base`. Without `base`, metadata that cannot become an
-/// ARC falls back to a plain RO-Crate.
+/// Snapshot files in the layout the metadata asks for. Metadata marked as an ARC that cannot
+/// become one falls back to a plain RO-Crate unless `base` is an ARC already.
 async fn snapshot_files(
     directory: &Path,
     source: (Ulid, &str, &[LinkedObject]),
     base: Option<&str>,
 ) -> std::io::Result<Result<(Files, Pointers), String>> {
+    let (_, jsonld, objects) = source;
+    let value: Value = serde_json::from_str(jsonld)?;
+    if metadata_layout(&value) == Layout::RoCrate {
+        return crate::rocrate::files(jsonld, objects).map(Ok);
+    }
     let layout = match base {
         Some(base) => Some(crate::rocrate::layout(directory, base).await?),
         None => None,
     };
-    let (_, jsonld, objects) = source;
-    if layout == Some(Layout::RoCrate) {
-        return crate::rocrate::files(jsonld, objects).map(Ok);
-    }
     Ok(match (arc_files(directory, source, base).await?, layout) {
-        (Err(error), None) => {
+        (Err(error), None | Some(Layout::RoCrate)) => {
             tracing::info!(%error, "Metadata is not an ARC; the snapshot is a plain RO-Crate");
             Ok(crate::rocrate::files(jsonld, objects)?)
         }
@@ -467,12 +485,12 @@ async fn metadata_file(directory: &Path, revision: &str) -> Option<String> {
 /// `graph` JSON-LD. Returns the merged JSON-LD, or `None` when the graph stays the same.
 pub async fn merge_metadata(
     directory: &Path,
-    old: Option<&str>,
-    new: &str,
+    (old, new): (Option<&str>, &str),
     graph: &str,
+    location: Option<&DatasetLocation>,
 ) -> std::io::Result<Result<Option<String>, String>> {
     if crate::rocrate::layout(directory, new).await? == Layout::RoCrate {
-        return crate::rocrate::merge_metadata(directory, old, new, graph).await;
+        return crate::rocrate::merge_metadata(directory, (old, new), graph, location).await;
     }
     let derived = export(directory, new).await?;
     if let Some(error) = derived["error"].as_str() {
@@ -572,7 +590,7 @@ pub async fn merge(
         ) else {
             return Ok(MergeOutcome::Conflicts(resolvable));
         };
-        let merged = match merge_metadata(directory, Some(&base), source, &graph).await? {
+        let merged = match merge_metadata(directory, (Some(&base), source), &graph, None).await? {
             Ok(merged) => merged.unwrap_or(graph),
             Err(error) => return Ok(MergeOutcome::Failed(error)),
         };

@@ -54,6 +54,7 @@ impl GitStore {
             | GitEffect::SetRefs { document_id, .. }
             | GitEffect::Pack { document_id, .. }
             | GitEffect::Export { document_id, .. }
+            | GitEffect::ReadFile { document_id, .. }
             | GitEffect::Layout { document_id, .. } => *document_id,
             GitEffect::Http(request) => request.repository.document_id,
         };
@@ -115,10 +116,27 @@ impl GitStore {
                     .map(GitEvent::Merged)
             }
             GitEffect::MergeMetadata {
-                old, new, graph, ..
-            } => crate::arc::merge_metadata(&repository, old.as_deref(), &new, &graph)
-                .await
-                .map(GitEvent::MetadataMerged),
+                old,
+                new,
+                graph,
+                location,
+                ..
+            } => crate::arc::merge_metadata(
+                &repository,
+                (old.as_deref(), &new),
+                &graph,
+                location.as_ref(),
+            )
+            .await
+            .map(GitEvent::MetadataMerged),
+            GitEffect::ReadFile { revision, path, .. } => {
+                if revision.starts_with('-') || !aruna_core::git::valid_path(&path) {
+                    return Ok(GitEvent::File(None));
+                }
+                let spec = format!("{revision}:{path}");
+                let arguments = ["cat-file", "blob", &spec];
+                Ok(GitEvent::File(command(&repository, &arguments).await.ok()))
+            }
             GitEffect::Imported(_) => crate::repo::imported(&repository)
                 .await
                 .map(GitEvent::Imported),
