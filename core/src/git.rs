@@ -73,6 +73,8 @@ pub struct GitSnapshot {
     pub jsonld: String,
     /// Aruna objects that File entities name, placed in the ARC as LFS pointers.
     pub objects: Vec<LinkedObject>,
+    /// The author's commit message; `None` keeps the default one.
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

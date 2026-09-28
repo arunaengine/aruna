@@ -76,6 +76,7 @@ pub async fn edit(
             occurred_at_ms: now_ms(),
             jsonld,
             objects,
+            message: None,
         },
         message: format!("{}\n\nAruna-User: {}\n", plain(&summary), auth.user_id),
     };

@@ -319,6 +319,12 @@ async fn arc_files(
     Ok(Ok((files, pointers)))
 }
 
+/// The author's message, or the default one, followed by the revision `trailer`.
+fn snapshot_message(message: Option<&str>, trailer: &str) -> String {
+    let subject = message.unwrap_or("feat: capture Aruna metadata");
+    format!("{subject}{trailer}")
+}
+
 /// Builds the `aruna` commit for `source` and, when main must follow, the main commit.
 /// No ref moves: refs change only through replicated records. Unrepresentable metadata is an
 /// `Err` value, never a fabricated commit.
@@ -351,7 +357,7 @@ pub async fn generate(
         }
     }
     let parents: Vec<&str> = previous.iter().map(String::as_str).collect();
-    let message = format!("feat: capture Aruna metadata{trailer}");
+    let message = snapshot_message(source.message.as_deref(), &trailer);
     let commit = commit_tree(directory, &tree, &parents, message, source.occurred_at_ms).await?;
     let main = match main.as_deref() {
         None => Some(commit.clone()),
@@ -519,4 +525,27 @@ pub async fn merge(
     let parents = [target, source];
     let commit = commit_tree(directory, &tree, &parents, message, occurred_at_ms).await?;
     Ok(MergeOutcome::Merged(commit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_message;
+
+    #[test]
+    fn keeps_default_message() {
+        let trailer = "\n\nAruna-Revision: 01M\n";
+        assert_eq!(
+            snapshot_message(None, trailer),
+            "feat: capture Aruna metadata\n\nAruna-Revision: 01M\n"
+        );
+    }
+
+    #[test]
+    fn uses_author_message() {
+        let trailer = "\n\nAruna-Revision: 01M\n";
+        assert_eq!(
+            snapshot_message(Some("Add run 42\n\nNew LC-MS data"), trailer),
+            "Add run 42\n\nNew LC-MS data\n\nAruna-Revision: 01M\n"
+        );
+    }
 }

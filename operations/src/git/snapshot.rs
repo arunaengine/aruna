@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::project::{Projection, author, lock, project};
+use super::versions::plain;
 use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -17,7 +18,9 @@ use aruna_core::git::{
     CHECKPOINT_AFTER, GitChange, GitCheckpoint, GitEffect, GitEvent, GitSnapshot, GitStatus,
     LinkedObject, RefUpdate, STATUS, StoredObject, ZERO_OID,
 };
-use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
+use aruna_core::keyspaces::{
+    COMMIT_MESSAGE_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+};
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEventRecord, MetadataRawRevision,
 };
@@ -282,6 +285,16 @@ async fn generate(
         .as_ref()
         .map_or(UserId::nil(document.realm_id), |event| event.user_id);
     let occurred_at_ms = event.map_or(document.updated_at_ms, |event| event.occurred_at_ms);
+    let message: Option<String> = records::load(
+        context,
+        COMMIT_MESSAGE_KEYSPACE,
+        event_log_key(document.document_id, event_id).to_vec(),
+    )
+    .await?;
+    // Trailer lines stay reserved for Aruna, so an author cannot forge a trusted one.
+    let message = message
+        .map(|message| plain(&message))
+        .filter(|message| !message.is_empty());
     let objects = linked(context, document, &jsonld, &author(user)).await;
     let lfs: Vec<StoredObject> = objects.iter().map(|linked| linked.object.clone()).collect();
     let refs = &projection.state.refs;
@@ -292,6 +305,7 @@ async fn generate(
             occurred_at_ms,
             jsonld,
             objects,
+            message,
         },
         refs: refs.clone(),
     };
