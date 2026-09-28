@@ -28,6 +28,7 @@ pub mod onboarding;
 pub mod operation;
 pub mod permission_path;
 pub mod reducer;
+pub mod repo_layout;
 pub mod repository;
 pub mod request_policy;
 pub mod scheduling;
