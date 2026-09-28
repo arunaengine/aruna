@@ -210,12 +210,13 @@ def exercise(root):
     command(source, env, "push", "--no-verify", "origin", "missing", success=False)
     assert not command(source, env, "ls-remote", "origin", "refs/heads/missing")
     command(source, env, "checkout", "-b", "invalid", "main")
-    command(source, env, "rm", "isa.investigation.xlsx")
-    commit(source, env, "test: reject invalid native ARC")
+    # Without the workbook the commit is a plain RO-Crate, which still needs its metadata file.
+    command(source, env, "rm", "isa.investigation.xlsx", "ro-crate-metadata.json")
+    commit(source, env, "test: reject a commit without crate metadata")
     command(source, env, "push", "--atomic", "origin", "main:atomic-good", "invalid:atomic-bad", success=False)
     assert not command(source, env, "ls-remote", "origin", "refs/heads/atomic-*")
     assert second in command(source, env, "ls-remote", "origin", "refs/heads/main").decode()
-    print("PASS: missing LFS and invalid ARC rejected; atomic push publishes neither ref", flush=True)
+    print("PASS: missing LFS and missing crate metadata rejected; atomic push publishes neither ref", flush=True)
 
     command(source, env, "branch", "feature", first)
     command(source, env, "tag", "snapshot", first)
