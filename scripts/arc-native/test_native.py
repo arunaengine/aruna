@@ -140,14 +140,14 @@ def exercise(root):
     command(root, env, "clone", url, str(source))
     initial = command(source, env, "rev-parse", "HEAD").decode().strip()
     assert command(source, env, "log", "-1", "--format=%G?").strip() == b"N"
-    assert (source / "isa.investigation.xlsx").is_file()
+    # Metadata without ARC markers is a plain RO-Crate.
+    assert not (source / "isa.investigation.xlsx").exists()
+    assert not (source / "aruna-metadata.json").exists()
     assert (source / "ro-crate-metadata.json").is_file()
     generated = json.loads((source / "ro-crate-metadata.json").read_text())
     generated_root = next(item for item in generated["@graph"] if item.get("@id") == "./")
     assert generated_root["license"] == {"@id": "https://creativecommons.org/licenses/by/4.0/"}
-    assert not list(source.glob("studies/*/isa.study.xlsx"))
-    assert not list(source.glob("assays/*/isa.assay.xlsx"))
-    original_metadata = json.loads((source / "aruna-metadata.json").read_text())
+    original_metadata = graph(metadata_url)
     for _ in range(2):
         status, body = http(metadata_url + "/git")
         assert status == 200 and json.loads(body)["commit"] == initial
@@ -158,7 +158,37 @@ def exercise(root):
     initial = wait_snapshot(metadata_url, initial)
     assert initial in command(source, env, "ls-remote", "origin", "refs/heads/main").decode()
     command(source, env, "pull", "--ff-only", "origin", "main")
-    original_metadata = json.loads((source / "aruna-metadata.json").read_text())
+    status, location = api(metadata_url + "/storage-location")
+    assert status == 200 and location["default"], location
+    assert location["bucket"] == os.environ["ARUNA_BUCKET"], location
+    notes = b"plain dataset notes\n"
+    (source / "data").mkdir()
+    (source / "data/notes.txt").write_bytes(notes)
+    command(source, env, "add", "data/notes.txt")
+    plain = commit(source, env, "test: add a plain data file")
+    command(source, env, "push", "origin", "main")
+    key = location["prefix"] + "data/notes.txt"
+    deadline = time.monotonic() + 300
+    while not (stored := [item for item in graph(metadata_url)["@graph"]
+                          if item.get("localPath") == "data/notes.txt"]):
+        assert time.monotonic() < deadline, "pushed file was not stored"
+        time.sleep(0.1)
+    assert stored[0]["@id"].startswith("https://w3id.org/aruna/data/"), stored
+    assert stored[0]["contentUrl"] == f"s3://{location['bucket']}/{key}", stored
+    s3 = boto3.client("s3", endpoint_url=os.environ["ARUNA_S3_URL"],
+                      config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+    assert s3.get_object(Bucket=location["bucket"], Key=key)["Body"].read() == notes
+    wait_main(source, env, plain)
+    command(source, env, "pull", "--ff-only", "origin", "main")
+    copy = json.loads((source / "ro-crate-metadata.json").read_text())
+    entity = next(item for item in copy["@graph"] if item.get("@id") == "data/notes.txt")
+    assert "contentUrl" not in entity and "localPath" not in entity, entity
+    unchanged = graph(metadata_url)
+    # The push applies its metadata before it returns, so an unchanged push shows at once.
+    command(source, env, "commit", "-S", "--allow-empty", "-q", "-m", "test: push without changes")
+    command(source, env, "push", "origin", "main")
+    assert graph(metadata_url) == unchanged
+    print("PASS: pushed plain files are stored by content and round trip unchanged", flush=True)
     fixture = root / "fixture"
     scaffold(fixture)
     shutil.copytree(fixture, source, dirs_exist_ok=True)

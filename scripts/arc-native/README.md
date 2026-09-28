@@ -28,7 +28,8 @@ https://node.example/api/v1/git/<document-id>.git
 ```
 
 Use a credential manager with username `aruna` and an Aruna bearer token as password.
-The node provisions a group-local `arc-<group-id>` bucket through ordinary bucket operations.
+The node provisions a group-local `datasets-<group-id>` bucket through ordinary bucket operations.
+LFS objects pushed before this bucket name existed stay readable in their recorded `arc-<group-id>` bucket.
 The token needs the appropriate READ/WRITE grants on the document and the repository's
 `git-lfs/<document-id>/` object prefix in its bucket. Restricted tokens remain restricted.
 Native Git passwords are bearer tokens, not S3 access secrets. Use HTTPS outside loopback.
