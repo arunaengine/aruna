@@ -11,10 +11,11 @@ use ulid::Ulid;
 use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
-    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GIT_RECORD_KEYSPACE,
-    GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    REPOSITORY_LINK_KEYSPACE, USER_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
+    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GIT_PACK_KEYSPACE,
+    GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE, ID_MAPPING_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, REPOSITORY_LINK_KEYSPACE, USER_KEYSPACE, WATCH_INTEREST_KEYSPACE,
+    WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use crate::repository::link_key;
@@ -97,6 +98,11 @@ pub enum DocumentTarget {
     GitRecord {
         document_id: Ulid,
         event_id: Ulid,
+    },
+    /// The bytes of one Git pack by SHA-256, on the document's topic next to its record.
+    GitPack {
+        document_id: Ulid,
+        sha256: [u8; 32],
     },
 }
 
@@ -389,6 +395,7 @@ impl DocumentTarget {
             Self::MetadataRegistry { document_id, .. }
             | Self::MetadataCreateEvent { document_id, .. }
             | Self::GitRecord { document_id, .. }
+            | Self::GitPack { document_id, .. }
             | Self::MetadataDocumentLifecycle { document_id }
             | Self::PersistentIdMapping { document_id }
             | Self::RepositoryLink { document_id, .. } => TopicId::metadata(*document_id),
@@ -412,6 +419,7 @@ impl DocumentTarget {
             Self::MetadataRegistry { .. } => METADATA_INDEX_KEYSPACE,
             Self::MetadataCreateEvent { .. } => EVENT_LOG_KEYSPACE,
             Self::GitRecord { .. } => GIT_RECORD_KEYSPACE,
+            Self::GitPack { .. } => GIT_PACK_KEYSPACE,
             Self::MetadataDocumentLifecycle { .. } => DOCUMENT_LIFECYCLE_KEYSPACE,
             Self::MetadataGraphLifecycle { .. } => GRAPH_LIFECYCLE_KEYSPACE,
             Self::PersistentIdMapping { .. } => ID_MAPPING_KEYSPACE,
@@ -450,6 +458,10 @@ impl DocumentTarget {
                 document_id,
                 event_id,
             } => crate::git::git_record_key(*document_id, *event_id),
+            Self::GitPack {
+                document_id,
+                sha256,
+            } => crate::git::git_pack_key(*document_id, sha256),
             Self::MetadataDocumentLifecycle { document_id } => document_lifecycle_key(*document_id),
             Self::MetadataGraphLifecycle { graph_iri } => graph_lifecycle_key(graph_iri),
             Self::PersistentIdMapping { document_id } => {
@@ -488,6 +500,7 @@ impl DocumentTarget {
                 | Self::MetadataRegistry { .. }
                 | Self::MetadataCreateEvent { .. }
                 | Self::GitRecord { .. }
+                | Self::GitPack { .. }
                 | Self::MetadataDocumentLifecycle { .. }
                 | Self::MetadataGraphLifecycle { .. }
                 | Self::PersistentIdMapping { .. }

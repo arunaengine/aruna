@@ -316,6 +316,19 @@ impl AnnounceTopicOperation {
                 }
                 Ok(aruna_core::git::record_change(&record))
             }
+            DocumentTarget::GitPack {
+                document_id,
+                sha256,
+            } => {
+                let pack: aruna_core::git::GitPackRecord = postcard::from_bytes(bytes)
+                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                if pack.document_id != *document_id || !pack.valid(sha256) {
+                    return Err(AnnounceTopicError::DocumentSync(format!(
+                        "Git pack target of {document_id} does not match its payload"
+                    )));
+                }
+                Ok(pack.change())
+            }
             DocumentTarget::MetadataDocumentLifecycle { document_id } => {
                 let record: MetadataLifecycleRecord = postcard::from_bytes(bytes)
                     .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;

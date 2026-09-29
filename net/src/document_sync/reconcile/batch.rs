@@ -156,7 +156,7 @@ pub(super) async fn apply_batch_event(
     if matches!(
         &event,
         DocumentEvent::Upsert {
-            target: DocumentTarget::GitRecord { .. },
+            target: DocumentTarget::GitRecord { .. } | DocumentTarget::GitPack { .. },
             ..
         }
     ) {

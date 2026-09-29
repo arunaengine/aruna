@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::{DocumentEvent, DocumentTarget};
-use aruna_core::git::GitRecord;
+use aruna_core::git::{GitPackRecord, GitRecord};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::SyncQuarantineIdentity;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -22,6 +22,13 @@ pub(super) async fn apply_git_event(
     identity: SyncQuarantineIdentity,
     event: DocumentEvent,
 ) -> Result<MetadataOutcome> {
+    if let DocumentEvent::Upsert {
+        target: DocumentTarget::GitPack { .. },
+        ..
+    } = &event
+    {
+        return apply_git_pack(service, topic_id, identity, event).await;
+    }
     let DocumentEvent::Upsert {
         target: target @ DocumentTarget::GitRecord { .. },
         bytes,
@@ -95,4 +102,60 @@ pub(super) async fn apply_git_event(
             })
         }
     }
+}
+
+/// Packs are immutable like records: a receiver stores bytes that hash to the target once.
+async fn apply_git_pack(
+    service: &DocumentSyncService,
+    topic_id: ::irokle::TopicId,
+    identity: SyncQuarantineIdentity,
+    event: DocumentEvent,
+) -> Result<MetadataOutcome> {
+    let DocumentEvent::Upsert {
+        target:
+            target @ DocumentTarget::GitPack {
+                document_id,
+                sha256,
+            },
+        bytes,
+        change,
+        ..
+    } = &event
+    else {
+        return Err(NetError::Bootstrap(
+            "Git pack handler received another event".to_string(),
+        ));
+    };
+    let valid = postcard::from_bytes::<GitPackRecord>(bytes)
+        .is_ok_and(|pack| pack.document_id == *document_id && pack.valid(sha256));
+    if !valid {
+        warn!(%topic_id, "Rejecting replicated Git pack");
+        return Ok(MetadataOutcome::Rejected(SyncRejection::new(
+            identity,
+            event.clone(),
+            "Git pack does not match its target or size limit",
+        )));
+    }
+    let keyspace = target.storage_keyspace().to_string();
+    if service
+        .storage_read(keyspace.clone(), target.storage_key())
+        .await?
+        .is_some()
+    {
+        // Equal hashes mean equal bytes; which record first named them does not matter.
+        return Ok(MetadataOutcome::Skipped);
+    }
+    let bootstrap =
+        |error: aruna_core::errors::ConversionError| NetError::Bootstrap(error.to_string());
+    let mut writes = vec![
+        (keyspace, target.storage_key(), bytes.clone().into()),
+        sync_revision_entry(target, change).map_err(bootstrap)?,
+    ];
+    writes.extend(shard_manifest_entry(target, change).map_err(bootstrap)?);
+    service.storage_batch_write(writes).await?;
+    aruna_core::git::record_written(*document_id);
+    Ok(MetadataOutcome::Applied {
+        target: target.clone(),
+        tombstone: None,
+    })
 }

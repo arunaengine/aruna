@@ -32,6 +32,8 @@ pub const COMMIT_MESSAGE_KEYSPACE: &str = "metadata_commit_messages";
 pub const METADATA_ACTOR_KEYSPACE: &str = "metadata_actors";
 /// Replicated Git records of metadata documents, keyed by document and record id.
 pub const GIT_RECORD_KEYSPACE: &str = "git_records";
+/// Git pack bytes by document and SHA-256; packs stay small because large files use LFS.
+pub const GIT_PACK_KEYSPACE: &str = "git_packs";
 pub const CREATE_ACCEPTANCE_KEYSPACE: &str = "metadata_create_acceptance";
 pub const PENDING_PROJECTION_KEYSPACE: &str = "metadata_pending_projection";
 pub const DOCUMENT_LIFECYCLE_KEYSPACE: &str = "metadata_document_lifecycle";
@@ -292,6 +294,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     METADATA_CHECKPOINT_KEYSPACE,
     COMMIT_MESSAGE_KEYSPACE,
     GIT_RECORD_KEYSPACE,
+    GIT_PACK_KEYSPACE,
     CREATE_ACCEPTANCE_KEYSPACE,
     PENDING_PROJECTION_KEYSPACE,
     DOCUMENT_LIFECYCLE_KEYSPACE,

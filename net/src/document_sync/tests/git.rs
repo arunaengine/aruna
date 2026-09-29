@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::git::{GitChange, GitRecord, git_record_entry, record_change};
-use aruna_core::keyspaces::{GIT_RECORD_KEYSPACE, SHARD_MANIFEST_KEYSPACE, SYNC_REVISION_KEYSPACE};
+use aruna_core::git::{GitChange, GitPackRecord, GitRecord, git_record_entry, record_change};
+use aruna_core::keyspaces::{
+    GIT_PACK_KEYSPACE, GIT_RECORD_KEYSPACE, SHARD_MANIFEST_KEYSPACE, SYNC_REVISION_KEYSPACE,
+};
 use aruna_core::storage_entries::{shard_manifest_key, sync_revision_key};
 
 #[tokio::test]
@@ -94,15 +96,38 @@ async fn git_record_manifest() {
         .ensure_sync_topics(&[topic_id], Vec::new())
         .expect("Git shard topic genesis");
     let (_, _, bytes) = git_record_entry(&record).expect("record serializes");
+    let pack = GitPackRecord {
+        document_id,
+        event_id: record.event_id,
+        node_id: owner,
+        occurred_at_ms: 1,
+        placement,
+        bytes: b"PACK".to_vec().into(),
+    };
+    let forged = DocumentTarget::GitPack {
+        document_id,
+        sha256: [0; 32],
+    };
+    let pack_event = |event: u64, target: DocumentTarget| DocumentSyncPublish::Upsert {
+        event_id: Ulid::from_parts(event, 1),
+        target,
+        bytes: postcard::to_allocvec(&pack).expect("pack serializes"),
+        change: pack.change(),
+        allow_genesis: true,
+    };
     let published = service
         .publish_documents(
-            vec![DocumentSyncPublish::Upsert {
-                event_id: Ulid::from_parts(5_030, 1),
-                target: target.clone(),
-                bytes: bytes.to_vec(),
-                change: record_change(&record),
-                allow_genesis: true,
-            }],
+            vec![
+                DocumentSyncPublish::Upsert {
+                    event_id: Ulid::from_parts(5_030, 1),
+                    target: target.clone(),
+                    bytes: bytes.to_vec(),
+                    change: record_change(&record),
+                    allow_genesis: true,
+                },
+                pack_event(5_031, pack.target()),
+                pack_event(5_032, forged.clone()),
+            ],
             Vec::new(),
         )
         .await;
@@ -126,6 +151,14 @@ async fn git_record_manifest() {
         read_storage_value(&storage, GIT_RECORD_KEYSPACE, target.storage_key())
             .await
             .is_some()
+    );
+    let stored = |target: DocumentTarget| {
+        read_storage_value(&storage, GIT_PACK_KEYSPACE, target.storage_key())
+    };
+    assert!(stored(pack.target()).await.is_some());
+    assert!(
+        stored(forged).await.is_none(),
+        "a pack whose bytes do not hash to its target is refused"
     );
     assert!(
         read_storage_value(&storage, SYNC_REVISION_KEYSPACE, sync_revision_key(&target))

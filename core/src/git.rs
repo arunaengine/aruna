@@ -21,6 +21,8 @@ pub const PENDING: &str = "git_pending_merges";
 pub const MAX_GIT_BYTES: usize = 64 * 1024 * 1024;
 /// Upper bound for one replicated Git record.
 pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound for one pack; larger files belong in Git LFS.
+pub const MAX_PACK_BYTES: usize = MAX_RECORD_BYTES;
 /// Records not covered by a checkpoint; holders write a checkpoint well before this.
 pub const MAX_RECORDS: usize = 1024;
 pub const CHECKPOINT_AFTER: usize = 256;
@@ -577,6 +579,56 @@ pub fn git_record_entry(record: &GitRecord) -> Result<(KeySpace, Key, Value), po
         git_record_key(record.document_id, record.event_id),
         postcard::to_allocvec(record)?.into(),
     ))
+}
+
+pub fn git_pack_key(document_id: Ulid, sha256: &[u8; 32]) -> Key {
+    ByteView::from([document_id.to_bytes().as_slice(), sha256].concat())
+}
+
+/// The bytes of one pack, replicated with the fields of the record that first named it, so
+/// every node that stores the same pack writes identical rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPackRecord {
+    pub document_id: Ulid,
+    pub event_id: Ulid,
+    pub node_id: NodeId,
+    pub occurred_at_ms: u64,
+    pub placement: PlacementRef,
+    pub bytes: Bytes,
+}
+
+impl GitPackRecord {
+    pub fn sha256(&self) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(&self.bytes).into()
+    }
+
+    /// Whether the bytes fit the pack limit and hash to `sha256`.
+    pub fn valid(&self, sha256: &[u8; 32]) -> bool {
+        self.bytes.len() <= MAX_PACK_BYTES && self.sha256() == *sha256
+    }
+
+    pub fn target(&self) -> crate::document::DocumentTarget {
+        crate::document::DocumentTarget::GitPack {
+            document_id: self.document_id,
+            sha256: self.sha256(),
+        }
+    }
+
+    /// Like a record, a pack is only ever inserted, never replaced.
+    pub fn change(&self) -> crate::document::DocumentChange {
+        crate::document::DocumentChange {
+            base: None,
+            current: crate::document::DocumentSyncRevision {
+                generation: self.occurred_at_ms,
+                event_id: self.event_id,
+                actor: self.node_id,
+                updated_at_ms: self.occurred_at_ms,
+            },
+            kind: crate::document::DocumentChangeKind::Upsert,
+            placement: self.placement,
+        }
+    }
 }
 
 /// The sync revision of an immutable record: it is only ever inserted, never replaced.

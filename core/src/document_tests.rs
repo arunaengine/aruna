@@ -666,4 +666,11 @@ fn stored_target_tags() {
         }),
         16
     );
+    assert_eq!(
+        tag(&DocumentTarget::GitPack {
+            document_id,
+            sha256: [0; 32]
+        }),
+        17
+    );
 }
