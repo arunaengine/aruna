@@ -679,8 +679,14 @@ mod tests {
         let locks = DocumentLocks::default();
         let id = Ulid::from(1);
         let held = locks.lock(id).await;
-        assert!(locks.try_lock(id).is_none(), "a held lock is not handed out");
-        assert!(locks.try_lock(Ulid::from(2)).is_some(), "other documents stay free");
+        assert!(
+            locks.try_lock(id).is_none(),
+            "a held lock is not handed out"
+        );
+        assert!(
+            locks.try_lock(Ulid::from(2)).is_some(),
+            "other documents stay free"
+        );
         drop(held);
         assert!(locks.try_lock(id).is_some());
     }
