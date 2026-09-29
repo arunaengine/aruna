@@ -126,14 +126,15 @@ jobs:
           cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --profile ci --partition hash:${{ matrix.shard }}/4
 
-      # The same native Git run as the tests workflow, split across the shards too.
+      # The same native Git run as the tests workflow, split across the shards too;
+      # with two such tests, some shards get none.
       - name: Run instrumented native Git tests
         run: >-
           uv run --no-project --python 3.13
           --with-requirements scripts/arc-native/requirements.txt
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
           exec cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --run-ignored only --partition hash:${{ matrix.shard }}/4
+          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
           -E "binary(git_native)"'
 
       - name: Collect coverage
