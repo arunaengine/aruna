@@ -137,22 +137,28 @@ pub struct DocumentLocks(
 
 impl DocumentLocks {
     pub async fn lock(&self, document_id: Ulid) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(&document_id).and_then(std::sync::Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(document_id, std::sync::Arc::downgrade(&lock));
-                    lock
-                }
+        self.mutex(document_id).lock_owned().await
+    }
+
+    /// The lock when no one holds it, without waiting.
+    pub fn try_lock(&self, document_id: Ulid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.mutex(document_id).try_lock_owned().ok()
+    }
+
+    fn mutex(&self, document_id: Ulid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&document_id).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(document_id, std::sync::Arc::downgrade(&lock));
+                lock
             }
-        };
-        lock.lock_owned().await
+        }
     }
 }
 
@@ -667,6 +673,17 @@ pub fn record_change(record: &GitRecord) -> crate::document::DocumentChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reads_skip_busy() {
+        let locks = DocumentLocks::default();
+        let id = Ulid::from(1);
+        let held = locks.lock(id).await;
+        assert!(locks.try_lock(id).is_none(), "a held lock is not handed out");
+        assert!(locks.try_lock(Ulid::from(2)).is_some(), "other documents stay free");
+        drop(held);
+        assert!(locks.try_lock(id).is_some());
+    }
     use crate::document::DocumentTarget;
 
     fn record(change: GitChange) -> GitRecord {

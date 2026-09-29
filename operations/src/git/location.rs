@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::state::{Ancestry, reduce};
-use super::{GitError, objects, project, publish, records};
+use super::{GitError, objects, publish, records};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
@@ -80,7 +80,7 @@ pub async fn record(
     location: DatasetLocation,
 ) -> Result<DatasetLocation, GitError> {
     writable(context, auth, document, &location).await?;
-    let _guard = project::lock(document.document_id).await;
+    // A location moves no ref, so it needs no document lock and never waits for a snapshot.
     let change = GitChange::Location(location.clone());
     publish::publish(context, document, auth.user_id, change).await?;
     Ok(location)

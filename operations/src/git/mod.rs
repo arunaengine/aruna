@@ -154,13 +154,19 @@ pub async fn transport(
         return Err(GitError::Conflict);
     }
     let mut request = request;
-    let guard = project::lock(document.document_id).await;
-    match write {
-        true => drop(snapshot::refresh(context, store, &document).await?),
-        false => drop(snapshot::view(context, store, &document).await?),
-    }
+    let guard = match write {
+        true => {
+            let guard = project::lock(document.document_id).await;
+            snapshot::refresh(context, store, &document).await?;
+            Some(guard)
+        }
+        false => {
+            snapshot::read_view(context, store, &document).await?;
+            None
+        }
+    };
     // Reads need a current cache but not the lock; pushes keep it until their record is out.
-    let _guard = write.then_some(guard);
+    let _guard = guard;
     let _key = write.then(|| {
         let key = PushKey::open(document.document_id);
         request.push_key = key.value.clone();

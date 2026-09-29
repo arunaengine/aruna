@@ -26,6 +26,19 @@ pub async fn lock(document_id: Ulid) -> OwnedMutexGuard<()> {
     aruna_core::telemetry::time_stage("git_document_lock", LOCKS.lock(document_id)).await
 }
 
+/// The lock when it is free; reads use it to avoid waiting for a running snapshot.
+pub fn try_lock(document_id: Ulid) -> Option<OwnedMutexGuard<()>> {
+    LOCKS.try_lock(document_id)
+}
+
+/// The last completed projection of the document on this node, whatever changed since.
+pub fn last(document_id: Ulid) -> Option<Projection> {
+    let mut recent = RECENT.lock().ok()?;
+    recent
+        .get(&document_id)
+        .map(|(_, projection)| projection.clone())
+}
+
 /// The refs each document's cache last served, which a push must build on.
 static SERVED: LazyLock<
     std::sync::Mutex<std::collections::HashMap<Ulid, BTreeMap<String, String>>>,

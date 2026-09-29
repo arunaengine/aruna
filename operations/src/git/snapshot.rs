@@ -614,6 +614,26 @@ pub async fn view(
     Ok((projection, pending))
 }
 
+/// [`view`] without waiting behind a running snapshot: while one holds the lock, the last
+/// completed projection is served as pending. Only a document never projected here waits.
+pub async fn read_view(
+    context: &DriverContext,
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+) -> Result<(Projection, bool), GitError> {
+    let id = document.document_id;
+    let guard = match super::project::try_lock(id) {
+        Some(guard) => guard,
+        None => match super::project::last(id) {
+            Some(projection) => return Ok((projection, true)),
+            None => lock(id).await,
+        },
+    };
+    let viewed = view(context, store, document).await;
+    drop(guard);
+    viewed
+}
+
 /// Runs the full refresh once in the background. A lost run is found again by the next read;
 /// the metadata and pushed merges it acts on are stored durably.
 fn background(context: &DriverContext, document: &MetadataRegistryRecord) {
@@ -762,10 +782,26 @@ pub async fn status(
     GitError,
 > {
     let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
-    let guard = lock(id).await;
-    let (projection, pending) = view(context, store, &document).await?;
-    // The layout read names main's commit, so it needs no lock.
-    drop(guard);
+    // Status never waits for a first snapshot either; it reports an empty pending state.
+    let (projection, pending) = match super::project::try_lock(id) {
+        Some(guard) => {
+            let viewed = view(context, store, &document).await?;
+            drop(guard);
+            viewed
+        }
+        None => match super::project::last(id) {
+            Some(projection) => (projection, true),
+            None => (
+                Projection {
+                    state: super::state::GitState::default(),
+                    records: Default::default(),
+                    holders: Vec::new(),
+                    writes: 0,
+                },
+                true,
+            ),
+        },
+    };
     let status = records::load(context, STATUS, id.to_bytes().to_vec()).await?;
     let layout = match projection.state.refs.get("refs/heads/main") {
         Some(main) => {
@@ -791,8 +827,7 @@ pub async fn export(
     revision: String,
 ) -> Result<Bytes, GitError> {
     let document = document(context, auth, id, Permission::READ).await?;
-    let _guard = lock(id).await;
-    view(context, store, &document).await?;
+    read_view(context, store, &document).await?;
     let known = GitEffect::Resolve {
         document_id: id,
         revision: revision.clone(),
