@@ -560,6 +560,69 @@ pub async fn refresh(
     Ok(projection)
 }
 
+/// Documents with a background refresh queued or running on this node.
+static REFRESHING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<Ulid>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Like [`refresh`] for reads, which never wait for a snapshot. When the records lag behind
+/// the metadata, pushed metadata waits or a checkpoint is due, the full refresh runs in the
+/// background and `true` marks the projection as pending. The caller holds the lock.
+pub async fn view(
+    context: &DriverContext,
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+) -> Result<(Projection, bool), GitError> {
+    let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
+    if let Some(projection) = recent(context, store, document, overdue).await? {
+        return Ok((projection, false));
+    }
+    let projection = project(context, store, document).await?;
+    let prefix = document.document_id.to_bytes().to_vec();
+    let waiting = !records::prefixed::<PendingMerge>(context, PENDING, prefix)
+        .await?
+        .is_empty();
+    let pending = waiting
+        || projection.state.revision != Some(document.last_event_id)
+        || publish::uncovered(&projection.records).len() > CHECKPOINT_AFTER;
+    if pending {
+        background(context, document);
+    } else {
+        let node = context.net_handle.as_ref().map(|net| net.node_id());
+        remember(node, document, overdue, &projection);
+    }
+    Ok((projection, pending))
+}
+
+/// Runs the full refresh once in the background. A lost run is found again by the next read;
+/// the metadata and pushed merges it acts on are stored durably.
+fn background(context: &DriverContext, document: &MetadataRegistryRecord) {
+    let id = document.document_id;
+    if !REFRESHING
+        .lock()
+        .is_ok_and(|mut running| running.insert(id))
+    {
+        return;
+    }
+    let context = context.clone();
+    let document = document.clone();
+    tokio::spawn(async move {
+        if let Some(store) = context
+            .metadata_handle
+            .as_ref()
+            .and_then(|handle| handle.git())
+        {
+            let _guard = lock(id).await;
+            let refreshing = refresh(&context, store, &document);
+            if let Err(error) = Box::pin(refreshing).await {
+                tracing::warn!(document_id = %id, %error, "Background Git refresh failed");
+            }
+        }
+        if let Ok(mut running) = REFRESHING.lock() {
+            running.remove(&id);
+        }
+    });
+}
+
 /// Whether main is an ARC that Aruna made although the metadata has no ARC markers, as
 /// earlier versions made for every dataset. Such a main switches to a plain RO-Crate.
 async fn misplaced(
@@ -660,7 +723,8 @@ pub async fn capture(
     }
 }
 
-/// The snapshot status, the projection, and the layout of main when main exists.
+/// The snapshot status, the projection, the layout of main when main exists, the document and
+/// whether a newer snapshot is still being made.
 pub async fn status(
     context: &DriverContext,
     store: &GitStore,
@@ -672,12 +736,13 @@ pub async fn status(
         Projection,
         Option<Layout>,
         MetadataRegistryRecord,
+        bool,
     ),
     GitError,
 > {
     let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
     let guard = lock(id).await;
-    let projection = refresh(context, store, &document).await?;
+    let (projection, pending) = view(context, store, &document).await?;
     // The layout read names main's commit, so it needs no lock.
     drop(guard);
     let status = records::load(context, STATUS, id.to_bytes().to_vec()).await?;
@@ -694,7 +759,7 @@ pub async fn status(
         }
         None => None,
     };
-    Ok((status, projection, layout, document))
+    Ok((status, projection, layout, document, pending))
 }
 
 pub async fn export(
@@ -706,7 +771,7 @@ pub async fn export(
 ) -> Result<Bytes, GitError> {
     let document = document(context, auth, id, Permission::READ).await?;
     let _guard = lock(id).await;
-    refresh(context, store, &document).await?;
+    view(context, store, &document).await?;
     let known = GitEffect::Resolve {
         document_id: id,
         revision: revision.clone(),

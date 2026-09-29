@@ -6,7 +6,7 @@ use super::GitError;
 use super::changes::{EntityChange, entity_changes};
 use super::project::{Projection, lock};
 use super::push::record;
-use super::snapshot::{execute, refresh};
+use super::snapshot::{execute, refresh, view};
 use super::state::GitState;
 use crate::driver::DriverContext;
 use aruna_blob::git::GitStore;
@@ -88,9 +88,13 @@ pub(super) async fn open(
     id: Ulid,
     permission: Permission,
 ) -> Result<(MetadataRegistryRecord, Projection, Guard), GitError> {
+    let reading = permission == Permission::READ;
     let (document, _) = super::repository(context, auth, id, permission).await?;
     let guard = lock(id).await;
-    let projection = refresh(context, store, &document).await?;
+    let projection = match reading {
+        true => view(context, store, &document).await?.0,
+        false => refresh(context, store, &document).await?,
+    };
     Ok((document, projection, guard))
 }
 
