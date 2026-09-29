@@ -110,6 +110,17 @@ impl AdminDocumentState {
             AdminDocumentOperation::GroupPoliciesSet { policies } => {
                 self.apply_group_field(event, GROUP_POLICIES_PATH, Some(policies_value(policies)));
             }
+            AdminDocumentOperation::GroupLocationSet { location } => {
+                if location.as_ref().is_some_and(|location| !location.valid()) {
+                    return Err(AdminDocumentError::InvalidLocation);
+                }
+                let value = location
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidLocation)?;
+                self.apply_group_field(event, GROUP_LOCATION_PATH, value);
+            }
             _ => return Err(AdminDocumentError::UnsupportedTarget),
         }
         Ok(AdminApplyStatus::Applied)

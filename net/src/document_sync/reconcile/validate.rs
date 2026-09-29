@@ -866,6 +866,7 @@ pub(in crate::document_sync) async fn validate_group_authority(
             vec![format!("/{realm_id}/g/{group_id}/admin/config")]
         }
         AdminDocumentOperation::DisplayNameSet { .. }
+        | AdminDocumentOperation::GroupLocationSet { .. }
         | AdminDocumentOperation::GroupDeleted { .. } => vec![
             format!("/{realm_id}/g/{group_id}/admin"),
             format!("/{realm_id}/admin/groups"),
@@ -1587,6 +1588,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::GroupCreated { .. }
         | AdminDocumentOperation::GroupDeleted { .. }
         | AdminDocumentOperation::DisplayNameSet { .. }
+        | AdminDocumentOperation::GroupLocationSet { .. }
         | AdminDocumentOperation::GroupPoliciesSet { .. }
         | AdminDocumentOperation::GroupJoinRequested { .. }
         | AdminDocumentOperation::GroupJoinDecided { .. } => AdminOperationFamily::Group,
