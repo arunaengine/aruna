@@ -138,7 +138,7 @@ pub async fn upload(
 #[utoipa::path(get, path = "/git/{repository}/info/lfs/objects/{oid}", tag = "metadata/git",
     security(("bearer_auth" = []), ("basic_auth" = [])),
     summary = "Download an exact native LFS version",
-    description = "Downloads the exact Aruna version bound to an LFS identity.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password, with repository and source-object READ.\n\n**Behavior**: changing the S3 key head does not change the recorded LFS payload. Content stored on another holder is copied to this node first and then served from that copy.",
+    description = "Downloads the exact Aruna version bound to an LFS identity.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password, with repository and source-object READ.\n\n**Behavior**: changing the S3 key head does not change the recorded LFS payload. Content stored on another node is relayed from that node; this node keeps no copy.",
     params(("repository" = String, Path, description = "Document ID followed by .git"), ("oid" = String, Path, description = "Lowercase SHA-256")),
     responses((status = 200, description = "LFS bytes", content_type = "application/octet-stream"),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),

@@ -150,7 +150,7 @@ pub async fn upload(
 }
 
 /// Streams LFS content after authorizing the original object. Content held elsewhere is
-/// first copied to this node, whose copy serves later requests even if the source leaves.
+/// relayed from its node and not stored here.
 pub async fn download(
     context: &DriverContext,
     auth: &AuthContext,
@@ -173,8 +173,7 @@ pub async fn download(
         None => {
             let holders = publish::holders(context, &document).await?;
             let blob = objects::open(context, auth, &document, &original, &holders).await?;
-            let content = (format!("git-copies/{id}/{oid}"), original.size, oid);
-            objects::store(context, auth, &document, content, blob).await?
+            return Ok((blob, original.size));
         }
     };
     let blob = objects::open(context, auth, &document, &local, &[]).await?;
