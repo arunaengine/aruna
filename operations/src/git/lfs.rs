@@ -49,22 +49,7 @@ async fn permit(
         if permission != Permission::READ {
             return Err(GitError::Invalid);
         }
-        let request = BaoReadRequest {
-            auth_context: auth.clone(),
-            realm_id: auth.realm_id,
-            target: BaoReadTarget::ExactVersion(VersionedObjectArn {
-                realm_id: auth.realm_id,
-                node_id: object.node_id,
-                bucket: object.bucket.clone(),
-                key: object.key.clone(),
-                version: object.version_id,
-            }),
-            expected_blake3: Some(object.blake3),
-            metadata_only: true,
-            destination: None,
-            known_refs: Vec::new(),
-        };
-        return match managed_read(context, object.node_id, request).await {
+        return match managed_read(context, object.node_id, described(auth, object)).await {
             Ok(_) => Ok(()),
             Err(BaoReadError::Refused(_)) => Err(GitError::NotFound),
             Err(_) => Err(GitError::Unavailable),
@@ -87,6 +72,47 @@ async fn permit(
     )
     .await?;
     Ok(())
+}
+
+/// A metadata-only read of the exact version on its own node.
+fn described(auth: &AuthContext, object: &StoredObject) -> BaoReadRequest {
+    BaoReadRequest {
+        auth_context: auth.clone(),
+        realm_id: auth.realm_id,
+        target: BaoReadTarget::ExactVersion(VersionedObjectArn {
+            realm_id: auth.realm_id,
+            node_id: object.node_id,
+            bucket: object.bucket.clone(),
+            key: object.key.clone(),
+            version: object.version_id,
+        }),
+        expected_blake3: Some(object.blake3),
+        metadata_only: true,
+        destination: None,
+        known_refs: Vec::new(),
+    }
+}
+
+/// Whether the node holding `object` still serves that exact version to `auth`.
+pub(super) async fn readable(
+    context: &DriverContext,
+    auth: &AuthContext,
+    object: &StoredObject,
+) -> bool {
+    let local = context.net_handle.as_ref().map(|net| net.node_id());
+    match (local == Some(object.node_id), object.group_id) {
+        (true, Some(group_id)) => {
+            let found = (object.bucket.as_str(), group_id);
+            let version = Some(object.version_id);
+            objects::described(context, found, &object.key, version)
+                .await
+                .is_ok_and(|found| found.is_some())
+        }
+        (true, None) => false,
+        (false, _) => managed_read(context, object.node_id, described(auth, object))
+            .await
+            .is_ok(),
+    }
 }
 
 pub async fn inspect(

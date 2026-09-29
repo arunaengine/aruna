@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod changes;
+pub mod cleanup;
 mod dataset;
 pub mod hook;
 pub mod lfs;

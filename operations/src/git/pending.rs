@@ -164,6 +164,7 @@ pub fn spawn_drain(context: Arc<DriverContext>, shutdown: &Shutdown) {
     shutdown.spawn(async move {
         loop {
             drain(&context).await;
+            super::cleanup::remove_objects(&context).await;
             tokio::select! {
                 _ = token.cancelled() => return,
                 _ = tokio::time::sleep(DRAIN_INTERVAL) => {}
