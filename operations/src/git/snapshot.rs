@@ -666,7 +666,15 @@ pub async fn status(
     store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-) -> Result<(Option<GitStatus>, Projection, Option<Layout>), GitError> {
+) -> Result<
+    (
+        Option<GitStatus>,
+        Projection,
+        Option<Layout>,
+        MetadataRegistryRecord,
+    ),
+    GitError,
+> {
     let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
     let guard = lock(id).await;
     let projection = refresh(context, store, &document).await?;
@@ -686,7 +694,7 @@ pub async fn status(
         }
         None => None,
     };
-    Ok((status, projection, layout))
+    Ok((status, projection, layout, document))
 }
 
 pub async fn export(

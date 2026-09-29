@@ -8,7 +8,8 @@ use crate::auth::require_realm_auth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::repo_layout::Layout;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::dataset_location::default_bucket;
 use aruna_operations::git;
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -67,13 +68,7 @@ pub async fn repository_status(
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<RepositoryStatus>> {
     let auth = require_realm_auth(&state, auth)?;
-    let (_, repository) = git::repository(&state.get_ctx(), &auth, id, Permission::READ)
-        .await
-        .map_err(map_error)?;
-    let storage_location = git::location::get(&state.get_ctx(), &auth, id)
-        .await
-        .map_err(map_error)?;
-    let (status, projection, layout) = git::snapshot::status(
+    let (status, projection, layout, document) = git::snapshot::status(
         &state.get_ctx(),
         state.git().ok_or(ServerError::ServiceUnavailable)?,
         &auth,
@@ -81,12 +76,13 @@ pub async fn repository_status(
     )
     .await
     .map_err(map_error)?;
+    let storage_location = git::location::chosen(&document, projection.state.location.clone());
     let clone_url = base_url(&state, id).await?;
     Ok(Json(RepositoryStatus {
         document_id: id.to_string(),
         lfs_url: format!("{clone_url}/info/lfs"),
         clone_url,
-        bucket: repository.bucket,
+        bucket: default_bucket(document.group_id),
         revision: projection
             .state
             .revision

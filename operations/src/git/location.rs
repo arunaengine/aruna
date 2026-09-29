@@ -31,13 +31,24 @@ pub async fn effective(
     document: &MetadataRegistryRecord,
 ) -> Result<(DatasetLocation, bool), GitError> {
     let records = records::scan(context, document.document_id).await?;
-    Ok(match reduce(&records, &Ancestry::new()).0.location {
+    Ok(chosen(
+        document,
+        reduce(&records, &Ancestry::new()).0.location,
+    ))
+}
+
+/// The location a reduced state chose, or the default one; `true` marks the default.
+pub fn chosen(
+    document: &MetadataRegistryRecord,
+    location: Option<(Ulid, DatasetLocation)>,
+) -> (DatasetLocation, bool) {
+    match location {
         Some((_, location)) => (location, false),
         None => (
             DatasetLocation::default_for(document.group_id, document.document_id),
             true,
         ),
-    })
+    }
 }
 
 pub async fn get(
