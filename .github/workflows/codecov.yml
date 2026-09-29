@@ -19,11 +19,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # Source-based coverage reads __llvm_covmap from the binary, so DWARF is
-  # dead weight that OOM-kills the 16 GB runner during linking.
+  # Source-based coverage reads __llvm_covmap from the binary, so DWARF is dead weight.
+  CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
-  CARGO_BUILD_JOBS: 2
-  RUSTFLAGS: -Cinstrument-coverage -Cdebuginfo=0
+  # RUSTFLAGS replaces the rustflags of .cargo/config.toml, so the mold linker is named again.
+  RUSTFLAGS: -Cinstrument-coverage -Clink-arg=-fuse-ld=mold
 
 jobs:
   instrumented:
@@ -43,14 +43,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install Rust with LLVM tools
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+
+      - name: Install LLVM tools
         # rust-toolchain.toml supplies the channel used to build the tests.
         run: rustup component add llvm-tools-preview
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          cache-on-failure: true
 
       - name: Install grcov
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
@@ -176,18 +174,17 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
-      CARGO_BUILD_JOBS: 2
-      RUSTFLAGS: -Cdebuginfo=0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      # Not instrumented; the value replaces the coverage flags and keeps the mold linker.
+      RUSTFLAGS: -Clink-arg=-fuse-ld=mold
 
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install Rust
-        run: rustup show active-toolchain
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
 
       - name: Run restart scale tests
         run: |
