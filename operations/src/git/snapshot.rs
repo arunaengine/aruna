@@ -570,7 +570,8 @@ async fn update(
     revision: Option<&MetadataRawRevision>,
     materializing: bool,
 ) -> Result<Projection, GitError> {
-    let mut projection = erased(project(context, store, document)).await?;
+    let projecting = erased(project(context, store, document));
+    let mut projection = aruna_core::telemetry::time_stage("git_project", projecting).await?;
     if let Err(error) = erased(super::pending::apply(context, store, document)).await {
         tracing::warn!(document_id = %document.document_id, %error, "Pushed metadata waits");
     }
@@ -578,7 +579,12 @@ async fn update(
     let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
     // The graph's content decides, so a late older edit that changes it is captured too.
     if let Some(source) = erased(current(context, document, revision, materializing)).await?
-        && let Ok(canonical) = craqle::canonicalize_jsonld(&source.1)
+        && let Ok(canonical) = {
+            let started = std::time::Instant::now();
+            let canonical = craqle::canonicalize_jsonld(&source.1);
+            aruna_core::telemetry::record_stage("git_canonicalize", started.elapsed());
+            canonical
+        }
         && (leading || overdue)
     {
         let stale = projection.state.digest != Some(canonical.digest);

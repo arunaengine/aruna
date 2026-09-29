@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::git::{DocumentLocks, GitEffect, GitEvent, MAX_GIT_BYTES};
+use aruna_core::telemetry::{record_stage, time_stage};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -61,11 +62,14 @@ impl GitStore {
             | GitEffect::Layout { document_id, .. } => *document_id,
             GitEffect::Http(request) => request.repository.document_id,
         };
-        let _lock = self.locks.lock(id).await;
+        let _lock = time_stage("git_repository_lock", self.locks.lock(id)).await;
         // Taken after the repository lock, so waiters on one repository keep no slot.
-        let _slot = self.slots.acquire().await.map_err(std::io::Error::other)?;
+        let _slot = time_stage("git_slot", self.slots.acquire())
+            .await
+            .map_err(std::io::Error::other)?;
         let repository = self.root.join(format!("{id}.git"));
-        match effect {
+        let started = std::time::Instant::now();
+        let result = match effect {
             GitEffect::Generate { snapshot, refs } => Ok(
                 match crate::arc::generate(&repository, snapshot, &refs).await? {
                     Ok((aruna, main)) => GitEvent::Generated { aruna, main },
@@ -281,7 +285,9 @@ impl GitStore {
                     body: output.slice(boundary + 4..),
                 })
             }
-        }
+        };
+        record_stage("git_process", started.elapsed());
+        result
     }
 }
 

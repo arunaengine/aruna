@@ -11,6 +11,7 @@ use aruna_core::UserId;
 use aruna_core::git::{DocumentLocks, GitChange, GitEffect, GitEvent, GitRecord, record_writes};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::telemetry::time_stage;
 use lru::LruCache;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -22,7 +23,7 @@ static LOCKS: LazyLock<DocumentLocks> = LazyLock::new(DocumentLocks::default);
 
 /// Serializes projection, snapshots and pushes of one document on this node.
 pub async fn lock(document_id: Ulid) -> OwnedMutexGuard<()> {
-    LOCKS.lock(document_id).await
+    aruna_core::telemetry::time_stage("git_document_lock", LOCKS.lock(document_id)).await
 }
 
 /// The refs each document's cache last served, which a push must build on.
@@ -171,7 +172,7 @@ pub async fn project(
     execute(store, GitEffect::Initialize(id), actor).await?;
     // Read first, so a record stored during this projection makes the next one run again.
     let writes = record_writes(id);
-    let records = records::scan(context, id).await?;
+    let records = time_stage("git_records", records::scan(context, id)).await?;
     let (mut state, mut needs) = reduce(&records, &Ancestry::new());
     let GitEvent::Imported(known) = execute(store, GitEffect::Imported(id), actor).await? else {
         return Err(GitError::Unavailable);
@@ -191,7 +192,9 @@ pub async fn project(
                 _ => false,
             })
             .map_or(actor, |record| record.user_id);
-        let bytes = objects::fetch(context, &author(owner), document, pack, &holders).await?;
+        let owner = author(owner);
+        let fetch = objects::fetch(context, &owner, document, pack, &holders);
+        let bytes = time_stage("git_pack_fetch", fetch).await?;
         let digest = pack.sha256.clone();
         let effect = GitEffect::Import {
             document_id: id,
