@@ -246,9 +246,33 @@ jobs:
           --test docker_backend --locked --run-ignored all --no-tests fail
           -E 'test(=idempotent_submit) | test(=resubmit_after_removal) | test(=exit_code_capture) | test(=file_transfer) | test(=wildcard_outputs) | test(=chunked_transfer) | test(=cancelled_submit) | test(=cancel_stops) | test(=created_cancel_removes) | test(=reconcile_adopts) | test(=log_bounds) | test(=resource_limits) | test(=foreign_not_adopted) | test(=wait_is_observational)'
 
+  # The compute and node manifests define the supported backend selections; an
+  # all-feature build alone can hide a conditional-import mistake. The all-feature
+  # build itself is checked by clippy and compiled by the test build.
   feature-checks:
+    name: feature-checks (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default and compute
+            run: |
+              cargo check --workspace --locked
+              cargo check -p aruna-compute --all-targets --no-default-features --locked
+              for features in docker apptainer kubernetes; do
+                cargo check -p aruna-compute --all-targets --no-default-features --features "$features" --locked
+              done
+          # The node compiles its own configuration under each feature, so it is checked apart.
+          - name: node
+            run: cargo check -p aruna --all-targets --no-default-features --locked
+          - name: node docker
+            run: cargo check -p aruna --all-targets --no-default-features --features docker --locked
+          - name: node apptainer
+            run: cargo check -p aruna --all-targets --no-default-features --features apptainer --locked
+          - name: node kubernetes
+            run: cargo check -p aruna --all-targets --no-default-features --features kubernetes --locked
 
     steps:
       - name: Check out repository
@@ -256,32 +280,13 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
+        with:
+          shared-key: feature-checks
 
-      # The compute manifest defines the supported backend selections; an
-      # all-feature build alone can hide a conditional-import mistake.
-      - name: Check the default workspace build
-        run: |
-          cargo check --workspace --locked
-          cargo check --workspace --all-targets --all-features --locked
-
-      # The aruna node manifest defines the same backend selections; checking
-      # only the compute crate hides node-side configuration that is compiled
-      # under each feature.
-      - name: Check the compute feature selections
+      - name: Check the feature selection
         run: |
           set -euo pipefail
-          cargo check -p aruna-compute --all-targets --no-default-features --locked
-          for features in docker apptainer kubernetes; do
-            cargo check -p aruna-compute --all-targets --no-default-features --features "$features" --locked
-          done
-
-      - name: Check the node feature selections
-        run: |
-          set -euo pipefail
-          cargo check -p aruna --all-targets --no-default-features --locked
-          for features in docker apptainer kubernetes; do
-            cargo check -p aruna --all-targets --no-default-features --features "$features" --locked
-          done
+          ${{ matrix.run }}
 
   fmt:
     runs-on: ubuntu-latest
