@@ -121,11 +121,12 @@ pub async fn precheck(
     permit(context, auth, &bucket, location).await
 }
 
-/// The default location an admin set for the group's new datasets, as stored on this node.
+/// Where the group's new datasets store their files, as stored on this node. Groups record
+/// their generated bucket at creation; a group without a record uses the same.
 pub async fn group_default(
     context: &DriverContext,
     group_id: GroupId,
-) -> Result<Option<DatasetLocation>, GitError> {
+) -> Result<DatasetLocation, GitError> {
     let read = StorageEffect::Read {
         key_space: DOCUMENT_STATE_KEYSPACE.into(),
         key: reducer_state_key(&AdminDocumentTarget::Group { group_id }),
@@ -142,7 +143,9 @@ pub async fn group_default(
         .map(|bytes| decode_reducer_state(&bytes))
         .transpose()
         .map_err(|_| GitError::Unavailable)?;
-    Ok(state.and_then(|state| state.group_location()))
+    Ok(state
+        .and_then(|state| state.group_location())
+        .unwrap_or_else(|| DatasetLocation::group_default(group_id)))
 }
 
 /// Checks a group default here: its bucket exists on this node, belongs to the group and
@@ -173,22 +176,20 @@ pub async fn check_default(
 }
 
 /// Where a new dataset stores its files: the explicit choice, else the group default, which
-/// gets `<document id>/` appended to its prefix at create (`true`). `None` stores no location.
+/// gets `<document id>/` appended to its prefix at create (`true`).
 pub async fn resolve(
     context: &DriverContext,
     auth: &AuthContext,
     group_id: GroupId,
     chosen: Option<DatasetLocation>,
-) -> Result<Option<(DatasetLocation, bool)>, GitError> {
+) -> Result<(DatasetLocation, bool), GitError> {
     if let Some(chosen) = chosen {
         precheck(context, auth, group_id, &chosen).await?;
-        return Ok(Some((chosen, false)));
+        return Ok((chosen, false));
     }
-    let Some(default) = group_default(context, group_id).await? else {
-        return Ok(None);
-    };
+    let default = group_default(context, group_id).await?;
     check_default(context, auth, group_id, &default).await?;
-    Ok(Some((default, true)))
+    Ok((default, true))
 }
 
 /// Records the resolved location of a just-created dataset, so later group default

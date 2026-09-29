@@ -51,8 +51,7 @@ a holder that re-runs both checks under the caller's own token.
   `PUT /metadata/{document_id}/storage-location`. The bucket must exist on this node and allow
   WRITE under the prefix, except the default `datasets-<group id>` bucket. Without it the group's
   default storage location applies, with `<document id>/` appended to its prefix; its bucket must
-  exist on this node, belong to the group and allow WRITE. Without either, the document is created
-  without a chosen location. When this node cannot record the location for the new document, the
+  exist on this node, belong to the group and allow WRITE. When this node cannot record the location for the new document, the
   document is still created; check it with `GET /metadata/{document_id}/storage-location`.
 
 **Limits**: the document path is normalized before use and must not be empty. `message` is plain
@@ -197,10 +196,7 @@ pub async fn create_metadata_document(
         message,
     )
     .await?;
-    if let Some(resolved) = resolved {
-        aruna_operations::git::location::establish(&state.get_ctx(), &auth, &result, resolved)
-            .await;
-    }
+    aruna_operations::git::location::establish(&state.get_ctx(), &auth, &result, resolved).await;
 
     Ok((
         StatusCode::CREATED,

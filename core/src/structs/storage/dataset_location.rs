@@ -66,6 +66,14 @@ impl DatasetLocation {
         })
     }
 
+    /// A group's default until an admin changes it: its generated bucket, without a prefix.
+    pub fn group_default(group_id: GroupId) -> Self {
+        Self {
+            bucket: default_bucket(group_id),
+            prefix: String::new(),
+        }
+    }
+
     /// The location used while the dataset has no chosen one.
     pub fn default_for(group_id: GroupId, document_id: Ulid) -> Self {
         Self {

@@ -231,11 +231,11 @@ pub struct GroupInfoResponse {
     pub group_id: String,
     pub realm_id: String,
     pub roles: Vec<RoleResponse>,
-    /// Where new datasets store their files; shown to members only, `null` when unset.
+    /// Where new datasets store their files; shown to members only, `null` for others.
     pub dataset_location: Option<StorageLocationRequest>,
 }
 
-/// A group's default dataset location; `null` clears it.
+/// A group's default dataset location; `null` restores the generated group bucket.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GroupLocationRequest {
@@ -764,11 +764,12 @@ pub(crate) async fn run_get_group(
     let dataset_location = match is_member {
         true => group_default(&state.get_ctx(), group_id)
             .await
-            .map_err(|_| ServerError::ServiceUnavailable)?
             .map(|location| StorageLocationRequest {
                 bucket: location.bucket,
                 prefix: location.prefix,
-            }),
+            })
+            .map(Some)
+            .map_err(|_| ServerError::ServiceUnavailable)?,
         false => None,
     };
     Ok(GroupInfoResponse {
@@ -913,7 +914,8 @@ prefix.
   `datasets-<group id>` bucket, which is created on first use. Bucket names are node-local, so
   every node that creates datasets checks the bucket again and refuses the create when it is
   missing there; another bucket is never substituted.
-- `null` clears the default. Datasets created afterwards without a location have none recorded.
+- Every group starts with its generated `datasets-<group id>` bucket and no prefix. `null`
+  restores that default.
 - The change reaches the rest of the realm through document sync."#,
     request_body(
         content = GroupLocationRequest,

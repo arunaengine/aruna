@@ -402,9 +402,7 @@ impl McpServer {
             ),
             error => write_error(error),
         })?;
-        if let Some(resolved) = resolved {
-            aruna_operations::git::location::establish(&ctx, &auth, &record, resolved).await;
-        }
+        aruna_operations::git::location::establish(&ctx, &auth, &record, resolved).await;
         let summary = crate::metadata::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
