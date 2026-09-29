@@ -22,7 +22,12 @@ COPY . .
 RUN python3 -m venv /opt/arctrl \
     && /opt/arctrl/bin/pip install --no-cache-dir -r blob/arc-requirements.txt
 # One build for both binaries: separate builds unify features differently and rebuild shared crates.
-RUN cargo build --release --locked -p aruna -p aruna-doctor
+# CI passes binaries it already built in .prebuilt/, so the image build skips the compile.
+RUN if [ -x .prebuilt/aruna ] && [ -x .prebuilt/aruna-doctor ]; then \
+        mkdir -p target/release && cp .prebuilt/aruna .prebuilt/aruna-doctor target/release/; \
+    else \
+        cargo build --release --locked -p aruna -p aruna-doctor; \
+    fi
 # The runtime image has no shell, so copy the staged portal in the builder.
 RUN mkdir -p /portal ${PORTAL_EMBED_DIR} && cp -r ${PORTAL_EMBED_DIR}/. /portal/
 RUN mkdir -p /git-runtime/usr/bin /git-runtime/usr/lib/git-core \

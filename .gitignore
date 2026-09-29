@@ -13,3 +13,4 @@ target/
 /portal*
 aruna/compute-state/
 __pycache__/
+/.prebuilt/

@@ -401,9 +401,11 @@ jobs:
       - name: Run clippy
         run: cargo +nightly-2026-09-14 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-  cluster-start:
+  # Builds the release binaries once for the cluster and compose start checks.
+  release-build:
+    name: Build release binaries
     runs-on: ubuntu-latest
-    # Hang cap for the four cluster recipes plus one release build.
+    # Hang cap for one release build, not a performance budget.
     timeout-minutes: 60
 
     steps:
@@ -412,14 +414,45 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
+        with:
+          shared-key: release
+
+      - name: Build the deployment binaries
+        run: |
+          cargo build --release --locked -p aruna -p aruna-doctor
+          # A tarball keeps the executable bits that artifacts drop.
+          tar -cf release-binaries.tar -C target/release aruna aruna-doctor
+
+      - name: Upload the release binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-binaries
+          path: release-binaries.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  cluster-start:
+    needs: release-build
+    runs-on: ubuntu-latest
+    # Hang cap for the four cluster recipes.
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install just
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           tool: just@1.58.0
 
-      - name: Build the deployment binaries once
-        run: cargo build --release --locked -p aruna -p aruna-doctor
+      - name: Download the release binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-binaries
+
+      - name: Place the release binaries
+        run: mkdir -p target/release && tar -xf release-binaries.tar -C target/release
 
       - name: Start the cluster recipes
         run: |
@@ -643,9 +676,10 @@ jobs:
           echo "all cluster recipes started and stopped cleanly"
 
   compose-start:
+    needs: release-build
     runs-on: ubuntu-latest
     # Hang cap for the container image build plus both compose recipes.
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: Check out repository
@@ -656,8 +690,16 @@ jobs:
         with:
           tool: just@1.58.0
 
+      - name: Download the release binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-binaries
+
+      # The Dockerfile copies binaries from .prebuilt/ instead of compiling them again.
       - name: Build the compose image once
-        run: docker compose --file scripts/compose.yaml build aruna
+        run: |
+          mkdir -p .prebuilt && tar -xf release-binaries.tar -C .prebuilt
+          docker compose --file scripts/compose.yaml build aruna
 
       - name: Start the compose recipes
         run: |
