@@ -182,19 +182,16 @@ pub async fn project(
         .iter()
         .filter(|pack| !known.contains(&pack.sha256))
     {
-        let owner = records
-            .iter()
-            .find(|record| match &record.change {
-                GitChange::Objects {
-                    pack: Some(own), ..
-                } => **own == *pack,
-                GitChange::Checkpoint(checkpoint) => checkpoint.packs.contains(pack),
-                _ => false,
-            })
-            .map_or(actor, |record| record.user_id);
-        let owner = author(owner);
-        let fetch = objects::fetch(context, &owner, document, pack, &holders);
-        let bytes = time_stage("git_pack_fetch", fetch).await?;
+        // The record that named the pack first; a checkpoint only repeats it.
+        let named = |record: &&GitRecord| match &record.change {
+            GitChange::Objects {
+                pack: Some(own), ..
+            } => own == pack,
+            _ => false,
+        };
+        let owner = records.iter().find(named).ok_or(GitError::Unavailable)?;
+        let read = objects::pack_bytes(context, document, pack, owner);
+        let bytes = time_stage("git_pack_read", read).await?;
         let digest = pack.sha256.clone();
         let effect = GitEffect::Import {
             document_id: id,

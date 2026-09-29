@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::git::{
-    GitChange, GitCheckpoint, GitRecord, LfsLock, StoredObject, ZERO_OID, refs_clash,
+    GitChange, GitCheckpoint, GitPack, GitRecord, LfsLock, StoredObject, ZERO_OID, refs_clash,
 };
 use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,7 +23,7 @@ pub struct GitState {
     pub revision: Option<Ulid>,
     /// The graph digest of the newest applied snapshot.
     pub digest: Option<[u8; 32]>,
-    pub packs: Vec<StoredObject>,
+    pub packs: Vec<GitPack>,
     /// Commits nodes made themselves; only their Aruna trailers are trusted.
     pub made: BTreeSet<String>,
     /// The newest checkpoint the state starts from.
@@ -31,7 +31,7 @@ pub struct GitState {
     /// Records applied on top of that checkpoint; the next checkpoint covers exactly these.
     pub applied: Vec<Ulid>,
     /// Packs and LFS objects those records added.
-    pub new_packs: Vec<StoredObject>,
+    pub new_packs: Vec<GitPack>,
     pub new_lfs: Vec<StoredObject>,
     pub new_made: Vec<String>,
     /// The newest chosen storage location and the record that chose it.
@@ -140,7 +140,7 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
                 made,
             } => {
                 // Objects always stay: other records may build on a losing record's commits.
-                if let Some(pack) = pack.as_deref()
+                if let Some(pack) = pack.as_ref()
                     && !state.packs.contains(pack)
                 {
                     state.packs.push(pack.clone());
@@ -453,15 +453,9 @@ mod tests {
 
     #[test]
     fn checkpoint_keeps_late() {
-        let pack = StoredObject {
-            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
-            group_id: Some(Ulid::from(1)),
-            bucket: "arc".into(),
-            key: "pack".into(),
-            version_id: Ulid::from(1),
+        let pack = GitPack {
             size: 1,
             sha256: "a".repeat(64),
-            blake3: [0; 32],
         };
         let checkpoint = record(
             50,

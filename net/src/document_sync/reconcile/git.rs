@@ -48,7 +48,7 @@ pub(super) async fn apply_git_event(
             reason,
         )))
     };
-    let Ok(record) = postcard::from_bytes::<GitRecord>(bytes) else {
+    let Some(record) = GitRecord::decode(bytes) else {
         return reject("undecodable Git record");
     };
     if *target

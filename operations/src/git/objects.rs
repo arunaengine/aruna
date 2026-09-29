@@ -13,7 +13,10 @@ use crate::s3::object::get::{GetObjectInput, get_object_routed};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_core::NodeId;
-use aruna_core::git::{LOCAL_OBJECTS, StoredObject};
+use aruna_core::git::{
+    GitPack, GitPackRecord, GitRecord, LOCAL_OBJECTS, MAX_PACK_BYTES, StoredObject, git_pack_key,
+};
+use aruna_core::keyspaces::GIT_PACK_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::auth::AuthContext;
@@ -207,25 +210,61 @@ pub async fn described(
     }))
 }
 
-/// Stores a pack in this node's dataset bucket and returns its location for a record.
-pub async fn store_pack(
-    context: &DriverContext,
-    auth: &AuthContext,
-    document: &MetadataRegistryRecord,
-    pack: Bytes,
-) -> Result<StoredObject, GitError> {
-    let hashes = aruna_blob::hash::Hasher::new_with_bytes(&pack).to_map();
+/// Describes a pack for a record. Larger packs are refused: large files belong in Git LFS.
+pub fn describe_pack(pack: &Bytes) -> Result<GitPack, GitError> {
+    if pack.len() > MAX_PACK_BYTES {
+        return Err(GitError::Refused(format!(
+            "the pushed Git objects exceed {} MiB; track large files with Git LFS",
+            MAX_PACK_BYTES >> 20
+        )));
+    }
+    let hashes = aruna_blob::hash::Hasher::new_with_bytes(pack).to_map();
     let sha256 = hashes
         .get("sha256")
         .map(hex::encode)
         .ok_or(GitError::Unavailable)?;
-    let key = format!("git-packs/{}/{sha256}.pack", document.document_id);
-    let size = pack.len() as u64;
-    let body = aruna_core::stream::BackendStream::new(futures_util::stream::iter([Ok::<
-        _,
-        aruna_core::stream::StreamError,
-    >(pack)]));
-    store(context, auth, document, (key, size, &sha256), body).await
+    Ok(GitPack {
+        sha256,
+        size: pack.len() as u64,
+    })
+}
+
+/// The bytes of a pack `owner` names first. A pack this node still keeps only as an object
+/// from before packs moved into Fjall is moved there once and replicated.
+pub async fn pack_bytes(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    pack: &GitPack,
+    owner: &GitRecord,
+) -> Result<Bytes, GitError> {
+    let digest = pack.digest().ok_or(GitError::Invalid)?;
+    let key = git_pack_key(document.document_id, &digest).to_vec();
+    if let Some(stored) = records::load::<GitPackRecord>(context, GIT_PACK_KEYSPACE, key).await? {
+        return Ok(stored.bytes);
+    }
+    let Some(object) = copy(context, document, &pack.sha256).await? else {
+        return Err(GitError::Unavailable);
+    };
+    let auth = super::project::author(owner.user_id);
+    let mut blob = open(context, &auth, document, &object, &[]).await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = blob.next().await {
+        bytes.extend_from_slice(&chunk.map_err(|_| GitError::Unavailable)?);
+        if bytes.len() as u64 > pack.size {
+            return Err(GitError::Invalid);
+        }
+    }
+    let bytes = Bytes::from(bytes);
+    if describe_pack(&bytes).ok().as_ref() != Some(pack) {
+        return Err(GitError::Invalid);
+    }
+    super::publish::publish_pack(
+        context,
+        document,
+        super::publish::pack_record(owner, bytes.clone()),
+    )
+    .await?;
+    Ok(bytes)
 }
 
 /// Opens exact bytes: this node's copy, the recording node's version, or any holder's copy.
@@ -284,46 +323,4 @@ pub async fn open(
         }
     }
     Err(GitError::Unavailable)
-}
-
-/// Reads a bounded object fully, checks its SHA-256 and keeps a local copy of remote content.
-pub async fn fetch(
-    context: &DriverContext,
-    auth: &AuthContext,
-    document: &MetadataRegistryRecord,
-    object: &StoredObject,
-    holders: &[NodeId],
-) -> Result<Bytes, GitError> {
-    if usize::try_from(object.size).map_or(true, |size| size > aruna_core::git::MAX_GIT_BYTES) {
-        return Err(GitError::Invalid);
-    }
-    let mut blob = open(context, auth, document, object, holders).await?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = blob.next().await {
-        bytes.extend_from_slice(&chunk.map_err(|_| GitError::Unavailable)?);
-        if bytes.len() as u64 > object.size {
-            return Err(GitError::Invalid);
-        }
-    }
-    let hashes = aruna_blob::hash::Hasher::new_with_bytes(&bytes).to_map();
-    if hashes.get("sha256").map(hex::encode).as_deref() != Some(object.sha256.as_str()) {
-        return Err(GitError::Invalid);
-    }
-    let bytes = Bytes::from(bytes);
-    if copy(context, document, &object.sha256).await?.is_none() && object.node_id != local(context)?
-    {
-        let key = format!("git-copies/{}/{}", document.document_id, object.sha256);
-        let body = BackendStream::new(futures_util::stream::iter([Ok::<_, StreamError>(
-            bytes.clone(),
-        )]));
-        store(
-            context,
-            auth,
-            document,
-            (key, object.size, &object.sha256),
-            body,
-        )
-        .await?;
-    }
-    Ok(bytes)
 }

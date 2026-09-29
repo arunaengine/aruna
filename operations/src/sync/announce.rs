@@ -306,8 +306,9 @@ impl AnnounceTopicOperation {
                 document_id,
                 event_id,
             } => {
-                let record: aruna_core::git::GitRecord = postcard::from_bytes(bytes)
-                    .map_err(|error| AnnounceTopicError::ConversionError(error.into()))?;
+                let record = aruna_core::git::GitRecord::decode(bytes).ok_or_else(|| {
+                    AnnounceTopicError::DocumentSync("undecodable Git record".to_string())
+                })?;
                 if record.document_id != *document_id || record.event_id != *event_id {
                     return Err(AnnounceTopicError::DocumentSync(format!(
                         "Git record target {document_id}/{event_id} does not match payload {}/{}",

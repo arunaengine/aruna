@@ -160,13 +160,10 @@ pub(super) async fn record(
     (pack, lfs): (Bytes, Vec<StoredObject>),
     (made, merge): (Vec<String>, Option<PendingMerge>),
 ) -> Result<GitRecord, GitError> {
-    let pack = if objects_in(&pack) == 0 {
-        None
-    } else {
-        Some(objects::store_pack(context, auth, document, pack).await?)
-    };
+    let pack = (objects_in(&pack) != 0).then_some(pack);
+    let described = pack.as_ref().map(objects::describe_pack).transpose()?;
     let change = GitChange::Objects {
-        pack: pack.map(Box::new),
+        pack: described,
         refs,
         lfs,
         revision: None,
@@ -177,7 +174,7 @@ pub(super) async fn record(
         Some(merge) => vec![super::pending::entry(document.document_id, merge)?],
         None => Vec::new(),
     };
-    publish::publish_with(context, document, auth.user_id, change, extra).await
+    publish::publish_with(context, document, auth.user_id, change, (pack, extra)).await
 }
 
 #[cfg(test)]

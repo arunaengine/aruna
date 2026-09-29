@@ -475,8 +475,9 @@ async fn generate(
         let GitEvent::Packed(pack) = execute(store, effect, user).await? else {
             return Err(GitError::Unavailable);
         };
-        Some(objects::store_pack(context, &author(user), document, pack).await?)
+        Some(pack)
     };
+    let described = pack.as_ref().map(objects::describe_pack).transpose()?;
     let update = |name: &str, new: String| RefUpdate {
         name: name.into(),
         old: refs.get(name).cloned().unwrap_or_else(|| ZERO_OID.into()),
@@ -489,14 +490,14 @@ async fn generate(
     updates.retain(|update| update.old != update.new);
     made.retain(|commit| updates.iter().any(|update| update.new == *commit));
     let change = GitChange::Objects {
-        pack: pack.map(Box::new),
+        pack: described,
         refs: updates,
         lfs,
         revision: Some(event_id),
         digest,
         made,
     };
-    publish::publish(context, document, user, change).await?;
+    publish::publish_with(context, document, user, change, (pack, Vec::new())).await?;
     let status = GitStatus {
         event_id,
         commit: Some(aruna),

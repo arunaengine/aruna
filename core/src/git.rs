@@ -359,7 +359,7 @@ pub enum GitChange {
     /// metadata event it represents in `revision` and the graph it captured in `digest`; a
     /// snapshot whose updates no longer match is dropped, since the server makes a new one.
     Objects {
-        pack: Option<Box<StoredObject>>,
+        pack: Option<GitPack>,
         refs: Vec<RefUpdate>,
         lfs: Vec<StoredObject>,
         revision: Option<Ulid>,
@@ -388,7 +388,7 @@ pub enum GitChange {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCheckpoint {
     pub previous: Option<Ulid>,
-    pub packs: Vec<StoredObject>,
+    pub packs: Vec<GitPack>,
     /// Commits nodes made themselves since `previous`.
     pub made: Vec<String>,
     /// The graph digest of the newest applied snapshot.
@@ -496,7 +496,35 @@ impl StoredObject {
     }
 }
 
+/// A pack a record names; its bytes are the [`GitPackRecord`] stored under its SHA-256.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPack {
+    pub sha256: String,
+    pub size: u64,
+}
+
+impl GitPack {
+    fn valid(&self) -> bool {
+        hex(&self.sha256, 64) && usize::try_from(self.size).is_ok_and(|size| size <= MAX_PACK_BYTES)
+    }
+
+    /// The raw digest that keys the pack's bytes.
+    pub fn digest(&self) -> Option<[u8; 32]> {
+        hex::decode(&self.sha256).ok()?.try_into().ok()
+    }
+}
+
 impl GitRecord {
+    /// Decodes a stored or replicated record. Records written before packs moved into Fjall
+    /// are converted; replayed topic history still carries them.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let exact = |result: postcard::Result<(Self, &[u8])>| match result {
+            Ok((record, [])) if record.validate() => Some(record),
+            _ => None,
+        };
+        exact(postcard::take_from_bytes(bytes)).or_else(|| crate::git_legacy::decode(bytes))
+    }
+
     /// Checks shape and bounds; authorship and document state are checked by the writer and receiver.
     pub fn validate(&self) -> bool {
         let size = postcard::to_allocvec(self).map_or(usize::MAX, |bytes| bytes.len());
@@ -520,14 +548,14 @@ impl GitRecord {
                                 && hex(&update.new, 40)
                                 && update.old != update.new
                         })
-                        && pack.as_deref().is_none_or(StoredObject::valid)
+                        && pack.as_ref().is_none_or(GitPack::valid)
                         && lfs.iter().all(StoredObject::valid)
                         && made.iter().all(|commit| hex(commit, 40))
                 }
                 GitChange::Lock { path, .. } => valid_path(path),
                 GitChange::Unlock { .. } => true,
                 GitChange::Checkpoint(checkpoint) => {
-                    checkpoint.packs.iter().all(StoredObject::valid)
+                    checkpoint.packs.iter().all(GitPack::valid)
                         && checkpoint
                             .previous
                             .is_none_or(|previous| previous < self.event_id)
