@@ -8,7 +8,7 @@ use crate::driver::DriverContext;
 use aruna_blob::git::GitStore;
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::git::{DocumentLocks, GitChange, GitEffect, GitEvent, GitRecord};
+use aruna_core::git::{DocumentLocks, GitChange, GitEffect, GitEvent, GitRecord, record_writes};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use lru::LruCache;
@@ -40,6 +40,8 @@ pub struct Projection {
     pub state: GitState,
     pub records: Vec<GitRecord>,
     pub holders: Vec<NodeId>,
+    /// [`record_writes`] before the records were read.
+    pub writes: u64,
 }
 
 /// Documents whose last refresh and ancestry answers this node keeps; older ones drop first.
@@ -66,8 +68,8 @@ fn inputs(node: Option<NodeId>, document: &MetadataRegistryRecord, overdue: bool
     )
 }
 
-/// The projection of the last refresh, if the document, its holders and all its records,
-/// replicated ones included, are unchanged since then.
+/// The projection of the last refresh, if the document, its holders and its records,
+/// replicated ones included, are unchanged since then. Reads no Git record.
 pub async fn recent(
     context: &DriverContext,
     store: &GitStore,
@@ -82,8 +84,8 @@ pub async fn recent(
         return Ok(None);
     }
     let holders = publish::holders(context, document).await?;
-    let records = records::scan(context, document.document_id).await?;
-    Ok((holders == projection.holders && records == projection.records).then_some(projection))
+    let unchanged = record_writes(document.document_id) == projection.writes;
+    Ok((holders == projection.holders && unchanged).then_some(projection))
 }
 
 fn remembered(
@@ -166,6 +168,8 @@ pub async fn project(
     let id = document.document_id;
     let actor = UserId::nil(document.realm_id);
     execute(store, GitEffect::Initialize(id), actor).await?;
+    // Read first, so a record stored during this projection makes the next one run again.
+    let writes = record_writes(id);
     let records = records::scan(context, id).await?;
     let (mut state, mut needs) = reduce(&records, &Ancestry::new());
     let GitEvent::Imported(known) = execute(store, GitEffect::Imported(id), actor).await? else {
@@ -219,6 +223,7 @@ pub async fn project(
                 state,
                 records,
                 holders,
+                writes,
             });
         }
         let effect = GitEffect::Ancestry {
@@ -268,6 +273,7 @@ mod tests {
             state: GitState::default(),
             records: Vec::new(),
             holders: Vec::new(),
+            writes: 0,
         };
         projection
             .state

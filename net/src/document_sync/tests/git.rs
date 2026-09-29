@@ -111,10 +111,16 @@ async fn git_record_manifest() {
         DocumentNetEvent::DocumentsPublished { .. }
     ));
     reset_test_cursor(&service, topic_id).await;
+    let writes = aruna_core::git::record_writes(document_id);
     service
         .reconcile_document_topics([topic_id])
         .await
         .expect("Git record reconciles");
+    assert_ne!(
+        aruna_core::git::record_writes(document_id),
+        writes,
+        "a replicated record makes a remembered projection stale"
+    );
 
     assert!(
         read_storage_value(&storage, GIT_RECORD_KEYSPACE, target.storage_key())

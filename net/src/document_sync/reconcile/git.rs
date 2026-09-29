@@ -88,6 +88,7 @@ pub(super) async fn apply_git_event(
             ];
             writes.extend(shard_manifest_entry(target, change).map_err(bootstrap)?);
             service.storage_batch_write(writes).await?;
+            aruna_core::git::record_written(record.document_id);
             Ok(MetadataOutcome::Applied {
                 target: target.clone(),
                 tombstone: None,

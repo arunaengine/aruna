@@ -542,6 +542,24 @@ impl GitRecord {
     }
 }
 
+/// Documents share these counters, which only costs an extra refresh.
+static RECORD_WRITES: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+fn write_counter(document_id: Ulid) -> &'static std::sync::atomic::AtomicU64 {
+    &RECORD_WRITES[(u128::from(document_id) % 1024) as usize]
+}
+
+/// Changes whenever this process stores a Git record of the document, local or replicated.
+pub fn record_writes(document_id: Ulid) -> u64 {
+    write_counter(document_id).load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Called after a Git record of the document is durably stored.
+pub fn record_written(document_id: Ulid) {
+    write_counter(document_id).fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 pub fn git_record_prefix(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
