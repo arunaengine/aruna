@@ -39,8 +39,6 @@ impl GitStore {
         effect: GitEffect,
         actor: aruna_core::UserId,
     ) -> std::io::Result<GitEvent> {
-        // Waits for a free slot, so a burst of requests queues instead of failing.
-        let _slot = self.slots.acquire().await.map_err(std::io::Error::other)?;
         let id = match &effect {
             GitEffect::Initialize(id) | GitEffect::Refs(id) | GitEffect::Imported(id) => *id,
             GitEffect::Generate { snapshot, .. } | GitEffect::Edit { snapshot, .. } => {
@@ -64,6 +62,8 @@ impl GitStore {
             GitEffect::Http(request) => request.repository.document_id,
         };
         let _lock = self.locks.lock(id).await;
+        // Taken after the repository lock, so waiters on one repository keep no slot.
+        let _slot = self.slots.acquire().await.map_err(std::io::Error::other)?;
         let repository = self.root.join(format!("{id}.git"));
         match effect {
             GitEffect::Generate { snapshot, refs } => Ok(
@@ -484,6 +484,37 @@ mod tests {
             result.as_ref(),
             b"d670460b4b4aece5915caf5c68d12f560a9fe3e4\n"
         );
+    }
+
+    #[tokio::test]
+    async fn busy_repository_waits() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = std::sync::Arc::new(GitStore::new(
+            directory.path().to_path_buf(),
+            "helper".into(),
+        ));
+        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let busy = ulid::Ulid::from(1);
+        let held = store.locks.lock(busy).await;
+        let waiting = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move { store.execute(GitEffect::Refs(busy), actor).await })
+            })
+            .collect::<Vec<_>>();
+        tokio::task::yield_now().await;
+        // Deadlock guard only: the other repository needs no free slot from the waiters.
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            store.execute(GitEffect::Refs(ulid::Ulid::from(2)), actor),
+        )
+        .await
+        .expect("another repository progresses")
+        .ok();
+        drop(held);
+        for task in waiting {
+            task.await.expect("waiting request finishes").ok();
+        }
     }
 
     #[cfg(unix)]
