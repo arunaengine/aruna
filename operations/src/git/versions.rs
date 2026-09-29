@@ -238,11 +238,16 @@ pub(super) async fn graph(
         revision: commit.to_string(),
         path: ARUNA_FILE.to_string(),
     };
-    let mut value = match execute(store, effect, auth.user_id).await.ok()? {
+    let value = match execute(store, effect, auth.user_id).await.ok()? {
         GitEvent::File(Some(bytes)) => serde_json::from_slice(&bytes).ok()?,
         GitEvent::File(None) => rocrate(store, auth, id, commit).await?,
         _ => return None,
     };
+    Some(copied(value))
+}
+
+/// Names stored entities by their repository path, as a plain Git copy does.
+pub(super) fn copied(mut value: Value) -> Value {
     let paths: BTreeMap<String, String> = value["@graph"]
         .as_array()
         .into_iter()
@@ -251,7 +256,7 @@ pub(super) async fn graph(
         .filter_map(|entity| Some((entity["@id"].as_str()?.to_owned(), entity_path(entity)?)))
         .collect();
     git_copy(&mut value, &paths);
-    Some(value)
+    value
 }
 
 pub(super) fn branch_ref(name: &str) -> Result<String, GitError> {

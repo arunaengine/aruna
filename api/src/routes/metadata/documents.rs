@@ -46,7 +46,8 @@ a holder that re-runs both checks under the caller's own token.
   accepted.
 - The optional `message` becomes the Git commit message of the document's ARC snapshot for this
   revision. The `Aruna-Revision` trailer is always added, and lines starting with `Aruna-` are
-  dropped from the message. Without a message the snapshot keeps the default message.
+  dropped from the message. Without a message the snapshot is named after the change, such as
+  `Create <name>` or `Update <name>: add Ada Lovelace, change details`.
 - The optional `storage_location` chooses where files pushed through Git are stored, as with
   `PUT /metadata/{document_id}/storage-location`. The bucket must exist on this node and allow
   WRITE under the prefix, except the default `datasets-<group id>` bucket. Without it the group's

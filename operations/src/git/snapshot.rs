@@ -2,8 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::changes::summary;
 use super::project::{Projection, author, forget, lock, project, recent, remember};
-use super::versions::plain;
+use super::versions::{copied, graph, plain};
 use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -405,6 +406,22 @@ pub async fn unreadable_file(
     None
 }
 
+/// A subject that says what changed since the last snapshot, for metadata without a message.
+async fn subject(
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+    projection: &Projection,
+    jsonld: &str,
+    user: UserId,
+) -> String {
+    let after = serde_json::from_str(jsonld).map_or(serde_json::Value::Null, copied);
+    let before = match projection.state.refs.get("refs/heads/aruna") {
+        Some(commit) => graph(store, &author(user), document.document_id, commit).await,
+        None => None,
+    };
+    summary(before.as_ref(), &after)
+}
+
 async fn generate(
     context: &DriverContext,
     store: &GitStore,
@@ -431,9 +448,13 @@ async fn generate(
     )
     .await?;
     // Trailer lines stay reserved for Aruna, so an author cannot forge a trusted one.
-    let message = message
+    let message = match message
         .map(|message| plain(&message))
-        .filter(|message| !message.is_empty());
+        .filter(|message| !message.is_empty())
+    {
+        Some(message) => message,
+        None => subject(store, document, projection, &jsonld, user).await,
+    };
     let objects = linked(context, document, &jsonld, &author(user)).await;
     let lfs: Vec<StoredObject> = objects.iter().map(|linked| linked.object.clone()).collect();
     let refs = &projection.state.refs;
@@ -444,7 +465,7 @@ async fn generate(
             occurred_at_ms,
             jsonld,
             objects,
-            message,
+            message: Some(message),
         },
         refs: refs.clone(),
     };

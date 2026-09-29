@@ -135,6 +135,58 @@ pub fn property_conflicts(base: &Value, source: &Value, target: &Value) -> Vec<P
         .collect()
 }
 
+/// The subject of a snapshot without an author message: `Create <name>` for the first one,
+/// otherwise `Update <name>` with up to three changed entities.
+pub fn summary(before: Option<&Value>, after: &Value) -> String {
+    let name = root_name(after);
+    let Some(before) = before else {
+        return format!("Create {name}");
+    };
+    let items: Vec<String> = entity_changes(before, after)
+        .into_iter()
+        .filter(|change| change.id != "ro-crate-metadata.json")
+        .map(|change| {
+            let verb = match change.change {
+                EntityChangeKind::Added => "add",
+                EntityChangeKind::Removed => "remove",
+                EntityChangeKind::Changed => "change",
+            };
+            let label = match change.id.as_str() {
+                "./" => "details".to_string(),
+                _ => shortened(change.label.as_deref().unwrap_or(&change.id)),
+            };
+            format!("{verb} {label}")
+        })
+        .collect();
+    match items.len() {
+        0 => format!("Update {name}"),
+        1..=3 => format!("Update {name}: {}", items.join(", ")),
+        count => format!(
+            "Update {name}: {} and {} more",
+            items[..3].join(", "),
+            count - 3
+        ),
+    }
+}
+
+fn root_name(value: &Value) -> String {
+    value["@graph"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entity| entity["@id"] == "./")
+        .and_then(|root| root["name"].as_str())
+        .map_or_else(|| "dataset".to_string(), shortened)
+}
+
+fn shortened(text: &str) -> String {
+    let text = text.lines().next().unwrap_or_default().trim();
+    match text.char_indices().nth(40) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +194,34 @@ mod tests {
 
     fn crate_with(entities: Value) -> Value {
         json!({ "@context": "https://w3id.org/ro/crate/1.2/context", "@graph": entities })
+    }
+
+    #[test]
+    fn describes_snapshots() {
+        let first = crate_with(json!([{"@id": "./", "name": "Heat study"}]));
+        assert_eq!(summary(None, &first), "Create Heat study");
+        let person = |id: &str, name: &str| json!({"@id": id, "@type": "Person", "name": name});
+        let edited = crate_with(json!([
+            {"@id": "./", "name": "Heat study", "description": "New"},
+            person("#ada", "Ada Lovelace"),
+        ]));
+        assert_eq!(
+            summary(Some(&first), &edited),
+            "Update Heat study: add Ada Lovelace, change details"
+        );
+        assert_eq!(summary(Some(&edited), &edited), "Update Heat study");
+        let crowded = crate_with(json!([
+            {"@id": "./", "name": "Heat study", "description": "New"},
+            person("#ada", "Ada Lovelace"),
+            person("#bob", "Bob"),
+            person("#cy", "Cy"),
+            person("#di", "Di"),
+        ]));
+        assert_eq!(
+            summary(Some(&edited), &crowded),
+            "Update Heat study: add Bob, add Cy, add Di"
+        );
+        assert!(summary(Some(&first), &crowded).ends_with("and 2 more"));
     }
 
     #[test]

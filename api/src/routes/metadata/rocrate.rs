@@ -420,7 +420,7 @@ caller's own token.
 - Omitting `public` leaves the current visibility unchanged.
 - The optional `message` becomes the Git commit message of the document's ARC snapshot for this
   revision. The `Aruna-Revision` trailer is always added, and lines starting with `Aruna-` are
-  dropped from the message. Without a message the snapshot keeps the default message; earlier
+  dropped from the message. Without a message the snapshot is named after the change; earlier
   snapshots keep their messages.
 - Acceptance is durable but asynchronous: the revision may not be materialized, queryable,
   searchable or present on every replica yet.
