@@ -217,24 +217,21 @@ async fn reconcile(
             overlay.insert(path.clone(), entry.clone());
         }
     }
-    if !pointers.is_empty()
-        && let Some((mode, generated)) = files.get(".gitattributes")
-    {
-        // Keep the client's LFS rules and add the pointer paths it lacks.
+    if let Some((mode, generated)) = files.get(".gitattributes") {
+        // Keep the client's rules after the missing generated ones, so the client's win.
         let existing = command(directory, &["show", &format!("{main}:.gitattributes")])
             .await
             .unwrap_or_default();
-        let mut merged = String::from_utf8_lossy(&existing).into_owned();
-        let known: std::collections::BTreeSet<String> = merged.lines().map(str::to_owned).collect();
+        let client = String::from_utf8_lossy(&existing).into_owned();
+        let known: std::collections::BTreeSet<&str> = client.lines().collect();
+        let mut merged = String::new();
         for line in String::from_utf8_lossy(generated).lines() {
             if !known.contains(line) {
-                if !merged.is_empty() && !merged.ends_with('\n') {
-                    merged.push('\n');
-                }
                 merged.push_str(line);
                 merged.push('\n');
             }
         }
+        merged.push_str(&client);
         if merged.as_bytes() != existing.as_ref() {
             overlay.insert(".gitattributes".into(), (mode.clone(), merged.into_bytes()));
         }

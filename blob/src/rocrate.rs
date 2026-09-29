@@ -220,7 +220,7 @@ pub fn files(jsonld: &str, objects: &[LinkedObject]) -> std::io::Result<(Files, 
     let text = repo_layout::metadata_text(&value);
     let mut files = Files::new();
     files.insert(CRATE_FILE.into(), ("100644".into(), text));
-    let (mut pointers, mut attributes) = (Pointers::new(), String::new());
+    let (mut pointers, mut attributes) = (Pointers::new(), LFS_RULES.to_string());
     for (path, linked) in placed.into_values() {
         let object = &linked.object;
         let mut pointer = POINTER.to_vec();
@@ -230,14 +230,22 @@ pub fn files(jsonld: &str, objects: &[LinkedObject]) -> std::io::Result<(Files, 
         attributes.push_str(&format!("/{pattern} filter=lfs diff=lfs merge=lfs -text\n"));
         pointers.insert(path);
     }
-    if !attributes.is_empty() {
-        files.insert(
-            ".gitattributes".into(),
-            ("100644".into(), attributes.into_bytes()),
-        );
-    }
+    files.insert(
+        ".gitattributes".into(),
+        ("100644".into(), attributes.into_bytes()),
+    );
     Ok((files, pointers))
 }
+
+/// Every file goes through Git LFS except the metadata files, so a client needs no
+/// `git lfs track`. Kept equal to `LFS_RULES` in `arc.py`.
+pub(crate) const LFS_RULES: &str = "* filter=lfs diff=lfs merge=lfs -text
+.gitattributes -filter -diff -merge text
+.gitignore -filter -diff -merge text
+/ro-crate-metadata.json -filter -diff -merge text
+/aruna-metadata.json -filter -diff -merge text
+isa.*.xlsx -filter -diff -merge -text
+";
 
 #[cfg(test)]
 #[path = "rocrate_tests.rs"]

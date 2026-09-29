@@ -374,7 +374,7 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(pointer, f"version https://git-lfs.github.com/spec/v1\noid sha256:{'a' * 64}\nsize 7\n")
         attributes = base64.b64decode(result["files"][".gitattributes"]).decode().splitlines()
         self.assertIn("/assays/run/dataset/run[[:space:]]1.raw filter=lfs diff=lfs merge=lfs -text", attributes)
-        self.assertIn("*.bin filter=lfs diff=lfs merge=lfs -text", attributes)
+        self.assertIn("* filter=lfs diff=lfs merge=lfs -text", attributes)
         conversion.convert({"mode": "inspect", "files": result["files"]})
 
     def test_git_removals(self):

@@ -200,9 +200,15 @@ async fn keeps_plain_snapshots() {
         .await
         .expect("generate runs")
         .expect("plain snapshot");
-    assert_eq!(tree(path, &aruna).await, [CRATE_FILE]);
+    assert_eq!(tree(path, &aruna).await, [".gitattributes", CRATE_FILE]);
     let main = main.expect("main follows the metadata");
-    assert_eq!(tree(path, &main).await, ["data/a.csv", CRATE_FILE]);
+    assert_eq!(
+        tree(path, &main).await,
+        [".gitattributes", "data/a.csv", CRATE_FILE]
+    );
+    // Every data file a client adds after cloning goes through Git LFS on its own.
+    let rules = git(path, &["show", &format!("{main}:.gitattributes")]).await;
+    assert_eq!(rules, crate::rocrate::LFS_RULES.trim_end());
     assert_eq!(layout(path, &main).await.unwrap(), Layout::RoCrate);
     let text = git(path, &["show", &format!("{main}:{CRATE_FILE}")]).await;
     let written: Value = serde_json::from_str(&text).unwrap();
@@ -221,7 +227,7 @@ async fn falls_back_plain() {
         .await
         .expect("commit");
     assert_eq!(main.as_deref(), Some(aruna.as_str()));
-    assert_eq!(tree(path, &aruna).await, [CRATE_FILE]);
+    assert_eq!(tree(path, &aruna).await, [".gitattributes", CRATE_FILE]);
     assert_eq!(layout(path, &aruna).await.unwrap(), Layout::RoCrate);
 }
 
