@@ -293,6 +293,25 @@ async fn located(
     found
 }
 
+/// The readable exact object a file entity names, tried in the order it was located.
+async fn lookup(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    auth: &AuthContext,
+    entity: &serde_json::Value,
+    id: &str,
+) -> (DataIdentity, Result<StoredObject, GitError>) {
+    let identity = DataIdentity::read(id, &text_values(entity.get("contentUrl")));
+    let mut resolved = Err(GitError::NotFound);
+    for exact in located(context, document, &identity).await {
+        resolved = resolve(context, &exact, auth).await;
+        if resolved.is_ok() {
+            break;
+        }
+    }
+    (identity, resolved)
+}
+
 /// File entities that name an Aruna object in any supported form, with the repository path of
 /// a plain copy: `localPath`, the key inside the dataset location, or a layout of the keys.
 /// An object the caller cannot read stays out of the repository; its entity still describes it.
@@ -311,18 +330,22 @@ pub(super) async fn linked(
         .ok();
     let mut linked = Vec::new();
     let entities = value["@graph"].as_array().into_iter().flatten();
-    for entity in entities.filter(|entity| is_file(entity)).take(10_000) {
-        let Some(id) = entity["@id"].as_str() else {
-            continue;
-        };
-        let identity = DataIdentity::read(id, &text_values(entity.get("contentUrl")));
-        let mut resolved = Err(GitError::NotFound);
-        for exact in located(context, document, &identity).await {
-            resolved = resolve(context, &exact, auth).await;
-            if resolved.is_ok() {
-                break;
-            }
-        }
+    let files: Vec<_> = entities
+        .filter(|entity| is_file(entity))
+        .take(10_000)
+        .filter_map(|entity| Some((entity, entity["@id"].as_str()?)))
+        .collect();
+    // Independent lookups overlap, a few at a time; results keep the entity order.
+    use futures_util::StreamExt;
+    let lookups: Vec<_> = files
+        .iter()
+        .map(|&(entity, id)| lookup(context, document, auth, entity, id))
+        .collect();
+    let lookups = futures_util::stream::iter(lookups)
+        .buffered(8)
+        .collect::<Vec<_>>()
+        .await;
+    for ((entity, id), (identity, resolved)) in files.into_iter().zip(lookups) {
         let object = match resolved {
             Ok(object) => object,
             Err(error) if identity.is_aruna() => {
