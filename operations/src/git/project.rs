@@ -38,7 +38,8 @@ pub fn served(document_id: Ulid) -> Option<BTreeMap<String, String>> {
 #[derive(Clone)]
 pub struct Projection {
     pub state: GitState,
-    pub records: Vec<GitRecord>,
+    /// Shared, so reusing a remembered projection copies no records.
+    pub records: std::sync::Arc<Vec<GitRecord>>,
     pub holders: Vec<NodeId>,
     /// [`record_writes`] before the records were read.
     pub writes: u64,
@@ -221,7 +222,7 @@ pub async fn project(
             }
             return Ok(Projection {
                 state,
-                records,
+                records: records.into(),
                 holders,
                 writes,
             });
@@ -271,7 +272,7 @@ mod tests {
         let document = document();
         let mut projection = Projection {
             state: GitState::default(),
-            records: Vec::new(),
+            records: Default::default(),
             holders: Vec::new(),
             writes: 0,
         };
