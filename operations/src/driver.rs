@@ -1334,7 +1334,7 @@ mod test {
         assert!(transaction_reopens(&context).await);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn deadline_rollback() {
         let temp_dir = tempdir().unwrap();
         let temp_root = temp_dir.path().to_str().unwrap().to_string();
@@ -1368,6 +1368,9 @@ mod test {
             task_handle: None,
             compute_handle: None,
         };
+        // Paused only now: the handles above wait on real I/O, and auto-advance would fire
+        // their setup timeouts on a slow machine.
+        tokio::time::pause();
         let ready = Arc::new(tokio::sync::Notify::new());
         let operation = DeadlineOperation {
             state: 0,
