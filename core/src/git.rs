@@ -515,16 +515,6 @@ impl GitPack {
 }
 
 impl GitRecord {
-    /// Decodes a stored or replicated record. Records written before packs moved into Fjall
-    /// are converted; replayed topic history still carries them.
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let exact = |result: postcard::Result<(Self, &[u8])>| match result {
-            Ok((record, [])) if record.validate() => Some(record),
-            _ => None,
-        };
-        exact(postcard::take_from_bytes(bytes)).or_else(|| crate::git_legacy::decode(bytes))
-    }
-
     /// Checks shape and bounds; authorship and document state are checked by the writer and receiver.
     pub fn validate(&self) -> bool {
         let size = postcard::to_allocvec(self).map_or(usize::MAX, |bytes| bytes.len());

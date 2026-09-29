@@ -17,7 +17,6 @@ pub mod egress;
 pub mod errors;
 pub mod events;
 pub mod git;
-mod git_legacy;
 pub mod handle;
 pub mod id;
 pub mod jobs;

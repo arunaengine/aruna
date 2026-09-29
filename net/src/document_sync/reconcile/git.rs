@@ -48,8 +48,11 @@ pub(super) async fn apply_git_event(
             reason,
         )))
     };
-    let Some(record) = GitRecord::decode(bytes) else {
-        return reject("undecodable Git record");
+    let Ok(record) = postcard::from_bytes::<GitRecord>(bytes) else {
+        // Topic history still holds records from before packs moved into Fjall; every holder
+        // then had them and `aruna-doctor migrate` converted its copy.
+        tracing::debug!(%topic_id, "Dropping undecodable Git record");
+        return Ok(MetadataOutcome::Skipped);
     };
     if *target
         != (DocumentTarget::GitRecord {
