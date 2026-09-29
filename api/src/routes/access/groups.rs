@@ -923,7 +923,14 @@ prefix.
     ),
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
     responses(
-        (status = 200, description = "The group after the change, in the same shape as reading it", body = GroupInfoResponse),
+        (status = 200, description = "The group after the change, in the same shape as reading it", body = GroupInfoResponse,
+         example = json!({
+             "display_name": "Proteomics Lab",
+             "group_id": "01JABCDEF0123456789ABCDEFG",
+             "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+             "roles": [],
+             "dataset_location": {"bucket": "lab-data", "prefix": "datasets/"}
+         })),
         (status = 400, description = "Invalid group id, bucket name or prefix, or a bucket of another group or missing on this node, with the reason in the message", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, the caller administers neither the group nor the realm's groups, or WRITE is denied on the bucket", body = ErrorResponse),

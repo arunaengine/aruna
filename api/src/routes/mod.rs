@@ -468,6 +468,7 @@ pub(crate) mod tests {
         ("POST", "/access/s3/sessions"),
         ("POST", "/access/s3/sessions/{access_key_id}/refresh"),
         ("POST", "/access/tokens/revoke"),
+        ("PUT", "/access/groups/{id}/storage-location"),
         ("PUT", "/access/users/me/assistant/chats/{id}"),
         ("PUT", "/access/users/me/assistant/chats/{id}/turns/{seq}"),
         ("PUT", "/access/users/me/vault"),
