@@ -198,14 +198,14 @@ async fn check_outage(
                 .iter()
                 .any(|node| node == &json!(joiner.config.node_id.to_string())))
     );
-    let after = metadata_counts(seed, joiner.config.node_id);
+    let after = pool_settled(seed, joiner.config.node_id, &before).await?;
     assert_eq!(after.dials - before.dials, 1);
 
     let retry = metadata_query(&seed.base_url, token).await?;
     assert_eq!(retry["complete"], false);
     assert_eq!(retry["nodes_queried"], 2);
     assert_eq!(retry["nodes_failed"], 1);
-    let retried = metadata_counts(seed, joiner.config.node_id);
+    let retried = pool_settled(seed, joiner.config.node_id, &after).await?;
     // A request may cross the five-second cooldown; then one re-probe is valid.
     let retry_dials = retried.dials - after.dials;
     assert!(retry_dials <= 1);
@@ -249,7 +249,7 @@ async fn check_recovery(
     }
     .await;
     peer.net.shutdown().await;
-    let after = metadata_counts(seed, joiner.config.node_id);
+    let after = pool_settled(seed, joiner.config.node_id, &before).await?;
     assert_eq!(after.dials - before.dials, 1);
     result
 }
