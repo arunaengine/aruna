@@ -49,9 +49,11 @@ a holder that re-runs both checks under the caller's own token.
   dropped from the message. Without a message the snapshot keeps the default message.
 - The optional `storage_location` chooses where files pushed through Git are stored, as with
   `PUT /metadata/{document_id}/storage-location`. The bucket must exist on this node and allow
-  WRITE under the prefix, except the default `datasets-<group id>` bucket. When this node cannot
-  record the choice for the new document, the document is still created with the default
-  location; check it with `GET /metadata/{document_id}/storage-location`.
+  WRITE under the prefix, except the default `datasets-<group id>` bucket. Without it the group's
+  default storage location applies, with `<document id>/` appended to its prefix; its bucket must
+  exist on this node, belong to the group and allow WRITE. Without either, the document is created
+  without a chosen location. When this node cannot record the location for the new document, the
+  document is still created; check it with `GET /metadata/{document_id}/storage-location`.
 
 **Limits**: the document path is normalized before use and must not be empty. `message` is plain
 text of at most 4096 bytes after trimming; an empty message counts as none."#,
@@ -133,7 +135,7 @@ text of at most 4096 bytes after trimming; an empty message counts as none."#,
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path, the new document's path or the chosen storage location", body = ErrorResponse),
         (status = 404, description = "The chosen storage location names a bucket this node does not have", body = ErrorResponse),
-        (status = 409, description = "Concurrent create conflict; the create was not accepted and may be retried", body = ErrorResponse),
+        (status = 409, description = "Concurrent create conflict; the create was not accepted and may be retried. Or the group's default storage location is unusable on this node, which the message explains; choose a storage location or change the group default", body = ErrorResponse),
         (status = 503, description = "Placement binding unavailable or conflicted, realm configuration unreadable, local clock unhealthy, or no holder accepted the forwarded write; the create was not accepted and may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -179,15 +181,10 @@ pub async fn create_metadata_document(
             },
         ),
     };
-    if let Some(chosen) = &chosen {
-        aruna_operations::git::location::precheck(&state.get_ctx(), &auth, group_id, chosen)
+    let resolved =
+        aruna_operations::git::location::resolve(&state.get_ctx(), &auth, group_id, chosen)
             .await
-            .map_err(|error| match error {
-                GitError::NotFound => ServerError::NotFound,
-                GitError::Authorization(error) => crate::auth::map_authorize_error(error),
-                _ => ServerError::ServiceUnavailable,
-            })?;
-    }
+            .map_err(map_location_error)?;
     let result = run_create_metadata(
         &state,
         &auth,
@@ -200,14 +197,9 @@ pub async fn create_metadata_document(
         message,
     )
     .await?;
-    if let Some(chosen) = chosen {
-        let ctx = state.get_ctx();
-        let set = aruna_operations::git::location::record(&ctx, &auth, &result, chosen);
-        // The dataset exists either way; a location not recorded here is set with PUT later.
-        if let Err(error) = set.await {
-            tracing::warn!(document_id = %result.document_id, %error,
-                "Chosen storage location not recorded at create");
-        }
+    if let Some(resolved) = resolved {
+        aruna_operations::git::location::establish(&state.get_ctx(), &auth, &result, resolved)
+            .await;
     }
 
     Ok((
@@ -216,6 +208,16 @@ pub async fn create_metadata_document(
             summary: MetadataDocumentSummary::from(&result),
         }),
     ))
+}
+
+/// Maps a refused storage location at create; a refused group default says what to change.
+pub(crate) fn map_location_error(error: GitError) -> ServerError {
+    match error {
+        GitError::NotFound => ServerError::NotFound,
+        GitError::Refused(reason) => ServerError::Conflict(reason),
+        GitError::Authorization(error) => crate::auth::map_authorize_error(error),
+        _ => ServerError::ServiceUnavailable,
+    }
 }
 
 #[utoipa::path(

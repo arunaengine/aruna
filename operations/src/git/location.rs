@@ -8,7 +8,14 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::admin_documents::AdminDocumentTarget;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::git::GitChange;
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
+use aruna_core::reducer::decode_reducer_state;
+use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
@@ -101,6 +108,94 @@ pub async fn precheck(
     }
     let bucket = existing(context, &location.bucket).await?;
     permit(context, auth, &bucket, location).await
+}
+
+/// The default location an admin set for the group's new datasets, as stored on this node.
+pub async fn group_default(
+    context: &DriverContext,
+    group_id: GroupId,
+) -> Result<Option<DatasetLocation>, GitError> {
+    let read = StorageEffect::Read {
+        key_space: DOCUMENT_STATE_KEYSPACE.into(),
+        key: reducer_state_key(&AdminDocumentTarget::Group { group_id }),
+        txn_id: None,
+    };
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+        .storage_handle
+        .send_effect(Effect::Storage(read))
+        .await
+    else {
+        return Err(GitError::Unavailable);
+    };
+    let state = value
+        .map(|bytes| decode_reducer_state(&bytes))
+        .transpose()
+        .map_err(|_| GitError::Unavailable)?;
+    Ok(state.and_then(|state| state.group_location()))
+}
+
+/// Checks a group default here: its bucket exists on this node, belongs to the group and
+/// allows `auth` to write under the prefix. The generated group bucket is created on first use.
+pub async fn check_default(
+    context: &DriverContext,
+    auth: &AuthContext,
+    group_id: GroupId,
+    location: &DatasetLocation,
+) -> Result<(), GitError> {
+    if location.bucket == default_bucket(group_id) {
+        return Ok(());
+    }
+    let bucket = match existing(context, &location.bucket).await {
+        Err(GitError::NotFound) => Err(GitError::Refused(format!(
+            "bucket {} does not exist on this node; choose another storage location",
+            location.bucket
+        ))),
+        found => found,
+    }?;
+    if bucket.group_id != group_id {
+        return Err(GitError::Refused(format!(
+            "bucket {} belongs to another group; choose a bucket of this group",
+            location.bucket
+        )));
+    }
+    permit(context, auth, &bucket, location).await
+}
+
+/// Where a new dataset stores its files: the explicit choice, else the group default, which
+/// gets `<document id>/` appended to its prefix at create (`true`). `None` stores no location.
+pub async fn resolve(
+    context: &DriverContext,
+    auth: &AuthContext,
+    group_id: GroupId,
+    chosen: Option<DatasetLocation>,
+) -> Result<Option<(DatasetLocation, bool)>, GitError> {
+    if let Some(chosen) = chosen {
+        precheck(context, auth, group_id, &chosen).await?;
+        return Ok(Some((chosen, false)));
+    }
+    let Some(default) = group_default(context, group_id).await? else {
+        return Ok(None);
+    };
+    check_default(context, auth, group_id, &default).await?;
+    Ok(Some((default, true)))
+}
+
+/// Records the resolved location of a just-created dataset, so later group default
+/// changes never move it. A location not recorded here can be set with PUT later.
+pub async fn establish(
+    context: &DriverContext,
+    auth: &AuthContext,
+    document: &MetadataRegistryRecord,
+    (location, shared): (DatasetLocation, bool),
+) {
+    let location = match shared {
+        true => location.for_dataset(document.document_id),
+        false => location,
+    };
+    if let Err(error) = record(context, auth, document, location).await {
+        tracing::warn!(document_id = %document.document_id, %error,
+            "Chosen storage location not recorded at create");
+    }
 }
 
 async fn existing(context: &DriverContext, name: &str) -> Result<BucketInfo, GitError> {

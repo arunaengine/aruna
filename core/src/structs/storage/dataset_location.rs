@@ -74,6 +74,14 @@ impl DatasetLocation {
         }
     }
 
+    /// This location narrowed to one dataset: prefix `<prefix><document id>/`.
+    pub fn for_dataset(&self, document_id: Ulid) -> Self {
+        Self {
+            bucket: self.bucket.clone(),
+            prefix: format!("{}{document_id}/", self.prefix),
+        }
+    }
+
     /// Whether the values are already valid and normalized.
     pub fn valid(&self) -> bool {
         Self::new(&self.bucket, &self.prefix).as_ref() == Ok(self)
