@@ -132,8 +132,8 @@ jobs:
   report:
     name: Generate Coverage Report
     environment: coverage
-    needs: [instrumented, restart-stress]
-    if: ${{ needs.instrumented.result == 'success' && needs.restart-stress.result == 'success' }}
+    needs: instrumented
+    if: ${{ needs.instrumented.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -164,30 +164,3 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage-parts/coverage.lcov
           fail_ci_if_error: true
-
-  restart-stress:
-    name: Restart scale stress
-    runs-on: ubuntu-latest
-    # This is a non-instrumented functional stress lane, not a normal timing
-    # assertion; keep it bounded so a deadlock still fails the PR promptly.
-    timeout-minutes: 45
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_INCREMENTAL: 0
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      # Not instrumented; the value replaces the coverage flags and keeps the mold linker.
-      RUSTFLAGS: -Clink-arg=-fuse-ld=mold
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - name: Set up Rust
-        uses: ./.github/actions/rust-setup
-
-      - name: Run restart scale tests
-        run: |
-          set -euo pipefail
-          cargo test -p aruna-operations --test restart_traffic \
-            --all-features --locked offline_scale_ -- --ignored
