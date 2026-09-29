@@ -121,6 +121,10 @@ jobs:
         with:
           name: coverage-archive
 
+      # Shows whether the coverage export stays within memory at four threads.
+      - name: Sample memory use
+        run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
+
       - name: Run instrumented tests
         run: >-
           cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
@@ -138,12 +142,13 @@ jobs:
           -E "binary(git_native)"'
 
       - name: Collect coverage
-        # LLVM exports use Rayon's pool, independently of grcov's parser threads.
+        # LLVM exports use Rayon's pool, independently of grcov's parser threads;
+        # one export per core, since every shard exports nearly every test binary.
         env:
           RAYON_NUM_THREADS: 1
         run: |
           grcov . \
-            --threads 2 \
+            --threads 4 \
             --binary-path ./target/debug/deps/ \
             --source-dir . \
             --output-type lcov \
@@ -173,6 +178,15 @@ jobs:
             coverage-sources.txt
           if-no-files-found: error
           retention-days: 1
+
+      - name: Upload the memory log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-memory-${{ matrix.shard }}
+          path: memory.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload JUnit report
         if: failure()
