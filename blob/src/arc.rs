@@ -99,26 +99,42 @@ async fn write_tree(
     if let Some(base) = base {
         exchange(git(&["read-tree", base]), Bytes::new(), false).await?;
     }
-    for path in removed {
-        exchange(
-            git(&["update-index", "--force-remove", "--", path]),
-            Bytes::new(),
-            false,
-        )
-        .await?;
+    // One process writes every blob, and batch mode syncs them together instead of one by one.
+    let mut paths = Vec::new();
+    for (position, (_, data)) in files.values().enumerate() {
+        let path = temporary.path().join(format!("blob-{position}"));
+        tokio::fs::write(&path, data).await?;
+        paths.push(path.to_string_lossy().into_owned());
     }
-    for (path, (mode, data)) in files {
-        let oid = exchange(
-            git(&["hash-object", "-w", "--stdin"]),
-            data.clone().into(),
-            false,
-        )
-        .await?;
-        let oid = std::str::from_utf8(&oid)
-            .map_err(std::io::Error::other)?
-            .trim();
-        let arguments = ["update-index", "--add", "--cacheinfo", mode, oid, path];
-        exchange(git(&arguments), Bytes::new(), false).await?;
+    let oids = match paths.is_empty() {
+        true => Bytes::new(),
+        false => {
+            let mut process = git(&[
+                "-c",
+                "core.fsyncMethod=batch",
+                "hash-object",
+                "-w",
+                "--no-filters",
+            ]);
+            process.arg("--stdin-paths");
+            exchange(process, format!("{}\n", paths.join("\n")).into(), false).await?
+        }
+    };
+    let oids = std::str::from_utf8(&oids).map_err(std::io::Error::other)?;
+    // Mode 0 removes a path; every change goes into the index in one process.
+    let mut entries = Vec::new();
+    for path in removed {
+        entries.extend_from_slice(format!("0 {}\t{path}\0", "0".repeat(40)).as_bytes());
+    }
+    for ((path, (mode, _)), oid) in files.iter().zip(oids.lines()) {
+        entries.extend_from_slice(format!("{mode} {}\t{path}\0", oid.trim()).as_bytes());
+    }
+    if oids.lines().count() != files.len() {
+        return Err(std::io::Error::other("not every blob was written"));
+    }
+    if !entries.is_empty() {
+        let process = git(&["update-index", "-z", "--index-info"]);
+        exchange(process, entries.into(), false).await?;
     }
     let tree = exchange(git(&["write-tree"]), Bytes::new(), false).await?;
     Ok(std::str::from_utf8(&tree)
