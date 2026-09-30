@@ -240,4 +240,6 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ${{ env.COVERAGE_FILES }}
+          # Only the shard reports: the search would also send any file named like coverage.
+          disable_search: true
           fail_ci_if_error: true
