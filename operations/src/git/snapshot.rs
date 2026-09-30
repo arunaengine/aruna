@@ -4,7 +4,7 @@
 
 use super::changes::summary;
 use super::project::{Projection, author, forget, lock, project, recent, remember};
-use super::versions::{copied, graph, plain};
+use super::versions::{copied, plain};
 use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -26,7 +26,9 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEventRecord, MetadataRawRevision,
 };
-use aruna_core::repo_layout::{Layout, data_path, entity_path, is_file, metadata_layout, path_id};
+use aruna_core::repo_layout::{
+    ARUNA_FILE, CRATE_FILE, Layout, data_path, entity_path, is_file, metadata_layout, path_id,
+};
 use aruna_core::storage_entries::{event_log_key, materialization_status_key};
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -417,10 +419,33 @@ async fn subject(
 ) -> String {
     let after = serde_json::from_str(jsonld).map_or(serde_json::Value::Null, copied);
     let before = match projection.state.refs.get("refs/heads/aruna") {
-        Some(commit) => graph(store, &author(user), document.document_id, commit).await,
+        Some(commit) => previous(store, document.document_id, commit, user).await,
         None => None,
     };
     summary(before.as_ref(), &after)
+}
+
+/// The metadata a snapshot commit stores, read as the file itself: the ARC graph file, else
+/// the RO-Crate. The full version view also adds file entities, which a subject never needs.
+async fn previous(
+    store: &GitStore,
+    document_id: Ulid,
+    commit: &str,
+    user: UserId,
+) -> Option<serde_json::Value> {
+    for path in [ARUNA_FILE, CRATE_FILE] {
+        let effect = GitEffect::ReadFile {
+            document_id,
+            revision: commit.to_string(),
+            path: path.to_string(),
+        };
+        match execute(store, effect, user).await.ok()? {
+            GitEvent::File(Some(bytes)) => return serde_json::from_slice(&bytes).ok().map(copied),
+            GitEvent::File(None) => continue,
+            _ => return None,
+        }
+    }
+    None
 }
 
 async fn generate(
