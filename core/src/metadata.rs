@@ -305,6 +305,14 @@ pub struct MetadataMergedRevision {
 pub const EVENT_LIMIT: u32 = 1024;
 pub const RAW_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 
+/// What the history budget needs of one logged event, so a write never decodes the events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSize {
+    pub node_id: NodeId,
+    /// The length of the event's stored encoding.
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawOriginBudget {
     pub document_id: Ulid,
@@ -760,22 +768,58 @@ fn link_raw_entity(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataLifecycleRecord {
-    Upsert { event: Box<MetadataEventRecord> },
-    Delete { event: MetadataDeleteRecord },
+    Upsert {
+        event: Box<MetadataEventRecord>,
+    },
+    Delete {
+        event: MetadataDeleteRecord,
+    },
+    /// An upsert whose author gave a commit message for its ARC snapshot.
+    /// Stored rows depend on the variant order, so new variants go last.
+    UpsertWithMessage {
+        event: Box<MetadataEventRecord>,
+        message: String,
+    },
 }
 
 impl MetadataLifecycleRecord {
+    /// The upsert of `event`, carrying `message` when the author gave one.
+    pub fn for_event(event: MetadataEventRecord, message: Option<String>) -> Self {
+        let event = Box::new(event);
+        match message {
+            Some(message) => Self::UpsertWithMessage { event, message },
+            None => Self::Upsert { event },
+        }
+    }
+
     pub fn document_id(&self) -> Ulid {
         match self {
-            Self::Upsert { event } => event.record.document_id,
+            Self::Upsert { event } | Self::UpsertWithMessage { event, .. } => {
+                event.record.document_id
+            }
             Self::Delete { event } => event.tombstone.document_id,
         }
     }
 
     pub fn event_id(&self) -> Ulid {
         match self {
-            Self::Upsert { event } => event.event_id,
+            Self::Upsert { event } | Self::UpsertWithMessage { event, .. } => event.event_id,
             Self::Delete { event } => event.event_id,
+        }
+    }
+
+    /// The upserted event; `None` for a delete.
+    pub fn upsert(&self) -> Option<&MetadataEventRecord> {
+        match self {
+            Self::Upsert { event } | Self::UpsertWithMessage { event, .. } => Some(event),
+            Self::Delete { .. } => None,
+        }
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::UpsertWithMessage { message, .. } => Some(message),
+            Self::Upsert { .. } | Self::Delete { .. } => None,
         }
     }
 }
@@ -1425,6 +1469,21 @@ mod tests {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
+    #[test]
+    fn logs_event_size() {
+        let event = create_event(Ulid::from(1), Ulid::from(2));
+        let entries = crate::storage_entries::logged_event_entries(&event).expect("entries");
+        let [(log_space, log_key, log), (size_space, size_key, size)] = entries.as_slice() else {
+            panic!("an event log row and a size row");
+        };
+        assert_eq!(log_space, crate::keyspaces::EVENT_LOG_KEYSPACE);
+        assert_eq!(size_space, crate::keyspaces::EVENT_SIZE_KEYSPACE);
+        assert_eq!(size_key, log_key, "both rows share the event log key");
+        let size: super::EventSize = postcard::from_bytes(size).expect("size decodes");
+        assert_eq!(size.node_id, event.node_id);
+        assert_eq!(size.bytes, log.len() as u64);
+    }
+
     fn create_event(document_id: Ulid, event_id: Ulid) -> MetadataEventRecord {
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let group_id = Ulid::generate();
@@ -1757,6 +1816,27 @@ mod tests {
             .expect("lifecycle decodes"),
             lifecycle
         );
+    }
+
+    #[test]
+    fn lifecycle_variant_tags() {
+        // Postcard encodes the variant index first; stored rows and sync ops depend on it.
+        let create = create_event(Ulid::from(1), Ulid::from(2));
+        let plain = MetadataLifecycleRecord::for_event(create.clone(), None);
+        let noted = MetadataLifecycleRecord::for_event(create.clone(), Some("Add run".into()));
+        let old = postcard::to_allocvec(&plain).expect("lifecycle serializes");
+        let new = postcard::to_allocvec(&noted).expect("lifecycle serializes");
+
+        assert_eq!(old[0], 0);
+        assert_eq!(new[0], 2);
+        assert_eq!(
+            old[1..],
+            postcard::to_allocvec(&create).expect("event serializes")[..]
+        );
+        let decoded: MetadataLifecycleRecord = postcard::from_bytes(&new).expect("decodes");
+        assert_eq!(decoded.message(), Some("Add run"));
+        assert_eq!(decoded.upsert(), Some(&create));
+        assert_eq!(plain.message(), None);
     }
 
     #[test]

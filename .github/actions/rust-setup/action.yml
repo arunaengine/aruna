@@ -1,0 +1,33 @@
+# Shared Rust setup: the pinned toolchain, the mold linker and the build cache.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name: Set up Rust
+description: Toolchain from rust-toolchain.toml, mold for .cargo/config.toml and the Rust cache.
+inputs:
+  shared-key:
+    description: Cache key shared by jobs that build the same artifacts; empty keys by job.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      # rust-toolchain.toml is the single toolchain pin for every stable job.
+      shell: bash
+      run: rustup show active-toolchain
+
+    # .cargo/config.toml links with clang and mold; GNU ld is slower and needs more memory.
+    - name: Install mold
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends mold
+
+    # Pull requests restore the caches of main and never save their own, so the
+    # repository stays below the cache limit and main's caches are not evicted.
+    - name: Cache Rust build artifacts
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}

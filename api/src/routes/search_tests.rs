@@ -273,6 +273,8 @@ async fn create_doc(fx: &Fixture, group_id: Ulid, path: &str, name: &str) -> Str
             date_published: "2026-01-01".to_string(),
             license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
             public: true,
+            message: None,
+            storage_location: None,
         })),
     )
     .await
@@ -317,6 +319,7 @@ async fn attach_file(fx: &Fixture, document_id: &str, name: &str) {
             rocrate,
             public: Some(true),
             expected_revision: None,
+            message: None,
         }),
     )
     .await

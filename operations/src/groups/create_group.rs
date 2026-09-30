@@ -24,6 +24,7 @@ use aruna_core::structs::identity::group::{
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, Value};
 use byteview::ByteView;
@@ -213,6 +214,12 @@ impl CreateGroupOperation {
                 realm_id: self.config.actor.realm_id,
                 display_name: self.config.display_name.clone(),
                 owner: self.config.actor.user_id,
+            },
+        )?);
+        admin_events.push(reducer_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::GroupLocationSet {
+                location: Some(DatasetLocation::group_default(group_id)),
             },
         )?);
 
@@ -989,8 +996,17 @@ mod test {
             reducer_state.materialized_group_assignments()[&admin_role.role_id]
                 .contains(&actor.user_id)
         );
+        assert_eq!(
+            reducer_state.group_location(),
+            Some(
+                aruna_core::structs::storage::dataset_location::DatasetLocation::group_default(
+                    group.group_id
+                )
+            )
+        );
 
-        assert_eq!(outbox_records.len(), auth_doc.roles.len() + 2);
+        // Creation, the default dataset location, each role and the admin assignment.
+        assert_eq!(outbox_records.len(), auth_doc.roles.len() + 3);
         assert!(outbox_records.iter().all(|record| {
             record.target
                 == (DocumentTarget::GroupAuthorization {
@@ -1017,7 +1033,11 @@ mod test {
                 && display_name == &group.display_name
                 && *owner == group.owner
         ));
-        let role_names = events[1..=auth_doc.roles.len()]
+        assert!(matches!(
+            &events[1].op,
+            AdminDocumentOperation::GroupLocationSet { location: Some(_) }
+        ));
+        let role_names = events[2..=auth_doc.roles.len() + 1]
             .iter()
             .map(|event| match &event.op {
                 AdminDocumentOperation::GroupRoleCreated { role } => role.name.as_str(),
@@ -1036,7 +1056,7 @@ mod test {
                 if *role_id == admin_role.role_id && *user_id == actor.user_id
         ));
         assert!(
-            events[1..=auth_doc.roles.len()]
+            events[2..=auth_doc.roles.len() + 1]
                 .iter()
                 .all(|event| matches!(
                     &event.op,

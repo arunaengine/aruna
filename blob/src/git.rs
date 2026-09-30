@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::git::{DocumentLocks, GitEffect, GitEvent, MAX_GIT_BYTES};
+use aruna_core::telemetry::{record_stage, time_stage};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -29,13 +30,16 @@ impl GitStore {
         }
     }
 
+    /// Whether the local repository still has the required files and settings.
+    pub async fn configured(&self, id: ulid::Ulid) -> bool {
+        configured(&self.root.join(format!("{id}.git")), &self.helper).await
+    }
+
     pub async fn execute(
         &self,
         effect: GitEffect,
         actor: aruna_core::UserId,
     ) -> std::io::Result<GitEvent> {
-        // Waits for a free slot, so a burst of requests queues instead of failing.
-        let _slot = self.slots.acquire().await.map_err(std::io::Error::other)?;
         let id = match &effect {
             GitEffect::Initialize(id) | GitEffect::Refs(id) | GitEffect::Imported(id) => *id,
             GitEffect::Generate { snapshot, .. } | GitEffect::Edit { snapshot, .. } => {
@@ -43,6 +47,8 @@ impl GitStore {
             }
             GitEffect::Import { document_id, .. }
             | GitEffect::Resolve { document_id, .. }
+            | GitEffect::Peel { document_id, .. }
+            | GitEffect::Commits { document_id, .. }
             | GitEffect::MergeBase { document_id, .. }
             | GitEffect::Log { document_id, .. }
             | GitEffect::Diff { document_id, .. }
@@ -51,12 +57,19 @@ impl GitStore {
             | GitEffect::Ancestry { document_id, .. }
             | GitEffect::SetRefs { document_id, .. }
             | GitEffect::Pack { document_id, .. }
-            | GitEffect::Export { document_id, .. } => *document_id,
+            | GitEffect::Export { document_id, .. }
+            | GitEffect::ReadFile { document_id, .. }
+            | GitEffect::Layout { document_id, .. } => *document_id,
             GitEffect::Http(request) => request.repository.document_id,
         };
-        let _lock = self.locks.lock(id).await;
+        let _lock = time_stage("git_repository_lock", self.locks.lock(id)).await;
+        // Taken after the repository lock, so waiters on one repository keep no slot.
+        let _slot = time_stage("git_slot", self.slots.acquire())
+            .await
+            .map_err(std::io::Error::other)?;
         let repository = self.root.join(format!("{id}.git"));
-        match effect {
+        let started = std::time::Instant::now();
+        let result = match effect {
             GitEffect::Generate { snapshot, refs } => Ok(
                 match crate::arc::generate(&repository, snapshot, &refs).await? {
                     Ok((aruna, main)) => GitEvent::Generated { aruna, main },
@@ -66,6 +79,12 @@ impl GitStore {
             GitEffect::Resolve { revision, .. } => Ok(GitEvent::Resolved(
                 crate::repo::resolve(&repository, &revision).await,
             )),
+            GitEffect::Peel { revisions, .. } => crate::repo::peel(&repository, &revisions)
+                .await
+                .map(GitEvent::Peeled),
+            GitEffect::Commits { revisions, .. } => crate::repo::commits(&repository, &revisions)
+                .await
+                .map(GitEvent::Log),
             GitEffect::MergeBase { first, second, .. } => Ok(GitEvent::Resolved(
                 crate::repo::merge_base(&repository, &first, &second).await,
             )),
@@ -106,10 +125,27 @@ impl GitStore {
                     .map(GitEvent::Merged)
             }
             GitEffect::MergeMetadata {
-                old, new, graph, ..
-            } => crate::arc::merge_metadata(&repository, old.as_deref(), &new, &graph)
-                .await
-                .map(GitEvent::MetadataMerged),
+                old,
+                new,
+                graph,
+                location,
+                ..
+            } => crate::arc::merge_metadata(
+                &repository,
+                (old.as_deref(), &new),
+                &graph,
+                location.as_ref(),
+            )
+            .await
+            .map(GitEvent::MetadataMerged),
+            GitEffect::ReadFile { revision, path, .. } => {
+                if revision.starts_with('-') || !aruna_core::git::valid_path(&path) {
+                    return Ok(GitEvent::File(None));
+                }
+                let spec = format!("{revision}:{path}");
+                let arguments = ["cat-file", "blob", &spec];
+                Ok(GitEvent::File(command(&repository, &arguments).await.ok()))
+            }
             GitEffect::Imported(_) => crate::repo::imported(&repository)
                 .await
                 .map(GitEvent::Imported),
@@ -140,7 +176,18 @@ impl GitStore {
                         .into(),
                 ))
             }
+            GitEffect::Layout { revision, .. } => {
+                match crate::repo::resolve(&repository, &revision).await {
+                    Some(commit) => crate::rocrate::layout(&repository, &commit)
+                        .await
+                        .map(|layout| GitEvent::Layout(Some(layout))),
+                    None => Ok(GitEvent::Layout(None)),
+                }
+            }
             GitEffect::Initialize(_) => {
+                if configured(&repository, &self.helper).await {
+                    return Ok(GitEvent::Initialized);
+                }
                 tokio::fs::create_dir_all(&self.root).await?;
                 let root = tokio::fs::canonicalize(&self.root).await?;
                 command(
@@ -171,23 +218,14 @@ impl GitStore {
                 }
                 #[cfg(not(unix))]
                 return Err(std::io::Error::other("native Git hosting requires Unix"));
-                for (key, value) in [
-                    (
-                        "core.hooksPath",
-                        hooks
-                            .to_str()
-                            .ok_or_else(|| std::io::Error::other("invalid hook path"))?,
-                    ),
-                    ("http.receivepack", "true"),
-                    ("http.getanyfile", "false"),
-                    ("receive.fsckObjects", "true"),
-                    ("receive.denyNonFastForwards", "true"),
-                    ("core.logAllRefUpdates", "true"),
-                    ("core.fsync", "committed"),
-                ] {
+                let hooks = hooks
+                    .to_str()
+                    .ok_or_else(|| std::io::Error::other("invalid hook path"))?;
+                for (key, value) in settings(hooks) {
                     command(&repository, &["config", key, value]).await?;
                 }
                 tokio::fs::write(repository.join("git-daemon-export-ok"), []).await?;
+                tokio::fs::write(repository.join(SETTINGS), applied(hooks)).await?;
                 Ok(GitEvent::Initialized)
             }
             GitEffect::Http(request) => {
@@ -215,11 +253,7 @@ impl GitStore {
                     .env("ARUNA_GIT_TOKEN", request.token)
                     .env("ARUNA_GIT_LFS_URL", request.lfs_url)
                     .env("ARUNA_GIT_METADATA_URL", request.metadata_url)
-                    .env("ARUNA_GIT_PUSH_KEY", request.push_key)
-                    .env(
-                        "ARUNA_GIT_ARC",
-                        if request.repository.arc { "1" } else { "0" },
-                    );
+                    .env("ARUNA_GIT_PUSH_KEY", request.push_key);
                 let output = exchange(process, request.body, true).await?;
                 let boundary = output
                     .windows(4)
@@ -251,8 +285,52 @@ impl GitStore {
                     body: output.slice(boundary + 4..),
                 })
             }
+        };
+        record_stage("git_process", started.elapsed());
+        result
+    }
+}
+
+/// Records the settings last applied, so a configured repository needs no Git process.
+const SETTINGS: &str = "aruna-settings";
+
+fn settings(hooks: &str) -> [(&'static str, &str); 7] {
+    [
+        ("core.hooksPath", hooks),
+        ("http.receivepack", "true"),
+        ("http.getanyfile", "false"),
+        ("receive.fsckObjects", "true"),
+        ("receive.denyNonFastForwards", "true"),
+        ("core.logAllRefUpdates", "true"),
+        ("core.fsync", "committed"),
+    ]
+}
+
+fn applied(hooks: &str) -> String {
+    settings(hooks)
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .concat()
+}
+
+/// Whether an earlier setup with the current settings and receive hook is still in place.
+async fn configured(repository: &Path, helper: &Path) -> bool {
+    let Ok(hooks) = tokio::fs::canonicalize(repository.join("hooks")).await else {
+        return false;
+    };
+    let Some(path) = hooks.to_str() else {
+        return false;
+    };
+    for name in ["HEAD", "config", "objects", "refs", "git-daemon-export-ok"] {
+        if tokio::fs::metadata(repository.join(name)).await.is_err() {
+            return false;
         }
     }
+    tokio::fs::read_link(hooks.join("pre-receive"))
+        .await
+        .is_ok_and(|link| link == helper)
+        && tokio::fs::read_to_string(repository.join(SETTINGS))
+            .await
+            .is_ok_and(|text| text == applied(path))
 }
 
 pub async fn command(directory: &Path, args: &[&str]) -> std::io::Result<Bytes> {
@@ -412,5 +490,89 @@ mod tests {
             result.as_ref(),
             b"d670460b4b4aece5915caf5c68d12f560a9fe3e4\n"
         );
+    }
+
+    #[tokio::test]
+    async fn busy_repository_waits() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = std::sync::Arc::new(GitStore::new(
+            directory.path().to_path_buf(),
+            "helper".into(),
+        ));
+        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let busy = ulid::Ulid::from(1);
+        let held = store.locks.lock(busy).await;
+        let waiting = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move { store.execute(GitEffect::Refs(busy), actor).await })
+            })
+            .collect::<Vec<_>>();
+        tokio::task::yield_now().await;
+        // Deadlock guard only: the other repository needs no free slot from the waiters.
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            store.execute(GitEffect::Refs(ulid::Ulid::from(2)), actor),
+        )
+        .await
+        .expect("another repository progresses")
+        .ok();
+        drop(held);
+        for task in waiting {
+            task.await.expect("waiting request finishes").ok();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_runs_once() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let helper = directory.path().join("helper");
+        let store = GitStore::new(directory.path().join("git"), helper);
+        let id = ulid::Ulid::from(7);
+        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let repository = directory.path().join("git").join(format!("{id}.git"));
+        let config = || async {
+            tokio::fs::metadata(repository.join("config"))
+                .await
+                .expect("config exists")
+                .ino()
+        };
+        store
+            .execute(GitEffect::Initialize(id), actor)
+            .await
+            .expect("repository is set up");
+        // Keep the original inode allocated while Git replaces the config file.
+        let original = tokio::fs::File::open(repository.join("config"))
+            .await
+            .expect("config exists");
+        let first = original.metadata().await.expect("config metadata").ino();
+        store
+            .execute(GitEffect::Initialize(id), actor)
+            .await
+            .expect("configured repository is accepted");
+        // Git rewrites the config file on every change, so an unchanged file ran no setup.
+        assert_eq!(config().await, first);
+
+        tokio::fs::write(repository.join(SETTINGS), "core.fsync=none\n")
+            .await
+            .expect("older settings");
+        store
+            .execute(GitEffect::Initialize(id), actor)
+            .await
+            .expect("changed settings are applied");
+        assert_ne!(config().await, first);
+
+        tokio::fs::remove_file(repository.join("HEAD"))
+            .await
+            .expect("broken repository");
+        assert!(!store.configured(id).await);
+        store
+            .execute(GitEffect::Initialize(id), actor)
+            .await
+            .expect("broken repository is repaired");
+        assert!(repository.join("HEAD").exists());
+        assert!(store.configured(id).await);
     }
 }

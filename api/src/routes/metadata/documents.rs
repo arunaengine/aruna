@@ -3,17 +3,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
-use crate::error::{ErrorResponse, ServerResult};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
-    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, crate_entities,
-    ensure_readable_files, forwarded_auth_token, local_write_record, map_api_error,
+    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, commit_message,
+    crate_entities, ensure_readable_files, forwarded_auth_token, local_write_record, map_api_error,
     map_write_error, parse_document_id, run_create_metadata, run_document_list,
     serialize_jsonld_object,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::git::GitError;
 use aruna_operations::metadata::api::{
     GetVisibleRequest, MetadataLookupRequest, lookup_metadata_path as run_lookup_metadata_path,
 };
@@ -43,8 +44,19 @@ a holder that re-runs both checks under the caller's own token.
   or present on every replica yet, so a follow-up read can answer 404 or 503 for a moment.
 - A write that can neither be applied locally nor delivered to a holder is refused rather than
   accepted.
+- The optional `message` becomes the Git commit message of the document's ARC snapshot for this
+  revision. The `Aruna-Revision` trailer is always added, and lines starting with `Aruna-` are
+  dropped from the message. Without a message the snapshot is named after the change, such as
+  `Create <name>` or `Update <name>: add Ada Lovelace, change details`.
+- The optional `storage_location` chooses where files pushed through Git are stored, as with
+  `PUT /metadata/{document_id}/storage-location`. The bucket must exist on this node and allow
+  WRITE under the prefix, except the default `datasets-<group id>` bucket. Without it the group's
+  default storage location applies, with `<document id>/` appended to its prefix; its bucket must
+  exist on this node, belong to the group and allow WRITE. When this node cannot record the location for the new document, the
+  document is still created; check it with `GET /metadata/{document_id}/storage-location`.
 
-**Limits**: the document path is normalized before use and must not be empty."#,
+**Limits**: the document path is normalized before use and must not be empty. `message` is plain
+text of at most 4096 bytes after trimming; an empty message counts as none."#,
     request_body(
         content = CreateMetadataRequest,
         description = "Scaffold fields or a full RO-Crate JSON-LD object. Scaffold creation emits RO-Crate 1.3; the RO-Crate form accepts 1.2 and 1.3 contexts and specification IRIs and preserves the submitted version. Both forms reject unknown fields.",
@@ -59,7 +71,9 @@ a holder that re-runs both checks under the caller's own token.
                         "description": "Metadata record for LC-MS run 42",
                         "date_published": "2026-04-09",
                         "license": "https://creativecommons.org/licenses/by/4.0/",
-                        "public": true
+                        "public": true,
+                        "message": "Add LC-MS run 42",
+                        "storage_location": { "bucket": "lab-data", "prefix": "proteomics/run-42/" }
                     })
                 )
             ),
@@ -117,10 +131,11 @@ a holder that re-runs both checks under the caller's own token.
                 )
             )
         ),
-        (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a non-object RO-Crate, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
+        (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, an invalid storage location bucket or prefix, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path or the new document's path", body = ErrorResponse),
-        (status = 409, description = "Concurrent create conflict; the create was not accepted and may be retried", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path, the new document's path or the chosen storage location", body = ErrorResponse),
+        (status = 404, description = "The chosen storage location names a bucket this node does not have", body = ErrorResponse),
+        (status = 409, description = "Concurrent create conflict; the create was not accepted and may be retried. Or the group's default storage location is unusable on this node, which the message explains; choose a storage location or change the group default", body = ErrorResponse),
         (status = 503, description = "Placement binding unavailable or conflicted, realm configuration unreadable, local clock unhealthy, or no holder accepted the forwarded write; the create was not accepted and may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -132,6 +147,16 @@ pub async fn create_metadata_document(
     Json(request): Json<CreateMetadataRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
+    let message = commit_message(match &request {
+        CreateMetadataRequest::Scaffold(request) => request.message.clone(),
+        CreateMetadataRequest::RoCrate(request) => request.message.clone(),
+    })?;
+    let chosen = match &request {
+        CreateMetadataRequest::Scaffold(request) => request.storage_location.as_ref(),
+        CreateMetadataRequest::RoCrate(request) => request.storage_location.as_ref(),
+    }
+    .map(|location| location.location())
+    .transpose()?;
     let (group_id, path, public, payload) = match request {
         CreateMetadataRequest::Scaffold(request) => (
             parse_group_id(&request.group_id)?,
@@ -156,6 +181,10 @@ pub async fn create_metadata_document(
             },
         ),
     };
+    let resolved =
+        aruna_operations::git::location::resolve(&state.get_ctx(), &auth, group_id, chosen)
+            .await
+            .map_err(map_location_error)?;
     let result = run_create_metadata(
         &state,
         &auth,
@@ -165,8 +194,10 @@ pub async fn create_metadata_document(
         path,
         public,
         payload,
+        message,
     )
     .await?;
+    aruna_operations::git::location::establish(&state.get_ctx(), &auth, &result, resolved).await;
 
     Ok((
         StatusCode::CREATED,
@@ -174,6 +205,16 @@ pub async fn create_metadata_document(
             summary: MetadataDocumentSummary::from(&result),
         }),
     ))
+}
+
+/// Maps a refused storage location at create; a refused group default says what to change.
+pub(crate) fn map_location_error(error: GitError) -> ServerError {
+    match error {
+        GitError::NotFound => ServerError::NotFound,
+        GitError::Refused(reason) => ServerError::Conflict(reason),
+        GitError::Authorization(error) => crate::auth::map_authorize_error(error),
+        _ => ServerError::ServiceUnavailable,
+    }
 }
 
 #[utoipa::path(

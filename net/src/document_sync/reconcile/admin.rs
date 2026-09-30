@@ -342,6 +342,7 @@ async fn group_transaction(
             | AdminDocumentOperation::GroupJoinRequested { .. }
             | AdminDocumentOperation::GroupJoinDecided { .. }
             | AdminDocumentOperation::DisplayNameSet { .. }
+            | AdminDocumentOperation::GroupLocationSet { .. }
     ) {
         return Err(NetError::Bootstrap(
             "group admin operation sync only supports group creation, renames, role seeds, role creation/removal, role user assignment updates, and policy updates"

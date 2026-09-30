@@ -9,6 +9,7 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::data_identity::{DataIdentity, text_values};
 use aruna_core::types::GroupId;
 use serde_json::Value as JsonValue;
 
@@ -17,7 +18,6 @@ use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{DriverContext, drive, drive_until};
-use crate::jobs::export::{EntityIdentity, entity_identity};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::LocationSummaryRequest;
@@ -92,13 +92,8 @@ pub async fn restricted_files(
             complete = false;
             break;
         }
-        let identity = entity_identity(&entity_id, &content_urls);
-        if identity.exact.is_none()
-            && identity.hash.is_none()
-            && !std::iter::once(&entity_id)
-                .chain(&content_urls)
-                .any(|value| value.starts_with("s3://"))
-        {
+        let identity = DataIdentity::read(&entity_id, &content_urls);
+        if !identity.is_aruna() {
             continue;
         }
         let resolved =
@@ -163,27 +158,36 @@ async fn entity_paths(
     realm_id: RealmId,
     node_id: NodeId,
     auth: &AuthContext,
-    identity: &EntityIdentity,
+    identity: &DataIdentity,
     deadline: tokio::time::Instant,
 ) -> Result<ResolvedPaths, MetadataError> {
     let mut paths = Vec::new();
     let mut complete = true;
     let mut seen = BTreeSet::new();
-    if let Some(exact) = identity
+    let exact = identity
         .exact
         .as_ref()
         .filter(|exact| exact.realm_id == realm_id)
         .filter(|exact| exact.node_id == node_id)
-    {
+        .map(|exact| (exact.bucket.clone(), exact.key.clone(), Some(exact.version)));
+    // Without an exact version, an `s3://` location names the local object's current version.
+    let local = exact.or_else(|| {
+        identity
+            .location
+            .as_ref()
+            .filter(|_| identity.exact.is_none())
+            .map(|location| (location.bucket.clone(), location.key.clone(), None))
+    });
+    if let Some((bucket, key, version)) = local {
         for principal in [&AuthContext::anonymous(realm_id), auth] {
             let summary = drive_until(
                 LocationSummaryOperation::new_local(
                     node_id,
                     LocationSummaryRequest {
                         realm_id,
-                        bucket: exact.bucket.clone(),
-                        key: exact.key.clone(),
-                        version_id: Some(exact.version),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        version_id: version,
                         auth_context: principal.clone(),
                     },
                 )
@@ -193,24 +197,23 @@ async fn entity_paths(
             )
             .await;
             if let Ok(summary) = summary
-                && summary.summary.version_id == Some(exact.version)
+                && version.is_none_or(|version| summary.summary.version_id == Some(version))
                 && summary.summary.materialized
                 && summary.summary.blob_size.is_some()
                 && let Some(group_id) = summary.summary.group_id
             {
-                let path =
-                    object_permission_path(realm_id, group_id, node_id, &exact.bucket, &exact.key);
+                let path = object_permission_path(realm_id, group_id, node_id, &bucket, &key);
                 seen.insert(path.clone());
                 paths.push(ObjectPath {
                     group_id,
-                    bucket: exact.bucket.clone(),
-                    key: exact.key.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
                     path,
                 });
                 break;
             }
         }
-        if paths.is_empty() {
+        if paths.is_empty() && version.is_some() {
             complete = false;
         }
     }
@@ -287,15 +290,8 @@ fn draft_files(rocrate: &JsonValue) -> Vec<(String, Vec<String>)> {
         .filter_map(|entity| {
             let entity = entity.as_object()?;
             let entity_id = entity.get("@id")?.as_str()?;
-            is_file(entity.get("@type")?).then(|| {
-                (
-                    entity_id.to_string(),
-                    entity
-                        .get("contentUrl")
-                        .map(text_values)
-                        .unwrap_or_default(),
-                )
-            })
+            is_file(entity.get("@type")?)
+                .then(|| (entity_id.to_string(), text_values(entity.get("contentUrl"))))
         })
         .take(MAX_DRAFT_FILES + 1)
         .collect()
@@ -306,21 +302,6 @@ fn is_file(value: &JsonValue) -> bool {
         JsonValue::String(value) => FILE_TYPES.contains(&value.as_str()),
         JsonValue::Array(values) => values.iter().any(is_file),
         _ => false,
-    }
-}
-
-fn text_values(value: &JsonValue) -> Vec<String> {
-    match value {
-        JsonValue::String(value) => vec![value.clone()],
-        JsonValue::Array(values) => values.iter().flat_map(text_values).collect(),
-        JsonValue::Object(value) => value
-            .get("@id")
-            .and_then(JsonValue::as_str)
-            .map(|id| vec![id.to_string()])
-            .into_iter()
-            .flatten()
-            .collect(),
-        _ => Vec::new(),
     }
 }
 

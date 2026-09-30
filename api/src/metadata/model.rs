@@ -4,6 +4,7 @@
 
 use super::format_timestamp_ms;
 use crate::error::{ProfileFindingResponse, ValidationViolationResponse};
+use crate::routes::git::location::StorageLocationRequest;
 use aruna_core::metadata::{
     ProfileValidationCompleteness, ProfileValidationState, ProfileValidationStatus,
 };
@@ -203,6 +204,13 @@ pub struct CreateScaffoldRequest {
     pub license: Option<String>,
     #[serde(default)]
     pub public: bool,
+    /// Commit message for the ARC snapshot of this revision. Plain text, at most 4096 bytes after
+    /// trimming; empty or omitted describes the change instead.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Where files pushed through Git are stored; omitted keeps the default location.
+    #[serde(default)]
+    pub storage_location: Option<StorageLocationRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -215,6 +223,13 @@ pub struct CreateRoCrateRequest {
     pub public: bool,
     #[schema(value_type = Object)]
     pub rocrate: Value,
+    /// Commit message for the ARC snapshot of this revision. Plain text, at most 4096 bytes after
+    /// trimming; empty or omitted describes the change instead.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Where files pushed through Git are stored; omitted keeps the default location.
+    #[serde(default)]
+    pub storage_location: Option<StorageLocationRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -300,6 +315,10 @@ pub struct ReplaceRoCrateRequest {
     /// The newest event id the caller based its crate on; a newer edit answers 412.
     #[serde(default)]
     pub expected_revision: Option<String>,
+    /// Commit message for the ARC snapshot of this revision. Plain text, at most 4096 bytes after
+    /// trimming; empty or omitted describes the change instead.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

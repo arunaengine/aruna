@@ -10,6 +10,7 @@ pub const REALM_ID_PATH: &str = "group.realm_id";
 pub const GROUP_OWNER_PATH: &str = "group.owner";
 pub const GROUP_POLICIES_PATH: &str = "group.policies";
 pub const GROUP_DELETED_PATH: &str = "group.deleted";
+pub const GROUP_LOCATION_PATH: &str = "group.dataset_location";
 pub const METADATA_REPLICATION_PATH: &str = "realm_config.settings.metadata_replication";
 pub const CONFIG_DISCOVERY_PATH: &str = "realm_config.settings.discovery";
 pub const CONFIG_DESCRIPTION_PATH: &str = "realm_config.description";
@@ -101,6 +102,9 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::GroupPoliciesSet { .. } => {
             vec![GROUP_POLICIES_PATH.to_string()]
+        }
+        AdminDocumentOperation::GroupLocationSet { .. } => {
+            vec![GROUP_LOCATION_PATH.to_string()]
         }
         AdminDocumentOperation::NodePlacementSet { entry } => {
             vec![placement_node_path(&entry.node_id)]

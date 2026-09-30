@@ -17,6 +17,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
@@ -46,7 +47,14 @@ pub struct UpdateGroupConfig {
     /// credential stays restricted; it is never derived from `actor`.
     pub auth_context: AuthContext,
     pub group_id: GroupId,
-    pub display_name: String,
+    pub change: GroupChange,
+}
+
+/// What an update changes: the display name or the default dataset location.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupChange {
+    Name(String),
+    Location(Option<DatasetLocation>),
 }
 
 /// Renames a group after creation. Only the label changes: the group id and
@@ -96,6 +104,8 @@ pub enum UpdateGroupError {
     GroupNotFound,
     #[error("group name must be non-empty and at most {MAX_NAME_LEN} bytes")]
     InvalidDisplayName,
+    #[error("the dataset location has an invalid bucket name or prefix")]
+    InvalidLocation,
     #[error("stored group id does not match the requested group id")]
     GroupIdMismatch,
     #[error("missing active transaction")]
@@ -129,8 +139,18 @@ impl UpdateGroupOperation {
         }
     }
 
-    fn trimmed_name(&self) -> Result<String, UpdateGroupError> {
-        normalize_group_name(&self.config.display_name).ok_or(UpdateGroupError::InvalidDisplayName)
+    fn admin_change(&self) -> Result<AdminDocumentOperation, UpdateGroupError> {
+        match &self.config.change {
+            GroupChange::Name(name) => normalize_group_name(name)
+                .map(|display_name| AdminDocumentOperation::DisplayNameSet { display_name })
+                .ok_or(UpdateGroupError::InvalidDisplayName),
+            GroupChange::Location(Some(location)) if !location.valid() => {
+                Err(UpdateGroupError::InvalidLocation)
+            }
+            GroupChange::Location(location) => Ok(AdminDocumentOperation::GroupLocationSet {
+                location: location.clone(),
+            }),
+        }
     }
 
     fn document_ref(&self) -> DocumentTarget {
@@ -195,7 +215,7 @@ impl UpdateGroupOperation {
         let Some(txn_id) = self.txn_id else {
             return Err(UpdateGroupError::MissingTransaction);
         };
-        let display_name = self.trimmed_name()?;
+        let change = self.admin_change()?;
         let group_value = group_value.ok_or(UpdateGroupError::GroupNotFound)?;
         let mut group = Group::from_bytes(&group_value)?;
         if group.group_id != self.config.group_id || group.realm_id != self.config.actor.realm_id {
@@ -219,13 +239,10 @@ impl UpdateGroupOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_event = reducer_state.apply_operation(
-            &self.config.actor,
-            AdminDocumentOperation::DisplayNameSet {
-                display_name: display_name.clone(),
-            },
-        )?;
-        group.display_name = display_name;
+        let admin_event = reducer_state.apply_operation(&self.config.actor, change.clone())?;
+        if let AdminDocumentOperation::DisplayNameSet { display_name } = change {
+            group.display_name = display_name;
+        }
         overlay_reducer_name(&mut group, &reducer_state);
 
         let stale_conflict_deletes =
@@ -351,7 +368,7 @@ impl Operation for UpdateGroupOperation {
         {
             return self.fail(UpdateGroupError::Unauthorized);
         }
-        if let Err(error) = self.trimmed_name() {
+        if let Err(error) = self.admin_change() {
             return self.fail(error);
         }
         self.state = UpdateGroupState::AuthGroupAdmin;
@@ -551,7 +568,7 @@ mod pure_tests {
                 session: None,
             },
             group_id: group(),
-            display_name: display_name.to_string(),
+            change: super::GroupChange::Name(display_name.to_string()),
         }
     }
 

@@ -20,4 +20,5 @@ pub mod invenio;
 mod messages;
 pub mod opendal;
 pub mod repo;
+pub mod rocrate;
 pub mod s3;

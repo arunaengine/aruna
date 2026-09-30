@@ -288,7 +288,7 @@ pub fn event_projection_entries(
     materialization_status: &MaterializationStatusRecord,
     materialization_job: &MetadataMaterializationRecord,
 ) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
-    let mut writes = vec![create_event_entry(event)?];
+    let mut writes = aruna_core::storage_entries::logged_event_entries(event)?;
     writes.extend(aruna_core::storage_entries::checkpoint_entry(event));
     writes.extend(create_materialization_entries(
         &event.record,
@@ -448,7 +448,7 @@ mod pure_tests {
         (
             record,
             audit,
-            create_outbox_record(&create_event, None, false),
+            create_outbox_record(&create_event, None, None, false),
         )
     }
 

@@ -2,6 +2,10 @@
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
+# iroh-doctor does not depend on this repository, so source changes keep this stage cached.
+FROM rust:1.97.1-trixie@sha256:1bcff4befb740599103a2c7cb51058e14479b2e35e3a34a3f0dc4ede09927488 AS iroh
+RUN cargo install --locked --version 0.101.0 --root /iroh iroh-doctor
+
 # glibc, not musl: musl's `cmsghdr` is 4-byte aligned, so noq-udp's receive
 # timestamp decode trips its alignment assertion and aborts the process.
 FROM rust:1.97.1-trixie@sha256:1bcff4befb740599103a2c7cb51058e14479b2e35e3a34a3f0dc4ede09927488 AS builder
@@ -17,9 +21,13 @@ ARG PORTAL_EMBED_DIR=.portal-embed
 COPY . .
 RUN python3 -m venv /opt/arctrl \
     && /opt/arctrl/bin/pip install --no-cache-dir -r blob/arc-requirements.txt
-RUN cargo build --release --locked -p aruna
-RUN cargo build --release --locked -p aruna-doctor
-RUN cargo install --locked --version 0.101.0 --root target iroh-doctor
+# One build for both binaries: separate builds unify features differently and rebuild shared crates.
+# CI passes binaries it already built in .prebuilt/, so the image build skips the compile.
+RUN if [ -x .prebuilt/aruna ] && [ -x .prebuilt/aruna-doctor ]; then \
+        mkdir -p target/release && cp .prebuilt/aruna .prebuilt/aruna-doctor target/release/; \
+    else \
+        cargo build --release --locked -p aruna -p aruna-doctor; \
+    fi
 # The runtime image has no shell, so copy the staged portal in the builder.
 RUN mkdir -p /portal ${PORTAL_EMBED_DIR} && cp -r ${PORTAL_EMBED_DIR}/. /portal/
 RUN mkdir -p /git-runtime/usr/bin /git-runtime/usr/lib/git-core \
@@ -44,7 +52,7 @@ COPY --from=builder /opt/arctrl/ /opt/arctrl/
 ENV PATH=/opt/arctrl/bin:/usr/bin:/bin
 COPY --from=builder /build/target/release/aruna .
 COPY --from=builder /build/target/release/aruna-doctor .
-COPY --from=builder /build/target/bin/iroh-doctor .
+COPY --from=iroh /iroh/bin/iroh-doctor .
 COPY --from=builder /portal/ /run/portal/
 # Leave PORTAL_MODE unset: process env would override mounted /run/.env and pin the portal off.
 # PORTAL_DIR points at the embedded copy.

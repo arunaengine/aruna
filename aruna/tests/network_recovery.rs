@@ -65,6 +65,27 @@ fn metadata_counts(seed: &shared::SeedNode, peer: iroh::PublicKey) -> aruna_net:
     seed.net.pool_counts_for(peer, Alpn::Metadata)
 }
 
+/// The counts once the pool handled a request after `before`: the query's shared deadline
+/// can report the node failed before the pool dials or hits the cooldown for it.
+async fn pool_settled(
+    seed: &shared::SeedNode,
+    peer: iroh::PublicKey,
+    before: &aruna_net::PoolCounts,
+) -> TestResult<aruna_net::PoolCounts> {
+    // Hang guard only; the pool answers within its connect timeout.
+    let cap = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let counts = metadata_counts(seed, peer);
+        if counts.dials > before.dials || counts.cooldown_hits > before.cooldown_hits {
+            return Ok(counts);
+        }
+        if tokio::time::Instant::now() >= cap {
+            return Err(std::io::Error::other("the pool never handled the query").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn rejoin_peer(
     joiner: &shared::JoinerNode,
     seed: &shared::SeedNode,
@@ -177,14 +198,14 @@ async fn check_outage(
                 .iter()
                 .any(|node| node == &json!(joiner.config.node_id.to_string())))
     );
-    let after = metadata_counts(seed, joiner.config.node_id);
+    let after = pool_settled(seed, joiner.config.node_id, &before).await?;
     assert_eq!(after.dials - before.dials, 1);
 
     let retry = metadata_query(&seed.base_url, token).await?;
     assert_eq!(retry["complete"], false);
     assert_eq!(retry["nodes_queried"], 2);
     assert_eq!(retry["nodes_failed"], 1);
-    let retried = metadata_counts(seed, joiner.config.node_id);
+    let retried = pool_settled(seed, joiner.config.node_id, &after).await?;
     // A request may cross the five-second cooldown; then one re-probe is valid.
     let retry_dials = retried.dials - after.dials;
     assert!(retry_dials <= 1);
@@ -228,7 +249,7 @@ async fn check_recovery(
     }
     .await;
     peer.net.shutdown().await;
-    let after = metadata_counts(seed, joiner.config.node_id);
+    let after = pool_settled(seed, joiner.config.node_id, &before).await?;
     assert_eq!(after.dials - before.dials, 1);
     result
 }

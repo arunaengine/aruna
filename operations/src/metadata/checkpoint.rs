@@ -4,8 +4,8 @@
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, METADATA_CHECKPOINT_KEYSPACE};
-use aruna_core::metadata::MetadataEventRecord;
+use aruna_core::keyspaces::{EVENT_SIZE_KEYSPACE, METADATA_CHECKPOINT_KEYSPACE};
+use aruna_core::metadata::EventSize;
 use aruna_core::metadata::{EVENT_LIMIT, RAW_BYTES_LIMIT};
 use aruna_core::storage_entries::event_log_prefix;
 use aruna_core::structs::identity::auth::Actor;
@@ -49,10 +49,11 @@ async fn window(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         _ => return Err(UpdateDocumentError::MissingTransaction),
     };
+    // Size rows carry each event's origin and size, so no event is decoded here.
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
-            key_space: EVENT_LOG_KEYSPACE.to_string(),
+            key_space: EVENT_SIZE_KEYSPACE.to_string(),
             prefix: Some(prefix),
             start,
             limit: EVENT_LIMIT as usize,
@@ -63,11 +64,11 @@ async fn window(
         Event::Storage(StorageEvent::IterResult { values, .. }) => {
             let mut used: BTreeMap<NodeId, (u64, u64)> = BTreeMap::new();
             for (_, value) in &values {
-                let event: MetadataEventRecord = postcard::from_bytes(value)
+                let size: EventSize = postcard::from_bytes(value)
                     .map_err(aruna_core::errors::ConversionError::from)?;
-                let entry = used.entry(event.node_id).or_default();
+                let entry = used.entry(size.node_id).or_default();
                 entry.0 += 1;
-                entry.1 += value.len() as u64;
+                entry.1 += size.bytes;
             }
             Ok(used.into_values().fold((0, 0), |most, used| {
                 (most.0.max(used.0), most.1.max(used.1))

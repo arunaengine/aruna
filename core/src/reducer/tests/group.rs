@@ -236,3 +236,35 @@ fn group_created_change() {
     );
     assert_eq!(state, before);
 }
+
+#[test]
+fn group_location_materializes() {
+    use crate::structs::storage::dataset_location::DatasetLocation;
+    let location = DatasetLocation::new("lab-data", "datasets").unwrap();
+    let mut state = group_state();
+    let mut other = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::Group {
+        group_id: Ulid::from_bytes([9; 16]),
+    });
+    let set = |state: &mut AdminDocumentState, location: Option<DatasetLocation>| {
+        state.apply_operation(
+            &actor(node(1)),
+            AdminDocumentOperation::GroupLocationSet { location },
+        )
+    };
+    set(&mut state, Some(location.clone())).unwrap();
+    set(
+        &mut other,
+        Some(DatasetLocation::new("other-data", "").unwrap()),
+    )
+    .unwrap();
+    assert_eq!(state.group_location(), Some(location.clone()));
+    assert_eq!(other.group_location().unwrap().bucket, "other-data");
+    let invalid = DatasetLocation {
+        bucket: "Bad_Bucket".into(),
+        prefix: String::new(),
+    };
+    assert!(set(&mut state, Some(invalid)).is_err());
+    assert_eq!(state.group_location(), Some(location));
+    set(&mut state, None).unwrap();
+    assert_eq!(state.group_location(), None);
+}

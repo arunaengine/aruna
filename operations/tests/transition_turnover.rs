@@ -129,6 +129,7 @@ async fn turnover_moves_holder() -> TestResult<()> {
         },
         None,
         Some(realm.bearer_token()),
+        None,
     )
     .await?;
     for holder in &after {

@@ -227,6 +227,15 @@ def canonical_workbook(path):
     path.write_bytes(output.getvalue())
 
 
+# Every file goes through Git LFS except the metadata files; kept equal to LFS_RULES in rocrate.rs.
+LFS_RULES = ("* filter=lfs diff=lfs merge=lfs -text",
+             ".gitattributes -filter -diff -merge text",
+             ".gitignore -filter -diff -merge text",
+             "/ro-crate-metadata.json -filter -diff -merge text",
+             "/aruna-metadata.json -filter -diff -merge text",
+             "isa.*.xlsx -filter -diff -merge -text")
+
+
 def generate(request, root):
     source = request["jsonld"]
     arc = prepare(source, request["document_id"])
@@ -242,7 +251,7 @@ def generate(request, root):
     (root / "ro-crate-metadata.json").write_text(json.dumps(document, indent=2) + "\n")
     (root / "aruna-metadata.json").write_text(source)
     pointers = link(root, json.loads(source), request.get("objects", {}))
-    attributes = ["*.bin filter=lfs diff=lfs merge=lfs -text"]
+    attributes = list(LFS_RULES)
     attributes += ["/" + path.replace(" ", "[[:space:]]") + " filter=lfs diff=lfs merge=lfs -text"
                    for path in sorted(pointers)]
     (root / ".gitattributes").write_text("\n".join(attributes) + "\n")
@@ -349,6 +358,11 @@ def identities(graph, root, wanted):
 def apply(graph, root, base, new):
     """Applies the values changed from base to new onto graph; without base, new values win."""
     before, after = entities(base), entities(new)
+    for source in (before, after):
+        about = source.get("ro-crate-metadata.json", {}).get("about")
+        identifier = about.get("@id") if isinstance(about, dict) else about
+        if isinstance(identifier, str) and identifier in source and identifier != "./":
+            source["./"] = {**source.pop(identifier), "@id": "./"}
     changed = [identifier for identifier in sorted(set(before) | set(after))
                if identifier != "ro-crate-metadata.json"
                and properties(before.get(identifier)) != properties(after.get(identifier))]

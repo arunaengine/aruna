@@ -10,8 +10,8 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE};
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::{
-    create_acceptance_entry, create_acceptance_key, create_projection_entries,
-    shard_manifest_entry, sync_revision_entry,
+    commit_message_entry, create_acceptance_entry, create_acceptance_key,
+    create_projection_entries, shard_manifest_entry, sync_revision_entry,
 };
 use aruna_core::structs::SyncQuarantineIdentity;
 use aruna_core::types::Value;
@@ -293,6 +293,10 @@ impl DocumentSyncService {
                 .target()
                 .sync_topic_id(self.realm_id, &event.placement());
             if target_topic_id != topic_id {
+                // Heartbeats left on the retired node info topic are republished, so drop them.
+                if matches!(event.target(), DocumentTarget::NodeInfo { .. }) {
+                    continue;
+                }
                 warn!(
                     %topic_id,
                     %target_topic_id,
@@ -359,6 +363,12 @@ impl DocumentSyncService {
                 *value = ByteView::from(apply.bytes.clone());
             }
             entries.extend(event_entries);
+            if let Some(message) = &apply.message {
+                entries.push(
+                    commit_message_entry(&apply.record, message)
+                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                );
+            }
             if event_is_create(&apply.record) {
                 entries.push(
                     create_acceptance_entry(&apply.record)

@@ -1,5 +1,5 @@
-//! Re-encodes legacy job, realm and PID mapping rows and seals plain secret rows with the node key.
-//! Rows already current stay unchanged, the projection cache is cleared and repeats are safe.
+//! Re-encodes legacy job, realm, PID mapping and Git record rows, adds missing event size rows
+//! and seals plain secrets; current rows stay, the projection cache is cleared, repeats are safe.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,11 +8,14 @@ use crate::explorer::ExplorerError;
 use aruna::identity::PersistedNodeState;
 use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
+use aruna_core::document::DocumentTarget;
+use aruna_core::git::GitRecord;
 use aruna_core::keyspaces::{
-    BACKEND_SECRET_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
-    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, SECONDARY_ID_KEYSPACE, SOURCE_SECRET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    BACKEND_SECRET_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
+    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE,
+    JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    SECONDARY_ID_KEYSPACE, SOURCE_SECRET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
 use aruna_core::structs::execution::job::{
@@ -32,8 +35,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use ulid::Ulid;
 
+mod git;
 mod jobs;
 mod mappings;
+mod sizes;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {
@@ -67,6 +72,12 @@ pub struct MigrateOutput {
     /// Checkpoints of RO-Crate import and export jobs.
     pub checkpoints_scanned: usize,
     pub checkpoints_rewritten: usize,
+    /// Git records from before packs moved into Fjall, stored and queued for publishing.
+    pub git_records_scanned: usize,
+    pub git_records_rewritten: usize,
+    pub git_outbox_rewritten: usize,
+    /// Size rows written for logged metadata events that had none.
+    pub event_sizes_written: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -92,6 +103,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let outbox_rows = db.keyspace(SYNC_OUTBOX_KEYSPACE, KeyspaceCreateOptions::default)?;
     let index_rows = db.keyspace(SECONDARY_ID_KEYSPACE, KeyspaceCreateOptions::default)?;
     let job_rows = db.keyspace(JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let git_rows = db.keyspace(GIT_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let event_rows = db.keyspace(EVENT_LOG_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let size_rows = db.keyspace(EVENT_SIZE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let state_rows = db.keyspace(JOB_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
@@ -104,7 +118,24 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let configs = realm_configs(&db, &config_rows)?;
     let mappings =
         rewrites::<PersistentIdMapping, LegacyMapping>(&db, &mapping_rows, ID_MAPPING_KEYSPACE)?;
-    let outbox = mappings::outbox_rows(&db, &outbox_rows, SYNC_OUTBOX_KEYSPACE)?;
+    let mapping =
+        |target: &DocumentTarget| matches!(target, DocumentTarget::PersistentIdMapping { .. });
+    let outbox = mappings::outbox_rows(
+        &db,
+        &outbox_rows,
+        SYNC_OUTBOX_KEYSPACE,
+        (mapping, rewritten::<PersistentIdMapping, LegacyMapping>),
+    )?;
+    let git_records =
+        rewrites::<GitRecord, git::LegacyRecord>(&db, &git_rows, GIT_RECORD_KEYSPACE)?;
+    let sizes = sizes::missing_sizes(&db, &event_rows, &size_rows)?;
+    let record = |target: &DocumentTarget| matches!(target, DocumentTarget::GitRecord { .. });
+    let git_outbox = mappings::outbox_rows(
+        &db,
+        &outbox_rows,
+        SYNC_OUTBOX_KEYSPACE,
+        (record, rewritten::<GitRecord, git::LegacyRecord>),
+    )?;
     let index = mappings::index_rebuild(
         &db,
         &mapping_rows,
@@ -132,6 +163,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&config_rows, &configs.rows),
         (&mapping_rows, &mappings.rows),
         (&outbox_rows, &outbox.rows),
+        (&outbox_rows, &git_outbox.rows),
+        (&git_rows, &git_records.rows),
+        (&size_rows, &sizes.rows),
         (&index_rows, &index.writes),
         (&job_rows, &jobs.rows),
         (&state_rows, &checkpoints.rows),
@@ -180,6 +214,10 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         jobs_rewritten: jobs.rows.len(),
         checkpoints_scanned: checkpoints.scanned,
         checkpoints_rewritten: checkpoints.rows.len(),
+        git_records_scanned: git_records.scanned,
+        git_records_rewritten: git_records.rows.len(),
+        git_outbox_rewritten: git_outbox.rows.len(),
+        event_sizes_written: sizes.rows.len(),
     })
 }
 

@@ -25,9 +25,8 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
     ensure_confined_path, object_permission_path,
 };
-use aruna_core::structs::storage::replication::{
-    ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
-};
+use aruna_core::structs::storage::data_identity::DataIdentity;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 use async_zip::{Compression, ZipDateTime, ZipDateTimeBuilder, ZipEntryBuilder};
@@ -204,9 +203,9 @@ impl ExportCheckpoint {
 /// The bucket and key an entity was authored against, used to lay the archive
 /// out like the source prefix instead of by content hash.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct StorageKey {
-    bucket: String,
-    key: String,
+pub(crate) struct StorageKey {
+    pub(crate) bucket: String,
+    pub(crate) key: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -317,12 +316,6 @@ enum OpenStatus {
 enum CandidateOpen {
     Opened(BaoReadOutput),
     Status(OpenStatus),
-}
-
-pub(crate) struct EntityIdentity {
-    pub(crate) exact: Option<VersionedObjectArn>,
-    pub(crate) hash: Option<[u8; 32]>,
-    pub(crate) hash_realm: Option<RealmId>,
 }
 
 pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRunOutcome {
@@ -803,18 +796,22 @@ async fn resolve_entries(
                 .hash_realm
                 .is_none_or(|realm_id| realm_id == spec.auth_context.realm_id)
         });
-        let exact_version = entity
+        // Without an exact version or content hash, an `s3://` location names this node's
+        // current version of that key.
+        let current = match (&entity.exact, hash, &entity.storage_key) {
+            (None, None, Some(location)) => current_version(ctx, spec, location).await,
+            _ => None,
+        };
+        let entity = &checkpoint.entities[index];
+        let exact = entity
             .exact
             .as_ref()
             .filter(|exact| exact.realm_id == spec.auth_context.realm_id)
-            .map(|exact| exact.version);
+            .or(current.as_ref());
+        let exact_version = exact.map(|exact| exact.version);
         let mut mismatched = false;
 
-        if let Some(exact) = entity
-            .exact
-            .as_ref()
-            .filter(|exact| exact.realm_id == spec.auth_context.realm_id)
-        {
+        if let Some(exact) = exact {
             if exact.node_id == ctx.owner_node_id {
                 match resolve_exact(ctx, spec, exact).await? {
                     ResolveResult::Candidate(candidate) => {
@@ -1113,6 +1110,24 @@ fn merge_candidates(
             target.push(candidate.clone());
         }
     }
+}
+
+/// The current version of a key on this node, as an exact identity; `None` when absent.
+async fn current_version(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    location: &StorageKey,
+) -> Option<VersionedObjectArn> {
+    let input = crate::s3::object::head::HeadObjectInput {
+        bucket: location.bucket.clone(),
+        key: location.key.clone(),
+        version_id: None,
+    };
+    let operation = crate::s3::object::head::HeadObjectOperation::new(input);
+    let version = drive(operation, &ctx.driver).await.ok()?.version_id?;
+    let realm_id = spec.auth_context.realm_id;
+    let node_id = ctx.owner_node_id;
+    VersionedObjectArn::new(realm_id, node_id, &location.bucket, &location.key, version).ok()
 }
 
 async fn resolve_exact(

@@ -7,6 +7,7 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
+use crate::routes::git::location::StorageLocationRequest;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
@@ -21,6 +22,8 @@ use aruna_core::types::RoleId;
 use aruna_operations::device::realm_documents::install_group_docs;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::is_user_origin;
+use aruna_operations::git::GitError;
+use aruna_operations::git::location::{check_default, group_default};
 use aruna_operations::groups::add_member::{AddUserError, AddUserInput, AddUserOperation};
 use aruna_operations::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation};
 use aruna_operations::groups::create_group::{
@@ -36,7 +39,7 @@ use aruna_operations::groups::remove_role::{
     RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation,
 };
 use aruna_operations::groups::update_group::{
-    UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
+    GroupChange, UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
 };
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::stats::count_group_purpose;
@@ -71,6 +74,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(GroupsApiDoc::openapi())
         .routes(routes!(create_group, list_groups))
         .routes(routes!(get_group, update_group, delete_group))
+        .routes(routes!(set_group_location))
         .routes(routes!(get_group_usage))
         .routes(routes!(list_data_paths))
         .routes(routes!(list_group_members, add_group_member))
@@ -227,6 +231,15 @@ pub struct GroupInfoResponse {
     pub group_id: String,
     pub realm_id: String,
     pub roles: Vec<RoleResponse>,
+    /// Where new datasets store their files; shown to members only, `null` for others.
+    pub dataset_location: Option<StorageLocationRequest>,
+}
+
+/// A group's default dataset location; `null` restores the generated group bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GroupLocationRequest {
+    pub location: Option<StorageLocationRequest>,
 }
 
 fn map_roles(auth: GroupAuthorizationDocument, realm_id: RealmId) -> Vec<RoleResponse> {
@@ -364,6 +377,7 @@ impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
             group_id: group.group_id.to_string(),
             realm_id: group.realm_id.to_string(),
             roles: map_roles(auth, group.realm_id),
+            dataset_location: None,
         }
     }
 }
@@ -747,11 +761,23 @@ pub(crate) async fn run_get_group(
     let group_id = parse_group_id(group_id)?;
     let (group, auth_doc) = load_group(state, group_id).await?;
     let is_member = is_group_member(&auth_doc, auth.user_id);
+    let dataset_location = match is_member {
+        true => group_default(&state.get_ctx(), group_id)
+            .await
+            .map(|location| StorageLocationRequest {
+                bucket: location.bucket,
+                prefix: location.prefix,
+            })
+            .map(Some)
+            .map_err(|_| ServerError::ServiceUnavailable)?,
+        false => None,
+    };
     Ok(GroupInfoResponse {
         display_name: group.display_name,
         group_id: group.group_id.to_string(),
         realm_id: group.realm_id.to_string(),
         roles: map_visible_roles(auth_doc, group.realm_id, is_member),
+        dataset_location,
     })
 }
 
@@ -829,38 +855,129 @@ pub async fn update_group(
     }
     let group_id = parse_group_id(&group_id)?;
     refuse_group_edit(&state).await?;
-    // The operation decides again; the boundary refuses early for anyone who is
-    // neither a group admin nor a realm groups administrator.
-    let group_admin = format!("/{realm_id}/g/{group_id}/admin");
-    if !crate::auth::permission_granted(
-        &state,
-        &auth,
-        group_admin,
-        aruna_core::structs::identity::auth::Permission::WRITE,
-    )
-    .await?
-    {
-        crate::auth::ensure_permission(
-            &state,
-            &auth,
-            format!("/{realm_id}/admin/groups"),
-            aruna_core::structs::identity::auth::Permission::WRITE,
-        )
-        .await?;
-    }
+    ensure_group_admin(&state, &auth, group_id).await?;
 
     drive(
         UpdateGroupOperation::new(UpdateGroupConfig {
             actor: actor_for(&state, &auth),
             auth_context: auth.clone(),
             group_id,
-            display_name: request.display_name,
+            change: GroupChange::Name(request.display_name),
         }),
         &state.get_ctx(),
     )
     .await
     .map_err(map_rename_error)?;
 
+    Ok((
+        StatusCode::OK,
+        Json(run_get_group(&state, Some(auth), &group_id.to_string()).await?),
+    ))
+}
+
+/// The operation decides again; the boundary refuses early for anyone who is
+/// neither a group admin nor a realm groups administrator.
+async fn ensure_group_admin(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: Ulid,
+) -> ServerResult<()> {
+    let realm_id = auth.realm_id;
+    let group_admin = format!("/{realm_id}/g/{group_id}/admin");
+    if !crate::auth::permission_granted(state, auth, group_admin, Permission::WRITE).await? {
+        crate::auth::ensure_permission(
+            state,
+            auth,
+            format!("/{realm_id}/admin/groups"),
+            Permission::WRITE,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[utoipa::path(
+    put,
+    path = "/access/groups/{id}/storage-location",
+    tag = "access/groups",
+    summary = "Set the group's default dataset location",
+    description = r#"Sets or clears where new datasets of the group store their files.
+
+**Authentication**: realm bearer token without path restrictions, carrying WRITE on the group's
+administrative path or on the realm group-administration path, and WRITE on the bucket under the
+prefix.
+
+**Behavior**
+- A dataset created without its own storage location uses this bucket with prefix
+  `<prefix><document id>/`, recorded unless it is the generated default. Existing datasets keep
+  their location, and no data moves.
+- The bucket must exist on this node and belong to the group, except the generated
+  `datasets-<group id>` bucket, which is created on first use. Bucket names are node-local, so
+  every node that creates datasets checks the bucket again and refuses the create when it is
+  missing there; another bucket is never substituted.
+- Every group starts with its generated `datasets-<group id>` bucket and no prefix. `null`
+  restores that default.
+- The change reaches the rest of the realm through document sync."#,
+    request_body(
+        content = GroupLocationRequest,
+        example = json!({"location": {"bucket": "lab-data", "prefix": "datasets/"}})
+    ),
+    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
+    responses(
+        (status = 200, description = "The group after the change, in the same shape as reading it", body = GroupInfoResponse,
+         example = json!({
+             "display_name": "Proteomics Lab",
+             "group_id": "01JABCDEF0123456789ABCDEFG",
+             "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+             "roles": [],
+             "dataset_location": {"bucket": "lab-data", "prefix": "datasets/"}
+         })),
+        (status = 400, description = "Invalid group id, bucket name or prefix, or a bucket of another group or missing on this node, with the reason in the message", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Token is path-restricted or belongs to another realm, the caller administers neither the group nor the realm's groups, or WRITE is denied on the bucket", body = ErrorResponse),
+        (status = 404, description = "No such group on this node", body = ErrorResponse),
+        (status = 409, description = "This node is a device, a concurrent write conflicted, or the group's bucket cut over; the latter two are retryable unchanged", body = ErrorResponse),
+        (status = 503, description = "Bucket or group storage unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_group_location(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+    Json(request): Json<GroupLocationRequest>,
+) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
+    let auth = require_unrestricted(auth)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+    let group_id = parse_group_id(&group_id)?;
+    let location = request
+        .location
+        .map(|location| location.location())
+        .transpose()?;
+    refuse_group_edit(&state).await?;
+    ensure_group_admin(&state, &auth, group_id).await?;
+    if let Some(location) = &location {
+        check_default(&state.get_ctx(), &auth, group_id, location)
+            .await
+            .map_err(|error| match error {
+                GitError::Refused(reason) => ServerError::BadRequestMessage(reason),
+                GitError::Authorization(error) => crate::auth::map_authorize_error(error),
+                _ => ServerError::ServiceUnavailable,
+            })?;
+    }
+    drive(
+        UpdateGroupOperation::new(UpdateGroupConfig {
+            actor: actor_for(&state, &auth),
+            auth_context: auth.clone(),
+            group_id,
+            change: GroupChange::Location(location),
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_rename_error)?;
     Ok((
         StatusCode::OK,
         Json(run_get_group(&state, Some(auth), &group_id.to_string()).await?),
@@ -934,9 +1051,9 @@ fn map_rename_error(error: UpdateGroupError) -> ServerError {
     match error {
         UpdateGroupError::Unauthorized => ServerError::Forbidden,
         UpdateGroupError::GroupNotFound => ServerError::NotFound,
-        UpdateGroupError::InvalidDisplayName | UpdateGroupError::ConversionError(_) => {
-            ServerError::BadRequest
-        }
+        UpdateGroupError::InvalidDisplayName
+        | UpdateGroupError::InvalidLocation
+        | UpdateGroupError::ConversionError(_) => ServerError::BadRequest,
         UpdateGroupError::PlacementFenced => {
             ServerError::Conflict("the group moved to a new holder set; retry".to_string())
         }

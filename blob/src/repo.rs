@@ -137,6 +137,61 @@ pub async fn resolve(directory: &Path, revision: &str) -> Option<String> {
     Some(text(&output).ok()?.trim().to_string())
 }
 
+/// Revisions as stdin lines; one that is invalid or spans lines is refused.
+fn lines(revisions: &[String], suffix: &str) -> std::io::Result<String> {
+    if revisions
+        .iter()
+        .any(|revision| !revision_valid(revision) || revision.contains(['\n', '\r']))
+    {
+        return Err(std::io::Error::other("invalid Git revision"));
+    }
+    Ok(revisions
+        .iter()
+        .map(|revision| format!("{revision}{suffix}\n"))
+        .collect())
+}
+
+pub async fn peel(directory: &Path, revisions: &[String]) -> std::io::Result<Vec<Option<String>>> {
+    let input = lines(revisions, "^{commit}")?;
+    if revisions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut process = Command::new("git");
+    process
+        .current_dir(directory)
+        .args(["cat-file", "--batch-check=%(objectname)"]);
+    let output = exchange(process, input.into(), false).await?;
+    // A revision that names no commit answers "<revision> missing" instead of an id.
+    let peeled: Vec<_> = text(&output)?
+        .lines()
+        .map(|line| {
+            (!line.is_empty() && line.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then(|| line.to_string())
+        })
+        .collect();
+    if peeled.len() != revisions.len() {
+        return Err(std::io::Error::other("invalid object listing"));
+    }
+    Ok(peeled)
+}
+
+pub async fn commits(directory: &Path, revisions: &[String]) -> std::io::Result<Vec<CommitInfo>> {
+    let input = lines(revisions, "")?;
+    if revisions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut process = Command::new("git");
+    process
+        .current_dir(directory)
+        .args(["rev-list", "--no-walk=unsorted", "--header", "--stdin"]);
+    let output = exchange(process, input.into(), false).await?;
+    text(&output)?
+        .split('\0')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(parse_commit)
+        .collect()
+}
+
 pub async fn merge_base(directory: &Path, first: &str, second: &str) -> Option<String> {
     if !revision_valid(first) || !revision_valid(second) {
         return None;
@@ -352,5 +407,40 @@ mod tests {
         assert_eq!(resolve(path, "missing").await, None);
         assert_eq!(resolve(path, "--all").await, None);
         assert_eq!(merge_base(path, &first, &second).await, Some(first));
+    }
+
+    #[tokio::test]
+    async fn batch_matches_single() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path();
+        git(path, &["init", "-q", "--initial-branch=main"]).await;
+        git(path, &["commit", "-q", "--allow-empty", "-m", "First"]).await;
+        git(path, &["tag", "light"]).await;
+        git(path, &["branch", "old"]).await;
+        git(path, &["commit", "-q", "--allow-empty", "-m", "Second"]).await;
+        git(path, &["tag", "-a", "-m", "Release", "annotated"]).await;
+        git(path, &["tag", "-a", "-m", "Again", "nested", "annotated"]).await;
+        git(path, &["tag", "tree", "HEAD^{tree}"]).await;
+        let mut revisions = Vec::new();
+        for name in ["refs/tags/light", "refs/tags/annotated", "refs/tags/nested"] {
+            revisions.push(git(path, &["rev-parse", name]).await);
+        }
+        revisions.push(git(path, &["rev-parse", "refs/tags/tree"]).await);
+        revisions.push("f".repeat(40));
+        let mut single = Vec::new();
+        for revision in &revisions {
+            single.push(resolve(path, revision).await);
+        }
+        assert_eq!(peel(path, &revisions).await.expect("tags peel"), single);
+        assert_eq!(single[3], None);
+        assert!(peel(path, &["--all".into()]).await.is_err());
+
+        let heads = vec!["main".to_string(), "old".into(), "main".into()];
+        let mut expected = Vec::new();
+        for head in &heads[..2] {
+            expected.extend(log(path, (head, None), 0, 1).await.expect("log reads"));
+        }
+        assert_eq!(commits(path, &heads).await.expect("heads read"), expected);
+        assert!(commits(path, &[]).await.expect("nothing").is_empty());
     }
 }

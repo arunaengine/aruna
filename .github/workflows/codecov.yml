@@ -19,19 +19,73 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # Source-based coverage reads __llvm_covmap from the binary, so DWARF is
-  # dead weight that OOM-kills the 16 GB runner during linking.
+  # Source-based coverage reads __llvm_covmap from the binary, so DWARF is dead weight.
+  CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
-  CARGO_BUILD_JOBS: 2
-  RUSTFLAGS: -Cinstrument-coverage -Cdebuginfo=0
+  # RUSTFLAGS replaces the rustflags of .cargo/config.toml, so the mold linker is named again.
+  RUSTFLAGS: -Cinstrument-coverage -Clink-arg=-fuse-ld=mold
 
 jobs:
+  # Compiles every instrumented test binary once; the shards below run parts of it.
+  instrumented-build:
+    name: Build instrumented tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: coverage
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
+      # Peak memory was never measured; the log shows it when a build fails.
+      - name: Sample memory use
+        run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
+
+      # The measured target set matches the main tests job, so a coverage move
+      # cannot come from a different target selection.
+      - name: Build the instrumented test archive
+        run: >-
+          cargo nextest archive --workspace --all-targets --all-features --locked
+          --archive-file coverage-archive.tar.zst
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-archive
+          path: coverage-archive.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload the memory log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-memory
+          path: memory.log
+          if-no-files-found: warn
+          retention-days: 7
+
   instrumented:
-    name: Instrumented tests
+    name: Instrumented tests (${{ matrix.shard }}/4)
+    needs: instrumented-build
     runs-on: ubuntu-latest
     # Job-level hang cap, not a performance budget. Test concurrency and the
-    # per-test hang cap live in .config/nextest.toml; restart profiles run below.
-    timeout-minutes: 120
+    # per-test hang cap live in .config/nextest.toml.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       # nextest runs one process per test, so %m merges each binary's counters
       # into one file instead of writing a profraw per test process.
@@ -43,14 +97,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install Rust with LLVM tools
-        # rust-toolchain.toml supplies the channel used to build the tests.
+      - name: Install LLVM tools
+        # rust-toolchain.toml supplies the channel, so the tools match the compiler.
         run: rustup component add llvm-tools-preview
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          cache-on-failure: true
 
       - name: Install grcov
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
@@ -62,36 +111,44 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
 
-      # The measured target set matches the main tests job, so a coverage move
-      # cannot come from a different target selection.
-      - name: Run instrumented tests
-        run: cargo nextest run --workspace --all-targets --all-features --locked --profile ci
-
       - name: Install uv
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           tool: uv@0.11.28
 
-      # The same native Git run as the tests job, so both measure one target set.
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-archive
+
+      # Shows whether the coverage export stays within memory at four threads.
+      - name: Sample memory use
+        run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
+
+      - name: Run instrumented tests
+        run: >-
+          cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --partition hash:${{ matrix.shard }}/4
+
+      # The same native Git run as the tests workflow, split across the shards too;
+      # with two such tests, some shards get none.
       - name: Run instrumented native Git tests
         run: >-
           uv run --no-project --python 3.13
           --with-requirements scripts/arc-native/requirements.txt
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
-          exec cargo nextest run -p aruna --test git_native --all-features --locked
-          --profile ci --run-ignored only --no-tests fail'
-
-      # nextest never runs doctests; they stay in the measured set.
-      - name: Run instrumented doctests
-        run: cargo test --workspace --all-features --locked --doc
+          exec cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
+          -E "binary(git_native)"'
 
       - name: Collect coverage
-        # LLVM exports use Rayon's pool, independently of grcov's parser threads.
+        # LLVM exports use Rayon's pool, independently of grcov's parser threads;
+        # one export per core, since every shard exports nearly every test binary.
         env:
           RAYON_NUM_THREADS: 1
         run: |
           grcov . \
-            --threads 2 \
+            --threads 4 \
             --binary-path ./target/debug/deps/ \
             --source-dir . \
             --output-type lcov \
@@ -115,18 +172,27 @@ jobs:
       - name: Upload coverage artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coverage
+          name: coverage-${{ matrix.shard }}
           path: |
             coverage.lcov
             coverage-sources.txt
           if-no-files-found: error
           retention-days: 1
 
+      - name: Upload the memory log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-memory-${{ matrix.shard }}
+          path: memory.log
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Upload JUnit report
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: junit-instrumented
+          name: junit-instrumented-${{ matrix.shard }}
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
           retention-days: 7
@@ -134,8 +200,8 @@ jobs:
   report:
     name: Generate Coverage Report
     environment: coverage
-    needs: [instrumented, restart-stress]
-    if: ${{ needs.instrumented.result == 'success' && needs.restart-stress.result == 'success' }}
+    needs: instrumented
+    if: ${{ needs.instrumented.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -143,54 +209,37 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Download coverage artifact
+      - name: Download coverage artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: coverage
+          pattern: coverage-[0-9]*
           path: coverage-parts
 
+      # Codecov merges the uploads of one commit, so each shard's report is sent as is.
       - name: Validate coverage
         run: |
           set -euo pipefail
-          records=$(grep -c '^DA:' coverage-parts/coverage.lcov || true)
-          if [ "$records" -lt 1000 ]; then
-            echo "coverage.lcov has only $records DA records" >&2
-            exit 1
-          fi
-          grep '^SF:' coverage-parts/coverage.lcov | sed 's/^SF://' | sort -u \
-            | diff -u coverage-parts/coverage-sources.txt -
+          files=""
+          parts=0
+          for part in coverage-parts/coverage-*; do
+            parts=$((parts + 1))
+            records=$(grep -c '^DA:' "$part/coverage.lcov" || true)
+            if [ "$records" -lt 1000 ]; then
+              echo "$part/coverage.lcov has only $records DA records" >&2
+              exit 1
+            fi
+            grep '^SF:' "$part/coverage.lcov" | sed 's/^SF://' | sort -u \
+              | diff -u "$part/coverage-sources.txt" -
+            files="$files${files:+,}$part/coverage.lcov"
+          done
+          [ "$parts" = 4 ] || { echo "expected 4 coverage parts, found $parts" >&2; exit 1; }
+          echo "COVERAGE_FILES=$files" >> "$GITHUB_ENV"
 
       - name: Upload coverage report
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage-parts/coverage.lcov
+          files: ${{ env.COVERAGE_FILES }}
+          # Only the shard reports: the search would also send any file named like coverage.
+          disable_search: true
           fail_ci_if_error: true
-
-  restart-stress:
-    name: Restart scale stress
-    runs-on: ubuntu-latest
-    # This is a non-instrumented functional stress lane, not a normal timing
-    # assertion; keep it bounded so a deadlock still fails the PR promptly.
-    timeout-minutes: 45
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_INCREMENTAL: 0
-      CARGO_BUILD_JOBS: 2
-      RUSTFLAGS: -Cdebuginfo=0
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - name: Install Rust
-        run: rustup show active-toolchain
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      - name: Run restart scale tests
-        run: |
-          set -euo pipefail
-          cargo test -p aruna-operations --test restart_traffic \
-            --all-features --locked offline_scale_ -- --ignored

@@ -245,11 +245,15 @@ pub(super) async fn change(
         .ok_or("revision missing")?;
     let mut document: Value = serde_json::from_str(&revision.jsonld)?;
     let graph = document["@graph"].as_array_mut().ok_or("graph missing")?;
-    let empty = |entity: &Value| {
-        entity["@id"]
-            .as_str()
-            .is_some_and(|id| id.contains("/empty.txt@"))
-    };
+    let empty_id = graph
+        .iter()
+        .find(|entity| {
+            entity["contentUrl"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("/empty.txt"))
+        })
+        .map(|entity| entity["@id"].clone());
+    let empty = |entity: &Value| empty_id.as_ref() == Some(&entity["@id"]);
     for entity in graph.iter_mut() {
         if entity["@type"] == "Dataset" {
             entity["description"] = json!(text);
@@ -905,24 +909,20 @@ async fn missing_file_fails() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("graph missing")?
         .iter()
         .find(|entity| {
-            entity["@id"]
+            entity["contentUrl"]
                 .as_str()
-                .is_some_and(|id| id.contains("/empty.txt@"))
+                .is_some_and(|url| url.ends_with("/empty.txt"))
         })
         .ok_or("file entity missing")?;
-    // Neither the key nor the content hashes resolve, so no candidate holds the bytes.
+    // Neither the key nor the content hash resolve, so no candidate holds the bytes.
     let content = entity["contentUrl"].as_str().ok_or("content url missing")?;
-    let hash = content.rsplit('/').next().ok_or("hash missing")?;
     let present = entity["@id"].as_str().ok_or("id missing")?;
-    let arn_hash = present.split(':').nth(4).ok_or("arn hash missing")?;
+    let hash = present.rsplit('/').next().ok_or("hash missing")?;
     let unknown = hex::encode([0x11; 32]);
-    let gone = present
-        .replace(arn_hash, &unknown)
-        .replace("/empty.txt@", "/gone.txt@");
     let jsonld = revision
         .jsonld
-        .replace(present, &gone)
-        .replace(hash, &unknown);
+        .replace(present, &present.replace(hash, &unknown))
+        .replace(content, &content.replace("/empty.txt", "/gone.txt"));
     let document: Value = serde_json::from_str(&jsonld)?;
     Box::pin(replace_crate(&fixture, &document)).await?;
 

@@ -744,11 +744,11 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
     // One lifecycle target carries every event: an older concurrent upsert still belongs in
     // the event log, but never moves the lifecycle revision back.
     let stale = lifecycle_stale_txn(storage, &target, change, txn_id).await?;
-    if stale && !matches!(record, MetadataLifecycleRecord::Upsert { .. }) {
+    if stale && record.upsert().is_none() {
         return Ok(None);
     }
     let mut acceptance_to_write = None;
-    if let MetadataLifecycleRecord::Upsert { event } = record {
+    if let Some(event) = record.upsert() {
         validate_metadata_event(event)?;
         if create_fence_txn(storage, event, txn_id).await? {
             return Ok(None);
@@ -777,7 +777,7 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
                 return Ok(None);
             }
             if accepted.is_none() {
-                acceptance_to_write = Some(event.as_ref());
+                acceptance_to_write = Some(event);
             }
         } else if accepted.as_ref().is_none_or(|accepted| {
             !event_is_create(accepted)
@@ -787,7 +787,7 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
         }
     }
 
-    if let MetadataLifecycleRecord::Upsert { event } = record
+    if let Some(event) = record.upsert()
         && stale
         && transaction_read(
             storage,
@@ -803,6 +803,15 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
     let mut entries = match record {
         MetadataLifecycleRecord::Upsert { event } => create_projection_entries(event)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        MetadataLifecycleRecord::UpsertWithMessage { event, message } => {
+            let mut entries = create_projection_entries(event)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            entries.push(
+                aruna_core::storage_entries::commit_message_entry(event, message)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            );
+            entries
+        }
         MetadataLifecycleRecord::Delete { event } => document_delete_entries(event)?,
     };
     if let Some(event) = acceptance_to_write {
@@ -981,7 +990,8 @@ pub(in crate::document_sync) async fn delete_record_txn(
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
     match record {
         MetadataLifecycleRecord::Delete { event } => Ok(Some(event)),
-        MetadataLifecycleRecord::Upsert { .. } => Ok(None),
+        MetadataLifecycleRecord::Upsert { .. }
+        | MetadataLifecycleRecord::UpsertWithMessage { .. } => Ok(None),
     }
 }
 

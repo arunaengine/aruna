@@ -3,10 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{Rewrites, decode_error, rewritten};
+use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-use aruna_core::structs::{LegacyMapping, PersistentIdMapping, secondary_index_entries};
+use aruna_core::structs::{PersistentIdMapping, secondary_index_entries};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use std::collections::BTreeMap;
 
@@ -16,11 +16,15 @@ pub(super) struct IndexRebuild {
     pub(super) removes: Vec<Vec<u8>>,
 }
 
-/// Queued publishes carry the mapping bytes, so a legacy mapping inside one is re-encoded.
+type Rewrite = fn(&[u8]) -> Result<Option<Vec<u8>>, postcard::Error>;
+
+/// Queued publishes carry the row bytes, so a legacy row of a `kind` target inside one is
+/// re-encoded with `rewrite`.
 pub(super) fn outbox_rows(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
     name: &str,
+    (kind, rewrite): (fn(&DocumentTarget) -> bool, Rewrite),
 ) -> Result<Rewrites, ExplorerError> {
     let mut scanned = 0;
     let mut rows = Vec::new();
@@ -32,10 +36,10 @@ pub(super) fn outbox_rows(
         let DocumentOutboxEvent::Upsert { bytes, .. } = &mut record.event else {
             continue;
         };
-        if !matches!(record.target, DocumentTarget::PersistentIdMapping { .. }) {
+        if !kind(&record.target) {
             continue;
         }
-        match rewritten::<PersistentIdMapping, LegacyMapping>(bytes) {
+        match rewrite(bytes) {
             Ok(Some(mapping)) => *bytes = mapping,
             Ok(None) => continue,
             Err(error) => return Err(decode_error(name, &key, error)),

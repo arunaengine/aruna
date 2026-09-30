@@ -5,6 +5,7 @@
 use crate::keyspaces::GIT_RECORD_KEYSPACE;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
+use crate::structs::storage::dataset_location::DatasetLocation;
 use crate::types::{GroupId, Key, KeySpace, Value};
 use crate::{NodeId, UserId};
 use bytes::Bytes;
@@ -20,6 +21,8 @@ pub const PENDING: &str = "git_pending_merges";
 pub const MAX_GIT_BYTES: usize = 64 * 1024 * 1024;
 /// Upper bound for one replicated Git record.
 pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound for one pack; larger files belong in Git LFS.
+pub const MAX_PACK_BYTES: usize = MAX_RECORD_BYTES;
 /// Records not covered by a checkpoint; holders write a checkpoint well before this.
 pub const MAX_RECORDS: usize = 1024;
 pub const CHECKPOINT_AFTER: usize = 256;
@@ -30,7 +33,6 @@ pub struct GitRepository {
     pub document_id: Ulid,
     pub group_id: Ulid,
     pub bucket: String,
-    pub arc: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +48,31 @@ impl LfsObject {
                 .oid
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    /// The object a Git LFS pointer file names, if `bytes` is one.
+    pub fn from_pointer(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > 1024 {
+            return None;
+        }
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut lines = text.lines();
+        if lines.next()? != "version https://git-lfs.github.com/spec/v1" {
+            return None;
+        }
+        let (mut oid, mut size) = (None, None);
+        for line in lines {
+            if let Some(value) = line.strip_prefix("oid sha256:") {
+                oid = Some(value.to_owned());
+            } else if let Some(value) = line.strip_prefix("size ") {
+                size = value.parse().ok();
+            }
+        }
+        let object = Self {
+            oid: oid?,
+            size: size?,
+        };
+        object.valid().then_some(object)
     }
 }
 
@@ -73,12 +100,16 @@ pub struct GitSnapshot {
     pub jsonld: String,
     /// Aruna objects that File entities name, placed in the ARC as LFS pointers.
     pub objects: Vec<LinkedObject>,
+    /// The author's commit message; `None` keeps the default one.
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LinkedObject {
     pub entity: String,
     pub object: StoredObject,
+    /// The repository path of a plain RO-Crate copy; `None` keeps a relative entity's own.
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -106,22 +137,28 @@ pub struct DocumentLocks(
 
 impl DocumentLocks {
     pub async fn lock(&self, document_id: Ulid) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(&document_id).and_then(std::sync::Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(document_id, std::sync::Arc::downgrade(&lock));
-                    lock
-                }
+        self.mutex(document_id).lock_owned().await
+    }
+
+    /// The lock when no one holds it, without waiting.
+    pub fn try_lock(&self, document_id: Ulid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.mutex(document_id).try_lock_owned().ok()
+    }
+
+    fn mutex(&self, document_id: Ulid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&document_id).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(document_id, std::sync::Arc::downgrade(&lock));
+                lock
             }
-        };
-        lock.lock_owned().await
+        }
     }
 }
 
@@ -214,6 +251,16 @@ pub enum GitEffect {
         first: String,
         second: String,
     },
+    /// The commit each revision names, in order; `None` for one that names no commit.
+    Peel {
+        document_id: Ulid,
+        revisions: Vec<String>,
+    },
+    /// The commits the revisions name, without their history; one entry per distinct commit.
+    Commits {
+        document_id: Ulid,
+        revisions: Vec<String>,
+    },
     /// Up to `limit` commits reachable from `revision` but not from `exclude`, newest first,
     /// after skipping `skip`.
     Log {
@@ -243,13 +290,26 @@ pub enum GitEffect {
         message: String,
     },
     /// Applies the metadata changed from `old` (or nothing) to `new` onto `graph` JSON-LD.
+    /// Paths also match entities stored under `location`.
     MergeMetadata {
         document_id: Ulid,
         old: Option<String>,
         new: String,
         graph: String,
+        location: Option<DatasetLocation>,
+    },
+    /// The raw content of one file of a commit, `None` when the commit has no such file.
+    ReadFile {
+        document_id: Ulid,
+        revision: String,
+        path: String,
     },
     Http(Box<GitRequest>),
+    /// The layout of the commit a revision names, if any.
+    Layout {
+        document_id: Ulid,
+        revision: String,
+    },
 }
 
 pub enum GitEvent {
@@ -267,6 +327,7 @@ pub enum GitEvent {
     GenerateFailed(String),
     Exported(Bytes),
     Resolved(Option<String>),
+    Peeled(Vec<Option<String>>),
     Log(Vec<CommitInfo>),
     Diff(Vec<FileChange>),
     /// The new commit, the unchanged head, or why the metadata cannot become an ARC.
@@ -279,6 +340,8 @@ pub enum GitEvent {
         headers: Vec<(String, String)>,
         body: Bytes,
     },
+    Layout(Option<crate::repo_layout::Layout>),
+    File(Option<Bytes>),
 }
 
 /// One replicated Git fact of a metadata document. Every holder rebuilds its local
@@ -302,7 +365,7 @@ pub enum GitChange {
     /// metadata event it represents in `revision` and the graph it captured in `digest`; a
     /// snapshot whose updates no longer match is dropped, since the server makes a new one.
     Objects {
-        pack: Option<Box<StoredObject>>,
+        pack: Option<GitPack>,
         refs: Vec<RefUpdate>,
         lfs: Vec<StoredObject>,
         revision: Option<Ulid>,
@@ -321,6 +384,9 @@ pub enum GitChange {
     /// The state after the records it and its previous checkpoints cover. Records the
     /// chain does not list still apply on top in order, so a late record is never lost.
     Checkpoint(Box<GitCheckpoint>),
+    /// The dataset's chosen storage location; the newest record wins. Checkpoints never
+    /// cover the newest one, so it stays applied.
+    Location(DatasetLocation),
 }
 
 /// Refs, locks and revision are complete; packs, LFS objects and covered records are those
@@ -328,7 +394,7 @@ pub enum GitChange {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCheckpoint {
     pub previous: Option<Ulid>,
-    pub packs: Vec<StoredObject>,
+    pub packs: Vec<GitPack>,
     /// Commits nodes made themselves since `previous`.
     pub made: Vec<String>,
     /// The graph digest of the newest applied snapshot.
@@ -436,6 +502,24 @@ impl StoredObject {
     }
 }
 
+/// A pack a record names; its bytes are the [`GitPackRecord`] stored under its SHA-256.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPack {
+    pub sha256: String,
+    pub size: u64,
+}
+
+impl GitPack {
+    fn valid(&self) -> bool {
+        hex(&self.sha256, 64) && usize::try_from(self.size).is_ok_and(|size| size <= MAX_PACK_BYTES)
+    }
+
+    /// The raw digest that keys the pack's bytes.
+    pub fn digest(&self) -> Option<[u8; 32]> {
+        hex::decode(&self.sha256).ok()?.try_into().ok()
+    }
+}
+
 impl GitRecord {
     /// Checks shape and bounds; authorship and document state are checked by the writer and receiver.
     pub fn validate(&self) -> bool {
@@ -460,14 +544,14 @@ impl GitRecord {
                                 && hex(&update.new, 40)
                                 && update.old != update.new
                         })
-                        && pack.as_deref().is_none_or(StoredObject::valid)
+                        && pack.as_ref().is_none_or(GitPack::valid)
                         && lfs.iter().all(StoredObject::valid)
                         && made.iter().all(|commit| hex(commit, 40))
                 }
                 GitChange::Lock { path, .. } => valid_path(path),
                 GitChange::Unlock { .. } => true,
                 GitChange::Checkpoint(checkpoint) => {
-                    checkpoint.packs.iter().all(StoredObject::valid)
+                    checkpoint.packs.iter().all(GitPack::valid)
                         && checkpoint
                             .previous
                             .is_none_or(|previous| previous < self.event_id)
@@ -479,8 +563,27 @@ impl GitRecord {
                         && checkpoint.lfs.iter().all(StoredObject::valid)
                         && checkpoint.locks.iter().all(|lock| valid_path(&lock.path))
                 }
+                GitChange::Location(location) => location.valid(),
             }
     }
+}
+
+/// Documents share these counters, which only costs an extra refresh.
+static RECORD_WRITES: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+fn write_counter(document_id: Ulid) -> &'static std::sync::atomic::AtomicU64 {
+    &RECORD_WRITES[(u128::from(document_id) % 1024) as usize]
+}
+
+/// Changes whenever this process stores a Git record of the document, local or replicated.
+pub fn record_writes(document_id: Ulid) -> u64 {
+    write_counter(document_id).load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Called after a Git record of the document is durably stored.
+pub fn record_written(document_id: Ulid) {
+    write_counter(document_id).fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 pub fn git_record_prefix(document_id: Ulid) -> Key {
@@ -502,6 +605,56 @@ pub fn git_record_entry(record: &GitRecord) -> Result<(KeySpace, Key, Value), po
     ))
 }
 
+pub fn git_pack_key(document_id: Ulid, sha256: &[u8; 32]) -> Key {
+    ByteView::from([document_id.to_bytes().as_slice(), sha256].concat())
+}
+
+/// The bytes of one pack, replicated with the fields of the record that first named it, so
+/// every node that stores the same pack writes identical rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPackRecord {
+    pub document_id: Ulid,
+    pub event_id: Ulid,
+    pub node_id: NodeId,
+    pub occurred_at_ms: u64,
+    pub placement: PlacementRef,
+    pub bytes: Bytes,
+}
+
+impl GitPackRecord {
+    pub fn sha256(&self) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(&self.bytes).into()
+    }
+
+    /// Whether the bytes fit the pack limit and hash to `sha256`.
+    pub fn valid(&self, sha256: &[u8; 32]) -> bool {
+        self.bytes.len() <= MAX_PACK_BYTES && self.sha256() == *sha256
+    }
+
+    pub fn target(&self) -> crate::document::DocumentTarget {
+        crate::document::DocumentTarget::GitPack {
+            document_id: self.document_id,
+            sha256: self.sha256(),
+        }
+    }
+
+    /// Like a record, a pack is only ever inserted, never replaced.
+    pub fn change(&self) -> crate::document::DocumentChange {
+        crate::document::DocumentChange {
+            base: None,
+            current: crate::document::DocumentSyncRevision {
+                generation: self.occurred_at_ms,
+                event_id: self.event_id,
+                actor: self.node_id,
+                updated_at_ms: self.occurred_at_ms,
+            },
+            kind: crate::document::DocumentChangeKind::Upsert,
+            placement: self.placement,
+        }
+    }
+}
+
 /// The sync revision of an immutable record: it is only ever inserted, never replaced.
 pub fn record_change(record: &GitRecord) -> crate::document::DocumentChange {
     crate::document::DocumentChange {
@@ -520,6 +673,23 @@ pub fn record_change(record: &GitRecord) -> crate::document::DocumentChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reads_skip_busy() {
+        let locks = DocumentLocks::default();
+        let id = Ulid::from(1);
+        let held = locks.lock(id).await;
+        assert!(
+            locks.try_lock(id).is_none(),
+            "a held lock is not handed out"
+        );
+        assert!(
+            locks.try_lock(Ulid::from(2)).is_some(),
+            "other documents stay free"
+        );
+        drop(held);
+        assert!(locks.try_lock(id).is_some());
+    }
     use crate::document::DocumentTarget;
 
     fn record(change: GitChange) -> GitRecord {
@@ -625,6 +795,34 @@ mod tests {
             lfs.extend(std::iter::repeat_n(object, 5000));
         }
         assert!(!large.validate());
+    }
+
+    #[test]
+    fn reads_pointers() {
+        let oid = "a".repeat(64);
+        let pointer =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 12\n");
+        let object = LfsObject::from_pointer(pointer.as_bytes()).expect("pointer");
+        assert_eq!((object.oid, object.size), (oid, 12));
+        assert!(LfsObject::from_pointer(b"plain,csv\n1,2\n").is_none());
+        let short = "version https://git-lfs.github.com/spec/v1\noid sha256:ab\nsize 1\n";
+        assert!(LfsObject::from_pointer(short.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn change_tags() {
+        // Postcard encodes the variant index first; replicated records depend on it.
+        let tag = |change: GitChange| postcard::to_allocvec(&change).unwrap()[0];
+        let unlock = GitChange::Unlock { id: Ulid::from(1) };
+        let location = DatasetLocation::new("lab-data", "runs").unwrap();
+        assert_eq!(tag(unlock), 2);
+        assert_eq!(tag(GitChange::Location(location.clone())), 4);
+        assert!(record(GitChange::Location(location)).validate());
+        let raw = DatasetLocation {
+            bucket: "lab-data".into(),
+            prefix: "../x".into(),
+        };
+        assert!(!record(GitChange::Location(raw)).validate());
     }
 
     #[test]

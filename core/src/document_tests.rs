@@ -635,3 +635,42 @@ fn metadata_document_delete() {
         delete_target.sync_topic_id(realm_id, &placement)
     );
 }
+
+#[test]
+fn stored_target_tags() {
+    // Postcard encodes the variant index first; stored rows and sync ops depend on it.
+    let tag = |target: &DocumentTarget| postcard::to_allocvec(target).unwrap()[0];
+    let document_id = test_ulid(1);
+
+    assert_eq!(
+        tag(&DocumentTarget::MetadataDocumentLifecycle { document_id }),
+        7
+    );
+    assert_eq!(
+        tag(&DocumentTarget::PlacementPolicy {
+            policy_id: document_id
+        }),
+        14
+    );
+    assert_eq!(
+        tag(&DocumentTarget::RepositoryLink {
+            document_id,
+            link_id: document_id
+        }),
+        15
+    );
+    assert_eq!(
+        tag(&DocumentTarget::GitRecord {
+            document_id,
+            event_id: document_id
+        }),
+        16
+    );
+    assert_eq!(
+        tag(&DocumentTarget::GitPack {
+            document_id,
+            sha256: [0; 32]
+        }),
+        17
+    );
+}

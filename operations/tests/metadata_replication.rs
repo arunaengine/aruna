@@ -814,7 +814,8 @@ async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
 {{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"{name}","description":"Long history","datePublished":"2026-02-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}}}}]}}"#
         );
         // A burst can outrun materialization; the window opens again once it catches up.
-        for _ in 0..1200 {
+        // Short polls follow the catch-up closely; the attempts still allow five minutes.
+        for _ in 0..15_000 {
             let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
                 actor: actor(node),
                 group_id,
@@ -833,7 +834,7 @@ async fn history_passes_cap() -> Result<(), Box<dyn std::error::Error>> {
                     | UpdateDocumentError::StorageError(
                         aruna_core::errors::StorageError::TransactionConflict,
                     ),
-                ) => sleep(Duration::from_millis(250)).await,
+                ) => sleep(Duration::from_millis(20)).await,
                 Err(error) => return Err(error.into()),
             }
         }

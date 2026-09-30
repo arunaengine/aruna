@@ -98,7 +98,7 @@ pub struct ComparisonView {
     /// `null` when compared against an empty ARC.
     pub from: Option<String>,
     pub to: String,
-    /// `null` when either side has no readable ISA metadata.
+    /// `null` when either side has no readable metadata.
     pub entities: Option<Vec<EntityChangeView>>,
     pub files: Vec<FileChangeView>,
 }
@@ -447,7 +447,7 @@ pub async fn rocrate(
 
 #[utoipa::path(get, path = "/metadata/{document_id}/compare", tag = "metadata/versions",
     security(("bearer_auth" = [])), summary = "Compare two dataset versions",
-    description = "Lists the metadata entities and files that differ between two versions.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: entities are compared in the ISA-derived RO-Crate of each version; property values compare as sets.",
+    description = "Lists the metadata entities and files that differ between two versions.\n\n**Authentication**: realm bearer token with READ on the metadata document.\n\n**Behavior**: entities are compared in the full metadata graph of each version: `aruna-metadata.json` when the version has it, as ARC snapshots do, otherwise its RO-Crate. Stored data entities are named by their repository path on both sides, so storing a file alone is no entity change. Property values compare as sets.",
     params(("document_id" = String, Path, description = "Metadata document ID"), CompareQuery),
     responses((status = 200, description = "Differences", body = ComparisonView),
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),

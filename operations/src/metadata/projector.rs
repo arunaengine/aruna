@@ -15,7 +15,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
+    COMMIT_MESSAGE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventPayload,
@@ -545,8 +546,9 @@ pub async fn project_create_events(
         let outbox = if authored_here && has_live_holders {
             // The local node authored this create event, so it originates the
             // document's lifecycle sync topic and may mint its genesis.
+            let message = author_message(context, document_id, event.event_id).await?;
             Some(
-                create_outbox_record(&event, realm_config, true)
+                create_outbox_record(&event, message.as_deref(), realm_config, true)
                     .fenced_at(fence.generation(&realm_id, &event.record.placement)),
             )
         } else {
@@ -689,6 +691,32 @@ async fn pending_projection_marker(
         .await;
     match event {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+/// The commit message the author of this event gave, if any.
+async fn author_message(
+    context: &DriverContext,
+    document_id: Ulid,
+    event_id: Ulid,
+) -> Result<Option<String>, MetadataProjectionError> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: COMMIT_MESSAGE_KEYSPACE.to_string(),
+            key: event_log_key(document_id, event_id),
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
+            .map(|value| postcard::from_bytes(&value))
+            .transpose()
+            .map_err(ConversionError::from)?),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(MetadataProjectionError::UnexpectedEvent(format!(
             "{other:?}"
@@ -1028,12 +1056,11 @@ pub fn registry_outbox_record(
 
 pub fn create_outbox_record(
     event: &MetadataEventRecord,
+    message: Option<&str>,
     realm_config: Option<&RealmConfigDocument>,
     allow_genesis: bool,
 ) -> DocumentOutboxRecord {
-    let lifecycle = MetadataLifecycleRecord::Upsert {
-        event: Box::new(event.clone()),
-    };
+    let lifecycle = MetadataLifecycleRecord::for_event(event.clone(), message.map(str::to_owned));
     let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
@@ -1947,7 +1974,7 @@ mod tests {
     #[test]
     fn outbox_uses_lifecycle() {
         let event = create_event();
-        let outbox = create_outbox_record(&event, None, true);
+        let outbox = create_outbox_record(&event, None, None, true);
 
         assert!(outbox.allow_genesis);
         assert_eq!(outbox.outbox_id, event.event_id);
@@ -1994,7 +2021,7 @@ mod tests {
 
         let placement_of = |event: &MetadataEventRecord| {
             let DocumentOutboxEvent::Upsert { change, .. } =
-                create_outbox_record(event, Some(&config), true).event
+                create_outbox_record(event, None, Some(&config), true).event
             else {
                 panic!("expected upsert outbox event");
             };

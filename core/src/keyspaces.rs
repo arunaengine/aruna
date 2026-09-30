@@ -23,13 +23,19 @@ pub const VISIBILITY_INDEX_KEYSPACE: &str = "metadata_visibility_index";
 pub const VISIBILITY_STATE_KEYSPACE: &str = "metadata_visibility_state";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const EVENT_LOG_KEYSPACE: &str = "metadata_event_log";
+/// The origin and encoded size of each logged event, keyed like the event log.
+pub const EVENT_SIZE_KEYSPACE: &str = "metadata_event_sizes";
 /// One row per metadata checkpoint, keyed by document and event; the last row starts
 /// the document's current history window.
 pub const METADATA_CHECKPOINT_KEYSPACE: &str = "metadata_checkpoints";
+/// Commit messages authors gave for metadata events, keyed by document and event.
+pub const COMMIT_MESSAGE_KEYSPACE: &str = "metadata_commit_messages";
 /// This node's reused CRDT actor per metadata document.
 pub const METADATA_ACTOR_KEYSPACE: &str = "metadata_actors";
 /// Replicated Git records of metadata documents, keyed by document and record id.
 pub const GIT_RECORD_KEYSPACE: &str = "git_records";
+/// Git pack bytes by document and SHA-256; packs stay small because large files use LFS.
+pub const GIT_PACK_KEYSPACE: &str = "git_packs";
 pub const CREATE_ACCEPTANCE_KEYSPACE: &str = "metadata_create_acceptance";
 pub const PENDING_PROJECTION_KEYSPACE: &str = "metadata_pending_projection";
 pub const DOCUMENT_LIFECYCLE_KEYSPACE: &str = "metadata_document_lifecycle";
@@ -286,9 +292,12 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     VISIBILITY_STATE_KEYSPACE,
     METADATA_AUDIT_KEYSPACE,
     EVENT_LOG_KEYSPACE,
+    EVENT_SIZE_KEYSPACE,
     METADATA_ACTOR_KEYSPACE,
     METADATA_CHECKPOINT_KEYSPACE,
+    COMMIT_MESSAGE_KEYSPACE,
     GIT_RECORD_KEYSPACE,
+    GIT_PACK_KEYSPACE,
     CREATE_ACCEPTANCE_KEYSPACE,
     PENDING_PROJECTION_KEYSPACE,
     DOCUMENT_LIFECYCLE_KEYSPACE,

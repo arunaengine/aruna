@@ -15,7 +15,7 @@ pub use upload::{
     write_rocrate_upload,
 };
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -38,8 +38,9 @@ use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdenti
 use aruna_core::structs::storage::blob::{
     BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::data_identity::{ObjectLocation, normalized_id};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::{StreamExt, stream};
@@ -264,7 +265,7 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
                 )),
             },
             ImportPhase::Create if updates_link(spec) => match plan.as_ref() {
-                Some(plan) => Box::pin(update_document(ctx, spec, &mut checkpoint, plan)).await,
+                Some(_) => Box::pin(update_document(ctx, spec, &mut checkpoint)).await,
                 None => Err(ImportFailure::Permanent(
                     "import plan is missing".to_string(),
                 )),
@@ -817,11 +818,13 @@ fn preflight_crate(
         let Some(file_id) = entry.described_id.clone() else {
             continue;
         };
+        entry_arn(spec, node_id, entry)?;
+        let location = entry_location(spec, entry);
         targets.insert(
             file_id,
             RewriteTarget {
-                w3id: entry_arn(spec, node_id, entry)?.to_w3id(),
-                hash_w3id: format!("{ARUNA_DATA_PREFIX}{}", hex::encode([0u8; 32])),
+                id: location.to_url(),
+                content_url: location.to_url(),
                 local_path: entry.path.clone(),
             },
         );
@@ -829,6 +832,13 @@ fn preflight_crate(
     rewrite_document(value, &targets)
         .map(|_| ())
         .map_err(validation_failure)
+}
+
+fn entry_location(spec: &ImportRoCrateSpec, entry: &ImportEntryPlan) -> ObjectLocation {
+    ObjectLocation {
+        bucket: spec.target.bucket.clone(),
+        key: entry.target_key.clone(),
+    }
 }
 
 fn entry_arn(
@@ -1052,6 +1062,7 @@ async fn rewrite_crate(
         .await
         .map_err(transfer_failure)?;
     let mut targets = HashMap::new();
+    let mut used = BTreeSet::new();
     for entry in &plan.entries {
         let Some(file_id) = &entry.described_id else {
             continue;
@@ -1059,31 +1070,32 @@ async fn rewrite_crate(
         let report = reports
             .get(&entry.path)
             .ok_or_else(|| ImportFailure::Permanent("import report row is missing".to_string()))?;
-        let w3id = entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id();
-        let hash_w3id =
-            if reference.is_some_and(|kind| super::repository::is_reference(kind, &entry.path)) {
-                w3id.clone()
-            } else {
-                let hash: [u8; 32] = report
-                    .detail
-                    .blake3
-                    .as_deref()
-                    .ok_or_else(|| ImportFailure::Permanent("imported hash is missing".to_string()))
-                    .and_then(|hash| {
-                        hex::decode(hash)
-                            .ok()
-                            .and_then(|hash| hash.try_into().ok())
-                            .ok_or_else(|| {
-                                ImportFailure::Permanent("imported hash is invalid".to_string())
-                            })
-                    })?;
-                format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash))
-            };
+        let location = entry_location(spec, entry);
+        // A reference has no content address yet, so its exact version names it.
+        let id = if reference.is_some_and(|kind| super::repository::is_reference(kind, &entry.path))
+        {
+            entry_arn(spec, ctx.owner_node_id, entry)?.to_w3id()
+        } else {
+            let hash: [u8; 32] = report
+                .detail
+                .blake3
+                .as_deref()
+                .ok_or_else(|| ImportFailure::Permanent("imported hash is missing".to_string()))
+                .and_then(|hash| {
+                    hex::decode(hash)
+                        .ok()
+                        .and_then(|hash| hash.try_into().ok())
+                        .ok_or_else(|| {
+                            ImportFailure::Permanent("imported hash is invalid".to_string())
+                        })
+                })?;
+            normalized_id(hash, &location, &mut used)
+        };
         targets.insert(
             file_id.clone(),
             RewriteTarget {
-                w3id,
-                hash_w3id,
+                id,
+                content_url: location.to_url(),
                 local_path: entry.path.clone(),
             },
         );
@@ -1177,12 +1189,11 @@ fn updates_link(spec: &ImportRoCrateSpec) -> bool {
 }
 
 /// Replaces the linked dataset's crate with the merged one through the normal update, unless the
-/// dataset changed since the pull read it. A retry finds its own update by the minted versions.
+/// dataset changed since the pull read it. A retry finds its own update by the crate it wrote.
 async fn update_document(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
     checkpoint: &mut ImportCheckpoint,
-    plan: &ImportPlan,
 ) -> Result<(), ImportFailure> {
     // Pausing or deleting the link while the files were imported cancels the update.
     if let ImportRoCrateSource::Repository {
@@ -1232,6 +1243,7 @@ async fn update_document(
             UpdateDocumentMutation::ReplaceRoCrate { jsonld },
             Some(base),
             Some(AuthToken::internal(spec.auth_context.clone())),
+            None,
         ))
         .await
         {
@@ -1245,13 +1257,13 @@ async fn update_document(
             Err(error) => return Err(classify_metadata(error)),
         }
     } else {
-        let own = plan
-            .entries
-            .iter()
-            .find(|entry| entry.described_id.is_some())
-            .map(|entry| entry_arn(spec, ctx.owner_node_id, entry).map(|arn| arn.to_w3id()))
-            .transpose()?;
-        if !own.is_some_and(|w3id| current.contains(&w3id)) {
+        // The update landed when the dataset holds exactly the crate this pull wrote.
+        let digest = |jsonld: &str| {
+            craqle::canonicalize_jsonld(jsonld)
+                .ok()
+                .map(|value| value.digest)
+        };
+        if digest(&current).is_none() || digest(&current) != digest(&jsonld) {
             return Err(ImportFailure::Permanent(
                 "the dataset changed while the pull ran; pull again".to_string(),
             ));

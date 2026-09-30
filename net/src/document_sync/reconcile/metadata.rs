@@ -220,8 +220,10 @@ async fn apply_lifecycle_event(
             lifecycle.document_id()
         ))));
     }
+    let message = lifecycle.message().map(str::to_owned);
     match lifecycle {
-        MetadataLifecycleRecord::Upsert { event: record } => {
+        MetadataLifecycleRecord::Upsert { event: record }
+        | MetadataLifecycleRecord::UpsertWithMessage { event: record, .. } => {
             let record = *record;
             let inner_bytes = postcard::to_allocvec(&record)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -237,6 +239,7 @@ async fn apply_lifecycle_event(
                 lifecycle_revision: Some(change),
                 record,
                 bytes: inner_bytes,
+                message,
             })))
         }
         MetadataLifecycleRecord::Delete { event } => {

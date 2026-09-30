@@ -8,11 +8,12 @@ use super::{
     request_auth, server_error, tool_extras,
 };
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
+use aruna_core::structs::storage::data_identity::content_id;
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::complete_put;
@@ -87,6 +88,9 @@ pub struct ObjectOutput {
     pub last_modified: Option<String>,
     pub content_type: Option<String>,
     pub referenced: bool,
+    /// Content address `https://w3id.org/aruna/data/<blake3>` to use as a File entity `@id`.
+    /// Absent for a reference whose bytes were never read.
+    pub content_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -352,7 +356,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "List objects in one bucket, each with key, size, etag, last_modified, content_type, and whether it is a reference. Call list_buckets first for a valid bucket name. Narrow the answer with a key prefix, and follow next_cursor for the next page. Use read_object to fetch the text of one key.",
+        description = "List objects in one bucket, each with key, size, etag, last_modified, content_type, content_id, and whether it is a reference. Use content_id as the File entity @id and s3://bucket/key as its contentUrl. Call list_buckets first for a valid bucket name. Narrow the answer with a key prefix, and follow next_cursor for the next page. Use read_object to fetch the text of one key.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -417,6 +421,12 @@ impl McpServer {
                     .source_metadata
                     .as_ref()
                     .and_then(|metadata| metadata.content_type.clone());
+                let content_id = object
+                    .location
+                    .as_ref()
+                    .and_then(|location| location.hashes.get(HASH_BLAKE3))
+                    .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
+                    .map(content_id);
                 let last_modified = entry_time(&object)
                     .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
                 ObjectOutput {
@@ -426,6 +436,7 @@ impl McpServer {
                     last_modified,
                     content_type,
                     referenced: object.referenced,
+                    content_id,
                 }
             })
             .collect();

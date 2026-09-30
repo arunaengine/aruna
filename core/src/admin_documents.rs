@@ -353,6 +353,10 @@ pub enum AdminDocumentOperation {
     GroupDeleted {
         certificate: Box<crate::structs::identity::group_delete::GroupDeleteCertificate>,
     },
+    /// Sets or clears where new datasets of the group store their files.
+    GroupLocationSet {
+        location: Option<crate::structs::storage::dataset_location::DatasetLocation>,
+    },
 }
 
 #[cfg(test)]

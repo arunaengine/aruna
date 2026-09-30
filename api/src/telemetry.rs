@@ -19,7 +19,7 @@ use tracing::{Instrument, Span, error, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
 
-const REQUEST_THRESHOLD_MS: u64 = 500;
+const REQUEST_THRESHOLD_MS: u64 = 300;
 const REQUEST_THRESHOLD_ENV: &str = "ARUNA_SLOW_REQUEST_THRESHOLD_MS";
 
 // Unbiased per-route request latency histograms flushed as `latency.summary`.
@@ -279,12 +279,12 @@ mod tests {
 
     #[test]
     fn slow_threshold_defaults() {
-        assert_eq!(parse_slow_threshold(None), Duration::from_millis(500));
+        assert_eq!(parse_slow_threshold(None), Duration::from_millis(300));
         assert_eq!(
             parse_slow_threshold(Some("garbage")),
-            Duration::from_millis(500)
+            Duration::from_millis(300)
         );
-        assert_eq!(parse_slow_threshold(Some("")), Duration::from_millis(500));
+        assert_eq!(parse_slow_threshold(Some("")), Duration::from_millis(300));
     }
 
     #[test]

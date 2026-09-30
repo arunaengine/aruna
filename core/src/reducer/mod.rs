@@ -70,6 +70,8 @@ pub enum AdminDocumentError {
     InvalidJoinRequest,
     #[error("group deletion certificate is invalid")]
     InvalidGroupDeletion,
+    #[error("group dataset location is invalid")]
+    InvalidLocation,
     #[error(transparent)]
     InvalidUserAttribute(#[from] UserAttributeError),
     #[error("placement labels must not set the derived label `{0}`")]

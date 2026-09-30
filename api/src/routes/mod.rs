@@ -147,6 +147,8 @@ pub(crate) mod tests {
     /// A route added or removed without this fixture changing is a regression.
     const RUNTIME_ROUTES: &[(&str, &str)] = &[
         ("GET", "/metadata/{document_id}/git"),
+        ("GET", "/metadata/{document_id}/storage-location"),
+        ("PUT", "/metadata/{document_id}/storage-location"),
         ("POST", "/metadata/{document_id}/git/push"),
         ("GET", "/metadata/{document_id}/git/rocrate"),
         ("GET", "/git/{repository}/info/refs"),
@@ -466,6 +468,7 @@ pub(crate) mod tests {
         ("POST", "/access/s3/sessions"),
         ("POST", "/access/s3/sessions/{access_key_id}/refresh"),
         ("POST", "/access/tokens/revoke"),
+        ("PUT", "/access/groups/{id}/storage-location"),
         ("PUT", "/access/users/me/assistant/chats/{id}"),
         ("PUT", "/access/users/me/assistant/chats/{id}/turns/{seq}"),
         ("PUT", "/access/users/me/vault"),

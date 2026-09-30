@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, METADATA_ACTOR_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, METADATA_ACTOR_KEYSPACE,
     METADATA_CHECKPOINT_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
@@ -15,9 +15,9 @@ use aruna_core::metadata::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
-    create_acceptance_key, document_lifecycle_entry, event_log_key, event_log_prefix,
-    metadata_actor_entry, metadata_actor_key, profile_validation_entry, raw_budget_entry,
-    raw_budget_key, sync_revision_entry,
+    commit_message_entry, create_acceptance_key, document_lifecycle_entry, event_log_key,
+    event_log_prefix, metadata_actor_entry, metadata_actor_key, profile_validation_entry,
+    raw_budget_entry, raw_budget_key, sync_revision_entry,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -104,6 +104,8 @@ pub struct UpdateDocumentOperation {
     accepted_create: Option<MetadataEventRecord>,
     /// The latest checkpoint; raw budgets count events from it on.
     window: Option<Ulid>,
+    /// That checkpoint's event, which sets the window's quota.
+    opening: Option<MetadataEventRecord>,
     /// This node's quota in the current history window.
     quota: Option<RawOriginBudget>,
     realm_config: Option<RealmConfigDocument>,
@@ -113,6 +115,8 @@ pub struct UpdateDocumentOperation {
     route_profile_status: Option<ProfileValidationStatus>,
     /// The graph version the caller based its change on; any other refuses the update.
     expected_graph: Option<String>,
+    /// The author's commit message for the ARC snapshot of this update.
+    message: Option<String>,
     /// Phase-time and identity sampling; production keeps the defaults.
     phase_source: crate::metadata::MetadataPhaseSource,
     state: UpdateDocumentState,
@@ -209,11 +213,13 @@ impl UpdateDocumentOperation {
             next_raw_budget: None,
             accepted_create: None,
             window: None,
+            opening: None,
             quota: None,
             realm_config: None,
             fenced: Vec::new(),
             route_profile_status,
             expected_graph: None,
+            message: None,
             phase_source,
             state: UpdateDocumentState::Init,
             output: None,
@@ -224,6 +230,12 @@ impl UpdateDocumentOperation {
     /// computed from an older graph never removes values that arrived since.
     pub fn with_expected_graph(mut self, version: String) -> Self {
         self.expected_graph = Some(version);
+        self
+    }
+
+    /// Records `message` as the commit message of this update's ARC snapshot.
+    pub fn with_message(mut self, message: Option<String>) -> Self {
+        self.message = message;
         self
     }
 
@@ -391,8 +403,10 @@ impl UpdateDocumentOperation {
         let audit = self.audit_record(event);
         // Updating an existing document is a mutation, not an origin write, so it
         // never mints the lifecycle sync topic genesis.
-        let lifecycle_outbox = create_outbox_record(event, self.realm_config.as_ref(), false)
-            .fenced_at(self.generation_of(&event.record.placement));
+        let message = self.message.as_deref();
+        let lifecycle_outbox =
+            create_outbox_record(event, message, self.realm_config.as_ref(), false)
+                .fenced_at(self.generation_of(&event.record.placement));
         let outbox = (!event.record.holder_node_ids.is_empty()).then_some(&lifecycle_outbox);
         let status = new_pending_status(event, now);
         let job = new_materialization_job(event, now);
@@ -410,9 +424,10 @@ impl UpdateDocumentOperation {
                     .map_err(aruna_core::errors::ConversionError::from)?,
             );
         }
-        let lifecycle = MetadataLifecycleRecord::Upsert {
-            event: Box::new(event.clone()),
-        };
+        if let Some(message) = message {
+            writes.push(commit_message_entry(event, message)?);
+        }
+        let lifecycle = MetadataLifecycleRecord::for_event(event.clone(), self.message.clone());
         writes.push(document_lifecycle_entry(&lifecycle)?);
         if outbox.is_none() {
             let aruna_core::document::DocumentOutboxEvent::Upsert { change, .. } =
@@ -558,48 +573,47 @@ impl UpdateDocumentOperation {
         // A window opens at its checkpoint, which then stands in for the create.
         let opening = match self.window {
             Some(checkpoint) => {
-                let (_, value) = values.first().ok_or(UpdateDocumentError::RawLimit)?;
-                let event: MetadataEventRecord =
-                    postcard::from_bytes(value).map_err(|_| UpdateDocumentError::RawLimit)?;
-                if event.event_id != checkpoint {
+                let opening = self.opening.as_ref().ok_or(UpdateDocumentError::RawLimit)?;
+                let first = values
+                    .first()
+                    .and_then(|(key, _)| key.get(16..32))
+                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                    .map(Ulid::from_bytes);
+                if opening.event_id != checkpoint || first != Some(checkpoint) {
                     return Err(UpdateDocumentError::RawLimit);
                 }
-                event
+                opening
             }
-            None => create.clone(),
+            None => create,
         };
         let quota = match self.window {
-            Some(_) => self.window_quota(&opening)?,
+            Some(_) => self.window_quota(opening)?,
             None => self.origin_quota(create)?,
         };
-        let create = &opening;
+        let prefix = event_log_prefix(self.config.document_id);
         let mut events = 0u32;
         let mut encoded_bytes = 0u64;
         let mut total_bytes = 0u64;
         let mut saw_create = false;
         for (key, value) in values {
-            let event: MetadataEventRecord =
+            let size: aruna_core::metadata::EventSize =
                 postcard::from_bytes(value).map_err(|_| UpdateDocumentError::RawLimit)?;
-            if key != &event_log_key(self.config.document_id, event.event_id)
-                || event.record.document_id != self.config.document_id
-            {
+            if key.len() != 32 || !key.starts_with(&prefix) {
                 return Err(UpdateDocumentError::RawLimit);
             }
-            let value_len =
-                u64::try_from(value.len()).map_err(|_| UpdateDocumentError::RawLimit)?;
             total_bytes = total_bytes
-                .checked_add(value_len)
+                .checked_add(size.bytes)
                 .ok_or(UpdateDocumentError::RawLimit)?;
             if total_bytes > RAW_BYTES_LIMIT {
                 return Err(UpdateDocumentError::RawLimit);
             }
-            if &event == create {
+            if key.get(16..32) == Some(opening.event_id.to_bytes().as_slice()) {
                 saw_create = true;
             }
-            if event.node_id == self.config.actor.node_id {
+            if size.node_id == self.config.actor.node_id {
                 events = events.checked_add(1).ok_or(UpdateDocumentError::RawLimit)?;
                 encoded_bytes = encoded_bytes
-                    .checked_add(value_len)
+                    .checked_add(size.bytes)
                     .ok_or(UpdateDocumentError::RawLimit)?;
             }
         }
@@ -873,6 +887,12 @@ impl UpdateDocumentOperation {
         reads.extend(self.fenced.iter().map(|(placement, _)| {
             crate::placement::fence::fence_read(&record.realm_id, placement)
         }));
+        reads.extend(self.window.map(|checkpoint| {
+            (
+                EVENT_LOG_KEYSPACE.to_string(),
+                event_log_key(self.config.document_id, checkpoint),
+            )
+        }));
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
             txn_id: Some(txn_id),
@@ -882,12 +902,28 @@ impl UpdateDocumentOperation {
     fn read_raw_fence(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                let [(_, raw_budget), (_, accepted_create), fences @ ..] = values.as_slice() else {
+                let [(_, raw_budget), (_, accepted_create), rest @ ..] = values.as_slice() else {
                     return self.unexpected_event(
                         "metadata raw sidecar read",
                         format!("batch read with {} values", values.len()),
                     );
                 };
+                let (fences, opening) = match self.window {
+                    Some(_) => match rest.split_last() {
+                        Some(((_, opening), fences)) => (fences, opening.clone()),
+                        None => return self.fail(UpdateDocumentError::RawLimit),
+                    },
+                    None => (rest, None),
+                };
+                if self.window.is_some() {
+                    self.opening = match opening
+                        .as_deref()
+                        .map(postcard::from_bytes::<MetadataEventRecord>)
+                    {
+                        Some(Ok(checkpoint)) => Some(checkpoint),
+                        _ => return self.fail(UpdateDocumentError::RawLimit),
+                    };
+                }
                 if fences.len() != self.fenced.len() {
                     return self.unexpected_event(
                         "one fence value per fenced bucket",
@@ -941,8 +977,9 @@ impl UpdateDocumentOperation {
                     IterStart::At(event_log_key(self.config.document_id, checkpoint))
                 });
                 self.state = UpdateDocumentState::ReadRawEvents;
+                // Size rows stand in for the events, so the budget never decodes the history.
                 smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: EVENT_LOG_KEYSPACE.to_string(),
+                    key_space: EVENT_SIZE_KEYSPACE.to_string(),
                     prefix: Some(event_log_prefix(self.config.document_id)),
                     start,
                     limit: RAW_EVENT_LIMIT,
@@ -1300,12 +1337,13 @@ mod pure_tests {
     use super::*;
     use aruna_core::document::{
         DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+        DocumentTarget,
     };
     use aruna_core::keyspaces::{
-        DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
-        EVENT_LOG_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
-        METADATA_AUDIT_KEYSPACE, METADATA_INDEX_KEYSPACE, RAW_BUDGET_KEYSPACE,
-        SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
+        COMMIT_MESSAGE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE,
+        DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+        MATERIALIZATION_STATUS_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        RAW_BUDGET_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
     };
     use aruna_core::storage_entries::{
         create_acceptance_key, event_log_key, metadata_registry_key, raw_budget_key,
@@ -1495,13 +1533,13 @@ mod pure_tests {
         raw_read_for(record, node_id, None)
     }
 
+    /// The size rows of the create, as the budget scan reads them.
     fn raw_events(record: &MetadataRegistryRecord) -> Event {
         let create = create_event(record);
+        let entries = aruna_core::storage_entries::logged_event_entries(&create).unwrap();
+        let (_, key, size) = entries[1].clone();
         Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                event_log_key(record.document_id, create.event_id),
-                postcard::to_allocvec(&create).unwrap().into(),
-            )],
+            values: vec![(key, size)],
             next_start_after: None,
         })
     }
@@ -1972,6 +2010,83 @@ mod pure_tests {
     }
 
     #[test]
+    fn update_carries_message() {
+        let writes = |message: Option<&str>| {
+            let actor = actor();
+            let record = record(&actor);
+            let mutation = UpdateDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            };
+            let mut operation = UpdateDocumentOperation::new(config(actor, &record, mutation))
+                .with_message(message.map(str::to_owned));
+            operation.start();
+            operation.step(registry_read(&record));
+            configured(&mut operation, realm_config_read(&record));
+            operation.step(batch_planned(&record));
+            let txn_id = Ulid::from_parts(9, 9);
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            operation.step(registry_read(&record));
+            operation.step(no_window());
+            let size = postcard::experimental::serialized_size(&create_event(&record)).unwrap();
+            operation.step(raw_budget_read(&record, 1, size as u64));
+            let effects = operation.step(raw_events(&record));
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            else {
+                panic!("expected update batch write, got {effects:?}");
+            };
+            writes.clone()
+        };
+        let lifecycles = |writes: &[(String, ByteView, ByteView)]| {
+            let stored = writes
+                .iter()
+                .find(|(keyspace, _, _)| keyspace == DOCUMENT_LIFECYCLE_KEYSPACE)
+                .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
+                .expect("lifecycle row is written");
+            let sent = writes
+                .iter()
+                .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
+                .map(|(_, _, value)| postcard::from_bytes::<DocumentOutboxRecord>(value).unwrap())
+                .find_map(|outbox| match (outbox.target, outbox.event) {
+                    (
+                        DocumentTarget::MetadataDocumentLifecycle { .. },
+                        DocumentOutboxEvent::Upsert { bytes, .. },
+                    ) => Some(postcard::from_bytes(&bytes).unwrap()),
+                    _ => None,
+                })
+                .expect("lifecycle outbox is written");
+            [stored, sent] as [MetadataLifecycleRecord; 2]
+        };
+
+        let plain = writes(None);
+        assert!(
+            plain
+                .iter()
+                .all(|(keyspace, _, _)| keyspace != COMMIT_MESSAGE_KEYSPACE)
+        );
+        for lifecycle in lifecycles(&plain) {
+            assert!(matches!(lifecycle, MetadataLifecycleRecord::Upsert { .. }));
+        }
+
+        let noted = writes(Some("Add the raw file"));
+        let (_, key, value) = noted
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == COMMIT_MESSAGE_KEYSPACE)
+            .expect("message row is written");
+        let event = lifecycles(&noted)[0].upsert().cloned().expect("upsert");
+        assert_eq!(
+            *key,
+            event_log_key(event.record.document_id, event.event_id)
+        );
+        assert_eq!(
+            postcard::from_bytes::<String>(value).unwrap(),
+            "Add the raw file"
+        );
+        for lifecycle in lifecycles(&noted) {
+            assert_eq!(lifecycle.message(), Some("Add the raw file"));
+        }
+    }
+
+    #[test]
     fn refuses_changed_graph() {
         let planned = |version: String| {
             let actor = actor();
@@ -2086,15 +2201,8 @@ mod pure_tests {
                 ..
             })]
         ));
-        let create_value = postcard::to_allocvec(&create).unwrap();
-        let create_len = create_value.len() as u64;
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                event_log_key(record.document_id, create.event_id),
-                create_value.clone().into(),
-            )],
-            next_start_after: None,
-        }));
+        let create_len = postcard::to_allocvec(&create).unwrap().len() as u64;
+        let effects = operation.step(raw_events(&record));
         let event = assert_update_batch(effects.as_slice(), txn_id, is_data_upsert);
         let budget_value = effects
             .iter()
@@ -2388,8 +2496,18 @@ mod pure_tests {
             )],
             next_start_after: None,
         }));
-        // The earlier window exhausted its quota; the new window starts over.
-        let effects = operation.step(raw_read(&record, Some(budget(&record, EVENT_LIMIT, 0))));
+        // The earlier window exhausted its quota; the new window starts over. The read
+        // also returns the checkpoint event, which sets the window's quota.
+        let Event::Storage(StorageEvent::BatchReadResult { mut values }) =
+            raw_read(&record, Some(budget(&record, EVENT_LIMIT, 0)))
+        else {
+            panic!("raw read is a batch read");
+        };
+        values.push((
+            event_log_key(record.document_id, checkpoint.event_id),
+            Some(postcard::to_allocvec(&checkpoint).unwrap().into()),
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
         let [Effect::Storage(StorageEffect::Iter { start, .. })] = effects.as_slice() else {
             panic!("expected the window scan, got {effects:?}");
         };
@@ -2400,11 +2518,10 @@ mod pure_tests {
                 checkpoint.event_id
             )))
         );
+        let entries = aruna_core::storage_entries::logged_event_entries(&checkpoint).unwrap();
+        let (_, key, size) = entries[1].clone();
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                event_log_key(record.document_id, checkpoint.event_id),
-                postcard::to_allocvec(&checkpoint).unwrap().into(),
-            )],
+            values: vec![(key, size)],
             next_start_after: None,
         }));
         let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {

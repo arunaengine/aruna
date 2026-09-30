@@ -56,7 +56,8 @@ pub struct DatasetSearchInput {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ValidateInput {
     /// RO-Crate JSON-LD object with `@context`, `@graph`, a complete `./` Dataset, and descriptor.
-    /// The descriptor targets `./`; one Profile may be named and files use `s3://bucket/key` URLs.
+    /// The descriptor targets `./`; one Profile may be named. Files use their content address as
+    /// `@id` and `s3://bucket/key` as `contentUrl`.
     pub rocrate: JsonPayload,
     /// Target group from `list_groups`. Its private Profile is eligible during validation.
     /// Without a group, only public Profiles resolve.
@@ -365,7 +366,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Create a new metadata document from an RO-Crate and return the accepted registry summary, including the new document_id. Check the crate with validate_dataset first and call list_groups for a group_id the caller may write to. Use replace_dataset to change an existing document instead of creating a second one at another path. Acceptance is durable, but the document may need a moment before get_dataset can read it.",
+        description = "Create a new metadata document from an RO-Crate and return the accepted registry summary, including the new document_id. Check the crate with validate_dataset first and call list_groups for a group_id the caller may write to. Use replace_dataset to change an existing document instead of creating a second one at another path. Acceptance is durable, but the document may need a moment before get_dataset can read it. When the group has a default storage location, the new dataset stores its files there, and an unusable default refuses the create with the reason.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn create_dataset(
@@ -376,6 +377,11 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         let group_id = parse_group(&input.group_id)?;
         let jsonld = rocrate_json(&input.rocrate.0)?;
+        let ctx = self.state.get_ctx();
+        let resolved = aruna_operations::git::location::resolve(&ctx, &auth, group_id, None)
+            .await
+            .map_err(crate::routes::metadata::documents::map_location_error)
+            .map_err(server_error)?;
         let record = crate::metadata::run_create_metadata(
             &self.state,
             &auth,
@@ -385,6 +391,7 @@ impl McpServer {
             input.path,
             input.public.unwrap_or(false),
             CreateDocumentPayload::RoCrate { jsonld },
+            None,
         )
         .await
         .map_err(|error| match error {
@@ -395,6 +402,7 @@ impl McpServer {
             ),
             error => write_error(error),
         })?;
+        aruna_operations::git::location::establish(&ctx, &auth, &record, resolved).await;
         let summary = crate::metadata::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
@@ -434,6 +442,7 @@ impl McpServer {
             UpdateDocumentMutation::ReplaceRoCrate { jsonld },
             None,
             crate::metadata::forwarded_auth_token(request_bearer(&parts)).map_err(server_error)?,
+            None,
         )
         .await
         .map_err(crate::metadata::map_write_error)
@@ -1206,6 +1215,7 @@ mod authorization_tests {
             CreateDocumentPayload::RoCrate {
                 jsonld: serde_json::to_string(&draft_crate("MCP authorization fixture")).unwrap(),
             },
+            None,
         )
         .await
         .expect("owner can seed a private document");

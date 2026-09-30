@@ -21,38 +21,113 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
-  RUSTFLAGS: -C debuginfo=0
 
 jobs:
-  tests:
+  # Compiles every test binary once; the jobs below run parts of this archive.
+  test-build:
+    name: Build tests
     runs-on: ubuntu-latest
-    # Job-level hang cap, not a performance budget. Per-test concurrency and the
-    # 15 minute per-test hang cap live in .config/nextest.toml.
-    timeout-minutes: 90
+    # Hang cap for one workspace test build, not a performance budget.
+    timeout-minutes: 60
 
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install Rust
-        # rust-toolchain.toml is the single toolchain pin for every stable job.
-        run: rustup show active-toolchain
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: tests
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           tool: cargo-nextest@0.9.140
 
-      - name: Run workspace tests
-        run: cargo nextest run --workspace --all-targets --all-features --locked --profile ci
+      - name: Build the test archive
+        run: >-
+          cargo nextest archive --workspace --all-targets --all-features --locked
+          --archive-file nextest-archive.tar.zst
+
+      # nextest never runs doctests; this keeps them in the gate.
+      - name: Run doctests
+        run: cargo test --workspace --all-features --locked --doc
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          if-no-files-found: error
+          # The archive is already zstd compressed.
+          compression-level: 0
+          retention-days: 1
+
+  tests:
+    name: tests (${{ matrix.shard }}/4)
+    needs: test-build
+    runs-on: ubuntu-latest
+    # Job-level hang cap, not a performance budget. Per-test concurrency and the
+    # 15 minute per-test hang cap live in .config/nextest.toml.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-archive
+
+      # The archive unpacks at the build job's path, so compile-time paths in tests stay valid.
+      - name: Run the test shard
+        run: >-
+          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --partition hash:${{ matrix.shard }}/4
+
+      - name: Upload JUnit report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-tests-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  native-git:
+    name: Native Git tests
+    needs: test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
 
       - name: Install uv
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           tool: uv@0.11.28
+
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-archive
 
       # Real Git, Git LFS and ARC clients; the node itself converts ARCs with arctrl.
       - name: Run native Git tests
@@ -60,23 +135,38 @@ jobs:
           uv run --no-project --python 3.13
           --with-requirements scripts/arc-native/requirements.txt
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
-          exec cargo nextest run -p aruna --test git_native --all-features --locked
-          --profile ci --run-ignored only --no-tests fail'
+          exec cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --run-ignored only --no-tests fail -E "binary(git_native)"'
 
-      # nextest never runs doctests; this keeps them in the gate.
-      - name: Run doctests
-        run: cargo test --workspace --all-features --locked --doc
+  restart-stress:
+    name: Restart scale stress
+    needs: test-build
+    runs-on: ubuntu-latest
+    # A functional stress lane, not a timing assertion; bounded so a deadlock fails promptly.
+    timeout-minutes: 45
 
-      - name: Upload JUnit report
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          name: junit-tests
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: warn
-          retention-days: 7
+          tool: cargo-nextest@0.9.140
+
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-archive
+
+      - name: Run restart scale tests
+        run: >-
+          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --run-ignored only --no-tests fail
+          -E 'binary(restart_traffic) & test(/offline_scale_/)'
 
   s3-backend:
+    needs: test-build
     runs-on: ubuntu-latest
     # Hang cap for the MinIO-backed suite, not a performance budget.
     timeout-minutes: 30
@@ -89,12 +179,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - name: Install Rust
-        run: rustup show active-toolchain
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Start MinIO
         run: |
@@ -118,30 +202,18 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
 
-      - name: Run the s3 roundtrip range case
-        run: >-
-          cargo nextest run -p aruna-blob --lib --locked
-          --run-ignored all --no-tests fail
-          -E 'test(=blob::tests::s3_roundtrip_range)'
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-archive
 
-      - name: Run the s3 multipart compose case
+      - name: Run the s3 backend cases
         run: >-
-          cargo nextest run -p aruna-blob --lib --locked
+          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --run-ignored all --no-tests fail
-          -E 'test(=blob::tests::s3_multipart_compose)'
-
-      - name: Run the s3 group backend case
-        run: >-
-          cargo nextest run -p aruna-blob --lib --locked
-          --run-ignored all --no-tests fail
-          -E 'test(=blob::tests::s3_group_backend)'
-
-      - name: Run the s3 backend routes case
-        run: >-
-          cargo nextest run -p aruna-blob --lib --locked
-          --run-ignored all --no-tests fail
-          -E 'test(=blob::tests::s3_backend_routes)'
-
+          -E 'package(aruna-blob) & kind(lib) & (test(=blob::tests::s3_roundtrip_range)
+          | test(=blob::tests::s3_multipart_compose) | test(=blob::tests::s3_group_backend)
+          | test(=blob::tests::s3_backend_routes))'
 
   docker-backend:
     runs-on: ubuntu-latest
@@ -154,11 +226,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install Rust
-        run: rustup show active-toolchain
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
 
       # A required daemon job must fail when Docker is unavailable instead of
       # letting the ignored cases skip past a broken environment.
@@ -170,239 +239,119 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
 
-      - name: Run the idempotent submit case
+      # Built with the Docker feature alone, as a Docker-only node is.
+      - name: Run the Docker backend cases
         run: >-
           cargo nextest run -p aruna-compute --no-default-features --features docker
           --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=idempotent_submit)'
+          -E 'test(=idempotent_submit) | test(=resubmit_after_removal) | test(=exit_code_capture) | test(=file_transfer) | test(=wildcard_outputs) | test(=chunked_transfer) | test(=cancelled_submit) | test(=cancel_stops) | test(=created_cancel_removes) | test(=reconcile_adopts) | test(=log_bounds) | test(=resource_limits) | test(=foreign_not_adopted) | test(=wait_is_observational)'
 
-      - name: Run the resubmit after removal case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=resubmit_after_removal)'
-
-      - name: Run the exit code capture case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=exit_code_capture)'
-
-      - name: Run the file transfer case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=file_transfer)'
-
-      - name: Run the wildcard outputs case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=wildcard_outputs)'
-
-      - name: Run the chunked transfer case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=chunked_transfer)'
-
-      - name: Run the cancelled submit case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=cancelled_submit)'
-
-      - name: Run the cancel stops case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=cancel_stops)'
-
-      - name: Run the created cancel removes case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=created_cancel_removes)'
-
-      - name: Run the reconcile adopts case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=reconcile_adopts)'
-
-      - name: Run the log bounds case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=log_bounds)'
-
-      - name: Run the resource limits case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=resource_limits)'
-
-      - name: Run the foreign not adopted case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=foreign_not_adopted)'
-
-      - name: Run the wait is observational case
-        run: >-
-          cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=wait_is_observational)'
-
-
+  # The compute and node manifests define the supported backend selections; an
+  # all-feature build alone can hide a conditional-import mistake. The all-feature
+  # build itself is checked by clippy and compiled by the test build.
   feature-checks:
+    name: feature-checks (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default and compute
+            run: |
+              cargo check --workspace --locked
+              cargo check -p aruna-compute --all-targets --no-default-features --locked
+              for features in docker apptainer kubernetes; do
+                cargo check -p aruna-compute --all-targets --no-default-features --features "$features" --locked
+              done
+          # The node compiles its own configuration under each feature, so it is checked apart.
+          - name: node
+            run: cargo check -p aruna --all-targets --no-default-features --locked
+          - name: node docker
+            run: cargo check -p aruna --all-targets --no-default-features --features docker --locked
+          - name: node apptainer
+            run: cargo check -p aruna --all-targets --no-default-features --features apptainer --locked
+          - name: node kubernetes
+            run: cargo check -p aruna --all-targets --no-default-features --features kubernetes --locked
 
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install Rust
-        run: rustup show active-toolchain
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: feature-checks
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      # The compute manifest defines the supported backend selections; an
-      # all-feature build alone can hide a conditional-import mistake.
-      - name: Check the default workspace build
-        run: |
-          cargo check --workspace --locked
-          cargo check --workspace --all-targets --all-features --locked
-
-      # The aruna node manifest defines the same backend selections; checking
-      # only the compute crate hides node-side configuration that is compiled
-      # under each feature.
-      - name: Check the compute feature selections
+      - name: Check the feature selection
         run: |
           set -euo pipefail
-          cargo check -p aruna-compute --all-targets --no-default-features --locked
-          for features in docker apptainer kubernetes; do
-            cargo check -p aruna-compute --all-targets --no-default-features --features "$features" --locked
-          done
+          ${{ matrix.run }}
 
-      - name: Check the node feature selections
-        run: |
-          set -euo pipefail
-          cargo check -p aruna --all-targets --no-default-features --locked
-          for features in docker apptainer kubernetes; do
-            cargo check -p aruna --all-targets --no-default-features --features "$features" --locked
-          done
-
-  fmt:
+  # Quick checks share one runner, so one push does not occupy a slot per check.
+  static-checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install nightly rustfmt
+        if: ${{ !cancelled() }}
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
           toolchain: nightly-2026-09-14
           components: rustfmt
 
       - name: Check formatting
+        if: ${{ !cancelled() }}
         run: cargo +nightly-2026-09-14 fmt --all -- --check
 
-  clippy:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - name: Install nightly clippy
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
-        with:
-          toolchain: nightly-2026-09-14
-          components: clippy
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      - name: Run clippy
-        run: cargo +nightly-2026-09-14 clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-  style:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
       - name: Run the checker self-tests
+        if: ${{ !cancelled() }}
         run: python3 scripts/dev/check_style_tests.py
 
       # The same static structure, naming, and comment rules `just style` runs.
       - name: Run the style check
+        if: ${{ !cancelled() }}
         run: python3 scripts/dev/check_style.py
-
-  deny:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # The official action builds a container from Docker Hub, whose rate
       # limited pulls time out on hosted runners; install the binary instead.
       - name: Install cargo-deny
+        if: ${{ !cancelled() }}
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           tool: cargo-deny@0.20.2
 
       - name: Run cargo-deny
+        if: ${{ !cancelled() }}
         run: cargo deny --locked check
-
-  shellcheck:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Explicit manifest: nested image/helper build scripts and the
       # extensionless POSIX launcher each need their own dialect.
       - name: Run ShellCheck
+        if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/*.sh scripts/tests/*.sh
           shellcheck --shell=sh scripts/compute-helper/build.sh scripts/session-deno/build.sh \
             scripts/session-python/build.sh scripts/session-helper/session-start
 
       - name: Run Python helper tests
+        if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s scripts/session-helper
 
-  compose-config:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
       - name: Validate compose files
+        if: ${{ !cancelled() }}
         run: |
           docker compose -f scripts/compose.yaml config --quiet
           docker compose -f scripts/keycloak/docker-compose.yml config --quiet
 
-  alert-rules:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
       # promtool comes from the Compose-pinned Prometheus image, so rule
       # validation adds no toolchain and runs without network access.
       - name: Validate and test alert rules
+        if: ${{ !cancelled() }}
         env:
           PROMETHEUS_IMAGE: prom/prometheus:v3.5.3@sha256:ddc2493835a1509976d5e4e0c94199c4f843ce1f42dd6bcfc8231ba734a93ff7
         run: |
@@ -420,44 +369,90 @@ jobs:
           promtool check rules /rules/alerts.yml
           promtool test rules /rules/alerts.test.yml
 
-  just-contracts:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
       - name: Install just
+        if: ${{ !cancelled() }}
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           tool: just@1.58.0
 
       - name: Run recipe contract tests
+        if: ${{ !cancelled() }}
         run: bash scripts/tests/just_recipes.sh
 
-  cluster-start:
+  clippy:
     runs-on: ubuntu-latest
-    # Hang cap for the four cluster recipes plus one release build.
+    env:
+      # The cache keys and cleans by the active compiler, which must be the nightly Clippy uses.
+      RUSTUP_TOOLCHAIN: nightly-2026-09-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install nightly clippy
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: nightly-2026-09-14
+          components: clippy
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+
+      - name: Run clippy
+        run: cargo +nightly-2026-09-14 clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  # Builds the release binaries once for the cluster and compose start checks.
+  release-build:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+    # Hang cap for one release build, not a performance budget.
     timeout-minutes: 60
 
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install Rust
-        run: rustup show active-toolchain
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: release
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build the deployment binaries
+        run: |
+          cargo build --release --locked -p aruna -p aruna-doctor
+          # A tarball keeps the executable bits that artifacts drop.
+          tar -cf release-binaries.tar -C target/release aruna aruna-doctor
+
+      - name: Upload the release binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-binaries
+          path: release-binaries.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  cluster-start:
+    needs: release-build
+    runs-on: ubuntu-latest
+    # Hang cap for the four cluster recipes.
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install just
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
           tool: just@1.58.0
 
-      - name: Build the deployment binaries once
-        run: cargo build --release --locked -p aruna -p aruna-doctor
+      - name: Download the release binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-binaries
+
+      - name: Place the release binaries
+        run: mkdir -p target/release && tar -xf release-binaries.tar -C target/release
 
       - name: Start the cluster recipes
         run: |
@@ -681,9 +676,10 @@ jobs:
           echo "all cluster recipes started and stopped cleanly"
 
   compose-start:
+    needs: release-build
     runs-on: ubuntu-latest
     # Hang cap for the container image build plus both compose recipes.
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: Check out repository
@@ -694,8 +690,16 @@ jobs:
         with:
           tool: just@1.58.0
 
+      - name: Download the release binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-binaries
+
+      # The Dockerfile copies binaries from .prebuilt/ instead of compiling them again.
       - name: Build the compose image once
-        run: docker compose --file scripts/compose.yaml build aruna
+        run: |
+          mkdir -p .prebuilt && tar -xf release-binaries.tar -C .prebuilt
+          docker compose --file scripts/compose.yaml build aruna
 
       - name: Start the compose recipes
         run: |

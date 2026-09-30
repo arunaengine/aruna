@@ -6,17 +6,19 @@ use super::GitError;
 use super::changes::{EntityChange, entity_changes};
 use super::project::{Projection, lock};
 use super::push::record;
-use super::snapshot::{execute, refresh};
+use super::snapshot::{execute, read_view, refresh};
 use super::state::GitState;
 use crate::driver::DriverContext;
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CommitInfo, FileChange, GitEffect, GitEvent, RefUpdate, ZERO_OID, refs_clash, valid_ref,
 };
+use aruna_core::repo_layout::{ARUNA_FILE, entity_path, git_copy, is_file};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use tokio::sync::OwnedMutexGuard;
 use ulid::Ulid;
 
@@ -40,7 +42,7 @@ pub struct Comparison {
     /// `None` compares against an empty ARC.
     pub from: Option<String>,
     pub to: String,
-    /// `None` when either side has no readable ISA metadata.
+    /// `None` when either side has no readable metadata.
     pub entities: Option<Vec<EntityChange>>,
     pub files: Vec<FileChange>,
 }
@@ -92,6 +94,18 @@ pub(super) async fn open(
     Ok((document, projection, guard))
 }
 
+/// Refreshes under the lock and releases it; the reads that follow use the projection's refs
+/// or immutable commits, so they may overlap other requests.
+async fn read(
+    context: &DriverContext,
+    store: &GitStore,
+    auth: &AuthContext,
+    id: Ulid,
+) -> Result<Projection, GitError> {
+    let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
+    Ok(read_view(context, store, &document).await?.0)
+}
+
 pub(super) async fn resolve(
     store: &GitStore,
     auth: &AuthContext,
@@ -105,6 +119,46 @@ pub(super) async fn resolve(
     match execute(store, effect, auth.user_id).await? {
         GitEvent::Resolved(Some(commit)) => Ok(commit),
         GitEvent::Resolved(None) => Err(GitError::NotFound),
+        _ => Err(GitError::Unavailable),
+    }
+}
+
+/// The commit each revision names, in order, read with one Git call.
+async fn peel(
+    store: &GitStore,
+    auth: &AuthContext,
+    id: Ulid,
+    revisions: Vec<String>,
+) -> Result<Vec<String>, GitError> {
+    let effect = GitEffect::Peel {
+        document_id: id,
+        revisions,
+    };
+    match execute(store, effect, auth.user_id).await? {
+        GitEvent::Peeled(commits) => commits
+            .into_iter()
+            .collect::<Option<_>>()
+            .ok_or(GitError::NotFound),
+        _ => Err(GitError::Unavailable),
+    }
+}
+
+/// The commits themselves by id, read with one Git call.
+async fn commits(
+    store: &GitStore,
+    auth: &AuthContext,
+    id: Ulid,
+    revisions: Vec<String>,
+) -> Result<BTreeMap<String, CommitInfo>, GitError> {
+    let effect = GitEffect::Commits {
+        document_id: id,
+        revisions,
+    };
+    match execute(store, effect, auth.user_id).await? {
+        GitEvent::Log(commits) => Ok(commits
+            .into_iter()
+            .map(|commit| (commit.commit.clone(), commit))
+            .collect()),
         _ => Err(GitError::Unavailable),
     }
 }
@@ -166,6 +220,41 @@ pub(super) async fn rocrate(
     value.get_mut("rocrate").map(Value::take)
 }
 
+/// The full metadata graph of a commit: `aruna-metadata.json` of an ARC snapshot, otherwise
+/// its RO-Crate. Stored entities are named by their repository path, as in plain Git copies,
+/// so a version before and after a file was stored compares equal.
+pub(super) async fn graph(
+    store: &GitStore,
+    auth: &AuthContext,
+    id: Ulid,
+    commit: &str,
+) -> Option<Value> {
+    let effect = GitEffect::ReadFile {
+        document_id: id,
+        revision: commit.to_string(),
+        path: ARUNA_FILE.to_string(),
+    };
+    let value = match execute(store, effect, auth.user_id).await.ok()? {
+        GitEvent::File(Some(bytes)) => serde_json::from_slice(&bytes).ok()?,
+        GitEvent::File(None) => rocrate(store, auth, id, commit).await?,
+        _ => return None,
+    };
+    Some(copied(value))
+}
+
+/// Names stored entities by their repository path, as a plain Git copy does.
+pub(super) fn copied(mut value: Value) -> Value {
+    let paths: BTreeMap<String, String> = value["@graph"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entity| is_file(entity) && entity.get("localPath").is_some())
+        .filter_map(|entity| Some((entity["@id"].as_str()?.to_owned(), entity_path(entity)?)))
+        .collect();
+    git_copy(&mut value, &paths);
+    value
+}
+
 pub(super) fn branch_ref(name: &str) -> Result<String, GitError> {
     let full = format!("refs/heads/{name}");
     valid_ref(&full, true)
@@ -218,17 +307,21 @@ pub(super) async fn peeled_tags(
     id: Ulid,
     projection: &Projection,
 ) -> Result<Vec<Named>, GitError> {
-    let mut tags = Vec::new();
-    for name in projection.state.refs.keys() {
-        if let Some(short) = name.strip_prefix("refs/tags/") {
-            let version = resolve(store, auth, id, name).await?;
-            tags.push(Named {
-                name: short.to_string(),
-                version,
-            });
-        }
-    }
-    Ok(tags)
+    let (names, targets): (Vec<_>, Vec<_>) = projection
+        .state
+        .refs
+        .iter()
+        .filter_map(|(name, target)| Some((name.strip_prefix("refs/tags/")?, target.clone())))
+        .unzip();
+    let versions = peel(store, auth, id, targets).await?;
+    Ok(names
+        .into_iter()
+        .zip(versions)
+        .map(|(name, version)| Named {
+            name: name.to_string(),
+            version,
+        })
+        .collect())
 }
 
 pub(super) fn version(commit: CommitInfo, state: &GitState, tags: &[Named]) -> Version {
@@ -265,7 +358,7 @@ pub async fn list(
     id: Ulid,
     query: VersionQuery<'_>,
 ) -> Result<(Vec<Version>, Option<String>), GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     let (head, skip) = match query.cursor {
         Some(cursor) => {
             let (head, skip) = cursor.split_once('.').ok_or(GitError::Invalid)?;
@@ -310,7 +403,7 @@ pub async fn show(
     id: Ulid,
     revision: &str,
 ) -> Result<(Version, Vec<FileChange>), GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     let commit = resolve(store, auth, id, revision).await?;
     let info = log(store, auth, id, (&commit, None), 0, 1)
         .await?
@@ -336,7 +429,7 @@ pub async fn compare(
     from: Option<&str>,
     to: &str,
 ) -> Result<Comparison, GitError> {
-    let (_, _, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    read(context, store, auth, id).await?;
     let from = match from {
         Some(from) => Some(resolve(store, auth, id, from).await?),
         None => None,
@@ -344,10 +437,10 @@ pub async fn compare(
     let to = resolve(store, auth, id, to).await?;
     let files = diff(store, auth, id, from.as_deref(), &to).await?;
     let before = match &from {
-        Some(from) => rocrate(store, auth, id, from).await,
+        Some(from) => graph(store, auth, id, from).await,
         None => Some(serde_json::json!({ "@graph": [] })),
     };
-    let entities = match (before, rocrate(store, auth, id, &to).await) {
+    let entities = match (before, graph(store, auth, id, &to).await) {
         (Some(before), Some(after)) => Some(entity_changes(&before, &after)),
         _ => None,
     };
@@ -366,19 +459,23 @@ pub async fn branches(
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Vec<(String, Version)>, GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
-    let mut heads = Vec::new();
-    for (name, target) in &projection.state.refs {
-        if let Some(short) = name.strip_prefix("refs/heads/") {
-            let info = log(store, auth, id, (target, None), 0, 1)
-                .await?
-                .pop()
-                .ok_or(GitError::Unavailable)?;
-            heads.push((short.to_string(), version(info, &projection.state, &tags)));
-        }
-    }
-    Ok(heads)
+    let heads: Vec<_> = projection
+        .state
+        .refs
+        .iter()
+        .filter_map(|(name, target)| Some((name.strip_prefix("refs/heads/")?, target)))
+        .collect();
+    let targets = heads.iter().map(|(_, target)| (*target).clone()).collect();
+    let infos = commits(store, auth, id, targets).await?;
+    heads
+        .into_iter()
+        .map(|(short, target)| {
+            let info = infos.get(target).cloned().ok_or(GitError::Unavailable)?;
+            Ok((short.to_string(), version(info, &projection.state, &tags)))
+        })
+        .collect()
 }
 
 /// Every tag with the commit it names.
@@ -388,7 +485,7 @@ pub async fn tags(
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Vec<Named>, GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     peeled_tags(store, auth, id, &projection).await
 }
 
@@ -487,20 +584,27 @@ pub async fn conflicts(
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Vec<(Conflict, Version)>, GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
-    let mut kept = Vec::new();
-    for (name, target) in &projection.state.refs {
-        if let Some(conflict) = parse_conflict(name, target) {
-            let commit = resolve(store, auth, id, target).await?;
-            let info = log(store, auth, id, (&commit, None), 0, 1)
-                .await?
-                .pop()
-                .ok_or(GitError::Unavailable)?;
-            kept.push((conflict, version(info, &projection.state, &tags)));
-        }
-    }
-    Ok(kept)
+    let kept: Vec<_> = projection
+        .state
+        .refs
+        .iter()
+        .filter_map(|(name, target)| parse_conflict(name, target))
+        .collect();
+    let targets = kept
+        .iter()
+        .map(|conflict| conflict.version.clone())
+        .collect();
+    let peeled = peel(store, auth, id, targets).await?;
+    let infos = commits(store, auth, id, peeled.clone()).await?;
+    kept.into_iter()
+        .zip(peeled)
+        .map(|(conflict, commit)| {
+            let info = infos.get(&commit).cloned().ok_or(GitError::Unavailable)?;
+            Ok((conflict, version(info, &projection.state, &tags)))
+        })
+        .collect()
 }
 
 /// The full ref name of a kept conflict, for discarding it.
@@ -511,7 +615,7 @@ pub async fn conflict_ref(
     id: Ulid,
     conflict: Ulid,
 ) -> Result<String, GitError> {
-    let (_, projection, _guard) = open(context, store, auth, id, Permission::READ).await?;
+    let projection = read(context, store, auth, id).await?;
     projection
         .state
         .refs
@@ -553,6 +657,83 @@ mod tests {
             ..commit
         };
         assert_eq!(version(commit, &state, &[]).metadata_event_id, None);
+    }
+
+    async fn git(path: &std::path::Path, args: &[&str]) -> String {
+        let output = tokio::process::Command::new("git")
+            .current_dir(path)
+            .args(["-c", "user.name=Ada", "-c", "user.email=ada@example.org"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .await
+            .expect("git runs");
+        String::from_utf8(output.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_string()
+    }
+
+    fn metadata(measured: &[&str]) -> Value {
+        serde_json::json!({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"},
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}},
+            {"@id": "./", "@type": "Dataset", "name": "Liver", "description": "Liver runs",
+                "datePublished": "2026-09-28", "variableMeasured": measured,
+                "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}}]})
+    }
+
+    /// Commits `file` holding `value` and returns the commit.
+    async fn commit(path: &std::path::Path, file: &str, value: &Value) -> String {
+        tokio::fs::write(path.join(file), value.to_string())
+            .await
+            .expect("write");
+        git(path, &["add", "-A"]).await;
+        git(path, &["commit", "-q", "-m", "Edit"]).await;
+        git(path, &["rev-parse", "HEAD"]).await
+    }
+
+    #[tokio::test]
+    async fn compares_full_graph() {
+        // ARC snapshots keep the full graph in `aruna-metadata.json`, plain ones in the crate.
+        for file in [ARUNA_FILE, aruna_core::repo_layout::CRATE_FILE] {
+            let root = tempfile::tempdir().expect("directory");
+            let id = Ulid::from(9);
+            let path = root.path().join(format!("{id}.git"));
+            tokio::fs::create_dir(&path).await.expect("folder");
+            git(&path, &["init", "-q", "--initial-branch=main"]).await;
+            let before = commit(&path, file, &metadata(&["depth"])).await;
+            let after = commit(&path, file, &metadata(&["depth", "stuff"])).await;
+            let store = GitStore::new(root.path().to_path_buf(), "helper".into());
+            let auth = super::super::project::author(aruna_core::UserId::nil(
+                aruna_core::structs::identity::realm::RealmId([1; 32]),
+            ));
+            let before = graph(&store, &auth, id, &before).await.expect("before");
+            let after = graph(&store, &auth, id, &after).await.expect("after");
+            let changes = entity_changes(&before, &after);
+            assert_eq!(changes.len(), 1, "{file}");
+            assert_eq!(changes[0].id, "./");
+            assert_eq!(changes[0].properties[0].name, "variableMeasured");
+            assert_eq!(changes[0].properties[0].after.len(), 2);
+        }
+    }
+
+    #[test]
+    fn compares_stored_paths() {
+        let stored = serde_json::json!({"@graph": [{"@id": "https://w3id.org/aruna/data/ab",
+            "@type": "File", "name": "a.csv", "contentUrl": "s3://b/doc/data/a.csv",
+            "localPath": "data/a.csv"}]});
+        let plain = serde_json::json!({"@graph": [{"@id": "data/a.csv", "@type": "File",
+            "name": "a.csv"}]});
+        let mut copied = stored.clone();
+        let paths = BTreeMap::from([(
+            "https://w3id.org/aruna/data/ab".to_string(),
+            "data/a.csv".to_string(),
+        )]);
+        git_copy(&mut copied, &paths);
+        assert!(entity_changes(&plain, &copied).is_empty());
     }
 
     #[test]

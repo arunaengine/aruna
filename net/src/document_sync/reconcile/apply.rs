@@ -60,7 +60,7 @@ impl DocumentSyncService {
             )
             .await;
         }
-        if let DocumentTarget::GitRecord { .. } = target {
+        if let DocumentTarget::GitRecord { .. } | DocumentTarget::GitPack { .. } = target {
             // Git records only arrive through the reconcile loop, which validates them.
             return Err(NetError::Bootstrap(
                 "Git records must be applied through document reconcile".to_string(),
@@ -289,7 +289,7 @@ impl DocumentSyncService {
             return Ok(());
         }
         // Git records are immutable history; checkpoints supersede them instead.
-        if let DocumentTarget::GitRecord { .. } = target {
+        if let DocumentTarget::GitRecord { .. } | DocumentTarget::GitPack { .. } = target {
             return Ok(());
         }
         // A minted PID is a permanent identity: the row is never removed, only

@@ -532,6 +532,7 @@ async fn update_document(
         },
         None,
         Some(internal_token(source.created_by, realm_id)),
+        None,
     ))
     .await?;
     Ok(())

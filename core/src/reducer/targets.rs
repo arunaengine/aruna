@@ -87,6 +87,20 @@ impl AdminDocumentState {
             .and_then(policies_from_value)
     }
 
+    /// The group's default dataset location, if an admin set one.
+    pub fn group_location(
+        &self,
+    ) -> Option<crate::structs::storage::dataset_location::DatasetLocation> {
+        if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(GROUP_LOCATION_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| serde_json::from_str(value).ok())
+    }
+
     pub fn materialized_group_roles(&self) -> BTreeSet<RoleId> {
         if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
             return BTreeSet::new();

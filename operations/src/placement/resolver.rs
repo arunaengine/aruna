@@ -170,6 +170,7 @@ pub fn document_class(target: &DocumentTarget) -> DocumentClass {
         DocumentTarget::MetadataRegistry { .. } => DocumentClass::MetadataRegistry,
         DocumentTarget::MetadataCreateEvent { .. }
         | DocumentTarget::GitRecord { .. }
+        | DocumentTarget::GitPack { .. }
         | DocumentTarget::MetadataDocumentLifecycle { .. }
         | DocumentTarget::MetadataGraphLifecycle { .. }
         | DocumentTarget::PersistentIdMapping { .. }
@@ -196,6 +197,7 @@ pub fn subject_bytes(target: &DocumentTarget) -> Vec<u8> {
         DocumentTarget::MetadataRegistry { document_id, .. }
         | DocumentTarget::MetadataCreateEvent { document_id, .. }
         | DocumentTarget::GitRecord { document_id, .. }
+        | DocumentTarget::GitPack { document_id, .. }
         | DocumentTarget::MetadataDocumentLifecycle { document_id }
         | DocumentTarget::PersistentIdMapping { document_id }
         | DocumentTarget::RepositoryLink { document_id, .. } => document_id.to_bytes().to_vec(),

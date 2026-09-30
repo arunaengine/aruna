@@ -1436,6 +1436,39 @@ async fn older_update_logged() {
 }
 
 #[tokio::test]
+async fn lifecycle_stores_message() {
+    let (_dir, storage) = test_storage();
+    let document_id = Ulid::from_parts(31, 1);
+    let event_id = Ulid::from_parts(32, 1);
+    let event = metadata_create_event(Ulid::from_parts(30, 1), document_id, 100, event_id, 7);
+    let lifecycle = MetadataLifecycleRecord::for_event(event, Some("Add run 42".into()));
+    let change = metadata_lifecycle_change(&lifecycle, node(8));
+
+    assert!(
+        store_document_lifecycle(&storage, &lifecycle, change)
+            .await
+            .expect("lifecycle with message applies")
+    );
+    let key = event_log_key(document_id, event_id);
+    assert!(
+        read_storage_value(&storage, EVENT_LOG_KEYSPACE, key.clone())
+            .await
+            .is_some()
+    );
+    let message = read_storage_value(
+        &storage,
+        aruna_core::keyspaces::COMMIT_MESSAGE_KEYSPACE,
+        key,
+    )
+    .await
+    .expect("commit message is stored with the event");
+    assert_eq!(
+        postcard::from_bytes::<String>(&message).unwrap(),
+        "Add run 42"
+    );
+}
+
+#[tokio::test]
 async fn newer_sidecar_blocks() {
     let (_dir, storage) = test_storage();
     let group_id = Ulid::from_parts(10, 1);

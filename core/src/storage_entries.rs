@@ -14,18 +14,19 @@ use crate::document::{
 };
 use crate::errors::ConversionError;
 use crate::keyspaces::{
-    CREATE_ACCEPTANCE_KEYSPACE, DEAD_LETTER_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE,
-    DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
-    DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, IRI_INDEX_KEYSPACE,
-    MATERIALIZATION_JOB_KEYSPACE, MATERIALIZATION_PRUNE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
-    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE,
-    NOTIFICATION_OUTBOX_KEYSPACE, PENDING_PROJECTION_KEYSPACE, PRUNE_INDEX_KEYSPACE,
-    PRUNE_JOB_KEYSPACE, RAW_BUDGET_KEYSPACE, SHARD_MANIFEST_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
-    SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE, UPDATED_INDEX_KEYSPACE,
-    VALIDATION_STATUS_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
+    COMMIT_MESSAGE_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DEAD_LETTER_KEYSPACE,
+    DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE,
+    DOCUMENT_LIFECYCLE_KEYSPACE, DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, IRI_INDEX_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    MATERIALIZATION_PRUNE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE, PRUNE_INDEX_KEYSPACE, PRUNE_JOB_KEYSPACE, RAW_BUDGET_KEYSPACE,
+    SHARD_MANIFEST_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_CONFLICT_KEYSPACE,
+    SYNC_REVISION_KEYSPACE, UPDATED_INDEX_KEYSPACE, VALIDATION_STATUS_KEYSPACE,
+    WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use crate::metadata::{
-    DeadLetterRecord, GraphLifecycleRecord, GraphPruneRecord, IriIndexRecord,
+    DeadLetterRecord, EventSize, GraphLifecycleRecord, GraphPruneRecord, IriIndexRecord,
     MaterializationStatusRecord, MetadataEventRecord, MetadataLifecycleRecord,
     MetadataMaterializationRecord, ProfileValidationStatus, RawOriginBudget,
 };
@@ -378,6 +379,35 @@ pub fn create_event_entry(
     ))
 }
 
+/// The event log row of `event` and its size row, which are always written together.
+pub fn logged_event_entries(
+    event: &MetadataEventRecord,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    let log = create_event_entry(event)?;
+    let size = EventSize {
+        node_id: event.node_id,
+        bytes: log.2.len() as u64,
+    };
+    let size = (
+        EVENT_SIZE_KEYSPACE.to_string(),
+        log.1.clone(),
+        postcard::to_allocvec(&size)?.into(),
+    );
+    Ok(vec![log, size])
+}
+
+/// The commit message the author of `event` gave for its ARC snapshot.
+pub fn commit_message_entry(
+    event: &MetadataEventRecord,
+    message: &str,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        COMMIT_MESSAGE_KEYSPACE.to_string(),
+        event_log_key(event.record.document_id, event.event_id),
+        postcard::to_allocvec(message)?.into(),
+    ))
+}
+
 pub fn raw_budget_entry(
     budget: &RawOriginBudget,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
@@ -426,7 +456,8 @@ pub fn delete_projection_entry(document_id: Ulid, event_id: Ulid) -> (KeySpace, 
 pub fn create_projection_entries(
     event: &MetadataEventRecord,
 ) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
-    let mut entries = vec![create_event_entry(event)?, pending_projection_entry(event)];
+    let mut entries = logged_event_entries(event)?;
+    entries.push(pending_projection_entry(event));
     entries.extend(checkpoint_entry(event));
     Ok(entries)
 }
@@ -561,7 +592,8 @@ pub fn lifecycle_revision_change(
     placement: PlacementRef,
 ) -> DocumentChange {
     match record {
-        MetadataLifecycleRecord::Upsert { event } => DocumentChange {
+        MetadataLifecycleRecord::Upsert { event }
+        | MetadataLifecycleRecord::UpsertWithMessage { event, .. } => DocumentChange {
             base: None,
             current: DocumentSyncRevision {
                 generation: event.record.updated_at_ms,

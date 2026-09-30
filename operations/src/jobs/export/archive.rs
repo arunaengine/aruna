@@ -169,7 +169,7 @@ pub(super) fn recognize_entities(
             continue;
         }
         let urls = content_urls.get(&subject).map_or(&[][..], Vec::as_slice);
-        let identity = entity_identity(&entity_id, urls);
+        let identity = DataIdentity::read(&entity_id, urls);
         let storage_key = identity
             .exact
             .as_ref()
@@ -179,11 +179,12 @@ pub(super) fn recognize_entities(
                 key: exact.key.clone(),
             })
             .or_else(|| {
-                std::iter::once(entity_id.as_str())
-                    .chain(urls.iter().map(String::as_str))
-                    .find_map(object_location)
+                identity.location.as_ref().map(|location| StorageKey {
+                    bucket: location.bucket.clone(),
+                    key: location.key.clone(),
+                })
             });
-        let external = identity.exact.is_none() && identity.hash.is_none();
+        let external = !identity.is_aruna();
         let hash_realm = identity.hash_realm;
         let supported_exact = identity
             .exact
@@ -191,7 +192,8 @@ pub(super) fn recognize_entities(
             .is_some_and(|exact| exact.realm_id == realm_id);
         let supported_hash =
             identity.hash.is_some() && hash_realm.is_none_or(|hash_realm| hash_realm == realm_id);
-        let unsupported_realm = !external && !supported_exact && !supported_hash;
+        let located = identity.location.is_some();
+        let unsupported_realm = !external && !supported_exact && !supported_hash && !located;
         let paths = local_paths.remove(&subject).unwrap_or_default();
         let local_path = raw_path
             .filter(|raw_path| paths.contains(raw_path))
@@ -317,53 +319,6 @@ pub(super) fn term_value(term: &Term) -> Option<String> {
     }
 }
 
-/// Reads an Aruna object identity out of a data entity's `@id` and
-/// `contentUrl` values: a versioned ARN, or a content hash W3ID or ARN.
-pub(crate) fn entity_identity(entity_id: &str, content_urls: &[String]) -> EntityIdentity {
-    let mut exact = None;
-    let mut hash = None;
-    let mut hash_realm = None;
-    for value in std::iter::once(entity_id).chain(content_urls.iter().map(String::as_str)) {
-        if let Ok(identifier) = W3idIdentifier::parse(value) {
-            match identifier {
-                W3idIdentifier::ContentHash(value) => hash = Some(value),
-                W3idIdentifier::VersionedObject(value) => exact = Some(value),
-            }
-            continue;
-        }
-        if let Ok(value) = VersionedObjectArn::parse(value) {
-            exact = Some(value);
-            continue;
-        }
-        if let Ok(value) = ArunaArn::parse(value)
-            && value.resource_type == ArunaArnType::ContentHash
-            && let Some(value_hash) = parse_hash(&value.path)
-        {
-            hash = Some(value_hash);
-            hash_realm = Some(value.realm_id);
-        }
-    }
-    EntityIdentity {
-        exact,
-        hash,
-        hash_realm,
-    }
-}
-
-pub(super) fn parse_hash(value: &str) -> Option<[u8; 32]> {
-    let value = value.strip_prefix("blake3/").unwrap_or(value);
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return None;
-    }
-    let mut hash = [0; 32];
-    hex::decode_to_slice(value, &mut hash).ok()?;
-    Some(hash)
-}
-
 pub(super) fn safe_zip_path(value: &str) -> Option<String> {
     let mut value = value;
     while let Some(stripped) = value.strip_prefix("./") {
@@ -403,17 +358,9 @@ pub(super) fn jsonld_path(path: &str) -> String {
     url.path().trim_start_matches('/').to_string()
 }
 
-pub(super) fn synthesized_path(hash: [u8; 32], entity_id: &str) -> String {
+pub(crate) fn synthesized_path(hash: [u8; 32], entity_id: &str) -> String {
     let suffix = blake3::hash(entity_id.as_bytes()).to_hex();
     format!("data/{}-{}", hex::encode(hash), &suffix[..12])
-}
-
-pub(super) fn object_location(value: &str) -> Option<StorageKey> {
-    let (bucket, key) = value.strip_prefix("s3://")?.split_once('/')?;
-    (!bucket.is_empty() && !key.is_empty()).then(|| StorageKey {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-    })
 }
 
 /// The authored location wins over the resolved candidate: a content hash may
@@ -437,13 +384,13 @@ pub(super) fn source_key(entity: &ExportEntity, candidate_index: usize) -> Optio
 
 /// How keys become archive paths: one bucket drops the directory prefix every
 /// payload shares, several buckets keep the whole key under the bucket name.
-struct KeyLayout {
+pub(crate) struct KeyLayout {
     dropped: usize,
     with_bucket: bool,
 }
 
 impl KeyLayout {
-    fn new(sources: &[Option<StorageKey>]) -> Self {
+    pub(crate) fn new(sources: &[Option<StorageKey>]) -> Self {
         let mut buckets = BTreeSet::new();
         let mut shared: Option<Vec<&str>> = None;
         for source in sources.iter().flatten() {
@@ -465,7 +412,7 @@ impl KeyLayout {
         }
     }
 
-    fn path(&self, source: &StorageKey) -> Option<String> {
+    pub(crate) fn path(&self, source: &StorageKey) -> Option<String> {
         let relative = source
             .key
             .split('/')

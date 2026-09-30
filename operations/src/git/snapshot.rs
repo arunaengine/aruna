@@ -2,10 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::project::{Projection, author, lock, project};
+use super::changes::summary;
+use super::project::{Projection, author, forget, lock, project, recent, remember};
+use super::versions::{copied, graph, plain};
 use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
@@ -15,17 +18,21 @@ use crate::s3::object::get::{GetObjectInput, get_object_info};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CHECKPOINT_AFTER, GitChange, GitCheckpoint, GitEffect, GitEvent, GitSnapshot, GitStatus,
-    LinkedObject, RefUpdate, STATUS, StoredObject, ZERO_OID,
+    LinkedObject, PENDING, PendingMerge, RefUpdate, STATUS, StoredObject, ZERO_OID,
 };
-use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
+use aruna_core::keyspaces::{
+    COMMIT_MESSAGE_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+};
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEventRecord, MetadataRawRevision,
 };
+use aruna_core::repo_layout::{Layout, data_path, entity_path, is_file, metadata_layout, path_id};
 use aruna_core::storage_entries::{event_log_key, materialization_status_key};
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::data_identity::{DataIdentity, text_values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{NodeId, UserId};
@@ -211,7 +218,7 @@ fn exact_files<'a>(
             continue;
         }
         let urls = listed(&entity["contentUrl"]);
-        let Some(exact) = crate::jobs::export::entity_identity(id, &urls).exact else {
+        let Some(exact) = DataIdentity::read(id, &urls).exact else {
             continue;
         };
         if exact.realm_id == realm_id {
@@ -224,8 +231,91 @@ fn exact_files<'a>(
     files
 }
 
-/// File entities that name an exact Aruna object version. An object the caller cannot
-/// read stays out of the ARC; its entity still describes it in the metadata.
+/// The exact version a data entity names: its versioned ARN, the current version at its
+/// `s3://` location on this node when that holds its content, or a copy of its content.
+async fn located(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    identity: &DataIdentity,
+) -> Vec<VersionedObjectArn> {
+    let realm_id = document.realm_id;
+    if let Some(exact) = identity
+        .exact
+        .as_ref()
+        .filter(|exact| exact.realm_id == realm_id)
+    {
+        return vec![exact.clone()];
+    }
+    let mut found = Vec::new();
+    let node = context.net_handle.as_ref().map(|net| net.node_id());
+    if let (Some(location), Some(node)) = (&identity.location, node)
+        && let Ok(bucket) = drive(GetBucketOperation::new(location.bucket.clone()), context).await
+        && let Ok(Some(object)) = objects::described(
+            context,
+            (&location.bucket, bucket.group_id),
+            &location.key,
+            None,
+        )
+        .await
+        && identity.hash.is_none_or(|hash| hash == object.blake3)
+    {
+        let exact = VersionedObjectArn::new(
+            realm_id,
+            node,
+            &object.bucket,
+            &object.key,
+            object.version_id,
+        );
+        found.extend(exact.ok());
+    }
+    let hash = identity
+        .hash
+        .filter(|_| identity.hash_realm.is_none_or(|realm| realm == realm_id));
+    if let Some(hash) = hash
+        && let Ok(aliases) = drive(ResolvePathsOperation::new(hash), context).await
+    {
+        // Copies on this node come first; a few candidates are enough to find a readable one.
+        let mut aliases: Vec<_> = aliases
+            .into_iter()
+            .filter(|alias| alias.realm_id == realm_id)
+            .collect();
+        aliases.sort_by_key(|alias| Some(alias.node_id) != node);
+        found.extend(aliases.into_iter().take(4).filter_map(|alias| {
+            VersionedObjectArn::new(
+                realm_id,
+                alias.node_id,
+                alias.bucket,
+                alias.key,
+                alias.version_id,
+            )
+            .ok()
+        }));
+    }
+    found
+}
+
+/// The readable exact object a file entity names, tried in the order it was located.
+async fn lookup(
+    context: &DriverContext,
+    document: &MetadataRegistryRecord,
+    auth: &AuthContext,
+    entity: &serde_json::Value,
+    id: &str,
+) -> (DataIdentity, Result<StoredObject, GitError>) {
+    let identity = DataIdentity::read(id, &text_values(entity.get("contentUrl")));
+    let mut resolved = Err(GitError::NotFound);
+    for exact in located(context, document, &identity).await {
+        resolved = resolve(context, &exact, auth).await;
+        if resolved.is_ok() {
+            break;
+        }
+    }
+    (identity, resolved)
+}
+
+/// File entities that name an Aruna object in any supported form, with the repository path of
+/// a plain copy: `localPath`, the key inside the dataset location, or a layout of the keys.
+/// An object the caller cannot read stays out of the repository; its entity still describes it.
 pub(super) async fn linked(
     context: &DriverContext,
     document: &MetadataRegistryRecord,
@@ -235,15 +325,68 @@ pub(super) async fn linked(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(jsonld) else {
         return Vec::new();
     };
-    let entities = value["@graph"].as_array().into_iter().flatten();
+    let location = super::location::effective(context, document)
+        .await
+        .map(|(location, _)| location)
+        .ok();
     let mut linked = Vec::new();
-    for (entity, exact) in exact_files(entities, document.realm_id) {
-        match resolve(context, &exact, auth).await {
-            Ok(object) => linked.push(LinkedObject { entity, object }),
-            Err(error) => {
-                tracing::warn!(entity, %error, "Leaving unreadable object out of the ARC")
+    let entities = value["@graph"].as_array().into_iter().flatten();
+    let files: Vec<_> = entities
+        .filter(|entity| is_file(entity))
+        .take(10_000)
+        .filter_map(|entity| Some((entity, entity["@id"].as_str()?)))
+        .collect();
+    // Independent lookups overlap, a few at a time; results keep the entity order.
+    use futures_util::StreamExt;
+    let lookups: Vec<_> = files
+        .iter()
+        .map(|&(entity, id)| lookup(context, document, auth, entity, id))
+        .collect();
+    let lookups = futures_util::stream::iter(lookups)
+        .buffered(8)
+        .collect::<Vec<_>>()
+        .await;
+    for ((entity, id), (identity, resolved)) in files.into_iter().zip(lookups) {
+        let object = match resolved {
+            Ok(object) => object,
+            Err(error) if identity.is_aruna() => {
+                tracing::warn!(entity = id, %error, "Leaving unreadable object out of Git");
+                continue;
             }
-        }
+            Err(_) => continue,
+        };
+        let stored = identity.location.as_ref().zip(location.as_ref());
+        let path = entity_path(entity).or_else(|| {
+            let (source, location) = stored?;
+            location
+                .path(&source.bucket, &source.key)
+                .and_then(|path| data_path(&path_id(path)))
+        });
+        linked.push(LinkedObject {
+            entity: id.to_string(),
+            path,
+            object,
+        });
+    }
+    let sources: Vec<_> = linked
+        .iter()
+        .filter(|linked| linked.path.is_none())
+        .map(|linked| {
+            Some(crate::jobs::export::StorageKey {
+                bucket: linked.object.bucket.clone(),
+                key: linked.object.key.clone(),
+            })
+        })
+        .collect();
+    let layout = crate::jobs::export::KeyLayout::new(&sources);
+    for linked in linked.iter_mut().filter(|linked| linked.path.is_none()) {
+        let source = crate::jobs::export::StorageKey {
+            bucket: linked.object.bucket.clone(),
+            key: linked.object.key.clone(),
+        };
+        linked.path = Some(layout.path(&source).unwrap_or_else(|| {
+            crate::jobs::export::synthesized_path(linked.object.blake3, &linked.entity)
+        }));
     }
     linked
 }
@@ -263,13 +406,29 @@ pub async fn unreadable_file(
     None
 }
 
+/// A subject that says what changed since the last snapshot, for metadata without a message.
+async fn subject(
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+    projection: &Projection,
+    jsonld: &str,
+    user: UserId,
+) -> String {
+    let after = serde_json::from_str(jsonld).map_or(serde_json::Value::Null, copied);
+    let before = match projection.state.refs.get("refs/heads/aruna") {
+        Some(commit) => graph(store, &author(user), document.document_id, commit).await,
+        None => None,
+    };
+    summary(before.as_ref(), &after)
+}
+
 async fn generate(
     context: &DriverContext,
     store: &GitStore,
     document: &MetadataRegistryRecord,
     projection: &Projection,
     source: (Ulid, String),
-    digest: [u8; 32],
+    digest: Option<[u8; 32]>,
 ) -> Result<(), GitError> {
     let (event_id, jsonld) = source;
     let event: Option<MetadataEventRecord> = records::load(
@@ -282,6 +441,20 @@ async fn generate(
         .as_ref()
         .map_or(UserId::nil(document.realm_id), |event| event.user_id);
     let occurred_at_ms = event.map_or(document.updated_at_ms, |event| event.occurred_at_ms);
+    let message: Option<String> = records::load(
+        context,
+        COMMIT_MESSAGE_KEYSPACE,
+        event_log_key(document.document_id, event_id).to_vec(),
+    )
+    .await?;
+    // Trailer lines stay reserved for Aruna, so an author cannot forge a trusted one.
+    let message = match message
+        .map(|message| plain(&message))
+        .filter(|message| !message.is_empty())
+    {
+        Some(message) => message,
+        None => subject(store, document, projection, &jsonld, user).await,
+    };
     let objects = linked(context, document, &jsonld, &author(user)).await;
     let lfs: Vec<StoredObject> = objects.iter().map(|linked| linked.object.clone()).collect();
     let refs = &projection.state.refs;
@@ -292,6 +465,7 @@ async fn generate(
             occurred_at_ms,
             jsonld,
             objects,
+            message: Some(message),
         },
         refs: refs.clone(),
     };
@@ -322,8 +496,9 @@ async fn generate(
         let GitEvent::Packed(pack) = execute(store, effect, user).await? else {
             return Err(GitError::Unavailable);
         };
-        Some(objects::store_pack(context, &author(user), document, pack).await?)
+        Some(pack)
     };
+    let described = pack.as_ref().map(objects::describe_pack).transpose()?;
     let update = |name: &str, new: String| RefUpdate {
         name: name.into(),
         old: refs.get(name).cloned().unwrap_or_else(|| ZERO_OID.into()),
@@ -336,14 +511,14 @@ async fn generate(
     updates.retain(|update| update.old != update.new);
     made.retain(|commit| updates.iter().any(|update| update.new == *commit));
     let change = GitChange::Objects {
-        pack: pack.map(Box::new),
+        pack: described,
         refs: updates,
         lfs,
         revision: Some(event_id),
-        digest: Some(digest),
+        digest,
         made,
     };
-    publish::publish(context, document, user, change).await?;
+    publish::publish_with(context, document, user, change, (pack, Vec::new())).await?;
     let status = GitStatus {
         event_id,
         commit: Some(aruna),
@@ -374,7 +549,7 @@ async fn checkpoint(
         waiting: state.waiting.clone(),
         released: state.new_released.clone(),
         revision: state.revision,
-        covered: state.applied.clone(),
+        covered: state.coverable(),
     }));
     publish::publish(context, document, owner, change)
         .await
@@ -389,7 +564,131 @@ pub async fn refresh(
     store: &GitStore,
     document: &MetadataRegistryRecord,
 ) -> Result<Projection, GitError> {
-    update(context, store, document, None, false).await
+    let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
+    if let Some(projection) = recent(context, store, document, overdue).await? {
+        return Ok(projection);
+    }
+    let projection = update(context, store, document, None, false).await?;
+    // Pushed metadata that still waits must be retried by the next refresh.
+    let prefix = document.document_id.to_bytes().to_vec();
+    if records::prefixed::<PendingMerge>(context, PENDING, prefix)
+        .await
+        .is_ok_and(|rows| rows.is_empty())
+    {
+        let node = context.net_handle.as_ref().map(|net| net.node_id());
+        remember(node, document, overdue, &projection);
+    }
+    Ok(projection)
+}
+
+/// Documents with a background refresh queued or running on this node.
+static REFRESHING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<Ulid>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Like [`refresh`] for reads, which never wait for a snapshot. When the records lag behind
+/// the metadata, pushed metadata waits or a checkpoint is due, the full refresh runs in the
+/// background and `true` marks the projection as pending. The caller holds the lock.
+pub async fn view(
+    context: &DriverContext,
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+) -> Result<(Projection, bool), GitError> {
+    let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
+    if let Some(projection) = recent(context, store, document, overdue).await? {
+        return Ok((projection, false));
+    }
+    let projection = project(context, store, document).await?;
+    let prefix = document.document_id.to_bytes().to_vec();
+    let waiting = !records::prefixed::<PendingMerge>(context, PENDING, prefix)
+        .await?
+        .is_empty();
+    let pending = waiting
+        || projection.state.revision != Some(document.last_event_id)
+        || publish::uncovered(&projection.records).len() > CHECKPOINT_AFTER;
+    if pending {
+        background(context, document);
+    } else {
+        let node = context.net_handle.as_ref().map(|net| net.node_id());
+        remember(node, document, overdue, &projection);
+    }
+    Ok((projection, pending))
+}
+
+/// [`view`] without waiting behind a running snapshot: while one holds the lock, the last
+/// completed projection is served as pending. Only a document never projected here waits.
+pub async fn read_view(
+    context: &DriverContext,
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+) -> Result<(Projection, bool), GitError> {
+    let id = document.document_id;
+    let guard = match super::project::try_lock(id) {
+        Some(guard) => guard,
+        None => match super::project::last(id) {
+            Some(projection) => return Ok((projection, true)),
+            None => lock(id).await,
+        },
+    };
+    let viewed = view(context, store, document).await;
+    drop(guard);
+    viewed
+}
+
+/// Runs the full refresh once in the background. A lost run is found again by the next read;
+/// the metadata and pushed merges it acts on are stored durably.
+fn background(context: &DriverContext, document: &MetadataRegistryRecord) {
+    let id = document.document_id;
+    if !REFRESHING
+        .lock()
+        .is_ok_and(|mut running| running.insert(id))
+    {
+        return;
+    }
+    let context = context.clone();
+    let document = document.clone();
+    tokio::spawn(async move {
+        if let Some(store) = context
+            .metadata_handle
+            .as_ref()
+            .and_then(|handle| handle.git())
+        {
+            let _guard = lock(id).await;
+            let refreshing = refresh(&context, store, &document);
+            if let Err(error) = Box::pin(refreshing).await {
+                tracing::warn!(document_id = %id, %error, "Background Git refresh failed");
+            }
+        }
+        if let Ok(mut running) = REFRESHING.lock() {
+            running.remove(&id);
+        }
+    });
+}
+
+/// Whether main is an ARC that Aruna made although the metadata has no ARC markers, as
+/// earlier versions made for every dataset. Such a main switches to a plain RO-Crate.
+async fn misplaced(
+    store: &GitStore,
+    document: &MetadataRegistryRecord,
+    projection: &Projection,
+    jsonld: &str,
+) -> Result<bool, GitError> {
+    let Some(main) = projection.state.refs.get("refs/heads/main") else {
+        return Ok(false);
+    };
+    let plain =
+        serde_json::from_str(jsonld).is_ok_and(|value| metadata_layout(&value) == Layout::RoCrate);
+    if !plain || !projection.state.made.contains(main) {
+        return Ok(false);
+    }
+    let effect = GitEffect::Layout {
+        document_id: document.document_id,
+        revision: main.clone(),
+    };
+    let owner = UserId::nil(document.realm_id);
+    Ok(matches!(
+        execute(store, effect, owner).await?,
+        GitEvent::Layout(Some(Layout::Arc))
+    ))
 }
 
 async fn update(
@@ -399,7 +698,8 @@ async fn update(
     revision: Option<&MetadataRawRevision>,
     materializing: bool,
 ) -> Result<Projection, GitError> {
-    let mut projection = erased(project(context, store, document)).await?;
+    let projecting = erased(project(context, store, document));
+    let mut projection = aruna_core::telemetry::time_stage("git_project", projecting).await?;
     if let Err(error) = erased(super::pending::apply(context, store, document)).await {
         tracing::warn!(document_id = %document.document_id, %error, "Pushed metadata waits");
     }
@@ -407,20 +707,30 @@ async fn update(
     let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
     // The graph's content decides, so a late older edit that changes it is captured too.
     if let Some(source) = erased(current(context, document, revision, materializing)).await?
-        && let Ok(canonical) = craqle::canonicalize_jsonld(&source.1)
-        && projection.state.digest != Some(canonical.digest)
+        && let Ok(canonical) = {
+            let started = std::time::Instant::now();
+            let canonical = craqle::canonicalize_jsonld(&source.1);
+            aruna_core::telemetry::record_stage("git_canonicalize", started.elapsed());
+            canonical
+        }
         && (leading || overdue)
     {
-        erased(generate(
-            context,
-            store,
-            document,
-            &projection,
-            source,
-            canonical.digest,
-        ))
-        .await?;
-        projection = erased(project(context, store, document)).await?;
+        let stale = projection.state.digest != Some(canonical.digest);
+        let switch = !stale && erased(misplaced(store, document, &projection, &source.1)).await?;
+        if stale || switch {
+            // A switch records no digest, so the next refresh confirms the new snapshot.
+            let digest = (!switch).then_some(canonical.digest);
+            erased(generate(
+                context,
+                store,
+                document,
+                &projection,
+                source,
+                digest,
+            ))
+            .await?;
+            projection = erased(project(context, store, document)).await?;
+        }
     }
     let uncovered = publish::uncovered(&projection.records).len();
     if uncovered > CHECKPOINT_AFTER && (leading || uncovered > 2 * CHECKPOINT_AFTER) {
@@ -447,23 +757,66 @@ pub async fn capture(
         return Ok(());
     };
     let _guard = lock(record.document_id).await;
+    forget(record.document_id);
     match update(context, store, record, revision, true).await {
         Ok(_) | Err(GitError::NotHolder) => Ok(()),
         Err(error) => Err(error),
     }
 }
 
+/// The snapshot status, the projection, the layout of main when main exists, the document and
+/// whether a newer snapshot is still being made.
 pub async fn status(
     context: &DriverContext,
     store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
-) -> Result<(Option<GitStatus>, Projection), GitError> {
+) -> Result<
+    (
+        Option<GitStatus>,
+        Projection,
+        Option<Layout>,
+        MetadataRegistryRecord,
+        bool,
+    ),
+    GitError,
+> {
     let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
-    let _guard = lock(id).await;
-    let projection = refresh(context, store, &document).await?;
+    // Status never waits for a first snapshot either; it reports an empty pending state.
+    let (projection, pending) = match super::project::try_lock(id) {
+        Some(guard) => {
+            let viewed = view(context, store, &document).await?;
+            drop(guard);
+            viewed
+        }
+        None => match super::project::last(id) {
+            Some(projection) => (projection, true),
+            None => (
+                Projection {
+                    state: super::state::GitState::default(),
+                    records: Default::default(),
+                    holders: Vec::new(),
+                    writes: 0,
+                },
+                true,
+            ),
+        },
+    };
     let status = records::load(context, STATUS, id.to_bytes().to_vec()).await?;
-    Ok((status, projection))
+    let layout = match projection.state.refs.get("refs/heads/main") {
+        Some(main) => {
+            let effect = GitEffect::Layout {
+                document_id: id,
+                revision: main.clone(),
+            };
+            match execute(store, effect, auth.user_id).await? {
+                GitEvent::Layout(layout) => layout,
+                _ => return Err(GitError::Unavailable),
+            }
+        }
+        None => None,
+    };
+    Ok((status, projection, layout, document, pending))
 }
 
 pub async fn export(
@@ -474,8 +827,7 @@ pub async fn export(
     revision: String,
 ) -> Result<Bytes, GitError> {
     let document = document(context, auth, id, Permission::READ).await?;
-    let _guard = lock(id).await;
-    refresh(context, store, &document).await?;
+    read_view(context, store, &document).await?;
     let known = GitEffect::Resolve {
         document_id: id,
         revision: revision.clone(),

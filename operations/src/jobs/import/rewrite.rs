@@ -5,11 +5,12 @@
 use std::collections::{HashMap, HashSet};
 
 use aruna_core::metadata::MetadataValidationViolation;
+use aruna_core::structs::storage::data_identity::{LOCAL_PATH_IRI, ensure_local_term};
 use craqle::{CrateViolation, RoCrateError, UpdateError};
 use oxrdf::{NamedOrBlankNode, Term};
 use oxttl::NQuadsParser;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use thiserror::Error;
 use url::Url;
 
@@ -17,7 +18,6 @@ use crate::jobs::rocrate_jsonld::{JsonLdKeywords, RDF_TYPE_IRI, is_file_type};
 
 const JSONLD_BASE_IRI: &str = "https://craqle.invalid/";
 const SCHEMA_CONTENT_IRI: &str = "http://schema.org/contentUrl";
-const LOCAL_PATH_IRI: &str = "https://w3id.org/ro/terms#localPath";
 /// ASCII characters an IRI cannot carry literally. `%` is excluded so an already
 /// encoded identifier normalizes to itself.
 const ID_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -48,8 +48,10 @@ pub struct ValidatedDocument {
 
 #[derive(Clone, Debug)]
 pub struct RewriteTarget {
-    pub w3id: String,
-    pub hash_w3id: String,
+    /// The normalized `@id`, usually the content address.
+    pub id: String,
+    /// The `s3://` URL of the stored object.
+    pub content_url: String,
     pub local_path: String,
 }
 
@@ -254,7 +256,7 @@ fn rewrite_value(
                 .as_ref()
                 .and_then(|(key, id)| matching_target(targets, id).map(|target| (key, target)))
             {
-                object.insert(id_key.clone(), Value::String(target.w3id.clone()));
+                object.insert(id_key.clone(), Value::String(target.id.clone()));
                 if object.len() > 1 {
                     prepend_value(
                         object,
@@ -272,7 +274,7 @@ fn rewrite_value(
                         } else {
                             SCHEMA_CONTENT_IRI
                         },
-                        Value::String(target.hash_w3id),
+                        Value::String(target.content_url),
                     );
                 }
             }
@@ -335,40 +337,13 @@ fn contains_string(value: &Value, expected: &str) -> bool {
 }
 
 fn ensure_local_context(value: &mut Value) -> Result<(), CrateValidationError> {
-    let object = value.as_object_mut().ok_or_else(|| {
-        CrateValidationError::Invalid("RO-Crate document must be an object".to_string())
-    })?;
-    let mapping = json!({"localPath": LOCAL_PATH_IRI});
-    match object.remove("@context") {
-        Some(Value::Array(mut values)) => {
-            if !values.iter().any(has_local_context) {
-                values.push(mapping);
-            }
-            object.insert("@context".to_string(), Value::Array(values));
-        }
-        Some(Value::Object(mut context)) => {
-            context.insert(
-                "localPath".to_string(),
-                Value::String(LOCAL_PATH_IRI.to_string()),
-            );
-            object.insert("@context".to_string(), Value::Object(context));
-        }
-        Some(context) => {
-            object.insert("@context".to_string(), Value::Array(vec![context, mapping]));
-        }
-        None => {
-            object.insert("@context".to_string(), mapping);
-        }
+    if ensure_local_term(value) {
+        Ok(())
+    } else {
+        Err(CrateValidationError::Invalid(
+            "RO-Crate document must be an object".to_string(),
+        ))
     }
-    Ok(())
-}
-
-fn has_local_context(value: &Value) -> bool {
-    value
-        .as_object()
-        .and_then(|object| object.get("localPath"))
-        .and_then(Value::as_str)
-        == Some(LOCAL_PATH_IRI)
 }
 
 fn map_validation_error(error: RoCrateError) -> CrateValidationError {
@@ -402,6 +377,7 @@ fn validation_issue(violation: CrateViolation) -> MetadataValidationViolation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+    use serde_json::json;
 
     fn crate_json(version: &str) -> String {
         json!({
@@ -470,8 +446,8 @@ mod pure_tests {
 
         let validated = validate_document(&document).unwrap();
         let target = RewriteTarget {
-            w3id: "https://w3id.org/aruna/data/arn:example".to_string(),
-            hash_w3id: format!("https://w3id.org/aruna/data/{}", "a".repeat(64)),
+            id: "https://w3id.org/aruna/data/arn:example".to_string(),
+            content_url: "s3://bucket/data/a.txt".to_string(),
             local_path: "data/a.txt".to_string(),
         };
         let rewritten = rewrite_document(
@@ -504,8 +480,8 @@ mod pure_tests {
 
     fn target(name: &str) -> RewriteTarget {
         RewriteTarget {
-            w3id: format!("https://w3id.org/aruna/data/arn:{name}"),
-            hash_w3id: format!("https://w3id.org/aruna/data/{}", "a".repeat(64)),
+            id: format!("https://w3id.org/aruna/data/arn:{name}"),
+            content_url: "s3://bucket/data/a.txt".to_string(),
             local_path: format!("data/{name}"),
         }
     }
@@ -619,9 +595,10 @@ mod pure_tests {
     #[test]
     fn rewrite_updates_refs() {
         let validated = validate_document(&crate_json("1.1")).unwrap();
+        let id = aruna_core::structs::storage::data_identity::content_id([10; 32]);
         let target = RewriteTarget {
-            w3id: "https://w3id.org/aruna/data/arn:example".to_string(),
-            hash_w3id: format!("https://w3id.org/aruna/data/{}", "a".repeat(64)),
+            id: id.clone(),
+            content_url: "s3://bucket/data/a.txt".to_string(),
             local_path: "data/a.txt".to_string(),
         };
         let rewritten = rewrite_document(
@@ -631,10 +608,9 @@ mod pure_tests {
         .unwrap();
         assert!(rewritten.warnings.is_empty());
         let value: Value = serde_json::from_str(&rewritten.jsonld).unwrap();
-        assert_eq!(
-            value["@graph"][1]["hasPart"]["@id"],
-            "https://w3id.org/aruna/data/arn:example"
-        );
+        assert_eq!(value["@graph"][1]["hasPart"]["@id"], id);
+        assert_eq!(value["@graph"][2]["@id"], id);
+        assert_eq!(value["@graph"][2]["contentUrl"], "s3://bucket/data/a.txt");
         assert_eq!(value["@graph"][2]["localPath"], "data/a.txt");
         assert!(
             value["@context"]

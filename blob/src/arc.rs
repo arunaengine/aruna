@@ -3,7 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::git::{command, exchange};
-use aruna_core::git::{GitSnapshot, LinkedObject, MAX_GIT_BYTES, MergeOutcome, Refs};
+use aruna_core::git::{GitSnapshot, LfsObject, LinkedObject, MAX_GIT_BYTES, MergeOutcome, Refs};
+use aruna_core::repo_layout::{
+    ARUNA_FILE, CRATE_FILE, INVESTIGATION, Layout, metadata_layout, metadata_text,
+};
+use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -36,6 +40,9 @@ pub async fn export(directory: &Path, revision: &str) -> std::io::Result<Value> 
     let oid = std::str::from_utf8(&oid)
         .map_err(std::io::Error::other)?
         .trim();
+    if crate::rocrate::layout(directory, oid).await? == Layout::RoCrate {
+        return crate::rocrate::export(directory, oid).await;
+    }
     let tree = command(directory, &["ls-tree", "-rlz", oid]).await?;
     let mut files = BTreeMap::new();
     let mut total = 0usize;
@@ -70,7 +77,7 @@ fn failed(error: &str) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
-type Files = BTreeMap<String, (String, Vec<u8>)>;
+pub(crate) type Files = BTreeMap<String, (String, Vec<u8>)>;
 
 /// Writes `base` (or an empty tree) with `files` replaced and `removed` paths dropped.
 async fn write_tree(
@@ -176,11 +183,18 @@ async fn reconcile(
         .get("ro-crate-metadata.json")
         .ok_or_else(|| failed("ARC conversion omitted its RO-Crate"))?;
     let derived: Value = serde_json::from_slice(derived)?;
-    let current = export(directory, main).await.ok();
-    let same = current
-        .as_ref()
-        .and_then(|value| value.get("rocrate"))
-        .is_some_and(|value| entities(value) == entities(&derived));
+    // Plain RO-Crate files hold no workbooks, so client workbooks stay as they are.
+    let plain = !files.contains_key(INVESTIGATION);
+    let current = if plain {
+        None
+    } else {
+        export(directory, main).await.ok()
+    };
+    let same = plain
+        || current
+            .as_ref()
+            .and_then(|value| value.get("rocrate"))
+            .is_some_and(|value| entities(value) == entities(&derived));
     let mut overlay = Files::new();
     for (path, entry) in files {
         let isa = workbook(path) || path == "LICENSE";
@@ -195,39 +209,56 @@ async fn reconcile(
         let existing = command(directory, &["show", &format!("{main}:{path}")])
             .await
             .ok();
+        // A plain RO-Crate keeps its client files at the paths its entities name.
+        if plain && pointers.contains(path) && existing.is_some() {
+            continue;
+        }
         if existing.as_deref() != Some(entry.1.as_slice()) {
             overlay.insert(path.clone(), entry.clone());
         }
     }
-    if !pointers.is_empty()
-        && let Some((mode, generated)) = files.get(".gitattributes")
-    {
-        // Keep the client's LFS rules and add the pointer paths it lacks.
+    if let Some((mode, generated)) = files.get(".gitattributes") {
+        // Keep the client's rules after the missing generated ones, so the client's win.
         let existing = command(directory, &["show", &format!("{main}:.gitattributes")])
             .await
             .unwrap_or_default();
-        let mut merged = String::from_utf8_lossy(&existing).into_owned();
-        let known: std::collections::BTreeSet<String> = merged.lines().map(str::to_owned).collect();
+        let client = String::from_utf8_lossy(&existing).into_owned();
+        let known: std::collections::BTreeSet<&str> = client.lines().collect();
+        let mut merged = String::new();
         for line in String::from_utf8_lossy(generated).lines() {
             if !known.contains(line) {
-                if !merged.is_empty() && !merged.ends_with('\n') {
-                    merged.push('\n');
-                }
                 merged.push_str(line);
                 merged.push('\n');
             }
         }
+        merged.push_str(&client);
         if merged.as_bytes() != existing.as_ref() {
             overlay.insert(".gitattributes".into(), (mode.clone(), merged.into_bytes()));
         }
     }
     let mut removed = Vec::new();
-    if !same {
+    // A plain snapshot onto an ARC main drops the ISA workbooks and the ARC graph file.
+    let switching = plain && crate::rocrate::layout(directory, main).await? == Layout::Arc;
+    if !same || switching {
         let listing = command(directory, &["ls-tree", "-r", "-z", "--name-only", main]).await?;
         for path in listing.split(|byte| *byte == 0) {
             let path = std::str::from_utf8(path).map_err(std::io::Error::other)?;
-            if workbook(path) && !files.contains_key(path) {
+            let generated = workbook(path) || (switching && path == ARUNA_FILE);
+            if generated && !path.is_empty() && !files.contains_key(path) {
                 removed.push(path.to_string());
+            }
+        }
+    }
+    if switching {
+        // ARC pointers to objects the plain copy now places elsewhere would become extra files.
+        let placed: std::collections::BTreeSet<String> = pointers
+            .iter()
+            .filter_map(|path| LfsObject::from_pointer(&files.get(path)?.1))
+            .map(|object| object.oid)
+            .collect();
+        for (path, object) in crate::rocrate::pointer_files(directory, main).await? {
+            if placed.contains(&object.oid) && !files.contains_key(&path) {
+                removed.push(path);
             }
         }
     }
@@ -239,7 +270,7 @@ async fn reconcile(
         .map(Some)
 }
 
-type Pointers = std::collections::BTreeSet<String>;
+pub(crate) type Pointers = std::collections::BTreeSet<String>;
 
 /// Converts the snapshot's metadata into ARC files. Data files the metadata needs come
 /// from `base`. Unrepresentable metadata is an `Err` value.
@@ -278,6 +309,12 @@ async fn arc_files(
             .decode(content.as_str().ok_or_else(|| failed("invalid ARC file"))?)
             .map_err(std::io::Error::other)?;
         files.insert(path.clone(), ("100644".into(), data));
+    }
+    for path in [CRATE_FILE, ARUNA_FILE] {
+        if let Some((_, data)) = files.get_mut(path) {
+            let value: Value = serde_json::from_slice(data)?;
+            *data = metadata_text(&value);
+        }
     }
     let mut total: usize = files.values().map(|(_, data)| data.len()).sum();
     for path in conversion["required"].as_array().into_iter().flatten() {
@@ -319,6 +356,37 @@ async fn arc_files(
     Ok(Ok((files, pointers)))
 }
 
+/// Snapshot files in the layout the metadata asks for. Metadata marked as an ARC that cannot
+/// become one falls back to a plain RO-Crate unless `base` is an ARC already.
+async fn snapshot_files(
+    directory: &Path,
+    source: (Ulid, &str, &[LinkedObject]),
+    base: Option<&str>,
+) -> std::io::Result<Result<(Files, Pointers), String>> {
+    let (_, jsonld, objects) = source;
+    let value: Value = serde_json::from_str(jsonld)?;
+    if metadata_layout(&value) == Layout::RoCrate {
+        return crate::rocrate::files(jsonld, objects).map(Ok);
+    }
+    let layout = match base {
+        Some(base) => Some(crate::rocrate::layout(directory, base).await?),
+        None => None,
+    };
+    Ok(match (arc_files(directory, source, base).await?, layout) {
+        (Err(error), None | Some(Layout::RoCrate)) => {
+            tracing::info!(%error, "Metadata is not an ARC; the snapshot is a plain RO-Crate");
+            Ok(crate::rocrate::files(jsonld, objects)?)
+        }
+        (converted, _) => converted,
+    })
+}
+
+/// The author's message, or the default one, followed by the revision `trailer`.
+fn snapshot_message(message: Option<&str>, trailer: &str) -> String {
+    let subject = message.unwrap_or("feat: capture Aruna metadata");
+    format!("{subject}{trailer}")
+}
+
 /// Builds the `aruna` commit for `source` and, when main must follow, the main commit.
 /// No ref moves: refs change only through replicated records. Unrepresentable metadata is an
 /// `Err` value, never a fabricated commit.
@@ -327,17 +395,30 @@ pub async fn generate(
     source: GitSnapshot,
     refs: &Refs,
 ) -> std::io::Result<Result<(String, Option<String>), String>> {
-    let previous = refs.get("refs/heads/aruna").cloned();
     let main = refs.get("refs/heads/main").cloned();
     let converted = (
         source.document_id,
         source.jsonld.as_str(),
         source.objects.as_slice(),
     );
-    let (files, pointers) = match arc_files(directory, converted, main.as_deref()).await? {
+    let (files, pointers) = match snapshot_files(directory, converted, main.as_deref()).await? {
         Ok(converted) => converted,
         Err(error) => return Ok(Err(error)),
     };
+    snapshot_commit(directory, &source, refs, (files, pointers))
+        .await
+        .map(Ok)
+}
+
+/// Commits `files` on `aruna` and, when main must follow, merges them into main.
+pub(crate) async fn snapshot_commit(
+    directory: &Path,
+    source: &GitSnapshot,
+    refs: &Refs,
+    (files, pointers): (Files, Pointers),
+) -> std::io::Result<(String, Option<String>)> {
+    let previous = refs.get("refs/heads/aruna").cloned();
+    let main = refs.get("refs/heads/main").cloned();
     let trailer = format!("\n\nAruna-Revision: {}\n", source.event_id);
     let tree = write_tree(directory, None, &files, &[]).await?;
     if let Some(previous) = &previous {
@@ -347,11 +428,11 @@ pub async fn generate(
             .trim()
             == tree
         {
-            return Ok(Ok((previous.clone(), None)));
+            return Ok((previous.clone(), None));
         }
     }
     let parents: Vec<&str> = previous.iter().map(String::as_str).collect();
-    let message = format!("feat: capture Aruna metadata{trailer}");
+    let message = snapshot_message(source.message.as_deref(), &trailer);
     let commit = commit_tree(directory, &tree, &parents, message, source.occurred_at_ms).await?;
     let main = match main.as_deref() {
         None => Some(commit.clone()),
@@ -365,7 +446,7 @@ pub async fn generate(
             None => None,
         },
     };
-    Ok(Ok((commit, main)))
+    Ok((commit, main))
 }
 
 /// Commits the snapshot's metadata on top of `head`, keeping client files and equivalent
@@ -381,7 +462,7 @@ pub async fn edit(
         source.jsonld.as_str(),
         source.objects.as_slice(),
     );
-    let (files, pointers) = match arc_files(directory, converted, Some(head)).await? {
+    let (files, pointers) = match snapshot_files(directory, converted, Some(head)).await? {
         Ok(converted) => converted,
         Err(error) => return Ok(Err(error)),
     };
@@ -409,10 +490,13 @@ async fn metadata_file(directory: &Path, revision: &str) -> Option<String> {
 /// `graph` JSON-LD. Returns the merged JSON-LD, or `None` when the graph stays the same.
 pub async fn merge_metadata(
     directory: &Path,
-    old: Option<&str>,
-    new: &str,
+    (old, new): (Option<&str>, &str),
     graph: &str,
+    location: Option<&DatasetLocation>,
 ) -> std::io::Result<Result<Option<String>, String>> {
+    if crate::rocrate::layout(directory, new).await? == Layout::RoCrate {
+        return crate::rocrate::merge_metadata(directory, (old, new), graph, location).await;
+    }
     let derived = export(directory, new).await?;
     if let Some(error) = derived["error"].as_str() {
         return Ok(Err(error.into()));
@@ -497,18 +581,26 @@ pub async fn merge(
         return Ok(MergeOutcome::Conflicts(other));
     }
     if !resolvable.is_empty() {
+        // A plain RO-Crate keeps its whole graph in its RO-Crate file.
+        let graph = match crate::rocrate::layout(directory, target).await? {
+            Layout::Arc => metadata_file(directory, target).await,
+            Layout::RoCrate => command(directory, &["show", &format!("{target}:{CRATE_FILE}")])
+                .await
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok()),
+        };
         let (Some(base), Some(graph)) = (
             crate::repo::merge_base(directory, target, source).await,
-            metadata_file(directory, target).await,
+            graph,
         ) else {
             return Ok(MergeOutcome::Conflicts(resolvable));
         };
-        let merged = match merge_metadata(directory, Some(&base), source, &graph).await? {
+        let merged = match merge_metadata(directory, (Some(&base), source), &graph, None).await? {
             Ok(merged) => merged.unwrap_or(graph),
             Err(error) => return Ok(MergeOutcome::Failed(error)),
         };
         let converted = (document_id, merged.as_str(), &[][..]);
-        let (files, pointers) = match arc_files(directory, converted, Some(target)).await? {
+        let (files, pointers) = match snapshot_files(directory, converted, Some(target)).await? {
             Ok(converted) => converted,
             Err(error) => return Ok(MergeOutcome::Failed(error)),
         };
@@ -519,4 +611,27 @@ pub async fn merge(
     let parents = [target, source];
     let commit = commit_tree(directory, &tree, &parents, message, occurred_at_ms).await?;
     Ok(MergeOutcome::Merged(commit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_message;
+
+    #[test]
+    fn keeps_default_message() {
+        let trailer = "\n\nAruna-Revision: 01M\n";
+        assert_eq!(
+            snapshot_message(None, trailer),
+            "feat: capture Aruna metadata\n\nAruna-Revision: 01M\n"
+        );
+    }
+
+    #[test]
+    fn uses_author_message() {
+        let trailer = "\n\nAruna-Revision: 01M\n";
+        assert_eq!(
+            snapshot_message(Some("Add run 42\n\nNew LC-MS data"), trailer),
+            "Add run 42\n\nNew LC-MS data\n\nAruna-Revision: 01M\n"
+        );
+    }
 }
