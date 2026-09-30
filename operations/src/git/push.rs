@@ -177,6 +177,26 @@ pub(super) async fn record(
     publish::publish_with(context, document, auth.user_id, change, (pack, extra)).await
 }
 
+/// Like [`record`] for a pack this node made itself, outside a Git transfer: its cache holds
+/// the objects already. A push must not use it, since the transfer holds the repository.
+pub(super) async fn record_made(
+    context: &DriverContext,
+    auth: &AuthContext,
+    document: &MetadataRegistryRecord,
+    refs: Vec<RefUpdate>,
+    written: (Bytes, Vec<StoredObject>),
+    made: (Vec<String>, Option<PendingMerge>),
+) -> Result<GitRecord, GitError> {
+    let record = record(context, auth, document, refs, written, made).await?;
+    if let GitChange::Objects {
+        pack: Some(pack), ..
+    } = &record.change
+    {
+        objects::mark_imported(context, (document.document_id, auth.user_id), pack).await;
+    }
+    Ok(record)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

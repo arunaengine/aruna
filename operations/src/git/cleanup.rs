@@ -82,7 +82,15 @@ async fn settled(
     };
     // Copies of remote packs were stored under git-copies/ too.
     if object.key.starts_with("git-packs/") || history.iter().any(named) {
-        return moved(context, document, &pack, &history).await;
+        return match moved(context, document, &pack, &history).await {
+            // Neither the old version nor Fjall has the bytes, so the row points at nothing.
+            Err(error) if !stored(context, object).await => {
+                warn!(document_id = %document.document_id, key = %object.key, %error,
+                    "Old Git pack is lost; its index row is dropped");
+                Ok(Ok(()))
+            }
+            moved => moved,
+        };
     }
     original(context, document, object, &history).await
 }
@@ -143,6 +151,17 @@ async fn original(
     })
 }
 
+/// Whether the exact version still exists on this node.
+async fn stored(context: &DriverContext, object: &StoredObject) -> bool {
+    let Some(group_id) = object.group_id else {
+        return false;
+    };
+    let found = (object.bucket.as_str(), group_id);
+    objects::described(context, found, &object.key, Some(object.version_id))
+        .await
+        .is_ok_and(|described| described.is_some())
+}
+
 /// Deletes the exact version through the normal S3 delete; a version that is already gone
 /// only loses its index row.
 async fn delete(
@@ -152,11 +171,7 @@ async fn delete(
     key: Vec<u8>,
 ) -> Result<(), GitError> {
     let group_id = object.group_id.ok_or(GitError::Invalid)?;
-    let found = (object.bucket.as_str(), group_id);
-    let exists = objects::described(context, found, &object.key, Some(object.version_id))
-        .await
-        .is_ok_and(|described| described.is_some());
-    if exists {
+    if stored(context, object).await {
         drive(
             DeleteObjectOperation::new(DeleteObjectInput {
                 bucket: object.bucket.clone(),

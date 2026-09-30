@@ -24,19 +24,24 @@ pub async fn imported(directory: &Path) -> std::io::Result<BTreeSet<String>> {
 
 /// Imports a pack whose `digest` the caller verified, then remembers the digest.
 pub async fn import(directory: &Path, digest: &str, pack: Bytes) -> std::io::Result<()> {
-    let imported = directory.join("aruna-imported");
     let mut process = Command::new("git");
     process
         .current_dir(directory)
         .args(["index-pack", "--stdin", "--fix-thin"]);
     exchange(process, pack, false).await?;
+    remember(directory, digest).await
+}
+
+/// Records `digest` as imported, for a pack whose objects the repository already holds.
+pub async fn remember(directory: &Path, digest: &str) -> std::io::Result<()> {
+    let imported = directory.join("aruna-imported");
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(imported)
         .await?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, format!("{digest}\n").as_bytes()).await?;
-    file.sync_all().await
+    // Part of the rebuildable cache, like the repository itself, so it is not synced.
+    tokio::io::AsyncWriteExt::write_all(&mut file, format!("{digest}\n").as_bytes()).await
 }
 
 pub async fn refs(directory: &Path) -> std::io::Result<Refs> {
@@ -319,6 +324,25 @@ pub async fn diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remembers_local_packs() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        assert!(
+            imported(directory.path())
+                .await
+                .expect("empty list")
+                .is_empty()
+        );
+        let digest = "a".repeat(64);
+        remember(directory.path(), &digest)
+            .await
+            .expect("digest noted");
+        assert_eq!(
+            imported(directory.path()).await.expect("list"),
+            BTreeSet::from([digest])
+        );
+    }
 
     async fn git(directory: &Path, args: &[&str]) -> String {
         let mut process = Command::new("git");

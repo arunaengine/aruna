@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::git::{DocumentLocks, GitEffect, GitEvent, MAX_GIT_BYTES};
+use aruna_core::repo_layout::Layout;
 use aruna_core::telemetry::{record_stage, time_stage};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,12 @@ pub struct GitStore {
     helper: PathBuf,
     locks: DocumentLocks,
     slots: Semaphore,
+    /// The layout of each seen commit; a commit never changes, so the answer stays valid.
+    layouts: std::sync::Mutex<lru::LruCache<(ulid::Ulid, String), Layout>>,
 }
+
+/// Commits whose layout is kept; older answers are read from the repository again.
+const LAYOUTS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4096).unwrap();
 
 impl GitStore {
     pub fn new(root: PathBuf, helper: PathBuf) -> Self {
@@ -27,7 +33,18 @@ impl GitStore {
             helper,
             locks: DocumentLocks::default(),
             slots: Semaphore::new(2),
+            layouts: std::sync::Mutex::new(lru::LruCache::new(LAYOUTS)),
         }
+    }
+
+    /// The stored layout when `revision` is a full commit id seen before.
+    fn known_layout(&self, document_id: ulid::Ulid, revision: &str) -> Option<Layout> {
+        let full = revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if !full {
+            return None;
+        }
+        let mut layouts = self.layouts.lock().ok()?;
+        layouts.get(&(document_id, revision.to_string())).copied()
     }
 
     /// Whether the local repository still has the required files and settings.
@@ -40,12 +57,21 @@ impl GitStore {
         effect: GitEffect,
         actor: aruna_core::UserId,
     ) -> std::io::Result<GitEvent> {
+        if let GitEffect::Layout {
+            document_id,
+            revision,
+        } = &effect
+            && let Some(layout) = self.known_layout(*document_id, revision)
+        {
+            return Ok(GitEvent::Layout(Some(layout)));
+        }
         let id = match &effect {
             GitEffect::Initialize(id) | GitEffect::Refs(id) | GitEffect::Imported(id) => *id,
             GitEffect::Generate { snapshot, .. } | GitEffect::Edit { snapshot, .. } => {
                 snapshot.document_id
             }
             GitEffect::Import { document_id, .. }
+            | GitEffect::MarkImported { document_id, .. }
             | GitEffect::Resolve { document_id, .. }
             | GitEffect::Peel { document_id, .. }
             | GitEffect::Commits { document_id, .. }
@@ -154,6 +180,9 @@ impl GitStore {
                     .await
                     .map(|_| GitEvent::Initialized)
             }
+            GitEffect::MarkImported { digest, .. } => crate::repo::remember(&repository, &digest)
+                .await
+                .map(|_| GitEvent::Initialized),
             GitEffect::Refs(_) => crate::repo::refs(&repository).await.map(GitEvent::Refs),
             GitEffect::Ancestry { pairs, .. } => Ok(GitEvent::Ancestry(
                 crate::repo::ancestry(&repository, &pairs).await,
@@ -178,9 +207,13 @@ impl GitStore {
             }
             GitEffect::Layout { revision, .. } => {
                 match crate::repo::resolve(&repository, &revision).await {
-                    Some(commit) => crate::rocrate::layout(&repository, &commit)
-                        .await
-                        .map(|layout| GitEvent::Layout(Some(layout))),
+                    Some(commit) => {
+                        let layout = crate::rocrate::layout(&repository, &commit).await?;
+                        if let Ok(mut layouts) = self.layouts.lock() {
+                            layouts.put((id, commit), layout);
+                        }
+                        Ok(GitEvent::Layout(Some(layout)))
+                    }
                     None => Ok(GitEvent::Layout(None)),
                 }
             }
@@ -302,7 +335,8 @@ fn settings(hooks: &str) -> [(&'static str, &str); 7] {
         ("receive.fsckObjects", "true"),
         ("receive.denyNonFastForwards", "true"),
         ("core.logAllRefUpdates", "true"),
-        ("core.fsync", "committed"),
+        // The repository is a cache rebuilt from the replicated records, so it skips disk syncs.
+        ("core.fsync", "none"),
     ]
 }
 
@@ -523,6 +557,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn layouts_stay_known() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = GitStore::new(directory.path().to_path_buf(), "helper".into());
+        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let id = ulid::Ulid::from(3);
+        let repository = directory.path().join(format!("{id}.git"));
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory.path())
+                .output()
+                .expect("git runs");
+            String::from_utf8(output.stdout)
+                .expect("utf-8")
+                .trim()
+                .to_string()
+        };
+        let path = repository.to_str().expect("path");
+        run(&["init", "-q", "--bare", path]);
+        let tree = run(&[
+            "--git-dir",
+            path,
+            "hash-object",
+            "-w",
+            "-t",
+            "tree",
+            "/dev/null",
+        ]);
+        let commit = run(&[
+            "--git-dir",
+            path,
+            "-c",
+            "user.name=A",
+            "-c",
+            "user.email=a@b",
+            "commit-tree",
+            &tree,
+            "-m",
+            "empty",
+        ]);
+        let layout = || GitEffect::Layout {
+            document_id: id,
+            revision: commit.clone(),
+        };
+        let first = store.execute(layout(), actor).await.expect("layout read");
+        assert!(matches!(first, GitEvent::Layout(Some(Layout::RoCrate))));
+        std::fs::remove_dir_all(&repository).expect("repository removed");
+        // A commit never changes, so the answer no longer needs the repository.
+        let again = store.execute(layout(), actor).await.expect("layout known");
+        assert!(matches!(again, GitEvent::Layout(Some(Layout::RoCrate))));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn setup_runs_once() {
@@ -555,7 +642,7 @@ mod tests {
         // Git rewrites the config file on every change, so an unchanged file ran no setup.
         assert_eq!(config().await, first);
 
-        tokio::fs::write(repository.join(SETTINGS), "core.fsync=none\n")
+        tokio::fs::write(repository.join(SETTINGS), "core.fsync=committed\n")
             .await
             .expect("older settings");
         store

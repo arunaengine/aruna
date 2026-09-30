@@ -4,7 +4,7 @@
 
 use super::changes::summary;
 use super::project::{Projection, author, forget, lock, project, recent, remember};
-use super::versions::{copied, graph, plain};
+use super::versions::{copied, plain};
 use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -26,7 +26,9 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEventRecord, MetadataRawRevision,
 };
-use aruna_core::repo_layout::{Layout, data_path, entity_path, is_file, metadata_layout, path_id};
+use aruna_core::repo_layout::{
+    ARUNA_FILE, CRATE_FILE, Layout, data_path, entity_path, is_file, metadata_layout, path_id,
+};
 use aruna_core::storage_entries::{event_log_key, materialization_status_key};
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -35,6 +37,7 @@ use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::data_identity::{DataIdentity, text_values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::telemetry::time_stage;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
 use ulid::Ulid;
@@ -416,10 +419,33 @@ async fn subject(
 ) -> String {
     let after = serde_json::from_str(jsonld).map_or(serde_json::Value::Null, copied);
     let before = match projection.state.refs.get("refs/heads/aruna") {
-        Some(commit) => graph(store, &author(user), document.document_id, commit).await,
+        Some(commit) => previous(store, document.document_id, commit, user).await,
         None => None,
     };
     summary(before.as_ref(), &after)
+}
+
+/// The metadata a snapshot commit stores, read as the file itself: the ARC graph file, else
+/// the RO-Crate. The full version view also adds file entities, which a subject never needs.
+async fn previous(
+    store: &GitStore,
+    document_id: Ulid,
+    commit: &str,
+    user: UserId,
+) -> Option<serde_json::Value> {
+    for path in [ARUNA_FILE, CRATE_FILE] {
+        let effect = GitEffect::ReadFile {
+            document_id,
+            revision: commit.to_string(),
+            path: path.to_string(),
+        };
+        match execute(store, effect, user).await.ok()? {
+            GitEvent::File(Some(bytes)) => return serde_json::from_slice(&bytes).ok().map(copied),
+            GitEvent::File(None) => continue,
+            _ => return None,
+        }
+    }
+    None
 }
 
 async fn generate(
@@ -453,9 +479,17 @@ async fn generate(
         .filter(|message| !message.is_empty())
     {
         Some(message) => message,
-        None => subject(store, document, projection, &jsonld, user).await,
+        None => {
+            time_stage(
+                "git_subject",
+                subject(store, document, projection, &jsonld, user),
+            )
+            .await
+        }
     };
-    let objects = linked(context, document, &jsonld, &author(user)).await;
+    let linker = author(user);
+    let linking = linked(context, document, &jsonld, &linker);
+    let objects = time_stage("git_linked", linking).await;
     let lfs: Vec<StoredObject> = objects.iter().map(|linked| linked.object.clone()).collect();
     let refs = &projection.state.refs;
     let effect = GitEffect::Generate {
@@ -518,13 +552,27 @@ async fn generate(
         digest,
         made,
     };
-    publish::publish_with(context, document, user, change, (pack, Vec::new())).await?;
+    let marked = match &change {
+        GitChange::Objects {
+            pack: Some(pack), ..
+        } => Some(pack.clone()),
+        _ => None,
+    };
+    let publishing = publish::publish_with(context, document, user, change, (pack, Vec::new()));
+    time_stage("git_publish", publishing).await?;
+    if let Some(pack) = &marked {
+        objects::mark_imported(context, (document.document_id, user), pack).await;
+    }
     let status = GitStatus {
         event_id,
         commit: Some(aruna),
         error: None,
     };
-    records::save(context, STATUS, status_key, &status).await
+    time_stage(
+        "git_status",
+        records::save(context, STATUS, status_key, &status),
+    )
+    .await
 }
 
 /// Folds the records covered so far into one checkpoint so history never hits its cap.
@@ -652,8 +700,10 @@ fn background(context: &DriverContext, document: &MetadataRegistryRecord) {
             .as_ref()
             .and_then(|handle| handle.git())
         {
-            let _guard = lock(id).await;
-            let refreshing = refresh(&context, store, &document);
+            let refreshing = timed(id, async {
+                let _guard = lock(id).await;
+                refresh(&context, store, &document).await
+            });
             if let Err(error) = Box::pin(refreshing).await {
                 tracing::warn!(document_id = %id, %error, "Background Git refresh failed");
             }
@@ -706,7 +756,8 @@ async fn update(
     let leading = first(context, &projection.holders);
     let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
     // The graph's content decides, so a late older edit that changes it is captured too.
-    if let Some(source) = erased(current(context, document, revision, materializing)).await?
+    let loading = erased(current(context, document, revision, materializing));
+    if let Some(source) = time_stage("git_source", loading).await?
         && let Ok(canonical) = {
             let started = std::time::Instant::now();
             let canonical = craqle::canonicalize_jsonld(&source.1);
@@ -756,12 +807,28 @@ pub async fn capture(
     else {
         return Ok(());
     };
-    let _guard = lock(record.document_id).await;
-    forget(record.document_id);
-    match update(context, store, record, revision, true).await {
-        Ok(_) | Err(GitError::NotHolder) => Ok(()),
-        Err(error) => Err(error),
+    timed(record.document_id, async {
+        let _guard = lock(record.document_id).await;
+        forget(record.document_id);
+        match update(context, store, record, revision, true).await {
+            Ok(_) | Err(GitError::NotHolder) => Ok(()),
+            Err(error) => Err(error),
+        }
+    })
+    .await
+}
+
+/// Runs background snapshot work with the request stage timers and logs them when it is slow.
+async fn timed<T>(document_id: Ulid, work: impl std::future::Future<Output = T>) -> T {
+    let stages = aruna_core::telemetry::RequestStages::default();
+    let started = std::time::Instant::now();
+    let output = stages.clone().scope(work).await;
+    let elapsed = started.elapsed();
+    if elapsed >= std::time::Duration::from_millis(300) {
+        tracing::info!(%document_id, total_ms = elapsed.as_millis() as u64,
+            stages = %stages.render(), "Slow Git snapshot work");
     }
+    output
 }
 
 /// The snapshot status, the projection, the layout of main when main exists, the document and

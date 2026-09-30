@@ -213,6 +213,11 @@ pub enum GitEffect {
         digest: String,
         pack: Bytes,
     },
+    /// Notes a pack made from the local cache as imported, since it holds its objects already.
+    MarkImported {
+        document_id: Ulid,
+        digest: String,
+    },
     Refs(Ulid),
     /// Whether each first commit is an ancestor of the second; missing objects answer false.
     Ancestry {

@@ -4,7 +4,7 @@
 
 use super::changes::property_conflicts;
 use super::project::Projection;
-use super::push::{record, unlocked};
+use super::push::{record_made, unlocked};
 use super::snapshot::{execute, linked};
 use super::versions::{
     Version, WriteOptions, branch_ref, diff, expect, log, now_ms, open, parse_conflict,
@@ -99,7 +99,7 @@ pub async fn edit(
             new: new.clone(),
         };
         let made = vec![new.clone()];
-        record(
+        record_made(
             context,
             auth,
             &document,
@@ -255,7 +255,7 @@ async fn merge_into(
         );
     }
     if !updates.is_empty() {
-        record(
+        record_made(
             context,
             auth,
             document,
