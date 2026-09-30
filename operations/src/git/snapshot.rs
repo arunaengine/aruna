@@ -35,6 +35,7 @@ use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::data_identity::{DataIdentity, text_values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::telemetry::time_stage;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
 use ulid::Ulid;
@@ -453,9 +454,17 @@ async fn generate(
         .filter(|message| !message.is_empty())
     {
         Some(message) => message,
-        None => subject(store, document, projection, &jsonld, user).await,
+        None => {
+            time_stage(
+                "git_subject",
+                subject(store, document, projection, &jsonld, user),
+            )
+            .await
+        }
     };
-    let objects = linked(context, document, &jsonld, &author(user)).await;
+    let linker = author(user);
+    let linking = linked(context, document, &jsonld, &linker);
+    let objects = time_stage("git_linked", linking).await;
     let lfs: Vec<StoredObject> = objects.iter().map(|linked| linked.object.clone()).collect();
     let refs = &projection.state.refs;
     let effect = GitEffect::Generate {
@@ -518,13 +527,18 @@ async fn generate(
         digest,
         made,
     };
-    publish::publish_with(context, document, user, change, (pack, Vec::new())).await?;
+    let publishing = publish::publish_with(context, document, user, change, (pack, Vec::new()));
+    time_stage("git_publish", publishing).await?;
     let status = GitStatus {
         event_id,
         commit: Some(aruna),
         error: None,
     };
-    records::save(context, STATUS, status_key, &status).await
+    time_stage(
+        "git_status",
+        records::save(context, STATUS, status_key, &status),
+    )
+    .await
 }
 
 /// Folds the records covered so far into one checkpoint so history never hits its cap.
@@ -652,8 +666,10 @@ fn background(context: &DriverContext, document: &MetadataRegistryRecord) {
             .as_ref()
             .and_then(|handle| handle.git())
         {
-            let _guard = lock(id).await;
-            let refreshing = refresh(&context, store, &document);
+            let refreshing = timed(id, async {
+                let _guard = lock(id).await;
+                refresh(&context, store, &document).await
+            });
             if let Err(error) = Box::pin(refreshing).await {
                 tracing::warn!(document_id = %id, %error, "Background Git refresh failed");
             }
@@ -706,7 +722,8 @@ async fn update(
     let leading = first(context, &projection.holders);
     let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
     // The graph's content decides, so a late older edit that changes it is captured too.
-    if let Some(source) = erased(current(context, document, revision, materializing)).await?
+    let loading = erased(current(context, document, revision, materializing));
+    if let Some(source) = time_stage("git_source", loading).await?
         && let Ok(canonical) = {
             let started = std::time::Instant::now();
             let canonical = craqle::canonicalize_jsonld(&source.1);
@@ -756,12 +773,28 @@ pub async fn capture(
     else {
         return Ok(());
     };
-    let _guard = lock(record.document_id).await;
-    forget(record.document_id);
-    match update(context, store, record, revision, true).await {
-        Ok(_) | Err(GitError::NotHolder) => Ok(()),
-        Err(error) => Err(error),
+    timed(record.document_id, async {
+        let _guard = lock(record.document_id).await;
+        forget(record.document_id);
+        match update(context, store, record, revision, true).await {
+            Ok(_) | Err(GitError::NotHolder) => Ok(()),
+            Err(error) => Err(error),
+        }
+    })
+    .await
+}
+
+/// Runs background snapshot work with the request stage timers and logs them when it is slow.
+async fn timed<T>(document_id: Ulid, work: impl std::future::Future<Output = T>) -> T {
+    let stages = aruna_core::telemetry::RequestStages::default();
+    let started = std::time::Instant::now();
+    let output = stages.clone().scope(work).await;
+    let elapsed = started.elapsed();
+    if elapsed >= std::time::Duration::from_millis(300) {
+        tracing::info!(%document_id, total_ms = elapsed.as_millis() as u64,
+            stages = %stages.render(), "Slow Git snapshot work");
     }
+    output
 }
 
 /// The snapshot status, the projection, the layout of main when main exists, the document and
