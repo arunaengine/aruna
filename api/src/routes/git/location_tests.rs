@@ -93,12 +93,12 @@ async fn choose(
 async fn location_routes() {
     let test = setup_network_state().await;
     let id = create(&test, None).await;
-    // A new dataset records the group default, the generated bucket, plus its own id.
+    // The generated group default needs no record: the dataset uses it by default.
     let default = read(&test, &test.auth, id).await.expect("default");
     let group = test.group_id.to_string().to_lowercase();
     assert_eq!(default.bucket, format!("datasets-{group}"));
     assert_eq!(default.prefix, format!("{id}/"));
-    assert!(!default.default);
+    assert!(default.default);
     for invalid in [("lab-data", "a/../b"), ("Lab_Data", "a")] {
         let refused = choose(&test, &test.auth, id, invalid).await;
         assert!(

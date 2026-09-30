@@ -160,8 +160,8 @@ def exercise(root):
     assert initial in command(source, env, "ls-remote", "origin", "refs/heads/main").decode()
     command(source, env, "pull", "--ff-only", "origin", "main")
     status, location = api(metadata_url + "/storage-location")
-    # New datasets record the group default, the generated bucket, at creation.
-    assert status == 200 and not location["default"], location
+    # The generated group default needs no record, so the location reports as default.
+    assert status == 200 and location["default"], location
     assert location["bucket"] == os.environ["ARUNA_BUCKET"], location
     notes = b"plain dataset notes\n"
     (source / "data").mkdir()

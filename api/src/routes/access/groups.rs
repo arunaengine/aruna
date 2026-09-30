@@ -908,8 +908,9 @@ administrative path or on the realm group-administration path, and WRITE on the 
 prefix.
 
 **Behavior**
-- A dataset created without its own storage location records this bucket with prefix
-  `<prefix><document id>/`. Existing datasets keep their recorded location, and no data moves.
+- A dataset created without its own storage location uses this bucket with prefix
+  `<prefix><document id>/`, recorded unless it is the generated default. Existing datasets keep
+  their location, and no data moves.
 - The bucket must exist on this node and belong to the group, except the generated
   `datasets-<group id>` bucket, which is created on first use. Bucket names are node-local, so
   every node that creates datasets checks the bucket again and refuses the create when it is

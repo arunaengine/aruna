@@ -204,6 +204,10 @@ pub async fn establish(
         true => location.for_dataset(document.document_id),
         false => location,
     };
+    // A dataset without a record already uses exactly this location, so none is written.
+    if location == DatasetLocation::default_for(document.group_id, document.document_id) {
+        return;
+    }
     if let Err(error) = record(context, auth, document, location).await {
         tracing::warn!(document_id = %document.document_id, %error,
             "Chosen storage location not recorded at create");
