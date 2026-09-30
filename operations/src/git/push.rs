@@ -163,7 +163,7 @@ pub(super) async fn record(
     let pack = (objects_in(&pack) != 0).then_some(pack);
     let described = pack.as_ref().map(objects::describe_pack).transpose()?;
     let change = GitChange::Objects {
-        pack: described.clone(),
+        pack: described,
         refs,
         lfs,
         revision: None,
@@ -174,11 +174,25 @@ pub(super) async fn record(
         Some(merge) => vec![super::pending::entry(document.document_id, merge)?],
         None => Vec::new(),
     };
-    let record =
-        publish::publish_with(context, document, auth.user_id, change, (pack, extra)).await?;
-    // The pack came out of this node's cache, whose objects it therefore already holds.
-    if let Some(described) = &described {
-        objects::mark_imported(context, (document.document_id, auth.user_id), described).await;
+    publish::publish_with(context, document, auth.user_id, change, (pack, extra)).await
+}
+
+/// Like [`record`] for a pack this node made itself, outside a Git transfer: its cache holds
+/// the objects already. A push must not use it, since the transfer holds the repository.
+pub(super) async fn record_made(
+    context: &DriverContext,
+    auth: &AuthContext,
+    document: &MetadataRegistryRecord,
+    refs: Vec<RefUpdate>,
+    written: (Bytes, Vec<StoredObject>),
+    made: (Vec<String>, Option<PendingMerge>),
+) -> Result<GitRecord, GitError> {
+    let record = record(context, auth, document, refs, written, made).await?;
+    if let GitChange::Objects {
+        pack: Some(pack), ..
+    } = &record.change
+    {
+        objects::mark_imported(context, (document.document_id, auth.user_id), pack).await;
     }
     Ok(record)
 }

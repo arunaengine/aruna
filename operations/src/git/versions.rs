@@ -5,7 +5,7 @@
 use super::GitError;
 use super::changes::{EntityChange, entity_changes};
 use super::project::{Projection, lock};
-use super::push::record;
+use super::push::record_made;
 use super::snapshot::{execute, read_view, refresh};
 use super::state::GitState;
 use crate::driver::DriverContext;
@@ -548,7 +548,7 @@ pub async fn change_ref(
         new: new.clone(),
     };
     let nothing = (Bytes::new(), Vec::new());
-    record(
+    record_made(
         context,
         auth,
         &document,
