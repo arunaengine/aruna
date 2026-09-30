@@ -46,6 +46,7 @@ impl GitStore {
                 snapshot.document_id
             }
             GitEffect::Import { document_id, .. }
+            | GitEffect::MarkImported { document_id, .. }
             | GitEffect::Resolve { document_id, .. }
             | GitEffect::Peel { document_id, .. }
             | GitEffect::Commits { document_id, .. }
@@ -154,6 +155,9 @@ impl GitStore {
                     .await
                     .map(|_| GitEvent::Initialized)
             }
+            GitEffect::MarkImported { digest, .. } => crate::repo::remember(&repository, &digest)
+                .await
+                .map(|_| GitEvent::Initialized),
             GitEffect::Refs(_) => crate::repo::refs(&repository).await.map(GitEvent::Refs),
             GitEffect::Ancestry { pairs, .. } => Ok(GitEvent::Ancestry(
                 crate::repo::ancestry(&repository, &pairs).await,

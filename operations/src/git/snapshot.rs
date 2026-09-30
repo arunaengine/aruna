@@ -527,8 +527,17 @@ async fn generate(
         digest,
         made,
     };
+    let marked = match &change {
+        GitChange::Objects {
+            pack: Some(pack), ..
+        } => Some(pack.clone()),
+        _ => None,
+    };
     let publishing = publish::publish_with(context, document, user, change, (pack, Vec::new()));
     time_stage("git_publish", publishing).await?;
+    if let Some(pack) = &marked {
+        objects::mark_imported(context, (document.document_id, user), pack).await;
+    }
     let status = GitStatus {
         event_id,
         commit: Some(aruna),

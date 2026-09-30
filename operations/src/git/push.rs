@@ -163,7 +163,7 @@ pub(super) async fn record(
     let pack = (objects_in(&pack) != 0).then_some(pack);
     let described = pack.as_ref().map(objects::describe_pack).transpose()?;
     let change = GitChange::Objects {
-        pack: described,
+        pack: described.clone(),
         refs,
         lfs,
         revision: None,
@@ -174,7 +174,13 @@ pub(super) async fn record(
         Some(merge) => vec![super::pending::entry(document.document_id, merge)?],
         None => Vec::new(),
     };
-    publish::publish_with(context, document, auth.user_id, change, (pack, extra)).await
+    let record =
+        publish::publish_with(context, document, auth.user_id, change, (pack, extra)).await?;
+    // The pack came out of this node's cache, whose objects it therefore already holds.
+    if let Some(described) = &described {
+        objects::mark_imported(context, (document.document_id, auth.user_id), described).await;
+    }
+    Ok(record)
 }
 
 #[cfg(test)]

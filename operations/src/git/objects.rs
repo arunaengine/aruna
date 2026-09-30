@@ -324,3 +324,26 @@ pub async fn open(
     }
     Err(GitError::Unavailable)
 }
+
+/// Notes a published pack that was made from this node's cache as imported there, so the next
+/// projection does not index objects the cache already holds. A failure only costs that import.
+pub async fn mark_imported(
+    context: &DriverContext,
+    (document_id, actor): (ulid::Ulid, aruna_core::UserId),
+    pack: &GitPack,
+) {
+    let Some(store) = context
+        .metadata_handle
+        .as_ref()
+        .and_then(|handle| handle.git())
+    else {
+        return;
+    };
+    let effect = aruna_core::git::GitEffect::MarkImported {
+        document_id,
+        digest: pack.sha256.clone(),
+    };
+    if let Err(error) = store.execute(effect, actor).await {
+        tracing::debug!(%document_id, %error, "Published pack not marked as imported");
+    }
+}
