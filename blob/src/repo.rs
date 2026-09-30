@@ -40,8 +40,8 @@ pub async fn remember(directory: &Path, digest: &str) -> std::io::Result<()> {
         .append(true)
         .open(imported)
         .await?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, format!("{digest}\n").as_bytes()).await?;
-    file.sync_all().await
+    // Part of the rebuildable cache, like the repository itself, so it is not synced.
+    tokio::io::AsyncWriteExt::write_all(&mut file, format!("{digest}\n").as_bytes()).await
 }
 
 pub async fn refs(directory: &Path) -> std::io::Result<Refs> {

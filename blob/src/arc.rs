@@ -99,7 +99,7 @@ async fn write_tree(
     if let Some(base) = base {
         exchange(git(&["read-tree", base]), Bytes::new(), false).await?;
     }
-    // One process writes every blob, and batch mode syncs them together instead of one by one.
+    // One process writes every blob instead of one process per file.
     let mut paths = Vec::new();
     for (position, (_, data)) in files.values().enumerate() {
         let path = temporary.path().join(format!("blob-{position}"));
@@ -109,13 +109,7 @@ async fn write_tree(
     let oids = match paths.is_empty() {
         true => Bytes::new(),
         false => {
-            let mut process = git(&[
-                "-c",
-                "core.fsyncMethod=batch",
-                "hash-object",
-                "-w",
-                "--no-filters",
-            ]);
+            let mut process = git(&["hash-object", "-w", "--no-filters"]);
             process.arg("--stdin-paths");
             exchange(process, format!("{}\n", paths.join("\n")).into(), false).await?
         }

@@ -335,7 +335,8 @@ fn settings(hooks: &str) -> [(&'static str, &str); 7] {
         ("receive.fsckObjects", "true"),
         ("receive.denyNonFastForwards", "true"),
         ("core.logAllRefUpdates", "true"),
-        ("core.fsync", "committed"),
+        // The repository is a cache rebuilt from the replicated records, so it skips disk syncs.
+        ("core.fsync", "none"),
     ]
 }
 
@@ -641,7 +642,7 @@ mod tests {
         // Git rewrites the config file on every change, so an unchanged file ran no setup.
         assert_eq!(config().await, first);
 
-        tokio::fs::write(repository.join(SETTINGS), "core.fsync=none\n")
+        tokio::fs::write(repository.join(SETTINGS), "core.fsync=committed\n")
             .await
             .expect("older settings");
         store
