@@ -23,6 +23,8 @@ pub const VISIBILITY_INDEX_KEYSPACE: &str = "metadata_visibility_index";
 pub const VISIBILITY_STATE_KEYSPACE: &str = "metadata_visibility_state";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const EVENT_LOG_KEYSPACE: &str = "metadata_event_log";
+/// The origin and encoded size of each logged event, keyed like the event log.
+pub const EVENT_SIZE_KEYSPACE: &str = "metadata_event_sizes";
 /// One row per metadata checkpoint, keyed by document and event; the last row starts
 /// the document's current history window.
 pub const METADATA_CHECKPOINT_KEYSPACE: &str = "metadata_checkpoints";
@@ -290,6 +292,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     VISIBILITY_STATE_KEYSPACE,
     METADATA_AUDIT_KEYSPACE,
     EVENT_LOG_KEYSPACE,
+    EVENT_SIZE_KEYSPACE,
     METADATA_ACTOR_KEYSPACE,
     METADATA_CHECKPOINT_KEYSPACE,
     COMMIT_MESSAGE_KEYSPACE,

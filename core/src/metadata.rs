@@ -305,6 +305,14 @@ pub struct MetadataMergedRevision {
 pub const EVENT_LIMIT: u32 = 1024;
 pub const RAW_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 
+/// What the history budget needs of one logged event, so a write never decodes the events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSize {
+    pub node_id: NodeId,
+    /// The length of the event's stored encoding.
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawOriginBudget {
     pub document_id: Ulid,
@@ -1459,6 +1467,21 @@ mod tests {
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn logs_event_size() {
+        let event = create_event(Ulid::from(1), Ulid::from(2));
+        let entries = crate::storage_entries::logged_event_entries(&event).expect("entries");
+        let [(log_space, log_key, log), (size_space, size_key, size)] = entries.as_slice() else {
+            panic!("an event log row and a size row");
+        };
+        assert_eq!(log_space, crate::keyspaces::EVENT_LOG_KEYSPACE);
+        assert_eq!(size_space, crate::keyspaces::EVENT_SIZE_KEYSPACE);
+        assert_eq!(size_key, log_key, "both rows share the event log key");
+        let size: super::EventSize = postcard::from_bytes(size).expect("size decodes");
+        assert_eq!(size.node_id, event.node_id);
+        assert_eq!(size.bytes, log.len() as u64);
     }
 
     fn create_event(document_id: Ulid, event_id: Ulid) -> MetadataEventRecord {
