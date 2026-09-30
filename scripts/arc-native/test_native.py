@@ -83,7 +83,8 @@ def wait_snapshot(url, previous):
         if status == 200:
             updated = json.loads(body)
             assert updated["error"] is None, updated
-            if updated["commit"] != previous:
+            # A pending status may report no commit yet while the first snapshot is made.
+            if updated["commit"] not in (previous, None):
                 return updated["commit"]
         assert time.monotonic() < deadline, "metadata snapshot did not advance"
         time.sleep(0.1)
