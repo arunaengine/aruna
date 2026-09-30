@@ -10,6 +10,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use serde::{Serialize, de::DeserializeOwned};
 
+/// Writes one rebuildable row without a disk sync: a sync on the shared storage worker
+/// stalls every read of the node while it runs.
 pub(super) async fn save<T: Serialize>(
     context: &DriverContext,
     space: &str,
@@ -28,15 +30,6 @@ pub(super) async fn save<T: Serialize>(
             }))
             .await,
         Event::Storage(StorageEvent::WriteResult { .. })
-    ) {
-        return Err(GitError::Unavailable);
-    }
-    if !matches!(
-        context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::SyncAll))
-            .await,
-        Event::Storage(StorageEvent::SyncAllFinished)
     ) {
         return Err(GitError::Unavailable);
     }
