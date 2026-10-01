@@ -995,6 +995,7 @@ mod tests {
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, HashIndex,
     };
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
@@ -1028,6 +1029,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 7,
+            compression: Compression::Off,
         };
 
         let decoded = decode_entry(

@@ -479,6 +479,7 @@ mod test {
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BlobVersion, CurrentVersionPointer};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key};
     use aruna_storage::storage;
@@ -512,6 +513,7 @@ mod test {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             &driver_ctx,
@@ -562,6 +564,7 @@ mod test {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             &driver_ctx,
@@ -611,6 +614,7 @@ mod test {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             &driver_ctx,
@@ -731,6 +735,7 @@ mod test {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 }
                 .to_bytes()
                 .unwrap()
@@ -797,6 +802,7 @@ mod test {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 }
                 .to_bytes()
                 .unwrap()

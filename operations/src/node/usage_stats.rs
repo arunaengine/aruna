@@ -1759,6 +1759,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer,
     };
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::usage::global_shard_keys;
@@ -2025,6 +2026,7 @@ mod tests {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             &ctx,
@@ -2121,6 +2123,7 @@ mod tests {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             };
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
@@ -2461,6 +2464,7 @@ mod tests {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             &ctx,

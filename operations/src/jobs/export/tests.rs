@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
@@ -183,6 +184,7 @@ async fn seed_bao(
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
     let version = BlobVersion::materialized(

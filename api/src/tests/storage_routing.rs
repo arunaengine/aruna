@@ -13,6 +13,7 @@ use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::DriverContext;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -50,6 +51,7 @@ pub(crate) async fn setup_state() -> TestState {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
 
     // Request-policy loading fails closed without the realm config document.

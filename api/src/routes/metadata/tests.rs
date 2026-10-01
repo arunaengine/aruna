@@ -17,6 +17,7 @@ use crate::tests::routes::{
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::driver::drive;
@@ -1147,6 +1148,7 @@ async fn seed_preview_object(test: &TestState) -> Value {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     write_doc(
         &ctx,
@@ -3754,6 +3756,7 @@ async fn preflight_finds_ids() {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     write_doc(
         &ctx,

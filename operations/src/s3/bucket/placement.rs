@@ -425,6 +425,7 @@ mod pure_tests {
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::format::Compression;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 
@@ -464,6 +465,7 @@ mod pure_tests {
             storage_routing: Vec::new(),
             placement_policies: policies,
             placement_policy_generation: 3,
+            compression: Compression::Off,
         }
     }
 

@@ -9,6 +9,7 @@ use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::tests::{TestState, drain_metadata_background, setup_network_state};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use axum::extract::{Path, State};
@@ -48,6 +49,7 @@ async fn bucket(test: &TestState, name: &str) {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     let operation = CreateBucketOperation::new(name.to_string(), info);
     drive(operation, &test.state.get_ctx())

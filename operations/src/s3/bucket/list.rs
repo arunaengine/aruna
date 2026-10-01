@@ -255,6 +255,7 @@ impl Operation for ListBucketsOperation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_storage::storage;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -286,6 +287,7 @@ mod test {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             (
@@ -298,6 +300,7 @@ mod test {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
             (
@@ -310,6 +313,7 @@ mod test {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 },
             ),
         ] {
@@ -361,6 +365,7 @@ mod test {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         let entry = |name: &str, group_id| {
             (
@@ -426,6 +431,7 @@ mod test {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         let entry = |name: &str, group_id| {
             (
@@ -499,6 +505,7 @@ mod test {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 }
                 .to_bytes()
                 .unwrap()

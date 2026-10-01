@@ -20,6 +20,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BucketInfo,
 };
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
@@ -462,6 +463,7 @@ async fn seed_bucket(state: &ServerState, bucket: &str, group: Ulid, user: UserI
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     write_doc(
         state,

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::storage::format::Compression;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -138,6 +139,7 @@ async fn create_sync_bucket(
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             },
         ),
         context,

@@ -31,6 +31,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, VersionKey, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_operations::driver::DriverContext;
@@ -728,6 +729,7 @@ async fn seed_bucket(state: &ServerState, bucket: &str, group_id: Ulid) {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     store_bytes(
         state,

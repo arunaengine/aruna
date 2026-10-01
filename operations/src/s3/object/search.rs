@@ -484,6 +484,7 @@ fn storage_event_error(event: Event) -> SearchObjectsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
 
@@ -627,6 +628,7 @@ mod tests {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 }
                 .to_bytes()
                 .unwrap(),

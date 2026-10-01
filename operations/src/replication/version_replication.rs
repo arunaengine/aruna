@@ -2700,6 +2700,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
@@ -2763,6 +2764,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 

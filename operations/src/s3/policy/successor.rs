@@ -1023,6 +1023,7 @@ mod pure_tests {
         BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
         ManagedCopyRecord, ManagedCopyState, VersionKey,
     };
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
@@ -1067,6 +1068,7 @@ mod pure_tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 3,
+            compression: Compression::Off,
         }
     }
 

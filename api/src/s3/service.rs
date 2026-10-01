@@ -17,6 +17,7 @@ use self::attributes::{
     parse_part_marker,
 };
 use self::response::{attach_reference_refresh, object_metadata, reference_metadata_refresh};
+use aruna_core::structs::storage::format::Compression;
 
 use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
 use self::listing::{
@@ -330,6 +331,7 @@ impl S3 for ArunaS3Service {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             },
         );
 

@@ -18,6 +18,7 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::format::Compression;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::notifications::inbox::upsert_inbox_records;
@@ -227,6 +228,7 @@ async fn install_bucket(state: &ServerState, bucket: &str, group_id: Ulid, creat
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     write_fixture(
         state,

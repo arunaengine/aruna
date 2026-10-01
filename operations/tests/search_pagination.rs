@@ -6,6 +6,7 @@
 
 mod topology;
 
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use std::time::UNIX_EPOCH;
 
@@ -59,6 +60,7 @@ async fn seed_bucket(node: &TestNode, realm: &Topology, group_id: Ulid) -> TestR
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
         .to_bytes()?,
     )

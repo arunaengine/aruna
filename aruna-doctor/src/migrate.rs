@@ -15,8 +15,9 @@ use aruna_core::keyspaces::{
     EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE,
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE,
     JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
-    SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE,
+    SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
@@ -27,7 +28,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
-use aruna_core::structs::storage::blob::BlobVersion;
+use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo};
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
@@ -36,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use ulid::Ulid;
 
+mod buckets;
 mod git;
 mod jobs;
 mod mappings;
@@ -98,6 +100,9 @@ pub struct MigrateOutput {
     /// Blob versions from before materialized versions named their encoding class.
     pub versions_scanned: usize,
     pub versions_rewritten: usize,
+    /// Bucket records from before buckets carried a compression setting.
+    pub buckets_scanned: usize,
+    pub buckets_rewritten: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -134,6 +139,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let part_rows = db.keyspace(UPLOAD_PART_KEYSPACE, KeyspaceCreateOptions::default)?;
     let cleanup_rows = db.keyspace(BLOB_CLEANUP_KEYSPACE, KeyspaceCreateOptions::default)?;
     let version_rows = db.keyspace(BLOB_VERSIONS_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let bucket_rows = db.keyspace(S3_BUCKET_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -163,6 +169,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         &version_rows,
         BLOB_VERSIONS_KEYSPACE,
     )?;
+    let buckets =
+        rewrites::<BucketInfo, buckets::LegacyBucket>(&db, &bucket_rows, S3_BUCKET_KEYSPACE)?;
     let record = |target: &DocumentTarget| matches!(target, DocumentTarget::GitRecord { .. });
     let git_outbox = mappings::outbox_rows(
         &db,
@@ -214,6 +222,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&git_rows, &git_records.rows),
         (&size_rows, &sizes.rows),
         (&version_rows, &versions.rows),
+        (&bucket_rows, &buckets.rows),
         (&index_rows, &index.writes),
         (&job_rows, &jobs.rows),
         (&state_rows, &checkpoints.rows),
@@ -296,6 +305,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         upload_blobs_queued: old_uploads.blob_deletes.len(),
         versions_scanned: versions.scanned,
         versions_rewritten: versions.rows.len(),
+        buckets_scanned: buckets.scanned,
+        buckets_rewritten: buckets.rows.len(),
     })
 }
 

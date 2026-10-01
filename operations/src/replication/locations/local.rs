@@ -797,6 +797,7 @@ mod pure_tests {
         BackendLocation, BackendRef, BlobVersion, BucketInfo,
     };
     use aruna_core::structs::storage::blob::{CopyOrigin, VersionKey};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use std::collections::HashMap;
@@ -830,6 +831,7 @@ mod pure_tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 

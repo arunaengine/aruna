@@ -22,6 +22,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo, VersionKey,
 };
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -154,6 +155,7 @@ async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, Version
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     write_fixture(
         state,

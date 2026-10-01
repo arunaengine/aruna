@@ -386,6 +386,7 @@ pub(crate) mod test {
     use aruna_core::structs::storage::blob::{
         Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::Compression;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use axum::{Router, routing::get};
@@ -590,6 +591,7 @@ pub(crate) mod test {
             storage_routing: Vec::new(),
             placement_policies: policies,
             placement_policy_generation: 1,
+            compression: Compression::Off,
         };
         let _ = context
             .storage_handle

@@ -1885,6 +1885,7 @@ mod decision_tests {
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::{Effects, Value};
@@ -1962,6 +1963,7 @@ mod decision_tests {
             storage_routing: Vec::new(),
             placement_policies: refs,
             placement_policy_generation: generation,
+            compression: Compression::Off,
         };
         ByteView::from(info.to_bytes().expect("bucket encodes"))
     }

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use std::collections::HashMap;
@@ -145,6 +146,7 @@ async fn setup() -> Fixture {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             }
             .to_bytes()
             .unwrap(),

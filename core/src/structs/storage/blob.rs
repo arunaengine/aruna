@@ -658,6 +658,8 @@ pub struct BucketInfo {
     /// Advances on each default change, so a write that read an older default
     /// is detectable at commit time.
     pub placement_policy_generation: u64,
+    /// Compression of new writes; each node also re-encodes its own copies to match.
+    pub compression: Compression,
 }
 
 impl BucketInfo {
@@ -1365,6 +1367,7 @@ mod tests {
     use crate::structs::placement::policy::{
         MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef,
     };
+    use crate::structs::storage::format::Compression;
     use crate::structs::storage::format::EncodingClass;
     use crate::structs::storage::format::StoredFormat;
     use std::collections::HashMap;
@@ -1860,6 +1863,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 7,
+            compression: Compression::Off,
         }
     }
 

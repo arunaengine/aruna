@@ -27,6 +27,7 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -171,6 +172,7 @@ async fn setup(owner: UserId) -> (TempDir, Arc<ServerState>, Ulid) {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
         .to_bytes()
         .expect("bucket serializes"),

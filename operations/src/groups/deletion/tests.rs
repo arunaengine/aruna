@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::storage::format::Compression;
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
@@ -253,6 +254,7 @@ impl Fixture {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 }

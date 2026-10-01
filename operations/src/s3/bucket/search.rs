@@ -437,6 +437,7 @@ impl Operation for SearchBucketsOperation {
 
 #[cfg(test)]
 mod tests {
+    use aruna_core::structs::storage::format::Compression;
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
@@ -483,6 +484,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         (
             bucket.as_bytes().to_vec().into(),
@@ -669,6 +671,7 @@ mod tests {
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
+                    compression: Compression::Off,
                 }
                 .to_bytes()
                 .unwrap(),

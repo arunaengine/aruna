@@ -5,6 +5,7 @@
 // Fresh builds overflow the default query depth in nested async layouts.
 #![recursion_limit = "256"]
 
+use aruna_core::structs::storage::format::Compression;
 use std::collections::{BTreeMap, HashMap};
 
 use aruna_blob::blob::BlobHandler;
@@ -131,6 +132,7 @@ async fn create_bucket(h: &Harness, bucket: &str, group_id: Ulid) {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             },
         ),
         &h.driver,

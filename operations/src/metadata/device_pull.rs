@@ -575,6 +575,7 @@ async fn ensure_read(
 #[cfg(test)]
 mod tests {
     //! Tests for the realm side of a device's synced folders.
+    use aruna_core::structs::storage::format::Compression;
 
     use super::*;
     use aruna_core::UserId;
@@ -694,6 +695,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 

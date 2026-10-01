@@ -7,6 +7,7 @@
 
 mod topology;
 
+use aruna_core::structs::storage::format::Compression;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
@@ -78,6 +79,7 @@ async fn create_bucket(
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             },
         ),
         context,

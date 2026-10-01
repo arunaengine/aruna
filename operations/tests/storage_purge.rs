@@ -4,6 +4,7 @@
 
 #![recursion_limit = "256"]
 
+use aruna_core::structs::storage::format::Compression;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -176,6 +177,7 @@ async fn setup_context() -> TestContext {
                 storage_routing: Vec::new(),
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
+                compression: Compression::Off,
             },
         ),
         &driver,

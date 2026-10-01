@@ -251,6 +251,7 @@ mod tests {
     use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
     use aruna_core::structs::placement::policy::PlacementSubject;
     use aruna_core::structs::storage::blob::{BackendRef, ResolvedBackend};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::routing::{
         GroupStorageRouting, RoutingTarget, StorageRoutingRule, resolve_backend,
@@ -320,6 +321,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         }
     }
 
@@ -409,6 +411,7 @@ mod tests {
             storage_routing: vec![rule.clone()],
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         let record = GroupStorageRouting {
             group_id,

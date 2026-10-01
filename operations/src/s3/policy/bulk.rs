@@ -998,6 +998,7 @@ mod tests {
         Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, VersionKey,
     };
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::{GroupId, Key, Value};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -1116,6 +1117,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         let _ = context
             .storage_handle
@@ -1399,6 +1401,7 @@ mod tests {
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
+            compression: Compression::Off,
         };
         Value::from(bucket.to_bytes().expect("bucket encodes"))
     }

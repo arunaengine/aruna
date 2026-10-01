@@ -6,6 +6,7 @@ use crate::driver::{DriverContext, drive};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
 };
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
@@ -132,6 +133,7 @@ fn guard_allows_edit() {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     let edited = BucketInfo {
         cors_configuration: Some(
@@ -180,6 +182,7 @@ fn recreate_rejected() {
         storage_routing: Vec::new(),
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
+        compression: Compression::Off,
     };
     let recreated = BucketInfo {
         created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
