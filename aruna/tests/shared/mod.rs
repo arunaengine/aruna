@@ -322,16 +322,26 @@ pub(crate) fn sign_scoped_token(
     user_id: UserId,
     path_restrictions: Vec<PathRestriction>,
 ) -> TestResult<String> {
+    sign_token(seed, user_id, Some(path_restrictions), 600)
+}
+
+/// Signs a bearer token that expires `lifetime_secs` after now.
+pub(crate) fn sign_token(
+    seed: &SeedNode,
+    user_id: UserId,
+    restrictions: Option<Vec<PathRestriction>>,
+    lifetime_secs: u64,
+) -> TestResult<String> {
     let now = chrono::Utc::now().timestamp() as u64;
     let claims = TokenClaims {
         sub: user_id.to_string(),
         iss: seed.realm_id.to_string(),
         iat: now,
-        exp: now + 600,
+        exp: now + lifetime_secs,
         jti: Ulid::generate().to_string(),
         sid: None,
         session_kind: None,
-        restrictions: Some(path_restrictions),
+        restrictions,
         issuer_pubkey: None,
         delegation_signature: None,
     };
