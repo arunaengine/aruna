@@ -1,5 +1,5 @@
-//! Re-encodes legacy job, realm, PID mapping and Git record rows, adds missing event size rows
-//! and seals plain secrets; current rows stay, the projection cache is cleared, repeats are safe.
+//! Re-encodes legacy job, realm, PID mapping and Git record rows, adds missing event size rows,
+//! seals plain secrets and moves node secrets into the node vault; repeats are safe.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,22 +11,21 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, sea
 use aruna_core::document::DocumentTarget;
 use aruna_core::git::GitRecord;
 use aruna_core::keyspaces::{
-    BACKEND_SECRET_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
-    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE,
-    JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    SECONDARY_ID_KEYSPACE, SOURCE_SECRET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
+    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY,
+    NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, SECONDARY_ID_KEYSPACE,
+    SYNC_OUTBOX_KEYSPACE,
 };
+use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
     JobRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
-use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
-use aruna_core::structs::storage::group_backend::GroupStorageSecret;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
@@ -39,6 +38,7 @@ mod git;
 mod jobs;
 mod mappings;
 mod sizes;
+mod vault;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {
@@ -58,6 +58,9 @@ pub struct MigrateOutput {
     pub secrets_sealed: usize,
     /// Secret rows left unchanged because they could not be read, as `keyspace/key: reason`.
     pub secrets_skipped: Vec<String>,
+    /// Source connector and group backend secrets moved into the node vault.
+    pub vault_scanned: usize,
+    pub vault_moved: usize,
     pub mappings_scanned: usize,
     pub mappings_rewritten: usize,
     /// Queued document publishes; those carrying a legacy mapping are rewritten.
@@ -146,13 +149,26 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let jobs = rewrites::<JobRecord, jobs::LegacyJob>(&db, &job_rows, JOB_KEYSPACE)?;
     let kinds = jobs::checkpoint_kinds(&db, &job_rows, &jobs.rows, JOB_KEYSPACE)?;
     let checkpoints = jobs::checkpoint_rows(&db, &state_rows, &kinds, JOB_STATE_KEYSPACE)?;
-    let secret_key = node_key(&db)?;
+    let keys = node_secret(&db)?.map(|secret| {
+        (
+            CredentialEncryptionKey::derive(&secret),
+            NodeVaultKey::derive(&secret),
+        )
+    });
+    let secret_key = keys.as_ref().map(|(secret_key, _)| secret_key);
     let mut secrets = Vec::new();
     let mut secrets_skipped = Vec::new();
     for name in SEALED_KEYSPACES {
         let rows = db.keyspace(name, KeyspaceCreateOptions::default)?;
-        let sealed = seal_rows(&db, &rows, name, secret_key.as_ref(), &mut secrets_skipped)?;
+        let sealed = seal_rows(&db, &rows, name, secret_key, &mut secrets_skipped)?;
         secrets.push((rows, sealed));
+    }
+    let vault_rows = db.keyspace(NODE_VAULT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let mut moves = Vec::new();
+    for moved in vault::MOVED_KEYSPACES {
+        let rows = db.keyspace(moved.0, KeyspaceCreateOptions::default)?;
+        let found = vault::vault_rows(&db, &rows, moved, keys.as_ref(), &mut secrets_skipped)?;
+        moves.push((rows, found));
     }
 
     let mut txn = db.write_tx()?;
@@ -175,7 +191,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         secrets
             .iter()
             .map(|(keyspace, sealed)| (keyspace, &sealed.rows)),
-    ) {
+    )
+    .chain(moves.iter().map(|(_, moved)| (&vault_rows, &moved.rows)))
+    {
         for (key, value) in rows {
             txn.insert(keyspace.clone(), key.clone(), value.clone());
         }
@@ -185,6 +203,11 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     }
     for key in &index.removes {
         txn.remove(index_rows.clone(), key.clone());
+    }
+    for (keyspace, moved) in &moves {
+        for key in &moved.removed {
+            txn.remove(keyspace.clone(), key.clone());
+        }
     }
     txn.commit()?.map_err(|_| {
         ExplorerError::Decode("migration conflicted with a running node".to_string())
@@ -204,6 +227,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         secrets_scanned: secrets.iter().map(|(_, sealed)| sealed.scanned).sum(),
         secrets_sealed: secrets.iter().map(|(_, sealed)| sealed.rows.len()).sum(),
         secrets_skipped,
+        vault_scanned: moves.iter().map(|(_, moved)| moved.scanned).sum(),
+        vault_moved: moves.iter().map(|(_, moved)| moved.rows.len()).sum(),
         mappings_scanned: mappings.scanned,
         mappings_rewritten: mappings.rows.len(),
         outbox_scanned: outbox.scanned,
@@ -221,15 +246,15 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     })
 }
 
-/// The key the node seals secret rows with, derived like the node does at startup.
-fn node_key(db: &OptimisticTxDatabase) -> Result<Option<CredentialEncryptionKey>, ExplorerError> {
+/// The node secret the node derives its sealing keys from at startup.
+fn node_secret(db: &OptimisticTxDatabase) -> Result<Option<[u8; 32]>, ExplorerError> {
     let rows = db.keyspace(NODE_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let Some(value) = db.read_tx().get(&rows, NODE_STATE_KEY)? else {
         return Ok(None);
     };
     let state = postcard::from_bytes::<PersistedNodeState>(&value)
         .map_err(|error| decode_error(NODE_STATE_KEYSPACE, NODE_STATE_KEY, error))?;
-    Ok(Some(CredentialEncryptionKey::derive(&state.net_secret_key)))
+    Ok(Some(state.net_secret_key))
 }
 
 /// Seals plain secret rows; rows that already open with the node key stay unchanged.
@@ -242,9 +267,7 @@ fn seal_rows(
     skipped: &mut Vec<String>,
 ) -> Result<Rewrites, ExplorerError> {
     let plain = |value: &[u8]| match name {
-        SOURCE_SECRET_KEYSPACE => SourceConnectorSecret::from_bytes(value).is_ok(),
         CONNECTOR_SECRET_KEYSPACE => RepositoryConnectorSecret::from_bytes(value).is_ok(),
-        BACKEND_SECRET_KEYSPACE => GroupStorageSecret::from_bytes(value).is_ok(),
         _ => false,
     };
     let mut scanned = 0;
@@ -519,10 +542,12 @@ mod tests {
         LegacyConflict, LegacyEnvelope, LegacyFamilyRecord, LegacyPending, LegacyResult,
         LegacyUpdate, migrate_output,
     };
+    use aruna_core::keyspaces::{CONNECTOR_SECRET_KEYSPACE, NODE_VAULT_KEYSPACE};
     use aruna_core::keyspaces::{
         FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
         FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
+    use aruna_core::node_vault::NodeVaultKey;
     use aruna_core::structs::execution::job::{
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
@@ -754,18 +779,12 @@ mod tests {
         assert!(error.to_string().contains(&hex::encode(b"bad")));
     }
 
-    #[test]
-    fn seals_plain_secrets() {
+    fn node_state(path: &Path) {
         use aruna::identity::{
             BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
         };
-        use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes};
-        use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, SOURCE_SECRET_KEYSPACE};
-        use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
-        use std::collections::HashMap;
+        use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("db");
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::PendingOnboarding,
@@ -783,14 +802,25 @@ mod tests {
             ..state.clone()
         };
         write(
-            &path,
+            path,
             NODE_STATE_KEYSPACE,
             vec![
                 (b"another", postcard::to_allocvec(&other).unwrap()),
                 (b"node_state", postcard::to_allocvec(&state).unwrap()),
             ],
         );
-        let plain = SourceConnectorSecret::new(
+    }
+
+    #[test]
+    fn seals_plain_secrets() {
+        use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes};
+        use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
+        use std::collections::HashMap;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        node_state(&path);
+        let plain = RepositoryConnectorSecret::new(
             Ulid::from_bytes([1u8; 16]),
             HashMap::from([("token".to_string(), "canary-61d0".to_string())]),
             std::time::SystemTime::UNIX_EPOCH,
@@ -800,7 +830,7 @@ mod tests {
         .unwrap();
         write(
             &path,
-            SOURCE_SECRET_KEYSPACE,
+            CONNECTOR_SECRET_KEYSPACE,
             vec![(b"row", plain.clone()), (b"junk", vec![0xff; 3])],
         );
 
@@ -809,17 +839,71 @@ mod tests {
         // An unreadable row is reported and kept, and the readable one is still sealed.
         assert_eq!((output.secrets_scanned, output.secrets_sealed), (2, 1));
         assert_eq!(output.secrets_skipped.len(), 1);
-        assert!(output.secrets_skipped[0].starts_with(SOURCE_SECRET_KEYSPACE));
+        assert!(output.secrets_skipped[0].starts_with(CONNECTOR_SECRET_KEYSPACE));
         assert_eq!(
-            read(&path, SOURCE_SECRET_KEYSPACE)[b"junk".as_slice()],
+            read(&path, CONNECTOR_SECRET_KEYSPACE)[b"junk".as_slice()],
             vec![0xff; 3]
         );
-        let sealed = &read(&path, SOURCE_SECRET_KEYSPACE)[b"row".as_slice()];
+        let sealed = &read(&path, CONNECTOR_SECRET_KEYSPACE)[b"row".as_slice()];
         assert!(!sealed.windows(11).any(|window| window == b"canary-61d0"));
         let key = CredentialEncryptionKey::derive(&[11u8; 32]);
-        let aad = aruna_storage::row_aad(SOURCE_SECRET_KEYSPACE, b"row");
+        let aad = aruna_storage::row_aad(CONNECTOR_SECRET_KEYSPACE, b"row");
         assert_eq!(open_bytes(&key, sealed, &aad).unwrap(), plain);
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!((again.secrets_sealed, again.secrets_skipped.len()), (0, 1));
+    }
+
+    #[test]
+    fn moves_vault_secrets() {
+        use aruna_core::credential_encryption::{CredentialEncryptionKey, seal_bytes};
+        use aruna_core::keyspaces::{BACKEND_SECRET_KEYSPACE, SOURCE_SECRET_KEYSPACE};
+        use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
+        use aruna_core::structs::storage::group_backend::GroupStorageSecret;
+        use std::collections::HashMap;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        node_state(&path);
+        let (source_id, backend_id) = (Ulid::from_bytes([1u8; 16]), Ulid::from_bytes([2u8; 16]));
+        let config = HashMap::from([("token".to_string(), "canary-7e21".to_string())]);
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let source = SourceConnectorSecret::new(source_id, config.clone(), epoch).unwrap();
+        let backend = GroupStorageSecret {
+            backend_id,
+            secret_config: config,
+            updated_at: epoch,
+        };
+        // The source row is still plain; the backend row is sealed with the S3 credential key.
+        let backend_key = backend_id.to_bytes();
+        let aad = aruna_storage::row_aad(BACKEND_SECRET_KEYSPACE, &backend_key);
+        let credential = CredentialEncryptionKey::derive(&[11u8; 32]);
+        let sealed = seal_bytes(&credential, &backend.to_bytes().unwrap(), &aad).unwrap();
+        let source_key = source_id.to_bytes();
+        let source_rows = vec![
+            (source_key.as_slice(), source.to_bytes().unwrap()),
+            (b"junk".as_slice(), vec![0xff; 3]),
+        ];
+        write(&path, SOURCE_SECRET_KEYSPACE, source_rows);
+        write(&path, BACKEND_SECRET_KEYSPACE, vec![(&backend_key, sealed)]);
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!((output.vault_scanned, output.vault_moved), (3, 2));
+        assert_eq!(output.secrets_skipped.len(), 1);
+        assert_eq!(read(&path, SOURCE_SECRET_KEYSPACE).len(), 1);
+        assert!(read(&path, BACKEND_SECRET_KEYSPACE).is_empty());
+        let vault = read(&path, NODE_VAULT_KEYSPACE);
+        let key = NodeVaultKey::derive(&[11u8; 32]);
+        let opened = |entry: aruna_core::node_vault::VaultEntry| {
+            let row = &vault[&entry.key()];
+            assert!(!row.windows(11).any(|window| window == b"canary-7e21"));
+            key.open(entry, row).unwrap().expose().to_vec()
+        };
+        let source_entry = SourceConnectorSecret::vault_entry(source_id);
+        let backend_entry = GroupStorageSecret::vault_entry(backend_id);
+        assert_eq!(opened(source_entry), source.to_bytes().unwrap());
+        assert_eq!(opened(backend_entry), backend.to_bytes().unwrap());
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!((again.vault_scanned, again.vault_moved), (1, 0));
     }
 }
