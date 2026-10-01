@@ -129,6 +129,29 @@ async fn tampered_frame_fails() {
 }
 
 #[tokio::test]
+async fn reuses_cached_table() {
+    // The first read caches the seek table, so damage to the stored table is not read again.
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = sample();
+    let location = write(&handler, &data).await;
+    let range = FRAME_SIZE..FRAME_SIZE + 10;
+    let expected = &data[range.start as usize..range.end as usize];
+    let read = read_range(&handler, location.clone(), range.clone()).await;
+    assert_eq!(read.unwrap(), expected);
+
+    let path = location.get_full_path().unwrap();
+    let mut stored = std::fs::read(&path).unwrap();
+    let last = stored.len() - 1;
+    stored[last] ^= 1;
+    std::fs::write(&path, stored).unwrap();
+    assert_eq!(
+        read_range(&handler, location, range).await.unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
 async fn compose_writes_frames() {
     // Parts stay raw; only the composed object is framed, hashed over original bytes.
     let context = setup_two_backends().await;

@@ -14,12 +14,53 @@ use aruna_core::structs::storage::format::{FrameLayout, StoredLayout};
 use bytes::{Bytes, BytesMut};
 use futures::stream;
 use iroh_io::AsyncSliceReader;
+use lru::LruCache;
 use opendal::Operator;
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
+
+/// Upper bound for the parsed seek tables kept in memory, about 8 TiB of framed data.
+const INDEX_CACHE_BYTES: usize = 64 << 20;
+
+/// Parsed seek tables keyed by their hash. Stored objects never change, so entries stay valid.
+#[derive(Debug)]
+pub(super) struct IndexCache {
+    entries: LruCache<[u8; 32], Arc<FrameIndex>>,
+    bytes: usize,
+}
+
+impl IndexCache {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: LruCache::unbounded(),
+            bytes: 0,
+        }
+    }
+
+    fn get(&mut self, hash: &[u8; 32]) -> Option<Arc<FrameIndex>> {
+        self.entries.get(hash).cloned()
+    }
+
+    fn insert(&mut self, hash: [u8; 32], index: Arc<FrameIndex>) {
+        let memory = index.memory();
+        if memory > INDEX_CACHE_BYTES {
+            return;
+        }
+        if let Some((_, old)) = self.entries.push(hash, index) {
+            self.bytes -= old.memory();
+        }
+        self.bytes += memory;
+        while self.bytes > INDEX_CACHE_BYTES {
+            let Some((_, old)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes -= old.memory();
+        }
+    }
+}
 
 /// Random access to the original bytes of a framed copy. Keeps the last decoded
 /// frame, so sequential reads decode each frame once.
@@ -246,7 +287,7 @@ impl BlobHandler {
         })
     }
 
-    /// The seek table, read whole and checked against the record.
+    /// The seek table from the cache, or read whole and checked against the record.
     async fn frame_index(
         &self,
         operator: &Operator,
@@ -255,9 +296,18 @@ impl BlobHandler {
         layout: &FrameLayout,
         idle: Duration,
     ) -> Result<Arc<FrameIndex>, BlobError> {
+        let cached =
+            (self.frame_indexes.lock().ok()).and_then(|mut cache| cache.get(&layout.index_hash));
+        if let Some(index) = cached.filter(|index| index.size() == size) {
+            return Ok(index);
+        }
         let table = codec::table_range(size, layout)?;
         let table = read_range(operator, path, table, idle).await?;
-        Ok(Arc::new(FrameIndex::parse(size, layout, &table)?))
+        let index = Arc::new(FrameIndex::parse(size, layout, &table)?);
+        if let Ok(mut cache) = self.frame_indexes.lock() {
+            cache.insert(layout.index_hash, index.clone());
+        }
+        Ok(index)
     }
 
     /// Reader over the original bytes of any copy, for bao transfers.

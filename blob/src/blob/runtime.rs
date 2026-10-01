@@ -525,6 +525,7 @@ impl BlobHandler {
             spool_slots: Arc::new(Semaphore::new(SPOOL_SLOTS)),
             inflight: Arc::new(AtomicUsize::new(0)),
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            frame_indexes: Arc::new(std::sync::Mutex::new(super::frames::IndexCache::new())),
             reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             part_chains: Arc::default(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -166,6 +166,7 @@ pub(crate) fn table_range(size: u64, layout: &FrameLayout) -> Result<Range<u64>,
 /// The checked seek table: where each frame starts in the stored object.
 #[derive(Debug)]
 pub(crate) struct FrameIndex {
+    size: u64,
     /// One start per frame, then the end of the last frame.
     offsets: Vec<u64>,
 }
@@ -211,12 +212,21 @@ impl FrameIndex {
         if start + table.len() as u64 != layout.stored_size {
             return Err(integrity("frames do not fill the stored object"));
         }
-        Ok(Self { offsets })
+        Ok(Self { size, offsets })
     }
 
     /// Stored byte range of one frame.
     pub(crate) fn frame_range(&self, frame: u64) -> Range<u64> {
         self.offsets[frame as usize]..self.offsets[frame as usize + 1]
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Bytes the parsed table holds in memory.
+    pub(crate) fn memory(&self) -> usize {
+        self.offsets.len() * size_of::<u64>()
     }
 }
 
