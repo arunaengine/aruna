@@ -336,3 +336,196 @@ pub async fn delete_vault(
     append(&state, &auth, auth_token, VaultChange::Delete).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use crate::tests::routes::write_doc;
+    use crate::tests::users::{realm_auth, setup_state};
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use axum::response::IntoResponse;
+    use tempfile::TempDir;
+
+    /// A realm with one server node: this node when `holds`, otherwise one it cannot reach.
+    pub(in crate::routes::access::users) async fn vault_realm(
+        holds: bool,
+    ) -> (Arc<ServerState>, TempDir, AuthContext) {
+        let (state, dir) = setup_state().await;
+        let auth = realm_auth(state.get_realm_id());
+        let server = if holds {
+            state.get_node_id()
+        } else {
+            iroh::SecretKey::generate().public()
+        };
+        let mut config = RealmConfigDocument::new(state.get_realm_id(), Vec::new(), 1);
+        config.seed_default_placement();
+        config.ensure_node(server, RealmNodeKind::Server);
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+            realm_id: auth.realm_id,
+        };
+        write_doc(
+            &state.get_ctx(),
+            REALM_CONFIG_KEYSPACE,
+            (*state.get_realm_id().as_bytes()).into(),
+            config.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        (state, dir, auth)
+    }
+
+    pub(in crate::routes::access::users) fn status(error: ServerError) -> StatusCode {
+        error.into_response().status()
+    }
+
+    async fn read_heads(
+        state: &Arc<ServerState>,
+        auth: &AuthContext,
+    ) -> Result<Vec<VaultHead>, StatusCode> {
+        get_vault(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+        )
+        .await
+        .map(|(_, Json(vault))| vault.heads)
+        .map_err(status)
+    }
+
+    async fn save(
+        state: &Arc<ServerState>,
+        auth: &AuthContext,
+        payload: &str,
+        predecessors: &[&str],
+    ) -> Result<Vec<VaultHead>, StatusCode> {
+        let request = SaveVaultRequest {
+            payload: payload.to_string(),
+            predecessors: predecessors.iter().map(ToString::to_string).collect(),
+        };
+        put_vault(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+            Json(request),
+        )
+        .await
+        .map(|(_, Json(vault))| vault.heads)
+        .map_err(status)
+    }
+
+    async fn delete(
+        state: &Arc<ServerState>,
+        auth: &AuthContext,
+    ) -> Result<StatusCode, StatusCode> {
+        delete_vault(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+        )
+        .await
+        .map_err(status)
+    }
+
+    fn payloads(heads: &[VaultHead]) -> Vec<&str> {
+        let mut payloads: Vec<&str> = heads.iter().map(|head| head.payload.as_str()).collect();
+        payloads.sort_unstable();
+        payloads
+    }
+
+    #[tokio::test]
+    async fn keeps_concurrent_saves() {
+        let (state, _dir, auth) = vault_realm(true).await;
+        assert_eq!(read_heads(&state, &auth).await.unwrap().len(), 0);
+        // Two browsers save from the same state: both saves stay as heads.
+        save(&state, &auth, "left", &[]).await.unwrap();
+        let heads = save(&state, &auth, "right", &[]).await.unwrap();
+        assert_eq!(payloads(&heads), ["left", "right"]);
+        let heads = read_heads(&state, &auth).await.unwrap();
+        assert_eq!(payloads(&heads), ["left", "right"]);
+        // The merge names both heads and leaves one.
+        let names: Vec<&str> = heads.iter().map(|head| head.revision.as_str()).collect();
+        let merged = save(&state, &auth, "merged", &names).await.unwrap();
+        assert_eq!(payloads(&merged), ["merged"]);
+        assert_eq!(merged[0].predecessors.len(), 2);
+        assert_eq!(
+            payloads(&read_heads(&state, &auth).await.unwrap()),
+            ["merged"]
+        );
+        // Another user never sees this vault.
+        let other = realm_auth(state.get_realm_id());
+        assert!(read_heads(&state, &other).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deletes_twice() {
+        let (state, _dir, auth) = vault_realm(true).await;
+        assert_eq!(delete(&state, &auth).await.unwrap(), StatusCode::NO_CONTENT);
+        save(&state, &auth, "sealed", &[]).await.unwrap();
+        assert_eq!(delete(&state, &auth).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(read_heads(&state, &auth).await.unwrap().is_empty());
+        assert_eq!(delete(&state, &auth).await.unwrap(), StatusCode::NO_CONTENT);
+        let heads = save(&state, &auth, "again", &[]).await.unwrap();
+        assert_eq!(payloads(&heads), ["again"]);
+    }
+
+    #[tokio::test]
+    async fn refuses_bad_saves() {
+        let (state, _dir, auth) = vault_realm(true).await;
+        let large = "x".repeat(MAX_VAULT_BYTES + 1);
+        assert_eq!(
+            save(&state, &auth, &large, &[]).await.unwrap_err(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            save(&state, &auth, "sealed", &["not a revision"])
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        let revision = Ulid::generate().to_string();
+        assert_eq!(
+            save(&state, &auth, "sealed", &[&revision, &revision])
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(read_heads(&state, &auth).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreachable_holders_unavailable() {
+        // The only holder is another node this test cannot reach: never "absent", always 503.
+        let (state, _dir, auth) = vault_realm(false).await;
+        assert_eq!(
+            read_heads(&state, &auth).await.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            save(&state, &auth, "sealed", &[]).await.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn requires_unrestricted_token() {
+        let (state, _dir, mut auth) = vault_realm(true).await;
+        auth.path_restrictions = Some(Vec::new());
+        assert_eq!(
+            read_heads(&state, &auth).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            save(&state, &auth, "sealed", &[]).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            delete(&state, &auth).await.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        let missing = get_vault(State(state.clone()), Extension(None), Extension(None)).await;
+        assert_eq!(status(missing.unwrap_err()), StatusCode::UNAUTHORIZED);
+    }
+}
