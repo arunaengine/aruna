@@ -448,7 +448,7 @@ impl BlobHandler {
                 let actual_blake3 = writer.hasher.finalize().blake3;
                 match writer.finalize().await.map(|layout| {
                     if let Some(layout) = layout {
-                        location.format.layout = StoredLayout::Frames(layout);
+                        location.format.layout = StoredLayout::Frames(Box::new(layout));
                     }
                 }) {
                     Err(error) => {

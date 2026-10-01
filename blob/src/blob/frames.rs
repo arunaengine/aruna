@@ -165,7 +165,7 @@ impl AsyncSliceReader for FrameReader {
 /// Source of a bao transfer: the stored bytes of a raw copy, or decoded frames.
 pub(super) enum SliceReader {
     Raw(OpenDalReader),
-    Framed(Box<FrameReader>),
+    Framed(FrameReader),
 }
 
 impl AsyncSliceReader for SliceReader {
@@ -298,7 +298,7 @@ impl BlobHandler {
     ) -> Result<SliceReader, BlobError> {
         if let StoredLayout::Frames(layout) = &location.format.layout {
             let reader = self.frame_reader(location, layout).await?;
-            return Ok(SliceReader::Framed(Box::new(reader)));
+            return Ok(SliceReader::Framed(reader));
         }
         let operator = self.operator_from_location(location)?;
         let path = location.get_storage_path()?;

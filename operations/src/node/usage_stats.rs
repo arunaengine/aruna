@@ -1807,11 +1807,11 @@ mod tests {
         // Backend capacity counts what the backend holds, not the original size.
         let mut framed = location(100, false, false);
         framed.hashes.insert("blake3".to_string(), vec![2u8; 32]);
-        framed.format.layout = StoredLayout::Frames(FrameLayout {
+        framed.format.layout = StoredLayout::Frames(Box::new(FrameLayout {
             level: 3,
             stored_size: 40,
             index_hash: [0u8; 32],
-        });
+        }));
 
         let delta = StoredDelta::for_location(&framed, true).unwrap();
 

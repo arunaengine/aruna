@@ -629,11 +629,11 @@ mod tests {
     fn location(framed: bool) -> BackendLocation {
         let mut format = StoredFormat::default();
         if framed {
-            format.layout = StoredLayout::Frames(FrameLayout {
+            format.layout = StoredLayout::Frames(Box::new(FrameLayout {
                 level: 3,
                 stored_size: 20,
                 index_hash: [0; 32],
-            });
+            }));
         }
         BackendLocation {
             backend: BackendRef::node_default(),

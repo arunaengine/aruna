@@ -538,7 +538,7 @@ impl BlobHandler {
                     return event;
                 }
             }
-            location.format.layout = StoredLayout::Frames(layout);
+            location.format.layout = StoredLayout::Frames(Box::new(layout));
         }
 
         reservation.mark_abandoned();
@@ -1277,7 +1277,7 @@ impl BlobHandler {
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
         if let Some(layout) = layout {
-            location.format.layout = StoredLayout::Frames(layout);
+            location.format.layout = StoredLayout::Frames(Box::new(layout));
         }
         BlobEvent::WriteFinished { location }
     }

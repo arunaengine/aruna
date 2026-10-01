@@ -21,7 +21,7 @@ pub enum StoredLayout {
     #[default]
     Raw,
     /// 1 MiB frames, each zstd compressed or raw, followed by a frame index.
-    Frames(FrameLayout),
+    Frames(Box<FrameLayout>),
 }
 
 /// Record of a framed copy. The index hash covers the tail that lists every frame group.

@@ -256,7 +256,12 @@ impl FrameIndex {
             digests: Vec::with_capacity(groups),
         };
         let mut start = 0u64;
-        for (group, summary) in tail.chunks_exact(SUMMARY_LEN as usize).enumerate() {
+        for (group, summary) in tail
+            .as_chunks::<{ SUMMARY_LEN as usize }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let mut len = [0; 8];
             len.copy_from_slice(&summary[..8]);
             let len = u64::from_le_bytes(len);
@@ -298,7 +303,12 @@ impl FrameIndex {
         let first = group * GROUP_FRAMES;
         let mut total = 0u64;
         let mut entries = Vec::with_capacity(bytes.len() / ENTRY_LEN as usize);
-        for (offset, bytes) in bytes.chunks_exact(ENTRY_LEN as usize).enumerate() {
+        for (offset, bytes) in bytes
+            .as_chunks::<{ ENTRY_LEN as usize }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let entry = FrameEntry::decode(bytes);
             let expected = frame_len(self.size, first + offset as u64);
             let valid = match entry.tag {
