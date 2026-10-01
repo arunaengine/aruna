@@ -43,6 +43,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CopyOrigin, CurrentVersionPointer, ManagedCopyKey, VersionKey, WriteOwner,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId};
@@ -551,6 +552,11 @@ impl PutObjectOperation {
             if location.backend != resolved.backend {
                 return self.emit_error(PutObjectError::WriteFailed(
                     "the adopted blob sits on another backend".to_string(),
+                ));
+            }
+            if location.format.encoding() != EncodingClass::from(resolved.compression) {
+                return self.emit_error(PutObjectError::WriteFailed(
+                    "the adopted blob uses another encoding".to_string(),
                 ));
             }
             self.adopted = true;

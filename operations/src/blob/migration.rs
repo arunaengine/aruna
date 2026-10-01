@@ -172,10 +172,7 @@ impl MigrateVersionOperation {
             Err(error) => return self.fail(error.into()),
         };
         // Governed versions keep a registered managed copy; they are left alone.
-        let wanted = match self.target {
-            Compression::Off => EncodingClass::Raw,
-            Compression::Zstd { level } => EncodingClass::Zstd { level },
-        };
+        let wanted = EncodingClass::from(self.target);
         let key = match &version.state {
             BlobVersionState::Materialized { encoding, .. }
                 if *encoding != wanted && version.placement_policies.is_empty() =>

@@ -121,6 +121,16 @@ impl EncodingClass {
     }
 }
 
+/// The class a write with this compression stores its copy in.
+impl From<Compression> for EncodingClass {
+    fn from(compression: Compression) -> Self {
+        match compression {
+            Compression::Off => Self::Raw,
+            Compression::Zstd { level } => Self::Zstd { level },
+        }
+    }
+}
+
 /// This node's progress re-encoding one bucket's versions to `target`.
 /// Keyed by bucket name; a later setting change replaces it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

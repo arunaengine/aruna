@@ -630,7 +630,7 @@ impl ReclaimBlobOperation {
             return self.fail(ReclaimBlobError::Failed);
         };
         self.output = Some(Ok(ReclaimVerdict::Freed {
-            bytes: location.blob_size,
+            bytes: location.stored_size(),
         }));
         self.state = ReclaimState::DeleteRows;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
