@@ -1150,6 +1150,7 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
     } else {
         (direct, None)
     };
+    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let realm_id = RealmId::from_bytes([41; 32]);
     let net = NetHandle::new(
         NetConfig {
