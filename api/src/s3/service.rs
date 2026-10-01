@@ -1405,8 +1405,11 @@ impl S3 for ArunaS3Service {
             now_ms: now_ms(),
         });
 
-        drive(operation, &self.state)
+        // A dropped connection must not stop the abort between its transactions.
+        let state = self.state.clone();
+        tokio::spawn(async move { drive(operation, &state).await }.in_current_span())
             .await
+            .map_err(|error| s3_error!(InternalError, "{}", error))?
             .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(S3Response::new(AbortMultipartUploadOutput::default()))
