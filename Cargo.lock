@@ -456,6 +456,7 @@ dependencies = [
 name = "aruna-core"
 version = "3.0.0-alpha.99"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "base64 0.23.1",
  "blake3",

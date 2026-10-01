@@ -25,6 +25,7 @@ pub mod keys;
 pub mod keyspaces;
 pub mod metadata;
 pub mod metrics;
+pub mod node_vault;
 pub mod onboarding;
 pub mod operation;
 pub mod permission_path;

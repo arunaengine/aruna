@@ -266,6 +266,8 @@ pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
 pub const API_STATE_KEYSPACE: &str = "api_state";
 pub const NODE_STATE_KEYSPACE: &str = "node_state";
+/// Secrets this node opens by itself, sealed with its node vault key. Never replicated.
+pub const NODE_VAULT_KEYSPACE: &str = "node_vault";
 /// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
 pub const NODE_STATE_KEY: &[u8] = b"node_state";
 pub const ONBOARDING_KEYSPACE: &str = "onboarding";
@@ -429,6 +431,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BUCKET_STATS_DB,
     API_STATE_KEYSPACE,
     NODE_STATE_KEYSPACE,
+    NODE_VAULT_KEYSPACE,
     ONBOARDING_KEYSPACE,
     DHT_KEYSPACE,
     CRAQLE_TERMS_KEYSPACE,
