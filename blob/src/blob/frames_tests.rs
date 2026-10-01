@@ -12,7 +12,7 @@ use aruna_core::structs::storage::format::{Compression, StoredLayout};
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use futures::TryStreamExt;
 
-/// Text frames, then seeded random frames that stay raw.
+/// Text frames, then seeded random frames that do not compress.
 fn sample() -> Vec<u8> {
     let mut data: Vec<u8> = b"framed research data "
         .iter()

@@ -1,11 +1,11 @@
-//! Reads framed copies: checks the index and each frame, then decodes only the frames needed.
+//! Reads framed copies: checks the seek table, then decodes only the frames needed.
 //! Also gives bao transfers random access to the original bytes of any copy.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::BlobHandler;
 use crate::bao_tree::OpenDalReader;
-use crate::codec::{self, FRAME_SIZE, FrameEntry, FrameIndex};
+use crate::codec::{self, FRAME_SIZE, FrameIndex};
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
@@ -17,24 +17,17 @@ use iroh_io::AsyncSliceReader;
 use opendal::Operator;
 use std::io;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// One loaded group: its number, checked entries and the stored offset of each frame.
-struct LoadedGroup {
-    group: u64,
-    entries: Vec<FrameEntry>,
-    offsets: Vec<u64>,
-}
-
-/// Random access to the original bytes of a framed copy. Keeps the last group's
-/// entries and the last decoded frame, so sequential reads decode each frame once.
+/// Random access to the original bytes of a framed copy. Keeps the last decoded
+/// frame, so sequential reads decode each frame once.
 pub(super) struct FrameReader {
     operator: Operator,
     path: String,
-    index: FrameIndex,
+    index: Arc<FrameIndex>,
     size: u64,
-    loaded: Option<LoadedGroup>,
     decoded: Option<(u64, Bytes)>,
     idle: Duration,
 }
@@ -72,56 +65,19 @@ async fn read_range(
 }
 
 impl FrameReader {
-    async fn load_group(&mut self, group: u64) -> Result<(), BlobError> {
-        if self
-            .loaded
-            .as_ref()
-            .is_some_and(|loaded| loaded.group == group)
-        {
-            return Ok(());
-        }
-        let range = self.index.entries_range(group);
-        let bytes = read_range(&self.operator, &self.path, range, self.idle).await?;
-        let entries = self.index.entries(group, &bytes)?;
-        let mut offset = self.index.group_start(group);
-        let offsets = entries
-            .iter()
-            .map(|entry| {
-                let start = offset;
-                offset += entry.stored_len();
-                start
-            })
-            .collect();
-        self.loaded = Some(LoadedGroup {
-            group,
-            entries,
-            offsets,
-        });
-        Ok(())
-    }
-
-    /// The original bytes of one frame, checked against its digest first.
+    /// The original bytes of one frame.
     async fn frame(&mut self, frame: u64) -> Result<Bytes, BlobError> {
         if let Some((cached, bytes)) = &self.decoded
             && *cached == frame
         {
             return Ok(bytes.clone());
         }
-        let (group, slot) = codec::group_of(frame);
-        self.load_group(group).await?;
-        let loaded = self
-            .loaded
-            .as_ref()
-            .ok_or_else(|| BlobError::ReadError("frame group is not loaded".to_string()))?;
-        let entry = loaded.entries[slot].clone();
-        let start = loaded.offsets[slot];
-        let range = start..start + entry.stored_len();
+        let range = self.index.frame_range(frame);
         let stored = read_range(&self.operator, &self.path, range, self.idle).await?;
         let length = codec::frame_len(self.size, frame);
-        let decoded =
-            tokio::task::spawn_blocking(move || codec::decode_frame(&entry, length, stored))
-                .await
-                .map_err(|error| BlobError::ReadError(error.to_string()))??;
+        let decoded = tokio::task::spawn_blocking(move || codec::decode_frame(length, stored))
+            .await
+            .map_err(|error| BlobError::ReadError(error.to_string()))??;
         self.decoded = Some((frame, decoded.clone()));
         Ok(decoded)
     }
@@ -267,7 +223,7 @@ impl BlobHandler {
         })
     }
 
-    /// Opens a framed copy after checking its tail against the location record.
+    /// Opens a framed copy with its seek table.
     pub(super) async fn frame_reader(
         &self,
         location: &BackendLocation,
@@ -277,18 +233,31 @@ impl BlobHandler {
         let operator = self.operator_from_location(location)?;
         let path = location.get_storage_path()?;
         let idle = self.transfer_idle_timeout();
-        let tail = codec::tail_range(size, layout)?;
-        let tail = read_range(&operator, &path, tail, idle).await?;
-        let index = FrameIndex::parse(size, layout, &tail)?;
+        let index = self
+            .frame_index(&operator, &path, size, layout, idle)
+            .await?;
         Ok(FrameReader {
             operator,
             path,
             index,
             size,
-            loaded: None,
             decoded: None,
             idle,
         })
+    }
+
+    /// The seek table, read whole and checked against the record.
+    async fn frame_index(
+        &self,
+        operator: &Operator,
+        path: &str,
+        size: u64,
+        layout: &FrameLayout,
+        idle: Duration,
+    ) -> Result<Arc<FrameIndex>, BlobError> {
+        let table = codec::table_range(size, layout)?;
+        let table = read_range(operator, path, table, idle).await?;
+        Ok(Arc::new(FrameIndex::parse(size, layout, &table)?))
     }
 
     /// Reader over the original bytes of any copy, for bao transfers.

@@ -20,11 +20,11 @@ pub enum StoredLayout {
     /// The original bytes, unchanged.
     #[default]
     Raw,
-    /// 1 MiB frames, each zstd compressed or raw, followed by a frame index.
+    /// The zstd seekable format: 1 MiB zstd frames, then a seek table in a skippable frame.
     Frames(Box<FrameLayout>),
 }
 
-/// Record of a framed copy. The index hash covers the tail that lists every frame group.
+/// Record of a framed copy. The index hash covers the seek table that ends the stored object.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FrameLayout {
     /// The zstd level the frames were written with.
