@@ -414,6 +414,7 @@ pub(crate) mod test {
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
         let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
             .await
             .unwrap();
