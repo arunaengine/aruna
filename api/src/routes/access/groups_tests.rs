@@ -31,6 +31,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, VersionKey, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
@@ -760,7 +761,7 @@ async fn seed_object(state: &ServerState, bucket: &str, key: &str, owner: UserId
     store_bytes(
         state,
         BLOB_LOCATIONS_KEYSPACE,
-        BlobLocationKey::new(hash, BackendRef::node_default()).to_bytes(),
+        BlobLocationKey::new(hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes(),
         BackendLocation {
             backend: BackendRef::node_default(),
             storage_class: None,

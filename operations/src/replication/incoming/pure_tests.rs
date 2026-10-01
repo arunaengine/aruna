@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState, ReceivedBlob};
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::replication::protocol::{
@@ -1044,6 +1045,7 @@ fn replacement_queues_reclaim() {
         op.replaced_reclaim_key(),
         Some(ReclaimCandidateKey::new(
             BackendRef::node_default(),
+            EncodingClass::Raw,
             [9u8; 32]
         ))
     );
@@ -1987,7 +1989,7 @@ fn probe_backend(
 }
 
 fn group_backend_key(backend_id: Ulid) -> Vec<u8> {
-    BlobLocationKey::new([1u8; 32], BackendRef::Group(backend_id)).to_bytes()
+    BlobLocationKey::new([1u8; 32], EncodingClass::Raw, BackendRef::Group(backend_id)).to_bytes()
 }
 
 fn probed_key(effects: &aruna_core::types::Effects) -> Vec<u8> {

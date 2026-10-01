@@ -713,8 +713,11 @@ impl PutObjectOperation {
         let Some(blake3_hash) = written_location.get_blake3() else {
             return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
         };
-        let key = match BlobLocationKey::from_blake3(blake3_hash, written_location.backend.clone())
-        {
+        let key = match BlobLocationKey::from_blake3(
+            blake3_hash,
+            written_location.format.encoding(),
+            written_location.backend.clone(),
+        ) {
             Ok(key) => key,
             Err(error) => return self.emit_error(error.into()),
         };

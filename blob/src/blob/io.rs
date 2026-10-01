@@ -774,7 +774,7 @@ impl BlobHandler {
             }
         }
 
-        let key = BlobLocationKey::new(hash, location.backend.clone());
+        let key = BlobLocationKey::new(hash, location.format.encoding(), location.backend.clone());
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Read {

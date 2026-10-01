@@ -18,6 +18,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use std::collections::VecDeque;
@@ -524,7 +525,7 @@ impl ListVersionsOperation {
                 } => {
                     location_reads.push((
                         BLOB_LOCATIONS_KEYSPACE.to_string(),
-                        BlobLocationKey::new(blob_hash, backend.clone())
+                        BlobLocationKey::new(blob_hash, EncodingClass::Raw, backend.clone())
                             .to_bytes()
                             .into(),
                     ));
@@ -797,6 +798,7 @@ mod test {
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -899,7 +901,7 @@ mod test {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: BlobLocationKey::new(hash, BackendRef::node_default())
+                key: BlobLocationKey::new(hash, EncodingClass::Raw, BackendRef::node_default())
                     .to_bytes()
                     .into(),
                 value: location(hash).to_bytes().unwrap().into(),

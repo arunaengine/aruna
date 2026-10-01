@@ -21,9 +21,10 @@ use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -307,15 +308,16 @@ impl HeadObjectOperation {
                 backend,
                 source,
             } => {
+                let location_key = BlobLocationKey::new(blob_hash, EncodingClass::Raw, backend);
                 self.source_binding = source;
                 self.source_metadata = None;
                 self.last_refresh = None;
                 self.version_created_at = Some(version.created_at);
                 self.source_policies = version.placement_policies.clone();
                 if version.placement_policies.is_empty() {
-                    return self.read_blob_location(BlobLocationKey::new(blob_hash, backend));
+                    return self.read_blob_location(location_key);
                 }
-                self.check_managed_copy(version_id, blob_hash, backend)
+                self.check_managed_copy(version_id, location_key)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 HeadObjectError::DeleteMarker
@@ -359,18 +361,12 @@ impl HeadObjectOperation {
 
     /// A governed version is only serveable from a registered local copy, so an
     /// unregistered or quarantined copy fails closed before any metadata is served.
-    fn check_managed_copy(
-        &mut self,
-        version_id: Ulid,
-        blob_hash: [u8; 32],
-        backend: BackendRef,
-    ) -> Effects {
+    fn check_managed_copy(&mut self, version_id: Ulid, location_key: BlobLocationKey) -> Effects {
         let check = match begin_copy_check(
             &self.input.bucket,
             &self.input.key,
             version_id,
-            blob_hash,
-            backend,
+            location_key,
             self.txn_id,
         ) {
             Ok(check) => check,
@@ -617,6 +613,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         Backend, BackendRef, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_net::{NetConfig, NetHandle};
     use std::collections::HashMap;
@@ -725,6 +722,7 @@ mod tests {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
                 key: BlobLocationKey::from_blake3(
                     location.get_blake3().unwrap(),
+                    EncodingClass::Raw,
                     location.backend.clone(),
                 )
                 .unwrap()
@@ -822,6 +820,7 @@ mod tests {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
                 key: BlobLocationKey::from_blake3(
                     location.get_blake3().unwrap(),
+                    EncodingClass::Raw,
                     location.backend.clone(),
                 )
                 .unwrap()

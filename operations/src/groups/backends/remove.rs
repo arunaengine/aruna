@@ -429,6 +429,7 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
     use aruna_core::structs::storage::multipart::MultipartUploadStatus;
@@ -593,7 +594,7 @@ mod tests {
         write(
             &ctx,
             BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::new([6u8; 32], BackendRef::Group(backend_id))
+            BlobLocationKey::new([6u8; 32], EncodingClass::Raw, BackendRef::Group(backend_id))
                 .to_bytes()
                 .into(),
             location.to_bytes().unwrap(),

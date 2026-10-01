@@ -997,7 +997,11 @@ impl CompleteUploadOperation {
             return self.schedule_error(CompleteUploadError::MissingExpectedChecksum("blake3"));
         };
         // Only the copy on the upload's pinned backend may be deduplicated.
-        let key = match BlobLocationKey::from_blake3(blake3_hash, location.backend.clone()) {
+        let key = match BlobLocationKey::from_blake3(
+            blake3_hash,
+            location.format.encoding(),
+            location.backend.clone(),
+        ) {
             Ok(key) => key,
             Err(error) => return self.schedule_error(error.into()),
         };

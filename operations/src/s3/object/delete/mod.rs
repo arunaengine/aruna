@@ -677,9 +677,13 @@ impl DeleteObjectOperation {
         self.state = DeleteObjectState::WriteReclaimCandidate;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: BLOB_RECLAIM_KEYSPACE.to_string(),
-            key: ReclaimCandidateKey::new(location.backend, location.blake3_hash)
-                .to_bytes()
-                .into(),
+            key: ReclaimCandidateKey::new(
+                location.backend,
+                location.encoding,
+                location.blake3_hash
+            )
+            .to_bytes()
+            .into(),
             value: value.into(),
             txn_id: self.txn_id,
         })]

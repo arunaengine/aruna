@@ -318,6 +318,7 @@ impl Operation for GetHoldersOperation {
 mod pure_tests {
     use aruna_core::events::DhtEntry;
     use aruna_core::operation::Operation;
+    use aruna_core::structs::storage::format::EncodingClass;
 
     use super::*;
 
@@ -328,12 +329,17 @@ mod pure_tests {
     use aruna_core::structs::storage::blob::BackendRef;
 
     fn location_key(seed: u8) -> Vec<u8> {
-        BlobLocationKey::new([seed; 32], BackendRef::node_default()).to_bytes()
+        BlobLocationKey::new([seed; 32], EncodingClass::Raw, BackendRef::node_default()).to_bytes()
     }
 
     /// A second copy of the same hash, so the scan must publish it only once.
     fn cold_key(seed: u8) -> Vec<u8> {
-        BlobLocationKey::new([seed; 32], BackendRef::Node("cold".to_string())).to_bytes()
+        BlobLocationKey::new(
+            [seed; 32],
+            EncodingClass::Raw,
+            BackendRef::Node("cold".to_string()),
+        )
+        .to_bytes()
     }
 
     fn entry(node_id: NodeId, realm_id: RealmId) -> DhtEntry {

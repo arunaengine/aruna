@@ -484,6 +484,7 @@ fn storage_event_error(event: Event) -> SearchObjectsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
 
     use std::collections::{HashMap, HashSet};
@@ -694,7 +695,8 @@ mod tests {
         write_value(
             &fixture.context,
             BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::new(blob_hash, BackendRef::node_default()).to_bytes(),
+            BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default())
+                .to_bytes(),
             location.to_bytes().unwrap(),
         )
         .await;

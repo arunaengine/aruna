@@ -28,6 +28,7 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permissi
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey, group_permission_path,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_operations::driver::DriverContext;
@@ -877,7 +878,8 @@ async fn reference_syncs_lazily() -> TestResult<()> {
             read_value(
                 harness.joiner.context.as_ref(),
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(source_hash, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(source_hash, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
             )
             .await?
             .is_none()
@@ -890,7 +892,8 @@ async fn reference_syncs_lazily() -> TestResult<()> {
             read_value(
                 harness.joiner.context.as_ref(),
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(source_hash, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(source_hash, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
             )
             .await?
             .is_none()

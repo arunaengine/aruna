@@ -22,6 +22,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex, VersionKey,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
@@ -320,6 +321,7 @@ fn queues_deleted_copy() {
     // The candidate rides the delete transaction, keyed backend first.
     let key = BlobLocationKey::new(
         [4u8; 32],
+        EncodingClass::Raw,
         aruna_core::structs::storage::blob::BackendRef::node_default(),
     );
     let mut op = candidate_op(Some(key.clone()));
@@ -341,7 +343,7 @@ fn queues_deleted_copy() {
     assert_eq!(*txn_id, op.txn_id);
     assert_eq!(
         written.as_ref(),
-        ReclaimCandidateKey::new(key.backend, key.blake3_hash)
+        ReclaimCandidateKey::new(key.backend, key.encoding, key.blake3_hash)
             .to_bytes()
             .as_slice()
     );

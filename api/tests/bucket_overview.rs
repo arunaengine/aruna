@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -217,7 +218,8 @@ async fn setup() -> Fixture {
         write_value(
             &state,
             BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::new([tag; 32], BackendRef::node_default()).to_bytes(),
+            BlobLocationKey::new([tag; 32], EncodingClass::Raw, BackendRef::node_default())
+                .to_bytes(),
             BackendLocation {
                 backend: BackendRef::node_default(),
                 storage_class: None,

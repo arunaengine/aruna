@@ -6,6 +6,7 @@ use crate::driver::{DriverContext, drive};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::node::usage_stats::{QuotaGate, UsageCounterUpdate};
@@ -911,6 +912,7 @@ pub async fn test_put_object() {
             key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
             key: BlobLocationKey::from_blake3(
                 result.location.get_blake3().unwrap(),
+                EncodingClass::Raw,
                 result.location.backend.clone(),
             )
             .unwrap()
@@ -1175,7 +1177,12 @@ pub async fn deduplicates_blob() {
     assert_eq!(count_files(Path::new(&blob_root)), 1);
     let blob_hash: [u8; 32] = first.location.get_blake3().unwrap().try_into().unwrap();
 
-    let location_key = BlobLocationKey::new(blob_hash, first.location.backend.clone()).to_bytes();
+    let location_key = BlobLocationKey::new(
+        blob_hash,
+        EncodingClass::Raw,
+        first.location.backend.clone(),
+    )
+    .to_bytes();
     let blob_location_value = read_value(&context, BLOB_LOCATIONS_KEYSPACE, location_key)
         .await
         .expect("missing blob location entry");
@@ -1443,6 +1450,7 @@ async fn delete_keeps_copy() {
         BLOB_LOCATIONS_KEYSPACE,
         BlobLocationKey::new(
             cold.location.get_blake3().unwrap().try_into().unwrap(),
+            EncodingClass::Raw,
             cold.location.backend.clone(),
         )
         .to_bytes(),

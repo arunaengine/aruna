@@ -995,6 +995,7 @@ mod tests {
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, HashIndex,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
@@ -2070,7 +2071,8 @@ mod tests {
             other => panic!("expected current version pointer, got {other:?}"),
         }
 
-        let location_key = BlobLocationKey::new([9_u8; 32], location.backend.clone());
+        let location_key =
+            BlobLocationKey::new([9_u8; 32], EncodingClass::Raw, location.backend.clone());
         let decoded_location = decode_entry(
             BLOB_LOCATIONS_KEYSPACE,
             &location_key.to_bytes(),

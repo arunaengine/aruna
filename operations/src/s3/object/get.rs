@@ -33,9 +33,10 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
+    BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
 };
@@ -519,12 +520,13 @@ impl GetObjectOperation {
                 backend,
                 source,
             } => {
+                let location_key = BlobLocationKey::new(blob_hash, EncodingClass::Raw, backend);
                 self.source_binding = source;
                 self.version_created_at = Some(version.created_at);
                 if version.placement_policies.is_empty() {
-                    return self.read_blob_location(BlobLocationKey::new(blob_hash, backend));
+                    return self.read_blob_location(location_key);
                 }
-                self.check_managed_copy(version_id, blob_hash, backend)
+                self.check_managed_copy(version_id, location_key)
             }
             BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
                 GetObjectError::DeleteMarker
@@ -564,18 +566,12 @@ impl GetObjectOperation {
 
     /// A governed version is only serveable from a registered local copy, so an
     /// unregistered or quarantined copy fails closed before any byte moves.
-    fn check_managed_copy(
-        &mut self,
-        version_id: Ulid,
-        blob_hash: [u8; 32],
-        backend: BackendRef,
-    ) -> Effects {
+    fn check_managed_copy(&mut self, version_id: Ulid, location_key: BlobLocationKey) -> Effects {
         let check = match begin_copy_check(
             &self.input.bucket,
             &self.input.key,
             version_id,
-            blob_hash,
-            backend,
+            location_key,
             self.txn_id,
         ) {
             Ok(check) => check,

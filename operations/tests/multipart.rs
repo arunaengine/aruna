@@ -22,6 +22,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobHeadKey,
     BlobLocationKey, BlobVersion, CurrentVersionPointer, HashIndex, VersionKey, WriteOwner,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::{
     COMPLETION_LEASE_MS, MultipartChecksumHint, MultipartChecksumType, MultipartObjectKey,
     MultipartObjectPart, MultipartObjectSummary, MultipartPartKey, MultipartUpload,
@@ -358,7 +359,8 @@ async fn completion_persists_parts() {
     assert_eq!(complete.part_count, 2);
 
     let blob_hash: [u8; 32] = complete.location.get_blake3().unwrap().try_into().unwrap();
-    let location_key = BlobLocationKey::new(blob_hash, BackendRef::node_default()).to_bytes();
+    let location_key =
+        BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes();
     let blob_location = read_value(&context.driver, BLOB_LOCATIONS_KEYSPACE, location_key)
         .await
         .expect("missing blob location entry");
@@ -916,7 +918,8 @@ async fn completion_deduplicates_multipart() {
         .unwrap()
         .try_into()
         .unwrap();
-    let location_key = BlobLocationKey::new(blob_hash, BackendRef::node_default()).to_bytes();
+    let location_key =
+        BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes();
     let blob_location = read_value(&context.driver, BLOB_LOCATIONS_KEYSPACE, location_key)
         .await
         .expect("missing blob location entry");

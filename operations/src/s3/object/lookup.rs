@@ -12,7 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::OBJECT_METADATA_KEYSPACE;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BackendRef, BlobLocationKey, ManagedCopyKey, VersionKey,
+    BackendLocation, BlobLocationKey, ManagedCopyKey, VersionKey,
 };
 use aruna_core::structs::storage::multipart::{MultipartObjectKey, MultipartObjectSummary};
 use ulid::Ulid;
@@ -35,15 +35,17 @@ pub(crate) fn begin_copy_check(
     bucket: &str,
     key: &str,
     version_id: Ulid,
-    blob_hash: [u8; 32],
-    backend: BackendRef,
+    location_key: BlobLocationKey,
     txn_id: Option<Ulid>,
 ) -> Result<CopyLookup, ManagedCopyError> {
-    let copy_key = ManagedCopyKey::new(VersionKey::new(bucket, key, version_id), backend.clone());
+    let copy_key = ManagedCopyKey::new(
+        VersionKey::new(bucket, key, version_id),
+        location_key.backend.clone(),
+    );
     let effect = serve_reads(&copy_key, txn_id)?;
     Ok(CopyLookup {
         copy_key,
-        location_key: BlobLocationKey::new(blob_hash, backend),
+        location_key,
         effect,
     })
 }

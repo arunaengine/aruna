@@ -35,6 +35,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, VersionKey, bucket_permission_path,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
@@ -1075,7 +1076,7 @@ async fn write_materialized_version(
     let _ = storage
         .send_storage_effect(StorageEffect::Write {
             key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: BlobLocationKey::new(hash, location.backend.clone())
+            key: BlobLocationKey::new(hash, EncodingClass::Raw, location.backend.clone())
                 .to_bytes()
                 .into(),
             value: location.to_bytes().unwrap().into(),

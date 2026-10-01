@@ -37,6 +37,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
 use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
@@ -542,9 +543,13 @@ pub async fn test_get_object() {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: BlobLocationKey::new(blake3_hash, location.backend.clone())
-                    .to_bytes()
-                    .into(),
+                key: BlobLocationKey::new(
+                    blake3_hash,
+                    EncodingClass::Raw,
+                    location.backend.clone(),
+                )
+                .to_bytes()
+                .into(),
                 value: location.clone().to_bytes().unwrap().into(),
                 txn_id: Some(txn_id),
             })
@@ -796,9 +801,13 @@ pub async fn hash_mismatch_rejected() {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: BlobLocationKey::new(blake3_hash, location.backend.clone())
-                    .to_bytes()
-                    .into(),
+                key: BlobLocationKey::new(
+                    blake3_hash,
+                    EncodingClass::Raw,
+                    location.backend.clone(),
+                )
+                .to_bytes()
+                .into(),
                 value: location.clone().to_bytes().unwrap().into(),
                 txn_id: Some(txn_id),
             })

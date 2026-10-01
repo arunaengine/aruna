@@ -46,6 +46,7 @@ use aruna_core::structs::storage::blob::{
     bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
@@ -1066,7 +1067,7 @@ impl IncomingVersionOperation {
         };
         self.state = IncomingVersionState::ReadExistingBlob;
         smallvec![blob_location_read(
-            &BlobLocationKey::new(hash, backend),
+            &BlobLocationKey::new(hash, EncodingClass::Raw, backend),
             None
         )]
     }
@@ -1318,10 +1319,11 @@ impl IncomingVersionOperation {
         let replaced = self.replaced_version.as_ref()?.location_key()?;
         let replacement = self.effective_materialized_location().ok().and_then(|it| {
             let hash: [u8; 32] = it.get_blake3()?.try_into().ok()?;
-            Some(BlobLocationKey::new(hash, it.backend))
+            Some(BlobLocationKey::new(hash, it.format.encoding(), it.backend))
         });
-        (replacement.as_ref() != Some(&replaced))
-            .then(|| ReclaimCandidateKey::new(replaced.backend, replaced.blake3_hash))
+        (replacement.as_ref() != Some(&replaced)).then(|| {
+            ReclaimCandidateKey::new(replaced.backend, replaced.encoding, replaced.blake3_hash)
+        })
     }
 
     fn write_replaced_candidate(&mut self, key: ReclaimCandidateKey) -> Effects {
@@ -1419,7 +1421,7 @@ impl IncomingVersionOperation {
         };
         self.state = IncomingVersionState::VerifyExistingBlob;
         smallvec![blob_location_read(
-            &BlobLocationKey::new(hash, location.backend),
+            &BlobLocationKey::new(hash, location.format.encoding(), location.backend),
             self.txn_id
         )]
     }

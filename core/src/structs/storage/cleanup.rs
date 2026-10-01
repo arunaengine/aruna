@@ -5,6 +5,7 @@
 
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::BackendRef;
+use crate::structs::storage::format::EncodingClass;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 
@@ -44,16 +45,21 @@ impl CleanupStrategy {
 const KEY_SEPARATOR: u8 = 0;
 
 /// Reclaim queue key. Backend first, unlike the hash-first location key, so the
-/// queue can be counted and drained per backend.
+/// queue can be counted and drained per backend. The encoding class sits before the hash.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReclaimCandidateKey {
     pub backend: BackendRef,
+    pub encoding: EncodingClass,
     pub blake3: [u8; 32],
 }
 
 impl ReclaimCandidateKey {
-    pub fn new(backend: BackendRef, blake3: [u8; 32]) -> Self {
-        Self { backend, blake3 }
+    pub fn new(backend: BackendRef, encoding: EncodingClass, blake3: [u8; 32]) -> Self {
+        Self {
+            backend,
+            encoding,
+            blake3,
+        }
     }
 
     pub fn prefix(backend: &BackendRef) -> Vec<u8> {
@@ -64,17 +70,25 @@ impl ReclaimCandidateKey {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut key = Self::prefix(&self.backend);
+        key.extend_from_slice(&self.encoding.key_bytes());
         key.extend_from_slice(&self.blake3);
         key
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let split = bytes.len().checked_sub(33).ok_or_else(|| {
-            ConversionError::InvalidLength("reclaim candidate key is too short".to_string())
-        })?;
+        let short = || ConversionError::InvalidLength("reclaim candidate key is too short".into());
+        let split = bytes
+            .iter()
+            .position(|byte| *byte == KEY_SEPARATOR)
+            .ok_or_else(short)?;
         let (backend, tail) = bytes.split_at(split);
-        let blake3: [u8; 32] = tail[1..].try_into()?;
-        Ok(Self::new(BackendRef::from_key_bytes(backend)?, blake3))
+        let class_len = tail.len().checked_sub(33).ok_or_else(short)?;
+        let (class, blake3) = tail[1..].split_at(class_len);
+        Ok(Self::new(
+            BackendRef::from_key_bytes(backend)?,
+            EncodingClass::from_key_bytes(class)?,
+            blake3.try_into()?,
+        ))
     }
 }
 
@@ -99,12 +113,17 @@ impl ReclaimCandidate {
 mod tests {
     use super::{CleanupStrategy, ReclaimCandidate, ReclaimCandidateKey};
     use crate::structs::storage::blob::BackendRef;
+    use crate::structs::storage::format::EncodingClass;
     use std::time::SystemTime;
 
     #[test]
     fn key_round_trips() {
         // A name that prefixes another must not fall inside its scan range.
-        let key = ReclaimCandidateKey::new(BackendRef::Node("cold".to_string()), [4u8; 32]);
+        let key = ReclaimCandidateKey::new(
+            BackendRef::Node("cold".to_string()),
+            EncodingClass::Raw,
+            [4u8; 32],
+        );
         let bytes = key.to_bytes();
 
         assert_eq!(ReclaimCandidateKey::from_bytes(&bytes).unwrap(), key);

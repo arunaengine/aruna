@@ -15,6 +15,7 @@ use aruna_core::structs::execution::staging::{
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersionPointer};
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_storage::storage;
 use std::collections::HashMap;
@@ -93,7 +94,7 @@ async fn deleted_versions_skipped() {
     let event = storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            key: BlobLocationKey::new(live_hash, location.backend.clone())
+            key: BlobLocationKey::new(live_hash, EncodingClass::Raw, location.backend.clone())
                 .to_bytes()
                 .into(),
             value: location.to_bytes().unwrap().into(),
@@ -513,7 +514,7 @@ async fn seed_materialized_keys(
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: BlobLocationKey::new(hash, BackendRef::node_default())
+                key: BlobLocationKey::new(hash, EncodingClass::Raw, BackendRef::node_default())
                     .to_bytes()
                     .into(),
                 value: BackendLocation {

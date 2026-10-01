@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::jobs::executor::ProgressReporter;
@@ -225,7 +226,7 @@ async fn seed_bao(
         ),
         (
             BLOB_LOCATIONS_KEYSPACE.to_string(),
-            BlobLocationKey::new(hash, location.backend.clone())
+            BlobLocationKey::new(hash, EncodingClass::Raw, location.backend.clone())
                 .to_bytes()
                 .into(),
             location.to_bytes().unwrap().into(),

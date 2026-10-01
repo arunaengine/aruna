@@ -1759,6 +1759,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::usage::global_shard_keys;
     use std::time::SystemTime;
@@ -2142,7 +2143,7 @@ mod tests {
             ctx.storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: BlobLocationKey::new(hash, loc.backend.clone())
+                    key: BlobLocationKey::new(hash, EncodingClass::Raw, loc.backend.clone())
                         .to_bytes()
                         .into(),
                     value: loc.to_bytes().unwrap().into(),

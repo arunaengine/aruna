@@ -340,6 +340,7 @@ mod tests {
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::node_info::NodeUrls;
     use aruna_storage::FjallStorage;
@@ -754,7 +755,8 @@ mod tests {
             ),
             (
                 BLOB_LOCATIONS_KEYSPACE,
-                BlobLocationKey::new(hash, BackendRef::node_default()).to_bytes(),
+                BlobLocationKey::new(hash, EncodingClass::Raw, BackendRef::node_default())
+                    .to_bytes(),
                 location.to_bytes().unwrap(),
             ),
         ] {

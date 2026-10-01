@@ -25,6 +25,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
     VersionKey,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
@@ -483,9 +484,13 @@ async fn seed_reference_objects(test: &TestState) -> NodeId {
     write_doc(
         &test.state.get_ctx(),
         BLOB_LOCATIONS_KEYSPACE,
-        BlobLocationKey::new(materialized_hash, location.backend.clone())
-            .to_bytes()
-            .into(),
+        BlobLocationKey::new(
+            materialized_hash,
+            EncodingClass::Raw,
+            location.backend.clone(),
+        )
+        .to_bytes()
+        .into(),
         location.to_bytes().unwrap().into(),
     )
     .await;

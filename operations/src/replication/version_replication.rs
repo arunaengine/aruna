@@ -44,6 +44,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
 };
@@ -2203,7 +2204,11 @@ impl ReplicateObjectOperation {
                     source,
                     metadata,
                 });
-                self.read_blob_location(BlobLocationKey::new(blob_hash, backend))
+                self.read_blob_location(BlobLocationKey::new(
+                    blob_hash,
+                    EncodingClass::Raw,
+                    backend,
+                ))
             }
             BlobVersionState::Deleted => {
                 self.pending_materialized_version = None;
