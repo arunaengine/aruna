@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::compute::SecretBytes;
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, KeyInit, Nonce, Payload};
 use std::fmt;
 use thiserror::Error;
 use ulid::Ulid;
@@ -64,7 +64,7 @@ impl NodeVaultKey {
     }
 
     fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0))
+        Aes256Gcm::new((&self.0).into())
     }
 
     /// Seals `secret` for `entry` as `nonce || ciphertext`.
@@ -77,7 +77,7 @@ impl NodeVaultKey {
         };
         let ciphertext = self
             .cipher()
-            .encrypt(Nonce::from_slice(&nonce), payload)
+            .encrypt(&Nonce::<Aes256Gcm>::from(nonce), payload)
             .map_err(|_| VaultError::Seal)?;
         Ok([nonce.as_slice(), &ciphertext].concat())
     }
@@ -92,7 +92,7 @@ impl NodeVaultKey {
             aad: &entry.key(),
         };
         self.cipher()
-            .decrypt(Nonce::from_slice(nonce), payload)
+            .decrypt(&Nonce::<Aes256Gcm>::from(*nonce), payload)
             .map(SecretBytes::new)
             .map_err(|_| VaultError::Open)
     }
