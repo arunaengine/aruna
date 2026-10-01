@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod keys;
 mod status;
 mod vault;
 
@@ -84,6 +85,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(evict_device))
         .merge(status::router())
         .merge(vault::router())
+        .merge(keys::router())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

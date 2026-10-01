@@ -24,6 +24,8 @@ pub const MAX_PREDECESSORS: usize = 32;
 pub const MAX_VAULT_HEADS: usize = 32;
 /// Public key records one user may publish.
 pub const MAX_KEY_RECORDS: usize = 64;
+/// Bytes a key id may hold.
+pub const MAX_KEY_ID_BYTES: usize = 128;
 
 /// Why a vault or key record is not admissible.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -34,6 +36,8 @@ pub enum VaultRecordError {
     Predecessors,
     #[error("the key fingerprint does not match the public key")]
     Fingerprint,
+    #[error("a key id holds 1 to {MAX_KEY_ID_BYTES} bytes")]
+    KeyId,
 }
 
 /// The passphrase-sealed keys of one user. The payload is the portal's own
@@ -158,6 +162,9 @@ impl UserKeyRecord {
     pub fn validate(&self) -> Result<(), VaultRecordError> {
         if key_fingerprint(&self.public_key) != self.fingerprint {
             return Err(VaultRecordError::Fingerprint);
+        }
+        if self.key_id.is_empty() || self.key_id.len() > MAX_KEY_ID_BYTES {
+            return Err(VaultRecordError::KeyId);
         }
         Ok(())
     }
