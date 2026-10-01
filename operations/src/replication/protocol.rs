@@ -211,8 +211,6 @@ pub struct SyncOrigin {
 pub struct MaterializedBlobInfo {
     pub hash: [u8; 32],
     pub size: u64,
-    pub compressed: bool,
-    pub encrypted: bool,
     pub location: BackendLocation,
 }
 
@@ -632,6 +630,7 @@ pub struct VersionReplicationRequest {
 
 #[cfg(test)]
 mod pure_tests {
+    use aruna_core::structs::storage::format::StoredFormat;
     use std::time::Duration;
 
     use super::{
@@ -745,8 +744,7 @@ mod pure_tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "path/file.txt".to_string(),
             ulid: Ulid::from_parts(5, 5),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: test_user_id(),
             created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000120),
             staging: false,
@@ -757,8 +755,6 @@ mod pure_tests {
         MaterializedBlobInfo {
             hash: [1u8; 32],
             size: 42,
-            compressed: false,
-            encrypted: false,
             location,
         }
     }

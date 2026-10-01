@@ -35,6 +35,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, VersionKey, bucket_permission_path,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::request_authorization::authorize;
@@ -844,8 +845,7 @@ fn response_location(created_by: UserId) -> BackendLocation {
         storage_bucket: "objects".to_string(),
         backend_path: "bucket/object".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by,
         created_at: UNIX_EPOCH,
         staging: false,
@@ -1064,8 +1064,7 @@ async fn write_materialized_version(
         storage_bucket: "objects".to_string(),
         backend_path: format!("path/{key}"),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by,
         created_at,
         staging: false,

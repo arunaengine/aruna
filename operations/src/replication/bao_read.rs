@@ -1469,6 +1469,7 @@ impl Operation for IncomingBaoOperation {
 
 #[cfg(test)]
 mod pure_tests {
+    use aruna_core::structs::storage::format::StoredFormat;
     use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
 
@@ -1581,8 +1582,7 @@ mod pure_tests {
             storage_bucket: "blob-0".to_string(),
             backend_path: "object".to_string(),
             ulid: Ulid::from(6u128),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::nil(test_realm()),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

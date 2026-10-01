@@ -484,6 +484,7 @@ fn storage_event_error(event: Event) -> SearchObjectsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::structs::storage::format::StoredFormat;
 
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, UNIX_EPOCH};
@@ -682,8 +683,7 @@ mod tests {
             storage_bucket: bucket.to_string(),
             backend_path: key.to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: fixture.owner,
             created_at,
             staging: false,

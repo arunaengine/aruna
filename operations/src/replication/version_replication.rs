@@ -1805,8 +1805,6 @@ impl ReplicateObjectOperation {
                         blob: Some(MaterializedBlobInfo {
                             hash,
                             size: location.blob_size,
-                            compressed: location.compressed,
-                            encrypted: location.encrypted,
                             location,
                         }),
                         source,
@@ -2701,6 +2699,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
     };
@@ -2950,8 +2949,7 @@ mod tests {
             storage_bucket: "blob-bucket".to_string(),
             backend_path: format!("bucket/key_{}", Ulid::generate()),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: test_user_id(),
             created_at: SystemTime::now(),
             staging: false,

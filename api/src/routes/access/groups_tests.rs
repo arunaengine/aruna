@@ -31,6 +31,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, VersionKey, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
@@ -767,8 +768,7 @@ async fn seed_object(state: &ServerState, bucket: &str, key: &str, owner: UserId
             storage_bucket: "objects".to_string(),
             backend_path: format!("path/{key}"),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: owner,
             created_at,
             staging: false,

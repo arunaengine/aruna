@@ -88,6 +88,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BlobCleanupWork};
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
@@ -140,8 +141,7 @@ mod tests {
             storage_bucket: "parts".to_string(),
             backend_path: "_parts/old/00001".to_string(),
             ulid: Ulid::from(5),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

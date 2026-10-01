@@ -22,6 +22,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobLocationKey, BlobVersion, BucketInfo, VersionKey,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::{NodeId, UserId};
 use axum::Extension;
@@ -46,8 +47,7 @@ fn materialized_location(blake3: [u8; 32]) -> BackendLocation {
         storage_bucket: "objects".to_string(),
         backend_path: "blob.bin".to_string(),
         ulid: Ulid::from_bytes([2u8; 16]),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: UserId::nil(RealmId([3u8; 32])),
         created_at: SystemTime::UNIX_EPOCH,
         staging: false,

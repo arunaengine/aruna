@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::storage::format::StoredFormat;
 use std::time::Duration;
 
 use super::*;
@@ -93,8 +94,7 @@ fn part_record(part_number: u16, blob_size: u64) -> MultipartPart {
             storage_bucket: "multipart".to_string(),
             backend_path: format!("part-{part_number}"),
             ulid: Ulid::from_parts(5, 5),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::local(Ulid::from_parts(6, 6), RealmId::from_bytes([4u8; 32])),
             created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000120),
             staging: false,
@@ -1092,8 +1092,7 @@ fn cleanup_covers_omitted() {
         storage_bucket: "objects".to_string(),
         backend_path: "object".to_string(),
         ulid: Ulid::from_parts(7, 7),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: UserId::local(Ulid::from_parts(8, 8), RealmId::from_bytes([4u8; 32])),
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000240),
         staging: false,
@@ -1173,8 +1172,7 @@ fn finish_after_commit() {
         storage_bucket: "objects".to_string(),
         backend_path: "object".to_string(),
         ulid: Ulid::from_parts(11, 11),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: UserId::local(Ulid::from_parts(12, 12), RealmId::from_bytes([4u8; 32])),
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000300),
         staging: false,

@@ -156,8 +156,6 @@ pub async fn upload_part_copy(
             content_length,
             body: Some(source.blob),
             created_by: input.user_id,
-            compressed: false,
-            encrypted: false,
             expected_checksums: Vec::new(),
         }),
         context,

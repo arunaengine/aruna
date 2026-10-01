@@ -624,8 +624,6 @@ impl BlobHandler {
                 part_number,
                 resolved,
                 created_by,
-                compressed,
-                encrypted,
                 backend_upload: Some(upload),
                 size,
                 blob,
@@ -635,8 +633,6 @@ impl BlobHandler {
                     MultipartPartKey::new(upload_id, part_number),
                     resolved,
                     created_by,
-                    compressed,
-                    encrypted,
                     size,
                     blob,
                 ))
@@ -647,8 +643,6 @@ impl BlobHandler {
                 part_number,
                 resolved,
                 created_by,
-                compressed,
-                encrypted,
                 blob,
                 ..
             } => {
@@ -656,8 +650,6 @@ impl BlobHandler {
                     MultipartPartKey::new(upload_id, part_number),
                     resolved,
                     created_by,
-                    compressed,
-                    encrypted,
                     blob,
                 ))
                 .await

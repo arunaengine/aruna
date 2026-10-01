@@ -528,6 +528,7 @@ mod tests {
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5, HASH_SHA256};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -556,8 +557,7 @@ mod tests {
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_at: SystemTime::UNIX_EPOCH,
             created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             staging: false,

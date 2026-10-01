@@ -37,6 +37,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
 use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
 use aruna_net::{NetConfig, NetHandle};
@@ -338,8 +339,7 @@ fn materialized_range_reads() {
         storage_bucket: "aruna_test".to_string(),
         backend_path: "s3test/range.txt".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: Default::default(),
         created_at: SystemTime::UNIX_EPOCH,
         staging: false,
@@ -517,8 +517,7 @@ pub async fn test_get_object() {
         storage_bucket: format!("aruna_{}", Ulid::generate()),
         backend_path: format!("{bucket}/{key}_{blob_ulid}"),
         ulid: blob_ulid,
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: Default::default(),
         created_at: SystemTime::now(),
         staging: false,
@@ -773,8 +772,7 @@ pub async fn hash_mismatch_rejected() {
         storage_bucket: format!("aruna_{}", Ulid::generate()),
         backend_path: format!("{bucket}/{key}_{blob_ulid}"),
         ulid: blob_ulid,
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: Default::default(),
         created_at: SystemTime::now(),
         staging: false,

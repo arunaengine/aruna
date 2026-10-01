@@ -288,6 +288,7 @@ mod test {
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -312,8 +313,7 @@ mod test {
             storage_bucket: "parts".to_string(),
             backend_path: "path".to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

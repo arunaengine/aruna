@@ -15,6 +15,7 @@ use crate::structs::execution::staging::VersionSourceBinding;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
+use crate::structs::storage::format::{StoredFormat, StoredLayout};
 use crate::structs::storage::group_backend::GroupBackendKind;
 use crate::structs::storage::routing::StorageRoutingRule;
 use crate::types::GroupId;
@@ -358,13 +359,13 @@ pub struct BackendLocation {
     pub storage_bucket: String,
     pub backend_path: String,
     pub ulid: Ulid,
-    pub compressed: bool,
-    pub encrypted: bool,
+    pub format: StoredFormat,
     pub created_by: UserId,
     pub created_at: SystemTime,
     pub staging: bool,
     /// One part of an unfinished provider multipart upload: never an object of its own.
     pub partial: bool,
+    /// Size of the original bytes; `stored_size` is what the backend holds.
     pub blob_size: u64,
     pub hashes: HashMap<String, Vec<u8>>,
 }
@@ -417,6 +418,13 @@ impl BackendLocation {
 
     pub fn get_blake3(&self) -> Option<&[u8]> {
         self.hashes.get(HASH_BLAKE3).map(|h| h.as_slice())
+    }
+
+    /// Bytes this copy occupies on its backend.
+    pub fn stored_size(&self) -> u64 {
+        match self.format.layout {
+            StoredLayout::Raw => self.blob_size,
+        }
     }
 
     /// Whether both name the same physical object. The path carries a per-write
@@ -1323,6 +1331,7 @@ mod tests {
     use crate::structs::placement::policy::{
         MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef,
     };
+    use crate::structs::storage::format::StoredFormat;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;
@@ -1670,8 +1679,7 @@ mod tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "object.bin".to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::default(),
             created_at: SystemTime::now(),
             staging: false,
@@ -1704,8 +1712,7 @@ mod tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "object.bin".to_string(),
             ulid: Ulid::from_bytes([2u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
@@ -1772,8 +1779,7 @@ mod tests {
             storage_bucket: "storage".to_string(),
             backend_path: "object.bin".to_string(),
             ulid: Ulid::from_bytes([5u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

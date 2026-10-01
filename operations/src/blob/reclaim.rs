@@ -821,6 +821,7 @@ mod tests {
     use super::*;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
     use std::collections::HashMap;
@@ -852,8 +853,7 @@ mod tests {
             storage_bucket: "storage".to_string(),
             backend_path: "bucket/key_01".to_string(),
             ulid: Ulid::from_bytes([5u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: Default::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

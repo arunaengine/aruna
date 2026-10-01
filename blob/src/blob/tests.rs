@@ -32,6 +32,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobTimeoutConfig,
     HiddenBlobKey, ResolvedBackend, WriteOwner,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
@@ -493,8 +494,7 @@ fn make_test_location() -> BackendLocation {
         storage_bucket: "bucket".to_string(),
         backend_path: format!("blob/{}", Ulid::generate()),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::now(),
         staging: false,
@@ -567,8 +567,6 @@ async fn copies_across_backends() {
             MultipartPartKey::new(Ulid::generate(), 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             blob,
         )
         .await
@@ -780,8 +778,6 @@ async fn pins_part_area() {
             MultipartPartKey::new(Ulid::generate(), 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             stream_from_bytes(b"part"),
         )
         .await
@@ -1149,8 +1145,6 @@ async fn excludes_part_bucket() {
             upload_id: Ulid::generate(),
             part_number: 1,
             created_by: test_user_id(),
-            compressed: false,
-            encrypted: false,
             backend_upload: None,
             size: None,
             blob: stream_from_bytes(b"part"),
@@ -1869,8 +1863,7 @@ async fn reports_finalization_failure() {
         storage_bucket: "finalization-bucket".to_string(),
         backend_path: format!("obj/{}", Ulid::generate()),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::now(),
         staging: false,
@@ -1915,8 +1908,7 @@ async fn failed_write_cleans() {
         storage_bucket: "bucket".to_string(),
         backend_path: "partial.bin".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::now(),
         staging: false,
@@ -1977,8 +1969,6 @@ async fn compose_part_sizes() {
                     MultipartPartKey::new(upload_id, (index + 1) as u16),
                     ResolvedBackend::node_default(),
                     test_user_id(),
-                    false,
-                    false,
                     stream_from_bytes(&payload),
                 )
                 .await
@@ -2029,8 +2019,6 @@ async fn compose_streams_chunks() {
                 MultipartPartKey::new(upload_id, (index + 1) as u16),
                 ResolvedBackend::node_default(),
                 test_user_id(),
-                false,
-                false,
                 stream_from_bytes(&payload),
             )
             .await
@@ -2091,8 +2079,6 @@ async fn compose_timeout_deletes() {
             MultipartPartKey::new(Ulid::generate(), 1),
             ResolvedBackend::node_default(),
             test_user_id(),
-            false,
-            false,
             stream_from_bytes(b"part"),
         )
         .await
@@ -2139,8 +2125,7 @@ async fn compose_close_fails() {
         storage_bucket: "compose-target".to_string(),
         backend_path: format!("obj/{}", Ulid::generate()),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::now(),
         staging: false,
@@ -2990,8 +2975,6 @@ async fn s3_staged_replacement() {
             MultipartPartKey::new(upload.record_id, 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             stream_from_bytes(&replacement),
         )
         .await
@@ -3231,8 +3214,6 @@ async fn s3_overlapping_writes() {
             MultipartPartKey::new(upload.record_id, 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             Some(size as u64),
             stream_from_bytes(&second),
         )
@@ -3306,8 +3287,6 @@ async fn s3_delayed_write() {
             MultipartPartKey::new(upload.record_id, 1),
             cold_backend(),
             test_user_id(),
-            false,
-            false,
             Some(size as u64),
             stream_from_bytes(&vec![9u8; size]),
         )
@@ -3368,8 +3347,6 @@ async fn s3_multipart_compose() {
                 MultipartPartKey::new(upload_id, number),
                 cold_backend(),
                 test_user_id(),
-                false,
-                false,
                 stream_from_bytes(&payload),
             )
             .await

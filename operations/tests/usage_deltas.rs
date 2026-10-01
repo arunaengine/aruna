@@ -230,8 +230,6 @@ async fn upload_part(
             content_length: Some(bytes.len() as u64),
             body: Some(stream_from_bytes(bytes)),
             created_by: h.created_by,
-            compressed: false,
-            encrypted: false,
             expected_checksums: vec![],
         }),
         &h.driver,

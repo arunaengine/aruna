@@ -797,6 +797,7 @@ mod test {
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};
@@ -833,8 +834,7 @@ mod test {
             storage_bucket: "objects".to_string(),
             backend_path: "path".to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: created_by(),
             created_at: UNIX_EPOCH + Duration::from_secs(5),
             staging: false,
@@ -1367,6 +1367,7 @@ mod pure_tests {
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, ManagedCopyKey, VersionKey,
     };
+    use aruna_core::structs::storage::format::StoredFormat;
     use std::collections::{BTreeMap, HashMap};
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
@@ -1394,8 +1395,7 @@ mod pure_tests {
             storage_bucket: "aruna".to_string(),
             backend_path: "objects/one".to_string(),
             ulid: Ulid::from_bytes([5u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: Default::default(),
             created_at: UNIX_EPOCH,
             staging: false,

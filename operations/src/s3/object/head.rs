@@ -617,6 +617,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         Backend, BackendRef, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_net::{NetConfig, NetHandle};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -633,8 +634,7 @@ mod tests {
             storage_bucket: "mybucket".to_string(),
             backend_path: "hello.txt".to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_at: SystemTime::now(),
             created_by: Default::default(),
             staging: false,

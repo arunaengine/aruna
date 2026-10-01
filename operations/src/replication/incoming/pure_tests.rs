@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState, ReceivedBlob};
+use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::replication::protocol::{
     MAX_VALUE_BYTES, MaterializedBlobInfo, ReferenceAdvance, SyncOrigin,
@@ -111,8 +112,7 @@ fn make_location() -> BackendLocation {
         storage_bucket: "blob-bucket".to_string(),
         backend_path: "bucket/key".to_string(),
         ulid: Ulid::from_bytes([0x21; 16]),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: test_user_id(),
         created_at: SystemTime::UNIX_EPOCH,
         staging: false,
@@ -141,8 +141,6 @@ pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationMani
             Some(MaterializedBlobInfo {
                 hash: [1u8; 32],
                 size: location.blob_size,
-                compressed: location.compressed,
-                encrypted: location.encrypted,
                 location,
             })
         }

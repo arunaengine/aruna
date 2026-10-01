@@ -995,6 +995,7 @@ mod tests {
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, HashIndex,
     };
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
@@ -1728,8 +1729,7 @@ mod tests {
                 storage_bucket: "blob-bucket".to_string(),
                 backend_path: "multipart/part-5.bin".to_string(),
                 ulid: Ulid::from_bytes([4_u8; 16]),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by,
                 created_at: SystemTime::UNIX_EPOCH,
                 staging: false,
@@ -2028,8 +2028,7 @@ mod tests {
             storage_bucket: "blob-bucket".to_string(),
             backend_path: "path/blob.bin".to_string(),
             ulid: Ulid::from_bytes([5_u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: std::time::SystemTime::UNIX_EPOCH,
             staging: false,

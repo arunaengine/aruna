@@ -170,6 +170,7 @@ mod tests {
     use super::{seed_output, status_output};
     use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE};
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BlobLocationKey};
+    use aruna_core::structs::storage::format::StoredFormat;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::HashMap;
     use std::path::Path;
@@ -185,8 +186,7 @@ mod tests {
             storage_bucket: "storage".to_string(),
             backend_path: "bucket/key_01".to_string(),
             ulid: Ulid::from_bytes([1u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: Default::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging,

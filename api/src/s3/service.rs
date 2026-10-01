@@ -1152,8 +1152,6 @@ impl S3 for ArunaS3Service {
             content_length: req.input.content_length.map(checked_size).transpose()?,
             body: Some(body),
             created_by: user_access.user_identity,
-            compressed: false,
-            encrypted: false,
             expected_checksums: checksum_request.expected.clone(),
         });
 

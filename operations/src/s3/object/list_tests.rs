@@ -15,6 +15,7 @@ use aruna_core::structs::execution::staging::{
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersionPointer};
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_storage::storage;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
@@ -81,8 +82,7 @@ async fn deleted_versions_skipped() {
         storage_bucket: "objects".to_string(),
         backend_path: "path".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by,
         created_at,
         staging: false,
@@ -523,8 +523,7 @@ async fn seed_materialized_keys(
                     storage_bucket: "objects".to_string(),
                     backend_path: format!("path/{key}"),
                     ulid: Ulid::generate(),
-                    compressed: false,
-                    encrypted: false,
+                    format: StoredFormat::default(),
                     created_by,
                     created_at,
                     staging: false,

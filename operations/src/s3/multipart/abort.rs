@@ -530,6 +530,7 @@ mod pure_tests {
     use super::*;
     use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::BackendUpload;
 
     use std::collections::HashMap;
@@ -797,8 +798,7 @@ mod pure_tests {
             storage_bucket: "parts".to_string(),
             backend_path: "upload/part".to_string(),
             ulid: Ulid::from_bytes([4u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: Default::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

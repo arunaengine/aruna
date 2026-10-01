@@ -1970,6 +1970,7 @@ mod decision_tests {
         PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::MultipartChecksumHint;
     use aruna_core::types::Value;
     use std::collections::BTreeMap;
@@ -2197,8 +2198,7 @@ mod decision_tests {
             storage_bucket: "aruna".to_string(),
             backend_path: "objects/one".to_string(),
             ulid: Ulid::from_bytes([5u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::default(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             staging: false,

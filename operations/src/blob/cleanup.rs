@@ -576,6 +576,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
     };
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         BackendUpload, MultipartUpload, MultipartUploadStatus,
     };
@@ -609,8 +610,7 @@ mod tests {
                 storage_bucket: "bucket".to_string(),
                 backend_path: "bucket/object".to_string(),
                 ulid: Ulid::generate(),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by: UserId::local(Ulid::generate(), realm_id),
                 created_at: SystemTime::now(),
                 staging: false,

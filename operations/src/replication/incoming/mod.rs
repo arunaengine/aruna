@@ -181,8 +181,6 @@ pub enum IncomingVersionError {
     BlobHashMismatch,
     #[error("Replicated blob size does not match manifest")]
     BlobSizeMismatch,
-    #[error("Replicated blob storage flags do not match manifest")]
-    StorageFlagsMismatch,
     #[error("Existing blob copy changed before the version committed")]
     ExistingBlobChanged,
     #[error("Replaced multipart metadata exceeds the supported part limit")]
@@ -1369,9 +1367,6 @@ impl IncomingVersionOperation {
         }
         if location.blob_size != blob.size {
             return Err(IncomingVersionError::BlobSizeMismatch);
-        }
-        if location.compressed != blob.compressed || location.encrypted != blob.encrypted {
-            return Err(IncomingVersionError::StorageFlagsMismatch);
         }
 
         Ok(())

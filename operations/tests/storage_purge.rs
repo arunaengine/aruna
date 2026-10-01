@@ -341,8 +341,6 @@ async fn scoped_fence_isolates() {
                 content_length: Some(8),
                 body: Some(stream(b"part-two")),
                 created_by: context.user_id,
-                compressed: false,
-                encrypted: false,
                 expected_checksums: Vec::new(),
             }),
             &context.driver,

@@ -22,6 +22,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendLocation, BackendRef, BlobLocationKey, HIDDEN_BLOB_PREFIX, HiddenBlobEntry,
     HiddenBlobKey, ResolvedBackend,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use bytes::Bytes;
@@ -564,8 +565,7 @@ impl BlobHandler {
             storage_bucket: backend_bucket.clone(),
             backend_path,
             ulid,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -835,8 +835,7 @@ impl BlobHandler {
             storage_bucket: String::new(),
             backend_path,
             ulid,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -891,8 +890,6 @@ impl BlobHandler {
         part: MultipartPartKey,
         resolved: ResolvedBackend,
         created_by: UserId,
-        compressed: bool,
-        encrypted: bool,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
         let root = match self.registry.config_for(&resolved.backend) {
@@ -911,8 +908,7 @@ impl BlobHandler {
             storage_bucket: multipart_bucket.clone(),
             backend_path: build_part_path(part.upload_id, part.part_number, ulid),
             ulid,
-            compressed,
-            encrypted,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -986,8 +982,7 @@ impl BlobHandler {
             storage_bucket: String::new(),
             backend_path,
             ulid,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,

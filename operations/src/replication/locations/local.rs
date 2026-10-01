@@ -797,6 +797,7 @@ mod pure_tests {
         BackendLocation, BackendRef, BlobVersion, BucketInfo,
     };
     use aruna_core::structs::storage::blob::{CopyOrigin, VersionKey};
+    use aruna_core::structs::storage::format::StoredFormat;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -809,8 +810,7 @@ mod pure_tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "raw/run1.tar_0".to_string(),
             ulid: Ulid::from_bytes([2u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::nil(realm_id()),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

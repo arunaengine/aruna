@@ -6,6 +6,7 @@ use crate::driver::{DriverContext, drive};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectState,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::node::usage_stats::{QuotaGate, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
@@ -75,8 +76,7 @@ fn test_location(created_by: aruna_core::UserId) -> BackendLocation {
         storage_bucket: "bucket".to_string(),
         backend_path: "path".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by,
         created_at: std::time::SystemTime::now(),
         staging: false,
@@ -1487,8 +1487,7 @@ fn generation_increments() {
         storage_bucket: "bucket".to_string(),
         backend_path: "path".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: op.config.user_id,
         created_at: std::time::SystemTime::now(),
         staging: false,

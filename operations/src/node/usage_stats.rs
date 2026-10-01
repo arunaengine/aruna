@@ -1759,6 +1759,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer,
     };
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::usage::global_shard_keys;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -1783,8 +1784,7 @@ mod tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "path".to_string(),
             ulid: Ulid::generate(),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_at: SystemTime::now(),
             created_by: Default::default(),
             staging,

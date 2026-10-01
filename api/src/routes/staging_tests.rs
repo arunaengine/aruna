@@ -25,6 +25,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
     VersionKey,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use std::collections::HashMap;
@@ -471,8 +472,7 @@ async fn seed_reference_objects(test: &TestState) -> NodeId {
         storage_bucket: "objects".to_string(),
         backend_path: "materialized".to_string(),
         ulid: Ulid::generate(),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by,
         created_at: UNIX_EPOCH,
         staging: false,

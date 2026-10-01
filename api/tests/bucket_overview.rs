@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::storage::format::StoredFormat;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -224,8 +225,7 @@ async fn setup() -> Fixture {
                 storage_bucket: "data".to_string(),
                 backend_path: format!("{tag}.blob"),
                 ulid: Ulid::generate(),
-                compressed: false,
-                encrypted: false,
+                format: StoredFormat::default(),
                 created_by: owner,
                 created_at: UNIX_EPOCH,
                 staging: false,

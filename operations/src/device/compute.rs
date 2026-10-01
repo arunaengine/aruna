@@ -340,6 +340,7 @@ mod tests {
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::node_info::NodeUrls;
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
@@ -710,8 +711,7 @@ mod tests {
             storage_bucket: bucket.to_string(),
             backend_path: key.to_string(),
             ulid: version,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: user,
             created_at: std::time::SystemTime::UNIX_EPOCH,
             staging: false,

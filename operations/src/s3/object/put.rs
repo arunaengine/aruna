@@ -1573,6 +1573,7 @@ mod pure_tests {
     use aruna_core::structs::identity::auth::PathRestriction;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::structs::storage::routing::{
         BackendCatalog, GroupRoutingInputs, RoutingError, RoutingSnapshot, RoutingTarget,
@@ -1833,8 +1834,7 @@ mod pure_tests {
             storage_bucket: "bucket".to_string(),
             backend_path: "bucket/object".to_string(),
             ulid: Ulid::from_bytes([6u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: aruna_core::UserId::default(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             staging: false,
@@ -1881,6 +1881,7 @@ mod decision_tests {
         PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::{Effects, Value};
     use byteview::ByteView;
@@ -2277,8 +2278,7 @@ mod decision_tests {
             storage_bucket: "aruna".to_string(),
             backend_path: "objects/one".to_string(),
             ulid: Ulid::from_bytes([5u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
             created_at: UNIX_EPOCH,
             staging: false,

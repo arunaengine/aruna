@@ -18,6 +18,7 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, ResolvedBackend, WriteOwner,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
 use bytes::Bytes;
 use byteview::ByteView;
@@ -141,8 +142,7 @@ impl BlobHandler {
             storage_bucket: String::new(),
             backend_path,
             ulid,
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by,
             created_at: SystemTime::now(),
             staging: false,
@@ -232,8 +232,6 @@ impl BlobHandler {
         part: MultipartPartKey,
         resolved: ResolvedBackend,
         created_by: UserId,
-        compressed: bool,
-        encrypted: bool,
         size: Option<u64>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
@@ -251,12 +249,7 @@ impl BlobHandler {
                 ))
                 .await
             }
-            Ok(None) => {
-                Box::pin(
-                    self.write_blob_part(part, resolved, created_by, compressed, encrypted, blob),
-                )
-                .await
-            }
+            Ok(None) => Box::pin(self.write_blob_part(part, resolved, created_by, blob)).await,
             Err(error) => BlobEvent::Error(error),
         }
     }

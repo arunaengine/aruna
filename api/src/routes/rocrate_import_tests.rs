@@ -20,6 +20,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BucketInfo,
 };
+use aruna_core::structs::storage::format::StoredFormat;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::import::write_rocrate_upload;
@@ -488,8 +489,7 @@ async fn seed_upload(
             storage_bucket: "storage".to_string(),
             backend_path: format!("_jobs/{upload_id}/input"),
             ulid: Ulid::from_bytes([9u8; 16]),
-            compressed: false,
-            encrypted: false,
+            format: StoredFormat::default(),
             created_by: owner,
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,

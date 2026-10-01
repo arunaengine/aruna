@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::jobs::executor::ProgressReporter;
 use crate::sync::incoming::initialize_incoming_fixture;
@@ -1199,8 +1200,7 @@ fn caps_repeated_hashes() {
         storage_bucket: "bucket".to_string(),
         backend_path: "object".to_string(),
         ulid: Ulid::from_bytes([27; 16]),
-        compressed: false,
-        encrypted: false,
+        format: StoredFormat::default(),
         created_by: UserId::nil(realm_id),
         created_at: std::time::SystemTime::UNIX_EPOCH,
         staging: false,
