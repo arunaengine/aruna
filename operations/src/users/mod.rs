@@ -15,4 +15,5 @@ pub mod subject_index;
 pub mod update_user;
 pub mod user_vault;
 pub mod vault_read;
+pub mod vault_route;
 pub mod vault_write;
