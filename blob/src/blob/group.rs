@@ -368,7 +368,7 @@ mod tests {
     fn secret() -> GroupStorageSecret {
         GroupStorageSecret {
             backend_id: Ulid::from_bytes([1u8; 16]),
-            secret_config: HashMap::from([("account_key".to_string(), "key".to_string())]),
+            secret_config: HashMap::from([("account_key".to_string(), "canary-a3e6".to_string())]),
             updated_at: SystemTime::UNIX_EPOCH,
         }
     }
@@ -411,8 +411,10 @@ mod tests {
                 .service_config
                 .get("account_key")
                 .map(String::as_str),
-            Some("key")
+            Some("canary-a3e6")
         );
+        let rendered = format!("{entry:?}");
+        assert!(!rendered.contains("canary"), "{rendered}");
     }
 
     #[test]

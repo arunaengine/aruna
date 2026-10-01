@@ -5,9 +5,10 @@
 use super::source_connector::{SourceConnector, SourceConnectorKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::time::SystemTime;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ResolvedSourceAccess {
     OpenDal {
         kind: SourceConnectorKind,
@@ -15,6 +16,24 @@ pub enum ResolvedSourceAccess {
         path: String,
         version: Option<String>,
     },
+}
+
+/// Shows only the config keys; the values include connector credentials.
+impl fmt::Debug for ResolvedSourceAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self::OpenDal {
+            kind,
+            config,
+            path,
+            version,
+        } = self;
+        f.debug_struct("OpenDal")
+            .field("kind", kind)
+            .field("config_keys", &config.keys().collect::<Vec<_>>())
+            .field("path", path)
+            .field("version", version)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +116,20 @@ pub struct SourceEntry {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn access_hides_secrets() {
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::S3,
+            config: HashMap::from([("secret_access_key".to_string(), "canary-8b1d".to_string())]),
+            path: "data".to_string(),
+            version: None,
+        };
+        let effect = crate::effects::StagingSourceEffect::Check { access };
+        let rendered = format!("{effect:?}");
+        assert!(!rendered.contains("canary"), "{rendered}");
+        assert!(rendered.contains("secret_access_key"));
+    }
 
     fn metadata() -> SourceMetadata {
         SourceMetadata {
