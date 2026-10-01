@@ -1,5 +1,5 @@
-//! Re-encodes legacy job, realm, PID mapping and Git record rows, adds missing event size rows,
-//! seals plain secrets and moves node secrets into the node vault; repeats are safe.
+//! Re-encodes legacy rows, adds missing event size rows, seals plain secrets, moves node secrets
+//! into the node vault and deletes unreadable S3 sessions; repeats are safe.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -14,8 +14,8 @@ use aruna_core::keyspaces::{
     CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
     FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY,
-    NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, SECONDARY_ID_KEYSPACE,
-    SYNC_OUTBOX_KEYSPACE,
+    NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_SESSION_KEYSPACE,
+    SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
@@ -37,6 +37,7 @@ use ulid::Ulid;
 mod git;
 mod jobs;
 mod mappings;
+mod sessions;
 mod sizes;
 mod vault;
 
@@ -81,6 +82,9 @@ pub struct MigrateOutput {
     pub git_outbox_rewritten: usize,
     /// Size rows written for logged metadata events that had none.
     pub event_sizes_written: usize,
+    /// S3 sessions in an older format are deleted; their holders mint new ones.
+    pub sessions_scanned: usize,
+    pub sessions_deleted: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -110,6 +114,9 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let event_rows = db.keyspace(EVENT_LOG_KEYSPACE, KeyspaceCreateOptions::default)?;
     let size_rows = db.keyspace(EVENT_SIZE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let state_rows = db.keyspace(JOB_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let session_rows = db.keyspace(S3_SESSION_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let expiry_rows = db.keyspace(SESSION_EXPIRY_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let owner_rows = db.keyspace(SESSION_OWNER_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -132,6 +139,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let git_records =
         rewrites::<GitRecord, git::LegacyRecord>(&db, &git_rows, GIT_RECORD_KEYSPACE)?;
     let sizes = sizes::missing_sizes(&db, &event_rows, &size_rows)?;
+    let stale = sessions::stale_sessions(&db, &session_rows, &expiry_rows, &owner_rows)?;
     let record = |target: &DocumentTarget| matches!(target, DocumentTarget::GitRecord { .. });
     let git_outbox = mappings::outbox_rows(
         &db,
@@ -185,6 +193,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&index_rows, &index.writes),
         (&job_rows, &jobs.rows),
         (&state_rows, &checkpoints.rows),
+        (&owner_rows, &stale.owner_writes),
     ]
     .into_iter()
     .chain(
@@ -203,6 +212,15 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     }
     for key in &index.removes {
         txn.remove(index_rows.clone(), key.clone());
+    }
+    for (keyspace, keys) in [
+        (&session_rows, &stale.sessions),
+        (&expiry_rows, &stale.expiries),
+        (&owner_rows, &stale.owner_removes),
+    ] {
+        for key in keys {
+            txn.remove(keyspace.clone(), key.clone());
+        }
     }
     for (keyspace, moved) in &moves {
         for key in &moved.removed {
@@ -243,6 +261,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         git_records_rewritten: git_records.rows.len(),
         git_outbox_rewritten: git_outbox.rows.len(),
         event_sizes_written: sizes.rows.len(),
+        sessions_scanned: stale.scanned,
+        sessions_deleted: stale.sessions.len(),
     })
 }
 
