@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn same_setting_stays_idle() {
+    fn unchanged_stays_idle() {
         let mut operation =
             PutCompressionOperation::new("b".to_string(), group(), Compression::Off, 5);
 

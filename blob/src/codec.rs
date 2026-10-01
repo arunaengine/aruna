@@ -479,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn small_saving_stays_raw() {
+    fn small_savings_raw() {
         let (tag, _) = encode_frame(Bytes::from(vec![0u8; 900]), 3).unwrap();
         assert_eq!(tag, TAG_RAW);
         let (tag, _) = encode_frame(Bytes::from(random(FRAME_SIZE as usize, 5)), 3).unwrap();
