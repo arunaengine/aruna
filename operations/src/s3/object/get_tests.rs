@@ -252,6 +252,7 @@ fn reports_missing_blob() {
     let version = BlobVersion::materialized(
         blake3,
         BackendRef::node_default(),
+        EncodingClass::Raw,
         SystemTime::UNIX_EPOCH,
         operation.input.user_identity,
         None,
@@ -578,6 +579,7 @@ pub async fn test_get_object() {
                 value: BlobVersion::materialized(
                     blake3_hash,
                     BackendRef::node_default(),
+                    EncodingClass::Raw,
                     location.created_at,
                     location.created_by,
                     None,
@@ -677,6 +679,7 @@ async fn routed_missing_blob() {
                 value: BlobVersion::materialized(
                     [5u8; 32],
                     BackendRef::node_default(),
+                    EncodingClass::Raw,
                     SystemTime::UNIX_EPOCH,
                     user_identity,
                     None,
@@ -836,6 +839,7 @@ pub async fn hash_mismatch_rejected() {
                 value: BlobVersion::materialized(
                     blake3_hash,
                     BackendRef::node_default(),
+                    EncodingClass::Raw,
                     location.created_at,
                     location.created_by,
                     None,

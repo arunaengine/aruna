@@ -24,7 +24,6 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -306,9 +305,10 @@ impl HeadObjectOperation {
             BlobVersionState::Materialized {
                 blob_hash,
                 backend,
+                encoding,
                 source,
             } => {
-                let location_key = BlobLocationKey::new(blob_hash, EncodingClass::Raw, backend);
+                let location_key = BlobLocationKey::new(blob_hash, encoding, backend);
                 self.source_binding = source;
                 self.source_metadata = None;
                 self.last_refresh = None;
@@ -707,6 +707,7 @@ mod tests {
                 value: BlobVersion::materialized(
                     location.get_blake3().unwrap().try_into().unwrap(),
                     BackendRef::node_default(),
+                    EncodingClass::Raw,
                     location.created_at,
                     location.created_by,
                     None,
@@ -792,6 +793,7 @@ mod tests {
         let metadata = BlobVersion::materialized(
             location.get_blake3().unwrap().try_into().unwrap(),
             BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::now(),
             Default::default(),
             None,

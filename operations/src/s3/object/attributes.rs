@@ -21,7 +21,6 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
 };
@@ -267,9 +266,12 @@ impl GetAttributesOperation {
 
         match version.state {
             BlobVersionState::Materialized {
-                blob_hash, backend, ..
+                blob_hash,
+                backend,
+                encoding,
+                ..
             } => {
-                let location_key = BlobLocationKey::new(blob_hash, EncodingClass::Raw, backend);
+                let location_key = BlobLocationKey::new(blob_hash, encoding, backend);
                 self.source_metadata = None;
                 self.version_created_at = Some(version.created_at);
                 // Size and checksums are governed metadata: a copy this node may
@@ -603,6 +605,7 @@ mod tests {
             BlobVersion::materialized(
                 location.get_blake3().unwrap().try_into().unwrap(),
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 location.created_at,
                 location.created_by,
                 None,
@@ -757,6 +760,7 @@ mod tests {
             BlobVersion::materialized(
                 location.get_blake3().unwrap().try_into().unwrap(),
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 location.created_at,
                 location.created_by,
                 None,

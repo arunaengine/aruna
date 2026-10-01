@@ -746,6 +746,7 @@ mod tests {
                 BlobVersion::materialized(
                     hash,
                     BackendRef::node_default(),
+                    EncodingClass::Raw,
                     std::time::SystemTime::UNIX_EPOCH,
                     user,
                     None,

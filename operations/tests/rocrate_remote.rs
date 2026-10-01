@@ -389,6 +389,7 @@ async fn seed_holder(
     let version = BlobVersion::materialized(
         hash,
         BackendRef::node_default(),
+        EncodingClass::Raw,
         SystemTime::UNIX_EPOCH,
         owner,
         None,

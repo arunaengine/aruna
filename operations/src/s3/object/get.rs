@@ -36,7 +36,6 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
 };
@@ -518,9 +517,10 @@ impl GetObjectOperation {
             BlobVersionState::Materialized {
                 blob_hash,
                 backend,
+                encoding,
                 source,
             } => {
-                let location_key = BlobLocationKey::new(blob_hash, EncodingClass::Raw, backend);
+                let location_key = BlobLocationKey::new(blob_hash, encoding, backend);
                 self.source_binding = source;
                 self.version_created_at = Some(version.created_at);
                 if version.placement_policies.is_empty() {

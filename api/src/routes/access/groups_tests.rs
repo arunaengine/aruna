@@ -753,9 +753,16 @@ async fn seed_object(state: &ServerState, bucket: &str, key: &str, owner: UserId
         state,
         BLOB_VERSIONS_KEYSPACE,
         VersionKey::new(bucket, key, version_id).to_bytes().unwrap(),
-        BlobVersion::materialized(hash, BackendRef::node_default(), created_at, owner, None)
-            .to_bytes()
-            .unwrap(),
+        BlobVersion::materialized(
+            hash,
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            created_at,
+            owner,
+            None,
+        )
+        .to_bytes()
+        .unwrap(),
     )
     .await;
     store_bytes(

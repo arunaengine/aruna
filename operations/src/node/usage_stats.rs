@@ -2187,13 +2187,27 @@ mod tests {
         let alpha_live_head = write_version(
             "alpha",
             "live.txt",
-            BlobVersion::materialized(hashes[0], BackendRef::node_default(), now, user, None),
+            BlobVersion::materialized(
+                hashes[0],
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                now,
+                user,
+                None,
+            ),
         )
         .await;
         write_version(
             "alpha",
             "gone.txt",
-            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
+            BlobVersion::materialized(
+                hashes[1],
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                now,
+                user,
+                None,
+            ),
         )
         .await;
         let alpha_gone_head =
@@ -2201,13 +2215,27 @@ mod tests {
         write_version(
             "beta",
             "shared.bin",
-            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
+            BlobVersion::materialized(
+                hashes[1],
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                now,
+                user,
+                None,
+            ),
         )
         .await;
         let beta_head = write_version(
             "beta",
             "shared.bin",
-            BlobVersion::materialized(hashes[1], BackendRef::node_default(), now, user, None),
+            BlobVersion::materialized(
+                hashes[1],
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                now,
+                user,
+                None,
+            ),
         )
         .await;
         let alpha_ref_head = write_version(

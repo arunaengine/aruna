@@ -188,6 +188,7 @@ async fn seed_bao(
     let version = BlobVersion::materialized(
         hash,
         BackendRef::node_default(),
+        EncodingClass::Raw,
         std::time::SystemTime::UNIX_EPOCH,
         owner,
         None,

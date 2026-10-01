@@ -641,6 +641,7 @@ mod pure_tests {
         BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
         ManagedCopyRecord, ManagedCopyState, VersionKey,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::types::Key;
     use std::collections::HashMap;
@@ -680,6 +681,7 @@ mod pure_tests {
         BlobVersion::materialized(
             [6u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             UNIX_EPOCH,
             user_id(),
             None,

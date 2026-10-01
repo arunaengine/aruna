@@ -44,7 +44,6 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
-use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
 };
@@ -2195,6 +2194,7 @@ impl ReplicateObjectOperation {
             BlobVersionState::Materialized {
                 blob_hash,
                 backend,
+                encoding,
                 source,
             } => {
                 self.pending_materialized_version = Some(PendingMaterializedVersion {
@@ -2204,11 +2204,7 @@ impl ReplicateObjectOperation {
                     source,
                     metadata,
                 });
-                self.read_blob_location(BlobLocationKey::new(
-                    blob_hash,
-                    EncodingClass::Raw,
-                    backend,
-                ))
+                self.read_blob_location(BlobLocationKey::new(blob_hash, encoding, backend))
             }
             BlobVersionState::Deleted => {
                 self.pending_materialized_version = None;
@@ -2704,6 +2700,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
@@ -2900,6 +2897,7 @@ mod tests {
         BlobVersion::materialized(
             location.get_blake3().unwrap().try_into().unwrap(),
             BackendRef::node_default(),
+            EncodingClass::Raw,
             location.created_at,
             location.created_by,
             source,

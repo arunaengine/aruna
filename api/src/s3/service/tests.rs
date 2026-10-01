@@ -1042,6 +1042,7 @@ async fn write_materialized_version(
     let version = BlobVersion::materialized(
         hash,
         BackendRef::node_default(),
+        EncodingClass::Raw,
         created_at,
         created_by,
         None,

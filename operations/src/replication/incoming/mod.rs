@@ -1604,6 +1604,7 @@ impl IncomingVersionOperation {
                     let materialized = match BlobVersion::materialized(
                         hash,
                         location.backend.clone(),
+                        location.format.encoding(),
                         self.manifest.created_at,
                         self.manifest.created_by,
                         self.manifest.source.clone(),

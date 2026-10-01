@@ -797,6 +797,7 @@ mod pure_tests {
         BackendLocation, BackendRef, BlobVersion, BucketInfo,
     };
     use aruna_core::structs::storage::blob::{CopyOrigin, VersionKey};
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -899,6 +900,7 @@ mod pure_tests {
         BlobVersion::materialized(
             [7u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             UserId::nil(realm_id()),
             None,

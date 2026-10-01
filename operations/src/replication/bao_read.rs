@@ -1469,6 +1469,7 @@ impl Operation for IncomingBaoOperation {
 
 #[cfg(test)]
 mod pure_tests {
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
@@ -1550,6 +1551,7 @@ mod pure_tests {
         BlobVersion::materialized(
             hash,
             BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             UserId::nil(test_realm()),
             None,
@@ -1723,6 +1725,7 @@ mod pure_tests {
         let materialized = BlobVersion::materialized(
             [4u8; 32],
             location.backend.clone(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             UserId::nil(test_realm()),
             None,

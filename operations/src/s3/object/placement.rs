@@ -178,6 +178,7 @@ mod pure_tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersionPointer};
+    use aruna_core::structs::storage::format::EncodingClass;
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -207,6 +208,7 @@ mod pure_tests {
         let version = BlobVersion::materialized(
             [7u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             UserId::nil(aruna_core::structs::identity::realm::RealmId::from_bytes(
                 [1u8; 32],

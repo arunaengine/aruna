@@ -1023,6 +1023,7 @@ mod pure_tests {
         BackendLocation, BackendRef, BlobVersion, BucketInfo, CurrentVersionPointer,
         ManagedCopyRecord, ManagedCopyState, VersionKey,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
@@ -1193,6 +1194,7 @@ mod pure_tests {
         BlobVersion::materialized(
             CONTENT,
             BackendRef::node_default(),
+            EncodingClass::Raw,
             UNIX_EPOCH,
             user_id(),
             None,

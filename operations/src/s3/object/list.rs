@@ -22,7 +22,6 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -556,17 +555,16 @@ impl ListBucketOperation {
                             }));
                         }
                         BlobVersionState::Materialized {
-                            blob_hash, backend, ..
+                            blob_hash,
+                            backend,
+                            encoding,
+                            ..
                         } => {
                             self.location_reads.push((
                                 BLOB_LOCATIONS_KEYSPACE.to_string(),
-                                BlobLocationKey::new(
-                                    blob_hash,
-                                    EncodingClass::Raw,
-                                    backend.clone(),
-                                )
-                                .to_bytes()
-                                .into(),
+                                BlobLocationKey::new(blob_hash, encoding, backend.clone())
+                                    .to_bytes()
+                                    .into(),
                             ));
                             let governed = match version.placement_policies.is_empty() {
                                 true => None,

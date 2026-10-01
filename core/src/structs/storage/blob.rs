@@ -1067,6 +1067,7 @@ impl BlobVersion {
     pub fn materialized(
         blob_hash: [u8; 32],
         backend: BackendRef,
+        encoding: EncodingClass,
         created_at: SystemTime,
         created_by: UserId,
         source: Option<VersionSourceBinding>,
@@ -1077,6 +1078,7 @@ impl BlobVersion {
             state: BlobVersionState::Materialized {
                 blob_hash,
                 backend,
+                encoding,
                 source,
             },
             metadata: HashMap::new(),
@@ -1193,6 +1195,8 @@ pub enum BlobVersionState {
         /// Backend the write routed to. Stamped here so a read never has to
         /// re-derive routing or guess which physical copy the object owns.
         backend: BackendRef,
+        /// Encoding class of the copy, the last part of its location key.
+        encoding: EncodingClass,
         source: Option<VersionSourceBinding>,
     },
     Reference {
@@ -1224,12 +1228,11 @@ impl BlobVersionState {
     pub fn location_key(&self) -> Option<BlobLocationKey> {
         match self {
             Self::Materialized {
-                blob_hash, backend, ..
-            } => Some(BlobLocationKey::new(
-                *blob_hash,
-                EncodingClass::Raw,
-                backend.clone(),
-            )),
+                blob_hash,
+                backend,
+                encoding,
+                ..
+            } => Some(BlobLocationKey::new(*blob_hash, *encoding, backend.clone())),
             Self::Reference { .. } | Self::Deleted => None,
         }
     }
@@ -1630,6 +1633,7 @@ mod tests {
             BlobVersion::materialized(
                 [1u8; 32],
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 created_at,
                 created_by,
                 Some(binding.clone()),
@@ -1656,6 +1660,7 @@ mod tests {
         let materialized = BlobVersion::materialized(
             [1u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             created_at,
             created_by,
             None,
@@ -1918,6 +1923,7 @@ mod tests {
         let version = BlobVersion::materialized(
             [1u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             created_at,
             UserId::default(),
             None,

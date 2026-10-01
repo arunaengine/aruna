@@ -17,6 +17,7 @@ use crate::tests::routes::{
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
@@ -3781,6 +3782,7 @@ async fn preflight_finds_ids() {
         BlobVersion::materialized(
             hash,
             BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             test.auth.user_id,
             None,

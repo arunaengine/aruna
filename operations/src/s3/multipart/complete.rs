@@ -1212,6 +1212,7 @@ impl CompleteUploadOperation {
                 }
             },
             location.backend.clone(),
+            location.format.encoding(),
             created_at,
             self.input.created_by,
             None,

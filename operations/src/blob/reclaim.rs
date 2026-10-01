@@ -983,6 +983,7 @@ mod tests {
             BlobVersion::materialized(
                 HASH,
                 backend,
+                EncodingClass::Raw,
                 SystemTime::UNIX_EPOCH,
                 Default::default(),
                 None,

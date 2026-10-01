@@ -41,6 +41,7 @@ async fn deleted_versions_skipped() {
             BlobVersion::materialized(
                 live_hash,
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 created_at,
                 created_by,
                 None,
@@ -263,6 +264,7 @@ async fn zero_limit_honored() {
             value: BlobVersion::materialized(
                 hash,
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 created_at,
                 created_by,
                 None,
@@ -485,6 +487,7 @@ async fn seed_materialized_keys(
         let version = BlobVersion::materialized(
             hash,
             BackendRef::node_default(),
+            EncodingClass::Raw,
             created_at,
             created_by,
             None,
@@ -931,6 +934,7 @@ fn group_round_advances() {
     let version: aruna_core::types::Value = BlobVersion::materialized(
         [1u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         created_at,
         created_by,
         None,

@@ -184,6 +184,7 @@ async fn setup() -> Fixture {
             BlobVersion::materialized(
                 [1u8; 32],
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 UNIX_EPOCH + Duration::from_secs(3),
                 owner,
                 None,
@@ -194,6 +195,7 @@ async fn setup() -> Fixture {
             BlobVersion::materialized(
                 [2u8; 32],
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 UNIX_EPOCH + Duration::from_secs(2),
                 owner,
                 None,

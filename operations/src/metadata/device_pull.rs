@@ -587,6 +587,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
+    use aruna_core::structs::storage::format::EncodingClass;
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
 
@@ -760,6 +761,7 @@ mod tests {
         let mut version = BlobVersion::materialized(
             [4u8; 32],
             aruna_core::structs::storage::blob::BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             fixture.auth.user_id,
             None,

@@ -18,7 +18,6 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use std::collections::VecDeque;
@@ -521,11 +520,14 @@ impl ListVersionsOperation {
                     }));
                 }
                 BlobVersionState::Materialized {
-                    blob_hash, backend, ..
+                    blob_hash,
+                    backend,
+                    encoding,
+                    ..
                 } => {
                     location_reads.push((
                         BLOB_LOCATIONS_KEYSPACE.to_string(),
-                        BlobLocationKey::new(blob_hash, EncodingClass::Raw, backend.clone())
+                        BlobLocationKey::new(blob_hash, encoding, backend.clone())
                             .to_bytes()
                             .into(),
                     ));
@@ -892,6 +894,7 @@ mod test {
             BlobVersion::materialized(
                 hash,
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 UNIX_EPOCH + Duration::from_secs(5),
                 created_by(),
                 None,

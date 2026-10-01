@@ -6,6 +6,7 @@
 
 mod topology;
 
+use aruna_core::structs::storage::format::EncodingClass;
 use std::time::UNIX_EPOCH;
 
 use aruna_core::effects::StorageEffect;
@@ -80,6 +81,7 @@ async fn seed_object(node: &TestNode, realm: &Topology, key: &str, tag: u8) -> T
         BlobVersion::materialized(
             [tag; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             UNIX_EPOCH,
             realm.user_id,
             None,

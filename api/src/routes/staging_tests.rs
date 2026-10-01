@@ -502,6 +502,7 @@ async fn seed_reference_objects(test: &TestState) -> NodeId {
             BlobVersion::materialized(
                 materialized_hash,
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 UNIX_EPOCH,
                 created_by,
                 None,

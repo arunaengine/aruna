@@ -2040,6 +2040,7 @@ mod tests {
         let version = BlobVersion::materialized(
             [9_u8; 32],
             BackendRef::node_default(),
+            EncodingClass::Raw,
             std::time::SystemTime::UNIX_EPOCH,
             created_by,
             None,

@@ -936,6 +936,7 @@ impl PutObjectOperation {
                     }
                 },
                 output.backend.clone(),
+                output.format.encoding(),
                 version_created_at,
                 output.created_by,
                 self.config.version_source.clone(),

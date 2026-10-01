@@ -11,10 +11,10 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, sea
 use aruna_core::document::DocumentTarget;
 use aruna_core::git::GitRecord;
 use aruna_core::keyspaces::{
-    BLOB_CLEANUP_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
-    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE,
-    JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
+    BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, EVENT_LOG_KEYSPACE,
+    EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE,
+    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE,
+    JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
     SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
@@ -27,6 +27,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
+use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
@@ -42,6 +43,7 @@ mod sessions;
 mod sizes;
 mod uploads;
 mod vault;
+mod versions;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {
@@ -93,6 +95,9 @@ pub struct MigrateOutput {
     pub upload_parts_deleted: usize,
     /// Stored blobs of deleted parts, queued for the cleanup drain.
     pub upload_blobs_queued: usize,
+    /// Blob versions from before materialized versions named their encoding class.
+    pub versions_scanned: usize,
+    pub versions_rewritten: usize,
 }
 
 pub async fn migrate(database_path: String) -> Result<(), CliError> {
@@ -128,6 +133,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let upload_rows = db.keyspace(UPLOAD_KEYSPACE, KeyspaceCreateOptions::default)?;
     let part_rows = db.keyspace(UPLOAD_PART_KEYSPACE, KeyspaceCreateOptions::default)?;
     let cleanup_rows = db.keyspace(BLOB_CLEANUP_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let version_rows = db.keyspace(BLOB_VERSIONS_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -152,6 +158,11 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
     let sizes = sizes::missing_sizes(&db, &event_rows, &size_rows)?;
     let stale = sessions::stale_sessions(&db, &session_rows, &expiry_rows, &owner_rows)?;
     let old_uploads = uploads::stale_uploads(&db, &upload_rows, &part_rows)?;
+    let versions = rewrites::<BlobVersion, versions::LegacyVersion>(
+        &db,
+        &version_rows,
+        BLOB_VERSIONS_KEYSPACE,
+    )?;
     let record = |target: &DocumentTarget| matches!(target, DocumentTarget::GitRecord { .. });
     let git_outbox = mappings::outbox_rows(
         &db,
@@ -202,6 +213,7 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         (&outbox_rows, &git_outbox.rows),
         (&git_rows, &git_records.rows),
         (&size_rows, &sizes.rows),
+        (&version_rows, &versions.rows),
         (&index_rows, &index.writes),
         (&job_rows, &jobs.rows),
         (&state_rows, &checkpoints.rows),
@@ -282,6 +294,8 @@ fn migrate_output(database_path: &str) -> Result<MigrateOutput, ExplorerError> {
         uploads_deleted: old_uploads.uploads.len(),
         upload_parts_deleted: old_uploads.parts.len(),
         upload_blobs_queued: old_uploads.blob_deletes.len(),
+        versions_scanned: versions.scanned,
+        versions_rewritten: versions.rows.len(),
     })
 }
 

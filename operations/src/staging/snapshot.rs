@@ -23,7 +23,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
@@ -185,6 +184,7 @@ async fn find_snapshot(
     let BlobVersionState::Materialized {
         blob_hash,
         backend,
+        encoding,
         source: Some(source),
     } = version.state
     else {
@@ -193,7 +193,7 @@ async fn find_snapshot(
     if &source != version_source {
         return Ok(None);
     }
-    let location_key = BlobLocationKey::new(blob_hash, EncodingClass::Raw, backend)
+    let location_key = BlobLocationKey::new(blob_hash, encoding, backend)
         .to_bytes()
         .into();
     let Some(location) = read_value(context, BLOB_LOCATIONS_KEYSPACE, location_key)

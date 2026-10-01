@@ -495,6 +495,7 @@ fn existing_version_skips() {
     let version = BlobVersion::materialized(
         manifest.blob.as_ref().unwrap().hash,
         BackendRef::node_default(),
+        EncodingClass::Raw,
         manifest.created_at,
         manifest.created_by,
         None,
@@ -963,6 +964,7 @@ fn replacement_cleans_metadata() {
     op.replaced_version = Some(BlobVersion::materialized(
         [9u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         SystemTime::UNIX_EPOCH + Duration::from_secs(1600000060),
         test_user_id(),
         None,
@@ -1036,6 +1038,7 @@ fn replacement_queues_reclaim() {
     op.replaced_version = Some(BlobVersion::materialized(
         [9u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         SystemTime::UNIX_EPOCH + Duration::from_secs(1600000120),
         test_user_id(),
         None,
@@ -1091,6 +1094,7 @@ fn replaced_version_fenced() {
     let current = BlobVersion::materialized(
         [9u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         manifest.created_at,
         manifest.created_by,
         None,
@@ -1746,6 +1750,7 @@ fn newer_generation_rollback() {
             BlobVersion::materialized(
                 [2u8; 32],
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 SystemTime::UNIX_EPOCH + Duration::from_secs(1600000180),
                 test_user_id(),
                 None,
@@ -3164,6 +3169,7 @@ fn reclaim_uses_enqueue() {
     op.replaced_version = Some(BlobVersion::materialized(
         [9u8; 32],
         BackendRef::node_default(),
+        EncodingClass::Raw,
         fixed_created_at(),
         test_user_id(),
         None,

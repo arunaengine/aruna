@@ -171,6 +171,7 @@ async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, Version
         BlobVersion::materialized(
             hash,
             BackendRef::node_default(),
+            EncodingClass::Raw,
             SystemTime::UNIX_EPOCH,
             owner,
             None,

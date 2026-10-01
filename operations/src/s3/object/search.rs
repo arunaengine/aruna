@@ -669,6 +669,7 @@ mod tests {
             BlobVersion::materialized(
                 blob_hash,
                 BackendRef::node_default(),
+                EncodingClass::Raw,
                 created_at,
                 fixture.owner,
                 None,
