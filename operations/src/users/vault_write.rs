@@ -488,3 +488,238 @@ impl Operation for AppendVaultOperation {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::keyspaces::{VAULT_RETIRED_KEYSPACE, VAULT_REVISION_KEYSPACE};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+    use aruna_core::structs::identity::user::vault::user_record_key;
+    use aruna_core::task::TaskKey;
+    use std::time::Duration;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn user() -> UserId {
+        UserId::local(Ulid::from_bytes([7; 16]), RealmId::from_bytes([3; 32]))
+    }
+
+    fn txn() -> TxnId {
+        Ulid::from_bytes([6; 16])
+    }
+
+    /// Four servers and two vault replicas, so the realm has holders and non-holders.
+    fn config_bytes() -> (Value, Vec<NodeId>) {
+        let mut config = RealmConfigDocument::new(user().realm_id, Vec::new(), 2);
+        config.seed_default_placement();
+        for seed in 1..=4 {
+            config.ensure_node(node(seed), RealmNodeKind::Server);
+        }
+        let target = DocumentTarget::VaultRevision {
+            user_id: user(),
+            revision_id: Ulid::nil(),
+        };
+        let holders = plan_target_placement(&config, &target, Default::default())
+            .unwrap()
+            .unwrap()
+            .holders;
+        let actor = Actor {
+            node_id: node(1),
+            user_id: user(),
+            realm_id: user().realm_id,
+        };
+        (config.to_bytes(&actor).unwrap().into(), holders)
+    }
+
+    fn operation(node_id: NodeId, change: VaultChange) -> AppendVaultOperation {
+        AppendVaultOperation::new(AppendVaultConfig {
+            node_id,
+            user_id: user(),
+            record_id: Ulid::from_bytes([9; 16]),
+            change,
+            now_ms: 5,
+        })
+    }
+
+    /// Runs the operation up to the row read; `None` when it ended before that.
+    fn read_rows(operation: &mut AppendVaultOperation, config: Value) -> Option<Effects> {
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: txn(),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(&[][..]),
+            value: Some(config),
+        }));
+        matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::Iter { .. }))
+        )
+        .then_some(effects)
+    }
+
+    fn head(seed: u8, payload: Option<&str>) -> (Key, Value) {
+        let revision = VaultRevision {
+            user_id: user(),
+            revision_id: Ulid::from_bytes([seed; 16]),
+            predecessors: Vec::new(),
+            payload: payload.map(str::to_string),
+            node_id: node(1),
+            placement: PlacementRef::NIL,
+            created_at_ms: 1,
+        };
+        (
+            revision.target().storage_key(),
+            revision.to_bytes().unwrap().into(),
+        )
+    }
+
+    fn rows(operation: &mut AppendVaultOperation, values: Vec<(Key, Value)>) -> Effects {
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }))
+    }
+
+    fn written(effects: &Effects) -> Vec<(KeySpace, Key)> {
+        match effects.first() {
+            Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) => writes
+                .iter()
+                .map(|(key_space, key, _)| (key_space.clone(), key.clone()))
+                .collect(),
+            other => panic!("expected a batch write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn saves_on_holder() {
+        let (config, holders) = config_bytes();
+        let previous = Ulid::from_bytes([1; 16]);
+        let mut operation = operation(
+            holders[0],
+            VaultChange::Save {
+                payload: "sealed".to_string(),
+                predecessors: vec![previous],
+            },
+        );
+        read_rows(&mut operation, config).expect("a holder reads the heads");
+        let effects = rows(
+            &mut operation,
+            vec![head(1, Some("old")), head(2, Some("other"))],
+        );
+        let previous_row = user_record_key(user(), previous);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::BatchDelete { deletes, .. }))
+                if deletes == &vec![(VAULT_REVISION_KEYSPACE.to_string(), previous_row.clone())]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        let writes = written(&effects);
+        let own_row = user_record_key(user(), Ulid::from_bytes([9; 16]));
+        assert!(writes.contains(&(VAULT_REVISION_KEYSPACE.to_string(), own_row)));
+        assert!(writes.contains(&(VAULT_RETIRED_KEYSPACE.to_string(), previous_row)));
+        assert!(
+            writes
+                .iter()
+                .any(|(key_space, _)| key_space == aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE),
+            "the record is queued for the other holders in the same transaction"
+        );
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: txn(),
+        }));
+        operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainSyncOutbox,
+            after: Duration::ZERO,
+        }));
+        assert!(operation.is_complete());
+        let VaultAppended::Heads(heads) = operation.finalize().unwrap() else {
+            panic!("a save answers heads");
+        };
+        let ids: Vec<_> = heads.iter().map(|head| head.revision_id).collect();
+        assert_eq!(ids, [Ulid::from_bytes([2; 16]), Ulid::from_bytes([9; 16])]);
+    }
+
+    #[test]
+    fn refuses_non_holder() {
+        let (config, holders) = config_bytes();
+        let outsider = (1..=4)
+            .map(node)
+            .find(|node| !holders.contains(node))
+            .unwrap();
+        let mut operation = operation(outsider, VaultChange::Delete);
+        assert!(read_rows(&mut operation, config).is_none());
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(AppendVaultError::NotHolder { holders })
+        );
+    }
+
+    #[test]
+    fn deletes_live_heads() {
+        let (config, holders) = config_bytes();
+        let mut operation = operation(holders[0], VaultChange::Delete);
+        read_rows(&mut operation, config.clone()).unwrap();
+        // Only delete markers left: nothing to write.
+        let effects = rows(&mut operation, vec![head(1, None)]);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
+        ));
+        assert!(
+            matches!(operation.finalize(), Ok(VaultAppended::Heads(heads)) if heads.len() == 1)
+        );
+
+        let mut operation = self::operation(holders[0], VaultChange::Delete);
+        read_rows(&mut operation, config).unwrap();
+        let effects = rows(&mut operation, vec![head(1, None), head(2, Some("sealed"))]);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::BatchDelete { deletes, .. })) if deletes.len() == 2
+        ));
+    }
+
+    #[test]
+    fn bounds_key_records() {
+        let (config, holders) = config_bytes();
+        let change = VaultChange::PublishKey {
+            key_id: "key-1".to_string(),
+            public_key: [4; 32],
+            has_recovery: false,
+        };
+        let mut operation = operation(holders[0], change);
+        read_rows(&mut operation, config).unwrap();
+        let full = (0..MAX_KEY_RECORDS)
+            .map(|index| (Key::from(vec![index as u8]), Value::from(&[][..])))
+            .collect();
+        rows(&mut operation, full);
+        assert_eq!(operation.finalize(), Err(AppendVaultError::TooManyKeys));
+    }
+
+    #[test]
+    fn rejects_unexpected_event() {
+        let (_, holders) = config_bytes();
+        let mut operation = operation(holders[0], VaultChange::Delete);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: txn(),
+        }));
+        let effects = rows(&mut operation, Vec::new());
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
+        ));
+        assert!(matches!(
+            operation.finalize(),
+            Err(AppendVaultError::UnexpectedEvent { .. })
+        ));
+    }
+}
