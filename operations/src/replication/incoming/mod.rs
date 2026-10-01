@@ -302,6 +302,8 @@ pub struct IncomingVersionOperation {
     /// The destination bucket's own rules, so this receiver routes its replica
     /// with the tenant's rules and its own class table.
     destination_rules: Vec<StorageRoutingRule>,
+    /// The destination bucket's compression: the replica is stored with this node's setting.
+    destination_compression: Compression,
     destination_inputs: GroupRoutingInputs,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
@@ -362,6 +364,7 @@ impl IncomingVersionOperation {
             txn_id: None,
             destination_group_id: None,
             destination_rules: Vec::new(),
+            destination_compression: Compression::Off,
             destination_inputs: GroupRoutingInputs::default(),
             create_attempted: false,
             negotiation_result: None,
@@ -1088,7 +1091,8 @@ impl IncomingVersionOperation {
             .routing
             .snapshot(self.destination_group_id.unwrap_or(self.manifest.group_id))
             .with_group_inputs(self.destination_inputs.clone())
-            .with_bucket_rules(self.destination_rules.clone());
+            .with_bucket_rules(self.destination_rules.clone())
+            .with_compression(self.destination_compression);
         resolve_backend(&snapshot, &self.manifest.bucket, &self.manifest.key)
             .map_err(IncomingVersionError::RoutingFailed)
     }
@@ -2105,6 +2109,7 @@ impl IncomingVersionOperation {
         self.destination_group_id = Some(bucket_info.group_id);
         self.gated_bucket = Some(GatedBucket::observe(Some(&bucket_info)));
         self.destination_rules = bucket_info.storage_routing;
+        self.destination_compression = bucket_info.compression;
         self.load_destination_routing()
     }
 

@@ -2,10 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::codec::FrameEncoder;
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
 use crate::opendal::abort_partial_writer;
 use aruna_core::errors::BlobError;
+use aruna_core::structs::storage::format::{Compression, FrameLayout};
 use aruna_net::streams::{RecvStream, SendStream};
 use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncSeekExt};
@@ -162,6 +164,8 @@ pub struct OpenDalWriter {
     idle_timeout: Duration,
     control_timeout: Duration,
     written: u64,
+    /// Set when this node stores the replica as frames; hashes stay on original bytes.
+    encoder: Option<FrameEncoder>,
 }
 
 pub struct BaoReadWriter {
@@ -228,36 +232,17 @@ impl AsyncSliceWriter for BaoReadWriter {
 
 impl AsyncSliceWriter for OpenDalWriter {
     async fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-        self.check_offset(offset)?;
-        with_idle_timeout(
-            async {
-                self.writer
-                    .write(data.to_vec())
-                    .await
-                    .map_err(io::Error::from)
-            },
-            self.idle_timeout,
-            "writing replicated chunk to backend storage",
-        )
-        .await?;
-        self.hasher.update(data);
-        self.written += data.len() as u64;
-        Ok(())
+        self.write_bytes_at(offset, Bytes::copy_from_slice(data))
+            .await
     }
 
     async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> std::io::Result<()> {
         self.check_offset(offset)?;
-        with_idle_timeout(
-            async {
-                self.writer
-                    .write(data.clone())
-                    .await
-                    .map_err(io::Error::from)
-            },
-            self.idle_timeout,
-            "writing replicated chunk to backend storage",
-        )
-        .await?;
+        let pieces = match self.encoder.as_mut() {
+            Some(encoder) => encoder.push(&data).await.map_err(io::Error::other)?,
+            None => vec![data.clone()],
+        };
+        self.write_pieces(pieces).await?;
         self.hasher.update(&data);
         self.written += data.len() as u64;
         Ok(())
@@ -294,7 +279,29 @@ impl OpenDalWriter {
             idle_timeout,
             control_timeout,
             written: 0,
+            encoder: None,
         })
+    }
+
+    /// Stores the replica as frames when `compression` enables zstd.
+    pub fn encoded(mut self, compression: Compression) -> Self {
+        self.encoder = match compression {
+            Compression::Off => None,
+            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        };
+        self
+    }
+
+    async fn write_pieces(&mut self, pieces: Vec<Bytes>) -> io::Result<()> {
+        for piece in pieces {
+            with_idle_timeout(
+                async { self.writer.write(piece).await.map_err(io::Error::from) },
+                self.idle_timeout,
+                "writing replicated chunk to backend storage",
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     // The backend writer is append-only, so a non-sequential offset would
@@ -312,7 +319,19 @@ impl OpenDalWriter {
         Ok(())
     }
 
-    pub async fn finalize(mut self) -> Result<(), BlobError> {
+    /// Closes the replica; returns its frame layout when it was stored as frames.
+    pub async fn finalize(mut self) -> Result<Option<FrameLayout>, BlobError> {
+        let mut layout = None;
+        if let Some(encoder) = self.encoder.take() {
+            let (pieces, framed) = encoder.finish().await?;
+            if let Err(error) = self.write_pieces(pieces).await {
+                return match abort_partial_writer(&mut self.writer, self.control_timeout).await {
+                    Ok(()) => Err(BlobError::WriteError(error.to_string())),
+                    Err(cleanup) => Err(BlobError::DeleteError(format!("{error}; {cleanup}"))),
+                };
+            }
+            layout = Some(framed);
+        }
         let close_result = with_idle_timeout(
             async {
                 self.writer
@@ -331,7 +350,7 @@ impl OpenDalWriter {
                 Err(cleanup) => Err(BlobError::DeleteError(format!("{err}; {cleanup}"))),
             };
         }
-        Ok(())
+        Ok(layout)
     }
 
     pub async fn abort(mut self) -> Result<(), BlobError> {
@@ -537,5 +556,52 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         writer.write_at(3, b"d").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_encodes_frames() {
+        // A replica is stored with this node's compression, hashed over original bytes.
+        use crate::codec::FrameEncoder;
+        use aruna_core::structs::storage::format::Compression;
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let operator = opendal::Operator::from_iter::<opendal::services::Fs>(
+            [("root".to_string(), dir.path().to_str().unwrap().to_string())].into_iter(),
+        )
+        .unwrap()
+        .finish();
+        let mut writer = OpenDalWriter::new(
+            &operator,
+            "blob.bin",
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .encoded(Compression::Zstd { level: 3 });
+        let mut offset = 0;
+        for chunk in data.chunks(100_000) {
+            let bytes = bytes::Bytes::copy_from_slice(chunk);
+            writer.write_bytes_at(offset, bytes).await.unwrap();
+            offset += chunk.len() as u64;
+        }
+        assert_eq!(
+            writer.hasher.finalize().blake3,
+            *blake3::hash(&data).as_bytes()
+        );
+        let layout = writer
+            .finalize()
+            .await
+            .unwrap()
+            .expect("frames were written");
+
+        let mut encoder = FrameEncoder::new(3);
+        let mut expected = encoder.push(&data).await.unwrap().concat();
+        let (rest, expected_layout) = encoder.finish().await.unwrap();
+        expected.extend(rest.concat());
+        let stored = std::fs::read(dir.path().join("blob.bin")).unwrap();
+        assert_eq!(stored, expected);
+        assert_eq!(layout, expected_layout);
+        assert!(stored.len() < data.len());
     }
 }

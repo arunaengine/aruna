@@ -167,3 +167,28 @@ async fn compose_writes_frames() {
     );
     assert_eq!(read_back(&handler, location).await, data);
 }
+
+#[tokio::test]
+async fn replica_streams_original() {
+    // A bao transfer of a framed copy carries the original bytes and their hash.
+    use bao_tree::io::fsm::CreateOutboard;
+    use bao_tree::io::outboard::PreOrderOutboard;
+    use iroh_io::AsyncSliceReader;
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let data = sample();
+    let location = write(&handler, &data).await;
+
+    let mut reader = handler.slice_reader(&location).await.unwrap();
+    let outboard =
+        PreOrderOutboard::<bytes::BytesMut>::create(&mut reader, crate::blob::BAO_BLOCK_SIZE)
+            .await
+            .unwrap();
+
+    assert_eq!(outboard.root.as_bytes(), blake3::hash(&data).as_bytes());
+    let offset = FRAME_SIZE - 100;
+    let bytes = reader.read_exact_at(offset, 300).await.unwrap();
+    assert_eq!(&bytes[..], &data[offset as usize..offset as usize + 300]);
+    let end = reader.read_at(data.len() as u64 - 10, 100).await.unwrap();
+    assert_eq!(&end[..], &data[data.len() - 10..]);
+}
