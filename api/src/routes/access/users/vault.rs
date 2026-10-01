@@ -472,6 +472,19 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn deletes_many_heads() {
+        let (state, _dir, auth) = vault_realm(true).await;
+        for count in [33, 65] {
+            for _ in 0..count {
+                save(&state, &auth, "sealed", &[]).await.unwrap();
+            }
+            assert_eq!(delete(&state, &auth).await.unwrap(), StatusCode::NO_CONTENT);
+            assert!(read_heads(&state, &auth).await.unwrap().is_empty());
+            assert_eq!(delete(&state, &auth).await.unwrap(), StatusCode::NO_CONTENT);
+        }
+    }
+
+    #[tokio::test]
     async fn refuses_bad_saves() {
         let (state, _dir, auth) = vault_realm(true).await;
         let large = "x".repeat(MAX_VAULT_BYTES + 1);

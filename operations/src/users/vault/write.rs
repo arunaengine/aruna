@@ -4,14 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::vault::{
-    MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecordError, VaultRevision, head_rows,
-    record_rows, user_record_prefix,
+    MAX_KEY_RECORDS, MAX_PREDECESSORS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecordError,
+    VaultRevision, head_rows, record_rows, user_record_prefix,
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
@@ -173,6 +173,9 @@ pub struct AppendVaultOperation {
     txn_id: Option<TxnId>,
     state: AppendState,
     output: Option<Result<VaultAppended, AppendVaultError>>,
+    delete_heads: Vec<Ulid>,
+    delete_markers: Vec<VaultRevision>,
+    delete_live: bool,
 }
 
 impl AppendVaultOperation {
@@ -182,6 +185,9 @@ impl AppendVaultOperation {
             txn_id: None,
             state: AppendState::Init,
             output: None,
+            delete_heads: Vec::new(),
+            delete_markers: Vec::new(),
+            delete_live: false,
         }
     }
 
@@ -220,7 +226,7 @@ impl AppendVaultOperation {
             generation: fence::write_generation(&config, &plan.placement).unwrap_or_default(),
         });
         if planned.generation == 0 {
-            return self.read_rows(planned);
+            return self.read_rows(planned, None);
         }
         let (key_space, key) = fence::fence_read(&self.config.user_id.realm_id, &planned.placement);
         let txn_id = Some(self.txn()?);
@@ -232,7 +238,11 @@ impl AppendVaultOperation {
         })])
     }
 
-    fn read_rows(&mut self, planned: Box<Planned>) -> Result<Effects, AppendVaultError> {
+    fn read_rows(
+        &mut self,
+        planned: Box<Planned>,
+        start: Option<Key>,
+    ) -> Result<Effects, AppendVaultError> {
         let limit = match self.config.change {
             VaultChange::PublishKey { .. } => MAX_KEY_RECORDS,
             VaultChange::Save { .. } | VaultChange::Delete => MAX_VAULT_HEADS,
@@ -242,7 +252,7 @@ impl AppendVaultOperation {
         Ok(smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: self.target().storage_keyspace().to_string(),
             prefix: Some(user_record_prefix(self.config.user_id)),
-            start: None,
+            start: start.map(IterStart::After),
             limit,
             txn_id,
         })])
@@ -287,29 +297,19 @@ impl AppendVaultOperation {
                 let output = VaultAppended::Key(Box::new(record));
                 (rows, Vec::new(), output, bytes, change)
             }
-            change @ (VaultChange::Save { .. } | VaultChange::Delete) => {
+            VaultChange::Save {
+                payload,
+                predecessors,
+            } => {
                 let mut heads = rows
                     .iter()
                     .map(|(_, value)| VaultRevision::from_bytes(value))
                     .collect::<Result<Vec<_>, _>>()?;
-                let (payload, predecessors) = match change {
-                    VaultChange::Save {
-                        payload,
-                        predecessors,
-                    } => (Some(payload), predecessors),
-                    _ if heads.iter().all(|head| head.payload.is_none()) => {
-                        // Nothing to delete: answer the heads without a write.
-                        self.output = Some(Ok(VaultAppended::Heads(heads)));
-                        self.state = AppendState::Finish;
-                        return Ok(self.abort());
-                    }
-                    _ => (None, heads.iter().map(|head| head.revision_id).collect()),
-                };
                 let record = VaultRevision {
                     user_id,
                     revision_id: record_id,
                     predecessors,
-                    payload,
+                    payload: Some(payload),
                     node_id,
                     placement: planned.placement,
                     created_at_ms: now_ms,
@@ -322,6 +322,7 @@ impl AppendVaultOperation {
                 heads.sort_by_key(|head| head.revision_id);
                 (rows, deletes, VaultAppended::Heads(heads), bytes, change)
             }
+            VaultChange::Delete => return self.delete_heads(planned),
         };
         let mut writes = rows;
         let target = self.target();
@@ -336,6 +337,74 @@ impl AppendVaultOperation {
         .fenced_at(planned.generation);
         writes.push(outbox_write_entry(&outbox).map_err(ConversionError::from)?);
         self.output = Some(Ok(output));
+        self.write_rows(writes, deletes)
+    }
+
+    fn delete_heads(&mut self, planned: &Planned) -> Result<Effects, AppendVaultError> {
+        if !self.delete_live {
+            self.output = Some(Ok(VaultAppended::Heads(std::mem::take(
+                &mut self.delete_markers,
+            ))));
+            self.state = AppendState::Finish;
+            return Ok(self.abort());
+        }
+        let mut heads = std::mem::take(&mut self.delete_heads)
+            .into_iter()
+            .peekable();
+        let mut previous = None;
+        let mut writes = Vec::new();
+        let mut deletes = Vec::new();
+        loop {
+            let mut predecessors: Vec<_> = previous.into_iter().collect();
+            predecessors.extend(heads.by_ref().take(MAX_PREDECESSORS - predecessors.len()));
+            let final_head = heads.peek().is_none();
+            let record = VaultRevision {
+                user_id: self.config.user_id,
+                revision_id: if final_head {
+                    self.config.record_id
+                } else {
+                    Ulid::generate()
+                },
+                predecessors,
+                payload: None,
+                node_id: self.config.node_id,
+                placement: planned.placement,
+                created_at_ms: self.config.now_ms,
+            };
+            record.validate()?;
+            let bytes = record.to_bytes()?;
+            let change = record.sync_change();
+            let (mut rows, retired) = head_rows(&record, &bytes)?;
+            if !final_head {
+                rows.retain(|(key_space, _, _)| {
+                    key_space != aruna_core::keyspaces::VAULT_REVISION_KEYSPACE
+                });
+            }
+            writes.extend(rows);
+            deletes.extend(retired);
+            let outbox = new_outbox_record(
+                self.config.node_id,
+                record.target(),
+                planned.holders.clone(),
+                DocumentOutboxEvent::Upsert { bytes, change },
+                planned.placement,
+                false,
+            )
+            .fenced_at(planned.generation);
+            writes.push(outbox_write_entry(&outbox).map_err(ConversionError::from)?);
+            if final_head {
+                self.output = Some(Ok(VaultAppended::Heads(vec![record])));
+                return self.write_rows(writes, deletes);
+            }
+            previous = Some(record.revision_id);
+        }
+    }
+
+    fn write_rows(
+        &mut self,
+        writes: Vec<(KeySpace, Key, Value)>,
+        deletes: Vec<(KeySpace, Key)>,
+    ) -> Result<Effects, AppendVaultError> {
         let txn_id = Some(self.txn()?);
         if deletes.is_empty() {
             self.state = AppendState::Write;
@@ -384,12 +453,30 @@ impl AppendVaultOperation {
                 if !fence::admits(value.as_ref(), planned.generation) {
                     return Err(AppendVaultError::PlacementFenced);
                 }
-                self.read_rows(planned)
+                self.read_rows(planned, None)
             }
             (
                 AppendState::ReadRows(planned),
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => self.append(&planned, values),
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                if matches!(self.config.change, VaultChange::Delete) {
+                    for (_, value) in &values {
+                        let head = VaultRevision::from_bytes(value)?;
+                        self.delete_heads.push(head.revision_id);
+                        self.delete_live |= head.payload.is_some();
+                        if head.payload.is_none() && self.delete_markers.len() < MAX_VAULT_HEADS {
+                            self.delete_markers.push(head);
+                        }
+                    }
+                    if let Some(start) = next_start_after {
+                        return self.read_rows(planned, Some(start));
+                    }
+                }
+                self.append(&planned, values)
+            }
             (
                 AppendState::Delete(writes),
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }),
@@ -685,6 +772,135 @@ mod tests {
             effects.first(),
             Some(Effect::Storage(StorageEffect::BatchDelete { deletes, .. })) if deletes.len() == 2
         ));
+    }
+
+    #[test]
+    fn deletes_snapshot_heads() {
+        use aruna_core::document::DocumentOutboxRecord;
+        use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        for count in [33, 65] {
+            let (config, holders) = config_bytes();
+            let mut operation = operation(holders[0], VaultChange::Delete);
+            operation.config.record_id = Ulid::from_bytes([250; 16]);
+            let original: Vec<_> = (1..=count)
+                .map(|id| head(id, (id == count).then_some("sealed")))
+                .collect();
+            read_rows(&mut operation, config).unwrap();
+            let AppendState::ReadRows(planned) = &mut operation.state else {
+                panic!("expected scan");
+            };
+            planned.generation = 7;
+            let mut effects = smallvec![];
+            for (index, page) in original.chunks(MAX_VAULT_HEADS).enumerate() {
+                let next = (index * MAX_VAULT_HEADS + page.len() < original.len())
+                    .then(|| page.last().unwrap().0.clone());
+                effects = operation.step(Event::Storage(StorageEvent::IterResult {
+                    values: page.to_vec(),
+                    next_start_after: next.clone(),
+                }));
+                if let Some(next) = next {
+                    assert!(matches!(effects.first(),
+                        Some(Effect::Storage(StorageEffect::Iter {
+                            start: Some(IterStart::After(start)), limit, txn_id, ..
+                        })) if start == &next && *limit == MAX_VAULT_HEADS && *txn_id == Some(txn())));
+                }
+            }
+            let Some(Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })) =
+                effects.first()
+            else {
+                panic!("expected snapshot deletes");
+            };
+            assert_eq!(*txn_id, Some(txn()));
+            let deletes = deletes.clone();
+            assert!(original.iter().all(|(key, _)| {
+                deletes.contains(&(VAULT_REVISION_KEYSPACE.to_string(), key.clone()))
+            }));
+            let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+                entries: Vec::new(),
+            }));
+            let Some(Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })) =
+                effects.first()
+            else {
+                panic!("expected atomic writes");
+            };
+            assert_eq!(*txn_id, Some(txn()));
+            let outbox: Vec<_> = writes
+                .iter()
+                .filter(|(space, _, _)| space == SYNC_OUTBOX_KEYSPACE)
+                .map(|(_, _, bytes)| postcard::from_bytes::<DocumentOutboxRecord>(bytes).unwrap())
+                .collect();
+            assert_eq!(outbox.len(), if count == 33 { 2 } else { 3 });
+            let mut covered = BTreeSet::new();
+            let mut markers = BTreeSet::new();
+            for entry in &outbox {
+                assert_eq!(entry.generation, 7);
+                let DocumentOutboxEvent::Upsert { bytes, change } = &entry.event else {
+                    panic!("expected upsert");
+                };
+                let marker = VaultRevision::from_bytes(bytes).unwrap();
+                assert_eq!(marker.validate(), Ok(()));
+                assert!(marker.payload.is_none());
+                assert_eq!(entry.target, marker.target());
+                assert_eq!(*change, marker.sync_change());
+                assert!(
+                    writes.contains(
+                        &aruna_core::storage_entries::sync_revision_entry(&entry.target, change)
+                            .unwrap()
+                    )
+                );
+                assert!(
+                    writes.contains(
+                        &aruna_core::storage_entries::shard_manifest_entry(&entry.target, change)
+                            .unwrap()
+                            .unwrap()
+                    )
+                );
+                covered.extend(marker.predecessors);
+                markers.insert(marker.revision_id);
+            }
+            let final_id = operation.config.record_id;
+            assert!(
+                markers
+                    .iter()
+                    .filter(|id| **id != final_id)
+                    .all(|id| covered.contains(id))
+            );
+            for (key, value) in &original {
+                assert!(covered.contains(&VaultRevision::from_bytes(value).unwrap().revision_id));
+                assert!(
+                    writes.iter().any(
+                        |(space, retired, _)| space == VAULT_RETIRED_KEYSPACE && retired == key
+                    )
+                );
+            }
+            let concurrent = head(251, Some("later"));
+            let mut live: BTreeMap<_, _> = original.into_iter().collect();
+            live.insert(concurrent.0.clone(), concurrent.1.clone());
+            for (_, key) in &deletes {
+                live.remove(key);
+            }
+            for (space, key, value) in writes {
+                if space == VAULT_REVISION_KEYSPACE {
+                    live.insert(key.clone(), value.clone());
+                }
+            }
+            assert_eq!(live.len(), 2);
+            assert_eq!(live.get(&concurrent.0), Some(&concurrent.1));
+            assert!(
+                VaultRevision::from_bytes(&live[&user_record_key(user(), final_id)])
+                    .unwrap()
+                    .payload
+                    .is_none()
+            );
+            let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            }));
+            assert!(
+                matches!(effects.first(), Some(Effect::Storage(StorageEffect::CommitTransaction { txn_id })) if *txn_id == txn())
+            );
+        }
     }
 
     #[test]
