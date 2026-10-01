@@ -308,7 +308,10 @@ struct TestContext {
 }
 
 enum TestContextSetup<'a> {
-    Single { max_bucket_size: u64 },
+    Single {
+        max_bucket_size: u64,
+        timeouts: BlobTimeoutConfig,
+    },
     TwoFilesystem,
     S3Mixed(&'a S3Env),
 }
@@ -323,7 +326,10 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
         .unwrap();
 
     let (backends, policy) = match &setup {
-        TestContextSetup::Single { max_bucket_size } => {
+        TestContextSetup::Single {
+            max_bucket_size,
+            timeouts,
+        } => {
             let blob_root = format!("{temp_root}/blobstore");
             std::fs::create_dir_all(&blob_root).unwrap();
             let mut backends = std::collections::BTreeMap::new();
@@ -337,7 +343,7 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
                         bucket_prefix: Some("aruna-test-".to_string()),
                         max_bucket_size: Some(*max_bucket_size),
                         multipart_bucket: Some("uploaded-parts".to_string()),
-                        timeouts: Default::default(),
+                        timeouts: *timeouts,
                     },
                     None,
                 )),
@@ -389,7 +395,11 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
 }
 
 async fn setup_blob_handle(max_bucket_size: u64) -> TestContext {
-    setup_context(TestContextSetup::Single { max_bucket_size }).await
+    setup_context(TestContextSetup::Single {
+        max_bucket_size,
+        timeouts: BlobTimeoutConfig::default(),
+    })
+    .await
 }
 
 fn stream_from_bytes(
@@ -1968,6 +1978,45 @@ async fn compose_part_sizes() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn compose_timeout_deletes() {
+    // A compose write dropped by its idle timeout must never be polled again by cleanup.
+    let context = setup_context(TestContextSetup::Single {
+        max_bucket_size: 1024 * 1024,
+        timeouts: BlobTimeoutConfig {
+            transfer_idle_timeout: Duration::from_secs(1),
+            ..BlobTimeoutConfig::default()
+        },
+    })
+    .await;
+    let handler = context.blob_handle.handler.clone();
+    let BlobEvent::WriteFinished { location: part } = handler
+        .write_blob_part(
+            MultipartPartKey::new(Ulid::generate(), 1),
+            ResolvedBackend::node_default(),
+            test_user_id(),
+            false,
+            false,
+            stream_from_bytes(b"part"),
+        )
+        .await
+    else {
+        panic!("part write failed")
+    };
+    let (operator, delete_calls, writer) = failing_cleanup::pending_operator();
+
+    let event = handler
+        .compose_parts(make_test_location(), operator, vec![part])
+        .await;
+
+    assert!(matches!(
+        event,
+        BlobEvent::Error(BlobError::WriteCleanup { .. })
+    ));
+    assert_eq!(writer.aborts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

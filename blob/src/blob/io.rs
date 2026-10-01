@@ -986,6 +986,8 @@ impl BlobHandler {
 
         let mut hasher = Hasher::new();
         let mut ambiguous = false;
+        // A timeout drops the writer future mid-poll, which leaves the writer unusable.
+        let mut abandoned = false;
         let compose_result: Result<u64, BlobError> = async {
             let mut bytes_written = 0u64;
             for part in parts {
@@ -1026,6 +1028,7 @@ impl BlobHandler {
                     .await
                     .map_err(|_| {
                         ambiguous = true;
+                        abandoned = true;
                         BlobError::WriteError("compose writer idle timeout".to_string())
                     })?
                     .map_err(|err| BlobError::WriteError(err.to_string()))?;
@@ -1035,6 +1038,7 @@ impl BlobHandler {
                 .await
                 .map_err(|_| {
                     ambiguous = true;
+                    abandoned = true;
                     BlobError::WriteError("compose close idle timeout".to_string())
                 })?
                 .map_err(|err| {
@@ -1048,7 +1052,11 @@ impl BlobHandler {
         let bytes_written = match compose_result {
             Ok(bytes_written) => bytes_written,
             Err(err) => {
-                let cleanup = abort_partial_writer(&mut writer, self.io_timeout()).await;
+                let cleanup = if abandoned {
+                    self.delete_path(&operator, &storage_path).await
+                } else {
+                    abort_partial_writer(&mut writer, self.io_timeout()).await
+                };
                 if ambiguous {
                     return BlobEvent::Error(BlobError::WriteCleanup {
                         location,
