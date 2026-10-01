@@ -7,7 +7,7 @@ use super::validation::{check_identity, validate_backend_input};
 use super::{backend_key, parse_read, record_writes};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BACKEND_SECRET_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
+use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::types::{Effects, TxnId};
@@ -23,6 +23,7 @@ enum ReplaceState {
     StartTransaction,
     VerifyRecord,
     WriteRecords,
+    WriteSecret,
     CommitTransaction,
     AbortTransaction,
     Finish,
@@ -170,22 +171,13 @@ impl ReplaceBackendOperation {
             record.disabled = disabled;
         }
 
-        let (Some(record), Some(secret)) = (self.record.as_ref(), self.secret.as_ref()) else {
+        let Some(record) = self.record.as_ref() else {
             return self.fail(CreateBackendError::Failed);
         };
-        let mut writes = match record_writes(record) {
+        let writes = match record_writes(record) {
             Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
-        let secret_bytes = match secret.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error.into()),
-        };
-        writes.push((
-            BACKEND_SECRET_KEYSPACE.to_string(),
-            backend_key(self.backend_id),
-            secret_bytes.into(),
-        ));
 
         self.state = ReplaceState::WriteRecords;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -202,6 +194,34 @@ impl ReplaceBackendOperation {
                 return self.fail(CreateBackendError::InvalidStateEvent {
                     state: "WriteRecords",
                     expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                    received,
+                });
+            }
+        }
+
+        let Some(secret) = self.secret.as_ref() else {
+            return self.fail(CreateBackendError::Failed);
+        };
+        let secret_bytes = match secret.to_secret() {
+            Ok(bytes) => bytes,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = ReplaceState::WriteSecret;
+        smallvec![crate::node_vault::write_secret(
+            GroupStorageSecret::vault_entry(self.backend_id),
+            secret_bytes,
+            self.txn_id,
+        )]
+    }
+
+    fn handle_secret_written(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
+            received => {
+                return self.fail(CreateBackendError::InvalidStateEvent {
+                    state: "WriteSecret",
+                    expected: "Event::Storage(StorageEvent::WriteResult)",
                     received,
                 });
             }
@@ -271,6 +291,7 @@ impl Operation for ReplaceBackendOperation {
             ReplaceState::StartTransaction => self.handle_txn_started(event),
             ReplaceState::VerifyRecord => self.handle_verified(event),
             ReplaceState::WriteRecords => self.handle_written(event),
+            ReplaceState::WriteSecret => self.handle_secret_written(event),
             ReplaceState::CommitTransaction => self.handle_committed(event),
             ReplaceState::AbortTransaction => self.handle_aborted(event),
             ReplaceState::Finish | ReplaceState::Error => {
@@ -376,8 +397,17 @@ mod pure_tests {
             key: b"x".to_vec().into(),
             value: Some(stored.to_bytes().unwrap().into()),
         }));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        let secret = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
+        }));
+        assert!(matches!(
+            secret.as_slice(),
+            [Effect::Storage(StorageEffect::VaultWrite { txn_id: Some(txn_id), .. })]
+                if *txn_id == TxnId::from(7)
+        ));
+        assert!(!format!("{secret:?} {operation:?}").contains("new-key"));
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: b"x".to_vec().into(),
         }));
         operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id: TxnId::from(7),

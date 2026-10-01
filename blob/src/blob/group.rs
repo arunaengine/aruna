@@ -7,7 +7,7 @@ use crate::opendal::build_group_service;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BACKEND_SECRET_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
+use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
@@ -257,26 +257,36 @@ impl BlobHandler {
     /// Both records are read from one snapshot: a replacement committing between
     /// separate reads would pair the old endpoint with the new credentials.
     async fn read_group_backend(&self, backend_id: Ulid) -> Result<NodeBackend, BlobError> {
-        let key: Key = backend_id.to_bytes().to_vec().into();
-        let event = self
+        let unreadable =
+            || BlobError::ReadError(format!("group backend {backend_id} could not be read"));
+        let snapshot = self
             .storage
-            .send_storage_effect(StorageEffect::BatchRead {
-                reads: vec![
-                    (STORAGE_BACKEND_KEYSPACE.to_string(), key.clone()),
-                    (BACKEND_SECRET_KEYSPACE.to_string(), key),
-                ],
-                txn_id: None,
+            .start_transaction(true)
+            .await
+            .map_err(|_| unreadable())?;
+        let txn_id = snapshot.id();
+        let key: Key = backend_id.to_bytes().to_vec().into();
+        let record = self
+            .storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
+                key,
+                txn_id,
             })
             .await;
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return Err(BlobError::ReadError(format!(
-                "group backend {backend_id} could not be read"
-            )));
-        };
-        let [(_, record), (_, secret)] = values.as_slice() else {
-            return Err(BlobError::ReadError(format!(
-                "group backend {backend_id} returned an incomplete read"
-            )));
+        let entry = GroupStorageSecret::vault_entry(backend_id);
+        let secret = self
+            .storage
+            .send_storage_effect(StorageEffect::VaultRead { entry, txn_id })
+            .await;
+        // Dropping the owner aborts the read snapshot.
+        drop(snapshot);
+        let (
+            Event::Storage(StorageEvent::ReadResult { value: record, .. }),
+            Event::Storage(StorageEvent::VaultResult { secret, .. }),
+        ) = (record, secret)
+        else {
+            return Err(unreadable());
         };
         let (Some(record), Some(secret)) = (record, secret) else {
             return Err(BlobError::UnknownBackend(format!(
@@ -286,7 +296,7 @@ impl BlobHandler {
         let record =
             GroupStorage::from_bytes(record.as_ref()).map_err(BlobError::ConversionError)?;
         let secret =
-            GroupStorageSecret::from_bytes(secret.as_ref()).map_err(BlobError::ConversionError)?;
+            GroupStorageSecret::from_bytes(secret.expose()).map_err(BlobError::ConversionError)?;
         group_entry(&record, &secret, self.registry.timeouts())
     }
 

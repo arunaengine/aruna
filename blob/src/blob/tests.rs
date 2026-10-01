@@ -16,8 +16,8 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BACKEND_SECRET_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE,
-    PATHS_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::Status;
@@ -268,6 +268,7 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
         .await
         .unwrap();
@@ -1236,6 +1237,7 @@ async fn sweeps_demoted_backend() {
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
         .await
         .unwrap();
@@ -2469,23 +2471,11 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
         disabled: false,
         cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
     };
-    let mut writes = vec![(
+    let writes = vec![(
         STORAGE_BACKEND_KEYSPACE.to_string(),
         key.clone(),
         record.to_bytes().unwrap().into(),
     )];
-    if paired {
-        let secret = GroupStorageSecret {
-            backend_id,
-            secret_config: HashMap::from([("access_key_id".to_string(), "id".to_string())]),
-            updated_at: SystemTime::UNIX_EPOCH,
-        };
-        writes.push((
-            BACKEND_SECRET_KEYSPACE.to_string(),
-            key,
-            secret.to_bytes().unwrap().into(),
-        ));
-    }
     context
         .storage_handle
         .send_storage_effect(StorageEffect::BatchWrite {
@@ -2493,6 +2483,19 @@ async fn write_group_backend(context: &TestContext, backend_id: Ulid, paired: bo
             txn_id: None,
         })
         .await;
+    if paired {
+        let secret = GroupStorageSecret {
+            backend_id,
+            secret_config: HashMap::from([("access_key_id".to_string(), "id".to_string())]),
+            updated_at: SystemTime::UNIX_EPOCH,
+        };
+        let write = StorageEffect::VaultWrite {
+            entry: GroupStorageSecret::vault_entry(backend_id),
+            secret: secret.to_secret().unwrap(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(write).await;
+    }
 }
 
 fn group_effect(backend_id: Ulid) -> BlobEffect {

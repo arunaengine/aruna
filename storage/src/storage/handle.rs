@@ -153,7 +153,7 @@ impl StorageHandle {
         )
     }
 
-    /// Seals connector and backend secret rows with `key` from now on, for this
+    /// Seals repository connector secret rows with `key` from now on, for this
     /// handle and all its clones. Set once at startup; a later key is ignored.
     pub fn seal_secrets(&self, key: CredentialEncryptionKey) {
         let _ = self.secret_key.set(key);
