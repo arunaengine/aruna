@@ -16,6 +16,7 @@ mod metadata;
 mod registry;
 mod shared;
 mod validate;
+mod vault;
 
 pub(in crate::document_sync) use self::admin::*;
 #[cfg(test)]

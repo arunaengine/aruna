@@ -166,6 +166,15 @@ pub(super) async fn apply_batch_event(
     }
     if matches!(
         event.target(),
+        DocumentTarget::VaultRevision { .. } | DocumentTarget::UserKey { .. }
+    ) {
+        let outcome =
+            super::vault::apply_vault_event(service, topic_id, actor_id, identity, event).await?;
+        record_metadata(outcome, state);
+        return Ok(());
+    }
+    if matches!(
+        event.target(),
         DocumentTarget::PersistentIdMapping { .. } | DocumentTarget::PlacementPolicy { .. }
     ) {
         let outcome = apply_policy_event(service, topic_id, actor_id, identity, event).await?;
