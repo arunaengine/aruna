@@ -231,6 +231,7 @@ fn build_session(
         path_restrictions,
         issued_by,
         last_used_at: None,
+        previous: None,
     };
     session.encrypt_secret(encryption_key, secret_access_key.expose())?;
     Ok(S3SessionCredentials {
@@ -414,7 +415,7 @@ mod tests {
                     path_restrictions: None,
                     issued_by: issuer,
                 },
-                encryption_key,
+                encryption_key.clone(),
             ),
             &context,
         )
@@ -431,11 +432,32 @@ mod tests {
         );
         assert_eq!(refreshed.session.last_used_at, None);
 
+        // The replaced pair still verifies requests signed before, until its own expiry.
+        let old_token = S3Session::hash_token(issued.session_token.expose());
+        let after = boundary + Duration::from_secs(1);
+        assert_eq!(
+            refreshed
+                .session
+                .open_secret_for(&encryption_key, Some(&old_token), after)
+                .unwrap(),
+            issued.secret_access_key.expose()
+        );
+        drive(
+            TouchS3Operation::new(TouchS3Config {
+                access_key: refreshed.access_key_id.clone(),
+                token_hash: old_token.clone(),
+                now: after,
+                issued_by: issuer,
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
         let error = drive(
             TouchS3Operation::new(TouchS3Config {
                 access_key: refreshed.access_key_id,
-                token_hash: S3Session::hash_token(issued.session_token.expose()),
-                now: boundary + Duration::from_secs(1),
+                token_hash: old_token,
+                now: start + SESSION_MAX_TTL,
                 issued_by: issuer,
             }),
             &context,

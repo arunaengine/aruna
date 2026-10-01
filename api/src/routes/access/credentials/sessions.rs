@@ -264,8 +264,9 @@ pub async fn list_s3_sessions(
 must still be a member of the session's group with READ or WRITE on some path under its data root.
 
 **Behavior**
-- The access key id is kept while the signing secret and session token are rotated in place, so the
-  previous pair stops working.
+- The access key id is kept while the signing secret and session token are rotated in place. The
+  previous pair keeps working until its original expiry, so requests signed before the refresh
+  still verify; it stops working after that expiry or the next refresh.
 - Activity is reset for the next cycle, and the new expiry is capped by the bearer token's own.
 
 **Limits**

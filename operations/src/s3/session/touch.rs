@@ -106,7 +106,7 @@ impl TouchS3Operation {
         if session.issued_by != self.config.issued_by {
             return self.fail(S3SessionError::WrongIssuer);
         }
-        if !session.token_matches(&self.config.token_hash) {
+        if !session.token_matches(&self.config.token_hash, self.config.now) {
             return self.fail(S3SessionError::InvalidToken);
         }
         if session.is_expired(self.config.now) {
