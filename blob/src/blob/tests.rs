@@ -150,6 +150,7 @@ mod failing_cleanup {
     #[derive(Debug, Default)]
     struct CleanupBuilder {
         delete_calls: Arc<AtomicUsize>,
+        writer: CleanupWriter,
     }
 
     impl Builder for CleanupBuilder {
@@ -158,6 +159,7 @@ mod failing_cleanup {
         fn build(self) -> opendal::Result<impl Access> {
             Ok(CleanupBackend {
                 delete_calls: self.delete_calls,
+                writer: self.writer,
             })
         }
     }
@@ -165,6 +167,7 @@ mod failing_cleanup {
     #[derive(Debug)]
     struct CleanupBackend {
         delete_calls: Arc<AtomicUsize>,
+        writer: CleanupWriter,
     }
 
     impl Access for CleanupBackend {
@@ -191,7 +194,7 @@ mod failing_cleanup {
             _path: &str,
             _args: OpWrite,
         ) -> opendal::Result<(RpWrite, Self::Writer)> {
-            Ok((RpWrite::new(), CleanupWriter))
+            Ok((RpWrite::new(), self.writer.clone()))
         }
 
         async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
@@ -200,10 +203,20 @@ mod failing_cleanup {
         }
     }
 
-    struct CleanupWriter;
+    /// Counts writes and aborts; a pending writer never finishes a write.
+    #[derive(Clone, Debug, Default)]
+    pub(super) struct CleanupWriter {
+        pending: bool,
+        pub(super) writes: Arc<AtomicUsize>,
+        pub(super) aborts: Arc<AtomicUsize>,
+    }
 
     impl oio::Write for CleanupWriter {
         async fn write(&mut self, _bs: Buffer) -> opendal::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
 
@@ -212,6 +225,7 @@ mod failing_cleanup {
         }
 
         async fn abort(&mut self) -> opendal::Result<()> {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
             Err(Error::new(ErrorKind::Unexpected, "injected abort failure"))
         }
     }
@@ -220,10 +234,26 @@ mod failing_cleanup {
         let delete_calls = Arc::new(AtomicUsize::new(0));
         let operator = Operator::new(CleanupBuilder {
             delete_calls: delete_calls.clone(),
+            writer: CleanupWriter::default(),
         })
         .unwrap()
         .finish();
         (operator, delete_calls)
+    }
+
+    pub(super) fn pending_operator() -> (Operator, Arc<AtomicUsize>, CleanupWriter) {
+        let delete_calls = Arc::new(AtomicUsize::new(0));
+        let writer = CleanupWriter {
+            pending: true,
+            ..CleanupWriter::default()
+        };
+        let operator = Operator::new(CleanupBuilder {
+            delete_calls: delete_calls.clone(),
+            writer: writer.clone(),
+        })
+        .unwrap()
+        .finish();
+        (operator, delete_calls, writer)
     }
 }
 
@@ -2022,6 +2052,36 @@ async fn abandoned_writer_deletes() {
         .unwrap_err();
     assert!(matches!(error, BlobError::DeleteError(_)));
     assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancelled_write_deletes() {
+    // A write dropped mid-poll leaves the writer unusable, so cleanup must delete by path.
+    let context = setup_blob_handle(5).await;
+    let (operator, delete_calls, writer) = failing_cleanup::pending_operator();
+    let mut write = Box::pin(context.blob_handle.handler.write_stream(
+        make_test_location(),
+        operator,
+        stream_from_bytes(b"payload"),
+    ));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while writer.writes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(futures::poll!(&mut write).is_pending());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("write must reach the backend");
+
+    drop(write);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while delete_calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a cancelled write must delete its partial object");
+    assert_eq!(writer.aborts.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

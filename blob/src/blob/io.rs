@@ -110,8 +110,8 @@ struct HiddenReservation {
     storage_path: Option<String>,
     writer: Option<opendal::Writer>,
     uncertain: bool,
-    /// A writer future a timeout dropped mid-poll leaves opendal's retry layer
-    /// in a bad state, so the writer must never be polled again.
+    /// A writer future dropped mid-poll by a timeout or cancellation leaves
+    /// opendal's retry layer in a bad state, so the writer must never be polled again.
     abandoned: bool,
 }
 
@@ -163,6 +163,10 @@ impl HiddenReservation {
 
     fn mark_abandoned(&mut self) {
         self.abandoned = true;
+    }
+
+    fn mark_settled(&mut self) {
+        self.abandoned = false;
     }
 
     async fn fail(&mut self, error: BlobError) -> BlobEvent {
@@ -398,6 +402,8 @@ impl BlobHandler {
                     .await;
             }
             hasher.update(&bytes);
+            // Stays set if the caller drops this future before the write returns.
+            reservation.mark_abandoned();
             let write = match reservation.writer_mut() {
                 Some(writer) => match deadline {
                     Some(deadline) => {
@@ -415,6 +421,9 @@ impl BlobHandler {
                         .await;
                 }
             };
+            if write.is_ok() {
+                reservation.mark_settled();
+            }
             match write {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
@@ -434,6 +443,7 @@ impl BlobHandler {
             bytes_written = next_size;
         }
 
+        reservation.mark_abandoned();
         let close = match reservation.writer_mut() {
             Some(writer) => match deadline {
                 Some(deadline) => with_deadline(Some(deadline), writer.close()).await,
@@ -449,6 +459,9 @@ impl BlobHandler {
                     .await;
             }
         };
+        if close.is_ok() {
+            reservation.mark_settled();
+        }
         match close {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => {
