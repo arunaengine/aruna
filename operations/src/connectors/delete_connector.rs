@@ -75,6 +75,7 @@ pub struct DeleteSourceOperation {
     input: DeleteSourceInput,
     state: DeleteSourceState,
     txn_id: Option<TxnId>,
+    has_secret: bool,
     output: Option<Result<DeleteSourceResult, DeleteSourceError>>,
 }
 
@@ -84,6 +85,7 @@ impl DeleteSourceOperation {
             input,
             state: DeleteSourceState::Init,
             txn_id: None,
+            has_secret: false,
             output: None,
         }
     }
@@ -114,9 +116,7 @@ impl DeleteSourceOperation {
             Err(error) => return self.emit_error(error.into()),
         };
 
-        if secret.is_none() {
-            return self.delete_records();
-        }
+        self.has_secret = secret.is_some();
 
         self.state = DeleteSourceState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -128,7 +128,11 @@ impl DeleteSourceOperation {
         match event {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                 self.txn_id = Some(txn_id);
-                self.scan_reference_versions(None)
+                if self.has_secret {
+                    self.scan_reference_versions(None)
+                } else {
+                    self.delete_records()
+                }
             }
             Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
             received => self.emit_error(DeleteSourceError::InvalidStateEvent {
@@ -332,6 +336,7 @@ impl Operation for DeleteSourceOperation {
 mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+    use crate::connectors::replace_connector::{ReplaceSourceInput, ReplaceSourceOperation};
     use crate::connectors::repository::{parse_secret_read, read_secret_effect};
     use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
     use crate::driver::{DriverContext, drive};
@@ -831,6 +836,103 @@ mod tests {
         assert_eq!(
             config.get("endpoint").map(String::as_str),
             Some("https://example.org")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_delete_abort() {
+        let (_tempdir, context) = test_context();
+        let connector = create_public_connector(&context).await;
+        let input = DeleteSourceInput {
+            group_id: connector.group_id,
+            connector_id: connector.connector_id,
+        };
+        let mut operation = DeleteSourceOperation::new(input.clone());
+        let mut effects = operation.start();
+        for _ in 0..2 {
+            assert_eq!(effects.len(), 1);
+            let event = context.storage_handle.send_effect(effects.remove(0)).await;
+            effects = operation.step(event);
+        }
+
+        drive(
+            ReplaceSourceOperation::new(ReplaceSourceInput {
+                group_id: connector.group_id,
+                connector_id: connector.connector_id,
+                name: connector.name.clone(),
+                kind: connector.kind,
+                public_config: connector.public_config.clone(),
+                secret_config: HashMap::from([("token".to_string(), "secret".to_string())]),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        if matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ) {
+            let event = context.storage_handle.send_effect(effects.remove(0)).await;
+            effects = operation.step(event);
+        }
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete { .. })]
+        ));
+        let event = context.storage_handle.send_effect(effects.remove(0)).await;
+        let effects = operation.step(event);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::VaultDelete { .. })]
+        ));
+        for effect in operation.abort() {
+            let event = context.storage_handle.send_effect(effect).await;
+            assert!(matches!(
+                event,
+                Event::Storage(StorageEvent::TransactionAborted { .. })
+            ));
+        }
+
+        let event = context
+            .storage_handle
+            .send_effect(read_connector_effect(
+                input.group_id,
+                input.connector_id,
+                None,
+            ))
+            .await;
+        assert!(parse_connector_read(event).unwrap().is_some());
+        let event = context
+            .storage_handle
+            .send_effect(read_secret_effect(input.connector_id, None))
+            .await;
+        assert!(
+            parse_secret_read(event, input.connector_id)
+                .unwrap()
+                .is_some()
+        );
+
+        drive(DeleteSourceOperation::new(input.clone()), &context)
+            .await
+            .unwrap();
+        let event = context
+            .storage_handle
+            .send_effect(read_connector_effect(
+                input.group_id,
+                input.connector_id,
+                None,
+            ))
+            .await;
+        assert!(parse_connector_read(event).unwrap().is_none());
+        let event = context
+            .storage_handle
+            .send_effect(read_secret_effect(input.connector_id, None))
+            .await;
+        assert!(
+            parse_secret_read(event, input.connector_id)
+                .unwrap()
+                .is_none()
         );
     }
 
