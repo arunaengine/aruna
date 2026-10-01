@@ -493,3 +493,188 @@ impl Operation for MigrateVersionOperation {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::checksum::HASH_BLAKE3;
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
+    use std::collections::HashMap;
+    use ulid::Ulid;
+
+    const ZSTD: Compression = Compression::Zstd { level: 3 };
+
+    fn location(framed: bool) -> BackendLocation {
+        let mut format = StoredFormat::default();
+        if framed {
+            format.layout = StoredLayout::Frames(FrameLayout {
+                level: 3,
+                stored_size: 20,
+                index_hash: [0; 32],
+            });
+        }
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "store".to_string(),
+            backend_path: format!("b/k_{}", Ulid::generate()),
+            ulid: Ulid::generate(),
+            format,
+            created_by: Default::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 40,
+            hashes: HashMap::from([(HASH_BLAKE3.to_string(), vec![4u8; 32])]),
+        }
+    }
+
+    fn read_result(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: value.map(Into::into),
+        })
+    }
+
+    fn bucket(compression: Compression) -> Vec<u8> {
+        BucketInfo {
+            group_id: Ulid::from_bytes([1; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression,
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    /// Drives the operation up to the transaction that publishes the new copy.
+    fn written(operation: &mut MigrateVersionOperation, version: &BlobVersion) -> Effects {
+        operation.start();
+        operation.step(read_result(Some(version.to_bytes().unwrap())));
+        operation.step(read_result(Some(location(false).to_bytes().unwrap())));
+        let blob = BackendStream::new(futures_util::stream::empty::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let effects = operation.step(Event::Blob(BlobEvent::ReadFinished {
+            blob,
+            stream_size: 40,
+        }));
+        let [Effect::Blob(BlobEffect::Write { resolved, .. })] = effects.as_slice() else {
+            panic!("expected one write, got {effects:?}")
+        };
+        assert_eq!(resolved.compression, ZSTD);
+        operation.step(Event::Blob(BlobEvent::WriteFinished {
+            location: location(true),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }))
+    }
+
+    fn raw_version() -> BlobVersion {
+        BlobVersion::materialized(
+            [4u8; 32],
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            None,
+        )
+    }
+
+    fn operation() -> MigrateVersionOperation {
+        let key = VersionKey::new("b", "k", Ulid::from_bytes([2; 16]));
+        MigrateVersionOperation::new(key, ZSTD, SystemTime::UNIX_EPOCH)
+    }
+
+    #[test]
+    fn skips_encoded_version() {
+        let mut operation = operation();
+        let mut version = raw_version();
+        if let BlobVersionState::Materialized { encoding, .. } = &mut version.state {
+            *encoding = EncodingClass::Zstd { level: 3 };
+        }
+        operation.start();
+
+        let effects = operation.step(read_result(Some(version.to_bytes().unwrap())));
+
+        assert!(effects.is_empty());
+        assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+    }
+
+    #[test]
+    fn publishes_new_copy() {
+        let mut operation = operation();
+        let version = raw_version();
+        written(&mut operation, &version);
+        operation.step(read_result(Some(bucket(ZSTD))));
+        operation.step(read_result(Some(version.to_bytes().unwrap())));
+
+        let effects = operation.step(read_result(None));
+
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the row writes, got {effects:?}")
+        };
+        let spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
+        assert_eq!(
+            spaces,
+            [
+                BLOB_LOCATIONS_KEYSPACE,
+                BLOB_VERSIONS_KEYSPACE,
+                BLOB_RECLAIM_KEYSPACE
+            ]
+        );
+        let stored = BlobVersion::from_bytes(&writes[1].2).unwrap();
+        let class = stored.location_key().unwrap().encoding;
+        assert_eq!(class, EncodingClass::Zstd { level: 3 });
+        let old = ReclaimCandidateKey::from_bytes(&writes[2].1).unwrap();
+        assert_eq!(old.encoding, EncodingClass::Raw);
+    }
+
+    #[test]
+    fn stale_setting_discards() {
+        // The setting changed again while the copy was written: nothing is published
+        // and the written copy goes back to the cleanup queue.
+        let mut operation = operation();
+        written(&mut operation, &raw_version());
+
+        let effects = operation.step(read_result(Some(bucket(Compression::Off))));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TxnId::default(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReleaseReservation { .. })]
+        ));
+        let effects = operation.step(Event::Blob(BlobEvent::ReservationReleased {
+            id: Ulid::nil(),
+        }));
+        assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
+        assert_eq!(operation.finalize(), Ok(MigrateOutcome::Skipped));
+    }
+
+    #[test]
+    fn rejects_wrong_event() {
+        let mut operation = operation();
+        operation.start();
+
+        operation.step(Event::Blob(BlobEvent::DeleteFinished));
+
+        assert!(matches!(
+            operation.finalize(),
+            Err(MigrateVersionError::InvalidStateEvent { .. })
+        ));
+    }
+}
