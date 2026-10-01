@@ -41,6 +41,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CopyOrigin, CurrentVersionPointer, ResolvedBackend, VersionKey, WriteOwner,
 };
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
@@ -248,6 +249,8 @@ pub struct CompleteUploadOperation {
     gate: Option<PolicyGateOperation>,
     /// What the gate decided on, re-read inside the finalize transaction.
     gated_bucket: Option<GatedBucket>,
+    /// The bucket's compression when the gate read it; the composed object uses it.
+    compression: Compression,
     /// The reset that returns the record to `Open` has already been taken, so
     /// no later cleanup step may take it a second time.
     reset_done: bool,
@@ -285,6 +288,7 @@ impl CompleteUploadOperation {
             gate_context: None,
             gate: None,
             gated_bucket: None,
+            compression: Compression::Off,
             reset_done: false,
         }
     }
@@ -805,6 +809,10 @@ impl CompleteUploadOperation {
             Ok(bucket) => bucket,
             Err(error) => return self.schedule_error(error.into()),
         };
+        self.compression = bucket
+            .as_ref()
+            .map(|bucket| bucket.compression)
+            .unwrap_or_default();
         let inherited = self
             .upload_record
             .as_ref()
@@ -874,7 +882,8 @@ impl CompleteUploadOperation {
                 parts: self.resolved_parts.clone(),
             })];
         }
-        let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone());
+        let pinned = ResolvedBackend::new(upload.backend.clone(), upload.storage_class.clone())
+            .with_compression(self.compression);
         let parts = self
             .resolved_parts
             .iter()

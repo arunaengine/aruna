@@ -9,6 +9,7 @@ use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STA
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
+use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::{
     BackendCatalog, GroupRoutingInputs, NodeRouting, RoutingSnapshot, StorageRoutingRule,
 };
@@ -72,12 +73,12 @@ async fn group_inputs(
     Ok(crate::driver::drive(GroupInputsOperation::new(group_id), context).await?)
 }
 
-/// Bucket rules for callers that do not already hold the bucket record. A
-/// bucket without a record simply has no rules.
+/// Bucket rules and compression for callers that do not already hold the bucket
+/// record. A bucket without a record has no rules and no compression.
 async fn bucket_rules(
     context: &DriverContext,
     bucket: &str,
-) -> Result<Vec<StorageRoutingRule>, RoutingInputsError> {
+) -> Result<(Vec<StorageRoutingRule>, Compression), RoutingInputsError> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -87,7 +88,7 @@ async fn bucket_rules(
         })
         .await;
     Ok(parse_read(event, BucketInfo::from_bytes)?
-        .map(|info| info.storage_routing)
+        .map(|info| (info.storage_routing, info.compression))
         .unwrap_or_default())
 }
 
@@ -146,10 +147,12 @@ pub async fn routing_snapshot(
     group_id: GroupId,
     bucket: &str,
 ) -> Result<RoutingSnapshot, RoutingInputsError> {
+    let (rules, compression) = bucket_rules(context, bucket).await?;
     let snapshot = node_routing(context)
         .snapshot(group_id)
         .with_group_inputs(group_inputs(context, group_id).await?)
-        .with_bucket_rules(bucket_rules(context, bucket).await?);
+        .with_bucket_rules(rules)
+        .with_compression(compression);
     mark_full_backends(context, snapshot).await
 }
 
@@ -162,7 +165,8 @@ pub async fn bucket_snapshot(
     let snapshot = node_routing(context)
         .snapshot(bucket.group_id)
         .with_group_inputs(group_inputs(context, bucket.group_id).await?)
-        .with_bucket_rules(bucket.storage_routing.clone());
+        .with_bucket_rules(bucket.storage_routing.clone())
+        .with_compression(bucket.compression);
     mark_full_backends(context, snapshot).await
 }
 
@@ -411,7 +415,7 @@ mod tests {
             storage_routing: vec![rule.clone()],
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
-            compression: Compression::Off,
+            compression: Compression::Zstd { level: 5 },
         };
         let record = GroupStorageRouting {
             group_id,
@@ -439,10 +443,14 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.bucket_rules, vec![rule.clone()]);
         assert_eq!(snapshot.group_default, record.default_target);
+        // Every backend the snapshot resolves carries the bucket's compression.
+        let resolved = resolve_backend(&snapshot, "routed", "key").unwrap();
+        assert_eq!(resolved.compression, info.compression);
 
         let known = bucket_snapshot(&context, &info).await.unwrap();
         assert_eq!(known.bucket_rules, vec![rule]);
         assert_eq!(known.group_default, record.default_target);
+        assert_eq!(known.compression, info.compression);
 
         // An unwritten group and bucket are normal empty state, never an error.
         let absent = routing_snapshot(&context, Ulid::generate(), "missing")
