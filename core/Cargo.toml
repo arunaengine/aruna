@@ -48,7 +48,6 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 zeroize = { workspace = true }
-aes-gcm = { workspace = true }
 hpke = { workspace = true }
 pbkdf2 = { workspace = true }
 x25519-dalek = { workspace = true }
