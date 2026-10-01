@@ -27,6 +27,7 @@ use aruna_core::structs::storage::format::{Compression, FrameLayout, StoredForma
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt, stream};
 use opendal::{EntryMode, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
@@ -214,37 +215,42 @@ impl HiddenReservation {
         self.abandoned = false;
     }
 
-    async fn fail(&mut self, error: BlobError) -> BlobEvent {
-        match self.abort().await {
-            Ok(()) => BlobEvent::Error(error),
-            Err(cleanup) => {
-                let plain = self.key.lock().map_or(true, |key| key.is_none());
-                match (plain, self.location.clone()) {
-                    (true, Some(location)) => BlobEvent::Error(BlobError::WriteCleanup {
-                        location,
-                        message: cleanup.to_string(),
-                    }),
-                    _ => BlobEvent::Error(cleanup),
+    /// Boxed, so each failure exit of a write keeps only a pointer in the caller's stack frame.
+    fn fail(&mut self, error: BlobError) -> BoxFuture<'_, BlobEvent> {
+        Box::pin(async move {
+            match self.abort().await {
+                Ok(()) => BlobEvent::Error(error),
+                Err(cleanup) => {
+                    let plain = self.key.lock().map_or(true, |key| key.is_none());
+                    match (plain, self.location.clone()) {
+                        (true, Some(location)) => BlobEvent::Error(BlobError::WriteCleanup {
+                            location,
+                            message: cleanup.to_string(),
+                        }),
+                        _ => BlobEvent::Error(cleanup),
+                    }
                 }
             }
-        }
+        })
     }
 
-    async fn fail_close(&mut self, error: BlobError) -> BlobEvent {
-        self.mark_uncertain();
-        let cleanup = self.abort().await;
-        let Some(location) = self.location.clone() else {
-            return match cleanup {
-                Ok(()) => BlobEvent::Error(error),
-                Err(cleanup) => BlobEvent::Error(cleanup),
+    fn fail_close(&mut self, error: BlobError) -> BoxFuture<'_, BlobEvent> {
+        Box::pin(async move {
+            self.mark_uncertain();
+            let cleanup = self.abort().await;
+            let Some(location) = self.location.clone() else {
+                return match cleanup {
+                    Ok(()) => BlobEvent::Error(error),
+                    Err(cleanup) => BlobEvent::Error(cleanup),
+                };
             };
-        };
-        BlobEvent::Error(BlobError::WriteCleanup {
-            location,
-            message: match cleanup {
-                Ok(()) => error.to_string(),
-                Err(cleanup) => format!("{error}; {cleanup}"),
-            },
+            BlobEvent::Error(BlobError::WriteCleanup {
+                location,
+                message: match cleanup {
+                    Ok(()) => error.to_string(),
+                    Err(cleanup) => format!("{error}; {cleanup}"),
+                },
+            })
         })
     }
 
