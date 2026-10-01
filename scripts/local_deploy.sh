@@ -40,7 +40,8 @@ usage() {
 Usage: bash scripts/local_deploy.sh [--new] [--help]
 
 Behavior:
-  default Reuse the mounted state directory in target/compose/node/storage.
+  default Reuse the mounted state directory in target/compose/node/storage, migrated with
+          aruna-doctor migrate before the node starts.
           If the directory does not contain an existing database, bootstrap a fresh node in place.
   --new   Clear the mounted state directory before starting, then bootstrap a fresh node.
   --help  Print this help and exit.
@@ -275,9 +276,18 @@ bootstrap_fresh_state() {
   ADMIN_TOKEN="$token"
 }
 
+# Brings stored rows to the current format. Storage is single-writer, so the aruna service must be
+# down; compose.yaml mounts the state directory at /data.
+migrate_state() {
+  log "Migrating mounted state to the current format"
+  compose run --rm --no-deps aruna /run/aruna-doctor migrate /data \
+    || die "aruna-doctor migrate failed on the mounted state"
+}
+
 bootstrap_existing_state() {
   local token
 
+  migrate_state
   start_stack
   wait_until_ready "$OPS_READY_URL"
 
