@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::keyspaces::VAULT_RETIRED_KEYSPACE;
+use aruna_core::keyspaces::{VAULT_RETIRED_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use aruna_core::structs::identity::user::vault::{
     UserKeyRecord, VaultRevision, head_rows, record_rows, user_record_key,
 };
@@ -112,17 +112,21 @@ async fn store_head(
         )
         .await;
         let result = match retired {
-            Ok(Some(_)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Ok(false);
+            Ok(retired) => {
+                let mut writes = writes.clone();
+                if retired.is_some() {
+                    writes.retain(|(keyspace, key, _)| {
+                        keyspace != VAULT_REVISION_KEYSPACE || key != &marker
+                    });
+                }
+                replace_batch_in(storage, txn_id, deletes.clone(), writes)
+                    .await
+                    .map(|()| retired.is_none())
             }
-            Ok(None) => replace_batch_in(storage, txn_id, deletes.clone(), writes.clone()).await,
             Err(error) => Err(error),
         };
         match result {
-            Ok(()) => return Ok(true),
+            Ok(stored) => return Ok(stored),
             Err(error) => {
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })

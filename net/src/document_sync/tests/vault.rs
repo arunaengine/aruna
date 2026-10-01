@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::VAULT_REVISION_KEYSPACE;
-use aruna_core::structs::identity::user::vault::{VaultRevision, user_record_key};
+use aruna_core::keyspaces::{VAULT_RETIRED_KEYSPACE, VAULT_REVISION_KEYSPACE};
+use aruna_core::structs::identity::user::vault::{VaultRevision, record_rows, user_record_key};
 
 struct Holder {
     _storage_dir: TempDir,
@@ -137,4 +137,65 @@ async fn keeps_concurrent_heads() {
     assert!(holder.stored(4).await);
 
     holder.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn shuffled_retirement_replays() {
+    for deleted in [2, 3] {
+        for order in [[1, 2, 3], [1, 3, 2], [3, 2, 1]] {
+            let holder = Holder::open().await;
+            let mut records = [
+                holder.revision(1, &[]),
+                holder.revision(2, &[1]),
+                holder.revision(3, &[2]),
+            ];
+            records[deleted - 1].payload = None;
+            for replay in [false, true] {
+                let sequence = if replay { [2, 1, 3] } else { order };
+                for (event, id) in sequence.into_iter().enumerate() {
+                    holder
+                        .apply(
+                            &[records[id - 1].clone()],
+                            8_000 + u64::from(replay) * 10 + event as u64,
+                        )
+                        .await;
+                }
+                for id in [1, 2] {
+                    assert!(!holder.stored(id).await, "revision {id} is retired");
+                    assert!(
+                        read_storage_value(
+                            &holder.storage,
+                            VAULT_RETIRED_KEYSPACE,
+                            user_record_key(holder.user_id, Ulid::from_parts(id, 1)),
+                        )
+                        .await
+                        .is_some()
+                    );
+                }
+                assert!(holder.stored(3).await);
+                for record in &records {
+                    for (keyspace, key, expected) in record_rows(
+                        &record.target(),
+                        &record.to_bytes().unwrap(),
+                        &record.sync_change(),
+                    )
+                    .unwrap()
+                    {
+                        if keyspace == VAULT_REVISION_KEYSPACE
+                            && record.revision_id != records[2].revision_id
+                        {
+                            continue;
+                        }
+                        assert_eq!(
+                            read_storage_value(&holder.storage, &keyspace, key).await,
+                            Some(expected),
+                            "revision {} retains its {keyspace} row",
+                            record.revision_id
+                        );
+                    }
+                }
+            }
+            holder.service.shutdown().await;
+        }
+    }
 }
