@@ -691,7 +691,7 @@ impl ReclaimBlobOperation {
             self.key.blake3,
             self.key.backend.clone(),
             -1,
-            -i128::from(location.blob_size),
+            -i128::from(location.stored_size()),
         ));
         if update.is_noop() {
             return self.commit();
