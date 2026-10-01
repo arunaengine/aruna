@@ -368,20 +368,171 @@ pub(crate) fn decode_frame(
 mod tests {
     use super::*;
 
+    /// Seeded xorshift bytes, so random samples are the same on every run.
+    fn random(len: usize, mut seed: u64) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect()
+    }
+
+    fn text(len: usize) -> Vec<u8> {
+        b"aruna stores research data in frames. "
+            .iter()
+            .copied()
+            .cycle()
+            .take(len)
+            .collect()
+    }
+
+    fn encode(data: &[u8], level: u8) -> (Vec<u8>, FrameLayout) {
+        let mut writer = FrameWriter::new(level);
+        let mut out = Vec::new();
+        for chunk in data.chunks(FRAME_SIZE as usize) {
+            let (tag, stored) = encode_frame(Bytes::copy_from_slice(chunk), level).unwrap();
+            out.extend_from_slice(&stored);
+            if let Some(entries) = writer.push(tag, &stored).unwrap() {
+                out.extend(entries);
+            }
+        }
+        let (rest, layout) = writer.finish();
+        out.extend(rest);
+        (out, layout)
+    }
+
+    fn decode(
+        stored: &[u8],
+        layout: &FrameLayout,
+        size: u64,
+        range: Range<u64>,
+    ) -> Result<Vec<u8>, BlobError> {
+        let tail = tail_range(size, layout)?;
+        let index = FrameIndex::parse(size, layout, &stored[tail.start as usize..])?;
+        let mut out = Vec::new();
+        let mut position = range.start;
+        while position < range.end {
+            let frame = position / FRAME_SIZE;
+            let (group, slot) = group_of(frame);
+            let bounds = index.entries_range(group);
+            let entries =
+                index.entries(group, &stored[bounds.start as usize..bounds.end as usize])?;
+            let skipped: u64 = entries[..slot].iter().map(FrameEntry::stored_len).sum();
+            let start = (index.group_start(group) + skipped) as usize;
+            let entry = &entries[slot];
+            let bytes = &stored[start..start + entry.stored_len() as usize];
+            let length = frame_len(size, frame);
+            let decoded = decode_frame(entry, length, Bytes::copy_from_slice(bytes))?;
+            let frame_start = frame * FRAME_SIZE;
+            let to = (range.end - frame_start).min(length);
+            out.extend_from_slice(&decoded[(position - frame_start) as usize..to as usize]);
+            position = frame_start + to;
+        }
+        Ok(out)
+    }
+
+    fn samples() -> Vec<Vec<u8>> {
+        let mut mixed = text(3 * FRAME_SIZE as usize / 2);
+        mixed.extend(random(2 * FRAME_SIZE as usize, 7));
+        vec![
+            text(5 * FRAME_SIZE as usize + 17),
+            random(3 * FRAME_SIZE as usize + 5, 3),
+            mixed,
+            b"tiny".to_vec(),
+            Vec::new(),
+        ]
+    }
+
+    #[test]
+    fn round_trips_samples() {
+        for data in samples() {
+            let size = data.len() as u64;
+            let (stored, layout) = encode(&data, 3);
+
+            assert_eq!(layout.stored_size, stored.len() as u64);
+            assert_eq!(decode(&stored, &layout, size, 0..size).unwrap(), data);
+        }
+        let compressible = text(4 * FRAME_SIZE as usize);
+        let (stored, _) = encode(&compressible, 3);
+        assert!(stored.len() < compressible.len() / 10);
+    }
+
+    #[test]
+    fn ranges_cross_frames() {
+        let data = samples().remove(2);
+        let size = data.len() as u64;
+        let (stored, layout) = encode(&data, 9);
+        let ranges = [
+            FRAME_SIZE - 10..FRAME_SIZE + 10,
+            0..1,
+            size - 1..size,
+            FRAME_SIZE + 3..3 * FRAME_SIZE + 1,
+            5..5,
+        ];
+        for range in ranges {
+            let expected = &data[range.start as usize..range.end as usize];
+            assert_eq!(decode(&stored, &layout, size, range).unwrap(), expected);
+        }
+    }
+
     #[test]
     fn small_saving_stays_raw() {
         let (tag, _) = encode_frame(Bytes::from(vec![0u8; 900]), 3).unwrap();
+        assert_eq!(tag, TAG_RAW);
+        let (tag, _) = encode_frame(Bytes::from(random(FRAME_SIZE as usize, 5)), 3).unwrap();
         assert_eq!(tag, TAG_RAW);
         let (tag, _) = encode_frame(Bytes::from(vec![0u8; 4096]), 3).unwrap();
         assert_eq!(tag, TAG_ZSTD);
     }
 
+    #[test]
+    fn tampered_bytes_fail() {
+        let data = samples().remove(0);
+        let size = data.len() as u64;
+        let (stored, layout) = encode(&data, 3);
+        let integrity = |result: Result<Vec<u8>, BlobError>| {
+            matches!(result, Err(BlobError::IntegrityCheckFailed(_)))
+        };
+        let mut frame = stored.clone();
+        frame[10] ^= 1;
+        assert!(integrity(decode(&frame, &layout, size, 0..size)));
+        let mut tail = stored.clone();
+        let last = tail.len() - 1;
+        tail[last] ^= 1;
+        assert!(integrity(decode(&tail, &layout, size, 0..size)));
+        let index = tail_range(size, &layout).unwrap();
+        let tail = FrameIndex::parse(size, &layout, &stored[index.start as usize..]).unwrap();
+        let mut entries = stored.clone();
+        entries[tail.entries_range(0).start as usize + 1] ^= 1;
+        assert!(integrity(decode(&entries, &layout, size, 0..size)));
+        let mut record = layout.clone();
+        record.stored_size += 1;
+        assert!(integrity(decode(&stored, &record, size, 0..size)));
+    }
+
+    #[test]
+    fn bombs_stay_bounded() {
+        let entry = |stored: &[u8]| FrameEntry {
+            tag: TAG_ZSTD,
+            len: stored.len() as u32,
+            digest: *blake3::hash(stored).as_bytes(),
+        };
+        // A frame that claims more output than the frame may hold is refused unread.
+        let large = zstd::bulk::compress(&vec![0u8; 64 * FRAME_SIZE as usize], 3).unwrap();
+        let result = decode_frame(&entry(&large), FRAME_SIZE, Bytes::from(large.clone()));
+        assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
+        // A frame without a declared size is refused too.
+        let open = zstd::stream::encode_all(&vec![0u8; 1024][..], 3).unwrap();
+        let result = decode_frame(&entry(&open), 1024, Bytes::from(open.clone()));
+        assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
+    }
+
     #[tokio::test]
-    async fn encoder_writes_index() {
-        // Five frames in groups of two: three entry blocks and three tail summaries.
-        let data: Vec<u8> = (0..5 * FRAME_SIZE as usize)
-            .map(|i| (i % 7) as u8)
-            .collect();
+    async fn encoder_matches_frames() {
+        let data = samples().remove(2);
         let mut encoder = FrameEncoder::new(3);
         let mut stored = Vec::new();
         for chunk in data.chunks(300_001) {
@@ -394,9 +545,8 @@ mod tests {
             stored.extend_from_slice(&piece);
         }
 
-        assert_eq!(layout.stored_size, stored.len() as u64);
-        let tail = &stored[stored.len() - 3 * 40..];
-        assert_eq!(blake3::hash(tail).as_bytes(), &layout.index_hash);
-        assert!(stored.len() < data.len() / 10);
+        assert_eq!((stored.clone(), layout.clone()), encode(&data, 3));
+        let size = data.len() as u64;
+        assert_eq!(decode(&stored, &layout, size, 0..size).unwrap(), data);
     }
 }
