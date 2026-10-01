@@ -1072,7 +1072,8 @@ impl IncomingVersionOperation {
         };
         self.state = IncomingVersionState::ReadExistingBlob;
         smallvec![blob_location_read(
-            &BlobLocationKey::new(hash, EncodingClass::Raw, backend),
+            // Only a copy in this node's own encoding for the bucket can be reused.
+            &BlobLocationKey::new(hash, self.destination_compression.into(), backend),
             None
         )]
     }
