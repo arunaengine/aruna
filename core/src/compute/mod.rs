@@ -14,6 +14,7 @@ use bytes::Bytes;
 use futures::Stream;
 use globset::{Glob, GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -516,6 +517,40 @@ impl Drop for Secret {
     }
 }
 
+/// Secret bytes such as keys or sealed payloads in plain form. Debug output is
+/// redacted, the bytes are zeroed on drop, and equality runs in constant time.
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    pub fn new(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretBytes(***)")
+    }
+}
+
+impl PartialEq for SecretBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_slice().ct_eq(other.0.as_slice()).into()
+    }
+}
+
+impl Eq for SecretBytes {}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogLimits {
     #[serde(rename = "max_bytes_per_stream")]
@@ -902,6 +937,16 @@ pub struct TombstoneEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_bytes_redacted() {
+        let secret = SecretBytes::new(b"canary-3c9d".to_vec());
+        let rendered = format!("{secret:?} {:?}", Some(&secret));
+        assert!(!rendered.contains("canary") && !rendered.contains("99, 97"));
+        assert_eq!(secret, SecretBytes::new(b"canary-3c9d".to_vec()));
+        assert_ne!(secret, SecretBytes::new(b"canary-3c9e".to_vec()));
+        assert_ne!(secret, SecretBytes::new(b"canary".to_vec()));
+    }
 
     const LISTING: [&str; 6] = [
         "/out/a.txt",

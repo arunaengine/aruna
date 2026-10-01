@@ -485,6 +485,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "smallvec",
+ "subtle",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
