@@ -7,6 +7,8 @@
 use aruna_core::errors::BlobError;
 use aruna_core::structs::storage::format::FrameLayout;
 use bytes::{Bytes, BytesMut};
+use std::ops::Range;
+use zstd::zstd_safe::DParameter;
 
 pub(crate) const FRAME_SIZE: u64 = 1 << 20;
 /// Frames per group; one group's entries are read and checked together.
@@ -15,9 +17,38 @@ const GROUP_FRAMES: u64 = 1024;
 /// Tests use small groups so several groups fit in a few MiB.
 #[cfg(test)]
 const GROUP_FRAMES: u64 = 2;
+const ENTRY_LEN: u64 = 37;
+const SUMMARY_LEN: u64 = 40;
 const TAG_RAW: u8 = 0;
 const TAG_ZSTD: u8 = 1;
 const MIN_SAVING: usize = 1024;
+/// A zstd window of 1 MiB covers any frame; larger windows are refused.
+const WINDOW_LOG: u32 = 20;
+
+fn frame_count(size: u64) -> u64 {
+    size.div_ceil(FRAME_SIZE)
+}
+
+fn group_count(size: u64) -> u64 {
+    frame_count(size).div_ceil(GROUP_FRAMES)
+}
+
+/// Original length of one frame of an object of `size` bytes.
+pub(crate) fn frame_len(size: u64, frame: u64) -> u64 {
+    FRAME_SIZE.min(size - frame * FRAME_SIZE)
+}
+
+fn group_frames(size: u64, group: u64) -> u64 {
+    GROUP_FRAMES.min(frame_count(size) - group * GROUP_FRAMES)
+}
+
+fn tail_len(size: u64) -> u64 {
+    group_count(size) * SUMMARY_LEN
+}
+
+fn integrity(message: &str) -> BlobError {
+    BlobError::IntegrityCheckFailed(message.to_string())
+}
 
 /// One stored frame: its codec tag, stored length and the digest of its stored bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +63,22 @@ impl FrameEntry {
         out.push(self.tag);
         out.extend_from_slice(&self.len.to_le_bytes());
         out.extend_from_slice(&self.digest);
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        let mut len = [0; 4];
+        len.copy_from_slice(&bytes[1..5]);
+        let mut digest = [0; 32];
+        digest.copy_from_slice(&bytes[5..37]);
+        Self {
+            tag: bytes[0],
+            len: u32::from_le_bytes(len),
+            digest,
+        }
+    }
+
+    pub(crate) fn stored_len(&self) -> u64 {
+        u64::from(self.len)
     }
 }
 
@@ -168,6 +215,153 @@ impl FrameEncoder {
         out.push(Bytes::from(rest));
         Ok((out, layout))
     }
+}
+
+/// Byte range of the tail inside the stored object, checked against the record first.
+pub(crate) fn tail_range(size: u64, layout: &FrameLayout) -> Result<Range<u64>, BlobError> {
+    let len = tail_len(size);
+    // Every frame takes at least one byte plus its entry, so smaller objects are invalid.
+    let minimum = frame_count(size)
+        .checked_mul(ENTRY_LEN + 1)
+        .and_then(|frames| frames.checked_add(len))
+        .ok_or_else(|| integrity("frame index size overflows"))?;
+    if layout.stored_size < minimum {
+        return Err(integrity("stored size is too small for the frame index"));
+    }
+    Ok(layout.stored_size - len..layout.stored_size)
+}
+
+/// The checked tail: where each group starts and how long it is.
+#[derive(Debug)]
+pub(crate) struct FrameIndex {
+    size: u64,
+    starts: Vec<u64>,
+    lens: Vec<u64>,
+    digests: Vec<[u8; 32]>,
+}
+
+impl FrameIndex {
+    /// Verifies the tail hash before using any value, then checks every group bound.
+    pub(crate) fn parse(size: u64, layout: &FrameLayout, tail: &[u8]) -> Result<Self, BlobError> {
+        if tail.len() as u64 != tail_len(size) {
+            return Err(integrity("frame index tail has the wrong length"));
+        }
+        if blake3::hash(tail).as_bytes() != &layout.index_hash {
+            return Err(integrity("frame index hash mismatch"));
+        }
+        let groups = group_count(size) as usize;
+        let mut index = Self {
+            size,
+            starts: Vec::with_capacity(groups),
+            lens: Vec::with_capacity(groups),
+            digests: Vec::with_capacity(groups),
+        };
+        let mut start = 0u64;
+        for (group, summary) in tail.chunks_exact(SUMMARY_LEN as usize).enumerate() {
+            let mut len = [0; 8];
+            len.copy_from_slice(&summary[..8]);
+            let len = u64::from_le_bytes(len);
+            let mut digest = [0; 32];
+            digest.copy_from_slice(&summary[8..]);
+            let frames = group_frames(size, group as u64);
+            let original = (group as u64 * GROUP_FRAMES..group as u64 * GROUP_FRAMES + frames)
+                .map(|frame| frame_len(size, frame))
+                .sum::<u64>();
+            if len < frames * (ENTRY_LEN + 1) || len > original + frames * ENTRY_LEN {
+                return Err(integrity("frame group has an invalid length"));
+            }
+            index.starts.push(start);
+            index.lens.push(len);
+            index.digests.push(digest);
+            start += len;
+        }
+        if start + tail.len() as u64 != layout.stored_size {
+            return Err(integrity("frame groups do not fill the stored object"));
+        }
+        Ok(index)
+    }
+
+    /// Byte range of one group's entries.
+    pub(crate) fn entries_range(&self, group: u64) -> Range<u64> {
+        let end = self.starts[group as usize] + self.lens[group as usize];
+        end - group_frames(self.size, group) * ENTRY_LEN..end
+    }
+
+    /// Verifies one group's entries against the tail, then checks each entry.
+    pub(crate) fn entries(&self, group: u64, bytes: &[u8]) -> Result<Vec<FrameEntry>, BlobError> {
+        let range = self.entries_range(group);
+        if bytes.len() as u64 != range.end - range.start {
+            return Err(integrity("frame entries have the wrong length"));
+        }
+        if blake3::hash(bytes).as_bytes() != &self.digests[group as usize] {
+            return Err(integrity("frame entries hash mismatch"));
+        }
+        let first = group * GROUP_FRAMES;
+        let mut total = 0u64;
+        let mut entries = Vec::with_capacity(bytes.len() / ENTRY_LEN as usize);
+        for (offset, bytes) in bytes.chunks_exact(ENTRY_LEN as usize).enumerate() {
+            let entry = FrameEntry::decode(bytes);
+            let expected = frame_len(self.size, first + offset as u64);
+            let valid = match entry.tag {
+                TAG_RAW => entry.stored_len() == expected,
+                TAG_ZSTD => entry.len > 0 && entry.stored_len() < expected,
+                _ => false,
+            };
+            if !valid {
+                return Err(integrity("frame entry is invalid"));
+            }
+            total += entry.stored_len();
+            entries.push(entry);
+        }
+        if total + (range.end - range.start) != self.lens[group as usize] {
+            return Err(integrity("frame entries do not fill their group"));
+        }
+        Ok(entries)
+    }
+
+    /// Stored offset of the first frame of a group.
+    pub(crate) fn group_start(&self, group: u64) -> u64 {
+        self.starts[group as usize]
+    }
+}
+
+/// Group of a frame and the frame's place inside it.
+pub(crate) fn group_of(frame: u64) -> (u64, usize) {
+    (frame / GROUP_FRAMES, (frame % GROUP_FRAMES) as usize)
+}
+
+/// Checks a stored frame against its entry, then decodes it into exactly `expected` bytes.
+pub(crate) fn decode_frame(
+    entry: &FrameEntry,
+    expected: u64,
+    stored: Bytes,
+) -> Result<Bytes, BlobError> {
+    if stored.len() as u64 != entry.stored_len() {
+        return Err(integrity("stored frame has the wrong length"));
+    }
+    if blake3::hash(&stored).as_bytes() != &entry.digest {
+        return Err(integrity("stored frame hash mismatch"));
+    }
+    if entry.tag == TAG_RAW {
+        return Ok(stored);
+    }
+    match zstd::zstd_safe::get_frame_content_size(&stored) {
+        Ok(Some(size)) if size == expected => {}
+        _ => return Err(integrity("zstd frame declares the wrong size")),
+    }
+    let mut decoder =
+        zstd::bulk::Decompressor::new().map_err(|error| BlobError::ReadError(error.to_string()))?;
+    decoder
+        .set_parameter(DParameter::WindowLogMax(WINDOW_LOG))
+        .map_err(|error| BlobError::ReadError(error.to_string()))?;
+    let mut out = Vec::with_capacity(expected as usize);
+    decoder
+        .decompress_to_buffer(&stored, &mut out)
+        .map_err(|error| integrity(&format!("zstd frame does not decode: {error}")))?;
+    if out.len() as u64 != expected {
+        return Err(integrity("zstd frame decoded to the wrong size"));
+    }
+    Ok(Bytes::from(out))
 }
 
 #[cfg(test)]

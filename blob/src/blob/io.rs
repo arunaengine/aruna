@@ -32,7 +32,7 @@ use opendal::{EntryMode, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
@@ -66,6 +66,12 @@ enum HiddenCursor {
 /// Resolves the requested bounds against the stored size so a range read can
 /// report how many bytes its stream yields.
 fn range_length(range: &impl RangeBounds<u64>, blob_size: u64) -> u64 {
+    let range = clamped_range(range, blob_size);
+    range.end - range.start
+}
+
+/// The requested bounds as a range inside `0..blob_size`.
+fn clamped_range(range: &impl RangeBounds<u64>, blob_size: u64) -> Range<u64> {
     let start = match range.start_bound() {
         Bound::Included(start) => *start,
         Bound::Excluded(start) => start.saturating_add(1),
@@ -76,7 +82,8 @@ fn range_length(range: &impl RangeBounds<u64>, blob_size: u64) -> u64 {
         Bound::Excluded(end) => *end,
         Bound::Unbounded => blob_size,
     };
-    end.min(blob_size).saturating_sub(start)
+    let end = end.min(blob_size);
+    start.min(end)..end
 }
 
 /// Tenant writers open with an explicit chunk so a small-chunk stream cannot
@@ -1258,6 +1265,10 @@ impl BlobHandler {
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
+        if let StoredLayout::Frames(layout) = &location.format.layout {
+            let range = 0..location.blob_size;
+            return Box::pin(self.read_frames(&location, layout, range)).await;
+        }
         let expected_blake3: [u8; 32] = match location.get_blake3() {
             Some(hash) => match hash.try_into() {
                 Ok(hash) => hash,
@@ -1348,6 +1359,10 @@ impl BlobHandler {
         location: BackendLocation,
         range: impl RangeBounds<u64>,
     ) -> BlobEvent {
+        if let StoredLayout::Frames(layout) = &location.format.layout {
+            let range = clamped_range(&range, location.blob_size);
+            return Box::pin(self.read_frames(&location, layout, range)).await;
+        }
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),

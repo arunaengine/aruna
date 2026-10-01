@@ -17,6 +17,7 @@ use ulid::Ulid;
 
 mod backend;
 mod control_plane;
+mod frames;
 mod group;
 mod in_place;
 mod io;
