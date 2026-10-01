@@ -198,8 +198,8 @@ pub struct UploadSweepOutcome {
     pub failed: usize,
 }
 
-/// An upload no client will finish: an `Open` record past its TTL, or a
-/// `Completing` one whose lease lapsed long enough ago that its request is gone.
+/// An upload no client will finish: an `Open` record past its TTL, a `Completing` one whose
+/// lease lapsed long enough ago that its request is gone, or an abort that stopped midway.
 fn stale_upload(record: &MultipartUpload, now_ms: u64) -> bool {
     let age = record
         .created_at
@@ -212,7 +212,7 @@ fn stale_upload(record: &MultipartUpload, now_ms: u64) -> bool {
             .completing_since_ms
             .map(|since| now_ms.saturating_sub(since) >= COMPLETING_TTL_MS)
             .unwrap_or(age >= COMPLETING_TTL_MS),
-        MultipartUploadStatus::Aborting => false,
+        MultipartUploadStatus::Aborting => true,
     }
 }
 
@@ -255,17 +255,17 @@ pub async fn sweep_stale_uploads(
 
     for record in stale {
         let upload_id = record.upload_id;
-        match drive(
-            AbortUploadOperation::new(AbortUploadInput {
-                bucket: record.bucket,
-                key: record.key,
-                upload_id,
-                now_ms,
-            }),
-            context,
-        )
-        .await
-        {
+        let mut operation = AbortUploadOperation::new(AbortUploadInput {
+            bucket: record.bucket,
+            key: record.key,
+            upload_id,
+            now_ms,
+        });
+        // An abort is transactional, so finishing one that stopped midway is safe to repeat.
+        if record.status == MultipartUploadStatus::Aborting {
+            operation = operation.including_in_progress();
+        }
+        match drive(operation, context).await {
             Ok(_) => {
                 outcome.aborted = outcome.aborted.saturating_add(1);
                 warn!(%upload_id, status = ?record.status, "Reclaimed a stale multipart upload");

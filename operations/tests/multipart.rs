@@ -1727,6 +1727,46 @@ async fn sweep_reclaims_upload() {
     assert_eq!(count_blob_files(&context.blob_root), baseline);
 }
 
+// An abort cancelled after it marked the record leaves `Aborting`, which no client can abort again.
+#[tokio::test]
+async fn sweep_finishes_abort() {
+    let context = setup_context().await;
+    let realm_id = RealmId::from_bytes([9u8; 32]);
+    let created_by = UserId::local(Ulid::generate(), realm_id);
+    let baseline = count_blob_files(&context.blob_root);
+    let upload = create_upload(
+        &context,
+        "bucket-a",
+        "halted.bin",
+        Ulid::generate(),
+        created_by,
+    )
+    .await;
+    let part = upload_part_bytes(
+        &context,
+        "bucket-a",
+        "halted.bin",
+        upload.upload_id,
+        1,
+        &vec![4u8; MIN_PART_SIZE],
+        created_by,
+    )
+    .await;
+    let mut halted = read_upload(&context, upload.upload_id).await.unwrap();
+    halted.status = MultipartUploadStatus::Aborting;
+    write_upload(&context, &halted).await;
+
+    let outcome = sweep_stale_uploads(&context.driver, now_ms())
+        .await
+        .unwrap();
+
+    assert_eq!((outcome.aborted, outcome.failed), (1, 0));
+    assert!(read_upload(&context, upload.upload_id).await.is_none());
+    drain_cleanup(&context).await;
+    assert!(!exists(part.location.get_full_path().unwrap()).unwrap());
+    assert_eq!(count_blob_files(&context.blob_root), baseline);
+}
+
 async fn write_upload(context: &TestContext, record: &MultipartUpload) {
     let event = context
         .driver
